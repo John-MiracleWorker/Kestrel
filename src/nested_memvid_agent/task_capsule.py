@@ -16,9 +16,10 @@ from .backends.base import MemoryBackend
 from .backends.in_memory import InMemoryBackend
 from .backends.memvid_backend import MemvidBackend
 from .context_frames import MV2ContextFrame, to_memory_record
-from .file_lock import lock_exclusive, unlock
+from .file_lock import lock_exclusive, lock_shared, unlock
 from .models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from .nested_learning import LearningSignal, ValidationEvidence
+from .platform_primitives import is_link_or_reparse_point, is_windows_reparse_point
 from .private_artifacts import (
     create_private_empty_file,
     ensure_owner_only_directory,
@@ -181,22 +182,33 @@ class TaskCapsuleWriter:
         self.backend_name = backend
         self.path = runs_dir / self.run_id / "complete.mv2"
         self.backend: MemoryBackend | None = None
+        self._root_lock_handle: IO[str] | None = None
 
     def open(self) -> None:
+        _reject_windows_reparse_ancestors(self.runs_dir)
+        _reject_windows_reparse_ancestors(self.path.parent)
         ensure_owner_only_directory(self.runs_dir)
+        _reject_windows_reparse_ancestors(self.runs_dir)
+        _require_capsule_writer_directory(self.runs_dir)
         ensure_owner_only_directory(self.path.parent)
-        backend_cls: type[MemoryBackend] = (
-            MemvidBackend if self.backend_name == "memvid" else InMemoryBackend
-        )
-        self.backend = backend_cls(path=self.path, layer=MemoryLayer.EPISODIC)
+        _reject_windows_reparse_ancestors(self.path.parent)
+        _require_capsule_writer_directory(self.path.parent)
+        if self.backend_name != "memvid":
+            self._acquire_root_lock()
         try:
+            backend_cls: type[MemoryBackend] = (
+                MemvidBackend if self.backend_name == "memvid" else InMemoryBackend
+            )
+            self.backend = backend_cls(path=self.path, layer=MemoryLayer.EPISODIC)
             self.backend.open()
             if self.backend_name != "memvid":
                 create_private_empty_file(self.path)
             self._harden_artifacts()
         except Exception:
-            self.backend.close()
-            self.backend = None
+            if self.backend is not None:
+                self.backend.close()
+                self.backend = None
+            self._release_root_lock()
             raise
 
     def put_frame(self, frame: MV2ContextFrame) -> str:
@@ -235,7 +247,10 @@ class TaskCapsuleWriter:
         if self.backend is not None:
             self.backend.close()
             self.backend = None
-        self._harden_artifacts()
+        try:
+            self._harden_artifacts()
+        finally:
+            self._release_root_lock()
 
     def _backend(self) -> MemoryBackend:
         if self.backend is None:
@@ -244,6 +259,30 @@ class TaskCapsuleWriter:
 
     def _harden_artifacts(self) -> None:
         harden_memory_artifact_files(self.path)
+
+    def _acquire_root_lock(self) -> None:
+        if self._root_lock_handle is not None:
+            return
+        descriptor = open_private_file_descriptor(
+            _capsule_root_lock_path(self.runs_dir, self.run_id)
+        )
+        handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+        try:
+            lock_shared(handle, blocking=False)
+        except Exception:
+            handle.close()
+            raise
+        self._root_lock_handle = handle
+
+    def _release_root_lock(self) -> None:
+        handle = self._root_lock_handle
+        if handle is None:
+            return
+        try:
+            unlock(handle)
+        finally:
+            handle.close()
+            self._root_lock_handle = None
 
 
 def write_run_capsule(
@@ -368,7 +407,10 @@ def enforce_task_capsule_retention(
     if isinstance(retention_count, bool) or retention_count < 1:
         raise ValueError("retention_count must be an integer greater than or equal to 1")
     runs_dir = Path(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir)
     ensure_owner_only_directory(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir)
+    _require_capsule_writer_directory(runs_dir)
     preserved = tuple(preserve_run_ids)
     with _exclusive_retention_pass(runs_dir):
         return _enforce_task_capsule_retention_locked(
@@ -405,7 +447,9 @@ def _enforce_task_capsule_retention_locked(
                 skipped.append(TaskCapsuleRetentionSkip(entry.name, "unsafe_run_id"))
             continue
         scanned_run_count += 1
-        if not stat.S_ISDIR(entry_metadata.st_mode):
+        if is_link_or_reparse_point(entry_metadata) or not stat.S_ISDIR(
+            entry_metadata.st_mode
+        ):
             skipped.append(TaskCapsuleRetentionSkip(run_id, "unsafe_run_directory"))
             continue
         try:
@@ -471,8 +515,14 @@ def summarize_run_capsule(
     backend: str = "memory",
 ) -> TaskCapsuleSummary:
     run_id = validate_capsule_run_id(run_id)
+    _reject_windows_reparse_ancestors(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir / run_id)
     ensure_owner_only_directory(runs_dir)
+    _reject_windows_reparse_ancestors(runs_dir)
+    _require_capsule_writer_directory(runs_dir)
     path = runs_dir / run_id / "complete.mv2"
+    _reject_windows_reparse_ancestors(path.parent)
+    _require_capsule_writer_directory(path.parent)
     capsule = _load_capsule_payload(path, backend=backend)
     objective = str(capsule.get("objective", ""))
     signals = extract_learning_signals(capsule, run_id=run_id)
@@ -938,7 +988,12 @@ def _exclusive_capsule_locks(runs_dir: Path, run_id: str) -> Iterator[None]:
         os.lstat(layer_lock_path)
     except FileNotFoundError as exc:
         raise _RetentionSkipError("partial_capsule") from exc
-    lock_paths.append(layer_lock_path)
+    # Windows cannot rename a directory while a handle to a child lock file is
+    # open. Current writers (including Memvid) hold the root lock for their full
+    # lifetime, so that external lock is sufficient there and leaves the
+    # directory movable. POSIX keeps the additional legacy layer-lock check.
+    if os.name != "nt" or not lock_paths:
+        lock_paths.append(layer_lock_path)
 
     handles: list[IO[str]] = []
     try:
@@ -998,7 +1053,7 @@ def _delete_completed_capsule(
         ):
             raise _RetentionSkipError("capsule_changed_during_retention")
         try:
-            os.replace(candidate.path, quarantine)
+            _replace_capsule_directory(candidate.path, quarantine)
         except OSError as exc:
             raise _RetentionSkipError("capsule_deletion_failed") from exc
 
@@ -1022,7 +1077,7 @@ def _delete_completed_capsule(
     except Exception as exc:
         if not candidate.path.exists() and quarantine.exists():
             try:
-                os.replace(quarantine, candidate.path)
+                _replace_capsule_directory(quarantine, candidate.path)
             except OSError:
                 pass
         if isinstance(exc, _RetentionSkipError):
@@ -1048,6 +1103,77 @@ def _delete_completed_capsule(
         except (OSError, _RetentionSkipError):
             warnings.append(f"{candidate.run_id}:root_lock_cleanup_failed")
     return artifact_count, reclaimed_bytes, tuple(warnings)
+
+
+def _replace_capsule_directory(source: Path, destination: Path) -> None:
+    """Move a verified capsule directory without Windows replace flags."""
+
+    source_metadata = _safe_directory_metadata(source)
+    source_parent_metadata = _safe_directory_metadata(source.parent)
+    destination_parent_metadata = _safe_directory_metadata(destination.parent)
+    if not os.path.samestat(source_parent_metadata, destination_parent_metadata):
+        raise _RetentionSkipError("capsule_deletion_failed")
+    try:
+        destination_metadata = os.lstat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        if is_link_or_reparse_point(destination_metadata):
+            raise _RetentionSkipError("unsafe_run_directory")
+        raise _RetentionSkipError("capsule_deletion_failed")
+    moved = False
+    try:
+        os.replace(source, destination)
+        moved = True
+    except PermissionError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 5:
+            raise
+        source_retry = _safe_directory_metadata(source)
+        if not os.path.samestat(source_metadata, source_retry):
+            raise _RetentionSkipError("capsule_changed_during_retention") from exc
+        try:
+            os.lstat(destination)
+        except FileNotFoundError:
+            pass
+        else:
+            raise _RetentionSkipError("capsule_deletion_failed") from exc
+        os.rename(source, destination)
+        moved = True
+    try:
+        published_metadata = _safe_directory_metadata(destination)
+        if not os.path.samestat(source_metadata, published_metadata):
+            raise _RetentionSkipError("capsule_changed_during_retention")
+    except BaseException as exc:
+        if moved:
+            _restore_capsule_directory_move(destination, source, source_metadata)
+        raise exc
+
+
+def _restore_capsule_directory_move(
+    destination: Path,
+    source: Path,
+    expected: os.stat_result,
+) -> None:
+    """Restore the exact moved capsule after post-publication validation fails."""
+
+    try:
+        visible = os.lstat(destination)
+        if (
+            is_link_or_reparse_point(visible)
+            or not stat.S_ISDIR(visible.st_mode)
+            or not os.path.samestat(expected, visible)
+            or os.path.lexists(source)
+        ):
+            raise _RetentionSkipError("capsule_deletion_failed")
+        if os.name == "nt":
+            os.rename(destination, source)
+        else:
+            os.replace(destination, source)
+        restored = _safe_directory_metadata(source)
+        if not os.path.samestat(expected, restored):
+            raise _RetentionSkipError("capsule_deletion_failed")
+    except OSError as exc:
+        raise _RetentionSkipError("capsule_deletion_failed") from exc
 
 
 def _read_unchanged_regular_text(
@@ -1084,10 +1210,31 @@ def _safe_directory_metadata(path: Path) -> os.stat_result:
         metadata = os.lstat(path)
     except FileNotFoundError as exc:
         raise _RetentionSkipError("capsule_changed_during_scan") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
         raise _RetentionSkipError("unsafe_run_directory")
     _require_current_owner(metadata)
     return metadata
+
+
+def _require_capsule_writer_directory(path: Path) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"Task capsule directory is unavailable: {path}") from exc
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"Task capsule path must be a real directory: {path}")
+    return metadata
+
+
+def _reject_windows_reparse_ancestors(path: Path) -> None:
+    absolute = Path(os.path.abspath(path))
+    for candidate in tuple(reversed(absolute.parents)) + (absolute,):
+        try:
+            metadata = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        if is_windows_reparse_point(metadata):
+            raise RuntimeError(f"Task capsule path crosses a Windows reparse point: {candidate}")
 
 
 def _safe_regular_metadata(path: Path) -> os.stat_result:
@@ -1098,7 +1245,7 @@ def _safe_regular_metadata(path: Path) -> os.stat_result:
 
 def _require_safe_regular_metadata(metadata: os.stat_result) -> None:
     if (
-        stat.S_ISLNK(metadata.st_mode)
+        is_link_or_reparse_point(metadata)
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
     ):
@@ -1121,6 +1268,7 @@ def _artifact_fingerprint(name: str, metadata: os.stat_result) -> tuple[object, 
         metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
+        getattr(metadata, "st_file_attributes", 0),
     )
 
 

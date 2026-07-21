@@ -687,7 +687,8 @@ def test_memory_validation_key_authenticates_receipt_after_runtime_restart(
         receipt,
         require_subject_binding=True,
     )
-    assert (memory_dir / ".validation-integrity.key").stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert (memory_dir / ".validation-integrity.key").stat().st_mode & 0o777 == 0o600
 
 
 def test_memory_validation_key_concurrent_first_open_is_single_identity(

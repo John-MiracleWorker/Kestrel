@@ -10,7 +10,6 @@ import re
 import shutil
 import socket
 import stat
-import tempfile
 import threading
 import time
 import weakref
@@ -20,9 +19,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 from urllib.parse import urlparse
+from urllib.request import url2pathname
 
+from .platform_primitives import is_link_or_reparse_point, is_windows_reparse_point
+from .private_directory import (
+    PrivateDirectoryError,
+    create_owner_private_directory,
+    create_owner_private_temporary_directory,
+    harden_empty_owner_private_directory,
+    validate_owner_private_directory,
+)
 from .runtime_models import ToolCall, ToolExecution, ToolSpec
 from .secret_broker import is_secret_ref
 from .security_boundary import (
@@ -889,8 +897,11 @@ class MCPManager:
         identity: MCPLaunchIdentity,
     ) -> dict[str, object]:
         snapshot_base = self._snapshot_root()
-        snapshot_base.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(snapshot_base, 0o700)
+        _ensure_private_snapshot_directory(
+            snapshot_base,
+            allow_harden_empty=True,
+            harden_existing_posix=True,
+        )
         snapshot_dir = snapshot_base / identity.digest.removeprefix("sha256:")
         trusted_plugin_root = self._trusted_plugin_artifact_root(server)
         artifact_source = Path(identity.artifact_locator)
@@ -907,7 +918,7 @@ class MCPManager:
                 expected_digest=identity.artifact_tree_sha256,
             )
             snapshot_artifact = snapshot_dir / relative_artifact
-            snapshot_digest = _hash_launch_tree(snapshot_dir)
+            snapshot_digest = _hash_private_launch_tree(snapshot_dir)
             snapshot_kind = "plugin_tree"
         else:
             snapshot_artifact = snapshot_dir / artifact_source.name
@@ -918,7 +929,7 @@ class MCPManager:
                 expected_digest=identity.artifact_sha256,
                 executable=executable,
             )
-            snapshot_digest = _hash_launch_file(
+            snapshot_digest = _hash_private_launch_file(
                 snapshot_artifact,
                 label="private launch snapshot",
             )
@@ -1325,8 +1336,12 @@ def _verified_snapshot_launch(
             "MCP private snapshot is not bound to the approved source identity.",
         )
     try:
-        root = Path(str(raw_snapshot["root"])).resolve(strict=True)
-        artifact = Path(str(raw_snapshot["artifact_path"])).resolve(strict=True)
+        raw_root = Path(str(raw_snapshot["root"]))
+        raw_artifact = Path(str(raw_snapshot["artifact_path"]))
+        _reject_windows_reparse_ancestors(raw_root, label="private snapshot")
+        _reject_windows_reparse_ancestors(raw_artifact, label="private snapshot artifact")
+        root = raw_root.resolve(strict=True)
+        artifact = raw_artifact.resolve(strict=True)
         executable = Path(str(raw_snapshot["executable_path"])).absolute()
         executable_resolved = executable.resolve(strict=True)
         expected_executable_resolved = Path(str(raw_snapshot["executable_resolved_path"])).resolve(
@@ -1338,12 +1353,26 @@ def _verified_snapshot_launch(
             "MCP private launch snapshot is unavailable.",
         ) from exc
     if snapshot_root is not None:
-        allowed_root = snapshot_root.resolve()
+        try:
+            _reject_windows_reparse_ancestors(
+                snapshot_root,
+                label="private snapshot base",
+            )
+            allowed_root = snapshot_root.resolve(strict=True)
+        except OSError as exc:
+            raise MCPLaunchIdentityError(
+                "snapshot_unavailable",
+                "MCP private snapshot base is unavailable.",
+            ) from exc
+        _assert_private_snapshot_permissions(allowed_root)
         if not _path_within(root, allowed_root):
             raise MCPLaunchIdentityError(
                 "snapshot_outside_private_root",
                 "MCP private launch snapshot is outside its protected root.",
             )
+    else:
+        allowed_root = root.parent
+        _assert_private_snapshot_permissions(allowed_root)
     if not _path_within(artifact, root):
         raise MCPLaunchIdentityError(
             "snapshot_artifact_outside_root",
@@ -1354,13 +1383,13 @@ def _verified_snapshot_launch(
             "executable_path_mismatch",
             "MCP launch executable resolves to a different approved path.",
         )
-    _assert_private_snapshot_permissions(root)
+    _assert_private_snapshot_permissions(root, recursive=True)
     kind = str(raw_snapshot.get("kind") or "")
     expected_snapshot_digest = str(raw_snapshot.get("snapshot_digest") or "")
     if kind == "plugin_tree":
-        actual_snapshot_digest = _hash_launch_tree(root)
+        actual_snapshot_digest = _hash_private_launch_tree(root)
     elif kind in {"script", "executable"}:
-        actual_snapshot_digest = _hash_launch_file(
+        actual_snapshot_digest = _hash_private_launch_file(
             artifact,
             label="private launch snapshot",
         )
@@ -1419,6 +1448,11 @@ def _verified_snapshot_launch(
             json.dumps(plan_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
     )
+    # Keep the access-control boundary launch-adjacent as well as hash-adjacent.
+    # A weak parent can rename a protected child, while a weak nested directory
+    # can expose files despite a protected snapshot root on Windows.
+    _assert_private_snapshot_permissions(allowed_root)
+    _assert_private_snapshot_permissions(root, recursive=True)
     return MCPVerifiedLaunchPlan(
         executable_path=str(executable),
         launch_args=launch_args,
@@ -2232,6 +2266,7 @@ def _resolve_executable(command: str) -> tuple[Path, Path]:
         if not launch_path.is_absolute():
             launch_path = Path.cwd() / launch_path
         launch_path = launch_path.absolute()
+        _reject_windows_reparse_ancestors(launch_path, label="executable")
         resolved = launch_path.resolve(strict=True)
     except OSError as exc:
         raise MCPLaunchIdentityError(
@@ -2252,18 +2287,11 @@ def _resolve_launch_artifact(raw_path: str, *, label: str) -> Path:
             "artifact_not_found",
             f"MCP stdio {label} path is invalid.",
         )
-    parsed = urlparse(raw_path)
-    if parsed.scheme and parsed.scheme != "file":
-        raise MCPLaunchIdentityError(
-            "remote_artifact",
-            f"MCP stdio {label} must be a local file.",
-        )
+    local_path = _local_launch_artifact_path(raw_path, label=label)
     try:
-        resolved = (
-            Path(parsed.path if parsed.scheme == "file" else raw_path)
-            .expanduser()
-            .resolve(strict=True)
-        )
+        candidate = Path(local_path).expanduser()
+        _reject_windows_reparse_ancestors(candidate, label=label)
+        resolved = candidate.resolve(strict=True)
     except OSError as exc:
         raise MCPLaunchIdentityError(
             "artifact_not_found",
@@ -2277,15 +2305,34 @@ def _resolve_launch_artifact(raw_path: str, *, label: str) -> Path:
     return resolved
 
 
+def _local_launch_artifact_path(raw_path: str, *, label: str) -> str:
+    """Return one local path without treating a Windows drive as a URL scheme."""
+
+    if re.match(r"^[A-Za-z]:[\\/]", raw_path):
+        return raw_path
+    parsed = urlparse(raw_path)
+    if not parsed.scheme:
+        return raw_path
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        raise MCPLaunchIdentityError(
+            "remote_artifact",
+            f"MCP stdio {label} must be a local file.",
+        )
+    return url2pathname(parsed.path)
+
+
 def _resolve_launch_tree(raw_path: str) -> Path:
     try:
-        resolved = Path(raw_path).expanduser().resolve(strict=True)
+        candidate = Path(raw_path).expanduser()
+        _reject_windows_reparse_ancestors(candidate, label="plugin source tree")
+        resolved = candidate.resolve(strict=True)
     except OSError as exc:
         raise MCPLaunchIdentityError(
             "plugin_tree_not_found",
             "MCP plugin source tree could not be resolved.",
         ) from exc
-    if not resolved.is_dir():
+    metadata = resolved.lstat()
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
         raise MCPLaunchIdentityError(
             "plugin_tree_not_directory",
             "MCP plugin source tree must be a directory.",
@@ -2293,41 +2340,113 @@ def _resolve_launch_tree(raw_path: str) -> Path:
     return resolved
 
 
+def _require_real_launch_directory(path: Path) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise MCPLaunchIdentityError(
+            "plugin_tree_unreadable",
+            "MCP launch directory could not be read safely.",
+        ) from exc
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise MCPLaunchIdentityError(
+            "plugin_tree_symlink",
+            "MCP launch directories cannot be links or reparse points.",
+        )
+    return metadata
+
+
+def _reject_windows_reparse_ancestors(path: Path, *, label: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    for candidate in tuple(reversed(absolute.parents)) + (absolute,):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if is_windows_reparse_point(metadata):
+            raise MCPLaunchIdentityError(
+                "artifact_reparse_point",
+                f"MCP stdio {label} crosses a Windows reparse point.",
+            )
+
+
+def _remove_private_snapshot_tree(root: Path) -> None:
+    _assert_private_snapshot_permissions(root)
+    expected = _require_real_launch_directory(root)
+    try:
+        with os.scandir(root) as scanned:
+            names = sorted(entry.name for entry in scanned)
+    except OSError as exc:
+        raise MCPLaunchIdentityError(
+            "snapshot_cleanup_failed",
+            "MCP private snapshot cleanup could not inspect its temporary tree.",
+        ) from exc
+    for name in names:
+        path = root / name
+        metadata = path.lstat()
+        if is_link_or_reparse_point(metadata):
+            raise MCPLaunchIdentityError(
+                "snapshot_cleanup_failed",
+                "MCP private snapshot cleanup refused a linked temporary entry.",
+            )
+        if stat.S_ISDIR(metadata.st_mode):
+            _remove_private_snapshot_tree(path)
+        elif stat.S_ISREG(metadata.st_mode):
+            path.unlink()
+        else:
+            raise MCPLaunchIdentityError(
+                "snapshot_cleanup_failed",
+                "MCP private snapshot cleanup refused a special temporary entry.",
+            )
+    visible = _require_real_launch_directory(root)
+    if not os.path.samestat(expected, visible):
+        raise MCPLaunchIdentityError(
+            "snapshot_cleanup_failed",
+            "MCP private snapshot root changed during cleanup.",
+        )
+    root.rmdir()
+
+
 def _launch_tree_files(root: Path) -> list[tuple[str, Path]]:
     files: list[tuple[str, Path]] = []
     total_bytes = 0
-    for current_root, directory_names, file_names in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-    ):
-        current = Path(current_root)
-        kept_directories: list[str] = []
-        for name in sorted(directory_names):
-            candidate = current / name
+
+    def visit(current: Path) -> None:
+        nonlocal total_bytes
+        before = _require_real_launch_directory(current)
+        try:
+            with os.scandir(current) as scanned:
+                names = sorted(entry.name for entry in scanned)
+        except OSError as exc:
+            raise MCPLaunchIdentityError(
+                "plugin_tree_unreadable",
+                "MCP plugin source tree could not be read safely.",
+            ) from exc
+        after = _require_real_launch_directory(current)
+        if not os.path.samestat(before, after):
+            raise MCPLaunchIdentityError(
+                "plugin_tree_changed",
+                "MCP plugin source tree changed while it was being inspected.",
+            )
+        for name in names:
             if name == ".git":
                 continue
-            if candidate.is_symlink():
-                raise MCPLaunchIdentityError(
-                    "plugin_tree_symlink",
-                    "MCP plugin source trees cannot contain symbolic links.",
-                )
-            kept_directories.append(name)
-        directory_names[:] = kept_directories
-        for name in sorted(file_names):
             candidate = current / name
-            if candidate.is_symlink():
-                raise MCPLaunchIdentityError(
-                    "plugin_tree_symlink",
-                    "MCP plugin source trees cannot contain symbolic links.",
-                )
             try:
-                metadata = candidate.stat()
+                metadata = candidate.lstat()
             except OSError as exc:
                 raise MCPLaunchIdentityError(
                     "plugin_tree_unreadable",
                     "MCP plugin source tree could not be read safely.",
                 ) from exc
+            if is_link_or_reparse_point(metadata):
+                raise MCPLaunchIdentityError(
+                    "plugin_tree_symlink",
+                    "MCP plugin source trees cannot contain links or reparse points.",
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                visit(candidate)
+                continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise MCPLaunchIdentityError(
                     "plugin_tree_special_file",
@@ -2340,6 +2459,8 @@ def _launch_tree_files(root: Path) -> list[tuple[str, Path]]:
                     "MCP plugin source tree exceeds the private snapshot limit.",
                 )
             files.append((candidate.relative_to(root).as_posix(), candidate))
+
+    visit(root)
     return sorted(files)
 
 
@@ -2353,28 +2474,132 @@ def _hash_launch_tree(root: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _hash_private_launch_tree(root: Path) -> str:
+    _assert_private_snapshot_permissions(root, recursive=True)
+    digest = _hash_launch_tree(root)
+    _assert_private_snapshot_permissions(root, recursive=True)
+    return digest
+
+
+def _hash_private_launch_file(path: Path, *, label: str) -> str:
+    _assert_private_snapshot_permissions(path.parent, recursive=True)
+    digest = _hash_launch_file(path, label=label)
+    _assert_private_snapshot_permissions(path.parent, recursive=True)
+    return digest
+
+
+def _ensure_private_snapshot_directory(
+    path: Path,
+    *,
+    allow_harden_empty: bool,
+    harden_existing_posix: bool,
+) -> None:
+    _reject_windows_reparse_ancestors(path, label="private snapshot")
+    if _uses_windows_snapshot_acls():
+        try:
+            create_owner_private_directory(path)
+        except FileExistsError:
+            try:
+                validate_owner_private_directory(path)
+            except PrivateDirectoryError as validation_error:
+                if not allow_harden_empty:
+                    _raise_private_snapshot_boundary_error(validation_error)
+                try:
+                    harden_empty_owner_private_directory(path)
+                except PrivateDirectoryError as harden_error:
+                    _raise_private_snapshot_boundary_error(harden_error)
+        except PrivateDirectoryError as exc:
+            _raise_private_snapshot_boundary_error(exc)
+        _assert_private_snapshot_permissions(path)
+        return
+
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise MCPLaunchIdentityError(
+            "snapshot_unavailable",
+            "MCP private snapshot directory could not be created safely.",
+        ) from exc
+    if harden_existing_posix:
+        try:
+            os.chmod(path, 0o700)
+        except OSError as exc:
+            raise MCPLaunchIdentityError(
+                "snapshot_permissions",
+                "MCP private snapshot permissions could not be hardened.",
+            ) from exc
+    _assert_private_snapshot_permissions(path)
+
+
+def _ensure_private_snapshot_subdirectory(root: Path, destination: Path) -> None:
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as exc:
+        raise MCPLaunchIdentityError(
+            "snapshot_outside_private_root",
+            "MCP private snapshot directory escaped its protected root.",
+        ) from exc
+    current = root
+    for component in relative.parts:
+        current /= component
+        _ensure_private_snapshot_directory(
+            current,
+            allow_harden_empty=False,
+            harden_existing_posix=False,
+        )
+
+
+def _raise_private_snapshot_boundary_error(
+    exc: PrivateDirectoryError,
+) -> NoReturn:
+    message = str(exc)
+    code = (
+        "snapshot_unavailable"
+        if any(
+            marker in message
+            for marker in ("unavailable", "not_real", "identity_changed")
+        )
+        else "snapshot_permissions"
+    )
+    raise MCPLaunchIdentityError(
+        code,
+        "MCP private snapshot does not have a verified owner-private "
+        "access-control boundary.",
+    ) from exc
+
+
 def _ensure_private_tree_snapshot(
     source_root: Path,
     destination: Path,
     *,
     expected_digest: str,
 ) -> None:
-    if destination.exists():
-        if _hash_launch_tree(destination) != expected_digest:
+    if os.path.lexists(destination):
+        if _hash_private_launch_tree(destination) != expected_digest:
             raise MCPLaunchIdentityError(
                 "snapshot_integrity_mismatch",
                 "Existing MCP private snapshot failed integrity validation.",
             )
-        _assert_private_snapshot_permissions(destination)
         return
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = Path(
-        tempfile.mkdtemp(
-            prefix=".mcp-snapshot-",
-            dir=destination.parent,
-        )
+    _reject_windows_reparse_ancestors(destination.parent, label="private snapshot root")
+    _ensure_private_snapshot_directory(
+        destination.parent,
+        allow_harden_empty=True,
+        harden_existing_posix=False,
     )
-    os.chmod(temporary, 0o700)
+    try:
+        temporary = create_owner_private_temporary_directory(
+            prefix=".mcp-snapshot-",
+            parent=destination.parent,
+        )
+    except (OSError, PrivateDirectoryError) as exc:
+        raise MCPLaunchIdentityError(
+            "snapshot_permissions",
+            "MCP private snapshot temporary directory could not be secured.",
+        ) from exc
+    _assert_private_snapshot_permissions(temporary)
     try:
         source_before = _hash_launch_tree(source_root)
         if source_before != expected_digest:
@@ -2384,15 +2609,14 @@ def _ensure_private_tree_snapshot(
             )
         for relative, source in _launch_tree_files(source_root):
             target = temporary / relative
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(target.parent, 0o700)
+            _ensure_private_snapshot_subdirectory(temporary, target.parent)
             _copy_private_launch_file(source, target, executable=False)
         if _hash_launch_tree(source_root) != expected_digest:
             raise MCPLaunchIdentityError(
                 "source_changed_during_snapshot",
                 "MCP plugin source changed while its private snapshot was created.",
             )
-        if _hash_launch_tree(temporary) != expected_digest:
+        if _hash_private_launch_tree(temporary) != expected_digest:
             raise MCPLaunchIdentityError(
                 "snapshot_integrity_mismatch",
                 "MCP private snapshot failed integrity validation.",
@@ -2400,15 +2624,15 @@ def _ensure_private_tree_snapshot(
         try:
             temporary.rename(destination)
         except FileExistsError:
-            if _hash_launch_tree(destination) != expected_digest:
+            if _hash_private_launch_tree(destination) != expected_digest:
                 raise MCPLaunchIdentityError(
                     "snapshot_integrity_mismatch",
                     "Concurrent MCP private snapshot failed integrity validation.",
                 ) from None
     finally:
-        if temporary.exists():
-            shutil.rmtree(temporary)
-    _assert_private_snapshot_permissions(destination)
+        if os.path.lexists(temporary):
+            _remove_private_snapshot_tree(temporary)
+    _assert_private_snapshot_permissions(destination, recursive=True)
 
 
 def _ensure_private_file_snapshot(
@@ -2418,16 +2642,31 @@ def _ensure_private_file_snapshot(
     expected_digest: str,
     executable: bool,
 ) -> None:
-    if destination.exists():
-        if _hash_launch_file(destination, label="private launch snapshot") != expected_digest:
+    if os.path.lexists(destination):
+        destination_metadata = destination.lstat()
+        if is_link_or_reparse_point(destination_metadata):
+            raise MCPLaunchIdentityError(
+                "snapshot_unavailable",
+                "MCP private launch snapshot is unavailable.",
+            )
+        if (
+            _hash_private_launch_file(
+                destination,
+                label="private launch snapshot",
+            )
+            != expected_digest
+        ):
             raise MCPLaunchIdentityError(
                 "snapshot_integrity_mismatch",
                 "Existing MCP private snapshot failed integrity validation.",
             )
-        _assert_private_snapshot_permissions(destination.parent)
         return
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(destination.parent, 0o700)
+    _reject_windows_reparse_ancestors(destination.parent, label="private snapshot root")
+    _ensure_private_snapshot_directory(
+        destination.parent,
+        allow_harden_empty=True,
+        harden_existing_posix=False,
+    )
     temporary = (
         destination.parent / f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
@@ -2443,7 +2682,13 @@ def _ensure_private_file_snapshot(
                 "source_changed_during_snapshot",
                 "MCP launch artifact changed while its private snapshot was created.",
             )
-        if _hash_launch_file(temporary, label="private launch snapshot") != expected_digest:
+        if (
+            _hash_private_launch_file(
+                temporary,
+                label="private launch snapshot",
+            )
+            != expected_digest
+        ):
             raise MCPLaunchIdentityError(
                 "snapshot_integrity_mismatch",
                 "MCP private snapshot failed integrity validation.",
@@ -2456,9 +2701,15 @@ def _ensure_private_file_snapshot(
                 "MCP private snapshot could not be published safely.",
             ) from exc
     finally:
-        if temporary.exists():
+        if os.path.lexists(temporary):
+            temporary_metadata = temporary.lstat()
+            if is_link_or_reparse_point(temporary_metadata):
+                raise MCPLaunchIdentityError(
+                    "snapshot_cleanup_failed",
+                    "MCP private snapshot cleanup refused a linked temporary path.",
+                )
             temporary.unlink()
-    _assert_private_snapshot_permissions(destination.parent)
+    _assert_private_snapshot_permissions(destination.parent, recursive=True)
 
 
 def _copy_private_launch_file(
@@ -2467,6 +2718,13 @@ def _copy_private_launch_file(
     *,
     executable: bool,
 ) -> None:
+    source_before = source.lstat()
+    if is_link_or_reparse_point(source_before) or not stat.S_ISREG(source_before.st_mode):
+        raise MCPLaunchIdentityError(
+            "artifact_not_regular",
+            "MCP launch artifact must be a regular non-linked file.",
+        )
+    _assert_private_snapshot_permissions(destination.parent)
     read_flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         read_flags |= os.O_CLOEXEC
@@ -2489,21 +2747,107 @@ def _copy_private_launch_file(
             os.close(destination_fd)
     finally:
         os.close(source_fd)
+    source_after = source.lstat()
+    destination_after = destination.lstat()
+    if (
+        is_link_or_reparse_point(source_after)
+        or is_link_or_reparse_point(destination_after)
+        or not os.path.samestat(source_before, source_after)
+        or not stat.S_ISREG(destination_after.st_mode)
+    ):
+        raise MCPLaunchIdentityError(
+            "artifact_changed_during_snapshot",
+            "MCP launch artifact changed while its private snapshot was created.",
+        )
 
 
-def _assert_private_snapshot_permissions(root: Path) -> None:
+def _assert_private_snapshot_permissions(
+    root: Path,
+    *,
+    recursive: bool = False,
+) -> None:
+    _assert_private_snapshot_directory(root)
+    if not recursive:
+        return
+
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        before = _snapshot_directory_metadata(current)
+        try:
+            with os.scandir(current) as entries:
+                children = sorted(
+                    (current / entry.name for entry in entries),
+                    key=lambda path: path.name,
+                )
+        except OSError as exc:
+            raise MCPLaunchIdentityError(
+                "snapshot_unavailable",
+                "MCP private snapshot permissions could not be inspected.",
+            ) from exc
+        after = _snapshot_directory_metadata(current)
+        if not os.path.samestat(before, after):
+            raise MCPLaunchIdentityError(
+                "snapshot_unavailable",
+                "MCP private snapshot changed during permission validation.",
+            )
+        for child in children:
+            try:
+                metadata = child.lstat()
+            except OSError as exc:
+                raise MCPLaunchIdentityError(
+                    "snapshot_unavailable",
+                    "MCP private snapshot changed during permission validation.",
+                ) from exc
+            if is_link_or_reparse_point(metadata):
+                raise MCPLaunchIdentityError(
+                    "snapshot_unavailable",
+                    "MCP private snapshot contains a link or reparse point.",
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                _assert_private_snapshot_directory(child)
+                pending.append(child)
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise MCPLaunchIdentityError(
+                    "snapshot_unavailable",
+                    "MCP private snapshot contains a non-regular entry.",
+                )
+
+
+def _assert_private_snapshot_directory(root: Path) -> None:
+    _reject_windows_reparse_ancestors(root, label="private snapshot")
+    metadata = _snapshot_directory_metadata(root)
+    if _uses_windows_snapshot_acls():
+        try:
+            validate_owner_private_directory(root)
+        except PrivateDirectoryError as exc:
+            _raise_private_snapshot_boundary_error(exc)
+        return
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise MCPLaunchIdentityError(
+            "snapshot_permissions",
+            "MCP private snapshot permissions are not owner-only.",
+        )
+
+
+def _snapshot_directory_metadata(root: Path) -> os.stat_result:
     try:
-        mode = stat.S_IMODE(root.stat().st_mode)
+        metadata = root.lstat()
     except OSError as exc:
         raise MCPLaunchIdentityError(
             "snapshot_unavailable",
             "MCP private snapshot is unavailable.",
         ) from exc
-    if mode & 0o077:
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
         raise MCPLaunchIdentityError(
-            "snapshot_permissions",
-            "MCP private snapshot permissions are not owner-only.",
+            "snapshot_unavailable",
+            "MCP private snapshot is unavailable.",
         )
+    return metadata
+
+
+def _uses_windows_snapshot_acls() -> bool:
+    return os.name == "nt"
 
 
 def _launch_artifact_index(artifact_kind: str) -> int:
@@ -2511,6 +2855,12 @@ def _launch_artifact_index(artifact_kind: str) -> int:
 
 
 def _launch_file_has_shebang(path: Path) -> bool:
+    path_before = path.lstat()
+    if is_link_or_reparse_point(path_before) or not stat.S_ISREG(path_before.st_mode):
+        raise MCPLaunchIdentityError(
+            "artifact_not_regular",
+            "MCP stdio executable must be a regular non-linked file.",
+        )
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -2547,12 +2897,32 @@ def _launch_file_has_shebang(path: Path) -> bool:
                 "artifact_changed_during_validation",
                 "MCP stdio executable changed while it was being validated.",
             )
+        path_after = path.lstat()
+        if is_link_or_reparse_point(path_after) or not os.path.samestat(
+            path_before, path_after
+        ):
+            raise MCPLaunchIdentityError(
+                "artifact_changed_during_validation",
+                "MCP stdio executable changed while it was being validated.",
+            )
         return prefix == b"#!"
     finally:
         os.close(descriptor)
 
 
 def _hash_launch_file(path: Path, *, label: str) -> str:
+    try:
+        path_before = path.lstat()
+    except OSError as exc:
+        raise MCPLaunchIdentityError(
+            "artifact_unreadable",
+            f"MCP stdio {label} could not be opened safely.",
+        ) from exc
+    if is_link_or_reparse_point(path_before) or not stat.S_ISREG(path_before.st_mode):
+        raise MCPLaunchIdentityError(
+            "artifact_not_regular",
+            f"MCP stdio {label} must be a regular non-linked file.",
+        )
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -2586,6 +2956,14 @@ def _hash_launch_file(path: Path, *, label: str) -> str:
             after.st_ino,
             after.st_size,
             after.st_mtime_ns,
+        ):
+            raise MCPLaunchIdentityError(
+                "artifact_changed_during_validation",
+                f"MCP stdio {label} changed while it was being validated.",
+            )
+        path_after = path.lstat()
+        if is_link_or_reparse_point(path_after) or not os.path.samestat(
+            path_before, path_after
         ):
             raise MCPLaunchIdentityError(
                 "artifact_changed_during_validation",

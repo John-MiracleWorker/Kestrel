@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import socket
 import tempfile
+from ctypes import wintypes
 from pathlib import Path
 
 import pytest
@@ -72,6 +74,26 @@ def test_extension_scopes_default_deny_and_canonicalize() -> None:
         (
             {"filesystem": [{"root": "workspace", "path": "inputs/.NEST/data", "access": "read"}]},
             "filesystem_scope_control_tree_rejected",
+        ),
+        (
+            {"filesystem": [{"root": "workspace", "path": ".git.", "access": "read"}]},
+            "filesystem_scope_path_not_portable",
+        ),
+        (
+            {"filesystem": [{"root": "workspace", "path": ".nest ", "access": "read"}]},
+            "filesystem_scope_path_not_portable",
+        ),
+        (
+            {"filesystem": [{"root": "workspace", "path": "input:data", "access": "read"}]},
+            "filesystem_scope_path_not_portable",
+        ),
+        (
+            {"filesystem": [{"root": "workspace", "path": "NUL.txt", "access": "read"}]},
+            "filesystem_scope_path_not_portable",
+        ),
+        (
+            {"filesystem": [{"root": "workspace", "path": "report?.txt", "access": "read"}]},
+            "filesystem_scope_path_not_portable",
         ),
         (
             {"filesystem": [{"root": "workspace", "path": "outputs", "access": "write"}]},
@@ -144,6 +166,60 @@ def test_filesystem_scope_rejects_final_and_intermediate_symlink_components(
         )
         with pytest.raises(ExtensionPolicyError, match="symlink_rejected"):
             resolve_filesystem_scopes(scopes, workspace)
+
+
+def test_windows_canonical_resolution_rechecks_control_tree_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    control = workspace / ".git"
+    control.mkdir(parents=True)
+    monkeypatch.setattr(
+        extension_policy,
+        "_uses_windows_path_fallback",
+        lambda: True,
+    )
+
+    with pytest.raises(ExtensionPolicyError, match="control_tree_rejected"):
+        extension_policy._canonical_scope_relative(  # noqa: SLF001
+            workspace,
+            control,
+            declared_path="GIT~1",
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 alias semantics required")
+def test_windows_short_name_alias_cannot_grant_control_tree(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    control = workspace / ".git"
+    control.mkdir(parents=True)
+    loader = getattr(ctypes, "WinDLL", None)
+    if not callable(loader):
+        pytest.skip("WinAPI loader is unavailable")
+    kernel32 = loader("kernel32", use_last_error=True)
+    get_short_path = kernel32.GetShortPathNameW
+    get_short_path.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    get_short_path.restype = wintypes.DWORD
+    required = int(get_short_path(str(control), None, 0))
+    if required <= 1:
+        pytest.skip("8.3 aliases are disabled on this volume")
+    buffer = ctypes.create_unicode_buffer(required)
+    if not get_short_path(str(control), buffer, required):
+        pytest.skip("8.3 alias lookup failed")
+    alias = Path(buffer.value).name
+    if alias.casefold() == control.name.casefold():
+        pytest.skip("the control directory has no distinct 8.3 alias")
+    scopes = parse_extension_scopes(
+        {"filesystem": [{"path": alias, "access": "read"}]}
+    )
+
+    with pytest.raises(ExtensionPolicyError, match="control_tree_rejected"):
+        resolve_filesystem_scopes(scopes, workspace)
 
 
 def test_extension_tree_digest_binds_files_and_snapshot_rejects_symlinks(tmp_path: Path) -> None:
@@ -329,3 +405,90 @@ def test_extension_tree_rejects_hardlinks_and_bounds_empty_directories(
     monkeypatch.setattr(extension_policy, "MAX_EXTENSION_ENTRIES", 2)
     with pytest.raises(ExtensionPolicyError, match="entry_limit_exceeded"):
         extension_tree_digest(source)
+
+
+def test_windows_path_fallback_copies_extension_and_read_scope_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        extension_policy,
+        "_uses_windows_path_fallback",
+        lambda: True,
+    )
+    source = tmp_path / "skill"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    (source / "SKILL.md").write_text("Run safely.\n", encoding="utf-8")
+    (nested / "tool.py").write_text("print('safe')\n", encoding="utf-8")
+
+    expected_digest = extension_tree_digest(source)
+    snapshot = tmp_path / "skill-snapshot"
+    assert copy_extension_snapshot(source, snapshot) == expected_digest
+    assert (snapshot / "nested" / "tool.py").read_text(encoding="utf-8") == (
+        "print('safe')\n"
+    )
+
+    workspace = tmp_path / "workspace"
+    inputs = workspace / "inputs" / "nested"
+    inputs.mkdir(parents=True)
+    (inputs / "payload.txt").write_text("bounded\n", encoding="utf-8")
+    scopes = parse_extension_scopes(
+        {"filesystem": [{"path": "inputs", "access": "read"}]}
+    )
+    copied = copy_readonly_filesystem_scope_snapshots(
+        resolve_filesystem_scopes(scopes, workspace),
+        tmp_path / "scope-snapshots",
+        workspace=workspace,
+    )
+
+    assert copied[0].source.joinpath("nested", "payload.txt").read_text(
+        encoding="utf-8"
+    ) == "bounded\n"
+
+
+def test_windows_path_fallback_rejects_ambiguous_nested_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        extension_policy,
+        "_uses_windows_path_fallback",
+        lambda: True,
+    )
+    source = tmp_path / "skill"
+    source.mkdir()
+    (source / ".git.").mkdir()
+
+    with pytest.raises(ExtensionPolicyError, match="tree_path_not_portable"):
+        extension_tree_digest(source)
+
+    workspace = tmp_path / "workspace"
+    inputs = workspace / "inputs"
+    inputs.mkdir(parents=True)
+    (inputs / ".nest ").mkdir()
+    scopes = parse_extension_scopes(
+        {"filesystem": [{"path": "inputs", "access": "read"}]}
+    )
+    resolved = resolve_filesystem_scopes(scopes, workspace)
+
+    with pytest.raises(ExtensionPolicyError, match="scope_path_not_portable"):
+        copy_readonly_filesystem_scope_snapshots(
+            resolved,
+            tmp_path / "scope-snapshots-ambiguous",
+            workspace=workspace,
+        )
+
+
+def test_windows_snapshot_mode_helper_keeps_temp_files_cleanup_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_file = tmp_path / "snapshot.txt"
+    snapshot_file.write_text("temporary\n", encoding="utf-8")
+    before = snapshot_file.stat().st_mode
+    monkeypatch.setattr(extension_policy.os, "name", "nt")
+
+    extension_policy._chmod_snapshot_path(snapshot_file, 0o400)
+
+    assert snapshot_file.stat().st_mode == before

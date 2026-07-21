@@ -2663,6 +2663,13 @@ def _init_git_repo(path: Path) -> str:
         capture_output=True,
         text=True,
     )
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     (path / "README.md").write_text("seed\n")
     # Git-focused tests keep the memory backend inside the synthetic workspace.
     # Model the runtime-artifact ignores expected in an actual Kestrel workspace

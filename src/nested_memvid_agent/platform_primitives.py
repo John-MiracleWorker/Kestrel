@@ -2,8 +2,29 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 from collections.abc import Callable
 from typing import cast
+
+_WINDOWS_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+
+
+def is_windows_reparse_point(metadata: os.stat_result) -> bool:
+    """Return whether ``lstat`` metadata identifies a Windows reparse point."""
+
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(attributes & _WINDOWS_REPARSE_POINT)
+
+
+def is_link_or_reparse_point(metadata: os.stat_result) -> bool:
+    """Detect POSIX links and Windows reparse points from ``lstat`` metadata.
+
+    Python 3.11 has no portable ``Path.is_junction`` API. Windows exposes the
+    required junction/reparse bit on ``st_file_attributes``; POSIX metadata has
+    no such field and therefore keeps its existing symlink-only behavior.
+    """
+
+    return stat.S_ISLNK(metadata.st_mode) or is_windows_reparse_point(metadata)
 
 
 def chmod_descriptor(descriptor: int, mode: int) -> None:

@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -45,6 +46,21 @@ _REPAIR_INTEGRITY_SCHEMA_VERSION = 2
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS |= getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+@dataclass(frozen=True)
+class _RepairDirectoryHandle:
+    """A stable private directory reached by descriptor or checked pathname.
+
+    POSIX always uses ``descriptor`` and retains the existing no-follow dirfd
+    traversal.  Windows does not implement Python's dirfd APIs and does not let
+    ``os.open`` open directories, so it retains an lstat identity for every
+    traversed component and revalidates those identities around each operation.
+    """
+
+    path: Path
+    descriptor: int | None
+    path_identities: tuple[tuple[Path, os.stat_result], ...] = ()
 
 
 def require_git_root(workspace: Path) -> Path:
@@ -245,7 +261,8 @@ def write_repair_artifact(
     if len(encoded) > _MAX_ARTIFACT_BYTES:
         raise ValueError(f"Repair artifact exceeds {_MAX_ARTIFACT_BYTES} bytes.")
     with _repair_directory(workspace, collection=collection, create=True) as directory:
-        descriptor = os.open(
+        descriptor = _open_private_file_at(
+            directory,
             f"{artifact_id}.json",
             os.O_WRONLY
             | os.O_CREAT
@@ -253,7 +270,6 @@ def write_repair_artifact(
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
-            dir_fd=directory,
         )
         try:
             with os.fdopen(descriptor, "wb") as handle:
@@ -261,7 +277,7 @@ def write_repair_artifact(
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.fsync(directory)
+            _sync_receipt_key_directory(directory)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -314,7 +330,9 @@ def load_repair_artifact(
     _validate_artifact_component(collection, expected_prefix="repair_")
     _validate_artifact_component(artifact_id, expected_prefix=expected_prefix)
     with _repair_directory(workspace, collection=collection, create=False) as directory:
-        descriptor = os.open(f"{artifact_id}.json", _FILE_FLAGS, dir_fd=directory)
+        descriptor = _open_private_file_at(
+            directory, f"{artifact_id}.json", _FILE_FLAGS
+        )
         try:
             metadata = os.fstat(descriptor)
             _validate_private_file_metadata(metadata, artifact_id)
@@ -345,11 +363,11 @@ def load_repair_artifact(
 @contextmanager
 def repair_action_lock(workspace: Path) -> Iterator[None]:
     with _repair_directory(workspace, create=True) as directory:
-        descriptor = os.open(
+        descriptor = _open_private_file_at(
+            directory,
             "repair-actions.lock",
             os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
             0o600,
-            dir_fd=directory,
         )
         try:
             _validate_private_file_metadata(os.fstat(descriptor), "repair-actions.lock")
@@ -479,20 +497,17 @@ def _rotate_receipt_key(workspace: Path) -> bytes:
                 candidate = secrets.token_bytes(_REPAIR_RECEIPT_KEY_BYTES)
                 identity = _write_receipt_key_temp(directory, candidate)
                 try:
-                    temp_metadata = os.stat(
-                        _REPAIR_RECEIPT_KEY_TEMP_FILE,
-                        dir_fd=directory,
-                        follow_symlinks=False,
+                    temp_metadata = _stat_private_at(
+                        directory, _REPAIR_RECEIPT_KEY_TEMP_FILE
                     )
                     if (temp_metadata.st_dev, temp_metadata.st_ino) != identity:
                         raise ValueError(
                             "Temporary repair receipt signing key identity changed."
                         )
-                    os.replace(
+                    _replace_private_at(
+                        directory,
                         _REPAIR_RECEIPT_KEY_TEMP_FILE,
                         _REPAIR_RECEIPT_KEY_FILE,
-                        src_dir_fd=directory,
-                        dst_dir_fd=directory,
                     )
                     _sync_receipt_key_directory(directory)
                     published = _load_receipt_key_from_directory(directory)
@@ -585,8 +600,10 @@ def _load_receipt_key(workspace: Path) -> bytes:
             return _load_receipt_key_from_directory(directory)
 
 
-def _load_receipt_key_from_directory(directory: int) -> bytes:
-    descriptor = os.open(_REPAIR_RECEIPT_KEY_FILE, _FILE_FLAGS, dir_fd=directory)
+def _load_receipt_key_from_directory(directory: _RepairDirectoryHandle) -> bytes:
+    descriptor = _open_private_file_at(
+        directory, _REPAIR_RECEIPT_KEY_FILE, _FILE_FLAGS
+    )
     try:
         metadata = os.fstat(descriptor)
         _validate_private_file_metadata(metadata, _REPAIR_RECEIPT_KEY_FILE)
@@ -605,8 +622,12 @@ def _load_receipt_key_from_directory(directory: int) -> bytes:
     return key
 
 
-def _write_receipt_key_temp(directory: int, candidate: bytes) -> tuple[int, int]:
-    descriptor = os.open(
+def _write_receipt_key_temp(
+    directory: _RepairDirectoryHandle,
+    candidate: bytes,
+) -> tuple[int, int]:
+    descriptor = _open_private_file_at(
+        directory,
         _REPAIR_RECEIPT_KEY_TEMP_FILE,
         os.O_WRONLY
         | os.O_CREAT
@@ -614,9 +635,9 @@ def _write_receipt_key_temp(directory: int, candidate: bytes) -> tuple[int, int]
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0),
         0o600,
-        dir_fd=directory,
     )
     identity: tuple[int, int] | None = None
+    failed = False
     try:
         metadata = os.fstat(descriptor)
         _validate_private_file_metadata(metadata, _REPAIR_RECEIPT_KEY_TEMP_FILE)
@@ -630,7 +651,19 @@ def _write_receipt_key_temp(directory: int, candidate: bytes) -> tuple[int, int]
             raise ValueError("Temporary repair receipt signing key has an invalid size.")
         return metadata.st_dev, metadata.st_ino
     except BaseException:
-        if identity is not None:
+        failed = True
+        raise
+    finally:
+        try:
+            os.close(descriptor)
+        except BaseException:
+            # A close failure is authoritative only after an otherwise
+            # successful write.  During failure recovery, retain the original
+            # write/sync exception and let the next locked open recover any
+            # identity-validated orphan.
+            if not failed:
+                raise
+        if failed and identity is not None:
             try:
                 _remove_receipt_key_temp(
                     directory,
@@ -642,9 +675,6 @@ def _write_receipt_key_temp(directory: int, candidate: bytes) -> tuple[int, int]
                 # Recovery on the next locked open validates the orphan before
                 # removing it; never mask the original write/sync failure.
                 pass
-        raise
-    finally:
-        os.close(descriptor)
 
 
 def _write_receipt_key_bytes(descriptor: int, candidate: bytes) -> None:
@@ -660,46 +690,42 @@ def _sync_receipt_key_file(descriptor: int) -> None:
     os.fsync(descriptor)
 
 
-def _sync_receipt_key_directory(directory: int) -> None:
-    os.fsync(directory)
+def _sync_receipt_key_directory(directory: _RepairDirectoryHandle) -> None:
+    if directory.descriptor is not None:
+        os.fsync(directory.descriptor)
+    else:
+        # CPython cannot open a Windows directory as a file descriptor.  File
+        # contents are flushed before publication; revalidate the entire
+        # checked path in lieu of a directory fsync unavailable through os.
+        _validate_repair_directory_handle(directory)
 
 
 def _publish_receipt_key_temp(
-    directory: int,
+    directory: _RepairDirectoryHandle,
     *,
     expected_identity: tuple[int, int],
 ) -> None:
-    metadata = os.stat(
-        _REPAIR_RECEIPT_KEY_TEMP_FILE,
-        dir_fd=directory,
-        follow_symlinks=False,
-    )
+    metadata = _stat_private_at(directory, _REPAIR_RECEIPT_KEY_TEMP_FILE)
     _validate_receipt_key_temp_metadata(metadata, expected_links=1)
     if (metadata.st_dev, metadata.st_ino) != expected_identity:
         raise ValueError("Temporary repair receipt signing key identity changed.")
     if metadata.st_size != _REPAIR_RECEIPT_KEY_BYTES:
         raise ValueError("Temporary repair receipt signing key has an invalid size.")
-    os.link(
+    _link_private_at(
+        directory,
         _REPAIR_RECEIPT_KEY_TEMP_FILE,
         _REPAIR_RECEIPT_KEY_FILE,
-        src_dir_fd=directory,
-        dst_dir_fd=directory,
-        follow_symlinks=False,
     )
 
 
 def _remove_receipt_key_temp(
-    directory: int,
+    directory: _RepairDirectoryHandle,
     *,
     expected_identity: tuple[int, int],
     missing_ok: bool = False,
 ) -> None:
     try:
-        metadata = os.stat(
-            _REPAIR_RECEIPT_KEY_TEMP_FILE,
-            dir_fd=directory,
-            follow_symlinks=False,
-        )
+        metadata = _stat_private_at(directory, _REPAIR_RECEIPT_KEY_TEMP_FILE)
     except FileNotFoundError:
         if missing_ok:
             return
@@ -709,24 +735,16 @@ def _remove_receipt_key_temp(
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink not in {1, 2}:
         raise ValueError("Temporary repair receipt signing key has unsafe link metadata.")
     _require_current_owner(metadata, _REPAIR_RECEIPT_KEY_TEMP_FILE)
-    os.unlink(_REPAIR_RECEIPT_KEY_TEMP_FILE, dir_fd=directory)
+    _unlink_private_at(directory, _REPAIR_RECEIPT_KEY_TEMP_FILE)
 
 
-def _recover_receipt_key_temp(directory: int) -> None:
+def _recover_receipt_key_temp(directory: _RepairDirectoryHandle) -> None:
     try:
-        temp_metadata = os.stat(
-            _REPAIR_RECEIPT_KEY_TEMP_FILE,
-            dir_fd=directory,
-            follow_symlinks=False,
-        )
+        temp_metadata = _stat_private_at(directory, _REPAIR_RECEIPT_KEY_TEMP_FILE)
     except FileNotFoundError:
         return
     try:
-        final_metadata = os.stat(
-            _REPAIR_RECEIPT_KEY_FILE,
-            dir_fd=directory,
-            follow_symlinks=False,
-        )
+        final_metadata = _stat_private_at(directory, _REPAIR_RECEIPT_KEY_FILE)
     except FileNotFoundError:
         final_metadata = None
 
@@ -744,7 +762,7 @@ def _recover_receipt_key_temp(directory: int) -> None:
         _validate_receipt_key_temp_metadata(final_metadata, expected_links=2)
         if temp_metadata.st_size != _REPAIR_RECEIPT_KEY_BYTES:
             raise ValueError("Published repair receipt signing key has an invalid size.")
-    os.unlink(_REPAIR_RECEIPT_KEY_TEMP_FILE, dir_fd=directory)
+    _unlink_private_at(directory, _REPAIR_RECEIPT_KEY_TEMP_FILE)
     _sync_receipt_key_directory(directory)
 
 
@@ -765,14 +783,14 @@ def _receipt_key_lock(workspace: Path) -> Iterator[None]:
     """Serialize signing-key publication and reads across threads/processes."""
 
     with _repair_directory(workspace, create=True) as directory:
-        descriptor = os.open(
+        descriptor = _open_private_file_at(
+            directory,
             _REPAIR_RECEIPT_KEY_LOCK_FILE,
             os.O_RDWR
             | os.O_CREAT
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
-            dir_fd=directory,
         )
         try:
             _validate_private_file_metadata(
@@ -799,10 +817,37 @@ def _repair_directory(
     *,
     collection: str | None = None,
     create: bool,
-) -> Iterator[int]:
-    """Open `.nest` and an optional collection with no-follow dirfd traversal."""
+) -> Iterator[_RepairDirectoryHandle]:
+    """Open ``.nest`` through the strongest safe primitive on this platform."""
 
     root = require_git_root(workspace)
+    if _uses_windows_path_fallback():
+        root_metadata = root.lstat()
+        _validate_private_directory_metadata(root_metadata, str(root))
+        root_handle = _RepairDirectoryHandle(
+            path=root,
+            descriptor=None,
+            path_identities=((root, root_metadata),),
+        )
+        nest_handle = _open_private_directory_path(
+            root_handle,
+            _REPAIR_ARTIFACT_ROOT.name,
+            create=create,
+        )
+        selected = nest_handle
+        if collection is not None:
+            selected = _open_private_directory_path(
+                nest_handle,
+                collection,
+                create=create,
+            )
+        try:
+            yield selected
+        finally:
+            _validate_repair_directory_handle(selected)
+        return
+
+    _require_posix_repair_dirfd_support()
     root_descriptor = os.open(root, _DIRECTORY_FLAGS)
     nest_descriptor = -1
     collection_descriptor = -1
@@ -812,21 +857,229 @@ def _repair_directory(
             _REPAIR_ARTIFACT_ROOT.name,
             create=create,
         )
-        selected = nest_descriptor
+        selected_descriptor = nest_descriptor
         if collection is not None:
             collection_descriptor = _open_private_directory_at(
                 nest_descriptor,
                 collection,
                 create=create,
             )
-            selected = collection_descriptor
-        yield selected
+            selected_descriptor = collection_descriptor
+        selected_path = root / _REPAIR_ARTIFACT_ROOT
+        if collection is not None:
+            selected_path /= collection
+        yield _RepairDirectoryHandle(
+            path=selected_path,
+            descriptor=selected_descriptor,
+        )
     finally:
         if collection_descriptor >= 0:
             os.close(collection_descriptor)
         if nest_descriptor >= 0:
             os.close(nest_descriptor)
         os.close(root_descriptor)
+
+
+def _uses_windows_path_fallback() -> bool:
+    return os.name == "nt"
+
+
+def _require_posix_repair_dirfd_support() -> None:
+    required_flags = (
+        _optional_os_flag("O_DIRECTORY"),
+        _optional_os_flag("O_NOFOLLOW"),
+    )
+    if (
+        any(value is None for value in required_flags)
+        or os.open not in os.supports_dir_fd
+        or os.mkdir not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.unlink not in os.supports_dir_fd
+    ):
+        raise RuntimeError("secure_repair_dirfd_platform_unsupported")
+
+
+def _optional_os_flag(name: str) -> int | None:
+    value: object = getattr(os, name, None)
+    return value if isinstance(value, int) and value != 0 else None
+
+
+def _open_private_directory_path(
+    parent: _RepairDirectoryHandle,
+    name: str,
+    *,
+    create: bool,
+) -> _RepairDirectoryHandle:
+    _validate_repair_directory_handle(parent)
+    path = parent.path / name
+    if create:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    metadata = path.lstat()
+    _validate_private_directory_metadata(metadata, name)
+    if os.name != "nt":
+        path.chmod(0o700)
+    handle = _RepairDirectoryHandle(
+        path=path,
+        descriptor=None,
+        path_identities=parent.path_identities + ((path, metadata),),
+    )
+    _validate_repair_directory_handle(handle)
+    return handle
+
+
+def _validate_private_directory_metadata(metadata: os.stat_result, name: str) -> None:
+    if _metadata_is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"Repair artifact component is not a real directory: {name}")
+    _require_current_owner(metadata, name)
+
+
+def _validate_repair_directory_handle(directory: _RepairDirectoryHandle) -> None:
+    if directory.descriptor is not None:
+        return
+    for path, expected in directory.path_identities:
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise ValueError(f"Repair artifact directory changed: {path.name}") from exc
+        _validate_private_directory_metadata(current, path.name or str(path))
+        if not _same_file_identity(expected, current):
+            raise ValueError(f"Repair artifact directory changed: {path.name}")
+
+
+def _open_private_file_at(
+    directory: _RepairDirectoryHandle,
+    name: str,
+    flags: int,
+    mode: int = 0o777,
+) -> int:
+    if directory.descriptor is not None:
+        return os.open(name, flags, mode, dir_fd=directory.descriptor)
+
+    _validate_repair_directory_handle(directory)
+    path = directory.path / name
+    before = _lstat_optional(path)
+    if before is not None and _metadata_is_reparse_point(before):
+        raise ValueError(f"Repair artifact must not be a reparse point: {name}")
+    descriptor = os.open(path, flags | getattr(os, "O_NOINHERIT", 0), mode)
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if _metadata_is_reparse_point(current):
+            raise ValueError(f"Repair artifact must not be a reparse point: {name}")
+        if not _same_file_identity(opened, current):
+            raise ValueError(f"Repair artifact identity changed while opening: {name}")
+        if before is not None and not _same_file_identity(before, opened):
+            raise ValueError(f"Repair artifact identity changed while opening: {name}")
+        _validate_repair_directory_handle(directory)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _stat_private_at(
+    directory: _RepairDirectoryHandle,
+    name: str,
+) -> os.stat_result:
+    if directory.descriptor is not None:
+        return os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+    _validate_repair_directory_handle(directory)
+    metadata = (directory.path / name).lstat()
+    if _metadata_is_reparse_point(metadata):
+        raise ValueError(f"Repair artifact must not be a reparse point: {name}")
+    _validate_repair_directory_handle(directory)
+    return metadata
+
+
+def _replace_private_at(
+    directory: _RepairDirectoryHandle,
+    source: str,
+    destination: str,
+) -> None:
+    if directory.descriptor is not None:
+        os.replace(
+            source,
+            destination,
+            src_dir_fd=directory.descriptor,
+            dst_dir_fd=directory.descriptor,
+        )
+        return
+    source_metadata = _stat_private_at(directory, source)
+    destination_path = directory.path / destination
+    destination_metadata = _lstat_optional(destination_path)
+    if destination_metadata is not None and _metadata_is_reparse_point(
+        destination_metadata
+    ):
+        raise ValueError(
+            f"Repair artifact must not be a reparse point: {destination}"
+        )
+    os.replace(directory.path / source, destination_path)
+    published = _stat_private_at(directory, destination)
+    if not _same_file_identity(source_metadata, published):
+        raise ValueError(f"Repair artifact identity changed while publishing: {destination}")
+
+
+def _link_private_at(
+    directory: _RepairDirectoryHandle,
+    source: str,
+    destination: str,
+) -> None:
+    if directory.descriptor is not None:
+        os.link(
+            source,
+            destination,
+            src_dir_fd=directory.descriptor,
+            dst_dir_fd=directory.descriptor,
+            follow_symlinks=False,
+        )
+        return
+    source_metadata = _stat_private_at(directory, source)
+    destination_path = directory.path / destination
+    if _lstat_optional(destination_path) is not None:
+        raise FileExistsError(destination_path)
+    os.link(directory.path / source, destination_path, follow_symlinks=False)
+    linked = _stat_private_at(directory, destination)
+    current_source = _stat_private_at(directory, source)
+    if not (
+        _same_file_identity(source_metadata, linked)
+        and _same_file_identity(linked, current_source)
+    ):
+        raise ValueError(f"Repair artifact identity changed while publishing: {destination}")
+
+
+def _unlink_private_at(directory: _RepairDirectoryHandle, name: str) -> None:
+    if directory.descriptor is not None:
+        os.unlink(name, dir_fd=directory.descriptor)
+        return
+    _stat_private_at(directory, name)
+    (directory.path / name).unlink()
+    _validate_repair_directory_handle(directory)
+
+
+def _lstat_optional(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _metadata_is_reparse_point(metadata: os.stat_result) -> bool:
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def _same_file_identity(expected: os.stat_result, actual: os.stat_result) -> bool:
+    return (
+        stat.S_IFMT(expected.st_mode) == stat.S_IFMT(actual.st_mode)
+        and expected.st_dev == actual.st_dev
+        and expected.st_ino == actual.st_ino
+    )
 
 
 def _open_private_directory_at(parent_descriptor: int, name: str, *, create: bool) -> int:
@@ -841,9 +1094,7 @@ def _open_private_directory_at(parent_descriptor: int, name: str, *, create: boo
         raise
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError(f"Repair artifact component is not a directory: {name}")
-        _require_current_owner(metadata, name)
+        _validate_private_directory_metadata(metadata, name)
         if os.name != "nt":
             chmod_descriptor(descriptor, 0o700)
         return descriptor

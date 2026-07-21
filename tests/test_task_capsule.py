@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+import nested_memvid_agent.task_capsule as task_capsule_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.file_lock import lock_exclusive, unlock
 from nested_memvid_agent.models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
@@ -17,6 +19,81 @@ from nested_memvid_agent.task_capsule import (
     summarize_run_capsule,
     write_run_capsule,
 )
+
+
+def _windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable on this runner")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_task_capsule_writer_and_retention_reject_junction_run_directory(
+    tmp_path: Path,
+) -> None:
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    junction = runs_dir / "junction-run"
+    _windows_junction(junction, outside)
+
+    try:
+        with pytest.raises(RuntimeError, match="reparse point|real directory"):
+            write_run_capsule(
+                runs_dir=runs_dir,
+                run_id="junction-run",
+                objective="must not traverse junction",
+            )
+        report = enforce_task_capsule_retention(runs_dir=runs_dir, retention_count=1)
+
+        assert [(item.run_id, item.reason) for item in report.skipped] == [
+            ("junction-run", "unsafe_run_directory")
+        ]
+        assert sentinel.read_text(encoding="utf-8") == "untouched"
+        assert tuple(path.name for path in outside.iterdir()) == ("sentinel.txt",)
+    finally:
+        if os.path.lexists(junction):
+            os.rmdir(junction)
+
+
+def test_capsule_move_restores_source_when_post_publish_validation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "sentinel.txt").write_text("exact", encoding="utf-8")
+    destination = tmp_path / "destination"
+    real_validate = task_capsule_module._safe_directory_metadata
+    injected = False
+
+    def fail_once(path: Path) -> os.stat_result:
+        nonlocal injected
+        if path == destination and not injected:
+            injected = True
+            raise task_capsule_module._RetentionSkipError("injected_post_publish_failure")
+        return real_validate(path)
+
+    monkeypatch.setattr(task_capsule_module, "_safe_directory_metadata", fail_once)
+
+    with pytest.raises(
+        task_capsule_module._RetentionSkipError,
+        match="injected_post_publish_failure",
+    ):
+        task_capsule_module._replace_capsule_directory(source, destination)
+
+    assert injected is True
+    assert source.is_dir()
+    assert (source / "sentinel.txt").read_text(encoding="utf-8") == "exact"
+    assert os.path.lexists(destination) is False
 
 
 def test_capsule_close_failure_retains_backend_for_verified_retry(tmp_path: Path) -> None:

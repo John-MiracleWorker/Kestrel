@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from typing import Any
 import pytest
 
 import nested_memvid_agent.mcp_manager as mcp_module
+import nested_memvid_agent.private_directory as private_directory_module
 from nested_memvid_agent.capability_policy import CapabilityPolicy, parent_resource_digest
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.event_bus import RunEventBus
@@ -86,12 +88,61 @@ def _static_tool() -> list[dict[str, object]]:
     return [{"name": "echo", "description": "Echo."}]
 
 
+def _windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable on this runner")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_mcp_launch_tree_rejects_junction_before_resolving_it(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "server.py"
+    sentinel.write_text("# untouched\n", encoding="utf-8")
+    junction = tmp_path / "plugin-tree"
+    _windows_junction(junction, outside)
+
+    try:
+        with pytest.raises(MCPLaunchIdentityError, match="reparse point"):
+            mcp_module._resolve_launch_tree(str(junction))
+        assert sentinel.read_text(encoding="utf-8") == "# untouched\n"
+    finally:
+        if os.path.lexists(junction):
+            os.rmdir(junction)
+
+
+def test_local_launch_artifact_parser_accepts_windows_drives_and_rejects_remote_urls() -> None:
+    windows_path = r"C:\Users\operator\server.py"
+
+    assert (
+        mcp_module._local_launch_artifact_path(windows_path, label="Python script")
+        == windows_path
+    )
+    with pytest.raises(MCPLaunchIdentityError, match="must be a local file"):
+        mcp_module._local_launch_artifact_path(
+            "https://example.invalid/server.py",
+            label="Python script",
+        )
+    with pytest.raises(MCPLaunchIdentityError, match="must be a local file"):
+        mcp_module._local_launch_artifact_path(
+            "file://remote-host/server.py",
+            label="Python script",
+        )
+
+
 def test_path_drift_after_approval_fails_before_secret_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first = _copy_native_executable(tmp_path / "first" / "fixture-mcp")
-    second = _copy_native_executable(tmp_path / "second" / "fixture-mcp")
+    executable_name = "fixture-mcp.exe" if os.name == "nt" else "fixture-mcp"
+    first = _copy_native_executable(tmp_path / "first" / executable_name)
+    second = _copy_native_executable(tmp_path / "second" / executable_name)
     resolved_secrets: list[str] = []
     monkeypatch.setenv("PATH", str(first.parent))
     state = AgentStateStore(tmp_path / "state.db")
@@ -103,7 +154,7 @@ def test_path_drift_after_approval_fails_before_secret_resolution(
         {
             "id": "path-drift",
             "transport": "stdio",
-            "command": "fixture-mcp",
+            "command": executable_name,
             "secret_env": {"TOKEN": "secret://mcp-token"},
             "tools": _static_tool(),
         }
@@ -207,6 +258,188 @@ def test_plugin_rejects_package_runner_even_with_version_pin(tmp_path: Path) -> 
         manager.install("owner/unpinned")
 
 
+def test_windows_acl_seam_rejects_weak_nested_snapshot_before_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "snapshot"
+    nested = root / "nested"
+    nested.mkdir(parents=True, mode=0o700)
+    (nested / "server.py").write_text("# reviewed\n", encoding="utf-8")
+    hash_called = False
+
+    def validate(path: Path) -> None:
+        if path == nested:
+            raise private_directory_module.PrivateDirectoryError(
+                "private_directory_windows_trustee_unsafe"
+            )
+
+    def unexpected_hash(_root: Path) -> str:
+        nonlocal hash_called
+        hash_called = True
+        return "sha256:unreachable"
+
+    monkeypatch.setattr(mcp_module, "_uses_windows_snapshot_acls", lambda: True)
+    monkeypatch.setattr(mcp_module, "validate_owner_private_directory", validate)
+    monkeypatch.setattr(mcp_module, "_hash_launch_tree", unexpected_hash)
+
+    with pytest.raises(MCPLaunchIdentityError) as raised:
+        mcp_module._hash_private_launch_tree(root)
+
+    assert raised.value.code == "snapshot_permissions"
+    assert hash_called is False
+
+
+def test_windows_acl_seam_creates_reuses_and_cleans_protected_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "server.py"
+    source.write_text("# reviewed\n", encoding="utf-8")
+    base = tmp_path / "mcp_artifacts"
+    destination = base / ("a" * 64) / source.name
+    created: list[Path] = []
+    validated: list[Path] = []
+
+    def atomic_create(path: Path) -> Path:
+        path.mkdir(mode=0o700)
+        created.append(path)
+        return path
+
+    def validate(path: Path) -> None:
+        assert path.is_dir()
+        validated.append(path)
+
+    monkeypatch.setattr(mcp_module, "_uses_windows_snapshot_acls", lambda: True)
+    monkeypatch.setattr(mcp_module, "create_owner_private_directory", atomic_create)
+    monkeypatch.setattr(mcp_module, "validate_owner_private_directory", validate)
+
+    mcp_module._ensure_private_snapshot_directory(
+        base,
+        allow_harden_empty=True,
+        harden_existing_posix=True,
+    )
+    expected = mcp_module._hash_launch_file(source, label="launch artifact")
+    for _ in range(2):
+        mcp_module._ensure_private_file_snapshot(
+            source,
+            destination,
+            expected_digest=expected,
+            executable=False,
+        )
+
+    assert destination.read_text(encoding="utf-8") == "# reviewed\n"
+    assert created == [base, destination.parent]
+    assert base in validated
+    assert destination.parent in validated
+    mcp_module._remove_private_snapshot_tree(destination.parent)
+    assert not destination.parent.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics required")
+def test_snapshot_base_retains_posix_hardening_without_repairing_digest_roots(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "mcp_artifacts"
+    base.mkdir(mode=0o755)
+
+    mcp_module._ensure_private_snapshot_directory(
+        base,
+        allow_harden_empty=True,
+        harden_existing_posix=True,
+    )
+
+    assert base.stat().st_mode & 0o777 == 0o700
+    digest = base / ("a" * 64)
+    digest.mkdir(mode=0o755)
+    with pytest.raises(MCPLaunchIdentityError) as raised:
+        mcp_module._ensure_private_snapshot_directory(
+            digest,
+            allow_harden_empty=True,
+            harden_existing_posix=False,
+        )
+    assert raised.value.code == "snapshot_permissions"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows ACL semantics required")
+@pytest.mark.parametrize("weak_trustee", ["WD", "BU"])
+def test_windows_nonempty_weak_snapshot_acl_fails_closed(
+    tmp_path: Path,
+    weak_trustee: str,
+) -> None:
+    base = tmp_path / f"weak-{weak_trustee}"
+    current_sid = private_directory_module._windows_current_user_sid()
+    protection = "P" if weak_trustee == "WD" else ""
+    weak_sddl = (
+        f"O:{current_sid}D:{protection}"
+        f"(A;OICI;FA;;;{current_sid})"
+        f"(A;OICI;FA;;;{weak_trustee})"
+    )
+    private_directory_module._windows_create_directory_with_sddl(base, weak_sddl)
+    (base / "occupied.txt").write_text("untrusted inheritance\n", encoding="utf-8")
+    try:
+        with pytest.raises(MCPLaunchIdentityError) as raised:
+            mcp_module._ensure_private_snapshot_directory(
+                base,
+                allow_harden_empty=True,
+                harden_existing_posix=True,
+            )
+        assert raised.value.code == "snapshot_permissions"
+    finally:
+        shutil.rmtree(base)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows ACL semantics required")
+def test_windows_protected_snapshot_creates_reuses_and_cleans(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "server.py"
+    source.write_text("# reviewed\n", encoding="utf-8")
+    base = tmp_path / "mcp_artifacts"
+    destination = base / ("a" * 64) / source.name
+
+    mcp_module._ensure_private_snapshot_directory(
+        base,
+        allow_harden_empty=True,
+        harden_existing_posix=True,
+    )
+    expected = mcp_module._hash_launch_file(source, label="launch artifact")
+    for _ in range(2):
+        mcp_module._ensure_private_file_snapshot(
+            source,
+            destination,
+            expected_digest=expected,
+            executable=False,
+        )
+
+    private_directory_module.validate_owner_private_directory(base)
+    private_directory_module.validate_owner_private_directory(destination.parent)
+    assert destination.read_text(encoding="utf-8") == "# reviewed\n"
+    mcp_module._remove_private_snapshot_tree(destination.parent)
+    assert not destination.parent.exists()
+
+
+def test_private_tree_snapshot_failure_cleans_protected_temporary_directory(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "plugin"
+    source.mkdir()
+    (source / "server.py").write_text("# reviewed\n", encoding="utf-8")
+    base = tmp_path / "mcp_artifacts"
+    base.mkdir(mode=0o700)
+    destination = base / ("a" * 64)
+
+    with pytest.raises(MCPLaunchIdentityError, match="changed before"):
+        mcp_module._ensure_private_tree_snapshot(
+            source,
+            destination,
+            expected_digest="sha256:" + "0" * 64,
+        )
+
+    assert list(base.glob(".mcp-snapshot-*")) == []
+    assert not destination.exists()
+
+
 def test_unchanged_identity_connects_and_launches_exact_resolved_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -285,13 +518,84 @@ def test_unchanged_identity_connects_and_launches_exact_resolved_paths(
     snapshot = approved["vetting"]["stdio_launch_snapshot"]
     snapshot_root = Path(str(snapshot["root"]))
     snapshot_artifact = Path(str(snapshot["artifact_path"]))
-    assert snapshot_root.stat().st_mode & 0o077 == 0
-    assert snapshot_artifact.stat().st_mode & 0o077 == 0
+    if os.name != "nt":
+        assert snapshot_root.stat().st_mode & 0o077 == 0
+        assert snapshot_artifact.stat().st_mode & 0o077 == 0
+    else:
+        assert snapshot_root.is_dir()
+        assert snapshot_artifact.is_file()
     assert captured["command"] == str(Path(sys.executable).absolute())
     assert captured["args"] == [snapshot["artifact_path"]]
     assert captured["cwd"] == snapshot["root"]
     assert Path(str(captured["args"][0])).read_text(encoding="utf-8") == "# reviewed\n"
     assert captured["stream_entered"] is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="portable POSIX permission mutation")
+def test_launch_adjacent_snapshot_permission_change_blocks_process_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "server.py"
+    script.write_text("# reviewed\n", encoding="utf-8")
+    state = AgentStateStore(tmp_path / "state.db")
+    manager = MCPManager(state)
+    manager.add_server(
+        {
+            "id": "acl-launch-race",
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(script)],
+        }
+    )
+    approved = manager.approve_server_connect("acl-launch-race")
+    server = mcp_module._server_from_state(approved)
+    snapshot_root = Path(
+        str(approved["vetting"]["stdio_launch_snapshot"]["root"])
+    )
+    observations = {"parameters": False, "stdio_client": False}
+
+    class _Parameters:
+        def __init__(
+            self,
+            *,
+            command: str,
+            args: list[str],
+            env: dict[str, str] | None,
+            cwd: str,
+        ) -> None:
+            del command, args, env, cwd
+            observations["parameters"] = True
+            snapshot_root.chmod(0o755)
+
+    def forbidden_stdio_client(_params: object) -> object:
+        observations["stdio_client"] = True
+        raise AssertionError("process creation must not be reached")
+
+    mcp_sdk = SimpleNamespace(StdioServerParameters=_Parameters)
+    stdio_sdk = SimpleNamespace(stdio_client=forbidden_stdio_client)
+    real_import = mcp_module.import_module
+
+    def fake_import(name: str) -> Any:
+        if name == "mcp":
+            return mcp_sdk
+        if name == "mcp.client.stdio":
+            return stdio_sdk
+        return real_import(name)
+
+    monkeypatch.setattr(mcp_module, "import_module", fake_import)
+    context = mcp_module._session_context(
+        server,
+        snapshot_root=manager._snapshot_root(),
+    )
+    try:
+        with pytest.raises(MCPLaunchIdentityError) as raised:
+            asyncio.run(context.__aenter__())
+    finally:
+        snapshot_root.chmod(0o700)
+
+    assert raised.value.code == "snapshot_permissions"
+    assert observations == {"parameters": True, "stdio_client": False}
 
 
 def test_validation_to_launch_mutation_never_reaches_process_creation(

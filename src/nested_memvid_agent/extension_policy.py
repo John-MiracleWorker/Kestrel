@@ -5,7 +5,7 @@ import json
 import os
 import stat
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 MAX_EXTENSION_FILES = 512
@@ -19,6 +19,7 @@ MAX_FILESYSTEM_SCOPE_FILE_BYTES = 64 * 1024 * 1024
 MAX_FILESYSTEM_SCOPE_TREE_BYTES = 256 * 1024 * 1024
 MAX_FILESYSTEM_SCOPE_DEPTH = 64
 _CONTROL_TREE_NAMES = frozenset({".git", ".nest"})
+_WINDOWS_RESERVED_PATH_CHARACTERS = frozenset('<>:"|?*')
 
 
 class ExtensionPolicyError(ValueError):
@@ -153,11 +154,24 @@ def extension_scope_validation_errors(value: object) -> list[str]:
 
 def resolve_filesystem_scopes(scopes: ExtensionScopes, workspace: Path) -> tuple[ResolvedFilesystemScope, ...]:
     workspace_path = workspace.expanduser()
-    if workspace_path.is_symlink():
+    try:
+        workspace_metadata = workspace_path.lstat()
+    except OSError as exc:
+        raise ExtensionPolicyError("extension_workspace_unavailable") from exc
+    if _metadata_is_reparse_point(workspace_metadata):
         raise ExtensionPolicyError("extension_workspace_symlink_rejected")
     root = workspace_path.resolve()
     if not root.exists() or not root.is_dir():
         raise ExtensionPolicyError("extension_workspace_unavailable")
+    try:
+        resolved_workspace_metadata = root.lstat()
+    except OSError as exc:
+        raise ExtensionPolicyError("extension_workspace_unavailable") from exc
+    if _metadata_is_reparse_point(resolved_workspace_metadata) or not _same_stat_snapshot(
+        workspace_metadata,
+        resolved_workspace_metadata,
+    ):
+        raise ExtensionPolicyError("extension_workspace_changed_during_resolution")
     resolved: list[ResolvedFilesystemScope] = []
     for scope in scopes.filesystem:
         requested = root if scope.path == "." else root.joinpath(*PurePosixPath(scope.path).parts)
@@ -166,10 +180,11 @@ def resolve_filesystem_scopes(scopes: ExtensionScopes, workspace: Path) -> tuple
             source = requested.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise ExtensionPolicyError(f"extension_scope_path_unavailable:{scope.path}") from exc
-        try:
-            relative = source.relative_to(root)
-        except ValueError as exc:
-            raise ExtensionPolicyError(f"extension_scope_path_escapes_workspace:{scope.path}") from exc
+        relative = _canonical_scope_relative(
+            root,
+            source,
+            declared_path=scope.path,
+        )
         if "," in str(source):
             raise ExtensionPolicyError("extension_scope_path_contains_unsupported_comma")
         try:
@@ -217,7 +232,7 @@ def validate_resolved_filesystem_scopes(
             raise ExtensionPolicyError(
                 f"extension_scope_changed_during_snapshot:{scope.declared_path}"
             )
-        if stat.S_ISLNK(current.st_mode):
+        if _metadata_is_reparse_point(current):
             raise ExtensionPolicyError(
                 f"extension_scope_path_symlink_rejected:{scope.declared_path}"
             )
@@ -242,6 +257,15 @@ def copy_readonly_filesystem_scope_snapshots(
     """Snapshot bounded read grants so the engine never binds live user data."""
 
     destination_root.mkdir(mode=0o700, parents=False, exist_ok=False)
+    if _uses_windows_path_fallback():
+        windows_snapshots = _copy_readonly_filesystem_scope_snapshots_path(
+            scopes,
+            destination_root,
+            workspace=workspace,
+        )
+        _chmod_snapshot_path(destination_root, 0o500)
+        return windows_snapshots
+
     directory_flags = _required_scope_directory_flags()
     workspace_root = workspace.expanduser().resolve(strict=True)
     workspace_descriptor = os.open(workspace_root, directory_flags)
@@ -288,7 +312,7 @@ def _reject_symlink_components(root: Path, requested: Path, declared_path: str) 
             raise ExtensionPolicyError(
                 f"extension_scope_path_unavailable:{declared_path}"
             ) from exc
-        if stat.S_ISLNK(metadata.st_mode):
+        if _metadata_is_reparse_point(metadata):
             raise ExtensionPolicyError(
                 f"extension_scope_path_symlink_rejected:{declared_path}"
             )
@@ -305,7 +329,7 @@ def copy_extension_snapshot(source: Path, destination: Path) -> str:
 
     destination.mkdir(parents=True, mode=0o700, exist_ok=False)
     result = _process_extension_tree(source, destination=destination)
-    destination.chmod(0o500)
+    _chmod_snapshot_path(destination, 0o500)
     return result
 
 
@@ -317,15 +341,28 @@ class _ExtensionTreeBudget:
 
 
 def _process_extension_tree(source: Path, *, destination: Path | None) -> str:
-    if source.is_symlink():
-        raise ExtensionPolicyError("extension_root_must_be_a_real_directory")
     try:
+        source_metadata = source.expanduser().lstat()
+        if _metadata_is_reparse_point(source_metadata):
+            raise ExtensionPolicyError("extension_root_must_be_a_real_directory")
         resolved = source.expanduser().resolve(strict=True)
         expected_root = resolved.lstat()
+    except ExtensionPolicyError:
+        raise
     except OSError as exc:
         raise ExtensionPolicyError("extension_root_must_be_a_real_directory") from exc
-    if not stat.S_ISDIR(expected_root.st_mode):
+    if _metadata_is_reparse_point(expected_root) or not stat.S_ISDIR(
+        expected_root.st_mode
+    ):
         raise ExtensionPolicyError("extension_root_must_be_a_real_directory")
+    if not _same_stat_snapshot(source_metadata, expected_root):
+        raise ExtensionPolicyError("extension_tree_changed_during_read:.")
+    if _uses_windows_path_fallback():
+        return _process_extension_tree_path(
+            resolved,
+            destination=destination,
+            expected_root=expected_root,
+        )
     directory_flags = _required_directory_flags(
         "extension_snapshot_platform_unsupported"
     )
@@ -391,7 +428,7 @@ def _process_extension_directory_descriptor(
             raise ExtensionPolicyError(
                 f"extension_tree_filesystem_crossing_rejected:{display_path}"
             )
-        if stat.S_ISLNK(metadata.st_mode):
+        if _metadata_is_reparse_point(metadata):
             raise ExtensionPolicyError(
                 f"extension_tree_symlink_rejected:{display_path}"
             )
@@ -507,14 +544,222 @@ def _hash_and_copy_extension_file_at(
         target.chmod(0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400)
 
 
+def _process_extension_tree_path(
+    source: Path,
+    *,
+    destination: Path | None,
+    expected_root: os.stat_result,
+) -> str:
+    """Windows fallback with reparse and identity checks around every read.
+
+    Python on Windows exposes neither directory file descriptors nor openat.
+    The fallback therefore rejects every reparse point, pins each entry by its
+    lstat/fstat identity, and revalidates the complete parent snapshot before
+    and after recursion.  POSIX never reaches this path.
+    """
+
+    digest = hashlib.sha256()
+    _process_extension_directory_path(
+        source,
+        relative=PurePosixPath("."),
+        destination=destination,
+        digest=digest,
+        budget=_ExtensionTreeBudget(),
+        root_device=expected_root.st_dev,
+        depth=0,
+        expected=expected_root,
+    )
+    _require_unchanged_path(
+        source,
+        expected_root,
+        "extension_tree_changed_during_read:.",
+    )
+    return "sha256:" + digest.hexdigest()
+
+
+def _process_extension_directory_path(
+    directory: Path,
+    *,
+    relative: PurePosixPath,
+    destination: Path | None,
+    digest: Any,
+    budget: _ExtensionTreeBudget,
+    root_device: int,
+    depth: int,
+    expected: os.stat_result,
+) -> None:
+    if depth > MAX_EXTENSION_DEPTH:
+        raise ExtensionPolicyError("extension_tree_depth_limit_exceeded")
+    _require_real_directory_path(
+        directory,
+        expected,
+        f"extension_tree_changed_during_read:{relative.as_posix()}",
+    )
+    entries: list[tuple[str, os.stat_result]] = []
+    try:
+        with os.scandir(directory) as iterator:
+            for entry in iterator:
+                budget.entries += 1
+                if budget.entries > MAX_EXTENSION_ENTRIES:
+                    raise ExtensionPolicyError("extension_tree_entry_limit_exceeded")
+                try:
+                    metadata = (directory / entry.name).lstat()
+                except OSError as exc:
+                    raise ExtensionPolicyError(
+                        f"extension_tree_changed_during_read:{entry.name}"
+                    ) from exc
+                entries.append((entry.name, metadata))
+    except ExtensionPolicyError:
+        raise
+    except OSError as exc:
+        raise ExtensionPolicyError("extension_tree_scan_failed") from exc
+    _require_unchanged_path(
+        directory,
+        expected,
+        f"extension_tree_changed_during_read:{relative.as_posix()}",
+    )
+
+    for name, metadata in sorted(entries, key=lambda item: item[0]):
+        child_relative = (
+            PurePosixPath(name)
+            if relative == PurePosixPath(".")
+            else relative / name
+        )
+        display_path = child_relative.as_posix()
+        child = directory / name
+        if not _portable_windows_path_component(name):
+            raise ExtensionPolicyError(
+                f"extension_tree_path_not_portable:{display_path}"
+            )
+        if metadata.st_dev != root_device:
+            raise ExtensionPolicyError(
+                f"extension_tree_filesystem_crossing_rejected:{display_path}"
+            )
+        if _metadata_is_reparse_point(metadata):
+            raise ExtensionPolicyError(
+                f"extension_tree_symlink_rejected:{display_path}"
+            )
+        target = destination / name if destination is not None else None
+        if stat.S_ISDIR(metadata.st_mode):
+            digest.update(_digest_bytes(f"dir\0{display_path}\0"))
+            _require_real_directory_path(
+                child,
+                metadata,
+                f"extension_tree_changed_during_read:{display_path}",
+            )
+            if target is not None:
+                target.mkdir(mode=0o700)
+            _process_extension_directory_path(
+                child,
+                relative=child_relative,
+                destination=target,
+                digest=digest,
+                budget=budget,
+                root_device=root_device,
+                depth=depth + 1,
+                expected=metadata,
+            )
+            if target is not None:
+                _chmod_snapshot_path(target, 0o500)
+            _require_unchanged_path(
+                directory,
+                expected,
+                f"extension_tree_changed_during_read:{relative.as_posix()}",
+            )
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ExtensionPolicyError(
+                f"extension_tree_nonregular_rejected:{display_path}"
+            )
+        if metadata.st_nlink != 1:
+            raise ExtensionPolicyError(
+                f"extension_tree_hardlink_rejected:{display_path}"
+            )
+        budget.files += 1
+        if budget.files > MAX_EXTENSION_FILES:
+            raise ExtensionPolicyError("extension_tree_file_limit_exceeded")
+        if metadata.st_size > MAX_EXTENSION_FILE_BYTES:
+            raise ExtensionPolicyError(
+                f"extension_tree_file_too_large:{display_path}"
+            )
+        budget.bytes += metadata.st_size
+        if budget.bytes > MAX_EXTENSION_TREE_BYTES:
+            raise ExtensionPolicyError("extension_tree_size_limit_exceeded")
+        executable = int(bool(stat.S_IMODE(metadata.st_mode) & 0o111))
+        digest.update(
+            _digest_bytes(
+                f"file\0{display_path}\0{executable}\0{metadata.st_size}\0"
+            )
+        )
+        _hash_and_copy_extension_file_path(
+            child,
+            target,
+            metadata=metadata,
+            relative=display_path,
+            digest=digest,
+        )
+        _require_unchanged_path(
+            directory,
+            expected,
+            f"extension_tree_changed_during_read:{relative.as_posix()}",
+        )
+    _require_unchanged_path(
+        directory,
+        expected,
+        f"extension_tree_changed_during_read:{relative.as_posix()}",
+    )
+
+
+def _hash_and_copy_extension_file_path(
+    source: Path,
+    target: Path | None,
+    *,
+    metadata: os.stat_result,
+    relative: str,
+    digest: Any,
+) -> None:
+    _require_regular_path(source, metadata, relative)
+    descriptor = os.open(
+        source,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+    )
+    try:
+        _validate_open_extension_file(
+            os.fstat(descriptor), metadata=metadata, relative=relative
+        )
+        target_handle = target.open("xb") if target is not None else None
+        try:
+            with os.fdopen(descriptor, "rb", closefd=False) as source_handle:
+                while chunk := source_handle.read(64 * 1024):
+                    digest.update(chunk)
+                    if target_handle is not None:
+                        target_handle.write(chunk)
+        finally:
+            if target_handle is not None:
+                target_handle.close()
+        _validate_open_extension_file(
+            os.fstat(descriptor), metadata=metadata, relative=relative
+        )
+    finally:
+        os.close(descriptor)
+    _require_regular_path(source, metadata, relative)
+    if target is not None:
+        _chmod_snapshot_path(
+            target,
+            0o500 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o400,
+        )
+
+
 def _digest_bytes(value: str) -> bytes:
     return value.encode("utf-8", errors="surrogateescape")
 
 
 def _canonical_relative_path(value: object) -> str:
-    raw = str(value).strip()
-    if not raw:
+    raw = str(value)
+    if not raw.strip():
         raise ExtensionPolicyError("filesystem_scope_path_required")
+    if raw != raw.strip():
+        raise ExtensionPolicyError("filesystem_scope_path_not_portable")
     if "\\" in raw or any(ord(character) < 32 or ord(character) == 127 for character in raw):
         raise ExtensionPolicyError("filesystem_scope_path_not_portable")
     path = PurePosixPath(raw)
@@ -522,10 +767,48 @@ def _canonical_relative_path(value: object) -> str:
         raise ExtensionPolicyError("filesystem_scope_workspace_root_rejected")
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise ExtensionPolicyError("filesystem_scope_path_must_be_relative")
+    if any(not _portable_windows_path_component(part) for part in path.parts):
+        raise ExtensionPolicyError("filesystem_scope_path_not_portable")
     normalized = path.as_posix()
     if any(part.casefold() in _CONTROL_TREE_NAMES for part in path.parts):
         raise ExtensionPolicyError("filesystem_scope_control_tree_rejected")
     return normalized
+
+
+def _portable_windows_path_component(value: str) -> bool:
+    """Reject names whose Win32 meaning can differ from their review text."""
+
+    if (
+        value.startswith(" ")
+        or value.endswith((" ", "."))
+        or any(character in _WINDOWS_RESERVED_PATH_CHARACTERS for character in value)
+    ):
+        return False
+    return not PureWindowsPath(value).is_reserved()
+
+
+def _canonical_scope_relative(
+    root: Path,
+    source: Path,
+    *,
+    declared_path: str,
+) -> Path:
+    try:
+        relative = source.relative_to(root)
+    except ValueError as exc:
+        raise ExtensionPolicyError(
+            f"extension_scope_path_escapes_workspace:{declared_path}"
+        ) from exc
+    canonical = PurePosixPath(*relative.parts).as_posix()
+    if any(part.casefold() in _CONTROL_TREE_NAMES for part in relative.parts):
+        raise ExtensionPolicyError("filesystem_scope_control_tree_rejected")
+    if _uses_windows_path_fallback() and canonical.casefold() != (
+        declared_path.casefold()
+    ):
+        raise ExtensionPolicyError(
+            f"extension_scope_path_not_canonical:{declared_path}"
+        )
+    return relative
 
 
 def _reject_overlapping_filesystem_scopes(scopes: list[FilesystemScope]) -> None:
@@ -616,10 +899,351 @@ def _copy_readonly_scope_tree(
         os.close(descriptor)
 
 
+def _copy_readonly_filesystem_scope_snapshots_path(
+    scopes: tuple[ResolvedFilesystemScope, ...],
+    destination_root: Path,
+    *,
+    workspace: Path,
+) -> tuple[ResolvedFilesystemScope, ...]:
+    workspace_path = workspace.expanduser()
+    workspace_path_metadata = workspace_path.lstat()
+    if _metadata_is_reparse_point(workspace_path_metadata):
+        raise ExtensionPolicyError("extension_workspace_symlink_rejected")
+    workspace_root = workspace_path.resolve(strict=True)
+    workspace_metadata = workspace_root.lstat()
+    if _metadata_is_reparse_point(workspace_metadata) or not stat.S_ISDIR(
+        workspace_metadata.st_mode
+    ):
+        raise ExtensionPolicyError("extension_workspace_symlink_rejected")
+    if not _same_stat_snapshot(workspace_path_metadata, workspace_metadata):
+        raise ExtensionPolicyError("extension_workspace_changed_during_snapshot")
+    remaining_entries = MAX_FILESYSTEM_SCOPE_ENTRIES
+    remaining_bytes = MAX_FILESYSTEM_SCOPE_TREE_BYTES
+    snapshots: list[ResolvedFilesystemScope] = []
+    for index, scope in enumerate(scopes):
+        requested = workspace_root.joinpath(*PurePosixPath(scope.declared_path).parts)
+        _reject_symlink_components(workspace_root, requested, scope.declared_path)
+        try:
+            current_source = requested.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ExtensionPolicyError(
+                f"extension_scope_scan_failed:{scope.declared_path}"
+            ) from exc
+        _canonical_scope_relative(
+            workspace_root,
+            current_source,
+            declared_path=scope.declared_path,
+        )
+        if current_source != scope.source:
+            raise ExtensionPolicyError(
+                f"extension_scope_changed_during_snapshot:{scope.declared_path}"
+            )
+        destination = destination_root / f"scope-{index:02d}"
+        consumed_entries, consumed_bytes = _copy_readonly_scope_tree_path(
+            requested,
+            scope,
+            destination,
+            remaining_entries=remaining_entries,
+            remaining_bytes=remaining_bytes,
+        )
+        remaining_entries -= consumed_entries
+        remaining_bytes -= consumed_bytes
+        snapshots.append(
+            ResolvedFilesystemScope(
+                source=destination,
+                target=scope.target,
+                access="read",
+                declared_path=scope.declared_path,
+                source_stat=destination.lstat(),
+            )
+        )
+        _require_unchanged_path(
+            workspace_root,
+            workspace_metadata,
+            "extension_workspace_changed_during_snapshot",
+        )
+    return tuple(snapshots)
+
+
+def _copy_readonly_scope_tree_path(
+    source: Path,
+    scope: ResolvedFilesystemScope,
+    destination: Path,
+    *,
+    remaining_entries: int,
+    remaining_bytes: int,
+) -> tuple[int, int]:
+    declared_path = scope.declared_path
+    if remaining_entries < 1:
+        raise ExtensionPolicyError("extension_scope_entry_limit_exceeded")
+    try:
+        root_metadata = source.lstat()
+    except OSError as exc:
+        raise ExtensionPolicyError(
+            f"extension_scope_scan_failed:{declared_path}"
+        ) from exc
+    if _metadata_is_reparse_point(root_metadata):
+        raise ExtensionPolicyError(
+            f"extension_scope_path_symlink_rejected:{declared_path}"
+        )
+    if not _same_stat_snapshot(scope.source_stat, root_metadata):
+        raise ExtensionPolicyError(
+            f"extension_scope_changed_during_snapshot:{declared_path}"
+        )
+    if stat.S_ISREG(root_metadata.st_mode):
+        _validate_scope_file_metadata(
+            root_metadata,
+            display_path=declared_path,
+            remaining_bytes=remaining_bytes,
+        )
+        _copy_regular_file_path(
+            source,
+            destination,
+            metadata=root_metadata,
+            relative=declared_path,
+        )
+        return 1, root_metadata.st_size
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ExtensionPolicyError(
+            f"extension_scope_nonregular_rejected:{declared_path}"
+        )
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    budget = _ScopeSnapshotBudget(
+        remaining_entries=remaining_entries - 1,
+        remaining_bytes=remaining_bytes,
+        consumed_entries=1,
+    )
+    _copy_scope_directory_path(
+        source,
+        destination,
+        relative=PurePosixPath("."),
+        declared_path=declared_path,
+        root_device=root_metadata.st_dev,
+        budget=budget,
+        depth=0,
+        expected=root_metadata,
+    )
+    _chmod_snapshot_path(destination, 0o500)
+    return budget.consumed_entries, budget.consumed_bytes
+
+
+def _copy_scope_directory_path(
+    source: Path,
+    destination: Path,
+    *,
+    relative: PurePosixPath,
+    declared_path: str,
+    root_device: int,
+    budget: _ScopeSnapshotBudget,
+    depth: int,
+    expected: os.stat_result,
+) -> None:
+    if depth > MAX_FILESYSTEM_SCOPE_DEPTH:
+        raise ExtensionPolicyError("extension_scope_depth_limit_exceeded")
+    _require_real_directory_path(
+        source,
+        expected,
+        f"extension_scope_changed_during_snapshot:{declared_path}",
+    )
+    entries: list[tuple[str, os.stat_result]] = []
+    try:
+        with os.scandir(source) as iterator:
+            for entry in iterator:
+                budget.remaining_entries -= 1
+                budget.consumed_entries += 1
+                if budget.remaining_entries < 0:
+                    raise ExtensionPolicyError(
+                        "extension_scope_entry_limit_exceeded"
+                    )
+                try:
+                    metadata = (source / entry.name).lstat()
+                except OSError as exc:
+                    raise ExtensionPolicyError(
+                        f"extension_scope_changed_during_snapshot:{declared_path}"
+                    ) from exc
+                entries.append((entry.name, metadata))
+    except ExtensionPolicyError:
+        raise
+    except OSError as exc:
+        raise ExtensionPolicyError("extension_scope_scan_failed") from exc
+    _require_unchanged_path(
+        source,
+        expected,
+        f"extension_scope_changed_during_snapshot:{declared_path}",
+    )
+
+    for name, metadata in sorted(entries, key=lambda item: item[0]):
+        child_relative = (
+            PurePosixPath(name)
+            if relative == PurePosixPath(".")
+            else relative / name
+        )
+        display_path = _scope_display_path(declared_path, child_relative)
+        child_source = source / name
+        if not _portable_windows_path_component(name):
+            raise ExtensionPolicyError(
+                f"extension_scope_path_not_portable:{display_path}"
+            )
+        if name.casefold() in _CONTROL_TREE_NAMES:
+            raise ExtensionPolicyError(
+                f"extension_scope_control_tree_rejected:{display_path}"
+            )
+        if metadata.st_dev != root_device:
+            raise ExtensionPolicyError(
+                f"extension_scope_filesystem_crossing_rejected:{display_path}"
+            )
+        if _metadata_is_reparse_point(metadata):
+            raise ExtensionPolicyError(
+                f"extension_scope_path_symlink_rejected:{display_path}"
+            )
+        target = destination / name
+        if stat.S_ISDIR(metadata.st_mode):
+            _require_real_directory_path(
+                child_source,
+                metadata,
+                f"extension_scope_changed_during_snapshot:{display_path}",
+            )
+            target.mkdir(mode=0o700)
+            _copy_scope_directory_path(
+                child_source,
+                target,
+                relative=child_relative,
+                declared_path=declared_path,
+                root_device=root_device,
+                budget=budget,
+                depth=depth + 1,
+                expected=metadata,
+            )
+            _chmod_snapshot_path(target, 0o500)
+            _require_unchanged_path(
+                source,
+                expected,
+                f"extension_scope_changed_during_snapshot:{declared_path}",
+            )
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ExtensionPolicyError(
+                f"extension_scope_nonregular_rejected:{display_path}"
+            )
+        _validate_scope_file_metadata(
+            metadata,
+            display_path=display_path,
+            remaining_bytes=budget.remaining_bytes,
+        )
+        _copy_regular_file_path(
+            child_source,
+            target,
+            metadata=metadata,
+            relative=display_path,
+        )
+        budget.remaining_bytes -= metadata.st_size
+        budget.consumed_bytes += metadata.st_size
+        _require_unchanged_path(
+            source,
+            expected,
+            f"extension_scope_changed_during_snapshot:{declared_path}",
+        )
+    _require_unchanged_path(
+        source,
+        expected,
+        f"extension_scope_changed_during_snapshot:{declared_path}",
+    )
+
+
+def _copy_regular_file_path(
+    source: Path,
+    target: Path,
+    *,
+    metadata: os.stat_result,
+    relative: str,
+) -> None:
+    _require_regular_path(source, metadata, relative)
+    descriptor = os.open(
+        source,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+    )
+    try:
+        _validate_open_extension_file(
+            os.fstat(descriptor), metadata=metadata, relative=relative
+        )
+        with os.fdopen(descriptor, "rb", closefd=False) as source_handle:
+            with target.open("xb") as target_handle:
+                while chunk := source_handle.read(64 * 1024):
+                    target_handle.write(chunk)
+        _validate_open_extension_file(
+            os.fstat(descriptor), metadata=metadata, relative=relative
+        )
+    finally:
+        os.close(descriptor)
+    _require_regular_path(source, metadata, relative)
+    _chmod_snapshot_path(target, 0o400)
+
+
 def _required_scope_directory_flags() -> int:
     return _required_directory_flags(
         "extension_scope_snapshot_platform_unsupported"
     )
+
+
+def _uses_windows_path_fallback() -> bool:
+    return os.name == "nt"
+
+
+def _chmod_snapshot_path(path: Path, mode: int) -> None:
+    # Windows chmod maps write bits to the persistent read-only attribute,
+    # which can prevent TemporaryDirectory from deleting the private snapshot.
+    # The OCI bind is independently read-only; POSIX retains defense-in-depth
+    # mode bits while Windows leaves cleanup-safe Kestrel-owned temp files.
+    if os.name != "nt":
+        path.chmod(mode)
+
+
+def _metadata_is_reparse_point(metadata: os.stat_result) -> bool:
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def _require_unchanged_path(
+    path: Path,
+    expected: os.stat_result,
+    error: str,
+) -> os.stat_result:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise ExtensionPolicyError(error) from exc
+    if _metadata_is_reparse_point(current) or not _same_stat_snapshot(
+        expected, current
+    ):
+        raise ExtensionPolicyError(error)
+    return current
+
+
+def _require_real_directory_path(
+    path: Path,
+    expected: os.stat_result,
+    error: str,
+) -> None:
+    current = _require_unchanged_path(path, expected, error)
+    if not stat.S_ISDIR(current.st_mode):
+        raise ExtensionPolicyError(error)
+
+
+def _require_regular_path(
+    path: Path,
+    expected: os.stat_result,
+    relative: str,
+) -> None:
+    current = _require_unchanged_path(
+        path,
+        expected,
+        f"extension_tree_changed_during_read:{relative}",
+    )
+    if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+        raise ExtensionPolicyError(f"extension_tree_nonregular_rejected:{relative}")
 
 
 def _required_directory_flags(error: str) -> int:
@@ -654,7 +1278,9 @@ def _open_absolute_directory_descriptor(path: Path, directory_flags: int) -> int
     try:
         for part in path.parts[1:]:
             metadata = os.stat(part, dir_fd=current, follow_symlinks=False)
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            if _metadata_is_reparse_point(metadata) or not stat.S_ISDIR(
+                metadata.st_mode
+            ):
                 raise ExtensionPolicyError(
                     "extension_root_must_be_a_real_directory"
                 )
@@ -683,7 +1309,7 @@ def _open_declared_scope_descriptor(
     try:
         for index, part in enumerate(parts):
             metadata = os.stat(part, dir_fd=current, follow_symlinks=False)
-            if stat.S_ISLNK(metadata.st_mode):
+            if _metadata_is_reparse_point(metadata):
                 raise ExtensionPolicyError(
                     f"extension_scope_path_symlink_rejected:{declared_path}"
                 )
@@ -787,7 +1413,7 @@ def _copy_scope_directory_descriptor(
             raise ExtensionPolicyError(
                 f"extension_scope_filesystem_crossing_rejected:{display_path}"
             )
-        if stat.S_ISLNK(metadata.st_mode):
+        if _metadata_is_reparse_point(metadata):
             raise ExtensionPolicyError(
                 f"extension_scope_path_symlink_rejected:{display_path}"
             )

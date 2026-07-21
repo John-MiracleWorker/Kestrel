@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,72 @@ from nested_memvid_agent.tools.base import ToolContext
 from nested_memvid_agent.tools.builtin import SkillInstallTool
 
 
+def _windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable on this runner")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_extension_copy_rejects_child_junction_without_touching_target(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    junction = source / "linked-child"
+    _windows_junction(junction, outside)
+
+    try:
+        with pytest.raises(
+            extension_transaction.ExtensionTransactionError,
+            match="symbolic link|reparse point",
+        ):
+            extension_transaction.copy_regular_tree(source, destination)
+        assert sentinel.read_text(encoding="utf-8") == "untouched"
+        assert tuple(destination.iterdir()) == ()
+    finally:
+        if os.path.lexists(junction):
+            os.rmdir(junction)
+
+
+def test_extension_move_restores_source_when_post_publish_validation_fails(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "sentinel.txt").write_text("exact", encoding="utf-8")
+    destination = tmp_path / "destination"
+    real_lstat = Path.lstat
+    injected = False
+
+    def fail_once(path: Path) -> os.stat_result:
+        nonlocal injected
+        if path == destination and os.path.lexists(path) and not injected:
+            injected = True
+            raise OSError("injected post-publication validation failure")
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_once)
+
+    with pytest.raises(OSError, match="injected post-publication"):
+        extension_transaction._move_real_directory(source, destination)
+
+    assert injected is True
+    assert source.is_dir()
+    assert (source / "sentinel.txt").read_text(encoding="utf-8") == "exact"
+    assert os.path.lexists(destination) is False
+
+
 class TransactionFetcher:
     def __init__(self, source: Path, commit: str = "a" * 40) -> None:
         self.source = source
@@ -35,6 +102,54 @@ class TransactionFetcher:
         del source, ref
         shutil.copytree(self.source, destination)
         return self.commit
+
+
+def test_extension_tree_uses_full_lstat_instead_of_incomplete_direntry_metadata(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+    (nested / "SKILL.md").write_text("Review input.\n", encoding="utf-8")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    real_scandir = extension_transaction.os.scandir
+
+    class EntryWithoutCompleteStat:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self.name = entry.name
+            self.path = entry.path
+
+        def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+            del follow_symlinks
+            raise AssertionError("DirEntry.stat metadata must not be trusted")
+
+    class ScandirWithoutCompleteStat:
+        def __init__(self, path: object) -> None:
+            self._scanned = real_scandir(path)
+
+        def __enter__(self) -> object:
+            entries = self._scanned.__enter__()
+            return iter(EntryWithoutCompleteStat(entry) for entry in entries)
+
+        def __exit__(self, *args: object) -> object:
+            return self._scanned.__exit__(*args)
+
+    monkeypatch.setattr(
+        extension_transaction.os,
+        "scandir",
+        lambda path: ScandirWithoutCompleteStat(path),
+    )
+
+    extension_transaction.fsync_tree(source)
+    extension_transaction.copy_regular_tree(source, destination)
+
+    assert (destination / "manifest.json").read_text(encoding="utf-8") == "{}\n"
+    assert (destination / "nested" / "SKILL.md").read_text(encoding="utf-8") == (
+        "Review input.\n"
+    )
 
 
 @pytest.mark.parametrize("failed_move", [1, 2])

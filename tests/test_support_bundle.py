@@ -26,6 +26,120 @@ from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.support_bundle import export_support_bundle
 
 
+def _windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable on this runner")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_support_bundle_rejects_junction_destination_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    config = _support_config(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    junction = tmp_path / "bundle-parent"
+    _windows_junction(junction, outside)
+
+    try:
+        with pytest.raises(ValueError, match="reparse point"):
+            export_support_bundle(config, output_path=junction / "bundle.zip")
+        assert sentinel.read_text(encoding="utf-8") == "untouched"
+        assert tuple(path.name for path in outside.iterdir()) == ("sentinel.txt",)
+    finally:
+        if os.path.lexists(junction):
+            os.rmdir(junction)
+
+
+def test_support_bundle_path_fallback_detects_parent_swap_without_following_it(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config = _support_config(tmp_path)
+    parent = tmp_path / "bundle-parent"
+    parent.mkdir()
+    displaced = tmp_path / "bundle-parent-original"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    real_create = support_bundle._create_bundle_temporary
+
+    monkeypatch.setattr(support_bundle, "_bundle_directory_fd_flag", lambda: None)
+
+    def create_then_swap(
+        directory_fd: int | None,
+        requested_parent: Path,
+    ) -> tuple[int, str, tuple[int, int]]:
+        created = real_create(directory_fd, requested_parent)
+        requested_parent.rename(displaced)
+        requested_parent.symlink_to(outside, target_is_directory=True)
+        return created
+
+    monkeypatch.setattr(support_bundle, "_create_bundle_temporary", create_then_swap)
+
+    try:
+        with pytest.raises(ValueError, match="link|changed"):
+            export_support_bundle(config, output_path=parent / "bundle.zip")
+        assert sentinel.read_text(encoding="utf-8") == "untouched"
+        assert tuple(path.name for path in outside.iterdir()) == ("sentinel.txt",)
+    finally:
+        if parent.is_symlink():
+            parent.unlink()
+        if displaced.exists():
+            for artifact in displaced.iterdir():
+                artifact.unlink()
+            displaced.rmdir()
+
+
+@pytest.mark.skipif(
+    support_bundle._bundle_directory_fd_flag() is None,
+    reason="directory-relative support bundle publication is unavailable",
+)
+def test_support_bundle_directory_fd_rejects_parent_swapped_before_open(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config = _support_config(tmp_path)
+    parent = tmp_path / "bundle-parent"
+    parent.mkdir()
+    original_sentinel = parent / "original.txt"
+    original_sentinel.write_text("original", encoding="utf-8")
+    displaced = tmp_path / "bundle-parent-original"
+    replacement = tmp_path / "bundle-parent-replacement"
+    replacement.mkdir()
+    replacement_sentinel = replacement / "replacement.txt"
+    replacement_sentinel.write_text("replacement", encoding="utf-8")
+    real_open = support_bundle._open_bundle_directory
+
+    def swap_then_open(
+        requested_parent: Path,
+        *,
+        expected_identity: os.stat_result,
+    ) -> int | None:
+        requested_parent.rename(displaced)
+        replacement.rename(requested_parent)
+        return real_open(requested_parent, expected_identity=expected_identity)
+
+    monkeypatch.setattr(support_bundle, "_open_bundle_directory", swap_then_open)
+
+    with pytest.raises(ValueError, match="changed"):
+        export_support_bundle(config, output_path=parent / "bundle.zip")
+
+    assert (displaced / original_sentinel.name).read_text(encoding="utf-8") == "original"
+    assert (parent / replacement_sentinel.name).read_text(encoding="utf-8") == "replacement"
+    assert sorted(path.name for path in displaced.iterdir()) == ["original.txt"]
+    assert sorted(path.name for path in parent.iterdir()) == ["replacement.txt"]
+
+
 def test_support_bundle_git_probe_uses_absolute_resolved_executable(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
@@ -164,6 +278,39 @@ def test_support_bundle_write_failure_removes_private_temporary(
         export_support_bundle(config, output_path=destination)
 
     assert not destination.exists()
+    assert not list(tmp_path.glob(".kestrel-support-*.tmp"))
+
+
+def test_support_bundle_closes_temporary_before_unlink(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config = _support_config(tmp_path)
+    opened_handles: list[object] = []
+    real_fdopen = support_bundle.os.fdopen
+    real_unlink = support_bundle._unlink_bundle_entry
+
+    def tracked_fdopen(*args: object, **kwargs: object) -> object:
+        handle = real_fdopen(*args, **kwargs)
+        opened_handles.append(handle)
+        return handle
+
+    def assert_closed_before_unlink(
+        directory_fd: int | None,
+        parent: Path,
+        name: str,
+    ) -> None:
+        if name.startswith(".kestrel-support-"):
+            assert opened_handles
+            assert bool(getattr(opened_handles[-1], "closed", False)) is True
+        real_unlink(directory_fd, parent, name)
+
+    monkeypatch.setattr(support_bundle.os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(support_bundle, "_unlink_bundle_entry", assert_closed_before_unlink)
+
+    result = export_support_bundle(config, output_path=tmp_path / "bundle.zip")
+
+    assert result.bundle_path.is_file()
     assert not list(tmp_path.glob(".kestrel-support-*.tmp"))
 
 

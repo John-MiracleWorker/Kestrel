@@ -12,6 +12,7 @@ from typing import IO
 from uuid import uuid4
 
 from .file_lock import lock_exclusive, unlock
+from .platform_primitives import is_link_or_reparse_point
 
 
 class ExtensionTransactionError(RuntimeError):
@@ -33,7 +34,7 @@ def ensure_real_directory(path: Path) -> None:
         metadata = path.lstat()
     except OSError as exc:
         raise ExtensionTransactionError(f"Extension directory is unavailable: {path}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
         raise ExtensionTransactionError(f"Extension path must be a real directory: {path}")
 
 
@@ -49,7 +50,7 @@ def extension_lock(root: Path, name: str) -> Iterator[None]:
     except FileNotFoundError:
         lock_metadata = None
     if lock_metadata is not None and (
-        stat.S_ISLNK(lock_metadata.st_mode) or not stat.S_ISREG(lock_metadata.st_mode)
+        is_link_or_reparse_point(lock_metadata) or not stat.S_ISREG(lock_metadata.st_mode)
     ):
         raise ExtensionTransactionError("Extension transaction lock must be a regular file.")
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
@@ -128,7 +129,7 @@ def read_regular_file(path: Path) -> bytes:
     """Read one immutable snapshot from a no-follow regular-file descriptor."""
 
     path_before = path.lstat()
-    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+    if is_link_or_reparse_point(path_before) or not stat.S_ISREG(path_before.st_mode):
         raise ExtensionTransactionError(f"Extension file is not a regular file: {path}")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
@@ -218,10 +219,10 @@ class DirectorySwap:
         try:
             if path_exists(self.live):
                 ensure_real_directory(self.live)
-                os.replace(self.live, self.rollback)
+                _move_real_directory(self.live, self.rollback)
                 self.displaced = True
                 fsync_directory(self.live.parent)
-            os.replace(self.stage, self.live)
+            _move_real_directory(self.stage, self.live)
             self.published = True
             fsync_directory(self.live.parent)
         except BaseException as exc:
@@ -237,12 +238,12 @@ class DirectorySwap:
         failed_tree: Path | None = None
         if self.published and path_exists(self.live):
             failed_tree = self.live.parent / f".{self.live.name}.failed-{uuid4().hex}"
-            os.replace(self.live, failed_tree)
+            _move_real_directory(self.live, failed_tree)
             self.published = False
         if self.displaced:
             if self.rollback is None or not path_exists(self.rollback):
                 raise ExtensionCleanupIncompleteError("Extension rollback generation is missing.")
-            os.replace(self.rollback, self.live)
+            _move_real_directory(self.rollback, self.live)
             self.displaced = False
         fsync_directory(self.live.parent)
         if failed_tree is not None:
@@ -270,7 +271,7 @@ class DirectoryRemoval:
             return
         ensure_real_directory(self.live)
         self.rollback = self.live.parent / f".{self.live.name}.rollback-{uuid4().hex}"
-        os.replace(self.live, self.rollback)
+        _move_real_directory(self.live, self.rollback)
         self.displaced = True
         try:
             fsync_directory(self.live.parent)
@@ -290,7 +291,7 @@ class DirectoryRemoval:
             raise ExtensionCleanupIncompleteError("Extension removal rollback is missing.")
         if path_exists(self.live):
             raise ExtensionCleanupIncompleteError("Extension live path was recreated during removal.")
-        os.replace(self.rollback, self.live)
+        _move_real_directory(self.rollback, self.live)
         fsync_directory(self.live.parent)
         self.displaced = False
 
@@ -310,8 +311,12 @@ def _walk_real_tree(root: Path) -> list[Path]:
         raise ExtensionTransactionError(f"Extension tree is unreadable: {root}") from exc
     for entry in entries:
         path = Path(entry.path)
-        metadata = entry.stat(follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode):
+        # Windows ``DirEntry.stat`` may use directory-enumeration metadata
+        # whose ``st_nlink`` is zero even for an ordinary single-link file.
+        # A full path lstat obtains handle-backed link and identity metadata;
+        # the descriptor comparison below still catches a replacement race.
+        metadata = path.lstat()
+        if is_link_or_reparse_point(metadata):
             raise ExtensionTransactionError(f"Extension tree contains a symbolic link: {path}")
         if stat.S_ISDIR(metadata.st_mode):
             directories.extend(_walk_real_tree(path))
@@ -341,8 +346,8 @@ def _copy_regular_tree_contents(source: Path, destination: Path) -> None:
     for entry in entries:
         source_path = Path(entry.path)
         destination_path = destination / entry.name
-        metadata = entry.stat(follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode):
+        metadata = source_path.lstat()
+        if is_link_or_reparse_point(metadata):
             raise ExtensionTransactionError(
                 f"Extension tree contains a symbolic link: {source_path}"
             )
@@ -367,3 +372,87 @@ def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
         metadata.st_size,
         metadata.st_mtime_ns,
     )
+
+
+def _move_real_directory(source: Path, destination: Path) -> None:
+    """Move one verified generation without accepting links or junctions."""
+
+    ensure_real_directory(source.parent)
+    ensure_real_directory(destination.parent)
+    source_before = source.lstat()
+    if is_link_or_reparse_point(source_before) or not stat.S_ISDIR(source_before.st_mode):
+        raise ExtensionTransactionError(f"Extension path must be a real directory: {source}")
+    if path_exists(destination):
+        destination_metadata = destination.lstat()
+        if is_link_or_reparse_point(destination_metadata):
+            raise ExtensionTransactionError(
+                f"Extension move destination cannot be a link or reparse point: {destination}"
+            )
+        raise ExtensionTransactionError(f"Extension move destination already exists: {destination}")
+    moved = False
+    try:
+        os.replace(source, destination)
+        moved = True
+    except PermissionError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 5:
+            raise
+        source_retry = source.lstat()
+        if (
+            is_link_or_reparse_point(source_retry)
+            or not stat.S_ISDIR(source_retry.st_mode)
+            or _stat_identity(source_before) != _stat_identity(source_retry)
+            or path_exists(destination)
+        ):
+            raise ExtensionTransactionError(
+                "Extension directory changed before Windows publication."
+            ) from exc
+        os.rename(source, destination)
+        moved = True
+    try:
+        destination_after = destination.lstat()
+        if (
+            is_link_or_reparse_point(destination_after)
+            or not stat.S_ISDIR(destination_after.st_mode)
+            or _stat_identity(source_before) != _stat_identity(destination_after)
+        ):
+            raise ExtensionCleanupIncompleteError(
+                "Extension directory identity changed during publication."
+            )
+    except BaseException as exc:
+        if moved:
+            _restore_exact_directory_move(destination, source, source_before)
+        raise exc
+
+
+def _restore_exact_directory_move(
+    destination: Path,
+    source: Path,
+    expected: os.stat_result,
+) -> None:
+    try:
+        visible = destination.lstat()
+        if (
+            is_link_or_reparse_point(visible)
+            or not stat.S_ISDIR(visible.st_mode)
+            or _stat_identity(visible) != _stat_identity(expected)
+            or path_exists(source)
+        ):
+            raise ExtensionCleanupIncompleteError(
+                "Extension publication could not restore the exact source generation."
+            )
+        if os.name == "nt":
+            os.rename(destination, source)
+        else:
+            os.replace(destination, source)
+        restored = source.lstat()
+        if (
+            is_link_or_reparse_point(restored)
+            or _stat_identity(restored) != _stat_identity(expected)
+        ):
+            raise ExtensionCleanupIncompleteError(
+                "Extension publication restore changed directory identity."
+            )
+    except OSError as exc:
+        raise ExtensionCleanupIncompleteError(
+            "Extension publication could not restore the source generation."
+        ) from exc

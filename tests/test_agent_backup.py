@@ -27,6 +27,42 @@ from nested_memvid_agent.runtime_ownership import (
 )
 
 
+def _windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable on this runner")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+def test_agent_backup_rejects_configured_junction_before_resolving_it(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    outside = tmp_path / "outside-memory"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    junction = runtime / "memory"
+    _windows_junction(junction, outside)
+
+    try:
+        with pytest.raises(MemoryBackupError, match="Windows reparse point"):
+            AgentBackupManager(
+                memory_dir=junction,
+                state_path=runtime / "state" / "agent.db",
+                backup_root=tmp_path / "backups",
+            )
+        assert sentinel.read_text(encoding="utf-8") == "untouched"
+        assert tuple(path.name for path in outside.iterdir()) == ("sentinel.txt",)
+    finally:
+        if os.path.lexists(junction):
+            os.rmdir(junction)
+
+
 def _seed_memory(
     memory_dir: Path,
     value: str,
@@ -1104,7 +1140,8 @@ def test_agent_backup_keeps_shared_root_mode_and_rejects_symlink_lock(
     paths["backups"].mkdir(mode=0o755)
 
     assert manager.list_backups() == []
-    assert stat.S_IMODE(paths["backups"].stat().st_mode) == 0o755
+    if os.name != "nt":
+        assert stat.S_IMODE(paths["backups"].stat().st_mode) == 0o755
 
     lock_target = tmp_path / "lock-target"
     lock_target.write_text("do not touch", encoding="utf-8")
@@ -1115,7 +1152,8 @@ def test_agent_backup_keeps_shared_root_mode_and_rejects_symlink_lock(
         manager.validate("missing")
 
     assert lock_target.read_text(encoding="utf-8") == "do not touch"
-    assert stat.S_IMODE(lock_target.stat().st_mode) == 0o644
+    if os.name != "nt":
+        assert stat.S_IMODE(lock_target.stat().st_mode) == 0o644
 
 
 def test_agent_backup_resolves_symlinked_parent_before_overlap_check(

@@ -5,9 +5,7 @@ import math
 import os
 import shutil
 import signal
-import stat
 import subprocess  # nosec B404
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +23,11 @@ from .extension_policy import (
     validate_resolved_filesystem_scopes,
 )
 from .platform_primitives import required_signal, signal_process_group
+from .private_directory import (
+    PrivateDirectoryError,
+    private_temporary_directory,
+    validate_owner_private_directory,
+)
 
 OCI_MEMORY_LIMIT = "256m"
 OCI_CPU_LIMIT = "1.0"
@@ -253,9 +256,11 @@ class OCIContainerRunner:
             )
 
         try:
-            with tempfile.TemporaryDirectory(prefix="kestrel-extension-") as temp_name:
+            with private_temporary_directory(
+                prefix="kestrel-extension-"
+            ) as snapshot_root:
                 temp_root = _private_snapshot_root(
-                    Path(temp_name),
+                    snapshot_root,
                     source=request.source_dir,
                     workspace=request.workspace,
                 )
@@ -728,14 +733,17 @@ def _remove_and_confirm_container_absent(
 def _private_snapshot_root(root: Path, *, source: Path, workspace: Path) -> Path:
     """Require an owner-private system-temp root disjoint from user trees."""
 
-    root.chmod(0o700)
-    metadata = root.lstat()
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ExtensionPolicyError("extension_snapshot_location_unsafe")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ExtensionPolicyError("extension_snapshot_location_not_private")
-    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-        raise ExtensionPolicyError("extension_snapshot_location_not_owned")
+    try:
+        validate_owner_private_directory(root)
+    except PrivateDirectoryError as exc:
+        message = str(exc)
+        if "not_real" in message or "identity_changed" in message:
+            code = "extension_snapshot_location_unsafe"
+        elif "not_owned" in message or "wrong_windows_owner" in message:
+            code = "extension_snapshot_location_not_owned"
+        else:
+            code = "extension_snapshot_location_not_private"
+        raise ExtensionPolicyError(code) from exc
     resolved = root.resolve(strict=True)
     for protected in (source.expanduser().resolve(), workspace.expanduser().resolve()):
         if (

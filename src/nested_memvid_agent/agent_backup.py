@@ -28,7 +28,11 @@ from .memory_backup import (
     _write_json_atomic,
 )
 from .models import MemoryLayer
-from .platform_primitives import chmod_descriptor
+from .platform_primitives import (
+    chmod_descriptor,
+    is_link_or_reparse_point,
+    is_windows_reparse_point,
+)
 from .runtime_ownership import PrimaryRuntimeOwnership
 
 AgentBackupKind = Literal["directory", "file", "sqlite"]
@@ -90,6 +94,21 @@ class AgentBackupManager:
         repair_artifact_root: Path | None = None,
         specs: dict[MemoryLayer, LayerSpec] | None = None,
     ) -> None:
+        for configured_path in (
+            memory_dir,
+            state_path,
+            backup_root,
+            runs_dir,
+            skills_dir,
+            plugins_dir,
+            mcp_config_path,
+            channel_config_path,
+            runtime_settings_path,
+            layer_config_path,
+            repair_artifact_root,
+        ):
+            if configured_path is not None:
+                _reject_windows_reparse_ancestors(configured_path)
         self.memory_dir = memory_dir.resolve()
         self.state_path = state_path.resolve()
         # Keep the final path component unresolved so a symlink supplied as the
@@ -139,7 +158,15 @@ class AgentBackupManager:
         self._ensure_backup_root()
         rows: list[dict[str, Any]] = []
         for path in sorted(self.backup_root.iterdir(), reverse=True):
-            if path.is_symlink() or not path.is_dir() or path.name.startswith("."):
+            try:
+                metadata = path.lstat()
+            except OSError:
+                continue
+            if (
+                is_link_or_reparse_point(metadata)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or path.name.startswith(".")
+            ):
                 continue
             try:
                 manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
@@ -264,17 +291,21 @@ class AgentBackupManager:
                     rollbacks[component.name] = component_rollbacks
                     live_component_paths = _live_component_paths(component)
                     for live_path in live_component_paths:
-                        if live_path.is_symlink():
+                        try:
+                            live_metadata = live_path.lstat()
+                        except FileNotFoundError:
+                            continue
+                        if is_link_or_reparse_point(live_metadata):
                             raise MemoryBackupError(
-                                f"Refusing to replace symlinked component: {component.name}"
+                                f"Refusing to replace linked component: {component.name}"
                             )
                     for live_path in live_component_paths:
-                        if not (live_path.exists() or live_path.is_symlink()):
+                        if not os.path.lexists(live_path):
                             continue
                         rollback_path = live_path.with_name(
                             f".{live_path.name}.rollback-{rollback_token}.tmp"
                         )
-                        os.replace(live_path, rollback_path)
+                        _replace_path(live_path, rollback_path)
                         component_rollbacks.append((live_path, rollback_path))
                         if component.name not in touched:
                             touched.append(component.name)
@@ -283,7 +314,7 @@ class AgentBackupManager:
                     if stage_path is not None:
                         if component.name not in touched:
                             touched.append(component.name)
-                        os.replace(stage_path, component.path)
+                        _replace_path(stage_path, component.path)
                         installed_destinations.add(component.path)
                         installed.append(component.name)
                     elif component.name in rollbacks:
@@ -302,7 +333,7 @@ class AgentBackupManager:
                         str(rollback_path)
                         for component_rollbacks in rollbacks.values()
                         for _, rollback_path in component_rollbacks
-                        if rollback_path.exists() or rollback_path.is_symlink()
+                        if os.path.lexists(rollback_path)
                     )
                     details = "; ".join(rollback_errors)
                     preserved_paths_text = ", ".join(preserved_rollbacks) or "none"
@@ -370,14 +401,14 @@ class AgentBackupManager:
                 except BaseException as rollback_exc:
                     errors.append(f"remove:{component_name}:{live_path.name}:{rollback_exc}")
             for live_path, rollback_path in component_rollbacks:
-                if not (rollback_path.exists() or rollback_path.is_symlink()):
+                if not os.path.lexists(rollback_path):
                     errors.append(f"missing:{component_name}:{rollback_path.name}")
                     continue
-                if live_path.exists() or live_path.is_symlink():
+                if os.path.lexists(live_path):
                     errors.append(f"occupied:{component_name}:{live_path.name}")
                     continue
                 try:
-                    os.replace(rollback_path, live_path)
+                    _replace_path(rollback_path, live_path)
                 except BaseException as rollback_exc:
                     errors.append(f"replace:{component_name}:{rollback_path.name}:{rollback_exc}")
             try:
@@ -482,11 +513,7 @@ class AgentBackupManager:
         component_metadata: dict[str, dict[str, Any]] = {}
         try:
             for component in self.components:
-                present = (
-                    component.path.is_file()
-                    if component.kind != "directory"
-                    else component.path.is_dir()
-                )
+                present = _component_source_is_present(component)
                 if component.required and require_required and not present:
                     raise MemoryBackupError(
                         f"Missing required agent backup component: {component.name}"
@@ -532,11 +559,11 @@ class AgentBackupManager:
                 ],
             }
             _write_json_atomic(temporary / "manifest.json", manifest)
-            os.replace(temporary, destination)
+            _replace_path(temporary, destination)
             _fsync_directory(self.backup_root)
             return manifest
         except Exception:
-            shutil.rmtree(temporary, ignore_errors=True)
+            _remove_path(temporary, ignore_errors=True)
             raise
 
     def _copy_memory_component(
@@ -574,21 +601,17 @@ class AgentBackupManager:
     ) -> None:
         target_root = temporary / "components" / component.name
         target_root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        for source in sorted(component.path.rglob("*")):
+        for source, source_metadata in _snapshot_real_tree(component.path):
             relative = source.relative_to(component.path)
-            if source.is_symlink():
-                raise MemoryBackupError(
-                    f"Agent backup component contains a symlink: {component.name}/{relative}"
-                )
             target = target_root / relative
-            if source.is_dir():
+            if stat.S_ISDIR(source_metadata.st_mode):
                 target.mkdir(parents=True, mode=0o700, exist_ok=True)
                 continue
-            if not source.is_file():
+            if not stat.S_ISREG(source_metadata.st_mode):
                 raise MemoryBackupError(
                     f"Agent backup component contains an unsupported entry: {component.name}/{relative}"
                 )
-            if source.stat().st_nlink != 1:
+            if source_metadata.st_nlink != 1:
                 raise MemoryBackupError(
                     f"Agent backup component contains a hard link: {component.name}/{relative}"
                 )
@@ -715,10 +738,17 @@ class AgentBackupManager:
                     layer_files=layer_files,
                 )
                 path = backup_dir / relative
-                if path.is_symlink() or not path.is_file():
+                try:
+                    path_metadata = path.lstat()
+                except OSError:
                     errors.append(f"missing:{relative_name}")
                     continue
-                if path.stat().st_nlink != 1:
+                if is_link_or_reparse_point(path_metadata) or not stat.S_ISREG(
+                    path_metadata.st_mode
+                ):
+                    errors.append(f"missing:{relative_name}")
+                    continue
+                if path_metadata.st_nlink != 1:
                     errors.append(f"hardlink:{relative_name}")
                     continue
                 if not path.resolve().is_relative_to(backup_dir):
@@ -777,12 +807,24 @@ class AgentBackupManager:
 
         component_root = backup_dir / "components"
         actual_files: set[str] = set()
-        if component_root.is_dir():
-            for path in component_root.rglob("*"):
+        try:
+            component_root_metadata = component_root.lstat()
+        except FileNotFoundError:
+            component_root_metadata = None
+        component_entries: list[tuple[Path, os.stat_result]] = []
+        if component_root_metadata is not None:
+            if is_link_or_reparse_point(component_root_metadata) or not stat.S_ISDIR(
+                component_root_metadata.st_mode
+            ):
+                errors.append("components_root_unsafe")
+            else:
+                try:
+                    component_entries = _snapshot_real_tree(component_root)
+                except MemoryBackupError as exc:
+                    errors.append(f"components_tree_unsafe:{exc}")
+            for path, path_metadata in component_entries:
                 relative_name = path.relative_to(backup_dir).as_posix()
-                if path.is_symlink():
-                    errors.append(f"symlink:{relative_name}")
-                elif path.is_file():
+                if stat.S_ISREG(path_metadata.st_mode):
                     actual_files.add(relative_name)
         for unexpected in sorted(actual_files - seen):
             errors.append(f"unlisted:{unexpected}")
@@ -1013,7 +1055,7 @@ class AgentBackupManager:
                 parent = parent.parent
         root_metadata = stage.lstat()
         if (
-            stat.S_ISLNK(root_metadata.st_mode)
+            is_link_or_reparse_point(root_metadata)
             or not stat.S_ISDIR(root_metadata.st_mode)
             or (_ENFORCE_EXACT_POSIX_MODES and stat.S_IMODE(root_metadata.st_mode) != 0o700)
         ):
@@ -1022,13 +1064,8 @@ class AgentBackupManager:
             )
         actual: set[str] = set()
         actual_directories: set[str] = set()
-        for path in stage.rglob("*"):
+        for path, metadata in _snapshot_real_tree(stage):
             relative_name = path.relative_to(stage).as_posix()
-            metadata = path.lstat()
-            if stat.S_ISLNK(metadata.st_mode):
-                raise MemoryBackupError(
-                    f"Staged component contains a symlink: {component.name}/{relative_name}"
-                )
             if stat.S_ISDIR(metadata.st_mode):
                 if _ENFORCE_EXACT_POSIX_MODES and stat.S_IMODE(metadata.st_mode) != 0o700:
                     raise MemoryBackupError(
@@ -1064,8 +1101,17 @@ class AgentBackupManager:
         ):
             raise MemoryBackupError("Invalid backup id")
         candidate = self.backup_root / backup_id
-        if candidate.is_symlink():
-            raise MemoryBackupError("Agent backup directory cannot be a symlink")
+        try:
+            candidate_metadata = candidate.lstat()
+        except FileNotFoundError:
+            candidate_metadata = None
+        if candidate_metadata is not None and (
+            is_link_or_reparse_point(candidate_metadata)
+            or not stat.S_ISDIR(candidate_metadata.st_mode)
+        ):
+            raise MemoryBackupError(
+                "Agent backup directory cannot be a symlink or Windows reparse point"
+            )
         path = candidate.resolve()
         if path.parent != self.backup_root or path.name != backup_id:
             raise MemoryBackupError("Backup path escapes backup root")
@@ -1081,13 +1127,21 @@ class AgentBackupManager:
             kept.add(backup.name)
         for old in backups:
             if old.name not in kept:
-                shutil.rmtree(old)
+                _remove_path(old)
 
     def _managed_backup_directories(self) -> list[Path]:
         managed: list[Path] = []
         pattern = re.compile(r"\d{8}T\d{6}\.\d{6}Z_[0-9a-f]{8}(?:_pre_restore)?")
         for path in self.backup_root.iterdir():
-            if path.is_symlink() or not path.is_dir() or pattern.fullmatch(path.name) is None:
+            try:
+                path_metadata = path.lstat()
+            except OSError:
+                continue
+            if (
+                is_link_or_reparse_point(path_metadata)
+                or not stat.S_ISDIR(path_metadata.st_mode)
+                or pattern.fullmatch(path.name) is None
+            ):
                 continue
             try:
                 manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
@@ -1102,8 +1156,9 @@ class AgentBackupManager:
         return managed
 
     def _ensure_backup_root(self) -> None:
-        if self.backup_root.exists() or self.backup_root.is_symlink():
-            if self.backup_root.is_symlink() or not self.backup_root.is_dir():
+        if os.path.lexists(self.backup_root):
+            metadata = self.backup_root.lstat()
+            if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
                 raise MemoryBackupError("Agent backup root must be a regular directory")
             return
         self.backup_root.mkdir(parents=True, mode=0o700)
@@ -1147,7 +1202,9 @@ def _private_lock_handle(path: Path) -> Iterator[Any]:
     except OSError as exc:
         raise MemoryBackupError(f"Unable to inspect agent backup lock: {path}") from exc
     if before_open is not None and (
-        not stat.S_ISREG(before_open.st_mode) or before_open.st_nlink != 1
+        is_link_or_reparse_point(before_open)
+        or not stat.S_ISREG(before_open.st_mode)
+        or before_open.st_nlink != 1
     ):
         raise MemoryBackupError(f"Agent backup lock must be a regular, singly linked file: {path}")
     flags = os.O_RDWR | os.O_CREAT
@@ -1166,7 +1223,8 @@ def _private_lock_handle(path: Path) -> Iterator[Any]:
             metadata,
         )
         if (
-            not stat.S_ISREG(metadata.st_mode)
+            is_link_or_reparse_point(after_open)
+            or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
             or not stat.S_ISREG(after_open.st_mode)
             or after_open.st_nlink != 1
@@ -1280,7 +1338,7 @@ def _open_regular_beneath(
     leaf_name = relative.parts[-1]
     try:
         root_before = root.lstat()
-        if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(root_before.st_mode):
+        if is_link_or_reparse_point(root_before) or not stat.S_ISDIR(root_before.st_mode):
             raise MemoryBackupError(f"Backup source root is not a real directory: {root}")
         root_descriptor = os.open(root, directory_flags)
         directory_descriptors.append(root_descriptor)
@@ -1292,7 +1350,7 @@ def _open_regular_beneath(
         current_descriptor = root_descriptor
         for part in relative.parts[:-1]:
             visible = os.stat(part, dir_fd=current_descriptor, follow_symlinks=False)
-            if stat.S_ISLNK(visible.st_mode) or not stat.S_ISDIR(visible.st_mode):
+            if is_link_or_reparse_point(visible) or not stat.S_ISDIR(visible.st_mode):
                 raise MemoryBackupError(f"Backup source parent is not a real directory: {part}")
             child_descriptor = os.open(part, directory_flags, dir_fd=current_descriptor)
             child_opened = os.fstat(child_descriptor)
@@ -1311,7 +1369,7 @@ def _open_regular_beneath(
             dir_fd=current_descriptor,
             follow_symlinks=False,
         )
-        if stat.S_ISLNK(visible_file.st_mode) or not stat.S_ISREG(visible_file.st_mode):
+        if is_link_or_reparse_point(visible_file) or not stat.S_ISREG(visible_file.st_mode):
             raise MemoryBackupError(f"Backup source is not a regular file: {relative}")
         if visible_file.st_nlink != 1:
             raise MemoryBackupError(f"Backup source is hard-linked: {relative}")
@@ -1332,7 +1390,7 @@ def _open_regular_beneath(
         for parent_descriptor, part, child_descriptor, child_identity in directory_edges:
             visible = os.stat(part, dir_fd=parent_descriptor, follow_symlinks=False)
             if (
-                stat.S_ISLNK(visible.st_mode)
+                is_link_or_reparse_point(visible)
                 or not stat.S_ISDIR(visible.st_mode)
                 or _source_identity(visible) != child_identity
                 or _source_identity(os.fstat(child_descriptor)) != child_identity
@@ -1368,17 +1426,17 @@ def _open_regular_beneath_fallback(
     current = root
     for part in relative.parts[:-1]:
         metadata = current.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
             raise MemoryBackupError(f"Backup source parent is not a real directory: {current}")
         directory_snapshots.append((current, _source_identity(metadata)))
         current /= part
     parent_metadata = current.lstat()
-    if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+    if is_link_or_reparse_point(parent_metadata) or not stat.S_ISDIR(parent_metadata.st_mode):
         raise MemoryBackupError(f"Backup source parent is not a real directory: {current}")
     directory_snapshots.append((current, _source_identity(parent_metadata)))
     path = root / relative
     path_before = path.lstat()
-    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+    if is_link_or_reparse_point(path_before) or not stat.S_ISREG(path_before.st_mode):
         raise MemoryBackupError(f"Backup source is not a regular file: {path}")
     if path_before.st_nlink != 1:
         raise MemoryBackupError(f"Backup source is hard-linked: {path}")
@@ -1401,7 +1459,7 @@ def _open_regular_beneath_fallback(
         for directory, expected in directory_snapshots:
             visible = directory.lstat()
             if (
-                stat.S_ISLNK(visible.st_mode)
+                is_link_or_reparse_point(visible)
                 or not stat.S_ISDIR(visible.st_mode)
                 or _source_identity(visible) != expected
             ):
@@ -1550,9 +1608,13 @@ def _agent_file_entry(
 
 
 def _assert_regular_private_source(component: AgentBackupComponent) -> None:
-    if component.path.is_symlink() or not component.path.is_file():
+    try:
+        metadata = component.path.lstat()
+    except OSError as exc:
+        raise MemoryBackupError(f"Invalid agent backup component: {component.name}") from exc
+    if is_link_or_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
         raise MemoryBackupError(f"Invalid agent backup component: {component.name}")
-    if component.path.stat().st_nlink != 1:
+    if metadata.st_nlink != 1:
         raise MemoryBackupError(f"Agent backup component cannot be hard-linked: {component.name}")
 
 
@@ -1564,7 +1626,16 @@ def _copy_private_file(
     target_mode: int | None = None,
 ) -> int:
     target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    source_before = source.lstat()
+    if is_link_or_reparse_point(source_before) or not stat.S_ISREG(source_before.st_mode):
+        raise MemoryBackupError(f"Agent backup source is not a regular file: {source}")
     shutil.copy2(source, target)
+    source_after = source.lstat()
+    if (
+        is_link_or_reparse_point(source_after)
+        or not os.path.samestat(source_before, source_after)
+    ):
+        raise MemoryBackupError(f"Agent backup source changed while copying: {source}")
     if target_mode is None:
         target_mode = (
             0o700 if preserve_owner_execute and source.stat().st_mode & stat.S_IXUSR else 0o600
@@ -1628,22 +1699,190 @@ def _verify_sqlite(path: Path) -> None:
         raise MemoryBackupError("SQLite backup failed integrity_check")
 
 
+def _component_source_is_present(component: AgentBackupComponent) -> bool:
+    try:
+        metadata = component.path.lstat()
+    except FileNotFoundError:
+        return False
+    if is_link_or_reparse_point(metadata):
+        raise MemoryBackupError(f"Agent backup component is linked: {component.name}")
+    expected = stat.S_ISDIR if component.kind == "directory" else stat.S_ISREG
+    return expected(metadata.st_mode)
+
+
+def _require_real_backup_directory(path: Path) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise MemoryBackupError(f"Backup directory is unavailable: {path}") from exc
+    if is_link_or_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise MemoryBackupError(f"Backup path must be a real directory: {path}")
+    return metadata
+
+
+def _snapshot_real_tree(root: Path) -> list[tuple[Path, os.stat_result]]:
+    """Snapshot a tree without following POSIX links or Windows junctions."""
+
+    root_before = _require_real_backup_directory(root)
+    try:
+        with os.scandir(root) as scanned:
+            names = sorted(entry.name for entry in scanned)
+    except OSError as exc:
+        raise MemoryBackupError(f"Backup tree is unreadable: {root}") from exc
+    root_after = _require_real_backup_directory(root)
+    if not os.path.samestat(root_before, root_after):
+        raise MemoryBackupError(f"Backup tree changed while scanning: {root}")
+    entries: list[tuple[Path, os.stat_result]] = []
+    for name in names:
+        path = root / name
+        metadata = path.lstat()
+        if is_link_or_reparse_point(metadata):
+            raise MemoryBackupError(
+                f"Backup tree contains a symlink or Windows reparse point: {path}"
+            )
+        if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+            raise MemoryBackupError(f"Backup tree contains an unsupported entry: {path}")
+        entries.append((path, metadata))
+        if stat.S_ISDIR(metadata.st_mode):
+            entries.extend(_snapshot_real_tree(path))
+    return entries
+
+
+def _reject_windows_reparse_ancestors(path: Path) -> None:
+    """Reject configured Windows paths before ``resolve`` can hide a junction."""
+
+    absolute = Path(os.path.abspath(path))
+    candidates = tuple(reversed(absolute.parents)) + (absolute,)
+    for candidate in candidates:
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if is_windows_reparse_point(metadata):
+            raise MemoryBackupError(
+                f"Agent backup path crosses a Windows reparse point: {candidate}"
+            )
+
+
+def _restore_failed_move(
+    destination: Path,
+    source: Path,
+    expected: os.stat_result,
+) -> None:
+    """Restore an exact generation if post-publication validation fails."""
+
+    try:
+        visible = destination.lstat()
+        if (
+            is_link_or_reparse_point(visible)
+            or not os.path.samestat(expected, visible)
+            or os.path.lexists(source)
+        ):
+            raise MemoryBackupError("Cannot safely restore failed backup publication")
+        if os.name == "nt" and stat.S_ISDIR(visible.st_mode):
+            os.rename(destination, source)
+        else:
+            os.replace(destination, source)
+        restored = source.lstat()
+        if is_link_or_reparse_point(restored) or not os.path.samestat(expected, restored):
+            raise MemoryBackupError("Failed backup publication restore changed identity")
+    except BaseException as exc:
+        if isinstance(exc, MemoryBackupError):
+            raise
+        raise MemoryBackupError("Failed backup publication could not be restored") from exc
+
+
 def _fsync_tree(root: Path) -> None:
-    directories = [path for path in root.rglob("*") if path.is_dir()]
+    directories = [
+        path for path, metadata in _snapshot_real_tree(root) if stat.S_ISDIR(metadata.st_mode)
+    ]
     for path in sorted(directories, reverse=True):
         _fsync_directory(path)
     _fsync_directory(root)
 
 
 def _remove_path(path: Path, *, ignore_errors: bool = False) -> None:
-    if path.is_symlink() or path.is_file():
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            if not ignore_errors:
-                raise
-    elif path.is_dir():
-        shutil.rmtree(path, ignore_errors=ignore_errors)
+    try:
+        metadata = path.lstat()
+        if is_link_or_reparse_point(metadata):
+            raise MemoryBackupError(f"Refusing to remove linked backup path: {path}")
+        if stat.S_ISREG(metadata.st_mode):
+            path.unlink()
+            return
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise MemoryBackupError(f"Refusing to remove unsupported backup path: {path}")
+        entries = _snapshot_real_tree(path)
+        for entry, expected in reversed(entries):
+            visible = entry.lstat()
+            if is_link_or_reparse_point(visible) or not os.path.samestat(expected, visible):
+                raise MemoryBackupError(f"Backup cleanup tree changed: {entry}")
+            if stat.S_ISDIR(visible.st_mode):
+                entry.rmdir()
+            else:
+                entry.unlink()
+        final_root = path.lstat()
+        if is_link_or_reparse_point(final_root) or not os.path.samestat(metadata, final_root):
+            raise MemoryBackupError(f"Backup cleanup root changed: {path}")
+        path.rmdir()
+    except FileNotFoundError:
+        return
+    except (OSError, MemoryBackupError):
+        if not ignore_errors:
+            raise
+
+
+def _replace_path(source: Path, destination: Path) -> None:
+    """Atomically move a file or directory across the backup transaction.
+
+    ``os.replace`` maps to ``MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)`` on
+    Windows. That flag rejects directory sources even when the destination is
+    absent. These transaction destinations are already required to be vacant,
+    so retry an access-denied directory publication with Windows' create-once
+    ``rename`` operation while preserving ``replace`` everywhere else.
+    """
+
+    source_before = source.lstat()
+    if is_link_or_reparse_point(source_before) or not (
+        stat.S_ISDIR(source_before.st_mode) or stat.S_ISREG(source_before.st_mode)
+    ):
+        raise MemoryBackupError(f"Refusing to move linked backup path: {source}")
+    _require_real_backup_directory(source.parent)
+    _require_real_backup_directory(destination.parent)
+    if os.path.lexists(destination):
+        destination_before = destination.lstat()
+        if is_link_or_reparse_point(destination_before):
+            raise MemoryBackupError(f"Refusing linked backup destination: {destination}")
+        raise MemoryBackupError(f"Backup move destination already exists: {destination}")
+    moved = False
+    try:
+        os.replace(source, destination)
+        moved = True
+    except PermissionError as exc:
+        if (
+            os.name != "nt"
+            or getattr(exc, "winerror", None) != 5
+            or not stat.S_ISDIR(source_before.st_mode)
+        ):
+            raise
+        source_retry = source.lstat()
+        if (
+            is_link_or_reparse_point(source_retry)
+            or not os.path.samestat(source_before, source_retry)
+            or os.path.lexists(destination)
+        ):
+            raise MemoryBackupError("Backup directory changed before Windows publication") from exc
+        os.rename(source, destination)
+        moved = True
+    try:
+        destination_after = destination.lstat()
+        if is_link_or_reparse_point(destination_after) or not os.path.samestat(
+            source_before, destination_after
+        ):
+            raise MemoryBackupError("Backup path identity changed during publication")
+    except BaseException as exc:
+        if moved:
+            _restore_failed_move(destination, source, source_before)
+        raise exc
 
 
 def _live_component_paths(component: AgentBackupComponent) -> tuple[Path, ...]:

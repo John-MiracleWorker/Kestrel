@@ -150,6 +150,40 @@ def test_signed_repair_receipt_survives_process_restart(tmp_path: Path) -> None:
         assert (repo / ".nest" / "repair_receipt_signing.v2.key").stat().st_mode & 0o777 == 0o600
 
 
+def test_repair_receipts_use_secure_windows_path_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        repair_integrity_module,
+        "_uses_windows_path_fallback",
+        lambda: True,
+    )
+    repo = _repo(tmp_path)
+    artifact_id = "repair_validation_windows_path_fallback"
+
+    write_repair_artifact(
+        repo,
+        "repair_validations",
+        artifact_id,
+        {
+            "schema_version": 1,
+            "validation_id": artifact_id,
+            "success": True,
+        },
+    )
+    reopened = repair_integrity_module.load_repair_artifact(
+        repo,
+        collection="repair_validations",
+        artifact_id=artifact_id,
+        expected_prefix="repair_validation_",
+        id_field="validation_id",
+    )
+
+    assert reopened["validation_id"] == artifact_id
+    assert reopened["success"] is True
+
+
 def test_legacy_signed_validation_and_review_receipts_are_not_authorization(
     tmp_path: Path,
 ) -> None:
@@ -433,6 +467,58 @@ def test_repair_signing_key_fault_before_publication_cleans_temp_and_recovers(
     recovered = _load_or_create_receipt_key(repo)
     assert len(recovered) == 32
     assert key_path.read_bytes() == recovered
+    assert not temp_path.exists()
+
+
+def test_repair_signing_key_failure_closes_handle_before_windows_style_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
+    temp_path = repo / ".nest" / ".repair_receipt_signing.v2.key.tmp"
+    failed_descriptor: int | None = None
+    cleanup_observations: list[bool] = []
+    original_unlink = repair_integrity_module._unlink_private_at
+
+    def fail_partial_write(descriptor: int, candidate: bytes) -> None:
+        nonlocal failed_descriptor
+        failed_descriptor = descriptor
+        assert os.write(descriptor, candidate[:7]) == 7
+        raise OSError("injected Windows signing-key write failure")
+
+    def deny_open_handle_unlink(
+        directory: repair_integrity_module._RepairDirectoryHandle,
+        name: str,
+    ) -> None:
+        assert failed_descriptor is not None
+        try:
+            os.fstat(failed_descriptor)
+        except OSError:
+            descriptor_closed = True
+        else:
+            descriptor_closed = False
+        cleanup_observations.append(descriptor_closed)
+        if not descriptor_closed:
+            raise PermissionError("Windows denies unlink of an open file")
+        original_unlink(directory, name)
+
+    monkeypatch.setattr(
+        repair_integrity_module,
+        "_write_receipt_key_bytes",
+        fail_partial_write,
+    )
+    monkeypatch.setattr(
+        repair_integrity_module,
+        "_unlink_private_at",
+        deny_open_handle_unlink,
+    )
+
+    with pytest.raises(OSError, match="injected Windows signing-key write failure"):
+        _load_or_create_receipt_key(repo)
+
+    assert cleanup_observations == [True]
+    assert not key_path.exists()
     assert not temp_path.exists()
 
 
@@ -1203,6 +1289,13 @@ def _repo(tmp_path: Path) -> Path:
     )
     subprocess.run(
         ["git", "config", "user.name", "Kestrel Test"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
         cwd=repo,
         check=True,
         capture_output=True,

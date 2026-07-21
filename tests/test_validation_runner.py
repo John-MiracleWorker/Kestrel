@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import nested_memvid_agent.extension_policy as extension_policy
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.extension_runner import (
     ContainerExecutionRequest,
@@ -71,6 +72,32 @@ def test_validation_runner_uses_private_exact_candidate_and_attests_isolation(
     assert result.isolation["source_tree_digest"].startswith("sha256:")
     assert len(runner.requests) == 1
     assert not runner.requests[0].source_dir.exists()
+
+
+def test_validation_runner_uses_secure_windows_path_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        extension_policy,
+        "_uses_windows_path_fallback",
+        lambda: True,
+    )
+    repo = _repo(tmp_path)
+    (repo / "new.txt").write_text("untracked\n", encoding="utf-8")
+    runner = _InspectingRunner()
+
+    result = run_isolated_validation(
+        workspace=repo,
+        image=PINNED_IMAGE,
+        command=["python", "tracked.py"],
+        timeout_seconds=5,
+        runner=runner,
+    )
+
+    assert result.returncode == 0
+    assert result.isolation["source_tree_digest"].startswith("sha256:")
+    assert len(runner.requests) == 1
 
 
 def test_validation_runner_has_no_host_fallback_without_pinned_image(

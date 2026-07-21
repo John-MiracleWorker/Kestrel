@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -126,6 +127,59 @@ def test_container_runner_snapshots_outside_source_and_workspace(tmp_path: Path)
     snapshot = Path(_mount_options(extension_mount)["source"])
     assert source not in snapshot.parents
     assert workspace not in snapshot.parents
+    assert not snapshot.exists()
+
+
+def test_private_snapshot_root_rejects_unverified_permission_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "snapshot-root"
+    source = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    root.mkdir()
+    source.mkdir()
+    workspace.mkdir()
+
+    def reject(_path: Path) -> None:
+        raise extension_runner.PrivateDirectoryError(
+            "private_directory_windows_trustee_unsafe"
+        )
+
+    monkeypatch.setattr(
+        extension_runner,
+        "validate_owner_private_directory",
+        reject,
+    )
+
+    with pytest.raises(
+        ExtensionPolicyError,
+        match="extension_snapshot_location_not_private",
+    ):
+        extension_runner._private_snapshot_root(  # noqa: SLF001
+            root,
+            source=source,
+            workspace=workspace,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows ACL semantics required")
+def test_windows_runner_reaches_engine_and_cleans_private_snapshot(
+    tmp_path: Path,
+) -> None:
+    engine, log_path = _fake_engine(tmp_path)
+    source = _skill_tree(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    result = OCIContainerRunner(engine_command=engine).run(
+        _request(source, workspace)
+    )
+
+    assert result.success is True
+    run_call = _engine_calls(log_path)[0]
+    extension_mount = next(item for item in run_call if "target=/extension" in item)
+    snapshot = Path(_mount_options(extension_mount)["source"])
     assert not snapshot.exists()
 
 

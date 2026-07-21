@@ -182,7 +182,8 @@ def test_event_log_tail_reads_only_a_bounded_suffix(
     assert [event.id for event in events] == ["evt_tail_1", "evt_tail_2"]
     assert requested_reads
     assert sum(requested_reads) <= 4096
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_event_log_redacts_common_secret_shapes(tmp_path: Path) -> None:

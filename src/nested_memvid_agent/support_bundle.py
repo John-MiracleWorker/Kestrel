@@ -17,7 +17,11 @@ from typing import Any, BinaryIO
 
 from .config import AgentConfig
 from .event_log import read_bounded_jsonl_tail, redact_secrets
-from .platform_primitives import chmod_descriptor
+from .platform_primitives import (
+    chmod_descriptor,
+    is_link_or_reparse_point,
+    is_windows_reparse_point,
+)
 from .product_readiness import build_product_readiness_report
 from .repair_integrity import (
     hardened_readonly_git_command,
@@ -460,28 +464,41 @@ def _is_safe_event_text_field(field_name: str | None) -> bool:
 
 def _log_files(log_dir: Path) -> list[dict[str, Any]]:
     resolved = log_dir.expanduser()
-    if resolved.is_symlink() or not resolved.exists() or not resolved.is_dir():
+    try:
+        _reject_windows_reparse_ancestors(resolved, label="log directory")
+        root_metadata = resolved.lstat()
+    except (OSError, ValueError):
+        return []
+    if is_link_or_reparse_point(root_metadata) or not stat.S_ISDIR(root_metadata.st_mode):
         return []
     files: list[dict[str, Any]] = []
     for path in sorted(item for item in resolved.iterdir() if _safe_log_file(item, resolved)):
-        stat = path.stat()
+        file_metadata = path.lstat()
         files.append(
             {
                 "name": path.name,
-                "size_bytes": stat.st_size,
-                "modified_at": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                "size_bytes": file_metadata.st_size,
+                "modified_at": datetime.fromtimestamp(file_metadata.st_mtime, UTC).isoformat(),
             }
         )
     return files
 
 
 def _safe_log_file(path: Path, root: Path) -> bool:
-    if root.is_symlink() or path.is_symlink() or not path.is_file():
-        return False
     try:
+        _reject_windows_reparse_ancestors(root, label="log directory")
+        root_metadata = root.lstat()
+        path_metadata = path.lstat()
+        if (
+            is_link_or_reparse_point(root_metadata)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or is_link_or_reparse_point(path_metadata)
+            or not stat.S_ISREG(path_metadata.st_mode)
+        ):
+            return False
         resolved_root = root.resolve(strict=True)
         resolved_path = path.resolve(strict=True)
-    except (FileNotFoundError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return False
     return resolved_root in resolved_path.parents
 
@@ -500,16 +517,25 @@ def _write_support_archive_exclusive(
     """Build, validate, and publish a private ZIP without replacing a path."""
 
     parent = bundle_path.parent
-    directory_fd = _open_bundle_directory(parent)
+    _reject_windows_reparse_ancestors(parent, label="support bundle destination")
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    preopen_parent_identity = _pin_bundle_parent(parent)
+    directory_fd = _open_bundle_directory(
+        parent,
+        expected_identity=preopen_parent_identity,
+    )
+    parent_identity = preopen_parent_identity if directory_fd is None else None
     temporary_name: str | None = None
     temporary_identity: tuple[int, int] | None = None
     published = False
     try:
+        _revalidate_bundle_parent(directory_fd, parent, parent_identity)
         _require_absent_bundle_destination(directory_fd, parent, bundle_path.name)
         descriptor, temporary_name, temporary_identity = _create_bundle_temporary(
             directory_fd,
             parent,
         )
+        _revalidate_bundle_parent(directory_fd, parent, parent_identity)
         try:
             if os.name != "nt":
                 chmod_descriptor(descriptor, _PRIVATE_BUNDLE_MODE)
@@ -528,6 +554,7 @@ def _write_support_archive_exclusive(
                 handle.flush()
                 os.fsync(handle.fileno())
                 _validate_support_archive(handle, expected_entries=expected_entries)
+                _revalidate_bundle_parent(directory_fd, parent, parent_identity)
                 _verify_bundle_entry_identity(
                     directory_fd,
                     parent,
@@ -535,6 +562,7 @@ def _write_support_archive_exclusive(
                     expected_identity=temporary_identity,
                     expected_links=1,
                 )
+                _revalidate_bundle_parent(directory_fd, parent, parent_identity)
                 _require_absent_bundle_destination(directory_fd, parent, bundle_path.name)
                 _publish_bundle_entry(
                     directory_fd,
@@ -543,6 +571,7 @@ def _write_support_archive_exclusive(
                     bundle_path.name,
                 )
                 published = True
+                _revalidate_bundle_parent(directory_fd, parent, parent_identity)
                 _verify_bundle_entry_identity(
                     directory_fd,
                     parent,
@@ -550,48 +579,59 @@ def _write_support_archive_exclusive(
                     expected_identity=temporary_identity,
                     expected_links=2,
                 )
-                _remove_bundle_entry_if_identity(
-                    directory_fd,
-                    parent,
-                    temporary_name,
-                    expected_identity=temporary_identity,
-                )
-                temporary_name = None
-                _verify_bundle_entry_identity(
-                    directory_fd,
-                    parent,
-                    bundle_path.name,
-                    expected_identity=temporary_identity,
-                    expected_links=1,
-                )
-                _fsync_bundle_directory(directory_fd, parent)
+            # Windows does not permit unlinking a file while this process has
+            # it open without delete sharing.  Keep the descriptor through
+            # archive validation and create-once publication, then close it
+            # before removing the temporary hard-link name.  POSIX retains the
+            # same identity and link-count checks on both sides of publication.
+            _revalidate_bundle_parent(directory_fd, parent, parent_identity)
+            _remove_bundle_entry_if_identity(
+                directory_fd,
+                parent,
+                temporary_name,
+                expected_identity=temporary_identity,
+            )
+            _revalidate_bundle_parent(directory_fd, parent, parent_identity)
+            temporary_name = None
+            _verify_bundle_entry_identity(
+                directory_fd,
+                parent,
+                bundle_path.name,
+                expected_identity=temporary_identity,
+                expected_links=1,
+            )
+            _fsync_bundle_directory(directory_fd, parent)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
     except BaseException as exc:
         if published and temporary_identity is not None:
             try:
+                _revalidate_bundle_parent(directory_fd, parent, parent_identity)
                 _remove_bundle_entry_if_identity(
                     directory_fd,
                     parent,
                     bundle_path.name,
                     expected_identity=temporary_identity,
                 )
-            except OSError as cleanup_error:
+                _revalidate_bundle_parent(directory_fd, parent, parent_identity)
+            except (OSError, ValueError) as cleanup_error:
                 exc.add_note(f"Unable to remove failed support bundle publication: {cleanup_error}")
         if temporary_name is not None and temporary_identity is not None:
             try:
+                _revalidate_bundle_parent(directory_fd, parent, parent_identity)
                 _remove_bundle_entry_if_identity(
                     directory_fd,
                     parent,
                     temporary_name,
                     expected_identity=temporary_identity,
                 )
-            except OSError as cleanup_error:
+                _revalidate_bundle_parent(directory_fd, parent, parent_identity)
+            except (OSError, ValueError) as cleanup_error:
                 exc.add_note(f"Unable to remove support bundle temporary file: {cleanup_error}")
         try:
             _fsync_bundle_directory(directory_fd, parent)
-        except OSError as cleanup_error:
+        except (OSError, ValueError) as cleanup_error:
             exc.add_note(f"Unable to sync support bundle cleanup: {cleanup_error}")
         raise
     finally:
@@ -626,10 +666,17 @@ def _validate_support_archive(
             raise ValueError(f"Support bundle archive entry failed validation: {corrupt_entry}")
 
 
-def _open_bundle_directory(parent: Path) -> int | None:
+def _open_bundle_directory(
+    parent: Path,
+    *,
+    expected_identity: os.stat_result,
+) -> int | None:
+    _reject_windows_reparse_ancestors(parent, label="support bundle destination")
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     before_open = os.lstat(parent)
     _validate_bundle_directory(before_open, parent)
+    if not os.path.samestat(expected_identity, before_open):
+        raise ValueError("Support bundle destination directory changed before opening.")
     directory_flag = _bundle_directory_fd_flag()
     if directory_flag is None:
         return None
@@ -642,7 +689,10 @@ def _open_bundle_directory(parent: Path) -> int | None:
         after_open = os.lstat(parent)
         _validate_bundle_directory(opened, parent)
         _validate_bundle_directory(after_open, parent)
-        if not os.path.samestat(before_open, opened) or not os.path.samestat(opened, after_open):
+        if (
+            not os.path.samestat(expected_identity, opened)
+            or not os.path.samestat(opened, after_open)
+        ):
             raise ValueError("Support bundle destination directory changed during validation.")
     except BaseException:
         os.close(descriptor)
@@ -665,8 +715,10 @@ def _bundle_directory_fd_flag() -> int | None:
 
 
 def _validate_bundle_directory(metadata: os.stat_result, path: Path) -> None:
-    if stat.S_ISLNK(metadata.st_mode):
-        raise ValueError(f"Support bundle destination directory must not be a symbolic link: {path}")
+    if is_link_or_reparse_point(metadata):
+        raise ValueError(
+            f"Support bundle destination directory must not be a link or reparse point: {path}"
+        )
     if not stat.S_ISDIR(metadata.st_mode):
         raise NotADirectoryError(f"Support bundle destination parent is not a directory: {path}")
     mode = stat.S_IMODE(metadata.st_mode)
@@ -674,6 +726,38 @@ def _validate_bundle_directory(metadata: os.stat_result, path: Path) -> None:
         raise PermissionError(
             f"Support bundle destination directory must not be group/world writable: {path}"
         )
+
+
+def _pin_bundle_parent(parent: Path) -> os.stat_result:
+    metadata = os.lstat(parent)
+    _validate_bundle_directory(metadata, parent)
+    return metadata
+
+
+def _revalidate_bundle_parent(
+    directory_fd: int | None,
+    parent: Path,
+    expected: os.stat_result | None,
+) -> None:
+    if directory_fd is not None:
+        return
+    if expected is None:
+        raise ValueError("Support bundle destination identity was not pinned.")
+    visible = os.lstat(parent)
+    _validate_bundle_directory(visible, parent)
+    if not os.path.samestat(expected, visible):
+        raise ValueError("Support bundle destination directory changed during publication.")
+
+
+def _reject_windows_reparse_ancestors(path: Path, *, label: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    for candidate in tuple(reversed(absolute.parents)) + (absolute,):
+        try:
+            metadata = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        if is_windows_reparse_point(metadata):
+            raise ValueError(f"{label} crosses a Windows reparse point: {candidate}")
 
 
 def _create_bundle_temporary(
@@ -739,7 +823,7 @@ def _validate_bundle_file(
     path: Path,
     expected_links: int,
 ) -> None:
-    if not stat.S_ISREG(metadata.st_mode):
+    if is_link_or_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"Support bundle artifacts must be regular files: {path}")
     if metadata.st_nlink != expected_links:
         raise ValueError(f"Support bundle artifact has unsafe hard-link metadata: {path}")
@@ -789,8 +873,10 @@ def _remove_bundle_entry_if_identity(
         metadata = _bundle_entry_stat(directory_fd, parent, name)
     except FileNotFoundError:
         return
-    if (metadata.st_dev, metadata.st_ino) != expected_identity or not stat.S_ISREG(
-        metadata.st_mode
+    if (
+        (metadata.st_dev, metadata.st_ino) != expected_identity
+        or is_link_or_reparse_point(metadata)
+        or not stat.S_ISREG(metadata.st_mode)
     ):
         return
     _unlink_bundle_entry(directory_fd, parent, name)
@@ -809,6 +895,8 @@ def _fsync_bundle_directory(directory_fd: int | None, parent: Path) -> None:
     opened_here = False
     descriptor = directory_fd
     if descriptor is None:
+        metadata = os.lstat(parent)
+        _validate_bundle_directory(metadata, parent)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
         descriptor = os.open(parent, flags)
         opened_here = True
