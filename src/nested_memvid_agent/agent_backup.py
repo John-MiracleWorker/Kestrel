@@ -28,6 +28,7 @@ from .memory_backup import (
     _write_json_atomic,
 )
 from .models import MemoryLayer
+from .platform_primitives import chmod_descriptor
 from .runtime_ownership import PrimaryRuntimeOwnership
 
 AgentBackupKind = Literal["directory", "file", "sqlite"]
@@ -1584,7 +1585,7 @@ def _apply_private_file_mode(
     """Apply a private mode using the strongest native platform primitive."""
 
     if _ENFORCE_EXACT_POSIX_MODES:
-        os.fchmod(descriptor, mode)
+        chmod_descriptor(descriptor, mode)
         return
     # Native Windows has no exact POSIX mode model and may not expose fchmod.
     # chmod still clears a read-only attribute while the manifest retains the

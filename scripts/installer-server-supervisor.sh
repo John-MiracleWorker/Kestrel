@@ -30,13 +30,13 @@ process_group_tmp=""
 child_pid=""
 child_pgid=""
 
-# shellcheck disable=SC2329  # Invoked by the EXIT-trap cleanup path.
+# shellcheck disable=SC2317,SC2329  # Invoked by the EXIT-trap cleanup path.
 process_group_has_live_members() {
   ps -ax -o pid=,pgid=,stat= 2>/dev/null |
     awk -v target="$1" '$2 == target && $3 !~ /^Z/ { found=1 } END { exit(found ? 0 : 1) }'
 }
 
-# shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2317,SC2329  # Invoked indirectly by the EXIT trap.
 cleanup() {
   local status="$?"
   trap - EXIT INT TERM

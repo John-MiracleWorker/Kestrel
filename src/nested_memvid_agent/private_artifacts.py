@@ -5,6 +5,8 @@ import stat
 from pathlib import Path
 from uuid import uuid4
 
+from .platform_primitives import chmod_descriptor
+
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 _TASK_CAPSULE_ARTIFACT_NAMES = (
@@ -42,7 +44,7 @@ def ensure_private_directory(path: Path) -> None:
         _validate_directory(after_open, resolved)
         if not os.path.samestat(before_open, opened) or not os.path.samestat(opened, after_open):
             raise ValueError(f"Sensitive artifact directory changed during validation: {resolved}")
-        os.fchmod(descriptor, PRIVATE_DIRECTORY_MODE)
+        chmod_descriptor(descriptor, PRIVATE_DIRECTORY_MODE)
     finally:
         os.close(descriptor)
 
@@ -77,7 +79,7 @@ def harden_private_file(path: Path, *, missing_ok: bool = False) -> bool:
         if not os.path.samestat(before_open, opened) or not os.path.samestat(opened, after_open):
             raise ValueError(f"Sensitive artifact changed during validation: {resolved}")
         if os.name != "nt":
-            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+            chmod_descriptor(descriptor, PRIVATE_FILE_MODE)
     finally:
         os.close(descriptor)
     return True
@@ -110,7 +112,7 @@ def read_private_text(
         if not os.path.samestat(before_open, opened) or not os.path.samestat(opened, after_open):
             raise ValueError(f"Sensitive artifact changed during validation: {resolved}")
         if os.name != "nt":
-            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+            chmod_descriptor(descriptor, PRIVATE_FILE_MODE)
         with os.fdopen(descriptor, "r", encoding=encoding) as handle:
             descriptor = -1
             return handle.read()
@@ -137,7 +139,7 @@ def create_private_empty_file(path: Path) -> None:
         metadata = os.fstat(descriptor)
         _validate_file(metadata, resolved)
         if os.name != "nt":
-            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+            chmod_descriptor(descriptor, PRIVATE_FILE_MODE)
     finally:
         os.close(descriptor)
 
@@ -167,7 +169,7 @@ def open_private_file_descriptor(path: Path) -> int:
         ):
             raise ValueError(f"Sensitive artifact changed during validation: {resolved}")
         if os.name != "nt":
-            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+            chmod_descriptor(descriptor, PRIVATE_FILE_MODE)
     except Exception:
         os.close(descriptor)
         raise
@@ -188,7 +190,7 @@ def write_private_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
         metadata = os.fstat(descriptor)
         _validate_file(metadata, temporary)
         if os.name != "nt":
-            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+            chmod_descriptor(descriptor, PRIVATE_FILE_MODE)
         with os.fdopen(descriptor, "w", encoding=encoding) as handle:
             descriptor = -1
             handle.write(text)
@@ -231,7 +233,7 @@ def write_private_text_exclusive(
         metadata = os.fstat(descriptor)
         _validate_file(metadata, temporary)
         if os.name != "nt":
-            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+            chmod_descriptor(descriptor, PRIVATE_FILE_MODE)
         _write_private_bytes(descriptor, text.encode(encoding))
         _sync_private_file(descriptor)
         os.close(descriptor)
@@ -457,7 +459,7 @@ def _harden_owner_only_directory(path: Path) -> None:
         _validate_directory(after_open, path)
         if not os.path.samestat(before_open, opened) or not os.path.samestat(opened, after_open):
             raise ValueError(f"Sensitive artifact directory changed during validation: {path}")
-        os.fchmod(descriptor, PRIVATE_DIRECTORY_MODE)
+        chmod_descriptor(descriptor, PRIVATE_DIRECTORY_MODE)
     finally:
         os.close(descriptor)
 

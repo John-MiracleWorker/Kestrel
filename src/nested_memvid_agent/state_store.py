@@ -16,6 +16,7 @@ from time import sleep
 from typing import Any
 
 from .file_lock import lock_exclusive, unlock
+from .platform_primitives import chmod_descriptor
 from .private_artifacts import open_private_file_descriptor
 from .routine_limits import (
     MAX_ROUTINE_INTERVAL_SECONDS,
@@ -5128,7 +5129,7 @@ def _state_initialization_lock(path: Path) -> Iterator[None]:
         directory_fd = _open_owned_state_directory(path.parent)
         try:
             if created_directory:
-                os.fchmod(directory_fd, _STATE_DIRECTORY_MODE)
+                chmod_descriptor(directory_fd, _STATE_DIRECTORY_MODE)
         finally:
             os.close(directory_fd)
     descriptor = open_private_file_descriptor(_state_initialization_lock_path(path))
@@ -5148,7 +5149,7 @@ def _prepare_private_sqlite_storage(path: Path) -> None:
     directory_fd = _open_owned_state_directory(directory)
     try:
         if created_directory:
-            os.fchmod(directory_fd, _STATE_DIRECTORY_MODE)
+            chmod_descriptor(directory_fd, _STATE_DIRECTORY_MODE)
         _harden_sqlite_entry(
             directory_fd,
             path.name,
@@ -5271,7 +5272,7 @@ def _harden_sqlite_entry(
     try:
         metadata = os.fstat(descriptor)
         _validate_sqlite_file(metadata, display_path)
-        os.fchmod(descriptor, _SQLITE_FILE_MODE)
+        chmod_descriptor(descriptor, _SQLITE_FILE_MODE)
     finally:
         os.close(descriptor)
 

@@ -60,6 +60,7 @@ def test_container_runner_uses_fixed_default_deny_argv_and_bounded_payload(tmp_p
         "--env=HOME=/tmp",
     ):
         assert option in argv
+    assert not any(item.startswith("--ulimit=nproc=") for item in argv)
     assert any(item.endswith("target=/extension,readonly") for item in argv)
     assert any(item.endswith("target=/workspace/inputs,readonly") for item in argv)
     scope_mount = next(item for item in argv if "target=/workspace/inputs" in item)

@@ -21,7 +21,10 @@ CapabilityGate = Callable[[ToolSpec], tuple[bool, str]]
 # opt into settlement waiting get a larger, still-hard-bounded window.  Once
 # either window expires the only safe answer is "outcome unresolved" -- never a
 # retryable timeout that could duplicate a side effect which committed late.
-_CANCELLATION_SETTLEMENT_SECONDS = 0.25
+# Leave enough scheduler margin for a worker that is already near completion
+# when its deadline expires. This remains a hard bound: once it elapses, the
+# outcome stays unresolved, non-retryable, resource-retained, and quarantined.
+_CANCELLATION_SETTLEMENT_SECONDS = 0.50
 _CANCELLATION_HOOK_MAX_SECONDS = 0.10
 _TRUSTED_SETTLEMENT_MAX_SECONDS = 5.0
 

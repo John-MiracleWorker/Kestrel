@@ -17,6 +17,7 @@ from typing import Any, BinaryIO
 
 from .config import AgentConfig
 from .event_log import read_bounded_jsonl_tail, redact_secrets
+from .platform_primitives import chmod_descriptor
 from .product_readiness import build_product_readiness_report
 from .repair_integrity import (
     hardened_readonly_git_command,
@@ -511,7 +512,7 @@ def _write_support_archive_exclusive(
         )
         try:
             if os.name != "nt":
-                os.fchmod(descriptor, _PRIVATE_BUNDLE_MODE)
+                chmod_descriptor(descriptor, _PRIVATE_BUNDLE_MODE)
             temporary_metadata = os.fstat(descriptor)
             _validate_bundle_file(
                 temporary_metadata,
@@ -629,10 +630,11 @@ def _open_bundle_directory(parent: Path) -> int | None:
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     before_open = os.lstat(parent)
     _validate_bundle_directory(before_open, parent)
-    if not _bundle_directory_fd_supported():
+    directory_flag = _bundle_directory_fd_flag()
+    if directory_flag is None:
         return None
 
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | directory_flag | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(parent, flags)
     try:
@@ -648,15 +650,18 @@ def _open_bundle_directory(parent: Path) -> int | None:
     return descriptor
 
 
-def _bundle_directory_fd_supported() -> bool:
-    return (
-        os.name != "nt"
-        and hasattr(os, "O_DIRECTORY")
-        and os.open in os.supports_dir_fd
-        and os.stat in os.supports_dir_fd
-        and os.link in os.supports_dir_fd
-        and os.unlink in os.supports_dir_fd
-    )
+def _bundle_directory_fd_flag() -> int | None:
+    value: object = getattr(os, "O_DIRECTORY", None)
+    if (
+        os.name == "nt"
+        or not isinstance(value, int)
+        or os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.link not in os.supports_dir_fd
+        or os.unlink not in os.supports_dir_fd
+    ):
+        return None
+    return value
 
 
 def _validate_bundle_directory(metadata: os.stat_result, path: Path) -> None:

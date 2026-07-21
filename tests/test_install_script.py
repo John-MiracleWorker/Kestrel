@@ -306,6 +306,16 @@ def _current_tree_git_repo(tmp_path: Path) -> Path:
     assert not (source / "tiuni-fun").exists()
     assert all(_fixture_source_allowed(relative) for relative in copied_files)
     subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Kestrel Installer Test"],
+        cwd=source,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "kestrel-installer@example.invalid"],
+        cwd=source,
+        check=True,
+    )
     subprocess.run(["git", "add", "."], cwd=source, check=True)
     subprocess.run(
         [
@@ -1868,13 +1878,13 @@ def test_failed_health_kills_term_ignoring_server_and_grandchild_group(tmp_path:
     server_marker = home / "stubborn-server.pid"
     descendant_marker = home / "stubborn-descendant.pid"
     late_mutation = home / "late-mutation"
+    late_mutation_command = f"printf 'escaped' >{shlex.quote(str(late_mutation))}"
     grandchild = home / "stubborn-grandchild"
     grandchild.write_text(
         "#!/usr/bin/env bash\n"
         "trap '' TERM INT\n"
+        f"trap {shlex.quote(late_mutation_command)} EXIT\n"
         f"printf '%s\\n' \"$$\" >{shlex.quote(str(descendant_marker))}\n"
-        "sleep 5\n"
-        f"printf 'escaped' >{shlex.quote(str(late_mutation))}\n"
         "while :; do sleep 0.1; done\n",
         encoding="utf-8",
     )
@@ -1922,7 +1932,6 @@ def test_failed_health_kills_term_ignoring_server_and_grandchild_group(tmp_path:
     assert not supervisor_pid_file.exists()
     assert not process_group_file.exists()
     assert "full server process group" in result.stdout
-    time.sleep(2.5)
     assert not late_mutation.exists()
 
 

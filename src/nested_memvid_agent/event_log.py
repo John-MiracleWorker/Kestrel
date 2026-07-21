@@ -10,6 +10,7 @@ from typing import IO, Any, cast
 from uuid import uuid4
 
 from .file_lock import lock_exclusive, lock_shared, unlock
+from .platform_primitives import chmod_descriptor
 from .security_boundary import redact_secrets as redact_secrets
 
 _LOG_DIRECTORY_MODE = 0o700
@@ -166,7 +167,7 @@ def _prepare_event_log_storage(path: Path) -> None:
     directory_fd = _open_owned_log_directory(path.parent)
     try:
         if created_directory:
-            os.fchmod(directory_fd, _LOG_DIRECTORY_MODE)
+            chmod_descriptor(directory_fd, _LOG_DIRECTORY_MODE)
         descriptor = _open_event_entry(
             directory_fd,
             path.name,
@@ -289,7 +290,7 @@ def _open_event_entry(
     try:
         metadata = os.fstat(descriptor)
         _validate_event_file(metadata, display_path)
-        os.fchmod(descriptor, _EVENT_FILE_MODE)
+        chmod_descriptor(descriptor, _EVENT_FILE_MODE)
     except Exception:
         os.close(descriptor)
         raise

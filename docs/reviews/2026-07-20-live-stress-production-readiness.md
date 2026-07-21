@@ -27,9 +27,11 @@ the installed release environment. Those artifacts predate the final release com
 workflow-produced payload and `SHA256SUMS` are publication authority.
 
 **Exact public release: PRE-PUBLICATION HOLD.** The `v0.4.0` release metadata gate now passes,
-including the dated changelog. Remaining gates are the exact pull-request-head hosted CI run, one
-independent human approval, PyPI Trusted Publisher registration, repository immutable releases
-before tagging, first-publish GHCR visibility, and post-publication verification.
+including the dated changelog. The first pull-request run exposed ShellCheck 0.9, Windows typing,
+OCI process-limit, and hermetic-test defects; each was reproduced and corrected, and the complete
+local release gate is green. Remaining gates are a successful run for the latest exact pull-request
+head, one independent human approval, PyPI Trusted Publisher registration, repository immutable
+releases before tagging, first-publish GHCR visibility, and post-publication verification.
 
 **Credential incident: RESOLVED WITH A DOCUMENTED RESIDUAL.** GitHub reports zero open secret
 alerts. Alert 1 was resolved as revoked after a provider probe returned `API_KEY_INVALID`.
@@ -48,11 +50,11 @@ and no claim of bit-for-bit reproducibility is made.
 
 | Area | Current result |
 |---|---|
-| Aggregate Python suite | **PASS on the final runtime-source tree** — 1,830 collected; 1,775 passed; 55 intentional opt-in skips; 0 failed. Only the known third-party Starlette/httpx deprecation warning was emitted. |
-| Enabled integrations | **PASS** — 23/23: 18 Memvid (42.32 s), 1 stdio MCP, and 4 real OCI-container cases. |
+| Aggregate Python suite | **PASS on the final runtime-source tree** — 1,835 collected; 1,780 passed; 55 intentional opt-in skips; 0 failed. Only the known third-party Starlette/httpx deprecation warning was emitted. |
+| Enabled integrations | **PASS** — 23/23: 18 Memvid (50.28 s), 1 stdio MCP (13.03 s), and 4 real OCI-container cases (6.42 s). |
 | Local live provider | **PASS for Ollama/Qwen only** — generate, stream, and native-tool certification passed; 27 credential-dependent provider cases were skipped, not counted as passes. |
 | Deterministic benchmark bundle | **PASS** — memory, 4/4 agent tasks, 6/6 recovery tasks with 9 injected errors, and learning acceptance all passed. |
-| Golden evaluations | **PASS after OCI-path corrections** — memory 21/21, maximum 7,739.57 ms; Memvid 21/21, maximum 10,227.81 ms; 45 s per-case gate. Cost was unmeasured and was not an acceptance gate. |
+| Golden evaluations | **PASS after OCI-path corrections** — memory 21/21, maximum 7,915.02 ms; Memvid 21/21, maximum 10,218.98 ms; 45 s per-case gate. Cost was unmeasured and was not an acceptance gate. |
 | Memory-system evaluation | **PASS** — 9/9, 17 writes, 13 hits, 0 policy writes. |
 | Live learning | **PASS** — Qwen memory 8/8 and Qwen Memvid 8/8; evidence-gated behavior activation occurred; policy stayed empty. |
 | Large retrieval benchmark | **PASS versus its TF-IDF baseline, but quality-limited** — recall@5 0.449, precision@5 0.090, MRR 0.235 on 665 documents / 136 queries. |
@@ -69,15 +71,14 @@ and no claim of bit-for-bit reproducibility is made.
 | Current source-candidate secret scan | **PASS** — a 438-file source-only candidate assembled from tracked and non-ignored untracked files produced zero unallowed findings with pinned Gitleaks 8.30.1. The tag workflow now materializes and scans the exact release commit instead of failing on revoked historical bytes. |
 | Public history | **RESOLVED CREDENTIAL RESPONSE** — zero open GitHub alerts; the historical Google key is provider-invalid and revoked; the local Gmail artifact was never in the public remote; no history rewrite is required under the documented revoke-first decision. |
 | GitHub controls | **PARTIAL PASS** — branch ruleset `19198902` has no bypass and requires one approving review plus strict aggregate `docker`; tag ruleset `19299564` has no bypass and blocks update/deletion of `v*`; validity and non-provider scanning remain unavailable under the current plan. The `pypi` environment requires explicit owner approval and disallows admin bypass. |
-| Hosted exact-candidate CI | **NOT RUN** — the successful `origin/main` run predates this candidate and is not a substitute. |
+| Hosted exact-candidate CI | **PR OPEN; LATEST HEAD IS AUTHORITATIVE** — PR [#270](https://github.com/John-MiracleWorker/Kestrel/pull/270). Run [29790915475](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29790915475) on the first head exposed the cross-platform and runner defects described below. The ruleset-required latest-head rerun must pass before merge. |
 
 The aggregate Python suite emitted the known third-party Starlette/httpx TestClient deprecation
 warning. No Kestrel test failed in that run.
 
-The final local freeze reran `uv run pytest -q -o addopts=''` after the runtime, provider,
-exact-wheel, release-workflow, and interrupt-safe legacy restore regressions were added: 1,775 passed
-and 55 opt-in cases skipped in 206.01 seconds. The exact Memvid v2 integration selection separately
-passed 18/18 in 47.75 seconds.
+The final local freeze reran `uv run pytest -q` after the hosted-failure corrections were added:
+1,780 passed and 55 opt-in cases skipped. The exact Memvid v2 integration selection separately
+passed 18/18 in 50.28 seconds.
 Focused runtime-fence/provider review passed 126 tests, release/install/supply-chain validation passed
 132 with one opt-in installer case skipped, and pinned `actionlint` 1.7.7 accepted both workflows.
 
@@ -90,7 +91,8 @@ Focused runtime-fence/provider review passed 126 tests, release/install/supply-c
 - The opt-in Memvid log is `posthardening/pytest-memvid-integration-final.log`, SHA-256
   `e3da95fae2f1f91f25793f4a09e2e62278447ddeaf3508054c5a057b0a401088`; all 18 cases
   passed without skips.
-- CI-scoped Ruff, mypy over 123 source files, compileall, `uv lock --check`, `git diff --check`,
+- CI-scoped Ruff, native and Windows-targeted mypy over 124 source files, compileall,
+  `uv lock --check`, `git diff --check`,
   Bash syntax, ShellCheck, Bandit high-severity gating, development metadata, web tests/build,
   generated notices, and npm audit are green. A deliberately broad Ruff invocation found minor
   import-order and unused-import defects in three tracked root-level manual provider probes outside
@@ -399,9 +401,9 @@ identity because that version does not exist on PyPI. Evidence lives under
 `posthardening/package-evidence/`.
 
 The latest disposable artifact campaign produced wheel SHA-256
-`0c9bef23f8b73eb71973121f40e3fc5fccb53b23db8d1623ea58e4f4f2291661` (815,506 bytes) and
-sdist SHA-256 `e2bdd34f512812c84b7a8e0d2e405322dda88b25b97add6a00804913d7f02ecf`
-(779,227 bytes). They are local validation evidence only; the tag workflow must rebuild and attest
+`7c0b245084e6e39a8e3622b142f275c35c25a81cf2e2f8b1ed141bf36ecf7be6` (817,010 bytes) and
+sdist SHA-256 `5d5b667802e4db0e417aca5ab8d816ac85ba9dd70dc862a7885833219600ea77`
+(780,388 bytes). They are local validation evidence only; the tag workflow must rebuild and attest
 the final commit.
 
 These controls and artifacts are still not proof of publication. The `v0.4.0` metadata is now
@@ -517,6 +519,14 @@ The campaign found and addressed release-significant problems rather than only r
     interruptions around its live-directory swap. It now rolls back on `BaseException`, preserves
     incomplete-recovery evidence, and has a fault-injection regression proving exact original bytes
     survive a `KeyboardInterrupt` after the live directory moves.
+24. The first exact pull-request run exposed four portability assumptions: ShellCheck 0.9 treated
+    EXIT-trap callbacks as unreachable; Windows mypy could not type POSIX-only `os` and `signal`
+    members; a container `RLIMIT_NPROC` inherited host-real-UID accounting despite an existing
+    cgroup PID limit; and several tests depended on built web assets, global Git identity, symlink
+    traversal, or overly tight cleanup timing. Platform primitives are now dynamically and strictly
+    typed, the redundant UID-scoped limit is removed while `--pids-limit=64` remains, fixtures are
+    hermetic, symlinks are consistently excluded, and unresolved tool outcomes retain their bounded
+    fail-closed quarantine behavior.
 
 ## Residual limitations
 
@@ -550,7 +560,8 @@ The campaign found and addressed release-significant problems rather than only r
 
 ## Public-release blocker sequence
 
-1. Commit the curated candidate, open its pull request, and run exact pull-request-head hosted CI.
+1. Push the hosted-failure corrections to PR #270 and require successful CI for its latest exact
+   pull-request head.
 2. Add a trusted reviewer/collaborator and obtain the ruleset-required independent approval.
    `John-MiracleWorker` is currently the only collaborator, so self-approval cannot close this gate.
 3. In PyPI, register the pending Trusted Publisher for project `nested-memvid-agent`, owner
@@ -574,7 +585,8 @@ a real model, uses tools, persists and reopens canonical Memvid v2 memory, learn
 gates, blocks the exercised unapproved high-risk and sensitive-file operations, behaves predictably
 under bounded overload, and exposes a usable, accessible workbench. Local code-side release blockers
 are closed and the final local exact-candidate gates are green. Remaining work is controlled
-publication: exact pull-request CI, independent human approval, PyPI OIDC registration, immutable
+publication: successful CI for the latest PR head, independent human approval, PyPI OIDC
+registration, immutable
 release enablement, tagging, first GHCR visibility, and post-publication verification. The historical
 Google credential is revoked and its alert resolved; a destructive history rewrite is intentionally
 not required.

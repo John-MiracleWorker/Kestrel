@@ -2649,6 +2649,20 @@ def test_repair_prepare_requires_approval_even_when_file_write_enabled(tmp_path:
 
 def _init_git_repo(path: Path) -> str:
     subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Kestrel Test"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "kestrel-test@example.invalid"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     (path / "README.md").write_text("seed\n")
     # Git-focused tests keep the memory backend inside the synthetic workspace.
     # Model the runtime-artifact ignores expected in an actual Kestrel workspace

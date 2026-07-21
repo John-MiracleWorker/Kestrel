@@ -2,6 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import nested_memvid_agent.server as server_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.server import create_app
 
@@ -30,6 +31,10 @@ def _isolated_config(root: Path) -> AgentConfig:
 
 def test_security_headers_cover_spa_and_early_auth_errors(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("KESTREL_SECURITY_HEADER_TEST_TOKEN", "local-test-token")
+    web_dist = tmp_path / "web-dist"
+    web_dist.mkdir()
+    (web_dist / "index.html").write_text("<!doctype html><title>Kestrel</title>", encoding="utf-8")
+    monkeypatch.setattr(server_module, "_resolve_web_dist", lambda: web_dist)
 
     with TestClient(create_app(_isolated_config(tmp_path))) as client:
         page = client.get("/")

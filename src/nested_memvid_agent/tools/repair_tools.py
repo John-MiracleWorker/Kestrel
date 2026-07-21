@@ -11,6 +11,7 @@ from typing import Any
 
 from ..cognition import RetryPolicy
 from ..diagnosis import classify_failure
+from ..platform_primitives import chmod_descriptor
 from ..repair_integrity import (
     load_review_receipt,
     load_validation_receipt,
@@ -1374,7 +1375,7 @@ def _prepare_rollback_quarantine(workspace: Path, rollback_id: str) -> Path:
                 os.close(descriptor)
                 raise ValueError(f"Rollback quarantine component is not a directory: {name}")
             if os.name != "nt":
-                os.fchmod(descriptor, 0o700)
+                chmod_descriptor(descriptor, 0o700)
             descriptors.append(descriptor)
             parent = descriptor
         return root / ".nest" / "repair_rollback_quarantine" / rollback_id

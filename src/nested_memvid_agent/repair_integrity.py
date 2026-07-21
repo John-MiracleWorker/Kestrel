@@ -19,6 +19,7 @@ from typing import Any
 from uuid import uuid4
 
 from .file_lock import lock_exclusive, unlock
+from .platform_primitives import chmod_descriptor
 from .security_boundary import (
     redact_secrets,
     redact_text,
@@ -592,7 +593,7 @@ def _load_receipt_key_from_directory(directory: int) -> bytes:
         if metadata.st_size != _REPAIR_RECEIPT_KEY_BYTES:
             raise ValueError("Repair receipt signing key has an invalid size.")
         if os.name != "nt":
-            os.fchmod(descriptor, 0o600)
+            chmod_descriptor(descriptor, 0o600)
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
             key = handle.read(_REPAIR_RECEIPT_KEY_BYTES + 1)
@@ -621,7 +622,7 @@ def _write_receipt_key_temp(directory: int, candidate: bytes) -> tuple[int, int]
         _validate_private_file_metadata(metadata, _REPAIR_RECEIPT_KEY_TEMP_FILE)
         identity = metadata.st_dev, metadata.st_ino
         if os.name != "nt":
-            os.fchmod(descriptor, 0o600)
+            chmod_descriptor(descriptor, 0o600)
         _write_receipt_key_bytes(descriptor, candidate)
         _sync_receipt_key_file(descriptor)
         metadata = os.fstat(descriptor)
@@ -779,7 +780,7 @@ def _receipt_key_lock(workspace: Path) -> Iterator[None]:
                 _REPAIR_RECEIPT_KEY_LOCK_FILE,
             )
             if os.name != "nt":
-                os.fchmod(descriptor, 0o600)
+                chmod_descriptor(descriptor, 0o600)
             with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
                 descriptor = -1
                 lock_exclusive(handle)
@@ -844,7 +845,7 @@ def _open_private_directory_at(parent_descriptor: int, name: str, *, create: boo
             raise ValueError(f"Repair artifact component is not a directory: {name}")
         _require_current_owner(metadata, name)
         if os.name != "nt":
-            os.fchmod(descriptor, 0o700)
+            chmod_descriptor(descriptor, 0o700)
         return descriptor
     except Exception:
         os.close(descriptor)

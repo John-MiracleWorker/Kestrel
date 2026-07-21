@@ -37,7 +37,10 @@ class ListFilesTool(AgentTool):
             max_entries = int(arguments.get("max_entries", 80))
             entries = [
                 entry
-                for entry in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+                for entry in sorted(
+                    (candidate for candidate in path.iterdir() if not candidate.is_symlink()),
+                    key=lambda p: (p.is_file(), p.name.lower()),
+                )
                 if not _workspace_path_is_private(context, entry)
             ][:max_entries]
             data = [{"name": p.name, "type": "dir" if p.is_dir() else "file"} for p in entries]
@@ -115,6 +118,8 @@ class FindFilesTool(AgentTool):
             for path in sorted(root.rglob(pattern), key=lambda item: item.as_posix()):
                 if len(rows) >= max_results:
                     break
+                if path.is_symlink():
+                    continue
                 if any(_skip_repo_name(part) for part in path.relative_to(workspace).parts):
                     continue
                 if _workspace_path_is_private(context, path):

@@ -24,6 +24,7 @@ from .extension_policy import (
     resolve_filesystem_scopes,
     validate_resolved_filesystem_scopes,
 )
+from .platform_primitives import required_signal, signal_process_group
 
 OCI_MEMORY_LIMIT = "256m"
 OCI_CPU_LIMIT = "1.0"
@@ -557,7 +558,12 @@ def _container_argv(
         f"--memory={OCI_MEMORY_LIMIT}",
         f"--cpus={OCI_CPU_LIMIT}",
         f"--ulimit=nofile={OCI_NOFILE_LIMIT}:{OCI_NOFILE_LIMIT}",
-        f"--ulimit=nproc={OCI_PIDS_LIMIT}:{OCI_PIDS_LIMIT}",
+        # RLIMIT_NPROC is accounted by real host UID, not by the container's
+        # cgroup.  The sandbox deliberately maps to the invoking non-root UID
+        # so its read-only snapshots remain readable; on shared CI hosts that
+        # UID can already exceed a small nproc limit before container startup,
+        # making runc fail to exec docker-init with EAGAIN.  The container-local
+        # cgroup pids controller above remains the authoritative 64-task limit.
         "--ipc=none",
         "--init",
         "--stop-timeout=1",
@@ -630,12 +636,15 @@ def _terminate_process_group(process: subprocess.Popen[bytes], *, force: bool = 
         return
     if os.name != "nt":
         try:
-            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            signal_process_group(
+                process.pid,
+                required_signal("SIGKILL") if force else signal.SIGTERM,
+            )
             if not force:
                 try:
                     process.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    signal_process_group(process.pid, required_signal("SIGKILL"))
             return
         except (OSError, ProcessLookupError):
             pass

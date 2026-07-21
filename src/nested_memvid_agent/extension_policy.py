@@ -476,7 +476,13 @@ def _hash_and_copy_extension_file_at(
     relative: str,
     digest: Any,
 ) -> None:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    flags = (
+        os.O_RDONLY
+        | _required_open_flag(
+            "O_NOFOLLOW", "extension_snapshot_platform_unsupported"
+        )
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     try:
         _validate_open_extension_file(
@@ -617,14 +623,28 @@ def _required_scope_directory_flags() -> int:
 
 
 def _required_directory_flags(error: str) -> int:
+    directory_flag = _optional_open_flag("O_DIRECTORY")
+    no_follow_flag = _optional_open_flag("O_NOFOLLOW")
     if (
         os.open not in os.supports_dir_fd
         or os.scandir not in os.supports_fd
-        or not hasattr(os, "O_DIRECTORY")
-        or not hasattr(os, "O_NOFOLLOW")
+        or directory_flag is None
+        or no_follow_flag is None
     ):
         raise ExtensionPolicyError(error)
-    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    return os.O_RDONLY | directory_flag | no_follow_flag
+
+
+def _optional_open_flag(name: str) -> int | None:
+    value: object = getattr(os, name, None)
+    return value if isinstance(value, int) else None
+
+
+def _required_open_flag(name: str, error: str) -> int:
+    value = _optional_open_flag(name)
+    if value is None:
+        raise ExtensionPolicyError(error)
+    return value
 
 
 def _open_absolute_directory_descriptor(path: Path, directory_flags: int) -> int:
@@ -670,7 +690,14 @@ def _open_declared_scope_descriptor(
             if stat.S_ISDIR(metadata.st_mode):
                 flags = directory_flags
             elif stat.S_ISREG(metadata.st_mode) and index == len(parts) - 1:
-                flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+                flags = (
+                    os.O_RDONLY
+                    | _required_open_flag(
+                        "O_NOFOLLOW",
+                        "extension_scope_snapshot_platform_unsupported",
+                    )
+                    | getattr(os, "O_NONBLOCK", 0)
+                )
             else:
                 raise ExtensionPolicyError(
                     f"extension_scope_nonregular_rejected:{declared_path}"
@@ -827,7 +854,13 @@ def _copy_regular_file_at(
     metadata: os.stat_result,
     relative: str,
 ) -> None:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    flags = (
+        os.O_RDONLY
+        | _required_open_flag(
+            "O_NOFOLLOW", "extension_scope_snapshot_platform_unsupported"
+        )
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     try:
         _validate_open_extension_file(
