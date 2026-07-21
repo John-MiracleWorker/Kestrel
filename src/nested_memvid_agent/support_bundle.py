@@ -535,8 +535,12 @@ def _write_support_archive_exclusive(
             directory_fd,
             parent,
         )
-        _revalidate_bundle_parent(directory_fd, parent, parent_identity)
         try:
+            # Keep the newly-created descriptor inside the guarded region.  A
+            # fallback-path parent swap can fail the first revalidation below;
+            # Windows then requires this descriptor to be closed before the
+            # displaced directory can be recovered or removed.
+            _revalidate_bundle_parent(directory_fd, parent, parent_identity)
             if os.name != "nt":
                 chmod_descriptor(descriptor, _PRIVATE_BUNDLE_MODE)
             temporary_metadata = os.fstat(descriptor)

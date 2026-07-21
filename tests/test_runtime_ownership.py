@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+import nested_memvid_agent.runtime_ownership as runtime_ownership_module
 import nested_memvid_agent.server as server_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.event_bus import RunEventBus
@@ -39,6 +40,15 @@ class _PluginProbe:
         self.sync_calls += 1
         if self.fail:
             raise RuntimeError("injected plugin reconciliation failure")
+
+
+def test_windows_lock_violation_is_recognized_as_runtime_contention() -> None:
+    class _WindowsLockViolation(OSError):
+        winerror = 33
+
+    error = _WindowsLockViolation(33, "injected Windows lock violation")
+
+    assert runtime_ownership_module._is_lock_contention(error) is True
 
 
 def _build_manager(

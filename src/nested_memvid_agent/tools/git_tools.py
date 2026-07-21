@@ -215,17 +215,32 @@ def _staged_git_paths(workspace: Path) -> list[str]:
     return _diff_git_paths(workspace, staged=True)
 
 
-def _diff_git_paths(workspace: Path, *, staged: bool) -> list[str]:
+def _diff_git_paths(
+    workspace: Path,
+    *,
+    staged: bool,
+    ignore_cr_at_eol: bool = False,
+) -> list[str]:
     arguments = [
         "diff",
         "--no-ext-diff",
         "--no-textconv",
         "--no-renames",
-        "--name-only",
-        "-z",
     ]
+    if ignore_cr_at_eol:
+        # Kestrel removes inherited Git configuration before inspecting a
+        # worktree. On Windows, a file committed under the system-wide
+        # ``core.autocrlf=true`` setting can otherwise look modified solely
+        # because the hardened command no longer sees that setting. Ignore
+        # only carriage returns at EOL; substantive changes remain visible
+        # and protected paths still fail closed below.
+        arguments.extend(("--ignore-cr-at-eol", "--numstat", "-z"))
+    else:
+        arguments.extend(("--name-only", "-z"))
     if staged:
         arguments.insert(1, "--cached")
+    if ignore_cr_at_eol:
+        return _git_numstat_paths(workspace, arguments, operation="diff")
     return _git_path_list(workspace, arguments, operation="diff")
 
 
@@ -280,6 +295,42 @@ def _git_path_list(
         stderr = completed.stderr.decode("utf-8", errors="replace")
         raise RuntimeError(redact_text(f"Unable to inspect Git {operation} paths: {stderr}"))
     return [os.fsdecode(path) for path in completed.stdout.split(b"\0") if path]
+
+
+def _git_numstat_paths(
+    workspace: Path,
+    arguments: list[str],
+    *,
+    operation: str,
+) -> list[str]:
+    """Return paths whose rendered diff has substantive hunks.
+
+    Unlike ``--name-only``, ``--numstat`` honors ``--ignore-cr-at-eol`` when
+    deciding whether to emit a path. With ``--no-renames -z``, every record is
+    ``added<TAB>deleted<TAB>path<NUL>`` and tabs inside a path remain in the
+    final field.
+    """
+
+    completed = subprocess.run(  # noqa: S603 - fixed read-only git command  # nosec
+        _hardened_git_command(arguments, workspace=workspace),
+        cwd=workspace,
+        env=_sanitized_git_environment(None),
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(redact_text(f"Unable to inspect Git {operation} paths: {stderr}"))
+    paths: list[str] = []
+    for record in completed.stdout.split(b"\0"):
+        if not record:
+            continue
+        fields = record.split(b"\t", maxsplit=2)
+        if len(fields) != 3 or not fields[2]:
+            raise RuntimeError(f"Unable to inspect Git {operation} paths safely.")
+        paths.append(os.fsdecode(fields[2]))
+    return paths
 
 
 def _assert_git_paths_allowed(context: ToolContext, paths: list[str]) -> None:
@@ -411,10 +462,15 @@ class GitDiffTool(AgentTool):
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
         staged = bool(arguments.get("staged", False))
+        ignore_cr_at_eol = not staged
         try:
             _assert_git_paths_allowed(
                 context,
-                _diff_git_paths(context.workspace, staged=staged),
+                _diff_git_paths(
+                    context.workspace,
+                    staged=staged,
+                    ignore_cr_at_eol=ignore_cr_at_eol,
+                ),
             )
         except (OSError, RuntimeError, ValueError):
             return self._result(
@@ -423,7 +479,10 @@ class GitDiffTool(AgentTool):
                 content="Git diff includes a protected workspace path and was not rendered.",
                 error="git_diff_path_blocked",
             )
-        command = ["git", "diff", "--no-ext-diff", "--no-textconv"]
+        command = ["git", "diff"]
+        if ignore_cr_at_eol:
+            command.append("--ignore-cr-at-eol")
+        command.extend(("--no-ext-diff", "--no-textconv"))
         if staged:
             command.append("--cached")
         result = _git_read(
@@ -465,10 +524,15 @@ class GitExportPatchTool(AgentTool):
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
         staged = bool(arguments.get("staged", False))
+        ignore_cr_at_eol = not staged
         try:
             _assert_git_paths_allowed(
                 context,
-                _diff_git_paths(context.workspace, staged=staged),
+                _diff_git_paths(
+                    context.workspace,
+                    staged=staged,
+                    ignore_cr_at_eol=ignore_cr_at_eol,
+                ),
             )
         except (OSError, RuntimeError, ValueError):
             return self._result(
@@ -477,7 +541,10 @@ class GitExportPatchTool(AgentTool):
                 content="Git patch export includes a protected workspace path; nothing was written.",
                 error="git_export_path_blocked",
             )
-        command = ["git", "diff", "--no-ext-diff", "--no-textconv"]
+        command = ["git", "diff"]
+        if ignore_cr_at_eol:
+            command.append("--ignore-cr-at-eol")
+        command.extend(("--no-ext-diff", "--no-textconv"))
         if staged:
             command.append("--cached")
         try:
@@ -1442,7 +1509,10 @@ def _read_reviewed_manifest_entry(
         raise ValueError(f"Reviewed repair path changed type: {path}")
     descriptor = os.open(
         candidate,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         opened_before = os.fstat(descriptor)
@@ -1512,7 +1582,10 @@ def _index_fingerprint(workspace: Path) -> tuple[str, int, int] | None:
         raise ValueError("Git index is not a bounded regular file.")
     descriptor = os.open(
         candidate,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         digest = hashlib.sha256()

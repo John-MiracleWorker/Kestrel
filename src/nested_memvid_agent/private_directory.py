@@ -152,8 +152,9 @@ def harden_empty_owner_private_directory(path: Path) -> None:
 
     if _is_windows():
         current_sid = _windows_current_user_sid()
-        if _windows_sddl_owner(_windows_directory_sddl(target)) != (
-            _normalize_sddl_sid(current_sid)
+        if not _windows_sddl_sid_matches(
+            _windows_sddl_owner(_windows_directory_sddl(target)),
+            current_sid,
         ):
             raise PrivateDirectoryError("private_directory_wrong_windows_owner")
         _windows_apply_private_directory_sddl(
@@ -249,7 +250,7 @@ def _windows_private_directory_sddl(current_sid: str) -> str:
 
 
 def _validate_windows_private_sddl(sddl: str, *, current_sid: str) -> None:
-    if _windows_sddl_owner(sddl) != _normalize_sddl_sid(current_sid):
+    if not _windows_sddl_sid_matches(_windows_sddl_owner(sddl), current_sid):
         raise PrivateDirectoryError("private_directory_wrong_windows_owner")
 
     dacl_match = re.search(r"D:(.*?)(?=S:|$)", sddl)
@@ -260,11 +261,12 @@ def _validate_windows_private_sddl(sddl: str, *, current_sid: str) -> None:
     if "P" not in dacl_flags:
         raise PrivateDirectoryError("private_directory_windows_dacl_inherited")
 
-    expected = {
+    expected = [
         _normalize_sddl_sid(current_sid),
         _WINDOWS_SYSTEM_SID,
         _WINDOWS_ADMINISTRATORS_SID,
-    }
+    ]
+    expected = list(dict.fromkeys(expected))
     actual: list[str] = []
     for encoded_ace in re.findall(r"\(([^()]*)\)", dacl):
         fields = encoded_ace.split(";")
@@ -280,14 +282,92 @@ def _validate_windows_private_sddl(sddl: str, *, current_sid: str) -> None:
             or inherit_guid
         ):
             raise PrivateDirectoryError("private_directory_windows_ace_unsafe")
-        actual.append(_normalize_sddl_sid(trustee))
-    if len(actual) != len(set(actual)) or set(actual) != expected:
+        actual.append(trustee)
+    unmatched = expected.copy()
+    for trustee in actual:
+        matches = [
+            candidate
+            for candidate in unmatched
+            if _windows_sddl_sid_matches(trustee, candidate)
+        ]
+        if len(matches) != 1:
+            raise PrivateDirectoryError("private_directory_windows_trustee_unsafe")
+        unmatched.remove(matches[0])
+    if unmatched:
         raise PrivateDirectoryError("private_directory_windows_trustee_unsafe")
 
 
 def _normalize_sddl_sid(value: str) -> str:
     normalized = value.strip().upper()
     return _WINDOWS_SID_ALIASES.get(normalized, normalized)
+
+
+def _windows_sddl_sid_matches(left: str, right: str) -> bool:
+    """Compare SDDL trustees without mistaking an alias for another SID.
+
+    ``ConvertSecurityDescriptorToStringSecurityDescriptorW`` is allowed to
+    emit SDDL constants instead of the numeric SID supplied at creation.  In
+    particular, the built-in Administrator account can be rendered as
+    ``LA``.  Fixed well-known aliases can be normalized locally;
+    machine-relative aliases must be expanded by Windows so accounts from
+    another machine or domain are never accepted based on their RID.
+    """
+
+    normalized_left = _normalize_sddl_sid(left)
+    normalized_right = _normalize_sddl_sid(right)
+    if normalized_left == normalized_right:
+        return True
+    if not _is_windows():
+        return False
+    expanded_left = _windows_expand_sddl_sid_alias(normalized_left)
+    expanded_right = _windows_expand_sddl_sid_alias(normalized_right)
+    return (
+        expanded_left is not None
+        and expanded_right is not None
+        and expanded_left == expanded_right
+    )
+
+
+def _windows_expand_sddl_sid_alias(value: str) -> str | None:
+    """Return one native numeric SID for an SDDL trustee, or fail closed."""
+
+    normalized = _normalize_sddl_sid(value)
+    if normalized.startswith("S-"):
+        return normalized
+    if re.fullmatch(r"[A-Z]{2,3}", normalized) is None:
+        return None
+
+    advapi32, kernel32 = _windows_libraries()
+    _configure_windows_security_api(advapi32, kernel32)
+    descriptor = wintypes.LPVOID()
+    descriptor_size = wintypes.DWORD()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        f"O:{normalized}D:P",
+        _SDDL_REVISION_1,
+        ctypes.byref(descriptor),
+        ctypes.byref(descriptor_size),
+    ):
+        return None
+    try:
+        owner = wintypes.LPVOID()
+        owner_defaulted = wintypes.BOOL()
+        if not advapi32.GetSecurityDescriptorOwner(
+            descriptor,
+            ctypes.byref(owner),
+            ctypes.byref(owner_defaulted),
+        ) or not owner:
+            return None
+        encoded = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(owner, ctypes.byref(encoded)):
+            return None
+        try:
+            if not encoded.value:
+                return None
+            return _normalize_sddl_sid(str(encoded.value))
+        finally:
+            kernel32.LocalFree(ctypes.cast(encoded, wintypes.HLOCAL))
+    finally:
+        kernel32.LocalFree(descriptor)
 
 
 def _windows_sddl_owner(sddl: str) -> str:
@@ -551,6 +631,12 @@ def _configure_windows_security_api(advapi32: Any, kernel32: Any) -> None:
         ctypes.POINTER(wintypes.BOOL),
     ]
     advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorOwner.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.GetSecurityDescriptorOwner.restype = wintypes.BOOL
     advapi32.SetNamedSecurityInfoW.argtypes = [
         wintypes.LPWSTR,
         ctypes.c_int,

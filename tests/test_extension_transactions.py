@@ -152,6 +152,44 @@ def test_extension_tree_uses_full_lstat_instead_of_incomplete_direntry_metadata(
     )
 
 
+def test_extension_artifact_io_uses_binary_descriptors(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    payload = b"literal\nwindows\r\nbytes\x1a\x00"
+    synthetic_binary_flag = 1 << 29
+    native_binary_flag = getattr(os, "O_BINARY", 0)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def open_without_synthetic_flag(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(path) == artifact:
+            observed_flags.append(flags)
+        native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        extension_transaction.os,
+        "O_BINARY",
+        synthetic_binary_flag,
+        raising=False,
+    )
+    monkeypatch.setattr(extension_transaction.os, "open", open_without_synthetic_flag)
+
+    extension_transaction.write_regular_file(artifact, payload)
+
+    assert extension_transaction.read_regular_file(artifact) == payload
+    assert len(observed_flags) == 2
+    assert all(flags & synthetic_binary_flag for flags in observed_flags)
+
+
 @pytest.mark.parametrize("failed_move", [1, 2])
 def test_plugin_overwrite_move_failures_restore_exact_old_tree_and_state(
     tmp_path: Path,

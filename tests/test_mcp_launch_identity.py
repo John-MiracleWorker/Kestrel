@@ -50,6 +50,52 @@ class _FakeFetcher:
         return "a" * 40
 
 
+def test_launch_artifact_byte_io_uses_binary_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "server.py"
+    payload = b"#!\r\nprint('literal')\n\x1a\x00"
+    source.write_bytes(payload)
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir(mode=0o700)
+    destination = snapshot_root / "server.py"
+    synthetic_binary_flag = 1 << 29
+    native_binary_flag = getattr(os, "O_BINARY", 0)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def open_without_synthetic_flag(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(path) in {source, destination}:
+            observed_flags.append(flags)
+        native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(mcp_module.os, "O_BINARY", synthetic_binary_flag, raising=False)
+    monkeypatch.setattr(mcp_module.os, "open", open_without_synthetic_flag)
+    monkeypatch.setattr(
+        mcp_module,
+        "_assert_private_snapshot_permissions",
+        lambda _path: None,
+    )
+
+    assert mcp_module._launch_file_has_shebang(source) is True
+    assert mcp_module._hash_launch_file(source, label="launch artifact") == (
+        "sha256:" + mcp_module.hashlib.sha256(payload).hexdigest()
+    )
+    mcp_module._copy_private_launch_file(source, destination, executable=False)
+
+    assert destination.read_bytes() == payload
+    assert len(observed_flags) == 4
+    assert all(flags & synthetic_binary_flag for flags in observed_flags)
+
+
 def _copy_native_executable(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     source = Path(shutil.which("true") or sys.executable).resolve()

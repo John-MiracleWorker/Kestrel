@@ -96,6 +96,103 @@ def _state_value(state_path: Path) -> str:
     return str(row[0])
 
 
+def test_sqlite_snapshot_closes_connections_before_directory_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Cursor:
+        def __init__(self, value: tuple[str]) -> None:
+            self._value = value
+
+        def fetchone(self) -> tuple[str]:
+            return self._value
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def backup(self, _target: object) -> None:
+            return None
+
+        def execute(self, statement: str) -> _Cursor:
+            value = ("delete",) if "journal_mode=DELETE" in statement else ("ok",)
+            return _Cursor(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    connections: list[_Connection] = []
+
+    def connect(*_args: object, **_kwargs: object) -> _Connection:
+        connection = _Connection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(agent_backup_module.sqlite3, "connect", connect)
+
+    agent_backup_module._snapshot_sqlite(tmp_path / "state.db", tmp_path / "snapshot.db")
+
+    assert len(connections) == 2
+    assert all(connection.closed for connection in connections)
+
+
+def test_backup_hash_and_copy_use_binary_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "payload.bin"
+    payload = b"literal\nwindows\r\nbytes\x1a\x00"
+    source.write_bytes(payload)
+    target = tmp_path / "stage" / "payload.bin"
+    synthetic_binary_flag = 1 << 29
+    native_binary_flag = getattr(os, "O_BINARY", 0)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def open_without_synthetic_flag(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        path_text = os.fspath(path)
+        if path_text == source.name or Path(path_text) in {source, target}:
+            observed_flags.append(flags)
+        native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        agent_backup_module.os,
+        "O_BINARY",
+        synthetic_binary_flag,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_backup_module.os, "open", open_without_synthetic_flag)
+
+    identity, size, digest = agent_backup_module._inspect_backup_source(source)
+    agent_backup_module._copy_validated_backup_source(
+        source,
+        target,
+        source_root=source_root,
+        expected_identity=identity,
+        manifest_entry={"size": size, "sha256": digest},
+        target_mode=0o600,
+    )
+
+    assert target.read_bytes() == payload
+    assert len(observed_flags) == 3
+    assert all(flags & synthetic_binary_flag for flags in observed_flags)
+
+
 def _manager(
     tmp_path: Path,
     *,
@@ -1164,7 +1261,8 @@ def test_agent_backup_resolves_symlinked_parent_before_overlap_check(
     parent_alias = tmp_path / "memory-alias"
     parent_alias.symlink_to(memory_dir, target_is_directory=True)
 
-    with pytest.raises(MemoryBackupError, match="must not overlap"):
+    expected = "Windows reparse point" if os.name == "nt" else "must not overlap"
+    with pytest.raises(MemoryBackupError, match=expected):
         AgentBackupManager(
             memory_dir=memory_dir,
             state_path=tmp_path / "runtime" / "state" / "agent.db",

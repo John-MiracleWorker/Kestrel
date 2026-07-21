@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from typing import IO, Any
+
+_WINDOWS_LOCK_CONTENTION_ERRORS = frozenset({32, 33})
 
 if sys.platform == "win32":
     import ctypes as _ctypes
@@ -101,7 +104,11 @@ if sys.platform == "win32":
         if _lock_file_ex(os_handle, flags, 0, 1, 0, _ctypes.byref(overlapped)):
             return
         error = _ctypes.get_last_error()
-        raise OSError(error, _ctypes.FormatError(error))
+        raise _windows_lock_error(
+            error,
+            blocking=blocking,
+            message=_ctypes.FormatError(error),
+        )
 
 
     def _windows_unlock(handle: IO[str]) -> None:
@@ -111,3 +118,11 @@ if sys.platform == "win32":
             return
         error = _ctypes.get_last_error()
         raise OSError(error, _ctypes.FormatError(error))
+
+
+def _windows_lock_error(error: int, *, blocking: bool, message: str) -> OSError:
+    """Normalize an immediate Windows lock miss to Python's lock contract."""
+
+    if not blocking and error in _WINDOWS_LOCK_CONTENTION_ERRORS:
+        return BlockingIOError(errno.EAGAIN, message)
+    return OSError(error, message)

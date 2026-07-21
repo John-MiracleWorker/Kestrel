@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import errno
 import sys
 from pathlib import Path
 
 import pytest
 
+import nested_memvid_agent.file_lock as file_lock_module
 from nested_memvid_agent.file_lock import lock_exclusive, lock_shared, unlock
+
+
+@pytest.mark.parametrize("winerror", [32, 33])
+def test_windows_nonblocking_lock_contention_has_portable_exception(
+    winerror: int,
+) -> None:
+    error = file_lock_module._windows_lock_error(
+        winerror,
+        blocking=False,
+        message="injected Windows lock contention",
+    )
+
+    assert isinstance(error, BlockingIOError)
+    assert error.errno == errno.EAGAIN
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows LockFileEx semantics")
@@ -23,7 +39,7 @@ def test_windows_shared_locks_allow_one_runtime_to_open_multiple_layers(
         lock_shared(first, blocking=False)
         lock_shared(second, blocking=False)
         try:
-            with pytest.raises(OSError):
+            with pytest.raises(BlockingIOError):
                 lock_exclusive(contender, blocking=False)
         finally:
             unlock(second)

@@ -307,6 +307,7 @@ def test_container_runner_quarantines_unverified_cleanup_until_retry_succeeds(
     source = _skill_tree(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    cleanup_timeout = extension_runner.OCI_CLEANUP_TIMEOUT_SECONDS
     monkeypatch.setattr(extension_runner, "OCI_CLEANUP_TIMEOUT_SECONDS", 0.1)
     quarantine = OCIContainerCleanupQuarantine()
     runner = OCIContainerRunner(
@@ -340,6 +341,14 @@ def test_container_runner_quarantines_unverified_cleanup_until_retry_succeeds(
     assert runner.retry_cleanup(timeout_seconds=1.0) is True
     assert runner.pending_cleanup_count == 0
 
+    # The short timeout above forces the initial quarantine. Restore the
+    # production budget before proving that a subsequent run can complete;
+    # spawning both cleanup probes can legitimately exceed 100 ms on CI hosts.
+    monkeypatch.setattr(
+        extension_runner,
+        "OCI_CLEANUP_TIMEOUT_SECONDS",
+        cleanup_timeout,
+    )
     resumed = runner.run(_request(source, workspace))
     assert resumed.success is True
 

@@ -746,6 +746,49 @@ def test_memory_validation_key_recovers_post_link_crash_state(tmp_path: Path) ->
     assert final.stat().st_nlink == 1
 
 
+def test_exclusive_private_artifact_writer_uses_binary_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "receipt.json"
+    temporary = artifact.with_name(f"{artifact.name}.tmp")
+    text = "literal\nwindows\r\ntext"
+    synthetic_binary_flag = 1 << 29
+    native_binary_flag = getattr(os, "O_BINARY", 0)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def open_without_synthetic_flag(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(path) == temporary:
+            observed_flags.append(flags)
+        native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        private_artifacts_module.os,
+        "O_BINARY",
+        synthetic_binary_flag,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        private_artifacts_module.os,
+        "open",
+        open_without_synthetic_flag,
+    )
+
+    private_artifacts_module.write_private_text_exclusive(artifact, text)
+
+    assert artifact.read_bytes() == text.encode("utf-8")
+    assert len(observed_flags) == 1
+    assert observed_flags[0] & synthetic_binary_flag
+
+
 @pytest.mark.parametrize("failure_point", ["write", "file_fsync", "publish"])
 def test_memory_validation_key_fault_before_publication_cleans_temp_and_recovers(
     tmp_path: Path,

@@ -1077,7 +1077,10 @@ def test_run_heartbeat_error_revokes_execution_and_terminalizes_run(tmp_path, mo
     manager = _manager(
         tmp_path,
         run_heartbeat_interval_seconds=0.01,
-        run_lease_ttl_seconds=0.2,
+        # Keep lease expiry out of this heartbeat-error test. Hosted Windows
+        # can spend more than 200 ms in SQLite while the full suite is busy;
+        # expiry fencing has separate deterministic coverage.
+        run_lease_ttl_seconds=5.0,
     )
     run = manager.state.create_run(
         run_id="run_heartbeat_failure",
@@ -1099,6 +1102,7 @@ def test_run_heartbeat_error_revokes_execution_and_terminalizes_run(tmp_path, mo
         assert lease is not None
         assert heartbeat_failed.wait(timeout=1)
         assert _wait_until(lambda: manager._is_cancelled(run.run_id))
+        assert _wait_until(lambda: manager.state.get_run(run.run_id).status == "failed")
 
     failed = manager.state.get_run(run.run_id)
     assert failed.status == "failed"

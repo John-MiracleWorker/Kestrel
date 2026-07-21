@@ -35,6 +35,32 @@ def test_windows_private_sddl_allows_only_owner_system_and_administrators() -> N
         )
 
 
+def test_windows_private_sddl_compares_machine_relative_aliases_by_full_sid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_sid = "S-1-5-21-1000-1001-1002-500"
+    encoded = "O:LAD:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+
+    monkeypatch.setattr(private_directory, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        private_directory,
+        "_windows_expand_sddl_sid_alias",
+        lambda value: current_sid if value == "LA" else value,
+    )
+
+    private_directory._validate_windows_private_sddl(  # noqa: SLF001
+        encoded,
+        current_sid=current_sid,
+    )
+
+    other_machine_sid = "S-1-5-21-2000-2001-2002-500"
+    with pytest.raises(PrivateDirectoryError, match="wrong_windows_owner"):
+        private_directory._validate_windows_private_sddl(  # noqa: SLF001
+            encoded,
+            current_sid=other_machine_sid,
+        )
+
+
 def test_windows_private_temp_portable_seam_cleans_exact_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

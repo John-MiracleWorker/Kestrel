@@ -79,25 +79,30 @@ def test_support_bundle_path_fallback_detects_parent_swap_without_following_it(
         directory_fd: int | None,
         requested_parent: Path,
     ) -> tuple[int, str, tuple[int, int]]:
-        created = real_create(directory_fd, requested_parent)
+        descriptor, name, identity = real_create(directory_fd, requested_parent)
+        os.close(descriptor)
         requested_parent.rename(displaced)
-        requested_parent.symlink_to(outside, target_is_directory=True)
-        return created
+        outside.rename(requested_parent)
+        reopened = os.open(
+            displaced / name,
+            os.O_RDWR | getattr(os, "O_BINARY", 0),
+        )
+        return reopened, name, identity
 
     monkeypatch.setattr(support_bundle, "_create_bundle_temporary", create_then_swap)
 
     try:
-        with pytest.raises(ValueError, match="link|changed"):
+        with pytest.raises(ValueError, match="changed"):
             export_support_bundle(config, output_path=parent / "bundle.zip")
-        assert sentinel.read_text(encoding="utf-8") == "untouched"
-        assert tuple(path.name for path in outside.iterdir()) == ("sentinel.txt",)
+        assert (parent / sentinel.name).read_text(encoding="utf-8") == "untouched"
+        assert tuple(path.name for path in parent.iterdir()) == ("sentinel.txt",)
     finally:
-        if parent.is_symlink():
-            parent.unlink()
+        if parent.exists() and (parent / sentinel.name).exists():
+            parent.rename(outside)
         if displaced.exists():
             for artifact in displaced.iterdir():
                 artifact.unlink()
-            displaced.rmdir()
+            displaced.rename(parent)
 
 
 @pytest.mark.skipif(

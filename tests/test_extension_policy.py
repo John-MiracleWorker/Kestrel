@@ -460,7 +460,10 @@ def test_windows_path_fallback_rejects_ambiguous_nested_components(
     source.mkdir()
     (source / ".git.").mkdir()
 
-    with pytest.raises(ExtensionPolicyError, match="tree_path_not_portable"):
+    with pytest.raises(
+        ExtensionPolicyError,
+        match="tree_(?:path_not_portable|control_tree_rejected)",
+    ):
         extension_tree_digest(source)
 
     workspace = tmp_path / "workspace"

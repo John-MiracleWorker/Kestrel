@@ -100,7 +100,13 @@ def write_regular_file(path: Path, content: bytes, *, mode: int = 0o600) -> None
     """Create and fsync one staged file without following links."""
 
     ensure_real_directory(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, mode)
     completed = False
@@ -131,7 +137,12 @@ def read_regular_file(path: Path) -> bytes:
     path_before = path.lstat()
     if is_link_or_reparse_point(path_before) or not stat.S_ISREG(path_before.st_mode):
         raise ExtensionTransactionError(f"Extension file is not a regular file: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(path, flags)
     try:
         before = os.fstat(descriptor)

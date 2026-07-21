@@ -84,9 +84,15 @@ def runtime_ownership_lock_path(state_path: Path) -> Path:
 
 
 def _is_lock_contention(error: OSError) -> bool:
-    return isinstance(error, BlockingIOError) or error.errno in {
-        errno.EACCES,
-        errno.EAGAIN,
-        errno.EDEADLK,
-        errno.EWOULDBLOCK,
-    }
+    return (
+        isinstance(error, BlockingIOError)
+        or error.errno
+        in {
+            errno.EACCES,
+            errno.EAGAIN,
+            errno.EDEADLK,
+            errno.EWOULDBLOCK,
+        }
+        or getattr(error, "winerror", None) in {32, 33}
+        or (os.name == "nt" and error.errno in {32, 33})
+    )

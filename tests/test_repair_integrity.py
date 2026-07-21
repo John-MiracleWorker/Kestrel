@@ -348,18 +348,61 @@ def test_each_isolated_validation_rotates_prior_receipt_trust(tmp_path: Path) ->
 
 def test_repair_signing_key_concurrent_first_open_is_single_identity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _repo(tmp_path)
+    # LF bytes are translated to CRLF by Windows' default CRT text mode.  Use
+    # them deliberately so this concurrency test also proves binary key I/O.
+    candidate = b"\n" * 32
+    monkeypatch.setattr(
+        repair_integrity_module.secrets,
+        "token_bytes",
+        lambda size: candidate if size == len(candidate) else b"x" * size,
+    )
 
     with ThreadPoolExecutor(max_workers=12) as pool:
         keys = list(pool.map(lambda _: _load_or_create_receipt_key(repo), range(24)))
 
-    assert len(set(keys)) == 1
-    assert len(keys[0]) == 32
+    assert keys == [candidate] * 24
     key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
-    assert key_path.read_bytes() == keys[0]
+    assert key_path.read_bytes() == candidate
     if os.name != "nt":
         assert key_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_changed_path_manifest_opens_literal_bytes_in_binary_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "literal.bin"
+    candidate.write_bytes(b"literal\r\nbytes\r\n")
+    binary_flag = 1 << 29
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def open_without_synthetic_flag(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        observed_flags.append(flags)
+        return real_open(path, flags & ~binary_flag, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(repair_integrity_module.os, "O_BINARY", binary_flag, raising=False)
+    monkeypatch.setattr(repair_integrity_module.os, "open", open_without_synthetic_flag)
+
+    manifest = repair_integrity_module._changed_path_manifest(  # noqa: SLF001
+        tmp_path,
+        candidate.name,
+        reject_symlink=True,
+        max_bytes=1024,
+        deadline=time.monotonic() + 1,
+    )
+
+    assert observed_flags and observed_flags[0] & binary_flag
+    assert manifest["size"] == len(candidate.read_bytes())
 
 
 def test_repair_key_creation_closes_stdio_before_key_publication(tmp_path: Path) -> None:

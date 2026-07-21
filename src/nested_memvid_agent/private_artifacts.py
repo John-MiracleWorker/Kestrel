@@ -226,7 +226,13 @@ def write_private_text_exclusive(
     resolved = Path(path)
     ensure_private_directory(resolved.parent)
     temporary = resolved.with_name(f"{resolved.name}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(temporary, flags, PRIVATE_FILE_MODE)
     try:

@@ -816,6 +816,137 @@ def test_git_diff_show_and_export_never_surface_or_persist_registered_secret(
     assert sentinel in vault.read_text(encoding="utf-8")
 
 
+def test_git_diff_and_export_ignore_windows_autocrlf_config_drift_without_leaking_secret(
+    tmp_path: Path,
+) -> None:
+    """A hardened diff must not mistake Windows CRLF checkout bytes for a vault edit."""
+
+    _init_git(tmp_path)
+    sentinel = "opaque-git-crlf-sentinel-123456"
+    vault = _create_vault(tmp_path, sentinel)
+    vault.write_bytes(vault.read_bytes().replace(b"\n", b"\r\n"))
+    note = tmp_path / "notes.txt"
+    note.write_bytes(f"opaque={sentinel}\r\n".encode())
+    _git(
+        tmp_path,
+        "-c",
+        "core.autocrlf=true",
+        "add",
+        "config/runtime-state.json",
+        "notes.txt",
+    )
+    _git(tmp_path, "commit", "-m", "windows secret fixture")
+    safe_history = tmp_path / "safe-history.txt"
+    safe_history.write_bytes(f"historical opaque={sentinel}\r\n".encode())
+    _git(
+        tmp_path,
+        "-c",
+        "core.autocrlf=true",
+        "add",
+        "safe-history.txt",
+    )
+    _git(tmp_path, "commit", "-m", "windows history fixture")
+    note.write_bytes(f"changed opaque={sentinel}\r\n".encode())
+
+    config = _config(tmp_path)
+    registry = build_default_tools()
+    context = ToolContext(
+        memory=build_memory_system("memory", tmp_path / ".git-crlf-memory"),
+        config=config,
+        workspace=tmp_path,
+    )
+    diff = registry.execute(ToolCall(name="git.diff", arguments={}), context)
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={"path": ".kestrel/improvements/crlf-secret/diff.patch"},
+        id="export-crlf-redacted-patch",
+    )
+    exported = registry.execute(
+        export_call,
+        _approved_context(tmp_path, export_call, config=config),
+    )
+
+    artifact = tmp_path / ".kestrel" / "improvements" / "crlf-secret" / "diff.patch"
+    assert diff.success is True
+    assert exported.success is True
+    assert artifact.exists()
+    assert sentinel not in diff.content
+    assert sentinel not in exported.content
+    assert sentinel not in artifact.read_text(encoding="utf-8")
+    assert "config/runtime-state.json" not in diff.content
+    assert "config/runtime-state.json" not in artifact.read_text(encoding="utf-8")
+    assert "<redacted>" in diff.content
+    assert "<redacted>" in artifact.read_text(encoding="utf-8")
+    assert sentinel in vault.read_text(encoding="utf-8")
+
+    vault.write_bytes(vault.read_bytes().replace(b'"purpose": "test"', b'"purpose": "changed"'))
+    blocked_diff = registry.execute(ToolCall(name="git.diff", arguments={}), context)
+    blocked_export_call = ToolCall(
+        name="git.export_patch",
+        arguments={"path": ".kestrel/improvements/crlf-secret/blocked.patch"},
+        id="block-substantive-crlf-vault-change",
+    )
+    blocked_export = registry.execute(
+        blocked_export_call,
+        _approved_context(tmp_path, blocked_export_call, config=config),
+    )
+
+    assert blocked_diff.success is False
+    assert blocked_diff.error == "git_diff_path_blocked"
+    assert blocked_export.success is False
+    assert blocked_export.error == "git_export_path_blocked"
+    assert sentinel not in blocked_diff.content
+    assert sentinel not in blocked_export.content
+    assert not (
+        tmp_path / ".kestrel" / "improvements" / "crlf-secret" / "blocked.patch"
+    ).exists()
+
+
+def test_git_diff_and_export_preserve_intentionally_staged_crlf_only_change(
+    tmp_path: Path,
+) -> None:
+    _init_git(tmp_path)
+    attributes = tmp_path / ".gitattributes"
+    target = tmp_path / "line-endings.txt"
+    attributes.write_text("line-endings.txt -text\n", encoding="utf-8")
+    target.write_bytes(b"literal\n")
+    _git(tmp_path, "add", ".gitattributes", "line-endings.txt")
+    _git(tmp_path, "commit", "-m", "line ending fixture")
+    target.write_bytes(b"literal\r\n")
+    _git(tmp_path, "-c", "core.autocrlf=false", "add", "line-endings.txt")
+
+    config = _config(tmp_path)
+    registry = build_default_tools()
+    context = ToolContext(
+        memory=build_memory_system("memory", tmp_path / ".git-staged-crlf-memory"),
+        config=config,
+        workspace=tmp_path,
+    )
+    diff = registry.execute(
+        ToolCall(name="git.diff", arguments={"staged": True}),
+        context,
+    )
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "staged": True,
+            "path": ".kestrel/improvements/staged-crlf/diff.patch",
+        },
+        id="export-staged-crlf-patch",
+    )
+    exported = registry.execute(
+        export_call,
+        _approved_context(tmp_path, export_call, config=config),
+    )
+
+    artifact = tmp_path / ".kestrel" / "improvements" / "staged-crlf" / "diff.patch"
+    assert diff.success is True
+    assert exported.success is True
+    assert "line-endings.txt" in diff.content
+    assert artifact.exists()
+    assert "line-endings.txt" in artifact.read_text(encoding="utf-8")
+
+
 def test_git_reads_fail_before_deleted_or_historical_custom_vault_can_leak(
     tmp_path: Path,
 ) -> None:
@@ -911,6 +1042,13 @@ def test_git_diff_and_export_revalidate_paths_from_exact_rendered_patch(
                 command,
                 0,
                 stdout=b"safe.txt\0",
+                stderr=b"",
+            )
+        if "--numstat" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=b"1\t1\tsafe.txt\0",
                 stderr=b"",
             )
         return subprocess.CompletedProcess(

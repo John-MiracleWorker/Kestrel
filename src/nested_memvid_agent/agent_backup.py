@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import stat
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1329,7 +1329,12 @@ def _open_regular_beneath(
 
     directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     directory_descriptors: list[int] = []
     directory_edges: list[tuple[int, str, int, _ValidatedBackupSource]] = []
     file_descriptor = -1
@@ -1440,7 +1445,12 @@ def _open_regular_beneath_fallback(
         raise MemoryBackupError(f"Backup source is not a regular file: {path}")
     if path_before.st_nlink != 1:
         raise MemoryBackupError(f"Backup source is hard-linked: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
@@ -1523,7 +1533,12 @@ def _copy_validated_backup_source(
             if opened_source != expected_identity:
                 raise MemoryBackupError(f"Backup source changed after validation: {source}")
 
-            target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            target_flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+            )
             target_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             target_descriptor = os.open(target, target_flags, 0o600)
             target_created = True
@@ -1667,20 +1682,28 @@ def _apply_private_file_mode(
 def _snapshot_sqlite(source: Path, target: Path) -> None:
     source_uri = source.resolve().as_uri() + "?mode=ro"
     try:
-        with sqlite3.connect(source_uri, uri=True) as source_connection:
-            with sqlite3.connect(target) as target_connection:
-                source_connection.backup(target_connection)
-                result = target_connection.execute("PRAGMA integrity_check").fetchone()
-                if result is None or str(result[0]).lower() != "ok":
-                    raise MemoryBackupError("SQLite snapshot failed integrity_check")
-                # AgentStateStore intentionally runs in WAL mode. A SQLite backup
-                # inherits that persistent database setting, which can otherwise
-                # leave unmanifested -wal/-shm files beside the snapshot. Convert
-                # the closed backup artifact into one self-contained database.
-                target_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                journal_mode = target_connection.execute("PRAGMA journal_mode=DELETE").fetchone()
-                if journal_mode is None or str(journal_mode[0]).lower() != "delete":
-                    raise MemoryBackupError("SQLite snapshot could not leave WAL journal mode")
+        # sqlite3.Connection's context manager commits or rolls back but does
+        # not close the connection.  Explicitly close both handles before the
+        # containing backup directory is published; Windows refuses to rename
+        # a directory while a database file beneath it remains open.
+        with (
+            closing(sqlite3.connect(source_uri, uri=True)) as source_connection,
+            closing(sqlite3.connect(target)) as target_connection,
+            source_connection,
+            target_connection,
+        ):
+            source_connection.backup(target_connection)
+            result = target_connection.execute("PRAGMA integrity_check").fetchone()
+            if result is None or str(result[0]).lower() != "ok":
+                raise MemoryBackupError("SQLite snapshot failed integrity_check")
+            # AgentStateStore intentionally runs in WAL mode. A SQLite backup
+            # inherits that persistent database setting, which can otherwise
+            # leave unmanifested -wal/-shm files beside the snapshot. Convert
+            # the closed backup artifact into one self-contained database.
+            target_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            journal_mode = target_connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                raise MemoryBackupError("SQLite snapshot could not leave WAL journal mode")
     except sqlite3.Error as exc:
         raise MemoryBackupError(f"SQLite snapshot failed: {exc}") from exc
     sidecars = [target.with_name(target.name + suffix) for suffix in ("-wal", "-shm")]
@@ -1691,7 +1714,9 @@ def _snapshot_sqlite(source: Path, target: Path) -> None:
 
 def _verify_sqlite(path: Path) -> None:
     try:
-        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as connection:
+        with closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        ) as connection:
             result = connection.execute("PRAGMA integrity_check").fetchone()
     except sqlite3.Error as exc:
         raise MemoryBackupError(f"SQLite backup is unreadable: {exc}") from exc

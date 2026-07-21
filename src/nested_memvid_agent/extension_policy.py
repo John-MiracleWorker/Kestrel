@@ -424,6 +424,14 @@ def _process_extension_directory_descriptor(
             else relative / name
         )
         display_path = child_relative.as_posix()
+        if not _portable_windows_path_component(name):
+            raise ExtensionPolicyError(
+                f"extension_tree_path_not_portable:{display_path}"
+            )
+        if name.casefold() in _CONTROL_TREE_NAMES:
+            raise ExtensionPolicyError(
+                f"extension_tree_control_tree_rejected:{display_path}"
+            )
         if metadata.st_dev != root_device:
             raise ExtensionPolicyError(
                 f"extension_tree_filesystem_crossing_rejected:{display_path}"
@@ -630,6 +638,10 @@ def _process_extension_directory_path(
         if not _portable_windows_path_component(name):
             raise ExtensionPolicyError(
                 f"extension_tree_path_not_portable:{display_path}"
+            )
+        if name.casefold() in _CONTROL_TREE_NAMES:
+            raise ExtensionPolicyError(
+                f"extension_tree_control_tree_rejected:{display_path}"
             )
         if metadata.st_dev != root_device:
             raise ExtensionPolicyError(

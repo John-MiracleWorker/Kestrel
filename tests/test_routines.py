@@ -1602,8 +1602,9 @@ def _manager(tmp_path: Path) -> RunManager:
 def _wait_for_run(manager: RunManager, run_id: str):
     deadline = monotonic() + 10.0
     while monotonic() < deadline:
-        run = manager.state.get_run(run_id)
-        if run.status in {"completed", "failed", "cancelled"}:
+        public = manager.get_run(run_id)
+        if public["status"] in {"completed", "failed", "cancelled"}:
+            run = manager.state.get_run(run_id)
             assert run.status == "completed", run.error
             return run
         sleep(0.02)

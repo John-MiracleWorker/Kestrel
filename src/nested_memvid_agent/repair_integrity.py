@@ -633,7 +633,11 @@ def _write_receipt_key_temp(
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+        | getattr(os, "O_NOFOLLOW", 0)
+        # os.write uses the CRT descriptor mode on Windows.  Without O_BINARY,
+        # random key bytes containing LF are expanded to CRLF and no longer
+        # have the required fixed length.
+        | getattr(os, "O_BINARY", 0),
         0o600,
     )
     identity: tuple[int, int] | None = None
@@ -1405,7 +1409,12 @@ def _changed_path_manifest(
         )
     if before.st_size > max_bytes:
         raise ValueError(f"Repair content exceeds its aggregate byte budget: {relative_path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(candidate, flags)
     try:
         opened_before = os.fstat(descriptor)

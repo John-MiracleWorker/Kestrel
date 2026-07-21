@@ -4024,20 +4024,26 @@ def test_git_export_patch_writes_local_improvement_patch(
         del kwargs
         if "config" in command and "--get-regexp" in command:
             return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
-        if command[-6:] == [
+        if command[-7:] == [
             "diff",
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
-            "--name-only",
+            "--ignore-cr-at-eol",
+            "--numstat",
             "-z",
         ]:
-            return subprocess.CompletedProcess(command, 0, stdout=b"a.txt\0", stderr=b"")
+            return subprocess.CompletedProcess(command, 0, stdout=b"1\t0\ta.txt\0", stderr=b"")
         raise AssertionError(f"unexpected direct Git command: {command}")
 
     def fake_supervised(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
-        assert command[-3:] == ["diff", "--no-ext-diff", "--no-textconv"]
+        assert command[-4:] == [
+            "diff",
+            "--ignore-cr-at-eol",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]
         return subprocess.CompletedProcess(command, 0, stdout=patch_text, stderr="")
 
     monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)

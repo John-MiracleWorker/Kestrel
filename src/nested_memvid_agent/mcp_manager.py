@@ -2725,12 +2725,14 @@ def _copy_private_launch_file(
             "MCP launch artifact must be a regular non-linked file.",
         )
     _assert_private_snapshot_permissions(destination.parent)
-    read_flags = os.O_RDONLY
+    read_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_CLOEXEC"):
         read_flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         read_flags |= os.O_NOFOLLOW
-    write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    write_flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    )
     if hasattr(os, "O_CLOEXEC"):
         write_flags |= os.O_CLOEXEC
     source_fd = os.open(source, read_flags)
@@ -2861,7 +2863,7 @@ def _launch_file_has_shebang(path: Path) -> bool:
             "artifact_not_regular",
             "MCP stdio executable must be a regular non-linked file.",
         )
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -2923,7 +2925,7 @@ def _hash_launch_file(path: Path, *, label: str) -> str:
             "artifact_not_regular",
             f"MCP stdio {label} must be a regular non-linked file.",
         )
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):

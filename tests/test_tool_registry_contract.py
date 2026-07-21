@@ -330,12 +330,13 @@ def test_tool_registry_noop_cancel_cannot_wait_forever_or_invite_retry(
     inner = ToolRegistry(runtime_fence=runtime_fence)
     inner.register(PermanentlyBlockedTool())
     registry = RetryingRegistry(inner, max_attempts=3, backoff_base_seconds=0)
+    memory = build_memory_system("memory", tmp_path / "memory")
     started = monotonic()
 
     result = registry.execute(
         ToolCall(name="contract.blocked", arguments={}, id="blocked-call"),
         ToolContext(
-            memory=build_memory_system("memory", tmp_path / "memory"),
+            memory=memory,
             config=AgentConfig(tool_timeout_seconds=0.01),
             workspace=tmp_path,
             execution_origin="subagent:a",
@@ -661,12 +662,13 @@ def test_trusted_timeout_settlement_opt_in_remains_hard_bounded(
 
     registry = ToolRegistry()
     registry.register(TrustedBlockedTool())
+    memory = build_memory_system("memory", tmp_path / "trusted-memory")
     started = monotonic()
 
     result = registry.execute(
         ToolCall(name="contract.trusted-blocked", arguments={}),
         ToolContext(
-            memory=build_memory_system("memory", tmp_path / "trusted-memory"),
+            memory=memory,
             config=AgentConfig(tool_timeout_seconds=0.01),
             workspace=tmp_path,
         ),
@@ -703,11 +705,12 @@ def test_blocking_cancellation_hook_cannot_bypass_timeout_bound(tmp_path: Path) 
 
     registry = ToolRegistry()
     registry.register(BlockingCancelTool())
+    memory = build_memory_system("memory", tmp_path / "blocking-cancel-memory")
     started = monotonic()
     result = registry.execute(
         ToolCall(name="contract.blocking-cancel", arguments={}),
         ToolContext(
-            memory=build_memory_system("memory", tmp_path / "blocking-cancel-memory"),
+            memory=memory,
             config=AgentConfig(tool_timeout_seconds=0.01),
             workspace=tmp_path,
         ),
