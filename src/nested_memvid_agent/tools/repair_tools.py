@@ -299,15 +299,18 @@ class RepairApplyPatchTool(AgentTool):
                     _hardened_git_command(command[1:], workspace=root),
                     cwd=root,
                     env=_sanitized_git_environment(None),
-                    input=patch_text,
+                    # Text-mode pipes rewrite LF to CRLF on Windows. A patch
+                    # is an exact byte protocol, so preserve the approved UTF-8
+                    # payload across the subprocess boundary.
+                    input=patch_text.encode("utf-8"),
                     capture_output=True,
-                    text=True,
                     timeout=30,
                     check=False,
                 )
+            stdout = completed.stdout.decode("utf-8", errors="replace")
+            stderr = completed.stderr.decode("utf-8", errors="replace")
             content = redact_text(
-                f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
-                f"STDERR:\n{completed.stderr}"
+                f"exit_code={completed.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
             )
             return self._result(
                 call,

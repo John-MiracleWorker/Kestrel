@@ -1390,8 +1390,8 @@ def _repo(tmp_path: Path) -> Path:
         capture_output=True,
         text=True,
     )
-    (repo / ".gitignore").write_text(".nest/\n", encoding="utf-8")
-    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    (repo / ".gitignore").write_bytes(b".nest/\n")
+    (repo / "README.md").write_bytes(b"seed\n")
     subprocess.run(
         ["git", "add", ".gitignore", "README.md"],
         cwd=repo,

@@ -534,7 +534,10 @@ class PatchApplyTool(AgentTool):
                 arguments=arguments,
                 default_timeout=30,
                 sanitize_environment=True,
-                input_text=patch_text,
+                # Git patches are exact byte payloads. Text-mode stdin rewrites
+                # LF to CRLF on Windows and can invalidate otherwise-correct
+                # hunks against an LF worktree.
+                input_bytes=patch_text.encode("utf-8"),
             )
             content = _redact_subprocess_text(
                 f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"

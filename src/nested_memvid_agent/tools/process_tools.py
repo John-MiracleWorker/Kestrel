@@ -122,7 +122,7 @@ class _WindowsProcessJob:
 
 @dataclass
 class _TrackedProcess:
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[Any]
     run_id: str | None
     process_group_id: int | None
     cancellation_requested: threading.Event
@@ -143,10 +143,13 @@ def _run_subprocess(
     environment: dict[str, str] | None = None,
     environment_overrides: dict[str, str] | None = None,
     input_text: str | None = None,
+    input_bytes: bytes | None = None,
     requires_workspace_secret_isolation: bool = False,
     require_container_isolation: bool = False,
     expected_repair_snapshot: dict[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str] | IsolatedValidationResult:
+    if input_text is not None and input_bytes is not None:
+        raise ValueError("Subprocess input must be either text or bytes, not both.")
     isolation_error: WorkspaceSecretIsolationError | None = None
     if requires_workspace_secret_isolation and not require_container_isolation:
         try:
@@ -179,16 +182,28 @@ def _run_subprocess(
         )
         process_environment.update(environment_overrides)
     windows_job = _create_windows_process_job() if sys.platform == "win32" else None
-    process: subprocess.Popen[str] | None = None
+    process: subprocess.Popen[Any] | None = None
     process_group_id: int | None = None
     cancellation_requested = threading.Event()
     try:
-        process = _start_subprocess(
-            command,
-            context=context,
-            environment=process_environment,
-            pipe_stdin=input_text is not None,
-        )
+        if input_bytes is not None:
+            process = _start_subprocess(
+                command,
+                context=context,
+                environment=process_environment,
+                pipe_stdin=True,
+                binary_stdio=True,
+            )
+        else:
+            # Keep the original call shape for text/no-input execution. Some
+            # embedders replace this private launch seam with a fixed-signature
+            # supervisor that predates binary stdin support.
+            process = _start_subprocess(
+                command,
+                context=context,
+                environment=process_environment,
+                pipe_stdin=input_text is not None,
+            )
         process_group_id = process.pid if sys.platform != "win32" else None
         if windows_job is not None and not windows_job.assign(process.pid):
             # Windows launches are created suspended, so user code cannot spawn
@@ -212,7 +227,8 @@ def _run_subprocess(
                 "Windows process containment could not safely resume the suspended "
                 "Job Object member; the final outcome is unknown."
             )
-        stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+        stdin_payload = input_bytes if input_bytes is not None else input_text
+        stdout, stderr = process.communicate(input=stdin_payload, timeout=timeout)
         if cancellation_requested.is_set():
             if not _terminate_process_group(
                 process,
@@ -243,8 +259,8 @@ def _run_subprocess(
         return subprocess.CompletedProcess(
             command,
             process.returncode,
-            stdout=_redact_subprocess_text(stdout or ""),
-            stderr=_redact_subprocess_text(stderr or ""),
+            stdout=_redact_subprocess_text(_process_output_text(stdout, None)),
+            stderr=_redact_subprocess_text(_process_output_text(stderr, None)),
         )
     except subprocess.TimeoutExpired as exc:
         assert process is not None
@@ -341,12 +357,13 @@ def _start_subprocess(
     context: ToolContext,
     environment: dict[str, str] | None = None,
     pipe_stdin: bool = False,
-) -> subprocess.Popen[str]:
+    binary_stdio: bool = False,
+) -> subprocess.Popen[Any]:
     common: dict[str, Any] = {
         "cwd": context.workspace,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
+        "text": not binary_stdio,
     }
     if environment is not None:
         common["env"] = environment
@@ -634,7 +651,7 @@ def cancel_subprocesses_for_run(run_id: str) -> int:
 
 
 def _terminate_process_group(
-    process: subprocess.Popen[str],
+    process: subprocess.Popen[Any],
     *,
     process_group_id: int | None = None,
     windows_job: _WindowsProcessJob | None = None,
@@ -659,7 +676,7 @@ def _terminate_process_group(
 
 
 def _kill_process_group(
-    process: subprocess.Popen[str],
+    process: subprocess.Popen[Any],
     *,
     process_group_id: int | None = None,
     windows_job: _WindowsProcessJob | None = None,
@@ -881,7 +898,7 @@ def _create_windows_process_job() -> _WindowsProcessJob:
     )
 
 
-def _terminate_windows_process_tree(process: subprocess.Popen[str]) -> bool:
+def _terminate_windows_process_tree(process: subprocess.Popen[Any]) -> bool:
     """Best-effort fallback when no Job Object owns the tree.
 
     A successful taskkill call is considered verifiable only while the leader is

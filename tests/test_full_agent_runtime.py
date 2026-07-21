@@ -4826,7 +4826,8 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
     _git(repo, "init")
     _git(repo, "config", "user.email", "kestrel@example.test")
     _git(repo, "config", "user.name", "Kestrel Test")
-    (repo / "README.md").write_text("before repair\n", encoding="utf-8")
+    _git(repo, "config", "core.autocrlf", "false")
+    (repo / "README.md").write_bytes(b"before repair\n")
     _git(repo, "add", "README.md")
     _git(repo, "commit", "-m", "initial")
 
@@ -5034,9 +5035,7 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
     # proves that the initial prepare handoff is delivered live, rather than
     # relying on replay or a state-table bootstrap read.
     subscriber = manager.events.subscribe(run.run_id)
-    request.addfinalizer(
-        lambda: manager.events.unsubscribe(run.run_id, subscriber)
-    )
+    request.addfinalizer(lambda: manager.events.unsubscribe(run.run_id, subscriber))
     with manager._run_lease(run.run_id, manager.config) as lease:
         assert lease is not None
         running = manager.state.transition_run(
@@ -5070,6 +5069,27 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
         "git.commit",
     ]
 
+    def observed_event(event: Any) -> dict[str, Any]:
+        payload = event.payload
+        data = payload.get("data")
+        item = {
+            "type": event.type,
+            "tool_name": payload.get("tool_name") or payload.get("tool"),
+            "tool_call_id": payload.get("tool_call_id"),
+            "task_id": payload.get("task_id"),
+            "stop_reason": payload.get("stop_reason"),
+            "success": payload.get("success"),
+            "error": payload.get("error"),
+            "returncode": data.get("returncode") if isinstance(data, dict) else None,
+        }
+        if event.type == "tool.failed":
+            # Tool execution payloads are redacted before publication. Preserve
+            # the failure evidence here so a hosted-only failure identifies the
+            # failing process instead of collapsing into a terminal run event.
+            item["content"] = payload.get("content")
+            item["data"] = data
+        return item
+
     def wait_for_approval_handoff(
         expected_tool: str,
         *,
@@ -5094,19 +5114,20 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
                 event = subscriber.get(timeout=max(0.0, deadline - monotonic()))
             except Empty:
                 break
-            observed.append(
-                {
-                    "type": event.type,
-                    "tool_name": event.payload.get("tool_name"),
-                    "task_id": event.payload.get("task_id"),
-                }
-            )
+            observed.append(observed_event(event))
             if event.type in {"run.failed", "run.cancelled", "run.completed"}:
                 raise AssertionError(
                     {
                         "expected": expected_tool,
                         "unexpected_terminal_event": event.type,
                         "payload": event.payload,
+                        "run": manager.state.get_run(run.run_id),
+                        "capacity": manager.capacity_snapshot(),
+                        "approvals": list_approvals(expire=False),
+                        "tasks": [
+                            (task.title, task.status, task.failure_reason, task.result)
+                            for task in manager.state.list_task_nodes(run.run_id)
+                        ],
                         "observed": observed[-20:],
                     }
                 )
@@ -5124,10 +5145,7 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
                     approval_id = continuation.get("approval_id")
                     if isinstance(approval_id, str):
                         blocked_approval_ids.add(approval_id)
-            if (
-                approval is not None
-                and str(approval.get("approval_id")) in blocked_approval_ids
-            ):
+            if approval is not None and str(approval.get("approval_id")) in blocked_approval_ids:
                 return approval
 
         raise AssertionError(
@@ -5152,13 +5170,7 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
                 event = subscriber.get(timeout=max(0.0, deadline - monotonic()))
             except Empty:
                 break
-            observed.append(
-                {
-                    "type": event.type,
-                    "task_id": event.payload.get("task_id"),
-                    "stop_reason": event.payload.get("stop_reason"),
-                }
-            )
+            observed.append(observed_event(event))
             if event.type in {"run.completed", "run.failed", "run.cancelled"}:
                 return event.type, observed
         raise AssertionError(

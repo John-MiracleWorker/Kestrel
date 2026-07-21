@@ -81,6 +81,8 @@ No changes yet.
   locks before rollback.
 - Preserved web idempotency keys across ambiguous retryable failures and made explicit server
   validation failures authoritative rather than treating transport success as proof of validity.
+- Preserved approved Git patches as exact UTF-8 bytes across subprocess boundaries so Windows
+  newline translation cannot corrupt repair or general patch application against LF worktrees.
 
 ### Security
 

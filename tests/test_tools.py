@@ -15,7 +15,9 @@ from typing import Any, Literal, cast
 import pytest
 from pytest import MonkeyPatch
 
+import nested_memvid_agent.tools.command_tools as command_tools
 import nested_memvid_agent.tools.process_tools as process_tools
+import nested_memvid_agent.tools.repair_tools as repair_tools
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.extension_runner import (
     ContainerExecutionRequest,
@@ -270,6 +272,45 @@ def test_windows_popen_is_suspended_until_job_assignment(
 
     assert int(observed["creationflags"]) & 0x00000004
     assert int(observed["creationflags"]) & 0x00000200
+
+
+def test_subprocess_binary_stdin_preserves_exact_bytes(tmp_path: Path) -> None:
+    payload = b"first line\nsecond line\n"
+    completed = _run_subprocess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write(sys.stdin.buffer.read().hex())",
+        ],
+        context=ToolContext(
+            memory=build_memory_system("memory", tmp_path / "memory"),
+            config=AgentConfig(),
+            workspace=tmp_path,
+        ),
+        arguments={},
+        default_timeout=5,
+        input_bytes=payload,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == payload.hex()
+    assert completed.stderr == ""
+
+
+def test_subprocess_rejects_ambiguous_text_and_binary_stdin(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="either text or bytes"):
+        _run_subprocess(
+            [sys.executable, "-c", "pass"],
+            context=ToolContext(
+                memory=build_memory_system("memory", tmp_path / "memory"),
+                config=AgentConfig(),
+                workspace=tmp_path,
+            ),
+            arguments={},
+            default_timeout=5,
+            input_text="text",
+            input_bytes=b"bytes",
+        )
 
 
 @pytest.mark.parametrize("mode", ["success", "timeout", "cancel"])
@@ -2686,7 +2727,10 @@ def _init_git_repo(path: Path) -> str:
         capture_output=True,
         text=True,
     )
-    (path / "README.md").write_text("seed\n")
+    # Git patches in these fixtures use LF bytes. Keep the committed target
+    # byte-identical on Windows so tests exercise patch transport rather than
+    # platform newline conversion in Path.write_text().
+    (path / "README.md").write_bytes(b"seed\n")
     # Git-focused tests keep the memory backend inside the synthetic workspace.
     # Model the runtime-artifact ignores expected in an actual Kestrel workspace
     # so durable in-memory snapshots do not masquerade as user source changes.
@@ -2895,6 +2939,76 @@ def test_repair_apply_patch_refuses_non_repair_branch(tmp_path: Path) -> None:
     assert not result.success
     assert result.error == "not_repair_branch"
     assert (tmp_path / "README.md").read_text() == "seed\n"
+
+
+def test_repair_apply_patch_preserves_exact_utf8_bytes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _init_git_repo(tmp_path)
+    subprocess.run(
+        ["git", "switch", "-c", "codex/repair-exact-bytes"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert (tmp_path / "README.md").read_bytes() == b"seed\n"
+    patch_text = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-seed\n+patched β\n"
+    observed_inputs: list[object] = []
+    real_run = subprocess.run
+
+    def capture_git_apply(command: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(command, list) and "apply" in command:
+            observed_inputs.append(kwargs.get("input"))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(repair_tools.subprocess, "run", capture_git_apply)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="repair.apply_patch",
+        arguments={"patch": patch_text},
+        id="repair_apply_exact_bytes",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+
+    assert result.success, result.content
+    assert observed_inputs == [patch_text.encode("utf-8")]
+    assert (tmp_path / "README.md").read_bytes() == "patched β\n".encode()
+
+
+def test_patch_apply_preserves_exact_utf8_bytes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _init_git_repo(tmp_path)
+    assert (tmp_path / "README.md").read_bytes() == b"seed\n"
+    patch_text = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-seed\n+patched β\n"
+    observed_inputs: list[object] = []
+    real_run_subprocess = process_tools._run_subprocess  # noqa: SLF001
+
+    def capture_run_subprocess(command: list[str], **kwargs: Any) -> Any:
+        if command == ["git", "apply", "--whitespace=nowarn"]:
+            observed_inputs.append(kwargs.get("input_bytes"))
+            assert "input_text" not in kwargs
+        return real_run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(command_tools, "_run_subprocess", capture_run_subprocess)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="patch.apply",
+        arguments={"patch": patch_text},
+        id="patch_apply_exact_bytes",
+    )
+
+    result = registry.execute(call, _approved_context(memory, tmp_path, call))
+
+    assert result.success, result.content
+    assert observed_inputs == [patch_text.encode("utf-8")]
+    assert (tmp_path / "README.md").read_bytes() == "patched β\n".encode()
 
 
 def test_repair_apply_validate_and_rollback_on_repair_branch(tmp_path: Path) -> None:
@@ -3523,9 +3637,9 @@ def test_validation_subprocesses_do_not_inherit_credentials(
 
 def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
-    (tmp_path / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
-    (tmp_path / "test_calculator.py").write_text(
-        "from calculator import add\n\ndef test_adds_numbers():\n    assert add(2, 3) == 5\n"
+    (tmp_path / "calculator.py").write_bytes(b"def add(a, b):\n    return a - b\n")
+    (tmp_path / "test_calculator.py").write_bytes(
+        b"from calculator import add\n\ndef test_adds_numbers():\n    assert add(2, 3) == 5\n"
     )
     subprocess.run(
         ["git", "add", "calculator.py", "test_calculator.py"],

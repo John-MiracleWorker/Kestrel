@@ -1,6 +1,7 @@
 # Kestrel live benchmark, stress, and release-readiness review
 
-- Date: 2026-07-20
+- Review started: 2026-07-20
+- Last updated: 2026-07-21
 - Package version under review: `0.4.0`
 - Release-candidate branch: `agent/v0.4.0-release-candidate`
 - Base commit: `origin/main` at `d8ceb10dc1fdd48e93d09c798cada842cf4ff46a`
@@ -41,10 +42,17 @@ handles, Windows rollback path primitives, a binary-mode regression harness, pri
 fixtures, and loaded-runner timing. The fifth run passed every upstream lane except native Windows,
 where only two failures remained: a POSIX-mode assertion on a platform that cannot represent the
 execute bit and a scheduler test whose 100 Hz approval reads repeatedly competed for SQLite's sole
-writer slot. The final independently reviewed follow-up is now in the isolated release working
-tree. Its 1,824-pass aggregate suite, integrations, golden evaluations, and learning gate all pass
-locally; fresh wheel and sdist validation is recorded below. Its exact-head hosted run is still
-pending. Remaining gates are a successful run for the latest exact pull-request head, one
+writer slot. The sixth run passed every independently runnable lane except native Windows; both its
+first attempt and failed-job rerun reached the approved repair patch, then failed before validation.
+The failure was deterministic patch-stream newline translation at the Python-to-Git stdin boundary,
+not another scheduler race: Windows text stdin translated the approved LF patch to CRLF while the
+managed worktree contained LF bytes. Both patch tools now send the approved Unicode payload as exact
+UTF-8 bytes, byte-output decoding still
+passes through central redaction, and every real patch-target fixture is deterministic across
+platforms. The independently reviewed follow-up is now in the isolated release working tree. Its
+1,828-pass aggregate suite, integrations, golden evaluations, learning gate, and rebuilt wheel and
+sdist validation all pass locally. Its exact-head hosted run is still pending. Remaining gates are a
+successful run for the latest exact pull-request head, one
 independent human approval, PyPI Trusted Publisher registration, repository immutable releases
 before tagging, first-publish GHCR visibility, and post-publication verification.
 
@@ -65,11 +73,11 @@ and no claim of bit-for-bit reproducibility is made.
 
 | Area | Current result |
 |---|---|
-| Aggregate Python suite | **PASS ON THE CURRENT FOLLOW-UP TREE** — 1,824 passed, 69 intentional opt-in/platform skips, 0 failed, and one known third-party Starlette/httpx deprecation warning in 207.14 s. |
-| Enabled integrations | **PASS ON THE CURRENT FOLLOW-UP TREE** — 23/23: 18 Memvid (43.99 s), 1 stdio MCP (11.81 s), and 4 real OCI-container cases (8.08 s) using the pinned validation-image digest. |
+| Aggregate Python suite | **PASS ON THE CURRENT FOLLOW-UP TREE** — 1,828 passed, 69 intentional opt-in/platform skips, 0 failed, and one known third-party Starlette/httpx deprecation warning. |
+| Enabled integrations | **PASS ON THE CURRENT FOLLOW-UP TREE** — 23/23: 18 Memvid (52.49 s), 1 stdio MCP (21.41 s), and 4 real OCI-container cases (6.33 s) using the pinned validation-image digest. |
 | Local live provider | **PASS for Ollama/Qwen only** — generate, stream, and native-tool certification passed; 27 credential-dependent provider cases were skipped, not counted as passes. |
 | Deterministic benchmark bundle | **PASS** — memory, 4/4 agent tasks, 6/6 recovery tasks with 9 injected errors, and learning acceptance all passed. |
-| Golden evaluations | **PASS ON THE CURRENT FOLLOW-UP TREE** — memory 21/21, maximum 7,782.99 ms; Memvid 21/21, maximum 10,121.61 ms; zero false promotions; 45 s per-case gate. Cost was unmeasured and was not an acceptance gate. |
+| Golden evaluations | **PASS ON THE CURRENT FOLLOW-UP TREE** — memory 21/21, maximum 8,185.04 ms; Memvid 21/21, maximum 13,369.37 ms; zero false promotions; 45 s per-case gate. Cost was unmeasured and was not an acceptance gate. |
 | Current learning benchmark | **PASS ON THE CURRENT FOLLOW-UP TREE** — 4/4 outcomes and 7/7 acceptance assertions passed. |
 | Memory-system evaluation | **PASS** — 9/9, 17 writes, 13 hits, 0 policy writes. |
 | Live learning | **PASS** — Qwen memory 8/8 and Qwen Memvid 8/8; evidence-gated behavior activation occurred; policy stayed empty. |
@@ -81,17 +89,17 @@ and no claim of bit-for-bit reproducibility is made.
 | Rendered browser | **PASS** — headful Chromium 51/51 at desktop, tablet, and mobile; axe-core 4.11 reported 0 violations and 0 incomplete checks at all three sizes. |
 | Web static gates | **PASS** — 57/57 tests, production build, 106 package notices, npm audit 0 vulnerabilities, staged assets matched `web/dist`. |
 | Hash-locked installer | **PASS** — 2/2 live local-repository integrations, plus an isolated exact-wheel verifier using 67 hash-locked requirements and a fresh Memvid v2 store. |
-| Current wheel/sdist | **PASS AS LOCAL EXACT-TREE EVIDENCE** — the rebuilt wheel and sdist passed Twine strict checks, content verification, clean isolated installs, `doctor`, mock chat, and real Memvid write/reopen/retrieval. They represent the current follow-up tree, not workflow-built publication artifacts; only workflow output is publication authority. |
+| Current wheel/sdist | **PASS AS LOCAL EXACT PACKAGE-INPUT EVIDENCE** — the rebuilt wheel and sdist passed Twine strict checks, content verification, clean isolated installs, `doctor`, mock chat, and real Memvid write/reopen/retrieval. They represent all 136 current package inputs, not workflow-built publication artifacts; only workflow output is publication authority. |
 | Release SBOM/dependency audit | **PASS locally** — the current CycloneDX JSON contained 63 release components, all required runtime components and no pytest/Ruff/mypy; the installed environment had no known audited vulnerability. The unpublished Kestrel package itself was explicitly unauditable on PyPI. |
 | Supporting multi-arch image campaign | **PASS locally** — ARM64-native and AMD64-under-QEMU images from the preceding hardening campaign passed architecture/config inspection, read-only non-root CLI/Memvid smokes, authenticated readiness, and Compose-equivalent mock API soaks. These are supporting local BuildKit artifacts, not images rebuilt from the final follow-up or published provenance. |
 | Supporting pre-follow-up source scan | **PASS** — a 438-file source-only candidate assembled from tracked and non-ignored untracked files produced zero unallowed findings with pinned Gitleaks 8.30.1. The final exact candidate is independently archive-scanned after commit and scanned again by hosted CI; the tag workflow likewise materializes and scans the exact release commit instead of failing on revoked historical bytes. |
 | Public history | **RESOLVED CREDENTIAL RESPONSE** — zero open GitHub alerts; the historical Google key is provider-invalid and revoked; the local Gmail artifact was never in the public remote; no history rewrite is required under the documented revoke-first decision. |
 | GitHub controls | **PARTIAL PASS** — branch ruleset `19198902` has no bypass and requires one approving review plus strict aggregate `docker`; tag ruleset `19299564` has no bypass and blocks update/deletion of `v*`; validity and non-provider scanning remain unavailable under the current plan. The `pypi` environment requires explicit owner approval and disallows admin bypass. |
-| Hosted exact-candidate CI | **PENDING FOR THE FINAL FOLLOW-UP EXACT HEAD** — PR [#270](https://github.com/John-MiracleWorker/Kestrel/pull/270). Run [29790915475](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29790915475) exposed the first cross-platform and runner defects. Run [29792592489](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29792592489) passed every non-Windows lane but failed the native Windows test lane with 173 failures. Run [29796925999](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29796925999) passed all but one macOS 3.12 test and 90 Windows tests. Run [29799895155](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29799895155) passed all but macOS 3.11's one zombie-sensitive cleanup proof and 22 Windows cases. Run [29802177401](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29802177401) passed both macOS lanes, every Ubuntu lane, CodeQL, secret scan, web, integrations, and extension containment; native Windows had exactly two failures. The aggregate `docker` gate was correctly skipped after those upstream failures. The reviewed final follow-up tree closes both remaining causes locally but has not yet been certified by hosted CI; the ruleset-required exact-head rerun must pass before merge. |
+| Hosted exact-candidate CI | **PENDING FOR THE FINAL FOLLOW-UP EXACT HEAD** — PR [#270](https://github.com/John-MiracleWorker/Kestrel/pull/270). Run [29790915475](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29790915475) exposed the first cross-platform and runner defects. Run [29792592489](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29792592489) passed every non-Windows lane but failed the native Windows test lane with 173 failures. Run [29796925999](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29796925999) passed all but one macOS 3.12 test and 90 Windows tests. Run [29799895155](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29799895155) passed all but macOS 3.11's one zombie-sensitive cleanup proof and 22 Windows cases. Run [29802177401](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29802177401) passed all upstream lanes except two native-Windows tests. Run [29804791883](https://github.com/John-MiracleWorker/Kestrel/actions/runs/29804791883) passed both macOS lanes, every Ubuntu lane, CodeQL, secret scan, web, integrations, and extension containment; its first Windows attempt and failed-job rerun each repeated one exact repair-patch failure, so aggregate `docker` correctly skipped. The reviewed byte-exact follow-up closes that cause locally but has not yet been certified by hosted CI; the ruleset-required exact-head rerun must pass before merge. |
 
-The current aggregate Python suite passed 1,824 tests, skipped 69 intentional opt-in or
-platform-specific cases, and failed none in 207.14 seconds. It emitted only the known third-party
-Starlette/httpx TestClient deprecation warning.
+The current aggregate Python suite passed 1,828 tests, skipped 69 intentional opt-in or
+platform-specific cases, and failed none. It emitted only the known third-party Starlette/httpx
+TestClient deprecation warning.
 
 The previous local freeze reran `uv run pytest -q` after the first hosted-failure corrections were
 added: 1,780 passed and 55 opt-in cases skipped. The exact Memvid v2 integration selection
@@ -103,24 +111,24 @@ current final follow-up tree is recorded below.
 
 ### Current final-follow-up evidence (local candidate tree)
 
-- The final integration reruns record 18/18 Memvid integrations in 43.99 seconds, 1/1 stdio MCP
-  integration in 11.81 seconds, and 4/4 OCI extension integrations in 8.08
+- The final integration reruns record 18/18 Memvid integrations in 52.49 seconds, 1/1 stdio MCP
+  integration in 21.41 seconds, and 4/4 OCI extension integrations in 6.33
   seconds using the pinned validation-image digest.
-- The final evaluation reruns record golden memory 21/21 with maximum latency 7,782.99 ms and
-  golden Memvid 21/21 with maximum latency 10,121.61 ms. Both had zero false promotions. The
+- The final evaluation reruns record golden memory 21/21 with maximum latency 8,185.04 ms and
+  golden Memvid 21/21 with maximum latency 13,369.37 ms. Both had zero false promotions. The
   learning benchmark passed 4/4 outcomes and 7/7 acceptance assertions. Evidence is under
-  `/tmp/kestrel-v040-final-matrix.aDChHl`; its `SHA256SUMS` has SHA-256
-  `47f1b0f3f78f2bca2972624c3cfa37e7619ddb4b82e1c525c6e2848434a7845a`.
-- Evidence under `/tmp/kestrel-v040-package-hardened.vKlF5f` records a Python 3.12.11 build, strict
+  `/tmp/kestrel-v040-bytefix-matrix.P4Y07t`; its `SHA256SUMS` has SHA-256
+  `ab7b11e014246d2a2c1cf08fdf787cf1248488e6c8e39667aa75e2db364ed795`.
+- Evidence under `/tmp/kestrel-v040-package-approved.KVbld6` records a Python 3.12.11 build, strict
   Twine and content checks, and separate hash-locked, isolated Python 3.11.15 wheel and sdist
   installs. Both installs resolved all 67 locked requirements, imported all seven optional-extra
   surfaces, and passed `pip check`, metadata/resource checks, `doctor`, mock chat, and real Memvid
-  v2 write/seal/close/reopen/verify/retrieval. A 135-file package-input manifest was byte-identical
-  before the build, in the build snapshot, and after the gate. The wheel is 836,525 bytes with
-  SHA-256 `223d88d27a119d3c5272541a1549082753e077a1af6386a23bd1fd8b2b1e9ae8`; the sdist is
-  799,137 bytes with SHA-256 `03f018adf396712d4983338b0028159246f358d6ccf0aa025143e0759cc71ef6`.
-- The exact aggregate suite passed 1,824 tests, skipped 69 intentional opt-in or platform-specific
-  cases, and failed none in 207.14 seconds. These results exercise the exact local candidate tree,
+  v2 write/seal/close/reopen/verify/retrieval. A 136-file package-input manifest was byte-identical
+  before the build, in the build snapshot, and after the gate. The wheel is 836,977 bytes with
+  SHA-256 `95ffb387652b649921a00bb1a19580f83ec424b1b94f9e8786d204f766dc0b55`; the sdist is
+  799,592 bytes with SHA-256 `c3071ab6b57449983c677439daa4d05e951e29091c0ae03c350138bac9473216`.
+- The exact aggregate suite passed 1,828 tests, skipped 69 intentional opt-in or platform-specific
+  cases, and failed none. These results exercise the exact current code and test tree,
   but are not workflow-built publication attestations. Only release-
   workflow outputs built from the final exact commit are publication authority.
 
@@ -444,11 +452,11 @@ identity because that version does not exist on PyPI. Evidence lives under
 `/tmp/kestrel-final-validation.K8CPk5/posthardening/release-payload-final/` and
 `posthardening/package-evidence/`.
 
-The current hardened local tree produced wheel SHA-256
-`223d88d27a119d3c5272541a1549082753e077a1af6386a23bd1fd8b2b1e9ae8` (836,525 bytes) and
-sdist SHA-256 `03f018adf396712d4983338b0028159246f358d6ccf0aa025143e0759cc71ef6`
-(799,137 bytes), plus a 63-component CycloneDX inventory. They are local validation evidence under
-`/tmp/kestrel-v040-package-hardened.vKlF5f`, not publication artifacts. The tag workflow must
+The exact current package-input tree produced wheel SHA-256
+`95ffb387652b649921a00bb1a19580f83ec424b1b94f9e8786d204f766dc0b55` (836,977 bytes) and
+sdist SHA-256 `c3071ab6b57449983c677439daa4d05e951e29091c0ae03c350138bac9473216`
+(799,592 bytes), plus a 63-component CycloneDX inventory. They are local validation evidence under
+`/tmp/kestrel-v040-package-approved.KVbld6`, not publication artifacts. The tag workflow must
 independently rebuild and attest the final exact commit; only those workflow-produced artifacts and
 checksums are publication authority.
 
@@ -635,6 +643,22 @@ The campaign found and addressed release-significant problems rather than only r
     `BEGIN IMMEDIATE`; the full aggregate passes 1,824 tests, all enabled integrations and
     evaluations pass, fresh package installs pass, and independent review reports no P0-P3
     findings. Exact-head hosted execution remains mandatory.
+29. The sixth pull-request run passed every independently runnable lane except one native-Windows
+    scheduler flow. Both the initial Windows attempt and the failed-job rerun resumed the approved
+    `repair.apply_patch` call, emitted its failed execution, and terminated before the validation
+    approval. Git for Windows had normalized the managed worktree to LF, while Python text-mode
+    stdin translated the approved LF patch to CRLF; `git apply` therefore rejected the otherwise
+    correct hunk. `repair.apply_patch` now sends exact UTF-8 bytes directly, and the supervised
+    subprocess boundary adds an explicit binary-stdin path used by general `patch.apply` while
+    retaining text mode for every other caller. Byte output is decoded before central redaction,
+    simultaneous text and byte input fails closed, and Windows Job Object timeout/cancellation
+    semantics are unchanged. Portable regressions assert the exact approved Unicode bytes, apply
+    them to deterministic LF worktrees, round-trip binary stdin through a real child process, and
+    make every real patch-target fixture platform-independent. The scheduler diagnostic now records
+    the redacted failed tool, error, return code, and one-shot durable state snapshot. The current
+    aggregate passes 1,828 tests, all enabled integrations/evaluations and both fresh package
+    installs pass, and independent review reports no P0-P3 findings. Exact-head hosted execution
+    remains mandatory.
 
 ## Independent cross-platform hardening review
 
@@ -643,7 +667,8 @@ review covered WinAPI and SDDL use, recursive MCP snapshot ACL enforcement, supp
 identity pinning, repair cleanup descriptor ordering, the Windows rollback fallback and its
 owner-private/reparse/identity boundaries, canonical Windows path checks, binary-mode fingerprints,
 Git line-ending behavior, zombie-state handling, Windows mode semantics, SQLite expiry
-linearization, durable event ordering, and the separation of staged from unstaged changes.
+linearization, durable event ordering, exact patch-byte transport and decoding, deterministic
+cross-platform patch fixtures, and the separation of staged from unstaged changes.
 This is code-review evidence, not a substitute for the repository ruleset's human approval or
 exact-head CI.
 
@@ -686,7 +711,7 @@ Three residuals remain explicit:
   provenance, registry visibility, tag immutability, and post-publication install/rollback remain
   untested.
 - `0.4.0` is intentionally unpublished, but its release-tag metadata gate passes. The current
-  final follow-up tree still needs exact-head hosted CI. Its 1,824-pass local aggregate, integration,
+  final follow-up tree still needs exact-head hosted CI. Its 1,828-pass local aggregate, integration,
   evaluation, learning, and rebuilt package gates pass, but workflow-built artifacts remain
   publication authority; further holds are human review and publication
   configuration/evidence.
@@ -694,8 +719,9 @@ Three residuals remain explicit:
 
 ## Public-release blocker sequence
 
-1. Require successful CI, including native Windows and both macOS lanes, for the exact PR #270 head
-   containing this locally green, independently reviewed final follow-up.
+1. Require successful CI, including native Windows and both macOS lanes plus strict aggregate
+   `docker`, for the exact PR #270 head containing this locally green, independently reviewed
+   byte-exact follow-up.
 2. Add a trusted reviewer/collaborator and obtain the ruleset-required independent approval.
    `John-MiracleWorker` is currently the only collaborator, so self-approval cannot close this gate.
 3. In PyPI, register the pending Trusted Publisher for project `nested-memvid-agent`, owner
@@ -726,9 +752,13 @@ upstream lane other than macOS 3.11 and Windows; those lanes had one zombie-sens
 and 22 cases, respectively, isolating the final process-state, test-owned handle, rollback-primitive,
 binary-harness, fixture, and loaded-runner issues. The fifth run then passed both macOS lanes and all
 upstream jobs except two Windows tests, isolating the final mode-representation assumption and
-approval-reader writer contention. The current diff closes both causes, has independent code-review
-approval with no P0-P3 findings, and its focused/static gates, integrations, golden evaluations,
-learning benchmark, and 1,824-pass aggregate suite are green.
+approval-reader writer contention. The sixth run passed all of those corrections and every upstream
+lane except one Windows repair flow; its failed-job rerun repeated the same pre-validation patch
+failure and proved the remaining defect was text-mode newline translation, not scheduling. The
+current diff transports approved patches as exact UTF-8 bytes, makes every real patch fixture
+byte-deterministic, has independent code-review approval with no P0-P3 findings, and its
+focused/static gates, integrations, golden evaluations, learning benchmark, and 1,828-pass
+aggregate suite are green.
 Fresh local package evidence is recorded above. A green exact-head hosted run remains pending, and
 the local packages are evidence rather than publication authority.
 After that code-side gate,
