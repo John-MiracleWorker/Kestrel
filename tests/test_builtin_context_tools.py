@@ -13,7 +13,11 @@ from nested_memvid_agent.tools.builtin import build_default_tools
 
 
 def test_context_pack_tool_works(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory",
+        tmp_path / "memory",
+        enforce_stable_write_integrity=False,
+    )
     memory.put(
         MemoryRecord(
             title="Context fact",
@@ -148,7 +152,9 @@ def test_capsule_apply_requests_approval_when_enabled(tmp_path: Path) -> None:
     assert result.error == "approval_pending"
 
 
-def test_capsule_apply_after_approval_writes_non_policy_and_blocks_policy(tmp_path: Path) -> None:
+def test_capsule_apply_after_approval_stages_unvalidated_fact_and_blocks_policy(
+    tmp_path: Path,
+) -> None:
     config = AgentConfig(
         memory_dir=tmp_path / "memory",
         enable_auto_consolidation=True,
@@ -178,9 +184,36 @@ def test_capsule_apply_after_approval_writes_non_policy_and_blocks_policy(tmp_pa
     payload = json.loads(result.content)
     assert result.success
     assert payload["applied"] is True
-    assert memory.retrieve(
-        RetrievalQuery(query="Approved capsule apply", layers=(MemoryLayer.SEMANTIC,), k_per_layer=3)
+    assert not memory.retrieve(
+        RetrievalQuery(
+            query="Approved capsule apply",
+            layers=(MemoryLayer.SEMANTIC,),
+            k_per_layer=3,
+        )
     )
+    staged_hits = memory.retrieve(
+        RetrievalQuery(
+            query="Approved capsule apply",
+            layers=(MemoryLayer.EPISODIC,),
+            k_per_layer=3,
+        )
+    )
+    assert staged_hits
+    staged = staged_hits[0].record
+    assert staged.metadata["capsule_apply_status"] == "unvalidated_episodic_staging"
+    assert staged.metadata["actual_layer"] == "episodic"
+    assert staged.metadata["requested_stable_layer"] == "semantic"
+    assert staged.metadata["validation_status"] == "unresolved"
+    assert staged.metadata["stable_recall_eligible"] is False
+    assert staged.evidence[0].source == "task_capsule"
+    fact_decision = next(
+        item for item in payload["decisions"] if item["signal_kind"] == "fact"
+    )
+    assert fact_decision["write_mode"] == "unvalidated_episodic_staging"
+    assert fact_decision["actual_layer"] == "episodic"
+    assert fact_decision["requested_stable_layer"] == "semantic"
+    assert fact_decision["validation_status"] == "unresolved"
+    assert fact_decision["stable_promotion_blocked"] == "authenticated_validation_required"
     assert not memory.retrieve(
         RetrievalQuery(query="Policy candidates", layers=(MemoryLayer.POLICY,), k_per_layer=3)
     )
@@ -223,7 +256,11 @@ def test_capsule_apply_rejects_changed_arguments_after_approval(tmp_path: Path) 
 
 
 def test_memory_conflicts_returns_structured_output(tmp_path: Path) -> None:
-    memory = build_memory_system("memory", tmp_path / "memory")
+    memory = build_memory_system(
+        "memory",
+        tmp_path / "memory",
+        enforce_stable_write_integrity=False,
+    )
     for title, content in [
         ("Flag state", "feature flag omega is enabled."),
         ("Flag state correction", "feature flag omega is not enabled."),

@@ -17,7 +17,15 @@ from ..runtime_models import (
     ToolSpec,
 )
 from .base import LLMProvider, ProviderCapabilities, ProviderError
-from .parser import normalize_tool_calls, parse_agent_response
+from .parser import (
+    ControlMessageError,
+    native_tool_arguments,
+    native_tool_call_id,
+    native_tool_name,
+    normalize_tool_calls,
+    parse_agent_response,
+)
+from .provider_urls import validate_provider_http_url
 
 
 class OllamaNativeProvider(LLMProvider):
@@ -36,7 +44,7 @@ class OllamaNativeProvider(LLMProvider):
         provider_name: str = "ollama-cloud",
     ) -> None:
         self.model = model
-        self.base_url = base_url
+        self.base_url = validate_provider_http_url(base_url)
         self.api_key_env = api_key_env or "OLLAMA_API_KEY"
         self.api_key = api_key or os.getenv(self.api_key_env)
         self.timeout_seconds = timeout_seconds
@@ -53,6 +61,7 @@ class OllamaNativeProvider(LLMProvider):
             supports_json_mode=True,
             supports_system_messages=True,
             token_usage_available=True,
+            native_tool_limit=12,
         )
 
     def generate(
@@ -76,7 +85,9 @@ class OllamaNativeProvider(LLMProvider):
             )
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(str(exc), code=type(exc).__name__, retryable=True) from exc
-        return _ollama_response_to_llm_response(response, tools=tools, provider_name=self.provider_name)
+        return _ollama_response_to_llm_response(
+            response, tools=tools, provider_name=self.provider_name
+        )
 
     def stream(
         self,
@@ -113,6 +124,8 @@ class OllamaNativeProvider(LLMProvider):
                 usage = _usage_dict(chunk) or usage
                 done_reason = chunk.get("done_reason") if isinstance(chunk, dict) else None
                 finish_reason = str(done_reason) if done_reason else finish_reason
+        except ControlMessageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             yield LLMStreamEvent(
                 type="provider_error",
@@ -155,10 +168,13 @@ class OllamaNativeProvider(LLMProvider):
         return request
 
 
-def _post_json(url: str, payload: dict[str, Any], *, timeout_seconds: float, api_key: str | None) -> Any:
+def _post_json(
+    url: str, payload: dict[str, Any], *, timeout_seconds: float, api_key: str | None
+) -> Any:
     request = _json_request(url, payload, api_key=api_key)
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - provider URL comes from runtime provider configuration
+        # _json_request rejects every scheme except HTTP(S).
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
             body = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -178,7 +194,8 @@ def _post_json_lines(
 ) -> Iterator[dict[str, Any]]:
     request = _json_request(url, payload, api_key=api_key)
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310 - provider URL comes from runtime provider configuration
+        # _json_request rejects every scheme except HTTP(S).
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
             for raw_line in response:
                 line = raw_line.decode("utf-8").strip()
                 if not line:
@@ -195,21 +212,42 @@ def _post_json_lines(
 
 
 def _json_request(url: str, payload: dict[str, Any], *, api_key: str | None) -> Request:
+    safe_url = validate_provider_http_url(url)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    return Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    return Request(
+        safe_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
 
 
 def _join_url(base_url: str, suffix: str) -> str:
-    return urljoin(f"{base_url.rstrip('/')}/", suffix)
+    safe_base_url = validate_provider_http_url(base_url)
+    return validate_provider_http_url(urljoin(f"{safe_base_url.rstrip('/')}/", suffix))
 
 
 def _to_ollama_message(message: ChatMessage) -> dict[str, Any]:
     if message.role == "tool":
-        return {"role": "user", "content": f"Tool result from {message.name or 'tool'}:\n{message.content}"}
+        return {
+            "role": "tool",
+            "content": message.content,
+            "tool_name": message.name or "tool",
+        }
     role = "assistant" if message.role == "assistant" else message.role
-    return {"role": role, "content": message.content}
+    payload: dict[str, Any] = {"role": role, "content": message.content}
+    if message.role == "assistant" and message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments},
+            }
+            for call in message.tool_calls
+        ]
+    return payload
 
 
 def _to_ollama_tool(tool: ToolSpec) -> dict[str, Any]:
@@ -232,7 +270,9 @@ def _ollama_response_to_llm_response(
     message = response.get("message") if isinstance(response, dict) else None
     text = str(message.get("content", "") if isinstance(message, dict) else "")
     parsed = parse_agent_response(text, tools=tools, strict=True)
-    native_calls = _ollama_tool_calls(message.get("tool_calls") if isinstance(message, dict) else None)
+    native_calls = _ollama_tool_calls(
+        message.get("tool_calls") if isinstance(message, dict) else None
+    )
     finish_reason = response.get("done_reason") if isinstance(response, dict) else None
     return LLMResponse(
         content=parsed.content if parsed.raw is not None else text.strip(),
@@ -245,23 +285,40 @@ def _ollama_response_to_llm_response(
 
 def _ollama_tool_calls(raw_calls: Any) -> list[ToolCall]:
     calls: list[ToolCall] = []
-    if not isinstance(raw_calls, list):
+    if raw_calls is None:
         return calls
+    if not isinstance(raw_calls, list | tuple):
+        raise ControlMessageError(
+            "ollama.message.tool_calls must be a list",
+            code="invalid_tool_call",
+        )
     for index, item in enumerate(raw_calls):
+        location = f"ollama.message.tool_calls[{index}]"
         if not isinstance(item, dict):
-            continue
+            raise ControlMessageError(f"{location} must be an object", code="invalid_tool_call")
+        call_type = item.get("type")
+        if call_type is not None and call_type != "function":
+            raise ControlMessageError(
+                f"{location}.type must be function",
+                code="invalid_tool_call",
+            )
         function = item.get("function")
         if not isinstance(function, dict):
-            continue
-        name = function.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        args = function.get("arguments")
+            raise ControlMessageError(
+                f"{location}.function must be an object",
+                code="invalid_tool_call",
+            )
+        name = native_tool_name(function.get("name"), location=location)
+        arguments = native_tool_arguments(
+            function.get("arguments"),
+            tool_name=name,
+            location=location,
+        )
         calls.append(
             ToolCall(
                 name=name,
-                arguments=dict(args) if isinstance(args, dict) else {},
-                id=str(item.get("id") or f"ollama_tool_{index}_{name}"),
+                arguments=arguments,
+                id=native_tool_call_id(item.get("id"), location=f"{location}.id"),
             )
         )
     return calls

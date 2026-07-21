@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
+from .extension_runner import _digest_pinned_image as _is_digest_pinned_oci_image
 from .llm.factory import provider_health_id
 from .llm.resilience import global_provider_health_registry
 
@@ -97,7 +98,9 @@ def build_setup_readiness_report(
             allow_directory_target=True,
         ),
         _permission_gate_check(config),
+        _validation_container_check(config),
         _repair_isolation_check(config),
+        _proactive_routines_check(config),
         _api_auth_check(config),
     )
     pass_count = sum(1 for check in checks if check.status == SetupReadinessStatus.PASS)
@@ -330,6 +333,56 @@ def _permission_gate_check(config: AgentConfig) -> SetupReadinessCheck:
     )
 
 
+def _validation_container_check(config: AgentConfig) -> SetupReadinessCheck:
+    enabled_tools: list[str] = []
+    if config.allow_shell:
+        enabled_tools.extend(
+            [
+                "test.run",
+                "lint.run",
+                "repair.validate",
+                "repair.orchestrate_validate",
+            ]
+        )
+    if config.allow_codex_cli:
+        enabled_tools.append("codex.exec")
+    if not enabled_tools:
+        return SetupReadinessCheck(
+            "validation_container",
+            "Arbitrary-code OCI isolation",
+            SetupReadinessStatus.PASS,
+            "OCI-only test, lint, repair-validation, and Codex tool master gates are disabled.",
+            "Configure a preloaded digest-pinned validation image before enabling any of them.",
+        )
+
+    image = str(config.validation_container_image or "").strip()
+    enabled = ", ".join(enabled_tools)
+    if not image:
+        return SetupReadinessCheck(
+            "validation_container",
+            "Arbitrary-code OCI isolation",
+            SetupReadinessStatus.FAIL,
+            f"Configuration gates permit OCI-only tools, but no image is configured: {enabled}.",
+            "Set NEST_AGENT_VALIDATION_CONTAINER_IMAGE to a preloaded immutable "
+            "name@sha256:<64 hex> reference containing the requested commands.",
+        )
+    if not _is_digest_pinned_oci_image(image):
+        return SetupReadinessCheck(
+            "validation_container",
+            "Arbitrary-code OCI isolation",
+            SetupReadinessStatus.FAIL,
+            f"Configuration gates permit OCI-only tools, but `{image}` is not digest-pinned: {enabled}.",
+            "Replace the image setting with a preloaded immutable name@sha256:<64 hex> reference.",
+        )
+    return SetupReadinessCheck(
+        "validation_container",
+        "Arbitrary-code OCI isolation",
+        SetupReadinessStatus.PASS,
+        f"OCI-only tool configuration gates have a digest-pinned image reference: {enabled}.",
+        "Run one contained command to verify the image is preloaded and includes its dependencies.",
+    )
+
+
 def _repair_isolation_check(config: AgentConfig) -> SetupReadinessCheck:
     if config.enable_worker_isolation:
         return SetupReadinessCheck(
@@ -371,4 +424,30 @@ def _api_auth_check(config: AgentConfig) -> SetupReadinessCheck:
         SetupReadinessStatus.PASS,
         f"API auth is required and `{config.api_auth_token_env}` is present.",
         "No recovery needed.",
+    )
+
+
+def _proactive_routines_check(config: AgentConfig) -> SetupReadinessCheck:
+    if not config.enable_proactive_routines:
+        return SetupReadinessCheck(
+            "proactive_routines",
+            "Proactive routines",
+            SetupReadinessStatus.PASS,
+            "Time-based proactive execution is disabled by default.",
+            "Enable it only after creating and reviewing disabled routine drafts through the local CLI or an authenticated API.",
+        )
+    if not config.require_api_auth:
+        return SetupReadinessCheck(
+            "proactive_routines",
+            "Proactive routines",
+            SetupReadinessStatus.WARN,
+            "Proactive execution is enabled, but API authentication is disabled.",
+            "Keep the server strictly loopback-only or enable API authentication before managing routines through the web API.",
+        )
+    return SetupReadinessCheck(
+        "proactive_routines",
+        "Proactive routines",
+        SetupReadinessStatus.PASS,
+        "Proactive execution is enabled behind authenticated owner controls; individual routines still default disabled.",
+        "Review each routine revision and keep exact-call tool approvals enabled.",
     )

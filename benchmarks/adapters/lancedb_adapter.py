@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import lancedb
-import numpy as np
 import pyarrow as pa
 from sentence_transformers import SentenceTransformer
 

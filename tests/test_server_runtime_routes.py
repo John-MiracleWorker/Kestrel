@@ -4,6 +4,9 @@ import hashlib
 import json
 import os
 from dataclasses import replace
+from pathlib import Path
+from threading import Event, Thread
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -15,7 +18,9 @@ from nested_memvid_agent.runtime_settings import (
     RuntimeSettingsConflict,
     RuntimeSettingsStore,
     apply_runtime_settings,
+    default_runtime_settings_path,
 )
+from nested_memvid_agent.server import create_app
 from nested_memvid_agent.server_runtime_routes import register_runtime_routes
 
 
@@ -43,6 +48,7 @@ def test_runtime_routes_report_health_and_redacted_config(tmp_path, monkeypatch)
         state_path=tmp_path / "state.db",
         log_dir=tmp_path / "logs",
         api_key_env="KESTREL_TEST_API_KEY",
+        enable_semantic_orchestration=True,
     )
     app = FastAPI()
     register_runtime_routes(app, active_config=config, state=_FakeState())
@@ -58,6 +64,9 @@ def test_runtime_routes_report_health_and_redacted_config(tmp_path, monkeypatch)
     assert payload["schema_version"] == 10
     assert payload["provider"]["api_key_env"] == "KESTREL_TEST_API_KEY"
     assert payload["provider"]["api_key_configured"] is True
+    assert payload["feature_flags"]["enable_semantic_orchestration"] is True
+    assert payload["feature_flags"]["enable_proactive_routines"] is False
+    assert payload["limits"]["max_routines_per_tick"] == 3
     assert "raw-secret-value" not in runtime.text
 
 
@@ -192,6 +201,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     saved = client.put(
         "/api/runtime/settings",
         json={
+            "expected_revision": store.load(config).revision,
             "provider": "codex-cli",
             "model": "gpt-5.4",
             "temperature": 0.7,
@@ -211,6 +221,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
             "allow_executable_skills": True,
             "allow_web": True,
             "allow_self_modification": True,
+            "enable_semantic_orchestration": True,
         },
     )
 
@@ -233,6 +244,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert active_config.allow_plugin_install is True
     assert active_config.allow_git_commit is True
     assert active_config.allow_memory_import is True
+    assert active_config.enable_semantic_orchestration is True
     assert active_config.allow_executable_skills is True
     assert active_config.allow_web is True
     assert active_config.allow_self_modification is True
@@ -251,6 +263,7 @@ def test_runtime_settings_save_persists_and_updates_runtime_config(tmp_path) -> 
     assert runtime_payload["settings"]["runtime"]["max_tool_rounds"] == 12
     assert runtime_payload["settings"]["runtime"]["allow_shell"] is True
     assert runtime_payload["feature_flags"]["allow_shell"] is True
+    assert runtime_payload["feature_flags"]["enable_semantic_orchestration"] is True
 
 
 def test_runtime_settings_save_persists_provider_endpoint_and_key_env(tmp_path) -> None:
@@ -283,6 +296,7 @@ def test_runtime_settings_save_persists_provider_endpoint_and_key_env(tmp_path) 
     saved = client.put(
         "/api/runtime/settings",
         json={
+            "expected_revision": store.load(config).revision,
             "provider": "ollama-cloud",
             "model": "gpt-oss:120b",
             "base_url": "https://ollama.com/api",
@@ -318,11 +332,324 @@ def test_runtime_settings_rejects_launch_controlled_api_auth_toggle(tmp_path) ->
     )
     client = TestClient(app, raise_server_exceptions=False)
 
-    response = client.put("/api/runtime/settings", json={"require_api_auth": True})
+    response = client.put(
+        "/api/runtime/settings",
+        json={
+            "expected_revision": store.load(config).revision,
+            "require_api_auth": True,
+        },
+    )
 
     assert response.status_code == 400
     assert "require_api_auth_is_launch_controlled" in response.text
     assert not store.exists()
+
+
+def test_runtime_settings_requires_expected_revision(tmp_path) -> None:
+    config = AgentConfig(memory_dir=tmp_path / "memory", state_path=tmp_path / "state.db")
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    app = FastAPI()
+    register_runtime_routes(
+        app,
+        active_config=config,
+        state=_FakeState(),
+        settings_store=store,
+        http_exception=HTTPException,
+    )
+
+    with TestClient(app) as client:
+        response = client.put("/api/runtime/settings", json={"model": "stale-model"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "expected_revision_is_required"
+    assert not store.exists()
+
+
+def test_runtime_settings_rejects_stale_client_revision_without_reenabling_capability(
+    tmp_path,
+) -> None:
+    config = AgentConfig(
+        provider="mock",
+        model="mock",
+        allow_shell=True,
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+    )
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    initial = store.save(RuntimeSettings.from_config(config))
+    active = [config]
+    app = FastAPI()
+    register_runtime_routes(
+        app,
+        active_config=lambda: active[0],
+        state=_FakeState(),
+        settings_store=store,
+        on_config_update=lambda candidate: active.__setitem__(0, candidate),
+        http_exception=HTTPException,
+    )
+
+    with TestClient(app) as client:
+        disabled = client.put(
+            "/api/runtime/settings",
+            json={"expected_revision": initial.revision, "allow_shell": False},
+        )
+        stale = client.put(
+            "/api/runtime/settings",
+            json={
+                "expected_revision": initial.revision,
+                "model": "new-model-from-stale-tab",
+                "allow_shell": True,
+            },
+        )
+
+    assert disabled.status_code == 200
+    assert stale.status_code == 409
+    assert store.load(config).allow_shell is False
+    assert active[0].allow_shell is False
+
+
+def test_runtime_settings_serializes_persistence_and_activation(tmp_path) -> None:
+    config = AgentConfig(
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+    )
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    initial = store.save(RuntimeSettings.from_config(config))
+    active = [config]
+    activation_started = Event()
+    release_activation = Event()
+    load_started = Event()
+    load_finished = Event()
+
+    def activate(candidate: AgentConfig) -> None:
+        activation_started.set()
+        assert release_activation.wait(5)
+        active[0] = candidate
+
+    app = FastAPI()
+    register_runtime_routes(
+        app,
+        active_config=lambda: active[0],
+        state=_FakeState(),
+        settings_store=store,
+        on_config_update=activate,
+        http_exception=HTTPException,
+    )
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/runtime/settings"
+        and "PUT" in getattr(route, "methods", set())
+    )
+    update_result: dict[str, object] = {}
+
+    def update() -> None:
+        update_result.update(
+            endpoint(
+                {
+                    "expected_revision": initial.revision,
+                    "model": "serialized-model",
+                }
+            )
+        )
+
+    def load() -> None:
+        load_started.set()
+        store.load(config)
+        load_finished.set()
+
+    update_thread = Thread(target=update)
+    update_thread.start()
+    assert activation_started.wait(5)
+    load_thread = Thread(target=load)
+    load_thread.start()
+    assert load_started.wait(5)
+    assert not load_finished.wait(0.05)
+    release_activation.set()
+    update_thread.join(5)
+    load_thread.join(5)
+
+    assert not update_thread.is_alive()
+    assert not load_thread.is_alive()
+    assert load_finished.is_set()
+    assert active[0].model == "serialized-model"
+    assert store.load(config).model == "serialized-model"
+    runtime = update_result.get("runtime")
+    assert isinstance(runtime, dict)
+    assert runtime["model"] == "serialized-model"
+
+
+def test_runtime_settings_activation_failure_restores_persisted_and_live_config(
+    tmp_path,
+) -> None:
+    config = AgentConfig(
+        provider="mock",
+        model="mock",
+        allow_shell=True,
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+    )
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    initial = store.save(RuntimeSettings.from_config(config))
+    initial_payload = store.path.read_bytes()
+    active = [config]
+
+    class FailingRevocationRuns:
+        class Registry:
+            @staticmethod
+            def specs() -> list[SimpleNamespace]:
+                return [
+                    SimpleNamespace(
+                        name="shell.run",
+                        source="builtin",
+                        aliases=(),
+                    )
+                ]
+
+            all_specs = specs
+
+        def build_registry(self) -> Registry:
+            return self.Registry()
+
+        def revoke_pending_approvals_for_tools(
+            self,
+            _tool_names: set[str],
+            *,
+            reason: str,
+        ) -> int:
+            assert reason == "global_capability_disabled"
+            raise RuntimeError("simulated approval revocation failure")
+
+    app = FastAPI()
+    register_runtime_routes(
+        app,
+        active_config=lambda: active[0],
+        state=_FakeState(),
+        settings_store=store,
+        on_config_update=lambda candidate: active.__setitem__(0, candidate),
+        http_exception=HTTPException,
+        runs=FailingRevocationRuns(),
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.put(
+            "/api/runtime/settings",
+            json={
+                "expected_revision": initial.revision,
+                "allow_shell": False,
+            },
+        )
+
+    assert response.status_code == 500
+    assert active[0].allow_shell is True
+    assert store.path.read_bytes() == initial_payload
+    assert store.load(config).revision == initial.revision
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink path validation")
+def test_runtime_settings_rejects_invalid_memory_path_before_persisting(
+    tmp_path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    config = AgentConfig(
+        memory_dir=runtime_root / "memory",
+        state_path=runtime_root / "state" / "agent.db",
+        log_dir=runtime_root / "logs",
+        secret_store_path=runtime_root / "secrets" / "local_vault.json",
+        skills_dir=runtime_root / "skills",
+        plugins_dir=runtime_root / "plugins",
+        mcp_config_path=runtime_root / "config" / "mcp_servers.json",
+        channel_config_path=runtime_root / "config" / "channels.json",
+        worker_worktree_dir=runtime_root / "worktrees",
+        workspace=tmp_path / "workspace",
+    )
+    store = RuntimeSettingsStore(default_runtime_settings_path(config))
+    original = store.save(RuntimeSettings.from_config(config))
+    original_payload = store.path.read_bytes()
+    outside = tmp_path / "outside-memory"
+    outside.mkdir(mode=0o755)
+    linked_memory = runtime_root / "linked-memory"
+    linked_memory.parent.mkdir(parents=True, exist_ok=True)
+    linked_memory.symlink_to(outside, target_is_directory=True)
+
+    with TestClient(create_app(config), raise_server_exceptions=False) as client:
+        response = client.put(
+            "/api/runtime/settings",
+            json={
+                "expected_revision": original.revision,
+                "memory_dir": str(linked_memory),
+            },
+        )
+
+    assert response.status_code == 400
+    assert store.path.read_bytes() == original_payload
+    persisted = store.load(config)
+    assert persisted.revision == original.revision
+    assert persisted.memory_dir == str(config.memory_dir)
+    assert outside.stat().st_mode & 0o777 == 0o755
+
+    with TestClient(create_app(config)) as restarted:
+        health = restarted.get("/api/health")
+    assert health.status_code == 200
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX artifact alias validation")
+def test_runtime_settings_store_rejects_file_and_lock_aliases(tmp_path: Path) -> None:
+    config = AgentConfig(memory_dir=tmp_path / "memory")
+    outside = tmp_path / "outside-settings.json"
+    outside_store = RuntimeSettingsStore(outside)
+    outside_store.save(RuntimeSettings.from_config(replace(config, allow_shell=True)))
+    os.chmod(outside, 0o644)
+
+    symlink_store = RuntimeSettingsStore(tmp_path / "symlink" / "runtime_settings.json")
+    symlink_store.path.parent.mkdir()
+    symlink_store.path.symlink_to(outside)
+    with pytest.raises(ValueError, match="symbolic links"):
+        symlink_store.load(config)
+    assert outside.stat().st_mode & 0o777 == 0o644
+
+    hardlink_store = RuntimeSettingsStore(tmp_path / "hardlink" / "runtime_settings.json")
+    hardlink_store.path.parent.mkdir()
+    os.link(outside, hardlink_store.path)
+    outside_payload = outside.read_bytes()
+    with pytest.raises(ValueError, match="hard-linked"):
+        hardlink_store.save(RuntimeSettings.from_config(config))
+    assert outside.read_bytes() == outside_payload
+    assert outside.stat().st_mode & 0o777 == 0o644
+
+    lock_store = RuntimeSettingsStore(tmp_path / "lock-alias" / "runtime_settings.json")
+    lock_store.path.parent.mkdir()
+    lock_target = tmp_path / "outside-lock-target"
+    lock_target.write_text("unchanged", encoding="utf-8")
+    os.chmod(lock_target, 0o644)
+    lock_store.path.with_name(".runtime_settings.json.lock").symlink_to(lock_target)
+    with pytest.raises(ValueError, match="symbolic links"):
+        lock_store.save(RuntimeSettings.from_config(config))
+    assert lock_target.read_text(encoding="utf-8") == "unchanged"
+    assert lock_target.stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX artifact ownership and modes")
+def test_runtime_settings_store_hardens_mode_and_rejects_non_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AgentConfig(memory_dir=tmp_path / "memory")
+    store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
+    store.save(RuntimeSettings.from_config(config))
+    os.chmod(store.path, 0o644)
+
+    store.load(config)
+
+    assert store.path.stat().st_mode & 0o777 == 0o600
+    import nested_memvid_agent.private_artifacts as private_artifacts
+
+    current_owner = os.geteuid()
+    monkeypatch.setattr(private_artifacts.os, "geteuid", lambda: current_owner + 1)
+    with pytest.raises(PermissionError, match="owned by the current user"):
+        store.exists()
 
 
 def test_runtime_settings_store_loads_saved_config_on_restart(tmp_path) -> None:
@@ -374,8 +701,14 @@ def test_runtime_settings_store_accepts_verified_older_schema_shape(tmp_path) ->
     store.path.write_text(json.dumps(payload), encoding="utf-8")
 
     loaded = store.load(config)
+    updated = store.save(
+        replace(loaded, model="updated-after-migration"),
+        expected_revision=loaded.revision,
+    )
 
     assert loaded.provider_startup_probe is False
+    assert updated.model == "updated-after-migration"
+    assert store.load(config).model == "updated-after-migration"
 
 
 def test_runtime_settings_save_rejects_stale_revision(tmp_path) -> None:

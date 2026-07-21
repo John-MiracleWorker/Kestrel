@@ -2,18 +2,28 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
-from typing import Any, cast
+from threading import Lock, RLock
+from typing import IO, Any, cast
 
 import numpy as np
 
 from ..context_frames import MV2ContextFrame, to_memory_record
-from ..models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
+from ..file_lock import lock_exclusive, lock_shared, unlock
+from ..models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
+from ..private_artifacts import (
+    ensure_private_directory,
+    harden_memory_artifact_files,
+    open_private_file_descriptor,
+    read_private_text,
+    write_private_text,
+)
 from .base import MemoryBackend
 
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
@@ -112,14 +122,14 @@ class _BM25Index:
             score += idf * (f * (_K1 + 1)) / denom
         return score
 
-    def search(self, query_tokens: list[str], k: int = 8) -> list[tuple[int, float]]:
-        if not query_tokens or self._total_docs == 0:
+    def search(self, query_tokens: list[str], k: int = 8) -> list[tuple[str, float]]:
+        if not query_tokens or self._total_docs == 0 or k <= 0:
             return []
-        scores = []
+        scores: list[tuple[str, float]] = []
         for idx in range(self._total_docs):
             s = self.score(query_tokens, idx)
             if s > 0:
-                scores.append((idx, s))
+                scores.append((self._doc_ids[idx], s))
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:k]
 
@@ -152,13 +162,14 @@ class _VectorIndex:
             self._id_to_idx[did] = i
 
     def search(self, query_vector: np.ndarray, k: int = 8) -> list[tuple[str, float]]:
-        if not self._vectors:
+        if not self._vectors or k <= 0:
             return []
+        effective_k = min(k, len(self._vectors))
         q_normed = query_vector / (np.linalg.norm(query_vector) + 1e-12)
         # Stack and compute dot product (cosine because both are normalized)
         matrix = np.stack(self._vectors)
         similarities = matrix @ q_normed
-        top_k_idx = np.argpartition(similarities, -k)[-k:]
+        top_k_idx = np.argpartition(similarities, -effective_k)[-effective_k:]
         top_k_idx = top_k_idx[np.argsort(similarities[top_k_idx])[::-1]]
         return [(self._doc_ids[i], float(similarities[i])) for i in top_k_idx if similarities[i] > 0]
 
@@ -170,6 +181,9 @@ class InMemoryBackend(MemoryBackend):
     """
 
     _global_records: dict[str, list[MemoryRecord]] = {}
+    _global_versions: dict[str, int] = {}
+    _global_locks: dict[str, RLock] = {}
+    _global_locks_guard = Lock()
 
     def __init__(
         self,
@@ -180,12 +194,21 @@ class InMemoryBackend(MemoryBackend):
         super().__init__(path, layer, **kwargs)
         self.records: list[MemoryRecord] = []
         self._bm25 = _BM25Index()
-        self._bm25_id_to_idx: dict[str, int] = {}
 
         self._enable_vec = bool(kwargs.get("enable_vec", False))
         self._embedding_model_name = str(kwargs.get("embedding_model", "all-MiniLM-L6-v2"))
         self._vector_index: _VectorIndex | None = _VectorIndex() if self._enable_vec else None
         self._vector_cache: dict[str, np.ndarray] = {}
+        self._path_key = os.path.abspath(self.path)
+        self._state_lock = self._lock_for_path(self._path_key)
+        self._indexed_version = -1
+        self._snapshot_path = self.path.with_suffix(".memory.json")
+        self._snapshot_lock_path = self.path.parent / f".{self.path.name}.kestrel.lock"
+
+    @classmethod
+    def _lock_for_path(cls, key: str) -> RLock:
+        with cls._global_locks_guard:
+            return cls._global_locks.setdefault(key, RLock())
 
     def _text_for_record(self, record: MemoryRecord) -> str:
         return f"{record.title} {record.content} {' '.join(record.tags.values())}"
@@ -209,32 +232,74 @@ class InMemoryBackend(MemoryBackend):
         self._vector_cache.pop(record_id, None)
 
     def open(self) -> None:
-        key = str(self.path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if key in self._global_records:
-            self.records = self._global_records[key]
+        ensure_private_directory(self.path.parent)
+        with self._state_lock, self._snapshot_file_lock(exclusive=False):
+            harden_memory_artifact_files(self.path)
+            disk_records = self._load_snapshot_records()
+            shared_records = self._global_records.get(self._path_key)
+            if shared_records is None:
+                shared_records = disk_records or []
+                self._global_records[self._path_key] = shared_records
+                self._global_versions[self._path_key] = (
+                    self._global_versions.get(self._path_key, 0) + 1
+                )
+            elif disk_records is not None:
+                shared_records[:] = _merge_records(disk_records, shared_records)
+                self._global_versions[self._path_key] = (
+                    self._global_versions.get(self._path_key, 0) + 1
+                )
+            self.records = shared_records
             self._rebuild_indices()
+            self._indexed_version = self._global_versions[self._path_key]
+
+    @contextmanager
+    def _snapshot_file_lock(self, *, exclusive: bool) -> Iterator[None]:
+        descriptor = open_private_file_descriptor(self._snapshot_lock_path)
+        with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
+            typed_handle = cast(IO[str], handle)
+            if exclusive:
+                lock_exclusive(typed_handle)
+            else:
+                lock_shared(typed_handle)
+            try:
+                yield
+            finally:
+                unlock(typed_handle)
+
+    def _load_snapshot_records(self) -> list[MemoryRecord] | None:
+        raw = read_private_text(self._snapshot_path, missing_ok=True)
+        if raw is None:
+            return None
+        loaded = json.loads(raw)
+        if not isinstance(loaded, list):
+            raise ValueError(f"Memory snapshot must contain a JSON array: {self._snapshot_path}")
+        if any(not isinstance(item, dict) for item in loaded):
+            raise ValueError(f"Memory snapshot records must be JSON objects: {self._snapshot_path}")
+        return [_record_from_snapshot(item, self.layer) for item in loaded]
+
+    def _mark_mutation(self, *, indices_current: bool) -> None:
+        version = self._global_versions.get(self._path_key, 0) + 1
+        self._global_versions[self._path_key] = version
+        self._global_records[self._path_key] = self.records
+        if indices_current:
+            self._indexed_version = version
+
+    def _sync_indices(self) -> None:
+        version = self._global_versions.get(self._path_key, 0)
+        if self._indexed_version == version:
             return
-        snapshot_path = self.path.with_suffix(".memory.json")
-        if snapshot_path.exists():
-            loaded = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            self.records = [_record_from_snapshot(item, self.layer) for item in loaded]
-            self._rebuild_indices()
-        else:
-            self.records = []
-        self._global_records[key] = self.records
+        self._rebuild_indices()
+        self._indexed_version = version
 
     def _rebuild_indices(self) -> None:
         self._bm25 = _BM25Index()
-        self._bm25_id_to_idx = {}
         if self._vector_index is not None:
             self._vector_index = _VectorIndex()
             self._vector_cache = {}
-        for idx, record in enumerate(self.records):
+        for record in self.records:
             text = self._text_for_record(record)
             tokens = _tokens(text)
             self._bm25.add(record.id, tokens)
-            self._bm25_id_to_idx[record.id] = idx
             if self._vector_index is not None:
                 vec = self._encode(text)
                 self._vector_index.add(record.id, vec)
@@ -243,63 +308,71 @@ class InMemoryBackend(MemoryBackend):
     def put(self, record: MemoryRecord) -> str:
         if record.layer != self.layer:
             raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
-        self.records.append(record)
-        text = self._text_for_record(record)
-        tokens = _tokens(text)
-        self._bm25.add(record.id, tokens)
-        self._bm25_id_to_idx[record.id] = len(self._bm25._doc_ids) - 1
-        self._maybe_index_vector(record)
+        with self._state_lock:
+            self._sync_indices()
+            self.records.append(record)
+            text = self._text_for_record(record)
+            tokens = _tokens(text)
+            self._bm25.add(record.id, tokens)
+            self._maybe_index_vector(record)
+            self._mark_mutation(indices_current=True)
         return record.id
 
     def upsert(self, record: MemoryRecord) -> str:
         if record.layer != self.layer:
             raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
-        for index, existing in enumerate(self.records):
-            if existing.id == record.id:
-                old_text = self._text_for_record(existing)
-                new_text = self._text_for_record(record)
-                if old_text != new_text:
-                    self.records[index] = record
-                    self._bm25.remove(record.id)
-                    tokens = _tokens(new_text)
-                    self._bm25.add(record.id, tokens)
-                    self._bm25_id_to_idx[record.id] = len(self._bm25._doc_ids) - 1
-                    self._maybe_remove_vector(record.id)
-                    self._maybe_index_vector(record)
-                else:
-                    self.records[index] = record
-                return record.id
-        self.records.append(record)
-        text = self._text_for_record(record)
-        tokens = _tokens(text)
-        self._bm25.add(record.id, tokens)
-        self._bm25_id_to_idx[record.id] = len(self._bm25._doc_ids) - 1
-        self._maybe_index_vector(record)
+        with self._state_lock:
+            self._sync_indices()
+            for index, existing in enumerate(self.records):
+                if existing.id == record.id:
+                    old_text = self._text_for_record(existing)
+                    new_text = self._text_for_record(record)
+                    if old_text != new_text:
+                        self.records[index] = record
+                        self._bm25.remove(record.id)
+                        tokens = _tokens(new_text)
+                        self._bm25.add(record.id, tokens)
+                        self._maybe_remove_vector(record.id)
+                        self._maybe_index_vector(record)
+                    else:
+                        self.records[index] = record
+                    self._mark_mutation(indices_current=True)
+                    return record.id
+            self.records.append(record)
+            text = self._text_for_record(record)
+            tokens = _tokens(text)
+            self._bm25.add(record.id, tokens)
+            self._maybe_index_vector(record)
+            self._mark_mutation(indices_current=True)
         return record.id
 
     def tombstone(self, record_id: str, *, reason: str, superseded_by: str | None = None) -> bool:
-        record = self.get_record(record_id, include_inactive=True)
-        if record is None:
-            return False
-        record.metadata["active"] = False
-        record.metadata["tombstone_reason"] = reason
-        record.metadata["tombstoned_at"] = datetime.now(UTC).isoformat()
-        if superseded_by:
-            record.metadata["superseded_by"] = superseded_by
-        record.updated_at = datetime.now(UTC)
-        return True
+        with self._state_lock:
+            record = self.get_record(record_id, include_inactive=True)
+            if record is None:
+                return False
+            record.metadata["active"] = False
+            record.metadata["tombstone_reason"] = reason
+            record.metadata["tombstoned_at"] = datetime.now(UTC).isoformat()
+            if superseded_by:
+                record.metadata["superseded_by"] = superseded_by
+            record.updated_at = datetime.now(UTC)
+            self._mark_mutation(indices_current=True)
+            return True
 
     def iter_records(self, *, include_inactive: bool = False) -> Iterable[MemoryRecord]:
-        return tuple(record for record in self.records if include_inactive or _is_active(record))
+        with self._state_lock:
+            return tuple(record for record in self.records if include_inactive or _is_active(record))
 
     def get_record(self, record_id: str, *, include_inactive: bool = True) -> MemoryRecord | None:
-        for record in self.records:
-            metadata = record.metadata
-            if record.id == record_id or str(metadata.get("frame_id", "")) == record_id:
-                if include_inactive or _is_active(record):
-                    return record
-                return None
-        return None
+        with self._state_lock:
+            for record in self.records:
+                metadata = record.metadata
+                if record.id == record_id or str(metadata.get("frame_id", "")) == record_id:
+                    if include_inactive or _is_active(record):
+                        return record
+                    return None
+            return None
 
     def put_frame(self, frame: MV2ContextFrame) -> str:
         return self.put(to_memory_record(frame))
@@ -311,11 +384,9 @@ class InMemoryBackend(MemoryBackend):
         bm25_results = self._bm25.search(query_tokens, k=k * 2)
         hits: list[MemoryHit] = []
         query_token_set = set(query_tokens)
-        for idx, score in bm25_results:
-            if idx >= len(self.records):
-                continue
-            record = self.records[idx]
-            if not include_inactive and not _is_active(record):
+        for doc_id, score in bm25_results:
+            record = self.get_record(doc_id, include_inactive=include_inactive)
+            if record is None:
                 continue
             normalized_score = min(score / _BM25_SCORE_CAP, 1.0)
             normalized_score = max(normalized_score, 0.0)
@@ -410,12 +481,16 @@ class InMemoryBackend(MemoryBackend):
         *,
         include_inactive: bool = False,
     ) -> list[MemoryHit]:
-        resolved = mode if mode != "auto" else ("hybrid" if self._vector_index is not None else "lex")
-        if resolved == "hybrid" and self._vector_index is not None:
-            return self._find_hybrid(query, k, min_relevancy, include_inactive)
-        if resolved in {"vec", "vector"} and self._vector_index is not None:
-            return self._find_vector(query, k, min_relevancy, include_inactive)
-        return self._find_lexical(query, k, min_relevancy, include_inactive)
+        with self._state_lock:
+            self._sync_indices()
+            if k <= 0:
+                return []
+            resolved = mode if mode != "auto" else ("hybrid" if self._vector_index is not None else "lex")
+            if resolved == "hybrid" and self._vector_index is not None:
+                return self._find_hybrid(query, k, min_relevancy, include_inactive)
+            if resolved in {"vec", "vector"} and self._vector_index is not None:
+                return self._find_vector(query, k, min_relevancy, include_inactive)
+            return self._find_lexical(query, k, min_relevancy, include_inactive)
 
     def find_frames(
         self,
@@ -435,28 +510,21 @@ class InMemoryBackend(MemoryBackend):
         return [hit for hit in hits if str(hit.record.metadata.get("frame_type", "raw_chunk")) in allowed]
 
     def seal(self) -> None:
-        snapshot = [
-            {
-                "id": rec.id,
-                "title": rec.title,
-                "layer": rec.layer.value,
-                "kind": rec.kind.value,
-                "content": rec.content,
-                "confidence": rec.confidence,
-                "importance": rec.importance,
-                "tags": rec.tags,
-                "metadata": rec.metadata,
-                "evidence": [ref.__dict__ for ref in rec.evidence],
-                "created_at": rec.created_at.isoformat(),
-                "updated_at": rec.updated_at.isoformat(),
-                "expires_at": rec.expires_at.isoformat() if rec.expires_at else None,
-            }
-            for rec in self.records
-        ]
-        self.path.with_suffix(".memory.json").write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        with self._state_lock, self._snapshot_file_lock(exclusive=True):
+            harden_memory_artifact_files(self.path)
+            disk_records = self._load_snapshot_records() or []
+            self.records[:] = _merge_records(disk_records, self.records)
+            self._mark_mutation(indices_current=False)
+            self._sync_indices()
+            write_private_text(
+                self._snapshot_path,
+                json.dumps(_snapshot_payload(self.records), indent=2),
+                encoding="utf-8",
+            )
 
     def verify(self) -> bool:
-        return all(record.layer == self.layer and bool(record.content.strip()) for record in self.records)
+        with self._state_lock:
+            return all(record.layer == self.layer and bool(record.content.strip()) for record in self.records)
 
     def close(self) -> None:
         return None
@@ -478,6 +546,46 @@ def _is_active(record: MemoryRecord) -> bool:
     return record.metadata.get("active", True) is not False
 
 
+def _snapshot_payload(records: Iterable[MemoryRecord]) -> list[dict[str, object]]:
+    return [
+        {
+            "id": record.id,
+            "title": record.title,
+            "layer": record.layer.value,
+            "kind": record.kind.value,
+            "content": record.content,
+            "confidence": record.confidence,
+            "importance": record.importance,
+            "tags": record.tags,
+            "metadata": record.metadata,
+            "evidence": [ref.__dict__ for ref in record.evidence],
+            "created_at": record.created_at.isoformat(),
+            "updated_at": record.updated_at.isoformat(),
+            "expires_at": record.expires_at.isoformat() if record.expires_at else None,
+        }
+        for record in records
+    ]
+
+
+def _merge_records(
+    persisted: Iterable[MemoryRecord],
+    active: Iterable[MemoryRecord],
+) -> list[MemoryRecord]:
+    """Union snapshots by stable ID, preferring the most recently updated copy."""
+
+    merged: list[MemoryRecord] = []
+    positions: dict[str, int] = {}
+    for record in (*tuple(persisted), *tuple(active)):
+        position = positions.get(record.id)
+        if position is None:
+            positions[record.id] = len(merged)
+            merged.append(record)
+            continue
+        if _aware_datetime(record.updated_at) >= _aware_datetime(merged[position].updated_at):
+            merged[position] = record
+    return merged
+
+
 def _record_from_snapshot(item: dict[str, object], expected_layer: MemoryLayer) -> MemoryRecord:
     layer_value = str(item.get("layer", expected_layer.value))
     try:
@@ -489,6 +597,24 @@ def _record_from_snapshot(item: dict[str, object], expected_layer: MemoryLayer) 
         kind = MemoryKind(kind_value)
     except ValueError:
         kind = MemoryKind.OBSERVATION
+    evidence: list[EvidenceRef] = []
+    raw_evidence = item.get("evidence")
+    if isinstance(raw_evidence, list):
+        for raw_ref in raw_evidence:
+            if not isinstance(raw_ref, dict):
+                continue
+            source = str(raw_ref.get("source", "")).strip()
+            locator = str(raw_ref.get("locator", "")).strip()
+            if source and locator:
+                quote_raw = raw_ref.get("quote")
+                evidence.append(
+                    EvidenceRef(
+                        source=source,
+                        locator=locator,
+                        quote=str(quote_raw) if quote_raw is not None else None,
+                    )
+                )
+    now = datetime.now(UTC)
     return MemoryRecord(
         id=str(item.get("id", "mem_loaded")),
         title=str(item.get("title", "Loaded memory")),
@@ -499,7 +625,24 @@ def _record_from_snapshot(item: dict[str, object], expected_layer: MemoryLayer) 
         importance=_as_float(item.get("importance"), 0.5),
         tags=_as_str_dict(item.get("tags")),
         metadata=_as_any_dict(item.get("metadata")),
+        evidence=evidence,
+        created_at=_snapshot_datetime(item.get("created_at")) or now,
+        updated_at=_snapshot_datetime(item.get("updated_at")) or now,
+        expires_at=_snapshot_datetime(item.get("expires_at")),
     )
+
+
+def _snapshot_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return _aware_datetime(datetime.fromisoformat(value))
+    except ValueError:
+        return None
+
+
+def _aware_datetime(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _as_float(value: object, default: float) -> float:

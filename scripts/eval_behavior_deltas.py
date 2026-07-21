@@ -25,6 +25,7 @@ from nested_memvid_agent.behavior_delta import (  # noqa: E402
 from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger  # noqa: E402
 from nested_memvid_agent.config import AgentConfig  # noqa: E402
 from nested_memvid_agent.models import MemoryLayer  # noqa: E402
+from nested_memvid_agent.security_boundary import redact_secrets  # noqa: E402
 from nested_memvid_agent.state_store import AgentStateStore  # noqa: E402
 
 
@@ -57,6 +58,7 @@ class BehaviorDeltaReplayResult:
     agent_stop_reason: str | None = None
     activation_count: int = 0
     context_compile_events: int = 0
+    agent_policy_write_count: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -74,6 +76,7 @@ class BehaviorDeltaReplayResult:
             "agent_stop_reason": self.agent_stop_reason,
             "activation_count": self.activation_count,
             "context_compile_events": self.context_compile_events,
+            "agent_policy_write_count": self.agent_policy_write_count,
         }
 
 
@@ -106,7 +109,9 @@ def evaluate_behavior_delta_scenario(scenario: BehaviorDeltaScenario) -> Behavio
             if active_delta.status == BehaviorDeltaStatus.ACTIVE:
                 active_deltas.append(active_delta)
 
-        compiler = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True, log_activations=False))
+        compiler = BehaviorCompiler(
+            ledger=ledger, config=BehaviorCompilerConfig(enabled=True, log_activations=False)
+        )
         compiled = compiler.compile(_request_for(scenario, active_deltas))
 
     baseline_text = _baseline_behavior_text(scenario)
@@ -115,7 +120,11 @@ def evaluate_behavior_delta_scenario(scenario: BehaviorDeltaScenario) -> Behavio
     gate_violations = _gate_violations(compiled.text, scenario.failure_conditions)
     improvement = round(delta_score - baseline_score, 4)
     expected_hits = _hit_count(compiled.text, scenario.expected_behavior)
-    passed = delta_score > baseline_score and not gate_violations and expected_hits == len(scenario.expected_behavior)
+    passed = (
+        delta_score > baseline_score
+        and not gate_violations
+        and expected_hits == len(scenario.expected_behavior)
+    )
     return BehaviorDeltaReplayResult(
         scenario_id=scenario.scenario_id,
         delta_id=next(iter(scenario.active_delta_ids), None),
@@ -130,7 +139,9 @@ def evaluate_behavior_delta_scenario(scenario: BehaviorDeltaScenario) -> Behavio
     )
 
 
-def evaluate_behavior_delta_agent_scenario(scenario: BehaviorDeltaScenario) -> BehaviorDeltaReplayResult:
+def evaluate_behavior_delta_agent_scenario(
+    scenario: BehaviorDeltaScenario,
+) -> BehaviorDeltaReplayResult:
     """Replay a scenario through a real NestedMV2Agent turn with mock provider.
 
     This is deeper than fixture-only compiler replay: it persists active deltas in
@@ -153,12 +164,29 @@ def evaluate_behavior_delta_agent_scenario(scenario: BehaviorDeltaScenario) -> B
             memory_dir=root / "memory",
             log_dir=root / "logs",
             state_path=root / "state.db",
+            secret_store_path=root / "secrets" / "local_vault.json",
+            workspace=root / "workspace",
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            mcp_config_path=root / "config" / "mcp_servers.json",
+            channel_config_path=root / "config" / "channels.json",
+            worker_worktree_dir=root / "worktrees",
             enable_behavior_deltas=True,
             max_tool_rounds=0,
         )
         agent = build_agent(config, state=state)
         try:
-            turn = agent.chat(scenario.goal, session_id="behavior_delta_replay", run_id=f"replay_{scenario.scenario_id}")
+            turn = agent.chat(
+                scenario.goal,
+                session_id="behavior_delta_replay",
+                run_id=f"replay_{scenario.scenario_id}",
+            )
+            policy_records = list(
+                agent.memory.iter_records(
+                    layer=MemoryLayer.POLICY,
+                    include_inactive=True,
+                )
+            )
         finally:
             agent.close()
 
@@ -170,9 +198,26 @@ def evaluate_behavior_delta_agent_scenario(scenario: BehaviorDeltaScenario) -> B
         improvement = round(delta_score - baseline_score, 4)
         expected_hits = _hit_count(text, scenario.expected_behavior)
         active_delta_id = next(iter(scenario.active_delta_ids), None)
-        activations = ledger.list_activations(active_delta_id) if active_delta_id else ()
-        context_events = [event for event in agent.event_log.tail(limit=50) if event.type == "context.compile"] if agent.event_log else []
-        passed = delta_score > baseline_score and not gate_violations and expected_hits == len(scenario.expected_behavior)
+        activations = tuple(
+            activation
+            for delta_id in scenario.active_delta_ids
+            for activation in ledger.list_activations(delta_id)
+        )
+        context_events = (
+            [event for event in agent.event_log.tail(limit=50) if event.type == "context.compile"]
+            if agent.event_log
+            else []
+        )
+        passed = (
+            delta_score > baseline_score
+            and not gate_violations
+            and expected_hits == len(scenario.expected_behavior)
+            and turn.stop_reason == "complete"
+            and bool(scenario.active_delta_ids)
+            and len(activations) >= len(scenario.active_delta_ids)
+            and bool(context_events)
+            and not policy_records
+        )
         return BehaviorDeltaReplayResult(
             scenario_id=scenario.scenario_id,
             delta_id=active_delta_id,
@@ -188,11 +233,14 @@ def evaluate_behavior_delta_agent_scenario(scenario: BehaviorDeltaScenario) -> B
             agent_stop_reason=turn.stop_reason,
             activation_count=len(activations),
             context_compile_events=len(context_events),
+            agent_policy_write_count=len(policy_records),
         )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay-evaluate Kestrel behavior-delta scenarios.")
+    parser = argparse.ArgumentParser(
+        description="Replay-evaluate Kestrel behavior-delta scenarios."
+    )
     parser.add_argument("--scenario", type=Path, required=True)
     parser.add_argument("--provider", choices=["mock"], default="mock")
     parser.add_argument("--mode", choices=["compiler", "agent"], default="compiler")
@@ -208,14 +256,16 @@ def main() -> int:
     )
     payload = result.to_payload()
     if args.json:
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(redact_secrets(payload), indent=2))
     else:
         print(f"Behavior-delta replay: {result.scenario_id}")
         print(f"Delta: {result.delta_id}")
         print(f"Baseline score: {result.baseline_score}")
         print(f"Delta score: {result.delta_score}")
         print(f"Improvement: {result.improvement}")
-        print(f"Gate violations: {', '.join(result.gate_violations) if result.gate_violations else 'none'}")
+        print(
+            f"Gate violations: {', '.join(result.gate_violations) if result.gate_violations else 'none'}"
+        )
         print(f"Passed: {result.passed}")
     return 1 if args.fail_on_regression and not result.passed else 0
 
@@ -236,10 +286,18 @@ def _with_status(delta: BehaviorDelta, status: BehaviorDeltaStatus) -> BehaviorD
     return behavior_delta_from_metadata(payload)
 
 
-def _request_for(scenario: BehaviorDeltaScenario, deltas: list[BehaviorDelta]) -> BehaviorCompileRequest:
-    task_type = scenario.task_type or _first_non_empty(tuple(value for delta in deltas for value in delta.trigger.task_types))
-    tool_names = scenario.tool_names or tuple(value for delta in deltas for value in delta.trigger.tool_names)
-    memory_layers = scenario.memory_layers or tuple(value for delta in deltas for value in delta.trigger.memory_layers)
+def _request_for(
+    scenario: BehaviorDeltaScenario, deltas: list[BehaviorDelta]
+) -> BehaviorCompileRequest:
+    task_type = scenario.task_type or _first_non_empty(
+        tuple(value for delta in deltas for value in delta.trigger.task_types)
+    )
+    tool_names = scenario.tool_names or tuple(
+        value for delta in deltas for value in delta.trigger.tool_names
+    )
+    memory_layers = scenario.memory_layers or tuple(
+        value for delta in deltas for value in delta.trigger.memory_layers
+    )
     query = " ".join(value for delta in deltas for value in delta.trigger.query_patterns)
     return BehaviorCompileRequest(
         objective=scenario.goal,
@@ -266,7 +324,9 @@ def _hit_count(text: str, expectations: tuple[str, ...]) -> int:
 
 
 def _gate_violations(text: str, failure_conditions: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(condition for condition in failure_conditions if _failure_condition_matches(text, condition))
+    return tuple(
+        condition for condition in failure_conditions if _failure_condition_matches(text, condition)
+    )
 
 
 def _phrase_matches(text: str, phrase: str) -> bool:

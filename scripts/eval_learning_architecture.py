@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nested_memvid_agent.learning_eval import (  # noqa: E402
     LearningEvalOptions,
+    LearningEvalReport,
     list_learning_eval_scenarios,
     load_learning_eval_scenario,
     run_learning_eval_suite,
@@ -16,8 +17,12 @@ from nested_memvid_agent.learning_eval import (  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Kestrel's guarded learning architecture eval harness.")
-    parser.add_argument("--provider", choices=["mock", "openai", "openai-compatible"], default="mock")
+    parser = argparse.ArgumentParser(
+        description="Run Kestrel's guarded learning architecture eval harness."
+    )
+    parser.add_argument(
+        "--provider", choices=["mock", "openai", "openai-compatible"], default="mock"
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--backend", choices=["memory", "memvid"], default="memory")
     parser.add_argument("--memory-dir", type=Path, default=None)
@@ -32,14 +37,18 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--base-url", default=None, help="Base URL for openai-compatible providers.")
+    parser.add_argument(
+        "--base-url", default=None, help="Base URL for openai-compatible providers."
+    )
     parser.add_argument("--api-key-env", default=None, help="Provider API key env var name.")
     args = parser.parse_args()
 
     if not args.all and not args.scenario:
         parser.error("provide --scenario or --all")
 
-    scenarios = list_learning_eval_scenarios() if args.all else [load_learning_eval_scenario(args.scenario)]
+    scenarios = (
+        list_learning_eval_scenarios() if args.all else [load_learning_eval_scenario(args.scenario)]
+    )
     options = LearningEvalOptions(
         provider=args.provider,
         model=args.model,
@@ -79,7 +88,13 @@ def main() -> int:
             reason = f" ({result['skipped_reason']})" if result.get("skipped_reason") else ""
             print(f"- {result['scenario_id']}: {result['status']}{reason}")
 
-    return 1 if report.status == "fail" else 0
+    return _report_exit_code(report)
+
+
+def _report_exit_code(report: LearningEvalReport) -> int:
+    """Only executed validation evidence can satisfy this CLI gate."""
+
+    return 0 if report.status == "pass" and any(result.passed for result in report.results) else 1
 
 
 if __name__ == "__main__":

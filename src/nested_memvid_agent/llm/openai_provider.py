@@ -15,15 +15,23 @@ from ..runtime_models import (
     ToolSpec,
 )
 from .base import LLMProvider, ProviderCapabilities, ProviderError
-from .parser import normalize_tool_calls, parse_agent_response
+from .parser import (
+    ControlMessageError,
+    native_tool_arguments,
+    native_tool_call_id,
+    native_tool_name,
+    normalize_tool_calls,
+    parse_agent_response,
+    validate_tool_result_pairs,
+)
 
 
 class OpenAIResponsesProvider(LLMProvider):
     """Minimal OpenAI Responses API provider.
 
-    This provider intentionally keeps tool calls in the agent-control JSON envelope so the
-    runtime remains provider-portable. Codex can later upgrade this to native function
-    calling, but this version is already chat-capable when `openai` is installed.
+    Provider-neutral runtime messages are mapped to native Responses function-call and
+    function-call-output items while the same strict Kestrel validation boundary remains
+    authoritative.
     """
 
     def __init__(
@@ -125,6 +133,8 @@ class OpenAIResponsesProvider(LLMProvider):
                 if response.usage:
                     yield LLMStreamEvent(type="usage", data=response.usage)
                 yield LLMStreamEvent(type="message_complete", response=response)
+        except ControlMessageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             yield LLMStreamEvent(
                 type="provider_error",
@@ -141,12 +151,61 @@ class OpenAIResponsesProvider(LLMProvider):
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self.model,
-            "input": [msg.to_openai_dict() for msg in messages],
+            "input": _to_responses_input(messages),
             "temperature": options.temperature,
         }
         if tools:
             request["tools"] = [_to_responses_tool(tool) for tool in tools]
         return request
+
+
+def _to_responses_input(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    validate_tool_result_pairs(messages)
+    rendered: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role == "tool":
+            if not message.tool_call_id:
+                raise ControlMessageError(
+                    "tool result message must include tool_call_id",
+                    code="missing_tool_call_id",
+                )
+            call_id = native_tool_call_id(
+                message.tool_call_id,
+                location="tool result tool_call_id",
+                required=True,
+            )
+            rendered.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": message.content,
+                }
+            )
+            continue
+        if message.role == "assistant" and message.tool_calls:
+            if message.content:
+                rendered.append({"role": "assistant", "content": message.content})
+            for index, call in enumerate(message.tool_calls):
+                call_id = native_tool_call_id(
+                    call.id,
+                    location=f"assistant.tool_calls[{index}].id",
+                    required=True,
+                )
+                rendered.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": call.name,
+                        "arguments": json.dumps(
+                            call.arguments,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    }
+                )
+            continue
+        rendered.append({"role": message.role, "content": message.content})
+    return rendered
 
 
 def _to_responses_tool(tool: ToolSpec) -> dict[str, Any]:
@@ -158,7 +217,9 @@ def _to_responses_tool(tool: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _responses_to_llm_response(response: Any, *, tools: list[ToolSpec] | tuple[ToolSpec, ...]) -> LLMResponse:
+def _responses_to_llm_response(
+    response: Any, *, tools: list[ToolSpec] | tuple[ToolSpec, ...]
+) -> LLMResponse:
     text = _response_text(response)
     parsed = parse_agent_response(text, tools=tools, strict=True)
     native_calls = normalize_tool_calls(_response_tool_calls(response), tools=tools)
@@ -194,21 +255,34 @@ def _response_text(response: Any) -> str:
 def _response_tool_calls(response: Any) -> list[ToolCall]:
     calls: list[ToolCall] = []
     output = getattr(response, "output", None)
-    if not isinstance(output, list):
+    if output is None:
         return calls
-    for item in output:
+    if not isinstance(output, list | tuple):
+        raise ControlMessageError(
+            "responses.output must be a list",
+            code="invalid_tool_call",
+        )
+    for index, item in enumerate(output):
         item_type = _item_value(item, "type")
         if item_type not in {"function_call", "tool_call"}:
             continue
-        name = _item_value(item, "name")
-        if not isinstance(name, str) or not name:
-            continue
-        call_id = _item_value(item, "call_id") or _item_value(item, "id")
+        location = f"responses.output[{index}]"
+        if not _is_native_object(item):
+            raise ControlMessageError(f"{location} must be an object", code="invalid_tool_call")
+        name = native_tool_name(_item_value(item, "name"), location=location)
+        arguments = native_tool_arguments(
+            _item_value(item, "arguments"),
+            tool_name=name,
+            location=location,
+        )
+        call_id = _item_value(item, "call_id")
+        if call_id is None:
+            call_id = _item_value(item, "id")
         calls.append(
             ToolCall(
                 name=name,
-                arguments=_arguments_dict(_item_value(item, "arguments")),
-                id=str(call_id) if call_id else f"tool_{name}",
+                arguments=arguments,
+                id=native_tool_call_id(call_id, location=f"{location}.call_id"),
             )
         )
     return calls
@@ -227,18 +301,6 @@ def _stream_text_delta(event: Any) -> str:
     if delta is None:
         delta = _item_value(event, "text")
     return "" if delta is None else str(delta)
-
-
-def _arguments_dict(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return dict(raw)
-    if isinstance(raw, str) and raw.strip():
-        try:
-            loaded = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return dict(loaded) if isinstance(loaded, dict) else {}
-    return {}
 
 
 def _usage_dict(response: Any) -> dict[str, Any] | None:
@@ -267,3 +329,9 @@ def _item_value(item: Any, key: str) -> Any:
     if isinstance(item, dict):
         return item.get(key)
     return getattr(item, key, None)
+
+
+def _is_native_object(value: Any) -> bool:
+    return isinstance(value, dict) or (
+        value is not None and not isinstance(value, str | bytes | list | tuple | bool | int | float)
+    )

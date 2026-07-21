@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, cast
 
 from .server_models import SecretStoreRequest
@@ -10,6 +11,7 @@ def register_secret_routes(
     *,
     http_exception: Any,
     secret_broker: Any,
+    sensitive_material_transition: Any | None = None,
 ) -> None:
     @app.get("/api/secrets")  # type: ignore[untyped-decorator]
     def list_secrets() -> list[dict[str, object]]:
@@ -25,18 +27,32 @@ def register_secret_routes(
     @app.post("/api/secrets")  # type: ignore[untyped-decorator]
     def store_secret(request: SecretStoreRequest) -> dict[str, object]:
         try:
-            return cast(
-                dict[str, object],
-                secret_broker.store_secret(
-                    name=request.name,
-                    purpose=request.purpose,
-                    value=request.value,
-                    secret_id=request.id,
-                    validate=request.validate_now,
-                ),
+            transition = (
+                nullcontext()
+                if sensitive_material_transition is None
+                else sensitive_material_transition()
             )
-        except ValueError as exc:
-            raise http_exception(status_code=400, detail=str(exc)) from exc
+            with transition:
+                return cast(
+                    dict[str, object],
+                    secret_broker.store_secret(
+                        name=request.name,
+                        purpose=request.purpose,
+                        value=request.value,
+                        secret_id=request.id,
+                        validate=request.validate_now,
+                    ),
+                )
+        except (ValueError, RuntimeError) as exc:
+            code = getattr(exc, "code", None)
+            if isinstance(code, str):
+                raise http_exception(
+                    status_code=409,
+                    detail=code,
+                ) from exc
+            if isinstance(exc, ValueError):
+                raise http_exception(status_code=400, detail=str(exc)) from exc
+            raise
 
     @app.post("/api/secrets/{secret_id}/validate")  # type: ignore[untyped-decorator]
     def validate_secret(secret_id: str) -> dict[str, object]:

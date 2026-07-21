@@ -1,16 +1,16 @@
 import sys
-sys.path.insert(0, "src")
-
 import tempfile
 from pathlib import Path
-from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.llm.factory import build_llm_provider
-from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
-from nested_memvid_agent.backends.in_memory import InMemoryBackend
-from nested_memvid_agent.layers import LayeredMemorySystem
-from nested_memvid_agent.tools.builtin import build_default_tools
-from nested_memvid_agent.event_log import JsonlEventLog
-from nested_memvid_agent.state_store import AgentStateStore
+
+sys.path.insert(0, "src")
+
+from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent  # noqa: E402
+from nested_memvid_agent.backends.in_memory import InMemoryBackend  # noqa: E402
+from nested_memvid_agent.config import AgentConfig  # noqa: E402
+from nested_memvid_agent.event_log import JsonlEventLog  # noqa: E402
+from nested_memvid_agent.layers import LayeredMemorySystem  # noqa: E402
+from nested_memvid_agent.llm.factory import build_llm_provider  # noqa: E402
+from nested_memvid_agent.tools.builtin import build_default_tools  # noqa: E402
 
 with tempfile.TemporaryDirectory() as tmpdir:
     workspace = Path(tmpdir) / "workspace"

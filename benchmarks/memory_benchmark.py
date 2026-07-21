@@ -3,10 +3,12 @@
 Usage:
     python benchmarks/memory_benchmark.py --output results/memory_benchmark.json
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import tempfile
 import time
@@ -15,12 +17,62 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+if __package__:
+    from .baseline_rag import BaselineRAG
+    from .datasets_corpus.memory_corpus import build_memory_corpus
+else:
+    from baseline_rag import BaselineRAG
+    from datasets_corpus.memory_corpus import build_memory_corpus
+
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayeredMemorySystem
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 
-from baseline_rag import BaselineRAG
-from datasets_corpus.memory_corpus import build_memory_corpus
+_QUALITY_FLOOR_VERSION = "kestrel.memory-quality-floor.v1"
+_QUALITY_FLOOR_V1 = {
+    "recall_at_k": 0.80,
+    "precision_at_k": 0.20,
+    "mrr": 0.75,
+}
+
+
+def _finite_metric(payload: dict[str, Any], key: str) -> float:
+    try:
+        value = float(payload[key])
+    except (KeyError, TypeError, ValueError):
+        return float("nan")
+    return value if math.isfinite(value) else float("nan")
+
+
+def _evaluate_quality_gate(result: dict[str, Any]) -> dict[str, Any]:
+    overall = result.get("overall", {})
+    kestrel = overall.get("kestrel", {})
+    baseline = overall.get("baseline", {})
+    query_details = result.get("query_details", {}).get("kestrel", [])
+    observed = {metric: _finite_metric(kestrel, metric) for metric in _QUALITY_FLOOR_V1}
+    checks = {
+        "nonempty_query_evidence": bool(query_details),
+        **{
+            f"kestrel_{metric}_at_or_above_floor": (
+                math.isfinite(observed[metric]) and observed[metric] >= minimum
+            )
+            for metric, minimum in _QUALITY_FLOOR_V1.items()
+        },
+        "kestrel_recall_not_below_baseline": (
+            _finite_metric(kestrel, "recall_at_k") >= _finite_metric(baseline, "recall_at_k")
+        ),
+        "kestrel_mrr_not_below_baseline": (
+            _finite_metric(kestrel, "mrr") >= _finite_metric(baseline, "mrr")
+        ),
+    }
+    return {
+        "version": _QUALITY_FLOOR_VERSION,
+        "minimums": dict(_QUALITY_FLOOR_V1),
+        "observed": observed,
+        "query_count": len(query_details),
+        "checks": checks,
+        "passed": all(checks.values()),
+    }
 
 
 def _layer_from_string(s: str) -> MemoryLayer:
@@ -80,7 +132,15 @@ def run_memory_benchmark(*, k: int = 5, seed: int = 42) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="kestrel-bench-") as tmpdir:
         mem_dir = Path(tmpdir) / "memory"
         mem_dir.mkdir()
-        kestrel = LayeredMemorySystem.from_backend_factory(mem_dir, InMemoryBackend)
+        # This retrieval benchmark seeds a synthetic corpus directly into each
+        # target layer. It is not a memory-promotion benchmark, so disable the
+        # production stable-write gate explicitly instead of fabricating
+        # provenance or validation receipts for fixture data.
+        kestrel = LayeredMemorySystem.from_backend_factory(
+            mem_dir,
+            InMemoryBackend,
+            enforce_stable_write_integrity=False,
+        )
         _ingest_into_kestrel(kestrel, corpus.documents)
 
         # --- Setup Baseline ---
@@ -96,9 +156,7 @@ def run_memory_benchmark(*, k: int = 5, seed: int = 42) -> dict[str, Any]:
             # Kestrel retrieval — layer-aware: search only the relevant layer with full k budget
             layer = _layer_from_string(q.layer)
             t0 = time.perf_counter()
-            hits = kestrel.retrieve(
-                RetrievalQuery(query=q.query, k_per_layer=k, layers=(layer,))
-            )
+            hits = kestrel.retrieve(RetrievalQuery(query=q.query, k_per_layer=k, layers=(layer,)))
             t1 = time.perf_counter()
             kestrel_latencies.append(t1 - t0)
             kestrel_ids = [hit.record.id for hit in hits]
@@ -137,13 +195,17 @@ def run_memory_benchmark(*, k: int = 5, seed: int = 42) -> dict[str, Any]:
                     "recall_at_k": round(_avg("recall_at_k", k_layer), 3),
                     "precision_at_k": round(_avg("precision_at_k", k_layer), 3),
                     "mrr": round(_avg("mrr", k_layer), 3),
-                    "avg_latency_ms": round(sum(r["latency_ms"] for r in k_layer) / len(k_layer), 3) if k_layer else 0,
+                    "avg_latency_ms": round(sum(r["latency_ms"] for r in k_layer) / len(k_layer), 3)
+                    if k_layer
+                    else 0,
                 },
                 "baseline": {
                     "recall_at_k": round(_avg("recall_at_k", b_layer), 3),
                     "precision_at_k": round(_avg("precision_at_k", b_layer), 3),
                     "mrr": round(_avg("mrr", b_layer), 3),
-                    "avg_latency_ms": round(sum(r["latency_ms"] for r in b_layer) / len(b_layer), 3) if b_layer else 0,
+                    "avg_latency_ms": round(sum(r["latency_ms"] for r in b_layer) / len(b_layer), 3)
+                    if b_layer
+                    else 0,
                 },
             }
 
@@ -153,14 +215,24 @@ def run_memory_benchmark(*, k: int = 5, seed: int = 42) -> dict[str, Any]:
                 "precision_at_k": round(_avg("precision_at_k", kestrel_results), 3),
                 "mrr": round(_avg("mrr", kestrel_results), 3),
                 "avg_latency_ms": round(sum(kestrel_latencies) / len(kestrel_latencies) * 1000, 3),
-                "p99_latency_ms": round(sorted(kestrel_latencies)[int(len(kestrel_latencies) * 0.99)] * 1000, 3) if kestrel_latencies else 0,
+                "p99_latency_ms": round(
+                    sorted(kestrel_latencies)[int(len(kestrel_latencies) * 0.99)] * 1000, 3
+                )
+                if kestrel_latencies
+                else 0,
             },
             "baseline": {
                 "recall_at_k": round(_avg("recall_at_k", baseline_results), 3),
                 "precision_at_k": round(_avg("precision_at_k", baseline_results), 3),
                 "mrr": round(_avg("mrr", baseline_results), 3),
-                "avg_latency_ms": round(sum(baseline_latencies) / len(baseline_latencies) * 1000, 3),
-                "p99_latency_ms": round(sorted(baseline_latencies)[int(len(baseline_latencies) * 0.99)] * 1000, 3) if baseline_latencies else 0,
+                "avg_latency_ms": round(
+                    sum(baseline_latencies) / len(baseline_latencies) * 1000, 3
+                ),
+                "p99_latency_ms": round(
+                    sorted(baseline_latencies)[int(len(baseline_latencies) * 0.99)] * 1000, 3
+                )
+                if baseline_latencies
+                else 0,
             },
         }
 
@@ -169,9 +241,16 @@ def run_memory_benchmark(*, k: int = 5, seed: int = 42) -> dict[str, Any]:
         for metric in ["recall_at_k", "precision_at_k", "mrr"]:
             deltas[metric] = round(overall["kestrel"][metric] - overall["baseline"][metric], 3)
 
-        return {
+        result = {
             "schema": "kestrel.memory_benchmark.v1",
-            "config": {"k": k, "seed": seed, "total_queries": len(corpus.queries), "total_docs": len(corpus.documents)},
+            "config": {
+                "k": k,
+                "seed": seed,
+                "total_queries": len(corpus.queries),
+                "total_docs": len(corpus.documents),
+                "backend": "in_memory",
+                "synthetic_fixture_seed_mode": "direct_non_promotion",
+            },
             "overall": overall,
             "deltas": deltas,
             "per_layer": layer_comparison,
@@ -180,6 +259,8 @@ def run_memory_benchmark(*, k: int = 5, seed: int = 42) -> dict[str, Any]:
                 "baseline": baseline_results,
             },
         }
+        result["acceptance"] = _evaluate_quality_gate(result)
+        return result
 
 
 def main() -> int:
@@ -190,12 +271,13 @@ def main() -> int:
     args = parser.parse_args()
 
     result = run_memory_benchmark(k=args.k, seed=args.seed)
+    result["acceptance"] = _evaluate_quality_gate(result)
     print(json.dumps(result, indent=2))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2))
         print(f"\nWrote results to {args.output}", file=sys.stderr)
-    return 0
+    return 0 if result["acceptance"]["passed"] else 1
 
 
 if __name__ == "__main__":

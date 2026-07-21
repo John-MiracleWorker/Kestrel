@@ -9,6 +9,7 @@ from typing import Any
 
 from ..runtime_models import ChatMessage, LLMOptions, LLMResponse, LLMStreamEvent, ToolSpec
 from .base import LLMProvider, ProviderCapabilities, ProviderError
+from .parser import ControlMessageError
 
 
 @dataclass
@@ -194,6 +195,8 @@ class ResilientLLMProvider(LLMProvider):
 
 
 def classify_provider_error(exc: Exception) -> ProviderError:
+    if isinstance(exc, ControlMessageError):
+        return ProviderError(str(exc), code=exc.code, retryable=False)
     message = str(exc)
     lowered = message.lower()
     code = exc.code if isinstance(exc, ProviderError) else type(exc).__name__
@@ -204,7 +207,10 @@ def classify_provider_error(exc: Exception) -> ProviderError:
         return ProviderError("Provider rate limit exceeded.", code="rate_limit", retryable=True)
     if any(marker in lowered or marker in normalized_code for marker in ("timeout", "timed out")):
         return ProviderError("Provider request timed out.", code="timeout", retryable=True)
-    if any(marker in lowered or marker in normalized_code for marker in ("400", "invalid request", "context length", "badrequest")):
+    if any(
+        marker in lowered or marker in normalized_code
+        for marker in ("400", "404", "invalid request", "not found", "context length", "badrequest", "notfound")
+    ):
         return ProviderError("Provider rejected the request.", code="invalid_request", retryable=False)
     if any(marker in lowered or marker in normalized_code for marker in ("500", "502", "503", "504", "unavailable", "connection")):
         return ProviderError("Provider is unavailable.", code="unavailable", retryable=True)

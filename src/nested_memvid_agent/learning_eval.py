@@ -128,21 +128,28 @@ class LearningEvalScenario:
         scenario_id = str(payload.get("id") or payload.get("scenario_id"))
         provider_modes = _provider_modes(payload.get("provider_modes", ("both",)))
         backend_modes = _backend_modes(payload.get("backend_modes", ("both",)))
-        active_deltas = tuple(_delta_from_fixture(item) for item in payload.get("active_behavior_deltas", ()))
+        active_deltas = tuple(
+            _delta_from_fixture(item) for item in payload.get("active_behavior_deltas", ())
+        )
         return cls(
             id=scenario_id,
             title=str(payload.get("title") or scenario_id.replace("_", " ").title()),
             description=str(payload.get("description", "")),
             provider_modes=provider_modes,
             backend_modes=backend_modes,
-            initial_memory_records=tuple(dict(item) for item in payload.get("initial_memory_records", ()) or ()),
+            initial_memory_records=tuple(
+                dict(item) for item in payload.get("initial_memory_records", ()) or ()
+            ),
             active_behavior_deltas=active_deltas,
             user_goal=str(payload["user_goal"]),
-            expected_delta_kinds=tuple(str(item) for item in payload.get("expected_delta_kinds", ()) or ()),
+            expected_delta_kinds=tuple(
+                str(item) for item in payload.get("expected_delta_kinds", ()) or ()
+            ),
             expected_gate_status=_optional_str(payload.get("expected_gate_status")),
             expected_activation_count=_optional_int(payload.get("expected_activation_count")),
             expected_outcomes=tuple(
-                LearningEvalExpectedOutcome.from_payload(item) for item in payload.get("expected_outcomes", ()) or ()
+                LearningEvalExpectedOutcome.from_payload(item)
+                for item in payload.get("expected_outcomes", ()) or ()
             ),
             forbidden_events=tuple(str(item) for item in payload.get("forbidden_events", ()) or ()),
             required_events=tuple(str(item) for item in payload.get("required_events", ()) or ()),
@@ -166,7 +173,9 @@ class LearningEvalScenario:
             "provider_modes": list(self.provider_modes),
             "backend_modes": list(self.backend_modes),
             "initial_memory_records": list(self.initial_memory_records),
-            "active_behavior_deltas": [delta.to_metadata() for delta in self.active_behavior_deltas],
+            "active_behavior_deltas": [
+                delta.to_metadata() for delta in self.active_behavior_deltas
+            ],
             "user_goal": self.user_goal,
             "expected_delta_kinds": list(self.expected_delta_kinds),
             "expected_gate_status": self.expected_gate_status,
@@ -283,7 +292,9 @@ class LearningEvalReport:
                 "skipped": sum(1 for result in self.results if result.status == "skip"),
                 "llm_calls": sum(result.llm_calls for result in self.results),
                 "tool_calls": sum(result.tool_calls for result in self.results),
-                "estimated_cost_usd": round(sum(result.estimated_cost_usd for result in self.results), 6),
+                "estimated_cost_usd": round(
+                    sum(result.estimated_cost_usd for result in self.results), 6
+                ),
             },
             "results": [result.to_payload() for result in self.results],
             "report_path": str(self.report_path) if self.report_path else None,
@@ -355,7 +366,9 @@ class _RunContext:
     rollback_verified: bool = False
 
 
-def load_learning_eval_scenario(value: str | Path, *, scenario_dir: Path = DEFAULT_SCENARIO_DIR) -> LearningEvalScenario:
+def load_learning_eval_scenario(
+    value: str | Path, *, scenario_dir: Path = DEFAULT_SCENARIO_DIR
+) -> LearningEvalScenario:
     path = Path(value)
     if not path.exists():
         path = scenario_dir / f"{value}.json"
@@ -363,8 +376,13 @@ def load_learning_eval_scenario(value: str | Path, *, scenario_dir: Path = DEFAU
     return LearningEvalScenario.from_payload(payload)
 
 
-def list_learning_eval_scenarios(*, scenario_dir: Path = DEFAULT_SCENARIO_DIR) -> list[LearningEvalScenario]:
-    return [load_learning_eval_scenario(path, scenario_dir=scenario_dir) for path in sorted(scenario_dir.glob("*.json"))]
+def list_learning_eval_scenarios(
+    *, scenario_dir: Path = DEFAULT_SCENARIO_DIR
+) -> list[LearningEvalScenario]:
+    return [
+        load_learning_eval_scenario(path, scenario_dir=scenario_dir)
+        for path in sorted(scenario_dir.glob("*.json"))
+    ]
 
 
 def run_learning_eval_suite(
@@ -378,7 +396,9 @@ def run_learning_eval_suite(
     return report
 
 
-def run_learning_eval(scenario: LearningEvalScenario, options: LearningEvalOptions) -> LearningEvalResult:
+def run_learning_eval(
+    scenario: LearningEvalScenario, options: LearningEvalOptions
+) -> LearningEvalResult:
     started_at = datetime.now(UTC).isoformat()
     provider = options.provider
     model = resolve_eval_model(provider, options.model)
@@ -401,14 +421,27 @@ def run_learning_eval(scenario: LearningEvalScenario, options: LearningEvalOptio
             started_at=started_at,
         )
 
-    artifact_root = _artifact_root(options) / scenario.id
-    workspace = (options.workspace / scenario.id) if options.workspace is not None else artifact_root / "workspace"
-    memory_dir = (options.memory_dir / scenario.id) if options.memory_dir is not None else workspace / ".nest" / "memory"
+    run_scope = f"{scenario.id}-{uuid4().hex[:12]}"
+    artifact_root = _artifact_root(options) / run_scope
+    workspace = (
+        (options.workspace / run_scope)
+        if options.workspace is not None
+        else artifact_root / "workspace"
+    )
+    memory_dir = (
+        (options.memory_dir / run_scope)
+        if options.memory_dir is not None
+        else workspace / ".nest" / "memory"
+    )
     max_llm_calls = min(options.max_llm_calls, scenario.max_llm_calls or options.max_llm_calls)
     max_tool_calls = min(options.max_tool_calls, scenario.max_tool_calls or options.max_tool_calls)
     max_cost_usd = min(options.max_cost_usd, scenario.max_cost_usd or options.max_cost_usd)
-    timeout_seconds = min(options.timeout_seconds, scenario.timeout_seconds or options.timeout_seconds)
-    limits = _EvalLimits(max_llm_calls=max_llm_calls, max_tool_calls=max_tool_calls, max_cost_usd=max_cost_usd)
+    timeout_seconds = min(
+        options.timeout_seconds, scenario.timeout_seconds or options.timeout_seconds
+    )
+    limits = _EvalLimits(
+        max_llm_calls=max_llm_calls, max_tool_calls=max_tool_calls, max_cost_usd=max_cost_usd
+    )
     state = AgentStateStore(workspace / ".nest" / "state" / "agent.db")
     ledger = BehaviorDeltaLedger(state)
     config = _eval_agent_config(
@@ -475,12 +508,16 @@ def run_learning_eval(scenario: LearningEvalScenario, options: LearningEvalOptio
         if event in STAGE_NAMES and event not in stage_names:
             failures.append(f"required stage did not pass: {event}")
 
-    status: StageStatus = "fail" if failures or any(stage.status == "fail" for stage in stages) else "pass"
+    status: StageStatus = (
+        "fail" if failures or any(stage.status == "fail" for stage in stages) else "pass"
+    )
     report = ctx.ledger.report_deltas().to_payload()
     activation_payloads: list[dict[str, Any]] = []
     outcome_payloads: list[dict[str, Any]] = []
     for delta in ctx.ledger.list_deltas():
-        activation_payloads.extend(item.to_payload() for item in ctx.ledger.list_activations(delta.id))
+        activation_payloads.extend(
+            item.to_payload() for item in ctx.ledger.list_activations(delta.id)
+        )
         outcome_payloads.extend(item.to_payload() for item in ctx.ledger.list_outcomes(delta.id))
     finished_at = datetime.now(UTC).isoformat()
     return LearningEvalResult(
@@ -517,7 +554,15 @@ def write_learning_eval_markdown(report: LearningEvalReport, path: Path) -> None
         "",
     ]
     summary = payload["summary"]
-    for key in ("scenario_count", "passed", "failed", "skipped", "llm_calls", "tool_calls", "estimated_cost_usd"):
+    for key in (
+        "scenario_count",
+        "passed",
+        "failed",
+        "skipped",
+        "llm_calls",
+        "tool_calls",
+        "estimated_cost_usd",
+    ):
         lines.append(f"- {key}: {summary[key]}")
     for result in payload["results"]:
         lines.extend(
@@ -632,7 +677,9 @@ def _stage_provider_smoke(ctx: _RunContext) -> LearningEvalStep:
     return LearningEvalStep(
         "provider_smoke",
         "pass" if response.content.strip() else "fail",
-        "provider returned a valid response" if response.content.strip() else "provider returned empty content",
+        "provider returned a valid response"
+        if response.content.strip()
+        else "provider returned empty content",
         metrics={
             "provider": ctx.config.provider,
             "model": ctx.config.model,
@@ -656,7 +703,9 @@ def _stage_agent_run(ctx: _RunContext) -> LearningEvalStep:
     )
     return LearningEvalStep(
         "agent_run",
-        "pass" if ctx.turn.stop_reason in {"complete", "tool_error", "approval_required"} else "fail",
+        "pass"
+        if ctx.turn.stop_reason in {"complete", "tool_error", "approval_required"}
+        else "fail",
         f"agent stop_reason={ctx.turn.stop_reason}",
         metrics={
             "run_id": ctx.run_id,
@@ -682,19 +731,32 @@ def _stage_capsule_trace_extraction(ctx: _RunContext) -> LearningEvalStep:
         tool_executions=tuple(ctx.turn.tool_executions) + tuple(simulated_tools),
         final_response=ctx.turn.assistant_message,
         errors_encountered=tuple(str(item) for item in capsule.get("errors_encountered", ()) or ()),
-        unresolved_questions=tuple(str(item) for item in capsule.get("unresolved_questions", ()) or ()),
+        unresolved_questions=tuple(
+            str(item) for item in capsule.get("unresolved_questions", ()) or ()
+        ),
         reusable_lessons=tuple(str(item) for item in capsule.get("reusable_lessons", ()) or ()),
         candidate_facts=tuple(str(item) for item in capsule.get("candidate_facts", ()) or ()),
-        candidate_procedures=tuple(str(item) for item in capsule.get("candidate_procedures", ()) or ()),
-        candidate_corrections=tuple(str(item) for item in capsule.get("candidate_corrections", ()) or ()),
-        candidate_policy_items=tuple(str(item) for item in capsule.get("candidate_policy_items", ()) or ()),
+        candidate_procedures=tuple(
+            str(item) for item in capsule.get("candidate_procedures", ()) or ()
+        ),
+        candidate_corrections=tuple(
+            str(item) for item in capsule.get("candidate_corrections", ()) or ()
+        ),
+        candidate_policy_items=tuple(
+            str(item) for item in capsule.get("candidate_policy_items", ()) or ()
+        ),
     )
-    summary = summarize_run_capsule(runs_dir=ctx.artifact_root / "runs", run_id=ctx.run_id, backend=ctx.options.backend)
+    summary = summarize_run_capsule(
+        runs_dir=ctx.artifact_root / "runs", run_id=ctx.run_id, backend=ctx.options.backend
+    )
     ctx.capsule_payload = {
         **capsule,
         "run_id": ctx.run_id,
         "objective": ctx.scenario.user_goal,
-        "tool_calls": [_tool_execution_payload(execution) for execution in tuple(ctx.turn.tool_executions) + tuple(simulated_tools)],
+        "tool_calls": [
+            _tool_execution_payload(execution)
+            for execution in tuple(ctx.turn.tool_executions) + tuple(simulated_tools)
+        ],
     }
     ctx.proposals = BehaviorDeltaExtractor(ledger=ctx.ledger).propose_from_capsule(
         ctx.capsule_payload,
@@ -707,7 +769,9 @@ def _stage_capsule_trace_extraction(ctx: _RunContext) -> LearningEvalStep:
     return LearningEvalStep(
         "capsule_trace_extraction",
         status,
-        "capsule and behavior proposals extracted" if not missing else f"missing expected delta kinds: {missing}",
+        "capsule and behavior proposals extracted"
+        if not missing
+        else f"missing expected delta kinds: {missing}",
         metrics={
             "capsule_path": str(capsule_path),
             "summary_signal_count": len(summary.learning_signals),
@@ -732,7 +796,9 @@ def _stage_mutation_gate(ctx: _RunContext) -> LearningEvalStep:
             continue
         stored_delta = ctx.ledger.get_delta(delta.id)
         if stored_delta is not None and stored_delta.status != decision.status:
-            ctx.ledger.update_delta_status(delta.id, decision.status, reason=f"learning eval mutation gate: {decision.reason}")
+            ctx.ledger.update_delta_status(
+                delta.id, decision.status, reason=f"learning eval mutation gate: {decision.reason}"
+            )
     expected = ctx.scenario.expected_gate_status
     observed = {decision.status.value for decision in decisions.values()}
     status: StageStatus = "pass"
@@ -766,13 +832,27 @@ def _stage_replay_validation(ctx: _RunContext) -> LearningEvalStep:
     failures = tuple(str(item) for item in ctx.scenario.replay.get("failure_conditions", ()) or ())
     candidates = ctx.proposals or list(ctx.scenario.active_behavior_deltas)
     if not expected or not candidates:
-        ctx.replay_result = {"baseline_score": 1.0, "delta_score": 1.0, "improvement": 0.0, "skipped": True}
-        return LearningEvalStep("replay_validation", "skip", "no replay expectations configured", metrics=ctx.replay_result)
+        ctx.replay_result = {
+            "baseline_score": 1.0,
+            "delta_score": 1.0,
+            "improvement": 0.0,
+            "skipped": True,
+        }
+        return LearningEvalStep(
+            "replay_validation",
+            "skip",
+            "no replay expectations configured",
+            metrics=ctx.replay_result,
+        )
     delta_text = "\n".join(delta.behavior_change for delta in candidates)
-    baseline_text = f"BASELINE RUN: {ctx.scenario.user_goal}. No behavior delta instructions were compiled."
+    baseline_text = (
+        f"BASELINE RUN: {ctx.scenario.user_goal}. No behavior delta instructions were compiled."
+    )
     baseline_score = _score_text(baseline_text, expected)
     delta_score = _score_text(delta_text, expected)
-    violations = tuple(condition for condition in failures if _phrase_matches(delta_text, condition))
+    violations = tuple(
+        condition for condition in failures if _phrase_matches(delta_text, condition)
+    )
     improvement = round(delta_score - baseline_score, 4)
     ctx.replay_result = {
         "baseline_score": baseline_score,
@@ -801,7 +881,9 @@ def _stage_behavior_compilation(ctx: _RunContext) -> LearningEvalStep:
             "no active deltas compiled; proposed/staged deltas stayed inactive",
             metrics={"active_delta_count": 0, "compiled_delta_ids": []},
         )
-    compiler = BehaviorCompiler(ledger=ctx.ledger, config=BehaviorCompilerConfig(enabled=True, log_activations=False))
+    compiler = BehaviorCompiler(
+        ledger=ctx.ledger, config=BehaviorCompilerConfig(enabled=True, log_activations=False)
+    )
     tool_name = str(ctx.scenario.tool_preflight.get("tool_name", ""))
     compiled = compiler.compile(
         BehaviorCompileRequest(
@@ -813,13 +895,20 @@ def _stage_behavior_compilation(ctx: _RunContext) -> LearningEvalStep:
         )
     )
     ctx.compiled_text = compiled.text
-    missing = [delta.id for delta in active if delta.id not in {item.id for item in compiled.deltas}]
+    missing = [
+        delta.id for delta in active if delta.id not in {item.id for item in compiled.deltas}
+    ]
     status: StageStatus = "fail" if missing else "pass"
     return LearningEvalStep(
         "behavior_compilation",
         status,
-        "active deltas compiled into runtime context" if not missing else f"active deltas did not compile: {missing}",
-        metrics={"active_delta_count": len(active), "compiled_delta_ids": [delta.id for delta in compiled.deltas]},
+        "active deltas compiled into runtime context"
+        if not missing
+        else f"active deltas did not compile: {missing}",
+        metrics={
+            "active_delta_count": len(active),
+            "compiled_delta_ids": [delta.id for delta in compiled.deltas],
+        },
     )
 
 
@@ -835,7 +924,10 @@ def _stage_tool_aware_preflight(ctx: _RunContext) -> LearningEvalStep:
         arguments=dict(spec.get("arguments", {}) or {}),
         id=str(spec.get("tool_call_id", "learning-eval-tool-call")),
     )
-    previous = tuple(_tool_execution_from_payload(item, index=index) for index, item in enumerate(spec.get("previous_failures", ()) or (), start=1))
+    previous = tuple(
+        _tool_execution_from_payload(item, index=index)
+        for index, item in enumerate(spec.get("previous_failures", ()) or (), start=1)
+    )
     first = ctx.agent.tool_preflight_for_call(
         objective=ctx.scenario.user_goal,
         call=call,
@@ -883,11 +975,15 @@ def _stage_tool_aware_preflight(ctx: _RunContext) -> LearningEvalStep:
 def _stage_outcome_ledger(ctx: _RunContext) -> LearningEvalStep:
     if not ctx.scenario.expected_outcomes:
         summary = ctx.ledger.summarize_deltas().to_payload()
-        return LearningEvalStep("outcome_ledger", "pass", "no explicit outcomes requested", metrics=summary)
+        return LearningEvalStep(
+            "outcome_ledger", "pass", "no explicit outcomes requested", metrics=summary
+        )
     for expected in ctx.scenario.expected_outcomes:
         delta_id = expected.delta_id or _first_delta_id(ctx)
         if delta_id is None:
-            return LearningEvalStep("outcome_ledger", "fail", f"no delta available for outcome {expected.name}")
+            return LearningEvalStep(
+                "outcome_ledger", "fail", f"no delta available for outcome {expected.name}"
+            )
         ctx.ledger.record_outcome(
             BehaviorDeltaOutcome(
                 id=f"out_{delta_id}_{expected.name}_{uuid4().hex[:8]}",
@@ -895,12 +991,18 @@ def _stage_outcome_ledger(ctx: _RunContext) -> LearningEvalStep:
                 run_id=ctx.run_id,
                 outcome=expected.name,  # type: ignore[arg-type]
                 recorded_at=utc_now(),
-                evidence_ref=EvidenceRef(source="learning_eval", locator=f"{ctx.scenario.id}:outcome"),
+                evidence_ref=EvidenceRef(
+                    source="learning_eval", locator=f"{ctx.scenario.id}:outcome"
+                ),
                 notes=expected.notes or f"learning eval recorded {expected.name}",
             )
         )
     summary = ctx.ledger.summarize_deltas().to_payload()
-    missing = [item.name for item in ctx.scenario.expected_outcomes if summary["outcomes"].get(item.name, 0) < 1]
+    missing = [
+        item.name
+        for item in ctx.scenario.expected_outcomes
+        if summary["outcomes"].get(item.name, 0) < 1
+    ]
     status: StageStatus = "fail" if missing else "pass"
     return LearningEvalStep(
         "outcome_ledger",
@@ -917,7 +1019,9 @@ def _stage_rollback(ctx: _RunContext) -> LearningEvalStep:
     before = ctx.ledger.get_delta(delta_id)
     if before is None:
         return LearningEvalStep("rollback", "fail", f"unknown rollback delta: {delta_id}")
-    ctx.ledger.update_delta_status(delta_id, BehaviorDeltaStatus.ROLLED_BACK, reason="learning eval rollback")
+    ctx.ledger.update_delta_status(
+        delta_id, BehaviorDeltaStatus.ROLLED_BACK, reason="learning eval rollback"
+    )
     ctx.ledger.record_outcome(
         BehaviorDeltaOutcome(
             id=f"out_{delta_id}_rolled_back_{uuid4().hex[:8]}",
@@ -931,16 +1035,24 @@ def _stage_rollback(ctx: _RunContext) -> LearningEvalStep:
     )
     compiler = BehaviorCompiler(ledger=ctx.ledger, config=BehaviorCompilerConfig(enabled=True))
     compiled = compiler.compile(
-        BehaviorCompileRequest(objective=ctx.scenario.user_goal, query=ctx.scenario.user_goal, run_id=f"{ctx.run_id}_rollback")
+        BehaviorCompileRequest(
+            objective=ctx.scenario.user_goal,
+            query=ctx.scenario.user_goal,
+            run_id=f"{ctx.run_id}_rollback",
+        )
     )
     after = ctx.ledger.get_delta(delta_id)
     ignored = delta_id not in {delta.id for delta in compiled.deltas}
     history = bool(ctx.ledger.list_outcomes(delta_id)) and after is not None
-    ctx.rollback_verified = bool(after and after.status == BehaviorDeltaStatus.ROLLED_BACK and ignored and history)
+    ctx.rollback_verified = bool(
+        after and after.status == BehaviorDeltaStatus.ROLLED_BACK and ignored and history
+    )
     return LearningEvalStep(
         "rollback",
         "pass" if ctx.rollback_verified else "fail",
-        "rollback disabled delta and preserved audit history" if ctx.rollback_verified else "rollback verification failed",
+        "rollback disabled delta and preserved audit history"
+        if ctx.rollback_verified
+        else "rollback verification failed",
         metrics={
             "before_status": before.status.value,
             "after_status": after.status.value if after else None,
@@ -977,10 +1089,14 @@ def _skipped_result(
     )
 
 
-def _compatibility_skip(scenario: LearningEvalScenario, *, provider: str, backend: str) -> str | None:
+def _compatibility_skip(
+    scenario: LearningEvalScenario, *, provider: str, backend: str
+) -> str | None:
     provider_mode: ProviderMode = "mock" if provider == "mock" else "live"
     if "both" not in scenario.provider_modes and provider_mode not in scenario.provider_modes:
-        return f"scenario supports provider modes {list(scenario.provider_modes)}, not {provider_mode}"
+        return (
+            f"scenario supports provider modes {list(scenario.provider_modes)}, not {provider_mode}"
+        )
     backend_mode: BackendMode = "memvid" if backend == "memvid" else "memory"
     if "both" not in scenario.backend_modes and backend_mode not in scenario.backend_modes:
         return f"scenario supports backend modes {list(scenario.backend_modes)}, not {backend_mode}"
@@ -997,7 +1113,11 @@ def _live_provider_skip_reason(provider: str, options: LearningEvalOptions) -> s
         if not os.getenv(key_env):
             return f"provider=openai requires {key_env}"
     if provider == "openai-compatible":
-        base_url = options.base_url or os.getenv("NEST_AGENT_BASE_URL") or os.getenv("OPENAI_COMPATIBLE_BASE_URL")
+        base_url = (
+            options.base_url
+            or os.getenv("NEST_AGENT_BASE_URL")
+            or os.getenv("OPENAI_COMPATIBLE_BASE_URL")
+        )
         if not base_url:
             return "provider=openai-compatible requires --base-url, NEST_AGENT_BASE_URL, or OPENAI_COMPATIBLE_BASE_URL"
     return None
@@ -1024,7 +1144,9 @@ def _eval_agent_config(
         provider=provider,
         model=model,
         backend=backend,
-        base_url=options.base_url or os.getenv("NEST_AGENT_BASE_URL") or os.getenv("OPENAI_COMPATIBLE_BASE_URL"),
+        base_url=options.base_url
+        or os.getenv("NEST_AGENT_BASE_URL")
+        or os.getenv("OPENAI_COMPATIBLE_BASE_URL"),
         api_key_env=options.api_key_env,
         timeout_seconds=timeout_seconds,
         max_retries=0,
@@ -1034,6 +1156,11 @@ def _eval_agent_config(
         state_path=workspace / ".nest" / "state" / "agent.db",
         secret_store_path=workspace / ".nest" / "secrets" / "local_vault.json",
         workspace=workspace,
+        skills_dir=workspace / ".nest" / "skills",
+        plugins_dir=workspace / ".nest" / "plugins",
+        mcp_config_path=workspace / ".nest" / "config" / "mcp_servers.json",
+        channel_config_path=workspace / ".nest" / "config" / "channels.json",
+        worker_worktree_dir=workspace / ".nest" / "worktrees",
         max_tool_rounds=0,
         allow_shell=False,
         allow_file_write=False,
@@ -1062,7 +1189,11 @@ def _memory_record_from_payload(payload: dict[str, Any], *, index: int) -> Memor
         tags={str(key): str(value) for key, value in dict(payload.get("tags", {}) or {}).items()},
         metadata=dict(payload.get("metadata", {}) or {}),
         evidence=[
-            EvidenceRef(source=str(item.get("source", "fixture")), locator=str(item.get("locator", f"seed:{index}")), quote=_optional_str(item.get("quote")))
+            EvidenceRef(
+                source=str(item.get("source", "fixture")),
+                locator=str(item.get("locator", f"seed:{index}")),
+                quote=_optional_str(item.get("quote")),
+            )
             for item in evidence
             if isinstance(item, dict)
         ],
@@ -1092,7 +1223,9 @@ def _tool_execution_from_payload(payload: dict[str, Any], *, index: int) -> Tool
         success=bool(payload.get("success", False)),
         content=str(payload.get("content") or payload.get("error") or "simulated tool result"),
         data=dict(payload.get("data", {}) or {}),
-        error=_optional_str(payload.get("error")) if not bool(payload.get("success", False)) else None,
+        error=_optional_str(payload.get("error"))
+        if not bool(payload.get("success", False))
+        else None,
     )
 
 
@@ -1117,7 +1250,9 @@ def _mutation_gate_evidence(scenario: LearningEvalScenario) -> MutationGateEvide
         reviewed_rule=bool(payload.get("reviewed_rule", False)),
         replay_passed=bool(payload.get("replay_passed", False)),
         policy_delta_activation_enabled=bool(payload.get("policy_delta_activation_enabled", False)),
-        critical_delta_activation_enabled=bool(payload.get("critical_delta_activation_enabled", False)),
+        critical_delta_activation_enabled=bool(
+            payload.get("critical_delta_activation_enabled", False)
+        ),
         exact_call_approved=bool(payload.get("exact_call_approved", False)),
         human_approved=bool(payload.get("human_approved", False)),
     )
@@ -1129,7 +1264,11 @@ def _first_delta_id(ctx: _RunContext) -> str | None:
 
 
 def _artifact_payload(ctx: _RunContext) -> dict[str, str]:
-    payload = {"artifact_root": str(ctx.artifact_root), "workspace": str(ctx.workspace), "memory_dir": str(ctx.memory_dir)}
+    payload = {
+        "artifact_root": str(ctx.artifact_root),
+        "workspace": str(ctx.workspace),
+        "memory_dir": str(ctx.memory_dir),
+    }
     capsule = ctx.artifact_root / "runs" / ctx.run_id / "complete.mv2"
     if capsule.exists():
         payload["capsule"] = str(capsule)
@@ -1138,11 +1277,20 @@ def _artifact_payload(ctx: _RunContext) -> dict[str, str]:
 
 def _forbidden_event_seen(event: str, ctx: _RunContext) -> bool:
     if event == "policy_delta_active":
-        return any(delta.status == BehaviorDeltaStatus.ACTIVE for delta in ctx.ledger.list_deltas(kind=BehaviorDeltaKind.POLICY))
+        return any(
+            delta.status == BehaviorDeltaStatus.ACTIVE
+            for delta in ctx.ledger.list_deltas(kind=BehaviorDeltaKind.POLICY)
+        )
     if event == "approval_gate_rule_active":
-        return any(delta.status == BehaviorDeltaStatus.ACTIVE for delta in ctx.ledger.list_deltas(kind=BehaviorDeltaKind.APPROVAL_GATE_RULE))
+        return any(
+            delta.status == BehaviorDeltaStatus.ACTIVE
+            for delta in ctx.ledger.list_deltas(kind=BehaviorDeltaKind.APPROVAL_GATE_RULE)
+        )
     if event == "mv2_replaced":
-        return any("replace .mv2" in delta.behavior_change.lower() for delta in ctx.ledger.list_deltas(status=BehaviorDeltaStatus.ACTIVE))
+        return any(
+            "replace .mv2" in delta.behavior_change.lower()
+            for delta in ctx.ledger.list_deltas(status=BehaviorDeltaStatus.ACTIVE)
+        )
     if event == "secret_leak":
         return _contains_secret(json.dumps(ctx.ledger.report_deltas().to_payload(), default=str))
     return False
@@ -1212,7 +1360,9 @@ def _delta_from_fixture(payload: dict[str, Any]) -> BehaviorDelta:
 
 
 def _provider_modes(value: object) -> tuple[ProviderMode, ...]:
-    values = tuple(str(item) for item in value) if isinstance(value, list | tuple) else (str(value),)
+    values = (
+        tuple(str(item) for item in value) if isinstance(value, list | tuple) else (str(value),)
+    )
     for item in values:
         if item not in {"mock", "live", "both"}:
             raise ValueError(f"invalid provider mode: {item}")
@@ -1220,7 +1370,9 @@ def _provider_modes(value: object) -> tuple[ProviderMode, ...]:
 
 
 def _backend_modes(value: object) -> tuple[BackendMode, ...]:
-    values = tuple(str(item) for item in value) if isinstance(value, list | tuple) else (str(value),)
+    values = (
+        tuple(str(item) for item in value) if isinstance(value, list | tuple) else (str(value),)
+    )
     for item in values:
         if item not in {"memory", "memvid", "both"}:
             raise ValueError(f"invalid backend mode: {item}")

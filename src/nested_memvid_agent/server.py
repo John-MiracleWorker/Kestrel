@@ -8,18 +8,23 @@ from threading import Thread
 from typing import Any
 from uuid import uuid4
 
-from .app_factory import build_agent
 from .behavior_delta_ledger import BehaviorDeltaLedger
 from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
 from .config import AgentConfig
 from .event_bus import RunEventBus
+from .layers import (
+    load_layer_specs,
+    prepare_private_memory_artifacts,
+    prepare_private_runs_root,
+)
 from .llm.model_catalog import DEFAULT_API_KEY_ENVS
-from .mcp_manager import MCPManager
+from .mcp_manager import MCPManager, mcp_sensitive_material_transition
 from .models import MemoryLayer, RetrievalQuery
-from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
+from .routine_loop import RoutineLoop
+from .routines import RoutineService
 from .run_manager import RunCapacityError, RunManager
 from .runtime_settings import (
     RuntimeSettingsStore,
@@ -30,6 +35,7 @@ from .secret_broker import build_secret_broker
 from .self_profile import (
     SELF_PROFILE_QUERY,
     SELF_PROFILE_SCHEMA,
+    TRUSTED_ONBOARDING_ORIGIN,
     build_onboarding_profile,
     onboarding_record_content,
     onboarding_record_title,
@@ -74,9 +80,60 @@ from .server_support import (
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, CapabilityConflictError
 
+_BROWSER_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "base-uri 'none'; "
+        "connect-src 'self'; "
+        "font-src 'self' data:; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "img-src 'self' data: https:; "
+        "manifest-src 'self'; "
+        "object-src 'none'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "worker-src 'self' blob:"
+    ),
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": (
+        "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+        "magnetometer=(), microphone=(), payment=(), usb=()"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
+def _apply_browser_security_headers(response: Any) -> None:
+    for name, value in _BROWSER_SECURITY_HEADERS.items():
+        if name not in response.headers:
+            response.headers[name] = value
+
 
 def create_app(config: AgentConfig | None = None) -> Any:
-    """Create the local web/API app for the full Nested MV2 Agent."""
+    """Create the local Kestrel web/API app."""
+
+    construction_cleanup: list[Callable[[], None]] = []
+    try:
+        return _create_app(config, construction_cleanup=construction_cleanup)
+    except BaseException:
+        for cleanup in reversed(construction_cleanup):
+            try:
+                cleanup()
+            except Exception:
+                pass
+        raise
+
+
+def _create_app(
+    config: AgentConfig | None,
+    *,
+    construction_cleanup: list[Callable[[], None]],
+) -> Any:
+    """Assemble an app while exposing acquired resources to the factory guard."""
 
     try:
         fastapi_module = import_module("fastapi")
@@ -115,6 +172,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         )
         from .server_observability_routes import register_observability_routes
         from .server_product_routes import register_product_routes
+        from .server_routine_routes import register_routine_routes
         from .server_runtime_routes import register_runtime_routes
         from .server_secret_routes import register_secret_routes
         from .server_tool_routes import register_tool_routes, tool_invoke_response
@@ -134,8 +192,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
     base_config = config or AgentConfig.from_env()
     runtime_settings_store = RuntimeSettingsStore(default_runtime_settings_path(base_config))
     active_config = apply_runtime_settings(base_config, runtime_settings_store.load(base_config))
+    _prepare_private_runtime_artifacts(active_config)
+    workspace = active_config.workspace.expanduser().resolve()
+    secret_store_path = active_config.secret_store_path.expanduser()
+    if not secret_store_path.is_absolute():
+        secret_store_path = workspace / secret_store_path
+    secret_store_path = secret_store_path.resolve()
     secret_broker = build_secret_broker(
-        active_config.secret_store_path, backend=active_config.secret_backend
+        secret_store_path, backend=active_config.secret_backend
     )
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
@@ -143,6 +207,9 @@ def create_app(config: AgentConfig | None = None) -> Any:
         state,
         allow_network_endpoints=active_config.allow_mcp_network_endpoints,
         secret_resolver=secret_broker.resolve,
+        workspace=workspace,
+        secret_store_path=secret_store_path,
+        secret_backend=active_config.secret_backend,
     )
     skills = SkillManager(active_config.skills_dir, state)
     plugins = PluginManager(active_config.plugins_dir, state)
@@ -154,8 +221,34 @@ def create_app(config: AgentConfig | None = None) -> Any:
         skills=skills,
         plugins=plugins,
         secret_resolver=secret_broker.resolve,
+        enforce_single_owner=True,
+        auto_start=False,
     )
+
+    def abort_runtime_construction() -> None:
+        runs_stopped = runs.shutdown(timeout_seconds=5.0)
+        if not runs_stopped:
+            runs_stopped = runs.shutdown(timeout_seconds=1.0)
+        mcp_stopped = mcp.shutdown()
+        if not runs_stopped or not mcp_stopped:
+            raise RuntimeError("runtime_shutdown_incomplete")
+
+    construction_cleanup.append(abort_runtime_construction)
     channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve, run_manager=runs)
+    routine_service = RoutineService(
+        state,
+        runs,
+        claim_ttl_seconds=active_config.routine_claim_ttl_seconds,
+        max_occurrences_per_tick=active_config.max_routines_per_tick,
+    )
+    routine_loop = (
+        RoutineLoop(
+            routine_service,
+            interval_seconds=active_config.routine_poll_interval_seconds,
+        )
+        if active_config.enable_proactive_routines
+        else None
+    )
     secret_broker.register_allowed_env_names(
         _known_secret_env_names(channels.list_channels(), mcp.list_servers())
         | _provider_secret_env_names(active_config)
@@ -187,11 +280,11 @@ def create_app(config: AgentConfig | None = None) -> Any:
         return True
 
     def audit_plugin(action: str, plugin: dict[str, Any]) -> None:
-        memory = build_memory_system(active_config.backend, active_config.memory_dir)
+        agent = runs.build_runtime_agent(active_config)
         try:
-            plugins.write_audit_memory(memory, action=action, plugin=plugin)
+            plugins.write_audit_memory(agent.memory, action=action, plugin=plugin)
         finally:
-            memory.close_all()
+            runs.close_runtime_agent(agent)
 
     def inspect_memory_payload(
         *, query: str | None, layers: list[str] | None, k: int, include_inactive: bool = False
@@ -233,21 +326,51 @@ def create_app(config: AgentConfig | None = None) -> Any:
     @asynccontextmanager
     async def lifespan(app_instance: Any) -> Any:
         del app_instance
-        if active_config.provider_startup_probe:
-            Thread(
-                target=_probe_provider_health,
-                kwargs={"config": active_config, "secret_resolver": secret_broker.resolve},
-                name="kestrel-provider-startup-probe",
-                daemon=True,
-            ).start()
         try:
+            runs.start()
+            if routine_loop is not None:
+                routine_loop.start()
+            if active_config.provider_startup_probe:
+                Thread(
+                    target=_probe_provider_health,
+                    kwargs={"config": active_config, "secret_resolver": secret_broker.resolve},
+                    name="kestrel-provider-startup-probe",
+                    daemon=True,
+                ).start()
             yield
         finally:
-            channels.close()
-            mcp.shutdown()
+            shutdown_incomplete = False
+            try:
+                loop_stopped = (
+                    routine_loop is None
+                    or routine_loop.close(timeout_seconds=5.0)
+                )
+                if routine_loop is not None and not loop_stopped:
+                    loop_stopped = routine_loop.close(timeout_seconds=1.0)
+                shutdown_incomplete = not loop_stopped
+            except Exception:  # noqa: BLE001 - finish all dependency cleanup before reporting
+                shutdown_incomplete = True
+            try:
+                runs_stopped = runs.shutdown(timeout_seconds=5.0)
+                if not runs_stopped:
+                    runs_stopped = runs.shutdown(timeout_seconds=1.0)
+                shutdown_incomplete = shutdown_incomplete or not runs_stopped
+            except Exception:  # noqa: BLE001 - finish all dependency cleanup before reporting
+                shutdown_incomplete = True
+            try:
+                channels.close()
+            except Exception:  # noqa: BLE001 - MCP cleanup must still run
+                shutdown_incomplete = True
+            try:
+                mcp_stopped = mcp.shutdown()
+                shutdown_incomplete = shutdown_incomplete or not mcp_stopped
+            except Exception:  # noqa: BLE001 - report a fixed, non-secret lifecycle error
+                shutdown_incomplete = True
+            if shutdown_incomplete:
+                raise RuntimeError("runtime_shutdown_incomplete") from None
 
     app = FastAPI(
-        title="Nested MV2 Agent",
+        title="Kestrel",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -269,7 +392,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         origin = str(headers.get("origin", "")).strip()
         if origin:
             origin_host = _hostname_from_url(origin)
-            if origin_host and not _host_is_trusted(origin_host, trusted_hosts):  # nosec
+            if not origin_host or not _host_is_trusted(origin_host, trusted_hosts):  # nosec
                 return responses_module.JSONResponse(
                     {"detail": "untrusted_origin"}, status_code=403
                 )
@@ -333,6 +456,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         request.state.request_id = request_id
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
+        _apply_browser_security_headers(response)
         return response
 
     register_runtime_routes(
@@ -340,20 +464,31 @@ def create_app(config: AgentConfig | None = None) -> Any:
         active_config=lambda: active_config,
         state=state,
         settings_store=runtime_settings_store,
+        validate_config_update=_prepare_private_runtime_artifacts,
         on_config_update=update_active_config,
         secret_broker=secret_broker,
         http_exception=HTTPException,
         runs=runs,
+        routine_loop=routine_loop,
         provider_probe=lambda: _probe_provider_health(
             config=active_config,
             secret_resolver=secret_broker.resolve,
         ),
+    )
+    register_routine_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        service=routine_service,
+        loop=routine_loop,
+        http_exception=HTTPException,
     )
 
     register_secret_routes(
         app,
         http_exception=HTTPException,
         secret_broker=secret_broker,
+        sensitive_material_transition=mcp_sensitive_material_transition,
     )
     register_product_routes(app, active_config=lambda: active_config, secret_resolver=secret_broker.resolve)
     register_channel_routes(
@@ -462,6 +597,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         state=state,
         events=events,
         runs=runs,
+        routine_loop=routine_loop,
     )
     register_behavior_delta_routes(app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state))
 
@@ -501,7 +637,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         )
         rows = []
         if execution.success and isinstance(execution.data, dict):
-            raw_rows = execution.data.get("self_memory_hits")
+            raw_rows = execution.data.get("trusted_onboarding_hits")
             rows = raw_rows if isinstance(raw_rows, list) else []
         state_payload = onboarding_state_from_reflection(rows)
         state_payload["reflection"] = execution.data.get("reflection") if isinstance(execution.data, dict) else None
@@ -523,6 +659,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 "locator": "api://self/onboarding",
             },
             session_id="api",
+            trusted_request_origin=TRUSTED_ONBOARDING_ORIGIN,
         )
         return {
             "success": execution.success,
@@ -779,7 +916,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
             raise HTTPException(status_code=400, detail="k must be between 1 and 50")
         if mode not in {"auto", "lex", "vec", "vector", "hybrid"}:
             raise HTTPException(status_code=400, detail="mode must be auto, lex, vector, or hybrid")
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
+        agent = runs.build_runtime_agent(active_config)
         try:
             selected_layers = (
                 tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
@@ -808,7 +945,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
-            agent.close()
+            runs.close_runtime_agent(agent)
 
     @app.get("/api/memory/search")  # type: ignore[untyped-decorator]
     def search_memory_get(
@@ -834,15 +971,15 @@ def create_app(config: AgentConfig | None = None) -> Any:
 
     @app.get("/api/memory/verify")  # type: ignore[untyped-decorator]
     def verify_memory() -> dict[str, bool]:
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
+        agent = runs.build_runtime_agent(active_config)
         try:
             return {layer.value: ok for layer, ok in agent.memory.verify_all().items()}
         finally:
-            agent.close()
+            runs.close_runtime_agent(agent)
 
     @app.get("/api/memory/layers")  # type: ignore[untyped-decorator]
     def memory_layers() -> list[dict[str, object]]:
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
+        agent = runs.build_runtime_agent(active_config)
         try:
             verify = agent.memory.verify_all()
             vector_status = agent.memory.vector_index_status()
@@ -862,7 +999,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 )
             return rows
         finally:
-            agent.close()
+            runs.close_runtime_agent(agent)
 
     @app.get("/api/memory/inspect")  # type: ignore[untyped-decorator]
     def inspect_memory_get(
@@ -1063,7 +1200,14 @@ def create_app(config: AgentConfig | None = None) -> Any:
                 raise HTTPException(status_code=404, detail="not_found")
             return FileResponse(web_dist / "index.html")
 
+    construction_cleanup.clear()
     return app
+
+
+def _prepare_private_runtime_artifacts(config: AgentConfig) -> None:
+    specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
+    prepare_private_memory_artifacts(config.memory_dir, specs=specs)
+    prepare_private_runs_root(config.memory_dir.parent / "runs")
 
 
 def _resolve_web_dist() -> Path | None:

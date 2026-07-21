@@ -261,6 +261,76 @@ export type SecretRef = {
   source?: string;
 };
 
+export type Routine = {
+  routine_id: string;
+  name: string;
+  prompt: string;
+  schedule_kind: "once" | "interval";
+  start_at: string;
+  interval_seconds: number | null;
+  enabled: boolean;
+  revision: number;
+  next_run_at: string | null;
+  workspace?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  autonomy_mode: string;
+  misfire_grace_seconds: number;
+  last_scheduled_at?: string | null;
+  deleted_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RoutineOccurrence = {
+  occurrence_id: string;
+  routine_id: string;
+  routine_revision: number;
+  scheduled_for: string;
+  status: string;
+  run_id: string;
+  request: Record<string, unknown>;
+  trigger_kind: "scheduled" | "manual";
+  requested_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  skip_reason?: string | null;
+  error?: string | null;
+  result: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RoutineLoopStatus = {
+  running: boolean;
+  tick_count: number;
+  last_result: Record<string, unknown> | null;
+  last_error: string | null;
+  tick_in_progress: boolean;
+  current_tick_age_seconds: number | null;
+  last_started_at: string | null;
+  last_finished_at: string | null;
+};
+
+export type RoutineStatus = {
+  enabled: boolean;
+  loop: RoutineLoopStatus | null;
+};
+
+export type RoutineRunNowResult = {
+  requested_at: string;
+  claim_owner: string;
+  idempotent_replay: boolean;
+  occurrence: RoutineOccurrence;
+  dispatch: {
+    occurrence_id: string;
+    routine_id: string;
+    run_id: string;
+    status: string;
+    error?: string | null;
+  } | null;
+};
+
 
 export type BehaviorDeltaSummary = {
   delta_id: string;

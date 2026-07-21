@@ -1,26 +1,41 @@
 """ChromaDB adapter."""
 from __future__ import annotations
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-from .base import RetrievalResult
+from .base import OptionalDependencyUnavailable, RetrievalResult
 
 
 class ChromaAdapter:
     """ChromaDB in-memory vector search."""
 
+    BACKEND_NAME = "ChromaDB (in-memory)"
+
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", collection: str = "memory") -> None:
-        self.model = SentenceTransformer(model_name)
-        self.client = chromadb.Client()
-        self.collection = self.client.create_collection(name=collection, metadata={"hnsw:space": "cosine"})
+        try:
+            import chromadb
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(model_name)
+            client = chromadb.Client()
+            chroma_collection = client.create_collection(
+                name=collection,
+                metadata={"hnsw:space": "cosine"},
+            )
+        except ImportError as exc:
+            raise OptionalDependencyUnavailable(
+                self.BACKEND_NAME,
+                missing_dependency=getattr(exc, "name", None) or "chromadb",
+                install_hint="python -m pip install chromadb sentence-transformers",
+            ) from exc
+        self.model = model
+        self.client = client
+        self.collection = chroma_collection
         self._batch_ids = []
         self._batch_texts = []
         self._batch_layers = []
         self._batch_embs = []
 
     def name(self) -> str:
-        return "ChromaDB (in-memory)"
+        return self.BACKEND_NAME
 
     def ingest(self, doc_id: str, text: str, layer: str | None = None) -> None:
         emb = self.model.encode(text, normalize_embeddings=True).tolist()
@@ -39,7 +54,7 @@ class ChromaAdapter:
             ids=self._batch_ids,
             documents=self._batch_texts,
             embeddings=self._batch_embs,
-            metadatas=[{"layer": l} for l in self._batch_layers]
+            metadatas=[{"layer": item_layer} for item_layer in self._batch_layers],
         )
         self._batch_ids = []
         self._batch_texts = []

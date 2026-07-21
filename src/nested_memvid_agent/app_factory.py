@@ -5,7 +5,13 @@ from collections.abc import Callable
 from .agent import AgentDependencies, NestedMV2Agent
 from .config import AgentConfig
 from .event_log import JsonlEventLog
-from .layers import load_layer_specs
+from .layers import (
+    LayeredMemorySystem,
+    MemoryCleanupIncompleteError,
+    load_layer_specs,
+    prepare_private_memory_artifacts,
+    prepare_private_runs_root,
+)
 from .llm.factory import build_llm_provider
 from .orchestrator import build_memory_system
 from .promotion_ledger import PromotionLedger
@@ -21,40 +27,64 @@ def build_agent(
     *,
     state: AgentStateStore | None = None,
     secret_resolver: Callable[[str | None], str | None] | None = None,
+    close_handler: Callable[[], None] | None = None,
 ) -> NestedMV2Agent:
     register_secret_env_names(
         {config.api_key_env, config.fallback_api_key_env, config.api_auth_token_env}
     )
-    config.memory_dir.mkdir(parents=True, exist_ok=True)
-    config.log_dir.mkdir(parents=True, exist_ok=True)
-    specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
-    active_state = state or AgentStateStore(config.state_path)
-    memory = build_memory_system(
-        config.backend,
-        config.memory_dir,
-        specs=specs,
-        ledger=PromotionLedger(active_state),
-        max_file_bytes=config.memory_max_layer_bytes,
-    )
-    llm = build_llm_provider(config, secret_resolver=secret_resolver)
-    base_registry: ToolRegistry = tools or build_default_tools(config.enabled_tools)
-    # Wrap with transparent retry layer for transient failures
-    registry: ToolRegistry
-    if config.tool_retry_max_attempts > 0:
-        registry = RetryingRegistry(
-            base_registry,
-            max_attempts=config.tool_retry_max_attempts,
-            backoff_base_seconds=config.tool_retry_backoff_base_seconds,
+    memory: LayeredMemorySystem | None = None
+    try:
+        specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
+        prepare_private_memory_artifacts(
+            config.memory_dir,
+            specs=specs,
+            harden_existing=False,
         )
-    else:
-        registry = base_registry
-    event_log = JsonlEventLog(config.log_dir / "events.jsonl")
-    return NestedMV2Agent(
-        AgentDependencies(
-            memory=memory,
-            llm=llm,
-            tools=registry,
-            config=config,
-            event_log=event_log,
+        prepare_private_runs_root(config.memory_dir.parent / "runs")
+        active_state = state or AgentStateStore(config.state_path)
+        memory = build_memory_system(
+            config.backend,
+            config.memory_dir,
+            specs=specs,
+            ledger=PromotionLedger(active_state),
+            max_file_bytes=config.memory_max_layer_bytes,
         )
-    )
+        llm = build_llm_provider(config, secret_resolver=secret_resolver)
+        base_registry: ToolRegistry = tools or build_default_tools(config.enabled_tools)
+        # Wrap with transparent retry layer for transient failures
+        registry: ToolRegistry
+        if config.tool_retry_max_attempts > 0:
+            registry = RetryingRegistry(
+                base_registry,
+                max_attempts=config.tool_retry_max_attempts,
+                backoff_base_seconds=config.tool_retry_backoff_base_seconds,
+            )
+        else:
+            registry = base_registry
+        event_log = JsonlEventLog(config.log_dir / "events.jsonl")
+        return NestedMV2Agent(
+            AgentDependencies(
+                memory=memory,
+                llm=llm,
+                tools=registry,
+                config=config,
+                event_log=event_log,
+                close_handler=close_handler,
+            )
+        )
+    except MemoryCleanupIncompleteError:
+        # The exception owns the partial memory resources required for a
+        # verified cleanup retry. Keep the external lifecycle slot reserved.
+        raise
+    except BaseException:
+        if memory is not None:
+            try:
+                memory.close_all()
+            except BaseException as exc:
+                raise MemoryCleanupIncompleteError(
+                    (memory,),
+                    phase="agent_construction",
+                ) from exc
+        if close_handler is not None:
+            close_handler()
+        raise

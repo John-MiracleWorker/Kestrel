@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 from nested_memvid_agent.llm.base import LLMProvider, ProviderError
+from nested_memvid_agent.llm.parser import ControlMessageError
 from nested_memvid_agent.llm.resilience import ProviderHealthRegistry, ResilientLLMProvider
 from nested_memvid_agent.runtime_models import LLMResponse
 
@@ -79,6 +80,26 @@ def test_provider_error_classification_makes_auth_failure_non_retryable() -> Non
     assert health["state"] == "degraded"
     assert health["failure_class"] == "authentication"
     assert "API key" not in str(health)
+
+
+def test_provider_resilience_preserves_precise_invalid_tool_taxonomy() -> None:
+    registry = ProviderHealthRegistry()
+    provider = _SequenceProvider(
+        [
+            ControlMessageError(
+                "diagnosis.classify missing required arguments: ['failure_text']",
+                code="missing_tool_arguments",
+            )
+        ]
+    )
+    resilient = ResilientLLMProvider(provider, provider_id="primary", registry=registry)
+
+    with pytest.raises(ProviderError) as captured:
+        resilient.generate([], [])
+
+    assert captured.value.code == "missing_tool_arguments"
+    assert captured.value.retryable is False
+    assert "failure_text" in str(captured.value)
 
 
 def test_abandoned_half_open_stream_releases_the_probe_slot() -> None:

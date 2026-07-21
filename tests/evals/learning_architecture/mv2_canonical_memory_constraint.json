@@ -9,9 +9,9 @@
       "id": "seed_mv2_contract",
       "title": ".mv2 canonical contract",
       "content": "Memvid v2 .mv2 files are the canonical durable memory substrate; SQL and vector stores are control-plane or rebuildable sidecars only.",
-      "layer": "policy",
-      "kind": "policy",
-      "confidence": 0.99,
+      "layer": "episodic",
+      "kind": "fact",
+      "confidence": 0.9,
       "importance": 0.95,
       "evidence": [{"source": "fixture", "locator": "mv2_contract"}]
     }

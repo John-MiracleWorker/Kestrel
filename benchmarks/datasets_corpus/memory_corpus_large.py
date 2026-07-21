@@ -176,12 +176,11 @@ def _generate_semantic_corpus(seed: int) -> tuple[list[dict[str, Any]], list[Mem
     
     products = ["kestrel", "falcon", "raven", "hawk", "swift", "sparrow", "phoenix", "drake"]
     tools = ["pytest", "jest", "mocha", "vitest", "unittest", "cargo test", "go test"]
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     quarters = ["Q1 2026", "Q2 2026", "Q3 2026", "Q4 2026"]
     
     # Generate core semantic docs (variations across products)
     doc_id = 0
-    for topic_idx, (topic_key, template) in enumerate(SEMANTIC_TOPICS):
+    for _topic_idx, (topic_key, template) in enumerate(SEMANTIC_TOPICS):
         for product in products:
             doc_id += 1
             doc = {
@@ -238,7 +237,7 @@ def _generate_episodic_corpus(seed: int) -> tuple[list[dict[str, Any]], list[Mem
     times = ["yesterday", "last week", "this morning", "on Friday", "two days ago"]
     
     doc_id = 0
-    for topic_idx, (topic_key, template) in enumerate(EPISODIC_TEMPLATES):
+    for _topic_idx, (topic_key, template) in enumerate(EPISODIC_TEMPLATES):
         for product in products:
             for day in days[:3]:  # 3 days per product per topic
                 doc_id += 1
@@ -289,7 +288,7 @@ def _generate_procedural_corpus(seed: int) -> tuple[list[dict[str, Any]], list[M
     tools = ["pytest", "jest", "mocha"]
     
     doc_id = 0
-    for topic_idx, (topic_key, template) in enumerate(PROCEDURAL_TEMPLATES):
+    for _topic_idx, (topic_key, template) in enumerate(PROCEDURAL_TEMPLATES):
         for product in products:
             doc_id += 1
             doc = {

@@ -14,6 +14,7 @@ from nested_memvid_agent.learning_eval import (
     run_learning_eval,
     write_learning_eval_markdown,
 )
+from scripts.eval_learning_architecture import _report_exit_code
 
 
 def _options(tmp_path: Path, **overrides: object) -> LearningEvalOptions:
@@ -47,9 +48,38 @@ def test_openai_without_key_and_live_flag_skips_cleanly(tmp_path: Path, monkeypa
     assert "RUN_LIVE_LEARNING_EVALS=1" in str(result.skipped_reason)
 
 
+def test_cli_exit_gate_rejects_all_skipped_report(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("RUN_LIVE_LEARNING_EVALS", raising=False)
+    scenario = load_learning_eval_scenario("live_provider_smoke_learning_loop")
+    skipped = run_learning_eval(
+        scenario,
+        _options(tmp_path, provider="openai", model="gpt-5-mini"),
+    )
+
+    assert skipped.status == "skip"
+    assert _report_exit_code(LearningEvalReport(results=(skipped,))) == 1
+
+
+def test_eval_reuses_parent_only_through_unique_run_scopes(tmp_path: Path) -> None:
+    scenario = load_learning_eval_scenario("changed_strategy_after_failed_validation")
+    options = _options(tmp_path)
+
+    first = run_learning_eval(scenario, options)
+    second = run_learning_eval(scenario, options)
+
+    first_workspace = Path(first.artifacts["workspace"])
+    second_workspace = Path(second.artifacts["workspace"])
+    assert first_workspace != second_workspace
+    first_workspace.relative_to(tmp_path)
+    second_workspace.relative_to(tmp_path)
+
+
 def test_live_eval_refuses_to_run_unless_enabled(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("RUN_LIVE_LEARNING_EVALS", raising=False)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-testsecret123456789")
+    monkeypatch.setenv(
+        "OPENAI_API_KEY",
+        "sk-proj-testsecret123456789",  # gitleaks:allow -- synthetic redaction fixture
+    )
     scenario = load_learning_eval_scenario("live_provider_smoke_learning_loop")
 
     result = run_learning_eval(scenario, _options(tmp_path, provider="openai", model="gpt-5-mini"))
@@ -71,7 +101,7 @@ def test_call_guard_stops_eval_before_exceeding_max_calls(tmp_path: Path) -> Non
 
 def test_markdown_report_redacts_fake_api_keys_and_tokens(tmp_path: Path) -> None:
     report_path = tmp_path / "learning-report.md"
-    secret = "sk-proj-testsecret123456789"
+    secret = "sk-proj-testsecret123456789"  # gitleaks:allow -- synthetic redaction fixture
     result = LearningEvalResult(
         scenario_id="secret_redaction",
         title="Secret redaction",
@@ -86,7 +116,9 @@ def test_markdown_report_redacts_fake_api_keys_and_tokens(tmp_path: Path) -> Non
         failures=(f"OPENAI_API_KEY={secret}",),
     )
 
-    write_learning_eval_markdown(LearningEvalReport(results=(result,), report_path=report_path), report_path)
+    write_learning_eval_markdown(
+        LearningEvalReport(results=(result,), report_path=report_path), report_path
+    )
     text = report_path.read_text(encoding="utf-8")
 
     assert secret not in text

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -20,6 +21,28 @@ def _seed_memory(memory_dir: Path, suffix: str = "original") -> None:
             f'{{"layer":"{spec.layer.value}","value":"{suffix}"}}',
             encoding="utf-8",
         )
+
+
+def test_backup_restore_preserves_validation_integrity_key(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    backup_root = tmp_path / "backups"
+    _seed_memory(memory_dir)
+    key_path = memory_dir / ".validation-integrity.key"
+    original_key = "ab" * 32
+    key_path.write_text(original_key, encoding="utf-8")
+    key_path.chmod(0o600)
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backup_root)
+
+    manifest = manager.create()
+    key_path.write_text("cd" * 32, encoding="utf-8")
+    key_path.chmod(0o600)
+    restored = manager.restore(str(manifest["backup_id"]))
+
+    assert restored["restored_files"] == len(manifest["files"])
+    assert key_path.read_text(encoding="utf-8") == original_key
+    assert any(entry["path"] == "memory/.validation-integrity.key" for entry in manifest["files"])
+    if os.name != "nt":
+        assert key_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_file_fsync_uses_a_writable_descriptor(
@@ -56,9 +79,7 @@ def test_atomic_json_fsync_uses_a_writable_descriptor(
     assert json.loads(path.read_text(encoding="utf-8")) == {"ok": True}
 
 
-@pytest.mark.parametrize(
-    "backup_relative", [Path("memory/backups"), Path("."), Path("memory")]
-)
+@pytest.mark.parametrize("backup_relative", [Path("memory/backups"), Path("."), Path("memory")])
 def test_memory_backup_rejects_overlapping_memory_and_backup_roots(
     tmp_path: Path,
     backup_relative: Path,
@@ -70,7 +91,9 @@ def test_memory_backup_rejects_overlapping_memory_and_backup_roots(
         MemoryBackupManager(memory_dir=memory_dir, backup_root=backup_root)
 
 
-def test_memory_backup_round_trip_validates_checksums_and_creates_safety_copy(tmp_path: Path) -> None:
+def test_memory_backup_round_trip_validates_checksums_and_creates_safety_copy(
+    tmp_path: Path,
+) -> None:
     memory_dir = tmp_path / "memory"
     backups = tmp_path / "backups"
     _seed_memory(memory_dir)
@@ -88,6 +111,59 @@ def test_memory_backup_round_trip_validates_checksums_and_creates_safety_copy(tm
     for spec in DEFAULT_LAYER_SPECS.values():
         assert (memory_dir / spec.mv2_file).read_bytes() == f"{spec.layer.value}:original".encode()
     assert len(manager.list_backups()) == 2
+
+
+def test_memory_backup_create_reports_retention_failure_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    backups = tmp_path / "backups"
+    _seed_memory(memory_dir, suffix="committed")
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backups)
+
+    def fail_prune(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected retention prune failure")
+
+    monkeypatch.setattr(manager, "_prune_locked", fail_prune)
+
+    created = manager.create(retain=1)
+
+    assert (backups / str(created["backup_id"]) / "manifest.json").is_file()
+    assert manager.validate(str(created["backup_id"]))["ok"] is True
+    assert created["maintenance_warnings"] == [
+        {
+            "code": "retention_prune_failed",
+            "error_type": "OSError",
+            "message": "injected retention prune failure",
+        }
+    ]
+
+
+def test_memory_restore_reports_retention_failure_after_live_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    backups = tmp_path / "backups"
+    _seed_memory(memory_dir, suffix="backup")
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backups)
+    manifest = manager.create(retain=4)
+    _seed_memory(memory_dir, suffix="live")
+
+    def fail_prune(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected retention prune failure")
+
+    monkeypatch.setattr(manager, "_prune_locked", fail_prune)
+
+    restored = manager.restore(str(manifest["backup_id"]), retain=4)
+
+    assert restored["maintenance_warnings"][0]["code"] == "retention_prune_failed"
+    assert restored["maintenance_warnings"][0]["error_type"] == "OSError"
+    assert restored["maintenance_warnings"][0]["message"] == ("injected retention prune failure")
+    assert (backups / str(restored["safety_backup_id"]) / "manifest.json").is_file()
+    for spec in DEFAULT_LAYER_SPECS.values():
+        assert (memory_dir / spec.mv2_file).read_bytes() == (f"{spec.layer.value}:backup".encode())
 
 
 def test_memory_backup_restores_when_live_memory_is_missing(tmp_path: Path) -> None:
@@ -277,6 +353,44 @@ def test_memory_backup_rejects_hard_linked_backup_payload(tmp_path: Path) -> Non
     assert any(error.startswith("hardlink:") for error in validation["errors"])
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX link and mode safety contract")
+@pytest.mark.parametrize("lock_kind", ("memory", "backup"))
+@pytest.mark.parametrize("alias_kind", ("symlink", "hardlink"))
+def test_memory_backup_rejects_lock_aliases_without_mutating_target(
+    tmp_path: Path,
+    lock_kind: str,
+    alias_kind: str,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    backup_root = tmp_path / "backups"
+    memory_dir.mkdir()
+    backup_root.mkdir()
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backup_root)
+    lock_path = (
+        memory_dir.parent / f".{memory_dir.name}.kestrel-memory.lock"
+        if lock_kind == "memory"
+        else manager.lock_path
+    )
+    victim = tmp_path / f"{lock_kind}-{alias_kind}-victim.txt"
+    victim_bytes = b"do not mutate this target\n"
+    victim.write_bytes(victim_bytes)
+    victim.chmod(0o644)
+    if alias_kind == "symlink":
+        lock_path.symlink_to(victim)
+    else:
+        os.link(victim, lock_path)
+
+    with pytest.raises(MemoryBackupError, match="lock"):
+        manager.validate("missing-backup")
+
+    assert victim.read_bytes() == victim_bytes
+    assert victim.stat().st_mode & 0o777 == 0o644
+    if alias_kind == "symlink":
+        assert lock_path.is_symlink()
+    else:
+        assert os.path.samestat(victim.stat(), lock_path.stat())
+
+
 def test_failed_directory_swap_restores_the_entire_previous_memory_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -302,9 +416,84 @@ def test_failed_directory_swap_restores_the_entire_previous_memory_set(
         manager.restore(manifest["backup_id"])
 
     for spec in DEFAULT_LAYER_SPECS.values():
-        assert (memory_dir / spec.mv2_file).read_bytes() == f"{spec.layer.value}:live-before-failure".encode()
+        assert (
+            memory_dir / spec.mv2_file
+        ).read_bytes() == f"{spec.layer.value}:live-before-failure".encode()
     assert not list(tmp_path.glob(".memory.restore-*"))
     assert not list(tmp_path.glob(".memory.rollback-*"))
+
+
+def test_interrupted_directory_swap_restores_the_entire_previous_memory_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    backups = tmp_path / "backups"
+    _seed_memory(memory_dir, suffix="backup")
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backups)
+    manifest = manager.create()
+    _seed_memory(memory_dir, suffix="live-before-interrupt")
+    real_replace = memory_backup_module.os.replace
+
+    def interrupt_staged_swap(source: Path | str, target: Path | str) -> None:
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path.name.startswith(".memory.restore-") and target_path == memory_dir:
+            raise KeyboardInterrupt("injected staged swap interrupt")
+        real_replace(source, target)
+
+    monkeypatch.setattr(memory_backup_module.os, "replace", interrupt_staged_swap)
+
+    with pytest.raises(KeyboardInterrupt, match="injected staged swap interrupt"):
+        manager.restore(str(manifest["backup_id"]))
+
+    for spec in DEFAULT_LAYER_SPECS.values():
+        assert (memory_dir / spec.mv2_file).read_bytes() == (
+            f"{spec.layer.value}:live-before-interrupt".encode()
+        )
+    assert not list(tmp_path.glob(".memory.restore-*"))
+    assert not list(tmp_path.glob(".memory.rollback-*"))
+
+
+def test_failed_memory_rollback_preserves_the_only_intact_original_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    backups = tmp_path / "backups"
+    _seed_memory(memory_dir, suffix="backup")
+    manager = MemoryBackupManager(memory_dir=memory_dir, backup_root=backups)
+    manifest = manager.create()
+    _seed_memory(memory_dir, suffix="live-before-failure")
+    real_replace = memory_backup_module.os.replace
+
+    def fail_install_and_rollback(source: Path | str, target: Path | str) -> None:
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path.name.startswith(".memory.restore-") and target_path == memory_dir:
+            raise OSError("injected staged swap failure")
+        if source_path.name.startswith(".memory.rollback-") and target_path == memory_dir:
+            raise OSError("injected rollback failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(memory_backup_module.os, "replace", fail_install_and_rollback)
+
+    with pytest.raises(MemoryBackupError) as exc_info:
+        manager.restore(str(manifest["backup_id"]))
+
+    message = str(exc_info.value)
+    assert "injected staged swap failure" in message
+    assert "injected rollback failure" in message
+    assert "preserved_recovery_paths=" in message
+    rollback_paths = list(tmp_path.glob(".memory.rollback-*"))
+    assert len(rollback_paths) == 1
+    rollback_dir = rollback_paths[0]
+    for spec in DEFAULT_LAYER_SPECS.values():
+        assert (rollback_dir / spec.mv2_file).read_bytes() == (
+            f"{spec.layer.value}:live-before-failure".encode()
+        )
+    assert not memory_dir.exists()
+    assert not list(tmp_path.glob(".memory.restore-*"))
 
 
 def test_failed_post_swap_fsync_removes_new_memory_when_no_live_set_existed(

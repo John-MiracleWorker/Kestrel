@@ -6,14 +6,15 @@ MYPY ?= $(PYTHON) -m mypy
 NEST_AGENT_ARGS ?=
 PORT ?= 8765
 DOCKER_IMAGE ?= kestrel-agent:local
+VALIDATION_IMAGE ?= python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3
 
-.PHONY: install install-dev install-memvid test lint typecheck compile golden validate bootstrap doctor chat-smoke server docker-build docker-doctor clean
+.PHONY: install install-dev install-memvid test lint typecheck compile golden learning-gate validate bootstrap doctor chat-smoke server release-build docker-build docker-doctor clean
 
 install:
 	$(PIP) install -e '.[dev]'
 
 install-dev:
-	$(PIP) install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
+	$(PIP) install -e '.[memvid,openai,anthropic,gemini,server,mcp,keyring,dev]'
 
 install-memvid:
 	$(PIP) install -e '.[dev,memvid]'
@@ -40,18 +41,32 @@ chat-smoke:
 	$(NEST_AGENT) chat --backend memory --provider mock --message "hello from packaging smoke"
 
 golden:
-	$(PYTHON) scripts/run_golden_evals.py --backend memory --provider mock
+	docker image inspect "$(VALIDATION_IMAGE)" >/dev/null 2>&1 || docker pull "$(VALIDATION_IMAGE)"
+	NEST_AGENT_VALIDATION_CONTAINER_IMAGE="$(VALIDATION_IMAGE)" $(PYTHON) scripts/run_golden_evals.py --backend memory --provider mock
 
-validate: compile lint typecheck test golden
+learning-gate:
+	$(RUFF) check benchmarks/real_agent_learning_benchmark.py tests/test_real_agent_learning_benchmark.py
+	MYPYPATH=src $(MYPY) --strict benchmarks/real_agent_learning_benchmark.py
+	$(PYTHON) benchmarks/real_agent_learning_benchmark.py --output benchmark_results/agent_learning_gate.json
+
+validate: compile lint typecheck test golden learning-gate
 
 server:
 	$(NEST_AGENT) server $(NEST_AGENT_ARGS) --host 127.0.0.1 --port $(PORT)
+
+release-build:
+	npm ci --prefix web
+	npm run licenses:check --prefix web
+	npm run build --prefix web
+	$(PYTHON) scripts/stage_web_release.py
+	rm -rf dist
+	$(PYTHON) -m build --outdir dist
 
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
 docker-doctor:
-	docker run --rm $(DOCKER_IMAGE) nest-agent doctor --backend memory --memory-dir /tmp/kestrel-memory --provider mock --model mock
+	docker run --rm $(DOCKER_IMAGE) nest-agent doctor --backend memvid --memory-dir /data/memory --provider mock --model mock
 
 clean:
 	rm -rf .pytest_cache .ruff_cache .mypy_cache build dist *.egg-info

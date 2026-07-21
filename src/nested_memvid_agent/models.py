@@ -115,6 +115,7 @@ class RetrievalQuery:
     min_relevancy: float = 0.0
     objective: str | None = None
     include_inactive: bool = False
+    include_retrieval_artifacts: bool = False
 
     def __post_init__(self) -> None:
         if not self.query.strip():

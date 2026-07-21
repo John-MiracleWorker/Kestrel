@@ -9,9 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -25,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from nested_memvid_agent.app_factory import build_agent
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.runtime_models import ToolSpec
-from nested_memvid_agent.tools.base import AgentTool
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
 

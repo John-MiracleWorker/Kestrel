@@ -7,11 +7,12 @@ This runbook defines the supported production profile for Kestrel: a single-user
 - Memvid v2 `.mv2` only; one file per nested memory layer.
 - Never call Memvid `create(path)` when that `.mv2` already exists.
 - Runs are admitted through bounded worker capacity, hold fenced leases while executing, and heartbeat until terminal or blocked.
-- Startup never replays interrupted side effects. A fresh lease whose PID-bearing local owner is still alive is preserved; an expired lease or a lease owned by a dead local process is reconciled to `failed` with `interrupted_by_restart`. Pending approvals remain `blocked`.
+- Startup never replays interrupted side effects. A fresh run or approval-execution lease whose PID-bearing local owner is still alive is preserved. An expired/dead approval claimant is recorded as `approval_execution_outcome_unknown`; an expired run lease or one owned by a dead local process is reconciled to `failed`. Pending approvals remain `blocked`.
 - Subagent workers record their local manager owner; startup preserves live-owner workers and terminally reconciles dead-owner workers and their task nodes.
 - Terminal run states are immutable and cancellation emits one durable cancellation event.
 - Runtime settings are versioned, checksummed, source-attributed, and snapshotted into every run.
-- Schema v15 capability overrides are revisioned, and every mutation appends a capability change row.
+- Schema v18 retains revisioned proactive routines and adds renewable, claimant-only approval execution plus exact scheduler continuation bindings. Schema v17 introduced deterministic leased routine occurrences and atomic internal run admission.
+- Proactive routine polling is disabled by default; when enabled, definitions still start disabled, API owner mutations require authentication, and tick/lease/capacity bounds remain finite.
 - High-risk tools require an effective capability decision and every applicable master flag, and still require owner-bound, single-use exact-call approval. Pending approvals expire after 15 minutes by default (`NEST_AGENT_APPROVAL_TTL_SECONDS`).
 - The API must use authentication when bound beyond loopback.
 
@@ -21,10 +22,11 @@ This runbook defines the supported production profile for Kestrel: a single-user
 |---|---|
 | `GET /api/health/live` | Process is serving HTTP. Never use for traffic admission. |
 | `GET /api/health/ready` | SQLite is writable and on the supported schema, no orphaned running run exists, capacity and Memvid are healthy, required pollers are healthy, and the active provider has been operationally verified. |
-| `GET /api/metrics` | Run counts/capacity, provider state, memory utilization, Telegram poller health, and alert conditions. |
-| `GET /metrics` | Prometheus exposition for process, run, worker, provider, capacity, memory, and poller metrics. |
+| `GET /api/metrics` | Run counts/capacity, provider state, memory utilization, Telegram poller health, proactive-routine loop health and tick age, and alert conditions. |
+| `GET /metrics` | Prometheus exposition for process, run, worker, provider, capacity, memory, poller, and proactive-routine loop metrics. |
 | `POST /api/runtime/provider/probe` | Explicitly execute the configured provider health probe; protected by normal mutation auth and rate limits. |
-| `GET /api/diagnostics` | Redacted metrics, startup recovery report, and bounded recent event log. |
+| `GET /api/routines/status` | Report whether proactive polling is launch-enabled plus bounded loop tick/error state. |
+| `GET /api/diagnostics` | Redacted metrics, startup recovery report, and a reverse-read recent event tail bounded to 500 lines and 1 MiB. |
 
 Every HTTP response carries `X-Request-ID`. A valid inbound `X-Request-ID` is preserved; otherwise Kestrel generates one. Run traces use the durable `run_id` as their correlation key.
 
@@ -48,12 +50,17 @@ Turning on is asymmetric: it does not rewrite an active run's snapshotted launch
 
 The history actor is `owner` in the supported single-owner profile. Hosted/team operation still requires distinct administrator identities, RBAC for switches and approvals, hardened authenticated sessions, workspace/tenant isolation, and actor-attributed audit export.
 
+## Runtime settings operations
+
+`GET /api/runtime/config` includes the current non-secret persisted-settings snapshot and its content revision. Send that exact revision as `expected_revision` with `PUT /api/runtime/settings`. On HTTP 409, reload and reconsider the entire change; do not replay a stale form over a newer tool-permission decision. Kestrel validates candidate workspace and memory paths before persistence, then atomically applies persistence, live activation, and approval revocation. A failed activation restores both the prior file and live configuration. The owner-only settings file and lock reject symlink, hard-link, non-regular, and foreign-owner aliases before mutation. `require_api_auth` is a launch flag, not a persisted setting.
+
 ## Alert meanings
 
 - `provider_degraded`: inspect `/api/runtime/config` operational provider state. Authentication and invalid-request failures require operator correction; retryable failures open the circuit and can use configured fallback.
 - `run_queue_saturated`: capacity is exhausted. Do not increase limits until CPU, memory, provider quota, and tool subprocess limits are understood.
 - `failed_runs_present`: inspect recent run traces; this is informational unless the count/rate rises.
 - `telegram_poller_unhealthy`: the poller heartbeat is corrupt, stale for more than 90 seconds, or reports an error. Inspect the bounded poller log and launchd status.
+- `proactive_routine_loop_unhealthy`: polling is enabled but the loop is absent or stopped, its latest tick failed, or its active tick exceeded the stale bound. Inspect `/api/routines/status` and `/api/diagnostics`; disable proactive polling or repair the state, provider, or capacity issue before restart.
 - `memory_capacity_high`: at least one layer reached 90% of `NEST_AGENT_MEMORY_MAX_LAYER_BYTES`. Back up, verify, compact working/episodic layers, then reassess capacity.
 
 ## Suggested SLOs
@@ -71,7 +78,9 @@ For a local single-node deployment:
 
 Use the hardened launch scripts or launchd unit. They isolate inherited `PYTHONPATH`, `NODE_ENV`, `NEST_AGENT_*`, `NESTED_MEMVID_*`, `KESTREL_*`, provider, and Telegram variables, select the project virtualenv, and bound logs.
 
-Before planned shutdown, stop accepting new work and wait until `/api/metrics` reports `active=0` and `queued=0`. Pending approvals may remain blocked.
+Before planned shutdown, stop accepting new work and wait until `/api/metrics` reports `active=0` and `queued=0`. Pending approvals may remain blocked until their configured expiry; routine ticks expire overdue approvals even when no UI is polling and reconcile their occurrences terminally. The FastAPI lifespan stops and joins the proactive-routine loop first, then closes RunManager admission and cancels/joins every owned primary or subagent worker within a bound. Thread start and shutdown admission share the same lifecycle lock, and queued work is never promoted after shutdown begins. Channel and MCP cleanup is always attempted afterward; if either bounded join or dependency cleanup is incomplete, shutdown reports `runtime_shutdown_incomplete` instead of silently claiming a clean stop.
+
+Startup recovery reconstructs a missing initial task graph for an atomically admitted queued routine run before resuming it. The graph itself is persisted all-or-none, so a crash cannot leave a partially initialized run. Scheduler task claims, subagent insertion, worker heartbeats, pending-approval repair, and terminal pair transitions are fenced by the active run owner and generation. A fresh approval-execution claim defers recovery even if an observed parent-run lease looks stale. Dead/expired claims and stale result-bound continuations fail closed; the operator must inspect the external system before choosing any manual retry because the side-effect outcome may be unknown. The one-shot `routines tick` CLI performs graph recovery only for internally scoped scheduled runs whose occurrence is still linked and `running`; it does not execute unrelated queued user work.
 
 ```bash
 launchctl bootout "gui/$UID/ai.kestrel.daemon"
@@ -79,39 +88,56 @@ launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/ai.kestrel.daemon.pli
 launchctl kickstart -k "gui/$UID/ai.kestrel.daemon"
 ```
 
-## Memory backup and restore
+## Agent backup and restore
 
-Stop Kestrel before backup/restore. The CLI and Memvid backend also share an OS-level lock outside the memory directory, so a backup or restore fails closed while any layer is open; the service stop remains the supported operational procedure.
+Stop Kestrel before backup/restore. Full-agent backup and restore acquire the same
+primary-runtime ownership lock as the server before inspecting live state, and
+hold it through verification, replacement, rollback, and cleanup. The memory-only
+CLI path does the same when given the matching `--state-path`. Both paths also
+share an OS-level Memvid lock outside the memory directory, so they fail closed
+if either the primary runtime or any layer is still open; a clean service stop
+remains the supported operational procedure. Use the coherent agent snapshot for
+normal recovery so memory, SQLite control-plane state, run capsules, settings,
+skills, and plugins stay at the same point in time.
 
 ```bash
-.venv/bin/nest-agent memory backup \
+.venv/bin/nest-agent backup create \
   --backend memvid \
   --memory-dir .nest/memory \
   --state-path .nest/state/agent.db \
-  --backup-dir .nest/backups/memory \
+  --backup-dir .nest/backups/agent \
   --retain 7
 
-.venv/bin/nest-agent memory backup-list \
+.venv/bin/nest-agent backup list \
   --memory-dir .nest/memory \
-  --backup-dir .nest/backups/memory
+  --state-path .nest/state/agent.db \
+  --backup-dir .nest/backups/agent
 
-.venv/bin/nest-agent memory backup-verify BACKUP_ID \
+.venv/bin/nest-agent backup verify BACKUP_ID \
   --memory-dir .nest/memory \
-  --backup-dir .nest/backups/memory
+  --state-path .nest/state/agent.db \
+  --backup-dir .nest/backups/agent
 ```
 
-Restore is fail-closed, requires `--yes`, rejects traversal, absolute paths, symlinks, hardlinks, duplicate targets, and checksum mismatches, creates a pre-restore safety backup, stages a complete owner-only memory directory, swaps the closed directory, then reopens and deeply verifies all six layers. A failed in-process swap restores the prior directory.
+Restore is fail-closed, requires `--yes`, rejects traversal, absolute paths, symlinks, hardlinks, duplicate or unlisted targets, checksum mismatches, and invalid SQLite state. It creates a pre-restore safety snapshot, stages and verifies the components, then applies the complete snapshot. If a later component swap fails, Kestrel attempts to roll back every changed component. If rollback itself fails, the command reports the safety-backup ID and preserves any unreinstated rollback artifacts for operator recovery instead of deleting them. Optional components absent from the snapshot are removed so the restored agent identity is exact. A backed-up external layer configuration is installed at `.nest/config/layers.json` by default; pass `--layer-config` only to choose another target. The target may be absent on a clean host. If the snapshot instead stored `layers.json` inside the memory directory, a default clean-host restore also materializes that checksummed configuration at the external target so custom `.mv2` filenames remain usable.
+
+If a completed create or restore returns `maintenance_warnings` with
+`retention_prune_failed`, the data transaction is committed; only post-commit removal of older
+snapshots failed. Verify the selected/safety backups and resolve retention separately rather than
+rerunning the restore as though it had failed.
 
 ```bash
-.venv/bin/nest-agent memory restore BACKUP_ID \
+.venv/bin/nest-agent backup restore BACKUP_ID \
   --yes \
   --backend memvid \
   --memory-dir .nest/memory \
   --state-path .nest/state/agent.db \
-  --backup-dir .nest/backups/memory
+  --backup-dir .nest/backups/agent
 ```
 
-Backups and manifests are owner-only. A checksum-valid backup is necessary but not sufficient; perform a quarterly restore into an isolated directory and run search/inspect probes.
+Raw Secret Broker values, operational logs, and disposable worker worktrees are deliberately excluded. Preserve secrets through an independently encrypted or keychain-backed recovery process. Full-agent backups preserve the current `.nest/repair_receipt_signing.v2.key`, schema-v2 repair validation/review artifacts, and the memory validation key. Each new isolated validation rotates the repair key and intentionally invalidates older review gates. Schema-v1 receipts and `.nest/repair_receipt_signing.key` are never accepted as commit authorization. Restoring a legacy full-agent backup that predates repair-integrity components explicitly removes any live repair signing key and receipt directories; policy evidence therefore fails closed until it is validated and approved again. `nest-agent memory backup` includes `<memory_dir>/.validation-integrity.key`, but deliberately excludes workspace repair receipts and their signing key; policy records that depend on that omitted evidence fail closed after a memory-only migration and must be validated and approved again. Memory-only backups also do not restore run history, ledgers, capsules, settings, skills, or plugins.
+
+Backups and manifests are owner-only. A checksum-valid backup is necessary but not sufficient; perform a quarterly restore into an isolated runtime root and run state, search, inspect, skill, and plugin probes.
 
 ## Upgrade and rollback
 
@@ -148,7 +174,7 @@ Expected outcome: failures are classified; retryable failures count toward the c
 
 ### Queue saturation
 
-Expected outcome: up to `max_concurrent_runs` execute, up to `max_queued_runs` wait FIFO, and further admissions return HTTP 429 without creating a durable run.
+Expected outcome: with the in-memory backend, up to `max_concurrent_runs` execute; with Memvid, one run executes because the six `.mv2` writers are exclusive for an agent lifecycle. In both cases, up to `max_queued_runs` wait FIFO, and further admissions return HTTP 429 without creating a durable run. The capacity endpoint reports the effective active limit.
 
 ### Corrupt backup
 
@@ -167,10 +193,15 @@ Run against an isolated mock-provider deployment first:
   --base-url http://127.0.0.1:8765 \
   --runs 100 \
   --concurrency 4 \
-  --timeout 120
+  --timeout 120 \
+  --max-p95 10 \
+  --min-throughput 1 \
+  --response-contract mock-echo
 ```
 
-The command exits nonzero for any unexpected failed, blocked, cancelled, or timed-out run and reports min/median/p95/max latency. A saturation drill may add `--allow-overload --min-completed 1 --max-p95 10`; HTTP 429/503 admissions then count as expected overload rather than failures, while the command still requires the declared number of completions and zero unexpected failures. For real providers, reduce concurrency to quota-safe levels and use a non-sensitive prompt.
+The mock-only response contract requires the exact deterministic echo for each submitted probe, including its request index; it cannot pass on a canned or cross-request response. Real-provider quality runs omit that flag and use the default `exact-ok` contract. The command also requires readiness and all six named memory layers to verify before and after load, exact one-to-one accounting of probe indexes and accepted run IDs, and one `capsule.completed` trace event (with no `capsule.failed` event) for every accepted completion. It exits nonzero for any unexpected failed, blocked, cancelled, timed-out, rate-limited, unavailable, or capsule-unverified run and reports min/median/p95/max latency plus accepted-completion throughput.
+
+A queue-saturation drill must use an explicit saturation gate, for example `--require-overload --min-completed 4 --max-overload-ratio 0.90 --max-p95 10 --min-throughput 0.5`. `--require-overload` implies overload is allowed but also fails unless at least one capacity rejection is observed. The JSON keeps load and saturation acceptance separate, so `--allow-overload` alone is only a tolerant load test and is never evidence that saturation occurred. Only a structured HTTP 429 with `detail=run_capacity_exhausted` counts as expected overload; rate-limit 429s and every 503 remain failures. Raise the isolated deployment's API rate-limit ceiling above the request count and use concurrency greater than `max_concurrent_runs + max_queued_runs`, or deliberately lower the isolated queue limit, so the drill measures admission capacity rather than rate limiting. The default maximum overload ratio is `0.90`, which prevents a nominal saturation pass where nearly every request is rejected. For real providers, reduce concurrency to quota-safe levels, choose an environment-specific throughput floor, and use a non-sensitive prompt.
 
 Before promotion, include the capability control-plane suites in the exact-candidate validation:
 
@@ -197,9 +228,11 @@ A release candidate is acceptable only when all of the following are green on th
 4. `python -m compileall -q src tests scripts`
 5. Golden evaluations with mock provider.
 6. Frontend tests, audit, and production build.
-7. Wheel/sdist build, `twine check` equivalent metadata validation, isolated wheel install, packaged React asset smoke.
-8. Linux/macOS/Windows and supported Python CI matrix.
+7. Wheel/sdist build, `twine check --strict`, separate clean wheel and sdist installs against the hash-locked release dependency set, and packaged React/license asset smoke in both environments.
+8. The exact wheel on Linux x86_64, macOS arm64 and x86_64, and native Windows x86_64 for Python 3.11 through 3.13, with runner architecture asserted, plus a successful exact-SHA `main` CI push run before release publication.
 9. Chaos recovery test and bounded soak.
 10. Memvid integration tests under `RUN_MEMVID_INTEGRATION=1` in a credential-safe environment.
 11. Independent security/spec/code review of the exact diff.
 12. Deliberate tag/release action; never publish from an unreviewed dirty tree.
+13. Zero open GitHub secret alerts and a clean current-source candidate scan; any historical credential incident has confirmed provider revocation/rotation and documentation.
+14. One independent human approval, an approval-protected `pypi` environment and exact pending Trusted Publisher, repository immutable releases enabled before tagging, and a public GHCR package that passes anonymous pull after first publication.

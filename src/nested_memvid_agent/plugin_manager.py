@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shutil
 import subprocess  # nosec B404
 import tempfile
 from dataclasses import dataclass
@@ -12,7 +11,27 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .extension_transaction import (
+    DirectoryRemoval,
+    DirectorySwap,
+    ExtensionCleanupIncompleteError,
+    ExtensionTransactionError,
+    copy_regular_tree,
+    create_sibling_stage,
+    ensure_real_directory,
+    extension_lock,
+    fsync_tree,
+    path_exists,
+    read_regular_file,
+    read_regular_text,
+    remove_tree_verified,
+    write_regular_file,
+)
 from .models import EvidenceRef, MemoryKind, MemoryLayer, MemoryRecord
+from .repair_integrity import (
+    hardened_readonly_git_command,
+    hardened_readonly_git_environment,
+)
 from .skill_validation import validate_skill_manifest
 from .state_store import AgentStateStore
 
@@ -92,15 +111,41 @@ class GitPluginFetcher:
 
     def fetch(self, source: GitHubPluginSource, destination: Path, ref: str | None = None) -> str:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        command = ["git", "clone", "--depth", "1"]
-        if ref and not _looks_like_sha(ref):
-            command.extend(["--branch", ref])
-        command.extend([source.clone_url, str(destination)])
-        _run_git(command)
-        if ref and _looks_like_sha(ref):
-            _run_git(["git", "-C", str(destination), "fetch", "--depth", "1", "origin", ref])
-            _run_git(["git", "-C", str(destination), "checkout", "--detach", ref])
-        return _run_git(["git", "-C", str(destination), "rev-parse", "HEAD"]).strip()
+        with tempfile.TemporaryDirectory(prefix="kestrel-git-fetch-") as git_cwd_name:
+            git_cwd = Path(git_cwd_name)
+            command = [
+                "git",
+                "clone",
+                f"--template={git_cwd}",
+                "--depth",
+                "1",
+            ]
+            if ref and not _looks_like_sha(ref):
+                command.extend(["--branch", ref])
+            command.extend([source.clone_url, str(destination)])
+            _run_git(command, workspace=git_cwd)
+            if ref and _looks_like_sha(ref):
+                _run_git(
+                    [
+                        "git",
+                        "-C",
+                        str(destination),
+                        "fetch",
+                        "--depth",
+                        "1",
+                        "origin",
+                        ref,
+                    ],
+                    workspace=destination,
+                )
+                _run_git(
+                    ["git", "-C", str(destination), "checkout", "--detach", ref],
+                    workspace=destination,
+                )
+            return _run_git(
+                ["git", "-C", str(destination), "rev-parse", "HEAD"],
+                workspace=destination,
+            ).strip()
 
 
 class PluginManager:
@@ -152,51 +197,113 @@ class PluginManager:
     ) -> dict[str, Any]:
         parsed_source = parse_github_plugin_source(source)
         normalized_ref = _normalize_ref(ref)
-        tmp_parent = self.root / ".tmp"
-        tmp_parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="plugin-", dir=tmp_parent) as tmp_name:
-            repo_path = Path(tmp_name) / "repo"
-            commit_sha = self.fetcher.fetch(parsed_source, repo_path, normalized_ref)
-            initial_manifest = load_plugin_manifest(repo_path)
-            if expected_plugin_id is not None and initial_manifest.id != expected_plugin_id:
-                raise PluginError(f"Plugin manifest id changed during update: expected {expected_plugin_id}, got {initial_manifest.id}")
-            risk_report = _risk_report(
-                initial_manifest,
-                source=parsed_source.display_url,
-                commit_sha=commit_sha,
-                source_dir=repo_path,
-            )
-            _ensure_plugin_enable_allowed(initial_manifest, risk_report, enable=enable)
-            plugin_dir = _safe_plugin_dir(self.root, initial_manifest.id)
-            if plugin_dir.exists() and not overwrite:
-                raise FileExistsError(f"Plugin already installed: {initial_manifest.id}")
-            if plugin_dir.exists():
-                shutil.rmtree(plugin_dir)
-            plugin_dir.mkdir(parents=True, exist_ok=True)
-            source_dir = plugin_dir / PLUGIN_SOURCE_DIR
-            shutil.move(str(repo_path), str(source_dir))
+        with extension_lock(self.root, ".plugin-manager.lock"):
+            stage = create_sibling_stage(self.root, prefix="plugin")
+            try:
+                staged_source = stage / PLUGIN_SOURCE_DIR
+                commit_sha = self.fetcher.fetch(
+                    parsed_source,
+                    staged_source,
+                    normalized_ref,
+                )
+                initial_manifest = load_plugin_manifest(staged_source)
+                if (
+                    expected_plugin_id is not None
+                    and initial_manifest.id != expected_plugin_id
+                ):
+                    raise PluginError(
+                        "Plugin manifest id changed during update: "
+                        f"expected {expected_plugin_id}, got {initial_manifest.id}"
+                    )
+                plugin_dir = _safe_plugin_dir(self.root, initial_manifest.id)
+                if path_exists(plugin_dir) and not overwrite:
+                    raise FileExistsError(f"Plugin already installed: {initial_manifest.id}")
+                risk_report = _risk_report(
+                    initial_manifest,
+                    source=parsed_source.display_url,
+                    commit_sha=commit_sha,
+                    source_dir=staged_source,
+                )
+                _ensure_plugin_enable_allowed(
+                    initial_manifest,
+                    risk_report,
+                    enable=enable,
+                )
+                row = _plugin_state_row(
+                    initial_manifest,
+                    source=parsed_source.display_url,
+                    ref=normalized_ref,
+                    commit_sha=commit_sha,
+                    plugin_dir=plugin_dir,
+                    risk_report=risk_report,
+                    enabled=enable,
+                )
+                self._desired_extension_rows(
+                    row,
+                    tree_root=stage,
+                    materialize_skills=True,
+                    refresh_launch_vetting=False,
+                )
 
-        manifest = load_plugin_manifest(source_dir)
-        risk_report = _risk_report(manifest, source=parsed_source.display_url, commit_sha=commit_sha, source_dir=source_dir)
-        row = self.state.upsert_plugin(
-            {
-                "id": manifest.id,
-                "name": manifest.name,
-                "description": manifest.description,
-                "source_url": parsed_source.display_url,
-                "source_ref": normalized_ref,
-                "commit_sha": commit_sha,
-                "install_path": str(plugin_dir),
-                "manifest": manifest.to_state_payload(),
-                "capabilities": _capabilities(manifest),
-                "enabled": enable,
-                "risk_report": risk_report,
-                "install_status": "installed",
-                "format": manifest.format,
-            }
-        )
-        self.sync_plugin(row["id"])
-        return self.state.get_plugin(row["id"])
+                # Re-read every manifest-derived field only after the complete
+                # candidate tree exists. A changed or unreadable source never
+                # reaches the live path.
+                staged_manifest = load_plugin_manifest(staged_source)
+                if staged_manifest.to_state_payload() != initial_manifest.to_state_payload():
+                    raise PluginError("Plugin manifest changed during staged validation.")
+                staged_risk_report = _risk_report(
+                    staged_manifest,
+                    source=parsed_source.display_url,
+                    commit_sha=commit_sha,
+                    source_dir=staged_source,
+                )
+                if staged_risk_report != risk_report:
+                    raise PluginError("Plugin source changed during staged validation.")
+                fsync_tree(stage)
+
+                swap = DirectorySwap(live=plugin_dir, stage=stage)
+                quiesce = self.state.quiesce_plugin_bundle(initial_manifest.id)
+                state_committed = False
+                try:
+                    swap.publish()
+                    try:
+                        published_manifest = load_plugin_manifest(
+                            plugin_dir / PLUGIN_SOURCE_DIR
+                        )
+                        if (
+                            published_manifest.to_state_payload()
+                            != staged_manifest.to_state_payload()
+                        ):
+                            raise PluginError("Published plugin manifest failed validation.")
+                        skills, mcp_servers = self._desired_extension_rows(
+                            row,
+                            tree_root=plugin_dir,
+                            materialize_skills=False,
+                            refresh_launch_vetting=True,
+                        )
+                        installed = self.state.replace_plugin_bundle(
+                            row,
+                            skills=skills,
+                            mcp_servers=mcp_servers,
+                        )
+                        state_committed = True
+                    except BaseException:
+                        swap.restore()
+                        raise
+                    swap.finalize()
+                except BaseException:
+                    if (
+                        not state_committed
+                        and quiesce is not None
+                        and not swap.displaced
+                        and not swap.published
+                    ):
+                        self._restore_quiesce(quiesce)
+                    raise
+                return installed
+            finally:
+                if path_exists(stage):
+                    remove_tree_verified(stage)
 
     def update(self, plugin_id: str, *, ref: str | None = None) -> dict[str, Any]:
         current = self.state.get_plugin(plugin_id)
@@ -215,28 +322,93 @@ class PluginManager:
         return self.state.get_plugin(plugin_id)
 
     def set_enabled(self, plugin_id: str, enabled: bool) -> dict[str, Any]:
-        row = self.state.get_plugin(plugin_id)
-        if enabled:
+        with extension_lock(self.root, ".plugin-manager.lock"):
+            row = self.state.get_plugin(plugin_id)
+            desired = dict(row)
+            desired["enabled"] = enabled
+            if not enabled:
+                prefix = f"{PLUGIN_NAMESPACE}.{plugin_id}."
+                skills = [
+                    {**skill, "enabled": False}
+                    for skill in self.state.list_skills()
+                    if str(skill["id"]).startswith(prefix)
+                ]
+                mcp_servers = [
+                    {**server, "enabled": False}
+                    for server in self.state.list_mcp_servers()
+                    if str(server["id"]).startswith(prefix)
+                ]
+                return self.state.replace_plugin_bundle(
+                    desired,
+                    skills=skills,
+                    mcp_servers=mcp_servers,
+                )
+
             _ensure_plugin_enable_allowed_from_row(row)
-        self.state.set_plugin_enabled(plugin_id, enabled)
-        self.sync_plugin(plugin_id)
-        return self.state.get_plugin(plugin_id)
+            plugin_dir = _installed_plugin_dir(self.root, row)
+            self._validate_installed_source(row, plugin_dir)
+            skills, mcp_servers = self._desired_extension_rows(
+                desired,
+                tree_root=plugin_dir,
+                materialize_skills=False,
+                refresh_launch_vetting=True,
+            )
+            return self.state.replace_plugin_bundle(
+                desired,
+                skills=skills,
+                mcp_servers=mcp_servers,
+            )
 
     def remove(self, plugin_id: str) -> dict[str, Any]:
-        row = self.state.get_plugin(plugin_id)
-        self._delete_extension_rows(plugin_id)
-        install_path = Path(str(row["install_path"]))
-        if install_path.exists():
-            shutil.rmtree(install_path)
-        self.state.delete_plugin(plugin_id)
-        return {"removed": True, "plugin_id": plugin_id}
+        with extension_lock(self.root, ".plugin-manager.lock"):
+            row = self.state.get_plugin(plugin_id)
+            install_path = _installed_plugin_dir(self.root, row)
+            removal = DirectoryRemoval(install_path)
+            quiesce = self.state.quiesce_plugin_bundle(plugin_id)
+            state_committed = False
+            try:
+                removal.hide()
+                try:
+                    self.state.delete_plugin_bundle(plugin_id)
+                    state_committed = True
+                except BaseException:
+                    removal.restore()
+                    raise
+                removal.finalize()
+            except BaseException:
+                if (
+                    not state_committed
+                    and quiesce is not None
+                    and not removal.displaced
+                ):
+                    self._restore_quiesce(quiesce)
+                raise
+            return {"removed": True, "plugin_id": plugin_id}
 
     def sync_all(self) -> None:
         for row in self.state.list_plugins():
-            self._sync_plugin_row(row)
+            self.sync_plugin(str(row["id"]))
 
     def sync_plugin(self, plugin_id: str) -> None:
-        self._sync_plugin_row(self.state.get_plugin(plugin_id))
+        with extension_lock(self.root, ".plugin-manager.lock"):
+            row = self.state.get_plugin(plugin_id)
+            plugin_dir = _installed_plugin_dir(self.root, row)
+            self._validate_installed_source(
+                row,
+                plugin_dir,
+                require_source_digest=False,
+            )
+            try:
+                skills, mcp_servers = self._desired_extension_rows(
+                    row,
+                    tree_root=plugin_dir,
+                    materialize_skills=False,
+                    refresh_launch_vetting=True,
+                )
+            except (ExtensionTransactionError, OSError, PluginError):
+                self._rebuild_generated_extensions(row, plugin_dir)
+                return
+            self.state.replace_plugin_bundle(row, skills=skills, mcp_servers=mcp_servers)
 
     def write_audit_memory(self, memory: Any, *, action: str, plugin: dict[str, Any]) -> str:
         payload = {
@@ -265,19 +437,35 @@ class PluginManager:
         memory.seal_all()
         return str(record_id)
 
-    def _sync_plugin_row(self, row: dict[str, Any]) -> None:
+    def _desired_extension_rows(
+        self,
+        row: dict[str, Any],
+        *,
+        tree_root: Path,
+        materialize_skills: bool,
+        refresh_launch_vetting: bool,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         manifest = dict(row["manifest"])
         enabled = bool(row["enabled"])
-        plugin_id = str(row["id"])
-        skills = [dict(item) for item in manifest.get("skills", []) if isinstance(item, dict)]
-        mcp_servers = [dict(item) for item in manifest.get("mcp_servers", []) if isinstance(item, dict)]
-        desired_skill_ids = {str(item["namespaced_id"]) for item in skills}
-        desired_mcp_ids = {str(item["namespaced_id"]) for item in mcp_servers}
-        self._delete_stale_extension_rows(plugin_id, desired_skill_ids, desired_mcp_ids)
+        skill_definitions = [
+            dict(item) for item in manifest.get("skills", []) if isinstance(item, dict)
+        ]
+        server_definitions = [
+            dict(item)
+            for item in manifest.get("mcp_servers", [])
+            if isinstance(item, dict)
+        ]
+        skill_rows: list[dict[str, Any]] = []
+        server_rows: list[dict[str, Any]] = []
 
-        for skill in skills:
-            skill_manifest, skill_path = self._materialize_skill(row, skill)
-            self.state.upsert_skill(
+        for skill in skill_definitions:
+            skill_manifest, skill_path = self._prepare_skill(
+                row,
+                skill,
+                tree_root=tree_root,
+                materialize=materialize_skills,
+            )
+            skill_rows.append(
                 {
                     "id": skill["namespaced_id"],
                     "name": skill_manifest.get("name", skill["namespaced_id"]),
@@ -288,27 +476,88 @@ class PluginManager:
                 }
             )
 
-        for server in mcp_servers:
+        for server in server_definitions:
             payload = dict(server["config"])
             payload["id"] = server["namespaced_id"]
             payload["name"] = payload.get("name") or f"{row['name']} {server['id']}"
             payload["enabled"] = enabled and bool(payload.get("enabled", True))
             payload.setdefault("risk_policy", "approval_by_default")
             payload.setdefault("tools", [])
-            self.state.upsert_mcp_server(payload)
+            payload = self._materialize_mcp_launch(
+                row,
+                payload,
+                tree_root=tree_root,
+            )
+            if refresh_launch_vetting:
+                from .mcp_manager import refresh_stdio_launch_vetting
 
-    def _materialize_skill(self, row: dict[str, Any], skill: dict[str, Any]) -> tuple[dict[str, Any], Path]:
-        install_path = Path(str(row["install_path"]))
-        skill_path = _safe_child_path(
-            install_path,
+                try:
+                    current_server = self.state.get_mcp_server(str(payload["id"]))
+                except KeyError:
+                    current_server = None
+                payload = refresh_stdio_launch_vetting(
+                    payload,
+                    current_row=current_server,
+                )
+            server_rows.append(payload)
+        return skill_rows, server_rows
+
+    def _materialize_mcp_launch(
+        self,
+        row: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        tree_root: Path,
+    ) -> dict[str, Any]:
+        """Bind plugin script launchers to the installed, reviewed source tree."""
+
+        materialized = dict(payload)
+        vetting = dict(materialized.get("vetting", {}) or {})
+        relative = vetting.get("plugin_artifact_relative_path")
+        if not isinstance(relative, str) or not relative:
+            return materialized
+        staged_source_root = tree_root / PLUGIN_SOURCE_DIR
+        staged_artifact = _safe_child_path(staged_source_root, relative, must_exist=True)
+        read_regular_file(staged_artifact)
+        live_source_root = Path(str(row["install_path"])) / PLUGIN_SOURCE_DIR
+        live_artifact = live_source_root / relative
+        args = [str(item) for item in materialized.get("args", [])]
+        command_name = Path(str(materialized.get("command") or "")).name.lower()
+        index = 1 if command_name == "deno" else 0
+        if len(args) <= index:
+            raise PluginError("Plugin MCP launch artifact argument is missing.")
+        args[index] = str(live_artifact)
+        materialized["args"] = args
+        vetting["plugin_artifact_root"] = str(live_source_root.resolve())
+        materialized["vetting"] = vetting
+        return materialized
+
+    def _prepare_skill(
+        self,
+        row: dict[str, Any],
+        skill: dict[str, Any],
+        *,
+        tree_root: Path,
+        materialize: bool,
+    ) -> tuple[dict[str, Any], Path]:
+        tree_skill_path = _safe_child_path(
+            tree_root,
             f"{PLUGIN_GENERATED_DIR}/skills/{skill['id']}",
             must_exist=False,
         )
-        skill_path.mkdir(parents=True, exist_ok=True)
+        live_skill_path = (
+            Path(str(row["install_path"]))
+            / PLUGIN_GENERATED_DIR
+            / "skills"
+            / str(skill["id"])
+        )
         manifest = dict(skill["manifest"])
         manifest["id"] = skill["namespaced_id"]
         manifest.setdefault("name", skill.get("name") or skill["namespaced_id"])
-        manifest.setdefault("description", skill.get("description") or row.get("description") or "Plugin skill.")
+        manifest.setdefault(
+            "description",
+            skill.get("description") or row.get("description") or "Plugin skill.",
+        )
         manifest.setdefault("risk", row["manifest"].get("risk", DEFAULT_PLUGIN_RISK))
         manifest.setdefault("runtime", {"type": "instruction"})
         manifest.setdefault("capabilities", ["plugin", "skill"])
@@ -319,36 +568,147 @@ class PluginManager:
             "format": row["format"],
         }
         instructions = str(skill["instructions"])
-        (skill_path / "skill.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        (skill_path / "SKILL.md").write_text(instructions, encoding="utf-8")
-        return manifest, skill_path
+        manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+        instruction_bytes = instructions.encode()
+        if materialize:
+            tree_skill_path.mkdir(parents=True, exist_ok=False, mode=0o700)
+            write_regular_file(tree_skill_path / "skill.json", manifest_bytes)
+            write_regular_file(tree_skill_path / "SKILL.md", instruction_bytes)
+        if read_regular_file(tree_skill_path / "skill.json") != manifest_bytes:
+            raise PluginError(f"Materialized plugin skill changed: {skill['id']}")
+        if read_regular_file(tree_skill_path / "SKILL.md") != instruction_bytes:
+            raise PluginError(f"Materialized plugin instructions changed: {skill['id']}")
+        persisted_manifest = json.loads(read_regular_text(tree_skill_path / "skill.json"))
+        validation = validate_skill_manifest(persisted_manifest)
+        if validation["errors"]:
+            raise PluginError(
+                f"Materialized plugin skill is invalid: {skill['id']}: "
+                + ", ".join(validation["errors"])
+            )
+        return manifest, live_skill_path
 
-    def _delete_stale_extension_rows(
+    def _validate_installed_source(
         self,
-        plugin_id: str,
-        desired_skill_ids: set[str],
-        desired_mcp_ids: set[str],
+        row: dict[str, Any],
+        plugin_dir: Path,
+        *,
+        require_source_digest: bool = True,
     ) -> None:
-        prefix = f"{PLUGIN_NAMESPACE}.{plugin_id}."
-        for skill in self.state.list_skills():
-            skill_id = str(skill["id"])
-            if skill_id.startswith(prefix) and skill_id not in desired_skill_ids:
-                self.state.delete_capability_override("skill", skill_id)
-                self.state.delete_capability_override("tool", f"skill.{skill_id}.run")
-                self.state.delete_skill(skill_id)
-        for server in self.state.list_mcp_servers():
-            server_id = str(server["id"])
-            if server_id.startswith(prefix) and server_id not in desired_mcp_ids:
-                self.state.delete_capability_override("mcp_server", server_id)
-                for tool in server.get("tools", []):
-                    if isinstance(tool, dict) and tool.get("name"):
-                        self.state.delete_capability_override(
-                            "tool", str(tool["name"])
-                        )
-                self.state.delete_mcp_server(server_id)
+        expected_digest = dict(row.get("risk_report", {})).get("tree_sha256")
+        if not expected_digest:
+            # Compatibility for registry rows created before source-tree
+            # attestation was introduced. Their declarative generated files are
+            # still rebuilt through the same staged swap below.
+            return
+        source_dir = plugin_dir / PLUGIN_SOURCE_DIR
+        manifest = load_plugin_manifest(source_dir)
+        if manifest.id != str(row["id"]):
+            raise PluginError("Installed plugin manifest id does not match its state row.")
+        if manifest.to_state_payload() != dict(row["manifest"]):
+            raise PluginError("Installed plugin manifest differs from its reviewed state.")
+        actual_digest = _tree_sha256(source_dir)
+        if require_source_digest and actual_digest != expected_digest:
+            raise PluginError("Installed plugin source integrity check failed.")
 
-    def _delete_extension_rows(self, plugin_id: str) -> None:
-        self._delete_stale_extension_rows(plugin_id, set(), set())
+    def _rebuild_generated_extensions(
+        self,
+        row: dict[str, Any],
+        plugin_dir: Path,
+    ) -> None:
+        stage = create_sibling_stage(self.root, prefix=str(row["id"]))
+        try:
+            copy_regular_tree(plugin_dir, stage)
+            generated = stage / PLUGIN_GENERATED_DIR
+            if path_exists(generated):
+                remove_tree_verified(generated)
+            self._desired_extension_rows(
+                row,
+                tree_root=stage,
+                materialize_skills=True,
+                refresh_launch_vetting=False,
+            )
+            fsync_tree(stage)
+            swap = DirectorySwap(live=plugin_dir, stage=stage)
+            quiesce = self.state.quiesce_plugin_bundle(str(row["id"]))
+            state_committed = False
+            try:
+                swap.publish()
+                try:
+                    skills, mcp_servers = self._desired_extension_rows(
+                        row,
+                        tree_root=plugin_dir,
+                        materialize_skills=False,
+                        refresh_launch_vetting=True,
+                    )
+                    self.state.replace_plugin_bundle(
+                        row,
+                        skills=skills,
+                        mcp_servers=mcp_servers,
+                    )
+                    state_committed = True
+                except BaseException:
+                    swap.restore()
+                    raise
+                swap.finalize()
+            except BaseException:
+                if (
+                    not state_committed
+                    and quiesce is not None
+                    and not swap.displaced
+                    and not swap.published
+                ):
+                    self._restore_quiesce(quiesce)
+                raise
+        finally:
+            if path_exists(stage):
+                remove_tree_verified(stage)
+
+    def _restore_quiesce(self, token: dict[str, Any]) -> None:
+        try:
+            self.state.restore_quiesced_plugin_bundle(token)
+        except BaseException as exc:
+            raise ExtensionCleanupIncompleteError(
+                "Plugin rollback completed with unresolved fail-closed state rows."
+            ) from exc
+
+
+def _plugin_state_row(
+    manifest: PluginManifest,
+    *,
+    source: str,
+    ref: str | None,
+    commit_sha: str,
+    plugin_dir: Path,
+    risk_report: dict[str, Any],
+    enabled: bool,
+) -> dict[str, Any]:
+    return {
+        "id": manifest.id,
+        "name": manifest.name,
+        "description": manifest.description,
+        "source_url": source,
+        "source_ref": ref,
+        "commit_sha": commit_sha,
+        "install_path": str(plugin_dir),
+        "manifest": manifest.to_state_payload(),
+        "capabilities": _capabilities(manifest),
+        "enabled": enabled,
+        "risk_report": risk_report,
+        "install_status": "installed",
+        "format": manifest.format,
+    }
+
+
+def _installed_plugin_dir(root: Path, row: dict[str, Any]) -> Path:
+    expected = _safe_plugin_dir(root, str(row["id"]))
+    configured = Path(str(row["install_path"])).expanduser()
+    if not configured.is_absolute():
+        configured = configured.absolute()
+    if configured != expected:
+        raise PluginError("Plugin install path does not match its registry id.")
+    if path_exists(expected):
+        ensure_real_directory(expected)
+    return expected
 
 
 def parse_github_plugin_source(raw_source: str) -> GitHubPluginSource:
@@ -380,7 +740,7 @@ def parse_github_plugin_source(raw_source: str) -> GitHubPluginSource:
 def load_plugin_manifest(repo_root: Path) -> PluginManifest:
     kestrel_manifest = repo_root / "kestrel.plugin.json"
     if kestrel_manifest.exists():
-        raw = json.loads(kestrel_manifest.read_text(encoding="utf-8"))
+        raw = json.loads(read_regular_text(kestrel_manifest))
         if not isinstance(raw, dict):
             raise PluginError("kestrel.plugin.json must contain a JSON object.")
         return _normalize_kestrel_manifest(raw, repo_root)
@@ -406,7 +766,10 @@ def _normalize_kestrel_manifest(raw: dict[str, Any], repo_root: Path) -> PluginM
     isolation = _isolation(raw.get("isolation", {}))
     warnings: list[str] = []
     skills = tuple(_normalize_skill(plugin_id, item, repo_root, risk) for item in _dict_list(raw.get("skills", []), "skills"))
-    mcp_servers = tuple(_normalize_mcp_server(plugin_id, item) for item in _dict_list(raw.get("mcp_servers", []), "mcp_servers"))
+    mcp_servers = tuple(
+        _normalize_mcp_server(plugin_id, item, repo_root)
+        for item in _dict_list(raw.get("mcp_servers", []), "mcp_servers")
+    )
     if not skills and not mcp_servers:
         warnings.append("plugin_has_no_declarative_capabilities")
     return PluginManifest(
@@ -442,7 +805,10 @@ def _normalize_hermes_manifest(raw: dict[str, Any], repo_root: Path) -> PluginMa
         skills_raw = list(skills_raw.values())
     skills = tuple(_normalize_skill(plugin_id, item, repo_root, risk) for item in _dict_list(skills_raw, "skills"))
     mcp_raw = raw.get("mcp_servers", raw.get("mcp", []))
-    mcp_servers = tuple(_normalize_mcp_server(plugin_id, item) for item in _dict_list(mcp_raw, "mcp_servers"))
+    mcp_servers = tuple(
+        _normalize_mcp_server(plugin_id, item, repo_root)
+        for item in _dict_list(mcp_raw, "mcp_servers")
+    )
     if raw.get("tools") and not mcp_servers:
         unsupported.append("python_tool_registration_ignored")
     if not skills and not mcp_servers:
@@ -477,15 +843,17 @@ def _normalize_skill(plugin_id: str, raw: dict[str, Any], repo_root: Path, plugi
             manifest_path = skill_path / "skill.json"
             instructions_path = skill_path / "SKILL.md"
             if manifest_path.exists():
-                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                loaded = json.loads(read_regular_text(manifest_path))
                 if isinstance(loaded, dict):
                     source_manifest.update(loaded)
             if instructions_path.exists():
-                instructions = instructions_path.read_text(encoding="utf-8")
+                instructions = read_regular_text(instructions_path)
         elif skill_path.is_file():
-            instructions = skill_path.read_text(encoding="utf-8")
+            instructions = read_regular_text(skill_path)
     if raw.get("instructions_path"):
-        instructions = _safe_child_path(repo_root, str(raw["instructions_path"])).read_text(encoding="utf-8")
+        instructions = read_regular_text(
+            _safe_child_path(repo_root, str(raw["instructions_path"]))
+        )
     source_manifest.update(dict(raw.get("manifest", {})) if isinstance(raw.get("manifest", {}), dict) else {})
     source_manifest["id"] = namespaced_id
     source_manifest.setdefault("name", raw.get("name") or source_manifest.get("name") or skill_id)
@@ -512,7 +880,11 @@ def _normalize_skill(plugin_id: str, raw: dict[str, Any], repo_root: Path, plugi
     }
 
 
-def _normalize_mcp_server(plugin_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+def _normalize_mcp_server(
+    plugin_id: str,
+    raw: dict[str, Any],
+    repo_root: Path,
+) -> dict[str, Any]:
     server_id = _validated_component_id(str(raw.get("id", "")).strip())
     namespaced_id = f"{PLUGIN_NAMESPACE}.{plugin_id}.{server_id}"
     config = dict(raw)
@@ -527,17 +899,23 @@ def _normalize_mcp_server(plugin_id: str, raw: dict[str, Any]) -> dict[str, Any]
     if str(config.get("transport", "stdio")) == "stdio":
         command = str(config.get("command") or "").strip()
         args = [str(item) for item in config.get("args", [])]
-        _validate_plugin_stdio_command(command, args)
+        artifact = _validate_plugin_stdio_command(command, args, repo_root=repo_root)
+        from .mcp_manager import _stdio_command_hash
+
         vetting = dict(config.get("vetting", {}) or {})
         for approval_field in (
             "connect_approved",
             "connect_approved_at",
             "connect_approved_command_hash",
+            "connect_approved_launch_digest",
+            "stdio_launch_snapshot",
         ):
             vetting.pop(approval_field, None)
         vetting["stdio_command_hash"] = _stdio_command_hash(command, args)
         vetting["connect_requires_approval"] = True
         vetting["plugin_source"] = plugin_id
+        if artifact is not None:
+            vetting["plugin_artifact_relative_path"] = artifact
         config["vetting"] = vetting
     tools = _dict_list(config.get("tools", []), "mcp_servers.tools")
     config["tools"] = [_normalize_mcp_tool(namespaced_id, tool, str(config["risk_policy"])) for tool in tools]
@@ -566,38 +944,74 @@ def _normalize_mcp_tool(server_id: str, raw: dict[str, Any], risk_policy: str) -
     }
 
 
-def _validate_plugin_stdio_command(command: str, args: list[str]) -> None:
+def _validate_plugin_stdio_command(
+    command: str,
+    args: list[str],
+    *,
+    repo_root: Path,
+) -> str | None:
     if not command:
-        return
-    command_name = Path(command).name
+        return None
+    command_name = Path(command).name.lower()
     allowed = {"npx", "uvx", "python", "python3", "node", "bunx", "deno"}
     if command_name not in allowed:
         raise PluginError(f"Plugin MCP command is not allowed: {command_name}")
     if command_name in {"python", "python3"}:
-        if len(args) < 2 or args[0] != "-m" or not _valid_python_module(args[1]):
-            raise PluginError("Plugin MCP python commands must use `python -m <module>` with a valid module name.")
+        if not args or args[0].startswith("-") or not args[0].lower().endswith(".py"):
+            raise PluginError(
+                "Plugin MCP `python -m` launchers are mutable and are not allowed; "
+                "configure a plugin-relative `.py` script instead."
+            )
+        return _validated_plugin_artifact(repo_root, args[0], suffixes=(".py",))
     if command_name in {"npx", "uvx", "bunx"}:
-        if not args or not _valid_package_name(args[0]):
-            raise PluginError(f"Plugin MCP {command_name} commands must name a valid package.")
+        raise PluginError(
+            "Plugin MCP package runners are disabled because registry coordinates do not "
+            "prove the bytes that will execute; include a reviewed plugin-relative script."
+        )
     if command_name == "node":
-        if not args or any(_has_shell_metacharacters(part) for part in args):
+        if (
+            not args
+            or not args[0].lower().endswith((".js", ".cjs", ".mjs"))
+            or any(_has_shell_metacharacters(part) for part in args)
+        ):
             raise PluginError("Plugin MCP node args contain unsupported shell metacharacters.")
+        return _validated_plugin_artifact(
+            repo_root,
+            args[0],
+            suffixes=(".js", ".cjs", ".mjs"),
+        )
     if command_name == "deno":
-        if not args or any(_has_shell_metacharacters(part) for part in args):
+        if (
+            len(args) < 2
+            or args[0] != "run"
+            or any(_has_shell_metacharacters(part) for part in args)
+        ):
             raise PluginError("Plugin MCP deno args contain unsupported shell metacharacters.")
+        return _validated_plugin_artifact(
+            repo_root,
+            args[1],
+            suffixes=(".js", ".mjs", ".ts", ".mts"),
+        )
+    return None
 
 
-def _stdio_command_hash(command: str, args: list[str]) -> str:
-    payload = json.dumps({"command": command, "args": args}, sort_keys=True, separators=(",", ":"))
-    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _valid_python_module(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", value))
-
-
-def _valid_package_name(value: str) -> bool:
-    return bool(re.fullmatch(r"(@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", value))
+def _validated_plugin_artifact(
+    repo_root: Path,
+    raw_path: str,
+    *,
+    suffixes: tuple[str, ...],
+) -> str:
+    candidate = Path(raw_path)
+    if candidate.is_absolute() or candidate.suffix.lower() not in suffixes:
+        raise PluginError("Plugin MCP launch artifacts must use a plugin-relative script path.")
+    artifact = _safe_child_path(repo_root, raw_path, must_exist=True)
+    try:
+        read_regular_file(artifact)
+    except (ExtensionTransactionError, OSError, UnicodeError) as exc:
+        raise PluginError("Plugin MCP launch artifact must be a regular file.") from exc
+    if not artifact.is_file():
+        raise PluginError("Plugin MCP launch artifact must be a regular file.")
+    return artifact.relative_to(repo_root.resolve()).as_posix()
 
 
 def _has_shell_metacharacters(value: str) -> bool:
@@ -605,7 +1019,7 @@ def _has_shell_metacharacters(value: str) -> bool:
 
 
 def _load_yaml_manifest(path: Path) -> dict[str, Any]:
-    text = path.read_text(encoding="utf-8")
+    text = read_regular_text(path)
     try:
         yaml = import_module("yaml")
     except Exception:
@@ -773,15 +1187,17 @@ def _capabilities(manifest: PluginManifest) -> list[str]:
 def _tree_sha256(root: Path) -> str | None:
     if not root.exists():
         return None
+    fsync_tree(root)
     digest = hashlib.sha256()
     for path in sorted(item for item in root.rglob("*") if item.is_file() and ".git" not in item.parts):
         digest.update(str(path.relative_to(root)).encode("utf-8"))
-        digest.update(path.read_bytes())
+        digest.update(read_regular_file(path))
     return digest.hexdigest()
 
 
 def _safe_plugin_dir(root: Path, plugin_id: str) -> Path:
-    return _safe_child_path(root, plugin_id, must_exist=False)
+    _validated_plugin_id(plugin_id)
+    return root.resolve() / plugin_id
 
 
 def _safe_child_path(root: Path, relative: str, *, must_exist: bool = True) -> Path:
@@ -892,11 +1308,16 @@ def _looks_like_sha(value: str) -> bool:
     return bool(_SHA_RE.match(value))
 
 
-def _run_git(command: list[str]) -> str:
+def _run_git(command: list[str], *, workspace: Path) -> str:
+    if not command or Path(command[0]).name.casefold() not in {"git", "git.exe"}:
+        raise PluginError("Expected a structured Git command.")
     completed = subprocess.run(  # noqa: S603 - list argv only, no shell  # nosec B603
-        command,
+        hardened_readonly_git_command(command[1:], workspace=workspace),
+        cwd=workspace,
         capture_output=True,
         text=True,
+        env=hardened_readonly_git_environment(),
+        stdin=subprocess.DEVNULL,
         timeout=GIT_TIMEOUT_SECONDS,
         check=False,
     )

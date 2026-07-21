@@ -23,6 +23,18 @@ set +a
 export NEST_AGENT_REQUIRE_API_AUTH="${NEST_AGENT_REQUIRE_API_AUTH:-true}"
 export NEST_AGENT_API_AUTH_TOKEN_ENV="${NEST_AGENT_API_AUTH_TOKEN_ENV:-NEST_AGENT_API_TOKEN}"
 
+# Keep poller health scoped to the state store owned by this Kestrel instance.
+# The explicit health-path override remains authoritative for existing deployments.
+case "${KESTREL_TELEGRAM_RUNTIME:-shared}" in
+  shared)
+    export NEST_AGENT_STATE_PATH="${NEST_AGENT_STATE_PATH:-.nest/state/agent.db}"
+    ;;
+  isolated)
+    export NEST_AGENT_STATE_PATH="${NEST_AGENT_STATE_PATH:-.nest/telegram/state/agent.db}"
+    ;;
+esac
+export KESTREL_TELEGRAM_HEALTH_PATH="${KESTREL_TELEGRAM_HEALTH_PATH:-$(dirname "${NEST_AGENT_STATE_PATH:-.nest/state/agent.db}")/telegram-poller-health.json}"
+
 PORT="${KESTREL_PORT:-8765}"
 export KESTREL_PORT="$PORT"
 LOG_DIR="${KESTREL_STACK_LOG_DIR:-$HOME/.kestrel/logs}"

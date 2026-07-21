@@ -59,7 +59,12 @@ def test_memory_search_route_accepts_mode_and_layers_report_vector_status(
         lambda model_name=None: ConceptEmbedder(),
     )
     memory_dir = tmp_path / "memory"
-    memory = build_memory_system("memory", memory_dir, specs=load_layer_specs(layer_config))
+    memory = build_memory_system(
+        "memory",
+        memory_dir,
+        specs=load_layer_specs(layer_config),
+        enforce_stable_write_integrity=False,
+    )
     memory.put(
         MemoryRecord(
             id="pythonpath-fix",

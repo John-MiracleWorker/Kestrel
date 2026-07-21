@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
+
+import pytest
 
 from nested_memvid_agent import operational_metrics as operational_metrics_module
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
@@ -34,6 +39,20 @@ class _Runs:
         return {"started": 3, "completed": 2}
 
 
+class _RoutineLoop:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def status(self) -> object:
+        payload = self.payload
+
+        class _Status:
+            def to_dict(self) -> dict[str, object]:
+                return dict(payload)
+
+        return _Status()
+
+
 def test_operational_snapshot_reports_state_integrity_and_writable_storage(tmp_path) -> None:
     config = AgentConfig(
         backend="memory",
@@ -56,8 +75,210 @@ def test_operational_snapshot_reports_state_integrity_and_writable_storage(tmp_p
     assert snapshot["memory"]["available"] is True
     assert snapshot["memory"]["writable"] is True
     assert snapshot["workers"]["by_status"] == {}
+    assert snapshot["proactive_routines"] == {"status": "disabled", "enabled": False}
     assert snapshot["process"]["pid"] > 0
     assert readiness_snapshot(config=config, state=state, runs=_Runs())["ok"] is True
+
+
+def test_telegram_poller_health_defaults_to_the_instance_state_directory(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("KESTREL_TELEGRAM_HEALTH_PATH", raising=False)
+    first = AgentConfig(state_path=tmp_path / "first" / "agent.db")
+    second = AgentConfig(state_path=tmp_path / "second" / "agent.db")
+    first_health_path = first.state_path.parent / "telegram-poller-health.json"
+    first_health_path.parent.mkdir(parents=True)
+    first_health_path.write_text(
+        json.dumps(
+            {
+                "status": "healthy",
+                "updated_at_epoch": datetime.now(UTC).timestamp(),
+                "pid": 101,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert operational_metrics_module._telegram_poller_health(first)["pid"] == 101
+    assert operational_metrics_module._telegram_poller_health(second) == {
+        "status": "not_configured"
+    }
+
+
+def test_telegram_poller_health_preserves_explicit_path_override(
+    tmp_path, monkeypatch
+) -> None:
+    override = tmp_path / "operator" / "poller.json"
+    override.parent.mkdir()
+    override.write_text(
+        json.dumps(
+            {
+                "status": "healthy",
+                "updated_at_epoch": datetime.now(UTC).timestamp(),
+                "pid": 202,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KESTREL_TELEGRAM_HEALTH_PATH", str(override))
+    config = AgentConfig(state_path=tmp_path / "otherwise" / "agent.db")
+
+    assert operational_metrics_module._telegram_poller_health(config)["pid"] == 202
+
+
+def test_state_health_snapshot_coalesces_only_concurrent_checks(
+    tmp_path, monkeypatch
+) -> None:
+    class _BlockingState:
+        path = tmp_path / "state.db"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.call_lock = Lock()
+            self.entered = Event()
+            self.release = Event()
+
+        def health_snapshot(self) -> dict[str, object]:
+            with self.call_lock:
+                self.calls += 1
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            return {"ok": True, "integrity": "ok", "writable": True}
+
+    state = _BlockingState()
+    workers = 8
+    barrier = Barrier(workers)
+    follower_lock = Lock()
+    followers_ready = Event()
+    follower_count = 0
+
+    class _TrackingFuture(Future[dict[str, object]]):
+        def result(self, timeout: float | None = None) -> dict[str, object]:
+            nonlocal follower_count
+            with follower_lock:
+                follower_count += 1
+                if follower_count == workers - 1:
+                    followers_ready.set()
+            return super().result(timeout=timeout)
+
+    monkeypatch.setattr(operational_metrics_module, "Future", _TrackingFuture)
+
+    def check() -> dict[str, object]:
+        barrier.wait(timeout=2)
+        return operational_metrics_module._state_health_snapshot(state)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(check) for _ in range(workers)]
+        assert state.entered.wait(timeout=2)
+        assert followers_ready.wait(timeout=2)
+        state.release.set()
+        results = [future.result(timeout=2) for future in futures]
+
+    assert state.calls == 1
+    assert all(result["ok"] is True for result in results)
+
+    state.release.clear()
+    state.release.set()
+    operational_metrics_module._state_health_snapshot(state)
+    assert state.calls == 2
+
+
+def test_readiness_requires_healthy_enabled_proactive_routine_loop(tmp_path) -> None:
+    config = AgentConfig(
+        backend="memory",
+        state_path=tmp_path / "state.db",
+        memory_dir=tmp_path / "memory",
+        channel_config_path=tmp_path / "channels.json",
+        enable_proactive_routines=True,
+    )
+    config.memory_dir.mkdir()
+    state = AgentStateStore(config.state_path)
+    healthy = _RoutineLoop(
+        {
+            "running": True,
+            "tick_count": 2,
+            "last_error": None,
+            "tick_in_progress": False,
+            "current_tick_age_seconds": None,
+        }
+    )
+
+    readiness = readiness_snapshot(
+        config=config,
+        state=state,
+        runs=_Runs(),
+        routine_loop=healthy,
+    )
+
+    assert readiness["ok"] is True
+    assert readiness["proactive_routines"]["status"] == "healthy"
+
+
+@pytest.mark.parametrize(
+    ("loop", "expected_status"),
+    [
+        (None, "unavailable"),
+        (
+            _RoutineLoop(
+                {
+                    "running": False,
+                    "tick_count": 1,
+                    "last_error": None,
+                    "tick_in_progress": False,
+                }
+            ),
+            "stopped",
+        ),
+        (
+            _RoutineLoop(
+                {
+                    "running": True,
+                    "tick_count": 1,
+                    "last_error": "redacted failure",
+                    "tick_in_progress": False,
+                }
+            ),
+            "error",
+        ),
+        (
+            _RoutineLoop(
+                {
+                    "running": True,
+                    "tick_count": 1,
+                    "last_error": None,
+                    "tick_in_progress": True,
+                    "current_tick_age_seconds": 121.0,
+                }
+            ),
+            "stale",
+        ),
+    ],
+)
+def test_readiness_fails_for_unhealthy_proactive_routine_loop(
+    tmp_path,
+    loop,
+    expected_status,
+) -> None:
+    config = AgentConfig(
+        backend="memory",
+        state_path=tmp_path / f"{expected_status}.db",
+        memory_dir=tmp_path / f"memory-{expected_status}",
+        channel_config_path=tmp_path / "channels.json",
+        enable_proactive_routines=True,
+    )
+    config.memory_dir.mkdir()
+    state = AgentStateStore(config.state_path)
+
+    readiness = readiness_snapshot(
+        config=config,
+        state=state,
+        runs=_Runs(),
+        routine_loop=loop,
+    )
+
+    assert readiness["ok"] is False
+    assert readiness["proactive_routines"]["status"] == expected_status
+    assert "proactive_routine_loop_unhealthy" in readiness["reasons"]
 
 
 def test_prometheus_snapshot_uses_operational_snapshot_field_contract(
