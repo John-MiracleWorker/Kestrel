@@ -2076,19 +2076,34 @@ class AgentStateStore:
         """Atomically expire pending exact-call approvals whose deadline passed."""
 
         now = utc_now()
+        due_predicate = (
+            "status = 'pending' AND (expires_at IS NULL "
+            "OR julianday(expires_at) IS NULL "
+            "OR julianday(expires_at) <= julianday(?))"
+        )
+        params: tuple[object, ...] = (now,)
+        if approval_id is not None:
+            due_predicate += " AND approval_id = ?"
+            params = (now, approval_id)
+
+        # Approval reads are part of the scheduler's ordinary observation
+        # path. Avoid taking a reserved writer slot unless the same sampled
+        # instant proves that reconciliation is actually due. WAL readers can
+        # complete this probe while an unrelated writer is active.
+        with self._connect() as conn:
+            due = conn.execute(
+                f"SELECT 1 FROM approval_requests WHERE {due_predicate} LIMIT 1",
+                params,
+            ).fetchone()
+        if due is None:
+            return []
+
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            sql = (
-                "SELECT approval_id FROM approval_requests "
-                "WHERE status = 'pending' AND (expires_at IS NULL "
-                "OR julianday(expires_at) IS NULL "
-                "OR julianday(expires_at) <= julianday(?))"
-            )
-            params: list[object] = [now]
-            if approval_id is not None:
-                sql += " AND approval_id = ?"
-                params.append(approval_id)
-            rows = conn.execute(sql, tuple(params)).fetchall()
+            rows = conn.execute(
+                f"SELECT approval_id FROM approval_requests WHERE {due_predicate}",
+                params,
+            ).fetchall()
             identifiers = [str(row["approval_id"]) for row in rows]
             if not identifiers:
                 return []

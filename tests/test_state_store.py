@@ -506,6 +506,59 @@ def test_approval_expiry_and_principal_are_enforced_atomically(tmp_path: Path) -
     assert state.get_approval("approval_principal")["status"] == "pending"
 
 
+def test_unexpired_approval_listing_does_not_require_a_sqlite_writer_slot(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    state = AgentStateStore(path)
+    future = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    state.create_approval(
+        approval_id="approval_unexpired_reader",
+        run_id="run_unexpired_reader",
+        tool_call_id="call_unexpired_reader",
+        tool_name="shell.run",
+        arguments={"command": ["echo", "read"]},
+        risk="high",
+        expires_at=future,
+        principal="owner",
+    )
+
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        assert writer.in_transaction is True
+        listed = state.list_approvals(status="pending")
+        assert writer.in_transaction is True
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert [approval["approval_id"] for approval in listed] == [
+        "approval_unexpired_reader"
+    ]
+
+    expired_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    state.create_approval(
+        approval_id="approval_due_after_reader",
+        run_id="run_due_after_reader",
+        tool_call_id="call_due_after_reader",
+        tool_name="shell.run",
+        arguments={"command": ["echo", "expire"]},
+        risk="high",
+        expires_at=expired_at,
+        principal="owner",
+    )
+
+    expired = state.expire_pending_approvals()
+
+    assert [approval["approval_id"] for approval in expired] == [
+        "approval_due_after_reader"
+    ]
+    assert expired[0]["status"] == "expired"
+    assert expired[0]["decision"] == {"approved": False, "reason": "approval_expired"}
+    assert state.get_approval("approval_unexpired_reader")["status"] == "pending"
+
+
 def test_concurrent_exact_approval_requests_reuse_one_pending_record(
     tmp_path: Path,
 ) -> None:

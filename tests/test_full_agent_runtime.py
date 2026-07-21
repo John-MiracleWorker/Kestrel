@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from queue import Empty
 from threading import Event, Thread
 from time import monotonic, sleep
 from types import SimpleNamespace
@@ -4816,6 +4817,7 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
 def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     if shutil.which("git") is None:
         raise AssertionError("git is required for repair handoff tests")
@@ -5019,6 +5021,22 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
         )
 
     manager._build_agent = build_repair_agent  # type: ignore[method-assign]
+    approval_table_scans = 0
+    list_approvals = manager.state.list_approvals
+
+    def track_approval_table_scan(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        nonlocal approval_table_scans
+        approval_table_scans += 1
+        return list_approvals(*args, **kwargs)
+
+    monkeypatch.setattr(manager.state, "list_approvals", track_approval_table_scan)
+    # Subscribe before the first synchronous scheduler pass so the regression
+    # proves that the initial prepare handoff is delivered live, rather than
+    # relying on replay or a state-table bootstrap read.
+    subscriber = manager.events.subscribe(run.run_id)
+    request.addfinalizer(
+        lambda: manager.events.unsubscribe(run.run_id, subscriber)
+    )
     with manager._run_lease(run.run_id, manager.config) as lease:
         assert lease is not None
         running = manager.state.transition_run(
@@ -5051,53 +5069,138 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
         "repair.review",
         "git.commit",
     ]
-    for index, expected_tool in enumerate(expected_tools):
-        assert _wait_until(
-            lambda expected_tool=expected_tool: any(
-                approval["tool_name"] == expected_tool
-                for approval in manager.state.list_approvals(status="pending")
+
+    def wait_for_approval_handoff(
+        expected_tool: str,
+        *,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Wait without repeatedly taking SQLite write locks on Windows.
+
+        ``AgentStateStore.list_approvals`` performs expiry reconciliation by
+        default. Before the store's read-only due check, polling it at 100 Hz
+        repeatedly started immediate transactions and could starve the
+        continuation writes this test is waiting for. The event bus gives us
+        the two durable handoff boundaries directly: the exact-call approval
+        and the blocked task bound to it.
+        """
+
+        deadline = monotonic() + timeout_seconds
+        approval: dict[str, Any] | None = None
+        blocked_approval_ids: set[str] = set()
+        observed: list[dict[str, Any]] = []
+        while monotonic() < deadline:
+            try:
+                event = subscriber.get(timeout=max(0.0, deadline - monotonic()))
+            except Empty:
+                break
+            observed.append(
+                {
+                    "type": event.type,
+                    "tool_name": event.payload.get("tool_name"),
+                    "task_id": event.payload.get("task_id"),
+                }
             )
-        )
-        approval = next(
-            approval
-            for approval in manager.state.list_approvals(status="pending")
-            if approval["tool_name"] == expected_tool
-        )
-        approval_id = str(approval["approval_id"])
-        assert _wait_until(
-            lambda approval_id=approval_id: any(
-                task.status == "blocked"
-                and isinstance(task.result, dict)
-                and isinstance(task.result.get("approval_continuation"), dict)
-                and task.result["approval_continuation"].get("approval_id") == approval_id
-                for task in manager.state.list_task_nodes(run.run_id)
-            )
-        )
-        manager.decide_approval(
-            approval_id,
-            approved=True,
-            arguments=dict(approval["arguments"]),
-        )
-        if index + 1 < len(expected_tools):
-            next_tool = expected_tools[index + 1]
-            assert _wait_until(
-                lambda next_tool=next_tool: any(
-                    item["tool_name"] == next_tool
-                    for item in manager.state.list_approvals(status="pending")
-                ),
-                timeout=45.0 if expected_tool == "repair.apply_patch" else 30.0,
-            ), {
-                "after": expected_tool,
-                "expected": next_tool,
-                "approvals": manager.state.list_approvals(),
+            if event.type in {"run.failed", "run.cancelled", "run.completed"}:
+                raise AssertionError(
+                    {
+                        "expected": expected_tool,
+                        "unexpected_terminal_event": event.type,
+                        "payload": event.payload,
+                        "observed": observed[-20:],
+                    }
+                )
+            if (
+                event.type == "approval.requested"
+                and event.payload.get("tool_name") == expected_tool
+            ):
+                approval = dict(event.payload)
+            if event.type == "task.blocked":
+                result = event.payload.get("result")
+                continuation = (
+                    result.get("approval_continuation") if isinstance(result, dict) else None
+                )
+                if isinstance(continuation, dict):
+                    approval_id = continuation.get("approval_id")
+                    if isinstance(approval_id, str):
+                        blocked_approval_ids.add(approval_id)
+            if (
+                approval is not None
+                and str(approval.get("approval_id")) in blocked_approval_ids
+            ):
+                return approval
+
+        raise AssertionError(
+            {
+                "expected": expected_tool,
+                "run": manager.state.get_run(run.run_id),
+                "capacity": manager.capacity_snapshot(),
+                "approvals": manager.state.list_approvals(expire=False),
                 "tasks": [
                     (task.title, task.status, task.failure_reason, task.result)
                     for task in manager.state.list_task_nodes(run.run_id)
                 ],
+                "observed": observed[-20:],
             }
+        )
 
-    final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
-    assert final["status"] == "completed"
+    def wait_for_terminal_event() -> tuple[str, list[dict[str, Any]]]:
+        deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
+        observed: list[dict[str, Any]] = []
+        while monotonic() < deadline:
+            try:
+                event = subscriber.get(timeout=max(0.0, deadline - monotonic()))
+            except Empty:
+                break
+            observed.append(
+                {
+                    "type": event.type,
+                    "task_id": event.payload.get("task_id"),
+                    "stop_reason": event.payload.get("stop_reason"),
+                }
+            )
+            if event.type in {"run.completed", "run.failed", "run.cancelled"}:
+                return event.type, observed
+        raise AssertionError(
+            {
+                "expected": "terminal run event",
+                "run": manager.state.get_run(run.run_id),
+                "capacity": manager.capacity_snapshot(),
+                "approvals": manager.state.list_approvals(expire=False),
+                "tasks": [
+                    (task.title, task.status, task.failure_reason, task.result)
+                    for task in manager.state.list_task_nodes(run.run_id)
+                ],
+                "observed": observed[-20:],
+            }
+        )
+
+    handoff_timeouts = {
+        "repair.prepare": _ASYNC_TEST_TIMEOUT_SECONDS,
+        "repair.apply_patch": 30.0,
+        "repair.orchestrate_validate": 45.0,
+        "repair.review": 30.0,
+        "git.commit": 30.0,
+    }
+    try:
+        for expected_tool in expected_tools:
+            approval = wait_for_approval_handoff(
+                expected_tool,
+                timeout_seconds=handoff_timeouts[expected_tool],
+            )
+            manager.decide_approval(
+                str(approval["approval_id"]),
+                approved=True,
+                arguments=dict(approval["arguments"]),
+            )
+        terminal_event, terminal_observed = wait_for_terminal_event()
+    finally:
+        manager.events.unsubscribe(run.run_id, subscriber)
+
+    final = manager.state.get_run(run.run_id)
+    assert terminal_event == "run.completed", terminal_observed[-20:]
+    assert final.status == "completed"
+    assert approval_table_scans == 0
     persisted = {task.title: task for task in manager.state.list_task_nodes(run.run_id)}
     validation_artifact = (persisted["Validate repair"].result or {})["repair_artifact"]
     review_artifact = (persisted["Review repair before commit"].result or {})["repair_artifact"]

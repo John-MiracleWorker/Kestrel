@@ -1070,6 +1070,7 @@ def test_agent_backup_validation_handles_null_size_and_missing_optional_metadata
 
 def test_agent_backup_round_trip_preserves_only_owner_executable_mode(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, paths = _manager(tmp_path)
     _seed_runtime(paths, "backup")
@@ -1079,12 +1080,41 @@ def test_agent_backup_round_trip_preserves_only_owner_executable_mode(
     ordinary = paths["plugins"] / "sample" / "plugin.json"
     os.chmod(ordinary, 0o666)
     manifest = manager.create(retain=4)
+    manifest_modes = {entry["path"]: entry["mode"] for entry in manifest["files"]}
+    # Windows cannot express a POSIX execute bit through chmod/stat. Preserve
+    # it when the source platform exposes the intent and otherwise fail closed
+    # to a non-executable canonical mode for a future POSIX restore.
+    expected_executable_mode = 0o700 if executable.stat().st_mode & stat.S_IXUSR else 0o600
+    assert manifest_modes["components/skills/sample/run.sh"] == expected_executable_mode
+    assert manifest_modes["components/plugins/sample/plugin.json"] == 0o600
+    assert set(manifest_modes.values()) <= {0o600, 0o700}
+
+    applied_modes: dict[str, int] = {}
+    apply_private_file_mode = agent_backup_module._apply_private_file_mode
+
+    def record_applied_mode(path: Path, mode: int, *, descriptor: int) -> None:
+        if path.name in {"run.sh", "plugin.json"}:
+            applied_modes[path.name] = mode
+        apply_private_file_mode(path, mode, descriptor=descriptor)
+
+    monkeypatch.setattr(agent_backup_module, "_apply_private_file_mode", record_applied_mode)
 
     os.chmod(executable, 0o600)
     manager.restore(str(manifest["backup_id"]), retain=4)
 
-    assert stat.S_IMODE(executable.stat().st_mode) == 0o700
-    assert stat.S_IMODE(ordinary.stat().st_mode) == 0o600
+    # Bind restore to the canonical manifest intent even on platforms whose
+    # st_mode cannot materialize it. Exact POSIX modes remain mandatory where
+    # the runtime declares that it can enforce them.
+    assert applied_modes == {
+        "run.sh": expected_executable_mode,
+        "plugin.json": 0o600,
+    }
+    if agent_backup_module._ENFORCE_EXACT_POSIX_MODES:
+        assert stat.S_IMODE(executable.stat().st_mode) == expected_executable_mode
+        assert stat.S_IMODE(ordinary.stat().st_mode) == 0o600
+    else:
+        assert stat.S_ISREG(executable.lstat().st_mode)
+        assert stat.S_ISREG(ordinary.lstat().st_mode)
 
 
 def test_agent_backup_keeps_canonical_modes_when_platform_cannot_enforce_posix_modes(
