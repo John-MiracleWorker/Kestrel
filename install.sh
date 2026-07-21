@@ -1873,7 +1873,13 @@ process_is_expected_kestrel_supervisor() {
 }
 
 process_exists() {
-  ps -p "$1" -o pid= >/dev/null 2>&1
+  local process_state
+  process_state="$(ps -p "$1" -o stat= 2>/dev/null | tr -d '[:space:]')" || return 1
+  # A detached process can remain visible briefly as an unreaped zombie. It
+  # has exited, owns no open descriptors, cannot accept a signal, and its PID
+  # cannot be reused until it is reaped. Treating that state as live makes the
+  # failed-launch rollback depend on unrelated parent/reaper scheduling.
+  [[ -n "$process_state" && "$process_state" != Z* ]]
 }
 
 process_group_id_for_pid() {

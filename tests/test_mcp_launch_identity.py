@@ -472,7 +472,11 @@ def test_private_tree_snapshot_failure_cleans_protected_temporary_directory(
     source.mkdir()
     (source / "server.py").write_text("# reviewed\n", encoding="utf-8")
     base = tmp_path / "mcp_artifacts"
-    base.mkdir(mode=0o700)
+    mcp_module._ensure_private_snapshot_directory(
+        base,
+        allow_harden_empty=True,
+        harden_existing_posix=True,
+    )
     destination = base / ("a" * 64)
 
     with pytest.raises(MCPLaunchIdentityError, match="changed before"):
@@ -926,7 +930,7 @@ def test_secret_bearing_aliased_interpreter_is_rejected_before_resolution(
         }
     )
 
-    with pytest.raises(MCPLaunchIdentityError, match="installed plugin"):
+    with pytest.raises(MCPLaunchIdentityError, match="(?:installed plugin|reparse point)"):
         manager.approve_server_connect("aliased-secret-script")
 
     assert resolved == []

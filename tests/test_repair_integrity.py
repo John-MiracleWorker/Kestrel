@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import nested_memvid_agent.repair_integrity as repair_integrity_module
+import nested_memvid_agent.tools.repair_tools as repair_tools_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.mcp_manager import MCPLaunchIdentityError, MCPManager
 from nested_memvid_agent.orchestrator import build_memory_system
@@ -377,6 +378,7 @@ def test_changed_path_manifest_opens_literal_bytes_in_binary_mode(
     candidate = tmp_path / "literal.bin"
     candidate.write_bytes(b"literal\r\nbytes\r\n")
     binary_flag = 1 << 29
+    platform_binary_flag = getattr(os, "O_BINARY", 0)
     real_open = os.open
     observed_flags: list[int] = []
 
@@ -388,7 +390,10 @@ def test_changed_path_manifest_opens_literal_bytes_in_binary_mode(
         dir_fd: int | None = None,
     ) -> int:
         observed_flags.append(flags)
-        return real_open(path, flags & ~binary_flag, mode, dir_fd=dir_fd)
+        platform_flags = flags & ~binary_flag
+        if flags & binary_flag:
+            platform_flags |= platform_binary_flag
+        return real_open(path, platform_flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(repair_integrity_module.os, "O_BINARY", binary_flag, raising=False)
     monkeypatch.setattr(repair_integrity_module.os, "open", open_without_synthetic_flag)
@@ -1105,6 +1110,47 @@ def test_receipt_scoped_rollback_resets_staged_changes_and_preserves_unrelated_f
     assert json.loads(artifact.read_text(encoding="utf-8"))["success"] is True
     if os.name != "nt":
         assert artifact.stat().st_mode & 0o777 == 0o600
+
+
+def test_receipt_scoped_rollback_windows_path_fallback_preserves_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    _branch(repo, "repair/windows-scoped-rollback")
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    (repo / "README.md").write_text("reviewed tracked change\n", encoding="utf-8")
+    (repo / "reviewed-new.txt").write_text("reviewed new file\n", encoding="utf-8")
+    validation_id = _validate(registry, memory, repo, "windows_rollback_validation")
+    (repo / "unrelated-user-note.txt").write_text("preserve me\n", encoding="utf-8")
+    monkeypatch.setattr(
+        repair_tools_module,
+        "_uses_windows_rollback_path_fallback",
+        lambda: True,
+    )
+    call = ToolCall(
+        name="repair.rollback",
+        arguments={
+            "validation_id": validation_id,
+            "reason": "exercise Windows path fallback",
+            "expected_current_diff_digest": repair_snapshot(repo)["diff_digest"],
+        },
+        id="windows_scoped_rollback",
+    )
+
+    result = registry.execute(call, _approved(memory, repo, call))
+
+    assert result.success, result
+    assert (repo / "README.md").read_text(encoding="utf-8") == "seed\n"
+    assert not (repo / "reviewed-new.txt").exists()
+    assert (repo / "unrelated-user-note.txt").read_text(encoding="utf-8") == "preserve me\n"
+    quarantine = repo / result.data["quarantine_path"]
+    entry = result.data["quarantine_manifest"]["reviewed-new.txt"]
+    assert (quarantine / entry["stored_name"]).read_text(encoding="utf-8") == (
+        "reviewed new file\n"
+    )
+    assert result.data["recoverable"] is True
 
 
 def test_rollback_rejects_state_changed_after_exact_approval(tmp_path: Path) -> None:

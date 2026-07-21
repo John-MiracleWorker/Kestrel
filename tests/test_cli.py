@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -262,7 +263,10 @@ def test_agent_backup_cli_restores_clean_host_with_backed_up_layer_config(
     for layer, spec in specs.items():
         (memory_dir / spec.mv2_file).write_bytes(f"{layer.value}:portable".encode())
     state_path.parent.mkdir(parents=True)
-    with sqlite3.connect(state_path) as connection:
+    # Commit and close explicitly: sqlite3's context manager alone leaves the
+    # native handle open, which makes the clean-host deletion correctly fail on
+    # Windows even though no runtime owns this fixture database.
+    with closing(sqlite3.connect(state_path)) as connection, connection:
         connection.execute("CREATE TABLE restore_probe (value TEXT NOT NULL)")
         connection.execute("INSERT INTO restore_probe(value) VALUES ('portable')")
     source_layer_config.parent.mkdir(parents=True)
@@ -340,7 +344,7 @@ def test_agent_backup_cli_restores_clean_host_with_backed_up_layer_config(
     assert {
         layer: spec.mv2_file for layer, spec in load_layer_specs(canonical_layer_config).items()
     } == expected_files
-    with sqlite3.connect(state_path) as connection:
+    with closing(sqlite3.connect(state_path)) as connection, connection:
         assert connection.execute("SELECT value FROM restore_probe").fetchone() == ("portable",)
 
 

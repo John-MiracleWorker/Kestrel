@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
@@ -81,7 +82,11 @@ def _seed_memory(
 
 def _seed_state(state_path: Path, value: str) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(state_path) as connection:
+    # ``sqlite3.Connection.__exit__`` commits or rolls back but does not close
+    # the native database handle. Windows will then correctly refuse the live
+    # database swaps exercised by restore tests, so make fixture ownership
+    # explicit instead of relying on cyclic garbage collection.
+    with closing(sqlite3.connect(state_path)) as connection, connection:
         journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()
         assert journal_mode is not None and str(journal_mode[0]).lower() == "wal"
         connection.execute("CREATE TABLE IF NOT EXISTS snapshot_probe (value TEXT NOT NULL)")
@@ -90,13 +95,13 @@ def _seed_state(state_path: Path, value: str) -> None:
 
 
 def _state_value(state_path: Path) -> str:
-    with sqlite3.connect(state_path) as connection:
+    with closing(sqlite3.connect(state_path)) as connection, connection:
         row = connection.execute("SELECT value FROM snapshot_probe").fetchone()
     assert row is not None
     return str(row[0])
 
 
-def test_sqlite_snapshot_closes_connections_before_directory_publication(
+def test_sqlite_backup_helpers_close_connections_before_path_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -137,8 +142,9 @@ def test_sqlite_snapshot_closes_connections_before_directory_publication(
     monkeypatch.setattr(agent_backup_module.sqlite3, "connect", connect)
 
     agent_backup_module._snapshot_sqlite(tmp_path / "state.db", tmp_path / "snapshot.db")
+    agent_backup_module._verify_sqlite(tmp_path / "snapshot.db")
 
-    assert len(connections) == 2
+    assert len(connections) == 3
     assert all(connection.closed for connection in connections)
 
 
@@ -389,7 +395,7 @@ def test_agent_backup_round_trip_restores_memory_state_capsules_config_and_exten
     state_snapshot = (
         paths["backups"] / str(manifest["backup_id"]) / "components" / "state" / "agent.db"
     )
-    with sqlite3.connect(state_snapshot) as connection:
+    with closing(sqlite3.connect(state_snapshot)) as connection, connection:
         snapshot_mode = connection.execute("PRAGMA journal_mode").fetchone()
     assert snapshot_mode is not None and str(snapshot_mode[0]).lower() == "delete"
     assert not state_snapshot.with_name("agent.db-wal").exists()
@@ -1108,7 +1114,11 @@ def test_agent_backup_keeps_canonical_modes_when_platform_cannot_enforce_posix_m
 
     manifest = manager.create(retain=4)
     modes = {entry["path"]: entry["mode"] for entry in manifest["files"]}
-    assert modes["components/skills/sample/run.sh"] == 0o700
+    # Native Windows does not expose a POSIX execute bit for this source file.
+    # Preserve intent when the source can express it, and conservatively leave
+    # an unexpressed intent disabled.
+    expected_executable_mode = 0o700 if executable.stat().st_mode & stat.S_IXUSR else 0o600
+    assert modes["components/skills/sample/run.sh"] == expected_executable_mode
     assert modes["components/plugins/sample/plugin.json"] == 0o600
     assert set(modes.values()) <= {0o600, 0o700}
 

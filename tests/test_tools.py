@@ -55,10 +55,26 @@ def _isolated_repair_validation_stub(monkeypatch: MonkeyPatch) -> None:
             normalized = list(request.command)
             if normalized and Path(normalized[0]).name.casefold().startswith("python"):
                 normalized[0] = sys.executable
+            # Windows needs its native runtime and writable temporary-directory
+            # variables even in this credential-free unit runner. Without
+            # them, pytest falls back to the read-only candidate snapshot and
+            # exits before collecting the seeded regression.
+            environment = {"PATH": os.defpath}
+            for name in (
+                "COMSPEC",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "WINDIR",
+            ):
+                if value := os.environ.get(name):
+                    environment[name] = value
             completed = subprocess.run(  # noqa: S603  # nosec B603
                 normalized,
                 cwd=request.source_dir,
-                env={"PATH": os.defpath},
+                env=environment,
                 capture_output=True,
                 text=True,
                 timeout=request.timeout_seconds,

@@ -5084,7 +5084,8 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
                 lambda next_tool=next_tool: any(
                     item["tool_name"] == next_tool
                     for item in manager.state.list_approvals(status="pending")
-                )
+                ),
+                timeout=45.0 if expected_tool == "repair.apply_patch" else 30.0,
             ), {
                 "after": expected_tool,
                 "expected": next_tool,

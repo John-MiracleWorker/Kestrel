@@ -1407,6 +1407,66 @@ def test_install_script_launches_server_detached_and_checks_health() -> None:
 
 
 @POSIX_SHELL_ONLY
+def test_installer_process_exists_treats_zombie_as_stopped(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, time\n"
+                "child = os.fork()\n"
+                "if child == 0:\n"
+                "    os._exit(0)\n"
+                "print(child, flush=True)\n"
+                "time.sleep(30)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        zombie_pid = int(holder.stdout.readline().strip())
+        deadline = time.monotonic() + 5
+        process_state = ""
+        while time.monotonic() < deadline:
+            process_state = subprocess.run(
+                ["ps", "-p", str(zombie_pid), "-o", "stat="],
+                text=True,
+                capture_output=True,
+                check=False,
+            ).stdout.strip()
+            if process_state.startswith("Z"):
+                break
+            time.sleep(0.02)
+        assert process_state.startswith("Z"), process_state
+        assert (
+            subprocess.run(
+                ["kill", "-0", str(zombie_pid)],
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+
+        result = _run_installer_function(
+            'process_exists "$LIVE_PID" && ! process_exists "$ZOMBIE_PID"',
+            home=home,
+            pid_file=home / ".nest" / "server.pid",
+            port=_unused_local_port(),
+            extra_env={
+                "LIVE_PID": str(holder.pid),
+                "ZOMBIE_PID": str(zombie_pid),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+    finally:
+        _stop_process(holder)
+
+
+@POSIX_SHELL_ONLY
 def test_installer_server_handoff_polls_readiness_endpoint(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -1850,6 +1910,7 @@ def test_failed_child_pid_publication_still_cleans_via_supervisor_identity(
     local_supervisor.chmod(0o755)
     pid_file = home / ".nest" / "server.pid"
     supervisor_pid_file = home / ".nest" / "server.supervisor.pid"
+    process_group_file = home / ".nest" / "server.pgid"
 
     result = _run_installer_function(
         "start_server_detached",
@@ -1860,13 +1921,15 @@ def test_failed_child_pid_publication_still_cleans_via_supervisor_identity(
     )
 
     assert result.returncode != 0
-    assert "candidate Kestrel server could not be launched" in result.stderr
-    assert "failed supervisor and child were stopped" in result.stderr
+    diagnostics = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "candidate Kestrel server could not be launched" in result.stderr, diagnostics
+    assert "failed supervisor and child were stopped" in result.stderr, diagnostics
     _wait_for_file(marker)
     child_pid = int(marker.read_text(encoding="ascii").strip())
     assert subprocess.run(["kill", "-0", str(child_pid)], check=False).returncode != 0
     assert not pid_file.exists()
     assert not supervisor_pid_file.exists()
+    assert not process_group_file.exists()
     assert "Proved the failed launch supervisor, full server process group" in result.stdout
 
 

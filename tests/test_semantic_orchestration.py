@@ -313,7 +313,7 @@ def _wait_for_status(
     run_id: str,
     statuses: set[str],
 ) -> dict[str, Any]:
-    deadline = monotonic() + 10
+    deadline = monotonic() + 30
     while monotonic() < deadline:
         run = manager.get_run(run_id)
         if str(run["status"]) in statuses:

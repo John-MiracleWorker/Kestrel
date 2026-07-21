@@ -12,6 +12,10 @@ from typing import Any
 from ..cognition import RetryPolicy
 from ..diagnosis import classify_failure
 from ..platform_primitives import chmod_descriptor
+from ..private_directory import (
+    create_owner_private_directory,
+    validate_owner_private_directory,
+)
 from ..repair_integrity import (
     load_review_receipt,
     load_validation_receipt,
@@ -1337,7 +1341,9 @@ def _preflight_rollback_targets(workspace: Path, paths: list[str]) -> None:
                 parent_metadata = os.lstat(current)
             except FileNotFoundError:
                 break
-            if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+            if _rollback_metadata_is_reparse_point(parent_metadata) or not stat.S_ISDIR(
+                parent_metadata.st_mode
+            ):
                 raise ValueError(f"Rollback path traverses an unsafe parent: {relative}")
         try:
             metadata = os.lstat(candidate)
@@ -1349,6 +1355,8 @@ def _preflight_rollback_targets(workspace: Path, paths: list[str]) -> None:
 
 def _prepare_rollback_quarantine(workspace: Path, rollback_id: str) -> Path:
     root = require_git_root(workspace)
+    if _uses_windows_rollback_path_fallback():
+        return _prepare_rollback_quarantine_path(root, rollback_id)
     root_descriptor = os.open(
         root,
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -1389,8 +1397,10 @@ def _quarantine_rollback_targets(
     quarantine: Path,
     paths: list[str],
 ) -> dict[str, dict[str, object]]:
-    manifest: dict[str, dict[str, object]] = {}
     root = require_git_root(workspace)
+    if _uses_windows_rollback_path_fallback():
+        return _quarantine_rollback_targets_path(root, quarantine, paths)
+    manifest: dict[str, dict[str, object]] = {}
     quarantine_relative = quarantine.relative_to(root)
     quarantine_descriptor = _open_relative_directory_descriptor(root, quarantine_relative)
     try:
@@ -1433,6 +1443,187 @@ def _quarantine_rollback_targets(
     finally:
         os.close(quarantine_descriptor)
     return manifest
+
+
+def _uses_windows_rollback_path_fallback() -> bool:
+    return os.name == "nt"
+
+
+def _prepare_rollback_quarantine_path(workspace: Path, rollback_id: str) -> Path:
+    """Create a private quarantine without relying on Windows dirfd support.
+
+    CPython does not expose directory descriptors or the ``*at`` family on
+    Windows.  Keep the stronger descriptor implementation on POSIX, while the
+    Windows path revalidates every parent identity and gives both quarantine
+    levels a protected owner-private DACL.
+    """
+
+    root = require_git_root(workspace)
+    root_identity = _require_real_rollback_directory(root, "workspace")
+    nest = root / ".nest"
+    nest_identity = _require_real_rollback_directory(nest, ".nest")
+    parent = nest / "repair_rollback_quarantine"
+    try:
+        parent_identity = parent.lstat()
+    except FileNotFoundError:
+        create_owner_private_directory(parent)
+        parent_identity = _require_real_rollback_directory(parent, "repair_rollback_quarantine")
+    else:
+        _validate_real_rollback_directory(parent_identity, "repair_rollback_quarantine")
+        validate_owner_private_directory(parent)
+        _require_same_rollback_identity(
+            parent_identity,
+            parent.lstat(),
+            "Rollback quarantine parent changed during validation.",
+        )
+
+    _revalidate_rollback_path(
+        (
+            (root, root_identity),
+            (nest, nest_identity),
+            (parent, parent_identity),
+        )
+    )
+    quarantine = parent / rollback_id
+    try:
+        create_owner_private_directory(quarantine)
+    except FileExistsError:
+        raise ValueError(f"Rollback quarantine already exists: {rollback_id}") from None
+    quarantine_identity = _require_real_rollback_directory(quarantine, rollback_id)
+    _revalidate_rollback_path(
+        (
+            (root, root_identity),
+            (nest, nest_identity),
+            (parent, parent_identity),
+            (quarantine, quarantine_identity),
+        )
+    )
+    return quarantine
+
+
+def _quarantine_rollback_targets_path(
+    workspace: Path,
+    quarantine: Path,
+    paths: list[str],
+) -> dict[str, dict[str, object]]:
+    manifest: dict[str, dict[str, object]] = {}
+    root = require_git_root(workspace)
+    quarantine_identities = _rollback_directory_identities(
+        root,
+        quarantine,
+        validate_private_leaf=True,
+    )
+    for relative in paths:
+        _preflight_rollback_targets(root, [relative])
+        source = root / Path(relative)
+        try:
+            metadata = source.lstat()
+        except FileNotFoundError:
+            continue
+        parent_identities = _rollback_directory_identities(root, source.parent)
+        stored_name = hashlib.sha256(os.fsencode(relative)).hexdigest()
+        destination = quarantine / stored_name
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(f"Rollback quarantine collision for path: {relative}")
+
+        _revalidate_rollback_path(parent_identities)
+        _revalidate_rollback_path(quarantine_identities)
+        os.replace(source, destination)
+        moved = destination.lstat()
+        _require_same_rollback_identity(
+            metadata,
+            moved,
+            f"Rollback target identity changed while quarantining: {relative}",
+        )
+        try:
+            source.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(f"Rollback target remained after quarantining: {relative}")
+        _revalidate_rollback_path(parent_identities)
+        _revalidate_rollback_path(quarantine_identities)
+        manifest[relative] = {
+            "stored_name": stored_name,
+            "type": "symlink" if stat.S_ISLNK(metadata.st_mode) else "regular",
+            "mode": stat.S_IMODE(metadata.st_mode),
+        }
+    return manifest
+
+
+def _rollback_directory_identities(
+    root: Path,
+    leaf: Path,
+    *,
+    validate_private_leaf: bool = False,
+) -> tuple[tuple[Path, os.stat_result], ...]:
+    relative = leaf.relative_to(root)
+    identities: list[tuple[Path, os.stat_result]] = [
+        (root, _require_real_rollback_directory(root, "workspace"))
+    ]
+    current = root
+    for component in relative.parts:
+        current /= component
+        identities.append((current, _require_real_rollback_directory(current, component)))
+    if validate_private_leaf:
+        validate_owner_private_directory(leaf)
+        _revalidate_rollback_path(tuple(identities))
+    return tuple(identities)
+
+
+def _require_real_rollback_directory(path: Path, name: str) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"Rollback directory is unavailable: {name}") from exc
+    _validate_real_rollback_directory(metadata, name)
+    return metadata
+
+
+def _validate_real_rollback_directory(metadata: os.stat_result, name: str) -> None:
+    if _rollback_metadata_is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"Rollback directory is not a real directory: {name}")
+
+
+def _rollback_metadata_is_reparse_point(metadata: os.stat_result) -> bool:
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def _require_same_rollback_identity(
+    expected: os.stat_result,
+    actual: os.stat_result,
+    message: str,
+) -> None:
+    if (
+        stat.S_IFMT(expected.st_mode),
+        expected.st_dev,
+        expected.st_ino,
+    ) != (
+        stat.S_IFMT(actual.st_mode),
+        actual.st_dev,
+        actual.st_ino,
+    ):
+        raise ValueError(message)
+
+
+def _revalidate_rollback_path(
+    identities: tuple[tuple[Path, os.stat_result], ...],
+) -> None:
+    for path, expected in identities:
+        current = _require_real_rollback_directory(path, path.name or str(path))
+        _require_same_rollback_identity(
+            expected,
+            current,
+            f"Rollback directory identity changed: {path.name or path}",
+        )
 
 
 def _open_relative_directory_descriptor(root: Path, relative: Path) -> int:
@@ -1554,6 +1745,9 @@ def _head_tree_entry(workspace: Path, relative: str) -> tuple[str, str] | None:
 def _restore_literal_blob(workspace: Path, relative: str, mode: str, content: bytes) -> None:
     candidate = workspace / Path(relative)
     parent = workspace
+    parent_identities: list[tuple[Path, os.stat_result]] = [
+        (workspace, _require_real_rollback_directory(workspace, "workspace"))
+    ]
     for component in Path(relative).parts[:-1]:
         parent /= component
         try:
@@ -1561,8 +1755,9 @@ def _restore_literal_blob(workspace: Path, relative: str, mode: str, content: by
         except FileNotFoundError:
             parent.mkdir(mode=0o755)
             metadata = os.lstat(parent)
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        if _rollback_metadata_is_reparse_point(metadata) or not stat.S_ISDIR(metadata.st_mode):
             raise ValueError(f"Rollback path traverses an unsafe parent: {relative}")
+        parent_identities.append((parent, metadata))
     descriptor, temporary_name = tempfile.mkstemp(prefix=".kestrel-rollback-", dir=parent)
     temporary = Path(temporary_name)
     try:
@@ -1580,7 +1775,17 @@ def _restore_literal_blob(workspace: Path, relative: str, mode: str, content: by
                 handle.flush()
                 os.fsync(handle.fileno())
             temporary.chmod(0o755 if mode == "100755" else 0o644)
+        if _uses_windows_rollback_path_fallback():
+            _revalidate_rollback_path(tuple(parent_identities))
         os.replace(temporary, candidate)
+        if _uses_windows_rollback_path_fallback():
+            restored = candidate.lstat()
+            if mode == "120000":
+                if not stat.S_ISLNK(restored.st_mode):
+                    raise ValueError(f"Rollback symlink changed type: {relative}")
+            elif not stat.S_ISREG(restored.st_mode):
+                raise ValueError(f"Rollback file changed type: {relative}")
+            _revalidate_rollback_path(tuple(parent_identities))
     finally:
         if descriptor >= 0:
             os.close(descriptor)

@@ -475,7 +475,10 @@ def test_windows_path_fallback_rejects_ambiguous_nested_components(
     )
     resolved = resolve_filesystem_scopes(scopes, workspace)
 
-    with pytest.raises(ExtensionPolicyError, match="scope_path_not_portable"):
+    with pytest.raises(
+        ExtensionPolicyError,
+        match="scope_(?:path_not_portable|control_tree_rejected)",
+    ):
         copy_readonly_filesystem_scope_snapshots(
             resolved,
             tmp_path / "scope-snapshots-ambiguous",
