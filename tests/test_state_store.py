@@ -262,6 +262,120 @@ def test_regular_state_connections_do_not_reopen_sqlite_sidecars(
     assert store.health_snapshot()["integrity"] == "ok"
 
 
+def test_regular_connection_setup_retries_busy_with_a_fresh_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = AgentStateStore(tmp_path / "retry-busy.db")
+    store.create_run(
+        run_id="run_retry_busy",
+        message="retry only connection setup",
+        session_id="session",
+        workspace=str(tmp_path),
+        provider="mock",
+        model="mock",
+    )
+    real_apply_pragmas = state_store_module._apply_connection_pragmas
+    connections: list[sqlite3.Connection] = []
+
+    def fail_first_setup_with_busy(conn: sqlite3.Connection) -> None:
+        if connections:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+                connections[-1].execute("SELECT 1")
+        connections.append(conn)
+        if len(connections) == 1:
+            error = sqlite3.OperationalError("database is busy")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY | (1 << 8)
+            raise error
+        real_apply_pragmas(conn)
+
+    monkeypatch.setattr(
+        state_store_module,
+        "_apply_connection_pragmas",
+        fail_first_setup_with_busy,
+    )
+
+    assert store.get_run("run_retry_busy").run_id == "run_retry_busy"
+    assert len(connections) == 2
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+
+
+def test_regular_connection_setup_propagates_persistent_busy_after_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = AgentStateStore(tmp_path / "persistent-busy.db")
+    connections: list[sqlite3.Connection] = []
+
+    def always_busy(conn: sqlite3.Connection) -> None:
+        connections.append(conn)
+        error = sqlite3.OperationalError("database is busy")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(state_store_module, "_apply_connection_pragmas", always_busy)
+    monkeypatch.setattr(state_store_module, "sleep", lambda _seconds: None)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is busy"):
+        store.schema_version()
+
+    assert len(connections) == state_store_module._SQLITE_CONNECTION_SETUP_ATTEMPTS
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+
+
+@pytest.mark.parametrize("error_code", [sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_IOERR])
+def test_regular_connection_setup_does_not_retry_non_busy_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: int,
+) -> None:
+    store = AgentStateStore(tmp_path / f"non-busy-{error_code}.db")
+    connections: list[sqlite3.Connection] = []
+
+    def fail_setup(conn: sqlite3.Connection) -> None:
+        connections.append(conn)
+        error = sqlite3.OperationalError("connection setup failed")
+        error.sqlite_errorcode = error_code
+        raise error
+
+    monkeypatch.setattr(state_store_module, "_apply_connection_pragmas", fail_setup)
+
+    with pytest.raises(sqlite3.OperationalError, match="connection setup failed"):
+        store.schema_version()
+
+    assert len(connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connections[0].execute("SELECT 1")
+
+
+def test_regular_connection_does_not_retry_application_sql(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = AgentStateStore(tmp_path / "no-body-retry.db")
+    real_connect = sqlite3.connect
+    connections: list[sqlite3.Connection] = []
+
+    def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(state_store_module.sqlite3, "connect", tracking_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        with store._connect() as connection:
+            connection.execute("SELECT * FROM missing_application_table")
+
+    assert len(connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connections[0].execute("SELECT 1")
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX link semantics differ on Windows")
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
 def test_state_store_rejects_aliased_initialization_lock(

@@ -1298,7 +1298,7 @@ def _open_absolute_directory_descriptor(path: Path, directory_flags: int) -> int
                 )
             child = os.open(part, directory_flags, dir_fd=current)
             opened = os.fstat(child)
-            if not _same_stat_snapshot(metadata, opened):
+            if not _same_stat_identity(metadata, opened):
                 os.close(child)
                 raise ExtensionPolicyError("extension_tree_changed_during_read:.")
             os.close(current)
@@ -1344,7 +1344,12 @@ def _open_declared_scope_descriptor(
             os.close(current)
             current = child
             opened = os.fstat(current)
-            if not _same_stat_snapshot(metadata, opened):
+            unchanged = (
+                _same_stat_snapshot(metadata, opened)
+                if index == len(parts) - 1
+                else _same_stat_identity(metadata, opened)
+            )
+            if not unchanged:
                 raise ExtensionPolicyError(
                     f"extension_scope_changed_during_snapshot:{declared_path}"
                 )

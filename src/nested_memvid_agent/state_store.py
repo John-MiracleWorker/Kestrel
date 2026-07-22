@@ -38,6 +38,8 @@ CAPABILITY_KINDS = frozenset({"tool", "mcp_server", "skill"})
 _STATE_DIRECTORY_MODE = 0o700
 _SQLITE_FILE_MODE = 0o600
 _SQLITE_PRIVATE_SUFFIXES = ("", "-wal", "-shm", "-journal")
+_SQLITE_CONNECTION_SETUP_ATTEMPTS = 5
+_SQLITE_CONNECTION_SETUP_RETRY_BASE_SECONDS = 0.05
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 _ABORTED_RUN_STATUSES = {"failed", "cancelled"}
 _SCHEMA_MIGRATION_LOCK = RLock()
@@ -4551,10 +4553,8 @@ class AgentStateStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=5.0)
+        conn = self._open_configured_connection()
         try:
-            conn.row_factory = sqlite3.Row
-            _apply_connection_pragmas(conn)
             yield conn
         except BaseException:
             conn.rollback()
@@ -4563,6 +4563,29 @@ class AgentStateStore:
             conn.commit()
         finally:
             conn.close()
+
+    def _open_configured_connection(self) -> sqlite3.Connection:
+        """Open a fresh handle, retrying only transient setup-time BUSY errors."""
+
+        for attempt in range(_SQLITE_CONNECTION_SETUP_ATTEMPTS):
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = sqlite3.connect(self.path, check_same_thread=False, timeout=5.0)
+                conn.row_factory = sqlite3.Row
+                _apply_connection_pragmas(conn)
+            except sqlite3.OperationalError as exc:
+                if conn is not None:
+                    conn.close()
+                if not _is_sqlite_busy(exc) or attempt == _SQLITE_CONNECTION_SETUP_ATTEMPTS - 1:
+                    raise
+                sleep(_SQLITE_CONNECTION_SETUP_RETRY_BASE_SECONDS * (attempt + 1))
+            except BaseException:
+                if conn is not None:
+                    conn.close()
+                raise
+            else:
+                return conn
+        raise RuntimeError("Unable to configure SQLite state connection.")
 
 
 def _execute_schema_script(conn: sqlite3.Connection, script: str) -> None:
@@ -5312,6 +5335,11 @@ def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(code, int) and (code & 0xFF) == sqlite3.SQLITE_BUSY
 
 
 _ALLOWED_UPDATE_COLUMNS = {

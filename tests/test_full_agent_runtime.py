@@ -73,6 +73,8 @@ from nested_memvid_agent.validation_runner import (
 )
 
 _ASYNC_TEST_TIMEOUT_SECONDS = 15.0
+_DURABLE_RUN_TIMEOUT_SECONDS = 30.0
+_PUBLIC_RUN_TIMEOUT_SECONDS = 60.0
 
 
 def test_state_store_tracks_runs_and_approvals(tmp_path: Path) -> None:
@@ -3145,6 +3147,72 @@ def test_get_run_waits_for_publication_after_slow_terminal_finalizer(
     assert any(event["type"] == "run.completed" for event in timeline)
 
 
+def test_wait_for_status_separates_durable_and_publication_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    run = manager.state.create_run(
+        run_id="run_wait_for_published_status",
+        message="wait for published status",
+        session_id="session",
+        workspace=str(tmp_path),
+        provider="mock",
+        model="mock",
+    )
+    terminal_transitioned = Event()
+    release_publication = Event()
+    public_poll_started = Event()
+    listed_statuses: list[str] = []
+    get_run_calls = 0
+
+    def slow_finalizer(run_id: str) -> None:
+        manager.state.transition_run(run_id, "running")
+        manager.state.transition_run(run_id, "completed", stop_reason="complete")
+        terminal_transitioned.set()
+        assert release_publication.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+
+    original_list_runs = manager.list_runs_for_session
+
+    def observed_list_runs(session_id: str) -> list[dict[str, object]]:
+        listed = original_list_runs(session_id)
+        observed = next(item for item in listed if item["run_id"] == run.run_id)
+        listed_statuses.append(str(observed["status"]))
+        public_poll_started.set()
+        return listed
+
+    original_get_run = manager.get_run
+
+    def observed_get_run(run_id: str) -> dict[str, object]:
+        nonlocal get_run_calls
+        get_run_calls += 1
+        assert release_publication.is_set()
+        return original_get_run(run_id)
+
+    monkeypatch.setattr(manager, "list_runs_for_session", observed_list_runs)
+    monkeypatch.setattr(manager, "get_run", observed_get_run)
+    manager._schedule_primary_run(run.run_id, slow_finalizer)
+    assert terminal_transitioned.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+
+    def release_after_public_poll() -> None:
+        assert public_poll_started.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        release_publication.set()
+
+    release_thread = Thread(target=release_after_public_poll)
+    release_thread.start()
+    try:
+        observed = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    finally:
+        release_publication.set()
+        release_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+
+    assert not release_thread.is_alive()
+    assert listed_statuses[0] == "running"
+    assert listed_statuses[-1] == "completed"
+    assert get_run_calls == 1
+    assert observed["status"] == "completed"
+
+
 def test_cancelling_queued_run_finishes_publication_fence_without_worker(
     tmp_path: Path,
 ) -> None:
@@ -4232,6 +4300,7 @@ def test_chained_scheduler_approval_block_event_uses_live_second_grant(
         return event
 
     manager.events.publish = approve_first_request  # type: ignore[method-assign]
+    subscriber = manager.events.subscribe(run.run_id)
 
     def initial_scheduler(active_run_id: str) -> None:
         with manager._run_lease(active_run_id, manager.config) as lease:
@@ -4256,30 +4325,78 @@ def test_chained_scheduler_approval_block_event_uses_live_second_grant(
                     stop_reason="approval_required",
                 )
 
-    manager._reserve_primary_run(run.run_id)
-    manager._schedule_primary_run(run.run_id, initial_scheduler)
-    assert _wait_until(
-        lambda: len(requested_ids) == 2 and manager.state.get_run(run.run_id).status == "blocked"
-    )
-    second = manager.state.get_approval(requested_ids[1])
-    assert second["status"] == "pending"
-    assert _wait_until(
-        lambda: any(
-            event["type"] == "run.blocked"
-            and event["payload"].get("approval_id") == requested_ids[1]
-            for event in manager.state.list_run_steps(run.run_id)
+    observed: list[dict[str, Any]] = []
+    approval_ids: list[str] = []
+    deadline = monotonic() + _DURABLE_RUN_TIMEOUT_SECONDS
+    try:
+        manager._reserve_primary_run(run.run_id)
+        manager._schedule_primary_run(run.run_id, initial_scheduler)
+        while monotonic() < deadline:
+            try:
+                event = subscriber.get(timeout=max(0.0, deadline - monotonic()))
+            except Empty:
+                break
+            observed.append({"type": event.type, "payload": event.payload})
+            if event.type == "approval.requested":
+                approval_ids.append(str(event.payload["approval_id"]))
+            if event.type in {
+                "run.admission_failed",
+                "run.admission_reconciliation_deferred",
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+            }:
+                raise AssertionError(
+                    {
+                        "expected": "second approval blocked handoff",
+                        "unexpected_terminal_event": observed[-1],
+                        "run": manager.state.get_run(run.run_id),
+                        "approvals": manager.state.list_approvals(expire=False),
+                        "tasks": manager.state.list_task_nodes(run.run_id),
+                        "capacity": manager.capacity_snapshot(),
+                        "observed": observed[-20:],
+                    }
+                )
+            if (
+                len(approval_ids) == 2
+                and event.type == "run.blocked"
+                and event.payload.get("approval_id") == approval_ids[1]
+            ):
+                break
+    finally:
+        manager.events.unsubscribe(run.run_id, subscriber)
+
+    if (
+        len(approval_ids) != 2
+        or not observed
+        or observed[-1]["type"] != "run.blocked"
+        or observed[-1]["payload"].get("approval_id") != approval_ids[1]
+    ):
+        raise AssertionError(
+            {
+                "expected": "second approval blocked handoff",
+                "run": manager.state.get_run(run.run_id),
+                "approvals": manager.state.list_approvals(expire=False),
+                "tasks": manager.state.list_task_nodes(run.run_id),
+                "capacity": manager.capacity_snapshot(),
+                "observed": observed[-20:],
+            }
         )
-    )
+
+    assert requested_ids == approval_ids
+    assert approval_ids[1] != approval_ids[0]
+    assert manager.state.get_run(run.run_id).status == "blocked"
+    second = manager.state.get_approval(approval_ids[1])
+    assert second["status"] == "pending"
     blocked_events = [
         event
         for event in manager.state.list_run_steps(run.run_id)
         if event["type"] == "run.blocked" and "approval_id" in event["payload"]
     ]
-    assert blocked_events[-1]["payload"]["approval_id"] == requested_ids[1]
-    assert blocked_events[-1]["payload"]["approval_id"] != requested_ids[0]
+    assert blocked_events[-1]["payload"]["approval_id"] == approval_ids[1]
 
     manager.decide_approval(
-        requested_ids[1],
+        approval_ids[1],
         approved=True,
         arguments=dict(second["arguments"]),
     )
@@ -5518,7 +5635,13 @@ def test_stale_scheduler_generation_cannot_heartbeat_or_commit_claimed_pair(
         model="mock",
     )
     owner_a = "manager_999999_generation_a"
-    lease_a = state.acquire_run_lease(run.run_id, owner=owner_a, ttl_seconds=1.0)
+    lease_epoch = datetime.now(UTC)
+    lease_a = state.acquire_run_lease(
+        run.run_id,
+        owner=owner_a,
+        ttl_seconds=30.0,
+        now=lease_epoch,
+    )
     assert lease_a is not None
     state.transition_run(
         run.run_id,
@@ -5565,7 +5688,7 @@ def test_stale_scheduler_generation_cannot_heartbeat_or_commit_claimed_pair(
         run.run_id,
         owner="manager_999999_generation_b",
         ttl_seconds=30.0,
-        now=datetime.now(UTC) + timedelta(seconds=2),
+        now=lease_epoch + timedelta(seconds=31),
     )
     assert lease_b is not None
     assert lease_b.lease_generation == lease_a.lease_generation + 1
@@ -7445,13 +7568,62 @@ def _active_scheduler_run(
 
 
 def _wait_for_status(manager: RunManager, run_id: str, statuses: set[str]) -> dict[str, object]:
-    deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
-    while monotonic() < deadline:
-        run = manager.get_run(run_id)
-        if str(run["status"]) in statuses:
-            return run
-        sleep(0.05)
-    raise AssertionError(f"run {run_id} did not reach {statuses}")
+    durable_deadline = monotonic() + _DURABLE_RUN_TIMEOUT_SECONDS
+    while True:
+        durable = manager.state.get_run(run_id)
+        if durable.status in statuses:
+            break
+        remaining = durable_deadline - monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                {
+                    "run_id": run_id,
+                    "expected_statuses": sorted(statuses),
+                    "phase": "durable",
+                    "durable_status": durable.status,
+                    "durable_stop_reason": durable.stop_reason,
+                    "durable_error": durable.error,
+                }
+            )
+        sleep(min(0.05, remaining))
+
+    public_deadline = monotonic() + _PUBLIC_RUN_TIMEOUT_SECONDS
+    while True:
+        listed = next(
+            (
+                candidate
+                for candidate in manager.list_runs_for_session(durable.session_id)
+                if candidate["run_id"] == run_id
+            ),
+            None,
+        )
+        if listed is not None and str(listed["status"]) in statuses:
+            break
+        remaining = public_deadline - monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                {
+                    "run_id": run_id,
+                    "expected_statuses": sorted(statuses),
+                    "phase": "publication",
+                    "durable_status": manager.state.get_run(run_id).status,
+                    "public_run": listed,
+                }
+            )
+        sleep(min(0.05, remaining))
+
+    run = manager.get_run(run_id)
+    if str(run["status"]) not in statuses:
+        raise AssertionError(
+            {
+                "run_id": run_id,
+                "expected_statuses": sorted(statuses),
+                "phase": "published_read",
+                "durable_status": manager.state.get_run(run_id).status,
+                "public_run": run,
+            }
+        )
+    return run
 
 
 def _wait_until(predicate: Any, timeout: float = _ASYNC_TEST_TIMEOUT_SECONDS) -> bool:
