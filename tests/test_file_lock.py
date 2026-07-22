@@ -25,11 +25,11 @@ def test_windows_nonblocking_lock_contention_has_portable_exception(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows LockFileEx semantics")
-def test_windows_shared_locks_allow_one_runtime_to_open_multiple_layers(
+def test_windows_empty_file_preserves_shared_and_exclusive_lock_semantics(
     tmp_path: Path,
 ) -> None:
     lock_path = tmp_path / "memory.lock"
-    lock_path.write_text("0", encoding="utf-8")
+    lock_path.touch()
 
     with (
         lock_path.open("r+", encoding="utf-8") as first,
@@ -47,3 +47,5 @@ def test_windows_shared_locks_allow_one_runtime_to_open_multiple_layers(
 
         lock_exclusive(contender, blocking=False)
         unlock(contender)
+
+    assert lock_path.read_bytes() == b""

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import os
 import sys
 from typing import IO, Any
 
@@ -51,7 +50,6 @@ else:
 
 def lock_shared(handle: IO[str], *, blocking: bool = True) -> None:
     if sys.platform == "win32":
-        _ensure_lock_byte(handle)
         _windows_lock(handle, exclusive=False, blocking=blocking)
         return
     operation = _fcntl.LOCK_SH | (0 if blocking else _fcntl.LOCK_NB)
@@ -60,7 +58,6 @@ def lock_shared(handle: IO[str], *, blocking: bool = True) -> None:
 
 def lock_exclusive(handle: IO[str], *, blocking: bool = True) -> None:
     if sys.platform == "win32":
-        _ensure_lock_byte(handle)
         _windows_lock(handle, exclusive=True, blocking=blocking)
         return
     operation = _fcntl.LOCK_EX | (0 if blocking else _fcntl.LOCK_NB)
@@ -73,15 +70,6 @@ def unlock(handle: IO[str]) -> None:
         _windows_unlock(handle)
         return
     _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
-
-
-def _ensure_lock_byte(handle: IO[str]) -> None:
-    handle.seek(0, os.SEEK_END)
-    if handle.tell() == 0:
-        handle.write("0")
-        handle.flush()
-        os.fsync(handle.fileno())
-    handle.seek(0)
 
 
 if sys.platform == "win32":
