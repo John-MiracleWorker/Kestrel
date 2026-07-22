@@ -5518,7 +5518,13 @@ def test_stale_scheduler_generation_cannot_heartbeat_or_commit_claimed_pair(
         model="mock",
     )
     owner_a = "manager_999999_generation_a"
-    lease_a = state.acquire_run_lease(run.run_id, owner=owner_a, ttl_seconds=1.0)
+    lease_epoch = datetime.now(UTC)
+    lease_a = state.acquire_run_lease(
+        run.run_id,
+        owner=owner_a,
+        ttl_seconds=30.0,
+        now=lease_epoch,
+    )
     assert lease_a is not None
     state.transition_run(
         run.run_id,
@@ -5565,7 +5571,7 @@ def test_stale_scheduler_generation_cannot_heartbeat_or_commit_claimed_pair(
         run.run_id,
         owner="manager_999999_generation_b",
         ttl_seconds=30.0,
-        now=datetime.now(UTC) + timedelta(seconds=2),
+        now=lease_epoch + timedelta(seconds=31),
     )
     assert lease_b is not None
     assert lease_b.lease_generation == lease_a.lease_generation + 1
