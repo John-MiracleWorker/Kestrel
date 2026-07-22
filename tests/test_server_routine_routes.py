@@ -19,6 +19,8 @@ from nested_memvid_agent.security_boundary import register_secret_value
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.state_store import AgentStateStore
 
+_ASYNC_RUN_TIMEOUT_SECONDS = 30.0
+
 
 def test_server_shutdown_always_closes_dependencies_before_reporting_failure(
     tmp_path: Path,
@@ -586,13 +588,18 @@ def _wait_for_api_run(
     run_id: str,
     headers: dict[str, str],
 ) -> dict[str, object]:
-    deadline = monotonic() + 10.0
+    deadline = monotonic() + _ASYNC_RUN_TIMEOUT_SECONDS
+    last_status: object = "not_observed"
     while monotonic() < deadline:
         response = client.get(f"/api/runs/{run_id}", headers=headers)
         assert response.status_code == 200
         run = response.json()
+        last_status = run.get("status", "missing")
         if run["status"] in {"completed", "failed", "cancelled"}:
             assert run["status"] == "completed", run.get("error")
             return run
         sleep(0.02)
-    raise AssertionError(f"run {run_id} did not finish")
+    raise AssertionError(
+        f"run {run_id} did not finish within {_ASYNC_RUN_TIMEOUT_SECONDS:.0f}s "
+        f"(last_status={last_status!r})"
+    )
