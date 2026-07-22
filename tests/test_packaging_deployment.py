@@ -246,6 +246,7 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "urllib.request.urlretrieve" in dockerfile
     assert "sha256sum -c -" in dockerfile
     assert "import memvid_sdk; assert callable(memvid_sdk.create)" in dockerfile
+    assert "! perl -MStorable -e 1 >/dev/null 2>&1" in dockerfile
     assert "test -f /app/LICENSE" in dockerfile
     assert "chmod a-s /usr/bin/mount /usr/bin/umount /usr/bin/su" in dockerfile
     assert "test ! -u /usr/bin/mount" in dockerfile

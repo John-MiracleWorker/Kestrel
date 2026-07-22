@@ -128,6 +128,7 @@ RUN python -m pip install \
     && python -m pip install --no-deps --no-build-isolation -e ".[${INSTALL_EXTRAS}]" \
     && python -c "import keyring; assert callable(keyring.get_keyring)" \
     && python -c "import memvid_sdk; assert callable(memvid_sdk.create); assert callable(memvid_sdk.use)" \
+    && ! perl -MStorable -e 1 >/dev/null 2>&1 \
     && test -f /app/LICENSE \
     && test ! -u /usr/bin/mount \
     && test ! -u /usr/bin/umount \
