@@ -4300,6 +4300,7 @@ def test_chained_scheduler_approval_block_event_uses_live_second_grant(
         return event
 
     manager.events.publish = approve_first_request  # type: ignore[method-assign]
+    subscriber = manager.events.subscribe(run.run_id)
 
     def initial_scheduler(active_run_id: str) -> None:
         with manager._run_lease(active_run_id, manager.config) as lease:
@@ -4324,30 +4325,78 @@ def test_chained_scheduler_approval_block_event_uses_live_second_grant(
                     stop_reason="approval_required",
                 )
 
-    manager._reserve_primary_run(run.run_id)
-    manager._schedule_primary_run(run.run_id, initial_scheduler)
-    assert _wait_until(
-        lambda: len(requested_ids) == 2 and manager.state.get_run(run.run_id).status == "blocked"
-    )
-    second = manager.state.get_approval(requested_ids[1])
-    assert second["status"] == "pending"
-    assert _wait_until(
-        lambda: any(
-            event["type"] == "run.blocked"
-            and event["payload"].get("approval_id") == requested_ids[1]
-            for event in manager.state.list_run_steps(run.run_id)
+    observed: list[dict[str, Any]] = []
+    approval_ids: list[str] = []
+    deadline = monotonic() + _DURABLE_RUN_TIMEOUT_SECONDS
+    try:
+        manager._reserve_primary_run(run.run_id)
+        manager._schedule_primary_run(run.run_id, initial_scheduler)
+        while monotonic() < deadline:
+            try:
+                event = subscriber.get(timeout=max(0.0, deadline - monotonic()))
+            except Empty:
+                break
+            observed.append({"type": event.type, "payload": event.payload})
+            if event.type == "approval.requested":
+                approval_ids.append(str(event.payload["approval_id"]))
+            if event.type in {
+                "run.admission_failed",
+                "run.admission_reconciliation_deferred",
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+            }:
+                raise AssertionError(
+                    {
+                        "expected": "second approval blocked handoff",
+                        "unexpected_terminal_event": observed[-1],
+                        "run": manager.state.get_run(run.run_id),
+                        "approvals": manager.state.list_approvals(expire=False),
+                        "tasks": manager.state.list_task_nodes(run.run_id),
+                        "capacity": manager.capacity_snapshot(),
+                        "observed": observed[-20:],
+                    }
+                )
+            if (
+                len(approval_ids) == 2
+                and event.type == "run.blocked"
+                and event.payload.get("approval_id") == approval_ids[1]
+            ):
+                break
+    finally:
+        manager.events.unsubscribe(run.run_id, subscriber)
+
+    if (
+        len(approval_ids) != 2
+        or not observed
+        or observed[-1]["type"] != "run.blocked"
+        or observed[-1]["payload"].get("approval_id") != approval_ids[1]
+    ):
+        raise AssertionError(
+            {
+                "expected": "second approval blocked handoff",
+                "run": manager.state.get_run(run.run_id),
+                "approvals": manager.state.list_approvals(expire=False),
+                "tasks": manager.state.list_task_nodes(run.run_id),
+                "capacity": manager.capacity_snapshot(),
+                "observed": observed[-20:],
+            }
         )
-    )
+
+    assert requested_ids == approval_ids
+    assert approval_ids[1] != approval_ids[0]
+    assert manager.state.get_run(run.run_id).status == "blocked"
+    second = manager.state.get_approval(approval_ids[1])
+    assert second["status"] == "pending"
     blocked_events = [
         event
         for event in manager.state.list_run_steps(run.run_id)
         if event["type"] == "run.blocked" and "approval_id" in event["payload"]
     ]
-    assert blocked_events[-1]["payload"]["approval_id"] == requested_ids[1]
-    assert blocked_events[-1]["payload"]["approval_id"] != requested_ids[0]
+    assert blocked_events[-1]["payload"]["approval_id"] == approval_ids[1]
 
     manager.decide_approval(
-        requested_ids[1],
+        approval_ids[1],
         approved=True,
         arguments=dict(second["arguments"]),
     )

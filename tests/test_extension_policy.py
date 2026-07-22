@@ -247,6 +247,219 @@ def test_extension_tree_digest_binds_files_and_snapshot_rejects_symlinks(tmp_pat
         extension_tree_digest(source)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="descriptor traversal is POSIX-only")
+def test_extension_tree_allows_metadata_churn_in_an_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ancestor = tmp_path / "changing-ancestor"
+    source = ancestor / "skill"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("Run safely.\n", encoding="utf-8")
+    real_open = os.open
+    directory_flags = extension_policy._required_directory_flags(
+        "extension_snapshot_platform_unsupported"
+    )
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    ancestor_before = ancestor.stat()
+    churned = False
+
+    def open_after_ancestor_churn(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal churned
+        opened_parent = os.fstat(dir_fd) if dir_fd is not None else None
+        if (
+            not churned
+            and path == ancestor.name
+            and opened_parent is not None
+            and (opened_parent.st_dev, opened_parent.st_ino) == parent_identity
+        ):
+            metadata = ancestor.stat()
+            os.utime(
+                ancestor,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 2_000_000_000),
+            )
+            churned = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        extension_policy,
+        "_required_directory_flags",
+        lambda _error: directory_flags,
+    )
+    monkeypatch.setattr(extension_policy.os, "open", open_after_ancestor_churn)
+
+    assert extension_tree_digest(source).startswith("sha256:")
+    assert churned is True
+    ancestor_after = ancestor.stat()
+    assert extension_policy._same_stat_identity(ancestor_before, ancestor_after)
+    assert not extension_policy._same_stat_snapshot(ancestor_before, ancestor_after)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor traversal is POSIX-only")
+def test_extension_tree_still_rejects_target_churn_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ancestor = tmp_path / "stable-ancestor"
+    source = ancestor / "skill"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("Run safely.\n", encoding="utf-8")
+    real_open = os.open
+    directory_flags = extension_policy._required_directory_flags(
+        "extension_snapshot_platform_unsupported"
+    )
+    parent_identity = (ancestor.stat().st_dev, ancestor.stat().st_ino)
+    churned = False
+
+    def open_after_target_churn(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal churned
+        opened_parent = os.fstat(dir_fd) if dir_fd is not None else None
+        if (
+            not churned
+            and path == source.name
+            and opened_parent is not None
+            and (opened_parent.st_dev, opened_parent.st_ino) == parent_identity
+        ):
+            (source / "raced.txt").write_text("changed\n", encoding="utf-8")
+            churned = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        extension_policy,
+        "_required_directory_flags",
+        lambda _error: directory_flags,
+    )
+    monkeypatch.setattr(extension_policy.os, "open", open_after_target_churn)
+
+    with pytest.raises(ExtensionPolicyError, match="changed_during_read"):
+        extension_tree_digest(source)
+    assert churned is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor traversal is POSIX-only")
+def test_extension_tree_rejects_ancestor_identity_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ancestor = tmp_path / "original-ancestor"
+    source = ancestor / "skill"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("Run safely.\n", encoding="utf-8")
+    displaced = tmp_path / "displaced-ancestor"
+    real_open = os.open
+    directory_flags = extension_policy._required_directory_flags(
+        "extension_snapshot_platform_unsupported"
+    )
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    swapped = False
+
+    def open_after_ancestor_swap(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        opened_parent = os.fstat(dir_fd) if dir_fd is not None else None
+        if (
+            not swapped
+            and path == ancestor.name
+            and opened_parent is not None
+            and (opened_parent.st_dev, opened_parent.st_ino) == parent_identity
+        ):
+            ancestor.rename(displaced)
+            ancestor.mkdir()
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        extension_policy,
+        "_required_directory_flags",
+        lambda _error: directory_flags,
+    )
+    monkeypatch.setattr(extension_policy.os, "open", open_after_ancestor_swap)
+
+    with pytest.raises(ExtensionPolicyError, match="changed_during_read"):
+        extension_tree_digest(source)
+    assert swapped is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor traversal is POSIX-only")
+def test_read_scope_allows_metadata_churn_in_an_intermediate_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    ancestor = workspace / "changing-ancestor"
+    granted = ancestor / "granted"
+    granted.mkdir(parents=True)
+    (granted / "payload.txt").write_text("bounded\n", encoding="utf-8")
+    scopes = parse_extension_scopes(
+        {"filesystem": [{"path": "changing-ancestor/granted", "access": "read"}]}
+    )
+    resolved = resolve_filesystem_scopes(scopes, workspace)
+    real_open = os.open
+    directory_flags = extension_policy._required_scope_directory_flags()
+    workspace_identity = (workspace.stat().st_dev, workspace.stat().st_ino)
+    ancestor_before = ancestor.stat()
+    churned = False
+
+    def open_after_scope_ancestor_churn(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal churned
+        opened_parent = os.fstat(dir_fd) if dir_fd is not None else None
+        if (
+            not churned
+            and path == ancestor.name
+            and opened_parent is not None
+            and (opened_parent.st_dev, opened_parent.st_ino) == workspace_identity
+        ):
+            metadata = ancestor.stat()
+            os.utime(
+                ancestor,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 2_000_000_000),
+            )
+            churned = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        extension_policy,
+        "_required_scope_directory_flags",
+        lambda: directory_flags,
+    )
+    monkeypatch.setattr(extension_policy.os, "open", open_after_scope_ancestor_churn)
+
+    copied = copy_readonly_filesystem_scope_snapshots(
+        resolved,
+        tmp_path / "scope-snapshots",
+        workspace=workspace,
+    )
+
+    assert copied[0].source.joinpath("payload.txt").read_text(encoding="utf-8") == "bounded\n"
+    assert churned is True
+    ancestor_after = ancestor.stat()
+    assert extension_policy._same_stat_identity(ancestor_before, ancestor_after)
+    assert not extension_policy._same_stat_snapshot(ancestor_before, ancestor_after)
+
+
 def test_filesystem_scope_rejects_nested_control_tree_and_hardlinks(
     tmp_path: Path,
 ) -> None:
