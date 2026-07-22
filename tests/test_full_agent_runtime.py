@@ -73,6 +73,8 @@ from nested_memvid_agent.validation_runner import (
 )
 
 _ASYNC_TEST_TIMEOUT_SECONDS = 15.0
+_DURABLE_RUN_TIMEOUT_SECONDS = 30.0
+_PUBLIC_RUN_TIMEOUT_SECONDS = 60.0
 
 
 def test_state_store_tracks_runs_and_approvals(tmp_path: Path) -> None:
@@ -3143,6 +3145,72 @@ def test_get_run_waits_for_publication_after_slow_terminal_finalizer(
     timeline = manager.state.list_run_steps(run.run_id)
     assert observed["status"] == "completed"
     assert any(event["type"] == "run.completed" for event in timeline)
+
+
+def test_wait_for_status_separates_durable_and_publication_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    run = manager.state.create_run(
+        run_id="run_wait_for_published_status",
+        message="wait for published status",
+        session_id="session",
+        workspace=str(tmp_path),
+        provider="mock",
+        model="mock",
+    )
+    terminal_transitioned = Event()
+    release_publication = Event()
+    public_poll_started = Event()
+    listed_statuses: list[str] = []
+    get_run_calls = 0
+
+    def slow_finalizer(run_id: str) -> None:
+        manager.state.transition_run(run_id, "running")
+        manager.state.transition_run(run_id, "completed", stop_reason="complete")
+        terminal_transitioned.set()
+        assert release_publication.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+
+    original_list_runs = manager.list_runs_for_session
+
+    def observed_list_runs(session_id: str) -> list[dict[str, object]]:
+        listed = original_list_runs(session_id)
+        observed = next(item for item in listed if item["run_id"] == run.run_id)
+        listed_statuses.append(str(observed["status"]))
+        public_poll_started.set()
+        return listed
+
+    original_get_run = manager.get_run
+
+    def observed_get_run(run_id: str) -> dict[str, object]:
+        nonlocal get_run_calls
+        get_run_calls += 1
+        assert release_publication.is_set()
+        return original_get_run(run_id)
+
+    monkeypatch.setattr(manager, "list_runs_for_session", observed_list_runs)
+    monkeypatch.setattr(manager, "get_run", observed_get_run)
+    manager._schedule_primary_run(run.run_id, slow_finalizer)
+    assert terminal_transitioned.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+
+    def release_after_public_poll() -> None:
+        assert public_poll_started.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        release_publication.set()
+
+    release_thread = Thread(target=release_after_public_poll)
+    release_thread.start()
+    try:
+        observed = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+    finally:
+        release_publication.set()
+        release_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+
+    assert not release_thread.is_alive()
+    assert listed_statuses[0] == "running"
+    assert listed_statuses[-1] == "completed"
+    assert get_run_calls == 1
+    assert observed["status"] == "completed"
 
 
 def test_cancelling_queued_run_finishes_publication_fence_without_worker(
@@ -7451,13 +7519,62 @@ def _active_scheduler_run(
 
 
 def _wait_for_status(manager: RunManager, run_id: str, statuses: set[str]) -> dict[str, object]:
-    deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
-    while monotonic() < deadline:
-        run = manager.get_run(run_id)
-        if str(run["status"]) in statuses:
-            return run
-        sleep(0.05)
-    raise AssertionError(f"run {run_id} did not reach {statuses}")
+    durable_deadline = monotonic() + _DURABLE_RUN_TIMEOUT_SECONDS
+    while True:
+        durable = manager.state.get_run(run_id)
+        if durable.status in statuses:
+            break
+        remaining = durable_deadline - monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                {
+                    "run_id": run_id,
+                    "expected_statuses": sorted(statuses),
+                    "phase": "durable",
+                    "durable_status": durable.status,
+                    "durable_stop_reason": durable.stop_reason,
+                    "durable_error": durable.error,
+                }
+            )
+        sleep(min(0.05, remaining))
+
+    public_deadline = monotonic() + _PUBLIC_RUN_TIMEOUT_SECONDS
+    while True:
+        listed = next(
+            (
+                candidate
+                for candidate in manager.list_runs_for_session(durable.session_id)
+                if candidate["run_id"] == run_id
+            ),
+            None,
+        )
+        if listed is not None and str(listed["status"]) in statuses:
+            break
+        remaining = public_deadline - monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                {
+                    "run_id": run_id,
+                    "expected_statuses": sorted(statuses),
+                    "phase": "publication",
+                    "durable_status": manager.state.get_run(run_id).status,
+                    "public_run": listed,
+                }
+            )
+        sleep(min(0.05, remaining))
+
+    run = manager.get_run(run_id)
+    if str(run["status"]) not in statuses:
+        raise AssertionError(
+            {
+                "run_id": run_id,
+                "expected_statuses": sorted(statuses),
+                "phase": "published_read",
+                "durable_status": manager.state.get_run(run_id).status,
+                "public_run": run,
+            }
+        )
+    return run
 
 
 def _wait_until(predicate: Any, timeout: float = _ASYNC_TEST_TIMEOUT_SECONDS) -> bool:
