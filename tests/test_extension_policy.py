@@ -267,7 +267,7 @@ def test_extension_tree_allows_metadata_churn_in_an_ancestor(
     def open_after_ancestor_churn(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         flags: int,
-        mode: int = 0o777,
+        mode: int = 0o600,
         *,
         dir_fd: int | None = None,
     ) -> int:
@@ -320,7 +320,7 @@ def test_extension_tree_still_rejects_target_churn_during_open(
     def open_after_target_churn(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         flags: int,
-        mode: int = 0o777,
+        mode: int = 0o600,
         *,
         dir_fd: int | None = None,
     ) -> int:
@@ -368,7 +368,7 @@ def test_extension_tree_rejects_ancestor_identity_swap(
     def open_after_ancestor_swap(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         flags: int,
-        mode: int = 0o777,
+        mode: int = 0o600,
         *,
         dir_fd: int | None = None,
     ) -> int:
@@ -420,7 +420,7 @@ def test_read_scope_allows_metadata_churn_in_an_intermediate_ancestor(
     def open_after_scope_ancestor_churn(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         flags: int,
-        mode: int = 0o777,
+        mode: int = 0o600,
         *,
         dir_fd: int | None = None,
     ) -> int:
