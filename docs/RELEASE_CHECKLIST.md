@@ -48,17 +48,127 @@ KESTREL_EXTENSION_TEST_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dc
 python -m pytest -q tests/integration/test_extension_container_integration.py
 ```
 
-## Optional Live-Provider Validation
+## Provider Certification
 
-Run the cases for each provider claimed by the release when credentials and endpoints are available:
+Live execution is optional for providers the release does not claim. It is mandatory for every
+provider/model/profile claimed as release-certified. Run the provider and learning cases against
+the exact candidate and retain their structured outputs. Console output, a skipped case,
+credential presence, and an old report are not certification evidence. The credentialed job must
+provide conservative pytest JUnit XML (or an exact
+`kestrel.provider_certification_cases.v1` source) plus the required
+`kestrel.live_learning_eval.v1` memory and Memvid sources. Then collect a receipt and build a report
+bound to the reviewed candidate. Replace the example provider, model, source paths, and profile for
+each claimed row:
 
 ```bash
-RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
-OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memory
-OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid
-python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
-python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
+RELEASE_COMMIT_SHA="$(git rev-parse 'HEAD^{commit}')"
+RELEASE_TREE_DIGEST="$(git archive --format=tar "$RELEASE_COMMIT_SHA" | python -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+PROVIDER='ollama-cloud'
+MODEL='gpt-oss:120b'
+PROFILE='release'
+ARTIFACT_DIR="${RUNNER_TEMP:-$(mktemp -d)}/provider-certification"
+mkdir -p "$ARTIFACT_DIR"
+STARTED_AT="$(python -c 'from datetime import UTC,datetime; print(datetime.now(UTC).isoformat().replace("+00:00", "Z"))')"
+
+test -n "${OLLAMA_API_KEY:-}"  # injected by the controlled release environment
+export KESTREL_IT_OLLAMA_CLOUD_MODEL="$MODEL"
+RUN_PROVIDER_INTEGRATION=1 python -m pytest -q \
+  "tests/integration/test_provider_live_integration.py::test_live_provider_generate_smoke[$PROVIDER]" \
+  "tests/integration/test_provider_live_integration.py::test_live_provider_stream_smoke[$PROVIDER]" \
+  "tests/integration/test_provider_live_integration.py::test_live_provider_native_tool_call_certification[$PROVIDER]" \
+  --junitxml="$ARTIFACT_DIR/provider-cases.xml"
+
+python scripts/run_live_learning_eval.py \
+  --provider "$PROVIDER" --model "$MODEL" --backend memory \
+  --output-root /tmp/kestrel-live-learning-memory \
+  > "$ARTIFACT_DIR/live-learning-memory.json"
+python scripts/run_live_learning_eval.py \
+  --provider "$PROVIDER" --model "$MODEL" --backend memvid \
+  --output-root /tmp/kestrel-live-learning-memvid \
+  > "$ARTIFACT_DIR/live-learning-memvid.json"
+COMPLETED_AT="$(python -c 'from datetime import UTC,datetime; print(datetime.now(UTC).isoformat().replace("+00:00", "Z"))')"
+
+python scripts/run_provider_certification.py collect \
+  --provider "$PROVIDER" \
+  --model "$MODEL" \
+  --profile "$PROFILE" \
+  --level release \
+  --source "$ARTIFACT_DIR/provider-cases.xml" \
+  --source "$ARTIFACT_DIR/live-learning-memory.json" \
+  --source "$ARTIFACT_DIR/live-learning-memvid.json" \
+  --commit "$RELEASE_COMMIT_SHA" \
+  --tree-digest "$RELEASE_TREE_DIGEST" \
+  --runner-kind release_ci \
+  --trusted-runner \
+  --started-at "$STARTED_AT" \
+  --completed-at "$COMPLETED_AT" \
+  --output "$ARTIFACT_DIR/receipt-${PROVIDER}.json"
+EVIDENCE_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["evidence_id"])' "$ARTIFACT_DIR/receipt-${PROVIDER}.json")"
+
+python scripts/run_provider_certification.py build \
+  --commit "$RELEASE_COMMIT_SHA" \
+  --tree-digest "$RELEASE_TREE_DIGEST" \
+  --evidence "$ARTIFACT_DIR/receipt-${PROVIDER}.json" \
+  --authenticated-evidence-id "$EVIDENCE_ID" \
+  --release-target "$PROVIDER" \
+  --max-evidence-age-hours 168 \
+  --output "$ARTIFACT_DIR/provider-certification.json"
+
+python scripts/run_provider_certification.py check \
+  --report "$ARTIFACT_DIR/provider-certification.json" \
+  --provider "$PROVIDER" \
+  --require-state release_certified
 ```
+
+Repeat `--evidence`, `--authenticated-evidence-id`, and `--release-target` when building a
+multi-provider report, then run `check` once for every provider claimed by the release.
+`--trusted-runner` and authentication IDs assert release authority and must be supplied only by the
+controlled CI/release path, never inferred from an uploaded receipt. Publish or retain the
+resulting exact-subject JSON with the release evidence; do not commit it as a timeless description
+of `main`. When the tested model, endpoint, or API-key environment differs from built-in defaults,
+pass the same redacted `--config` to both `collect` and `build` so the configuration digest remains
+exact.
+
+Every receipt contains a required, sorted, unique `source_digests` list with the SHA-256 digest of
+each exact source consumed by the collector. The core derives the full canonical
+evidence ID from those digests and all other receipt content; callers cannot choose or override the
+ID. Changing a source or receipt field therefore changes the ID that the release channel must
+authenticate.
+
+Evidence levels accept only these profile and runner combinations:
+
+| Evidence level | Eligible profiles | Eligible runner kinds |
+|---|---|---|
+| `mock` | `default`, `mock`, `release` | `mock`, `ci`, `local`, `release_ci` |
+| `credential_free` | `default`, `credential_free`, `release` | `ci`, `local`, `release_ci` |
+| `live` | `default`, `live`, `release` | `local`, `release_ci` |
+| `release` | `release` | `release_ci` |
+
+An ineligible combination remains non-authoritative. Release evidence additionally requires the
+trusted-runner claim and separate caller-side authentication shown above.
+
+Release certification requires one fresh receipt for the same commit, tree digest, provider,
+tested model, configuration digest, and `release` profile. It must claim the release level, come
+from a trusted `release_ci` runner, and have its evidence ID separately authenticated by the build
+step. `generate`, `tool_normalization`, `learning_memory`, `learning_memvid`, and
+`policy_unchanged` must pass. `stream` and `native_tools` must pass when advertised and may be
+`not_supported` only when the registry declares them unsupported. Any missing, failed, skipped,
+stale, unauthenticated, untrusted, or wrong-scope mandatory case blocks the claim.
+
+The JUnit collector recognizes only the selected provider's three exact parameterized tests.
+Failures and errors become `fail`. Missing cases and skips of advertised capabilities become
+`not_run`; a skip becomes `not_supported` only when the implementation registry independently
+declares that capability unsupported. It never becomes `pass`. The native-tool test supplies both
+native-tool and normalization evidence, and unrelated test cases are ignored.
+
+Current limitation: Kestrel does not provision third-party credentials, provider quota, or local
+model endpoints in ordinary CI. Only rows for which the controlled release environment executes
+and authenticates all sources can advance; every other row must remain at its lower truthful state.
+The collector may normalize persisted sources after an ephemeral credential has been removed, but
+the built report still captures configured readiness separately. Certification `check` does not
+turn current credential presence into assurance or invalidate exact historical evidence after
+secret cleanup. Run the setup/deployment readiness gate separately before shipping a profile that
+must call that provider. Only requirement names are emitted.
 
 ## Packaging Validation
 
@@ -234,6 +344,8 @@ Do not tag the release if any of these are true:
 - Credential-free Memvid v2, stdio MCP, or executable-skill OCI containment integration fails or skips in enabled mode.
 - Python and private web release metadata do not agree.
 - The deterministic end-to-end agent learning gate, golden evals, or live-learning E2E checks regress.
+- A provider is claimed as release-certified without a fresh exact-subject report, or its
+  `run_provider_certification.py check` gate does not pass for the claimed model/profile.
 - Memvid verification fails for a production memory directory.
 - High-risk tools are enabled by default.
 - `.mv2` memory is replaced by another primary memory store.

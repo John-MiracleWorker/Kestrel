@@ -1394,15 +1394,43 @@ def _print_provider_certification(config: AgentConfig, args: argparse.Namespace)
         return
     headline = payload["headline"]
     print("Provider certification")
+    print(f"Policy: {payload['policy_version']}")
+    subject = payload["subject"]
+    print(f"Subject: commit={subject['commit']} tree={subject['tree_digest']}")
     print(f"Release certified: {'yes' if headline['release_certified'] else 'no'}")
+    state_counts = headline["state_counts"]
     print(
-        f"Providers: {headline['certified_count']} certified, "
-        f"{headline['configured_count']} configured, {headline['blocked_count']} blocked, "
-        f"{headline['manual_validation_required_count']} manual"
+        f"Assurance: {headline['release_certified_count']} release certified; "
+        + ", ".join(f"{state}={state_counts[state]}" for state in sorted(state_counts))
+    )
+    readiness_counts = headline["readiness_counts"]
+    print(
+        "Readiness: "
+        + ", ".join(
+            f"{status}={readiness_counts[status]}" for status in sorted(readiness_counts)
+        )
     )
     print()
     for provider in payload["providers"]:
-        print(f"{provider['provider']}: {provider['status']}")
+        print(
+            f"{provider['provider']}: readiness={provider['readiness']['status']} "
+            f"certification={provider['certification_state']}"
+        )
+        print(
+            "  Checks: "
+            f"generate={provider['generate']['status']} "
+            f"stream={provider['stream']['status']} "
+            f"native_tools={provider['native_tools']['status']} "
+            f"tool_normalization={provider['tool_normalization']['status']} "
+            f"learning_e2e={provider['learning_e2e']['status']}"
+        )
+        print(f"  Last tested: {provider['last_tested'] or 'never'}")
+        if provider["tested_models"]:
+            print(f"  Models: {', '.join(provider['tested_models'])}")
+        if provider["tested_profiles"]:
+            print(f"  Profiles: {', '.join(provider['tested_profiles'])}")
+        if provider["missing_requirements"]:
+            print(f"  Missing: {', '.join(provider['missing_requirements'])}")
         print(f"  Next: {provider['next_action']}")
 
 
