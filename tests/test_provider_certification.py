@@ -84,6 +84,33 @@ def test_provider_registry_exactly_covers_supported_provider_options() -> None:
     assert PROVIDER_IMPLEMENTATION_REGISTRY["codex-cli"].native_tools is False
 
 
+def test_provider_config_digest_is_deterministic_and_exact() -> None:
+    first = _config(
+        provider="openai",
+        model="gpt-test",
+        base_url="http://127.0.0.1:1234/v1",
+        api_key_env="FIRST_API_KEY",
+    )
+    same = _config(
+        provider="openai",
+        model="gpt-test",
+        base_url="http://127.0.0.1:1234/v1",
+        api_key_env="FIRST_API_KEY",
+    )
+    different = _config(
+        provider="openai",
+        model="gpt-test",
+        base_url="http://127.0.0.1:1234/v1",
+        api_key_env="SECOND_API_KEY",
+    )
+
+    first_digest = provider_config_digest(first, "openai", "gpt-test")
+
+    assert first_digest == provider_config_digest(same, "openai", "gpt-test")
+    assert first_digest != provider_config_digest(different, "openai", "gpt-test")
+    assert len(first_digest) == 64
+
+
 def test_no_evidence_reports_implementation_separately_from_environment_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

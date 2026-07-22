@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -551,7 +552,10 @@ def provider_config_digest(
         "api_key_env": _api_key_env_for(config, provider) or "<none>",
     }
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    # This is a deterministic configuration fingerprint, not password storage or
+    # an authentication tag.  A fixed domain key keeps the digest separate from
+    # raw SHA-256 uses while preserving exact, non-secret configuration identity.
+    return hmac.digest(b"kestrel-provider-config-v1", encoded, "sha256").hex()
 
 
 def _canonical_evidence_id(receipt: ProviderCertificationEvidence) -> str:
