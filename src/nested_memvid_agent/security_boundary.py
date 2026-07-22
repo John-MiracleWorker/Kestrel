@@ -122,7 +122,8 @@ _KEY_VALUE_RE = re.compile(
     r"(?i)([\"']?(?:api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|"
     r"bot[_-]?token|client[_-]?secret|credentials?|password|passwd|private[_-]?key|"
     r"refresh[_-]?token|secret|token)[\"']?\s*[:=]\s*)"
-    r"(?!//)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]}]+)"
+    r"(?!//)(?!(?:(?-i:null|true|false))(?=\s*[,}\]\r\n]|$))"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]}]+)"
 )
 _URI_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/@:]+):([^\s/@]+)@")
 _KNOWN_TOKEN_PATTERNS = (

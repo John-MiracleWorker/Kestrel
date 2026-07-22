@@ -13,14 +13,14 @@ Kestrel is currently a maintainer-led project, and focused pull requests are wel
 
 ## Development Setup
 
-Kestrel requires Python 3.11 or newer and Node.js 22 for the web workbench.
+Kestrel supports Python 3.11, 3.12, and 3.13 (not 3.14+) and requires Node.js 22 for the web workbench.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
-npm install --prefix web
+python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+python -m pip install --no-build-isolation -e '.[memvid,openai,anthropic,gemini,server,mcp,keyring,dev]'
+npm ci --prefix web
 ```
 
 On Windows, activate the virtual environment with the command appropriate for your shell.

@@ -13,7 +13,8 @@ from typing import Any
 import pytest
 
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
-from nested_memvid_agent.backends.memvid_backend import MemvidBackend
+from nested_memvid_agent.backends.memvid_backend import MemvidBackend, MemvidLockError
+from nested_memvid_agent.layers import LayeredMemorySystem, MemoryCleanupIncompleteError
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
 
 
@@ -332,6 +333,208 @@ def test_memvid_backend_serializes_same_path_open_in_process(
     assert len(opened) == 2
 
     second.close()
+
+
+def test_memvid_backend_close_failure_retains_handle_and_exclusive_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "semantic.mv2"
+    path.write_bytes(b"existing")
+    allow_close = False
+
+    class FakeMem:
+        def close(self) -> None:
+            if not allow_close:
+                raise RuntimeError("injected SDK close failure")
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(
+            create=lambda *args, **kwargs: FakeMem(),
+            use=lambda *args, **kwargs: FakeMem(),
+        ),
+    )
+    first = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    first.open()
+    handle = first.mem
+
+    with pytest.raises(RuntimeError, match="injected SDK close failure"):
+        first.close()
+
+    assert first.mem is handle
+    second = MemvidBackend(
+        path=path,
+        layer=MemoryLayer.SEMANTIC,
+        path_lock_blocking=False,
+    )
+    with pytest.raises(MemvidLockError, match="already open in this process"):
+        second.open()
+
+    allow_close = True
+    first.close()
+    assert first.mem is None
+    second.open()
+    second.close()
+
+
+def test_memvid_failed_open_keeps_locks_when_partial_handle_cannot_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "semantic.mv2"
+    path.write_bytes(b"existing")
+    allow_close = False
+
+    class FakeMem:
+        def close(self) -> None:
+            if not allow_close:
+                raise RuntimeError("injected partial-handle close failure")
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(
+            create=lambda *args, **kwargs: FakeMem(),
+            use=lambda *args, **kwargs: FakeMem(),
+        ),
+    )
+    first = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
+    monkeypatch.setattr(
+        first,
+        "_load_exact_index",
+        lambda: (_ for _ in ()).throw(RuntimeError("injected index load failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="partial-handle close failure"):
+        first.open()
+    assert first.mem is not None
+
+    second = MemvidBackend(
+        path=path,
+        layer=MemoryLayer.SEMANTIC,
+        path_lock_blocking=False,
+    )
+    with pytest.raises(MemvidLockError, match="already open in this process"):
+        second.open()
+
+    allow_close = True
+    first.close()
+    second.open()
+    second.close()
+
+
+def test_layered_memvid_construction_retains_failed_cleanup_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    allow_close = False
+
+    class FakeMem:
+        def close(self) -> None:
+            if not allow_close:
+                raise RuntimeError("injected layered cleanup failure")
+
+    def fake_create(filename: str, **kwargs: object) -> FakeMem:
+        del kwargs
+        path = Path(filename)
+        if path.name == "episodic.mv2":
+            raise RuntimeError("injected second-layer open failure")
+        path.write_bytes(b"fake mv2")
+        return FakeMem()
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(
+            create=fake_create,
+            use=lambda *args, **kwargs: FakeMem(),
+        ),
+    )
+
+    with pytest.raises(MemoryCleanupIncompleteError) as raised:
+        LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend)
+    assert raised.value.phase == "memory_construction"
+    assert raised.value.pending_resource_count == 1
+
+    replacement = MemvidBackend(
+        path=memory_dir / "working.mv2",
+        layer=MemoryLayer.WORKING,
+        path_lock_blocking=False,
+    )
+    with pytest.raises(MemvidLockError, match="already open in this process"):
+        replacement.open()
+
+    allow_close = True
+    assert raised.value.retry_cleanup() is True
+    assert raised.value.pending_resource_count == 0
+    replacement.open()
+    replacement.close()
+
+
+def test_layered_memvid_failed_seal_retains_handles_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    allow_seal = False
+    close_calls = 0
+
+    class FakeMem:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def put(self, *args: object, **kwargs: object) -> str:
+            del args, kwargs
+            return "frame"
+
+        def seal(self) -> None:
+            if self.path.name == "working.mv2" and not allow_seal:
+                raise RuntimeError("injected SDK seal failure")
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    def fake_create(filename: str, **kwargs: object) -> FakeMem:
+        del kwargs
+        path = Path(filename)
+        path.write_bytes(b"fake mv2")
+        return FakeMem(path)
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.backends.memvid_backend.import_module",
+        lambda name: SimpleNamespace(
+            create=fake_create,
+            use=lambda _kind, filename, **kwargs: FakeMem(Path(filename)),
+        ),
+    )
+    memory = LayeredMemorySystem.from_backend_factory(memory_dir, MemvidBackend)
+    memory.put(
+        MemoryRecord(
+            id="dirty-working",
+            title="Dirty working frame",
+            content="This frame must be sealed before ownership is released.",
+            layer=MemoryLayer.WORKING,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="injected SDK seal failure"):
+        memory.close_all()
+    assert close_calls == 0
+
+    replacement = MemvidBackend(
+        path=memory_dir / "working.mv2",
+        layer=MemoryLayer.WORKING,
+        path_lock_blocking=False,
+    )
+    with pytest.raises(MemvidLockError, match="already open in this process"):
+        replacement.open()
+
+    allow_seal = True
+    memory.close_all()
+    assert close_calls == len(MemoryLayer)
+    replacement.open()
+    replacement.close()
 
 
 def test_memvid_backend_rejects_conflicting_cross_process_writer(

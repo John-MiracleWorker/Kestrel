@@ -16,6 +16,17 @@ from ..context_frames import (
     to_memory_record,
 )
 from ..context_packer import ContextPacker, ContextPackRequest
+from ..extension_transaction import (
+    DirectorySwap,
+    ExtensionCleanupIncompleteError,
+    create_sibling_stage,
+    extension_lock,
+    fsync_tree,
+    path_exists,
+    read_regular_file,
+    remove_tree_verified,
+    write_regular_file,
+)
 from ..models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import (
     STABLE_MEMORY_LAYERS,
@@ -98,7 +109,6 @@ from .workspace_tools import (
     RepoMapTool,
     RepoSearchTool,
     WriteFileTool,
-    _safe_path,
 )
 
 
@@ -668,21 +678,27 @@ class MemvidVerifyTool(AgentTool):
 class MemvidDoctorTool(AgentTool):
     spec = ToolSpec(
         name="memvid.doctor",
-        description="Run dry-run doctor checks on memory layers when the backend supports it.",
-        parameters={
-            "type": "object",
-            "properties": {"dry_run": {"type": "boolean"}},
-        },
+        description="Run read-only doctor checks on memory layers when the backend supports it.",
+        parameters={"type": "object", "properties": {}},
     )
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
-        dry_run = bool(arguments.get("dry_run", True))
+        if arguments.get("dry_run") is False:
+            return self._result(
+                call,
+                success=False,
+                content=(
+                    "Mutating Memvid doctor repairs are not exposed as a low-risk agent tool; "
+                    "run an owner-controlled maintenance workflow instead."
+                ),
+                error="mutating_doctor_disabled",
+            )
         rows: dict[str, object] = {}
         for layer, backend in context.memory.backends.items():
             doctor = getattr(backend, "doctor", None)
             if callable(doctor):
-                rows[layer.value] = doctor(dry_run=dry_run)
+                rows[layer.value] = doctor(dry_run=True)
             else:
                 rows[layer.value] = {"ok": backend.verify(), "doctor_available": False}
         return self._result(
@@ -1530,13 +1546,16 @@ class MemoryCompactTool(AgentTool):
 class MemoryExportTool(AgentTool):
     spec = ToolSpec(
         name="memory.export",
-        description="Export memory records as structured JSON. Use query for backends without full record iteration.",
+        description="Export a bounded, paginated page of memory records as structured JSON.",
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "layers": {"type": "array", "items": {"type": "string"}},
                 "k": {"type": "integer", "minimum": 1, "maximum": 100},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                "include_inactive": {"type": "boolean"},
             },
         },
     )
@@ -1546,19 +1565,65 @@ class MemoryExportTool(AgentTool):
         layers = _layers_arg(arguments.get("layers")) or tuple(MemoryLayer)
         rows: list[dict[str, object]] = []
         query = str(arguments.get("query", "")).strip()
+        include_inactive = bool(arguments.get("include_inactive", False))
         if query:
+            k_per_layer = int(arguments.get("k", 20))
             hits = context.memory.retrieve(
-                RetrievalQuery(query=query, layers=layers, k_per_layer=int(arguments.get("k", 20)))
+                RetrievalQuery(
+                    query=query,
+                    layers=layers,
+                    k_per_layer=k_per_layer,
+                    include_inactive=include_inactive,
+                )
             )
             rows = [_memory_record_payload(hit.record) for hit in hits]
+            payload: dict[str, object] = {
+                "mode": "query",
+                "records": rows,
+                "count": len(rows),
+                "layers": [layer.value for layer in layers],
+                "k_per_layer": k_per_layer,
+                "include_inactive": include_inactive,
+                "complete_export": False,
+            }
         else:
+            offset = int(arguments.get("offset", 0))
+            limit = int(arguments.get("limit", 100))
+            if offset < 0 or not 1 <= limit <= 1000:
+                return self._result(
+                    call,
+                    success=False,
+                    content="offset must be non-negative and limit must be between 1 and 1000",
+                    error="bad_pagination",
+                )
+            total = 0
             for layer in layers:
-                backend = context.memory.backends.get(layer)
-                records = getattr(backend, "records", None)
-                if isinstance(records, list):
-                    rows.extend(_memory_record_payload(record) for record in records)
+                for record in context.memory.iter_records(
+                    layer,
+                    include_inactive=include_inactive,
+                ):
+                    if offset <= total < offset + limit:
+                        rows.append(_memory_record_payload(record))
+                    total += 1
+            next_offset = offset + len(rows) if offset + len(rows) < total else None
+            payload = {
+                "mode": "full",
+                "records": rows,
+                "count": len(rows),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "next_offset": next_offset,
+                "truncated": next_offset is not None,
+                "include_inactive": include_inactive,
+                "layers": [layer.value for layer in layers],
+                "complete_export": offset == 0 and next_offset is None,
+            }
         return self._result(
-            call, success=True, content=json.dumps(rows, indent=2), data={"records": rows}
+            call,
+            success=True,
+            content=json.dumps(payload, indent=2),
+            data=payload,
         )
 
 
@@ -1692,26 +1757,67 @@ class SkillInstallTool(AgentTool):
             )
 
         try:
-            skill_dir = _safe_path(context.config.skills_dir, skill_id)
+            skills_root = context.config.skills_dir.resolve()
+            skill_dir = skills_root / skill_id
             payload["path"] = str(skill_dir)
             if payload["dry_run"]:
                 return self._result(
                     call, success=True, content=json.dumps(payload, indent=2), data=payload
                 )
-            if skill_dir.exists() and not bool(arguments.get("overwrite", False)):
-                return self._result(
-                    call,
-                    success=False,
-                    content=json.dumps(payload, indent=2),
-                    data=payload,
-                    error="skill_exists",
-                )
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            (skill_dir / "skill.json").write_text(manifest_text + "\n", encoding="utf-8")
-            (skill_dir / "SKILL.md").write_text(instructions, encoding="utf-8")
-            payload["installed"] = True
+            with extension_lock(skills_root, ".skill-install.lock"):
+                if path_exists(skill_dir) and not bool(arguments.get("overwrite", False)):
+                    return self._result(
+                        call,
+                        success=False,
+                        content=json.dumps(payload, indent=2),
+                        data=payload,
+                        error="skill_exists",
+                    )
+                stage = create_sibling_stage(skills_root, prefix=skill_id)
+                try:
+                    manifest_bytes = (manifest_text + "\n").encode()
+                    instructions_bytes = instructions.encode()
+                    write_regular_file(stage / "skill.json", manifest_bytes)
+                    write_regular_file(stage / "SKILL.md", instructions_bytes)
+                    if read_regular_file(stage / "skill.json") != manifest_bytes:
+                        raise ValueError("Staged skill manifest changed during validation.")
+                    if read_regular_file(stage / "SKILL.md") != instructions_bytes:
+                        raise ValueError("Staged skill instructions changed during validation.")
+                    persisted_manifest = json.loads(
+                        read_regular_file(stage / "skill.json").decode("utf-8")
+                    )
+                    persisted_validation = validate_skill_manifest(persisted_manifest)
+                    if persisted_validation["errors"]:
+                        raise ValueError("Staged skill manifest failed validation.")
+                    fsync_tree(stage)
+
+                    swap = DirectorySwap(live=skill_dir, stage=stage)
+                    swap.publish()
+                    try:
+                        if read_regular_file(skill_dir / "skill.json") != manifest_bytes:
+                            raise ValueError("Published skill manifest changed.")
+                        if read_regular_file(skill_dir / "SKILL.md") != instructions_bytes:
+                            raise ValueError("Published skill instructions changed.")
+                    except BaseException:
+                        swap.restore()
+                        raise
+                    swap.finalize()
+                    payload["installed"] = True
+                    return self._result(
+                        call,
+                        success=True,
+                        content=json.dumps(payload, indent=2),
+                        data=payload,
+                    )
+                finally:
+                    if path_exists(stage):
+                        remove_tree_verified(stage)
+        except ExtensionCleanupIncompleteError as exc:
             return self._result(
-                call, success=True, content=json.dumps(payload, indent=2), data=payload
+                call,
+                success=False,
+                content=str(exc),
+                error="skill_install_cleanup_incomplete",
             )
         except Exception as exc:  # noqa: BLE001
             return self._result(call, success=False, content=str(exc), error="skill_install_failed")
@@ -2373,6 +2479,10 @@ def _memory_record_payload(record: MemoryRecord) -> dict[str, object]:
         "importance": record.importance,
         "tags": record.tags,
         "metadata": record.metadata,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+        "expires_at": record.expires_at.isoformat() if record.expires_at else None,
+        "content_hash": record.content_hash,
         "evidence": [
             {"source": evidence.source, "locator": evidence.locator, "quote": evidence.quote}
             for evidence in record.evidence

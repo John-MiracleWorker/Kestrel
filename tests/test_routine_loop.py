@@ -165,7 +165,7 @@ def test_routine_loop_serializes_concurrent_starts_before_close(
 
 
 def test_routine_loop_redacts_tick_errors_and_keeps_running() -> None:
-    secret = "routine-loop-opaque-secret-97143"
+    secret = "routine-loop-opaque-secret-97143"  # gitleaks:allow -- synthetic fixture
     register_secret_value(secret)
 
     class _Service:

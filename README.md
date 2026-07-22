@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="https://github.com/John-MiracleWorker/Kestrel/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/John-MiracleWorker/Kestrel/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Python 3.11 through 3.13" src="https://img.shields.io/badge/Python-3.11--3.13-3776AB?logo=python&logoColor=white">
   <img alt="Memvid v2" src="https://img.shields.io/badge/Memory-Memvid%20v2%20.mv2-6f42c1">
   <img alt="Local first" src="https://img.shields.io/badge/Runtime-local--first-059669">
-  <img alt="Status v0.4.0 stable" src="https://img.shields.io/badge/Status-v0.4.0%20stable-15803d">
+  <img alt="Status v0.4.0 development" src="https://img.shields.io/badge/Status-v0.4.0%20development-d97706">
   <img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue">
 </p>
 
@@ -19,25 +19,46 @@ It is not a chatbot wrapper and not just a memory library. Kestrel is built arou
 
 > Repeated engineering work should make the agent safer and more capable through evidence-backed, auditable, reversible learning.
 
-`v0.4.0` is the current stable release. It targets one trusted user, one Kestrel server/worker
-process, and one local or privately networked node, not a hosted/team or multi-tenant Internet
-service.
+`v0.3.1` is the current stable release. This checkout is the unreleased `v0.4.0` development line.
+Both target one trusted user, one Kestrel server/worker process, and one local or privately
+networked node, not a hosted/team or multi-tenant Internet service.
 
 ## Start Here
 
-The one-shot Bash installer supports macOS and Linux, including Linux inside WSL.
-On native Windows, open a WSL distro before running it; Git Bash and the Windows
-`bash.exe` launcher are not supported installer environments. The Python runtime
-continues to be tested on native Windows; the published universal wheel is built,
-installed, and smoke-tested in the isolated Linux release environment.
+The one-shot Bash installer supports Intel/Apple-silicon macOS and Linux x86_64,
+including x86_64 Linux inside WSL. Linux ARM64 must use the published `linux/arm64`
+container image. On native Windows, use the wheel rather than Git Bash or the Windows
+`bash.exe` launcher. The exact downloaded universal wheel is release-gated on native
+Windows 3.11, Linux x86_64 Python 3.11 through 3.13, and both Apple-silicon and Intel
+macOS Python 3.11 through 3.13. Each macOS lane asserts its actual CPU architecture so
+a hosted-runner label change fails closed.
 
-Install the current stable release (`v0.4.0`), initialize `.mv2` memory, install the bundled workbench, run a deterministic smoke check, and explicitly open the localhost app:
+Install the current stable release (`v0.3.1`), initialize `.mv2` memory, install the bundled workbench, run a deterministic smoke check, and explicitly open the localhost app:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Omit the two launch variables for an install-only run that starts no server.
+
+Starting with `v0.4.0` (after that release workflow succeeds), Linux ARM64 uses the
+same gated candidate through GHCR rather than the Bash installer:
+
+```bash
+docker pull --platform linux/arm64 ghcr.io/john-miracleworker/kestrel:v0.4.0
+docker run --rm --platform linux/arm64 \
+  ghcr.io/john-miracleworker/kestrel:v0.4.0 \
+  nest-agent doctor --backend memvid --memory-dir /tmp/kestrel-doctor --provider mock
+```
+
+The workflow publishes both `linux/amd64` and `linux/arm64` from the exact scanned
+image archives, labels each image with the release source, version, and commit, and
+also publishes `sha-<full-GitHub-SHA>`. The multi-platform index is composed from the
+registry-returned per-platform push digests, never from the temporary mutable tags.
+Registry tags are pointers; deployment automation should resolve and pin the
+multi-platform digest and verify its GitHub attestation. This is a released-byte
+identity guarantee, not a bit-reproducible-build claim. `v0.3.1` remains the current
+stable release until `v0.4.0` is actually published.
 
 Then choose a real provider when you are ready to work:
 
@@ -148,17 +169,17 @@ recovery contract and separate secret-handling requirement.
 One-shot local install:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.0/install.sh | bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | bash
 ```
 
-The published release installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins the checkout to `v0.4.0`, finds Python 3.11 or newer without relying on bare `python`, verifies the published wheel and hash-locked dependencies against `SHA256SUMS`, installs the bundled workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools. Use the editable development install below when evaluating changes after the stable tag.
+The published release installer clones or updates Kestrel in `${KESTREL_HOME:-$HOME/.kestrel-agent}`, pins its checkout, requires Python 3.11, 3.12, or 3.13, verifies the published wheel and hash-locked dependencies against `SHA256SUMS`, installs the bundled workbench, initializes `.nest/memory/*.mv2`, verifies memory, and runs a deterministic `mock` CLI smoke check. The hardened `v0.4.0` release installer will additionally bind that checkout to the immutable release commit and reject repository/ref overrides; this remains candidate behavior until `v0.4.0` is published. For a safer first install, the installer does not start the server or open a browser unless explicitly enabled. `mock` is a zero-secret health check, not the intended operating mode. The installer does not ask for secrets or enable high-risk tools. Use the editable development install below when evaluating the unreleased `v0.4.0` line.
 
 Production installs should use the immutable GitHub release installer above; it pins the source, wheel, dependency manifest, and checksum manifest to the same tag. `main` is a development source, not the published release channel.
 
 Install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.0/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.3.1/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful installer options:
@@ -198,9 +219,9 @@ Manual development install:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
-npm install --prefix web
+python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+python -m pip install --no-build-isolation -e '.[memvid,openai,anthropic,gemini,server,mcp,keyring,dev]'
+npm ci --prefix web
 npm run build --prefix web
 ```
 
@@ -209,7 +230,7 @@ Fast local validation:
 ```bash
 python -m compileall -q src tests scripts
 python -m pytest -q
-python scripts/run_golden_evals.py --backend memory --provider mock
+make golden
 nest-agent chat --backend memory --provider mock --message "hello"
 ```
 
@@ -331,7 +352,7 @@ nest-agent plugins disable <plugin_id> --backend memory
 
 Plugin review, installation, and updates fetch public GitHub plugin sources, accept `kestrel.plugin.json` plus limited Hermes-style `plugin.yaml`, and materialize plugin-declared skills/MCP servers disabled by default. Review returns provenance, risk, declared dependency, isolation, warning, unsupported-feature, and enable-blocker metadata without installing or executing plugin code. Agent-initiated `plugin.review` and `plugin.install` are high risk: they require `--allow-plugin-install` / `NEST_AGENT_ALLOW_PLUGIN_INSTALL` plus exact-call approval before execution.
 
-Every live MCP stdio command, including a manually configured server, is bound to a command/argument hash and requires explicit connect approval before Kestrel starts the process. Shell/proxy launchers and interpreter eval modes such as `python -c` or `node --eval` are rejected. Tools discovered dynamically from a live server always remain at least medium risk with exact-call approval, even when static manifest metadata is trusted.
+Every live MCP stdio command, including a manually configured server, requires explicit connect approval bound to the resolved executable and entry-artifact bytes. Kestrel launches an owner-only content-addressed snapshot; installed plugin scripts bind and snapshot the complete source tree so imported sibling drift revokes approval. Registry package runners (`npx`, `uvx`, `bunx`), mutable `python -m`, shell/proxy launchers, and interpreter eval modes such as `python -c` or `node --eval` are rejected. Secret-bearing standalone interpreter scripts, interpreter aliases, and direct shebang executables are rejected; supported installed-plugin script launchers require a verified private tree snapshot. Tools discovered dynamically from a live server always remain at least medium risk with exact-call approval, even when static manifest metadata is trusted.
 
 Executable skills never run directly on the host. They require explicit executable-skill enablement, exact-call approval, a digest-pinned OCI image, a verified skill-tree snapshot, and canonical default-deny scopes. Declared read grants are copied with bounded, no-follow traversal into owner-private temporary snapshots before launch; the container never receives a live workspace bind. Workspace-root, `.git`, `.nest`, writable, secret, and network scopes fail closed. The Docker runner pins a verified local engine endpoint and uses a read-only root filesystem, nonroot execution, dropped capabilities, no-new-privileges, PID/CPU/memory/ulimit/tmpfs and input/output bounds, supervised timeout cleanup, and no host fallback. Instruction-only skills remain available without executing code.
 
@@ -424,10 +445,16 @@ nest-agent chat \
   --message "Help me continue this build"
 ```
 
-The provider runs `codex exec` in read-only, ephemeral mode by default and ignores ambient
-Codex user configuration while retaining the user's Codex authentication. This keeps unrelated
-global model and reasoning settings from overriding Kestrel's explicit provider configuration.
-Write-capable Codex work belongs behind the separate high-risk `codex.exec` tool approval path.
+The response provider runs host `codex exec` in read-only, ephemeral mode by default and ignores
+ambient Codex user configuration while retaining the user's Codex authentication. This keeps
+unrelated global model and reasoning settings from overriding Kestrel's explicit provider
+configuration. Because read-only mode is not same-account credential isolation, the provider fails
+closed when Kestrel has raw-vault bytes, keyring secret records, or repair trust material.
+
+The separate high-risk `codex.exec` tool does not reuse that host process or authentication. It
+rejects workspace-write mode and runs only inside the configured networkless, credential-free OCI
+validation image, so remote-model use is unavailable there. Write-capable code changes must use the
+staged repair prepare/apply/validate/review pipeline.
 
 ## Web Workbench
 
@@ -496,6 +523,7 @@ NEST_AGENT_ALLOW_SHELL=false
 NEST_AGENT_ALLOW_FILE_WRITE=false
 NEST_AGENT_ALLOW_POLICY_WRITES=false
 NEST_AGENT_ALLOW_CODEX_CLI=false
+NEST_AGENT_VALIDATION_CONTAINER_IMAGE=
 NEST_AGENT_ALLOW_PLUGIN_INSTALL=false
 NEST_AGENT_ALLOW_GIT_COMMIT=false
 NEST_AGENT_ALLOW_GIT_PUSH=false
@@ -521,7 +549,11 @@ NEST_AGENT_REQUIRE_API_AUTH=false
 
 High-risk tools need an enabled per-capability decision, every applicable master flag, and exact-call approval before execution. Capability switches cannot bypass those prerequisites. Approval cannot be disabled by configuration; it is owner-bound, single-use, bound to the requested tool call ID and exact arguments, and expires after 15 minutes by default. It is also bound to the capability revision and a digest of the current tool specification, policy gates, and parent MCP/skill resource. Changed arguments, policy, specification, parent resource, capability revision, or expiry require a new approval.
 
-Secrets stay out of chat. The Secret Broker stores channel/MCP/tool credentials through backend API/UI flows and returns only metadata such as `secret://...` handles, configured state, validation state, timestamps, and fingerprints. No public GET route returns raw secret values; MCP `secret_env` can point to host env names or broker refs, and channel status checks use the same metadata-only boundary.
+Secrets stay out of chat. The Secret Broker stores channel/MCP/tool credentials through backend API/UI flows and returns only metadata such as `secret://...` handles, configured state, validation state, timestamps, and fingerprints. No public GET route returns raw secret values; MCP `secret_env` can point to host env names or broker refs, and channel status checks use the same metadata-only boundary. Local stdio fails closed whenever the configured raw JSON/file/local vault exists, keyring metadata has secret records, or repair receipt/signing material exists, because an approved same-user process is not an OS sandbox. Secret and repair-key publication also serialize against stdio launch and first quiesce all registered local stdio sessions; unverified teardown aborts publication. The default installer includes the `keyring` extra, but keyring is an at-rest backend rather than process isolation. Use remote authenticated MCP or separate containment for hostile server code or independent runtimes. Do not point the keyring backend at a populated JSON vault: use a new metadata path, rotate/re-enter the secrets, and remove the old raw vault only after validating the replacement. A missing raw-vault path and an empty keyring metadata file are not expanded or enumerated by MCP lifecycle. The stock headless container intentionally stays on the owner-private JSON backend because installing the Python client does not create an OS keychain service.
+
+Agent-invoked `test.run`, `lint.run`, `repair.validate`, `repair.orchestrate_validate`, and read-only `codex.exec` never execute candidate code on the host. Configure a preloaded digest-pinned validation image, for example `NEST_AGENT_VALIDATION_CONTAINER_IMAGE='registry.example/kestrel-validation@sha256:…'`, containing every requested command and project dependency. Kestrel copies the exact Git candidate into a bounded private snapshot and runs it in a networkless, secret-free, read-only, nonroot OCI boundary; there is no host fallback and Kestrel never pulls the image during a tool call. `nest-agent doctor --allow-shell --validation-container-image "$VALIDATION_IMAGE"` validates the configuration shape, while local image availability and command dependencies are checked at execution. Each isolated repair validation also records a schema-v2 attestation and rotates `.nest/repair_receipt_signing.v2.key`; legacy schema-v1 receipts and the former workspace key cannot authorize review or commit.
+
+The validation image must be purpose-built for the repository: the small pinned Python image used by the containment fixture is not a general Kestrel test image. Build and publish the required dependencies to a trusted registry, pull the resulting immutable `name@sha256:<64 hex>` reference ahead of time, and then configure that exact reference. `codex.exec` additionally requires a Codex binary in the image, but the current boundary intentionally grants neither provider credentials nor network access; remote-model Codex delegation is therefore unavailable through this tool. The separate `codex-cli` response provider and local stdio MCP remain host-process surfaces and fail closed when raw-vault bytes, keyring secret records, or repair trust material exist.
 
 Self-improvement is local-first: Kestrel can learn into local `.mv2` memory, create approval-gated local branches with `git.create_local_branch`, export patch artifacts with `git.export_patch`, and run tests without publishing. Remote mutation is a separate gated lane. `git.commit` never pushes, refuses protected branches by default, and repair branch commits also require a current `repair.review` artifact tied to a successful validation result and the current diff hash. The shell tool blocks common remote-publishing escape routes unless a future publishing mode explicitly gates them.
 
@@ -537,9 +569,9 @@ python -m ruff check scripts src tests
 python -m mypy src
 python -m pytest -q tests/test_capability_policy.py tests/test_capability_control_plane.py tests/test_state_store.py
 python -m pytest -q
-python scripts/run_golden_evals.py --backend memory --provider mock
+make golden
 python benchmarks/real_agent_learning_benchmark.py --output benchmark_results/agent_learning_gate.json
-python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json --fail-on-regression
 npm run test --prefix web
 npm run build --prefix web
 ```
@@ -547,12 +579,13 @@ npm run build --prefix web
 Credential-free release-gated integration checks:
 
 ```bash
+VALIDATION_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+docker pull "$VALIDATION_IMAGE"
 RUN_MCP_INTEGRATION=1 python -m pytest -q tests/integration/test_mcp_stdio_integration.py
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_memory_system.py tests/integration/test_memvid_context_frames.py
-RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
-docker pull 'python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden --validation-container-image "$VALIDATION_IMAGE"
 RUN_EXTENSION_SANDBOX_INTEGRATION=1 \
-KESTREL_EXTENSION_TEST_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3' \
+KESTREL_EXTENSION_TEST_IMAGE="$VALIDATION_IMAGE" \
 python -m pytest -q tests/integration/test_extension_container_integration.py
 ```
 
@@ -560,8 +593,8 @@ Optional live-provider checks:
 
 ```bash
 RUN_PROVIDER_INTEGRATION=1 python -m pytest -q tests/integration/test_provider_live_integration.py
-OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memory
-OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memory --validation-container-image "$VALIDATION_IMAGE"
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid --validation-container-image "$VALIDATION_IMAGE"
 python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memory --output-root /tmp/kestrel-live-learning-memory
 python scripts/run_live_learning_eval.py --provider ollama-cloud --model gpt-oss:120b --backend memvid --output-root /tmp/kestrel-live-learning-memvid
 ```

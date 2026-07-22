@@ -6,6 +6,7 @@ MYPY ?= $(PYTHON) -m mypy
 NEST_AGENT_ARGS ?=
 PORT ?= 8765
 DOCKER_IMAGE ?= kestrel-agent:local
+VALIDATION_IMAGE ?= python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3
 
 .PHONY: install install-dev install-memvid test lint typecheck compile golden learning-gate validate bootstrap doctor chat-smoke server release-build docker-build docker-doctor clean
 
@@ -13,7 +14,7 @@ install:
 	$(PIP) install -e '.[dev]'
 
 install-dev:
-	$(PIP) install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
+	$(PIP) install -e '.[memvid,openai,anthropic,gemini,server,mcp,keyring,dev]'
 
 install-memvid:
 	$(PIP) install -e '.[dev,memvid]'
@@ -40,7 +41,8 @@ chat-smoke:
 	$(NEST_AGENT) chat --backend memory --provider mock --message "hello from packaging smoke"
 
 golden:
-	$(PYTHON) scripts/run_golden_evals.py --backend memory --provider mock
+	docker image inspect "$(VALIDATION_IMAGE)" >/dev/null 2>&1 || docker pull "$(VALIDATION_IMAGE)"
+	NEST_AGENT_VALIDATION_CONTAINER_IMAGE="$(VALIDATION_IMAGE)" $(PYTHON) scripts/run_golden_evals.py --backend memory --provider mock
 
 learning-gate:
 	$(RUFF) check benchmarks/real_agent_learning_benchmark.py tests/test_real_agent_learning_benchmark.py

@@ -456,6 +456,34 @@ class AgentStateStore:
             conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?", values)  # nosec
         return self.get_run(run_id)
 
+    def record_cancelled_run_durability_failure(
+        self,
+        run_id: str,
+        *,
+        error: str,
+        recovery_reason: str,
+    ) -> tuple[RunRecord, bool]:
+        """Annotate an immutable cancelled run when its final close was not durable."""
+
+        if not error.strip():
+            raise ValueError("cancelled run durability error is required")
+        if not recovery_reason.strip():
+            raise ValueError("cancelled run durability recovery reason is required")
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE runs SET error = ?, recovery_reason = ?, updated_at = ?
+                WHERE run_id = ? AND status = 'cancelled'
+                """,
+                (error, recovery_reason, now, run_id),
+            )
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            return _run_from_row(row), cursor.rowcount == 1
+
     def transition_run(
         self,
         run_id: str,
@@ -2586,76 +2614,8 @@ class AgentStateStore:
 
     def upsert_mcp_server(self, server: dict[str, Any]) -> dict[str, Any]:
         server_id = str(server["id"])
-        now = utc_now()
-        tools = list(server.get("tools", []))
-        capabilities = server.get("capabilities") or sorted(
-            {
-                str(capability)
-                for tool in tools
-                for capability in list(dict(tool).get("capabilities", []))
-            }
-        )
-        payload = {
-            "name": server.get("name", server_id),
-            "transport": server.get("transport", "stdio"),
-            "command": server.get("command"),
-            "args_json": json.dumps(server.get("args", [])),
-            "env_json": json.dumps(server.get("env", {})),
-            "url": server.get("url"),
-            "enabled": 1 if server.get("enabled", True) else 0,
-            "tools_json": json.dumps(tools),
-            "status": server.get("status", "configured"),
-            "error": server.get("error"),
-            "last_synced_at": server.get("last_synced_at"),
-            "last_seen_at": server.get("last_seen_at"),
-            "tool_count": int(server.get("tool_count", len(tools))),
-            "capabilities_json": json.dumps(capabilities),
-            "risk_policy": server.get("risk_policy", "approval_by_default"),
-            "secret_env_json": json.dumps(server.get("secret_env", {})),
-            "session_state": server.get("session_state", "disconnected"),
-            "last_call_at": server.get("last_call_at"),
-            "last_error_at": server.get("last_error_at"),
-            "failure_count": int(server.get("failure_count", 0)),
-            "last_latency_ms": server.get("last_latency_ms"),
-            "vetting_json": json.dumps(server.get("vetting", {})),
-            "updated_at": now,
-        }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO mcp_servers (
-                    id, name, transport, command, args_json, env_json, url, enabled,
-                    tools_json, status, error, last_synced_at, last_seen_at, tool_count,
-                    capabilities_json, risk_policy, secret_env_json, session_state, last_call_at,
-                    last_error_at, failure_count, last_latency_ms, vetting_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    transport = excluded.transport,
-                    command = excluded.command,
-                    args_json = excluded.args_json,
-                    env_json = excluded.env_json,
-                    url = excluded.url,
-                    enabled = excluded.enabled,
-                    tools_json = excluded.tools_json,
-                    status = excluded.status,
-                    error = excluded.error,
-                    last_synced_at = excluded.last_synced_at,
-                    last_seen_at = excluded.last_seen_at,
-                    tool_count = excluded.tool_count,
-                    capabilities_json = excluded.capabilities_json,
-                    risk_policy = excluded.risk_policy,
-                    secret_env_json = excluded.secret_env_json,
-                    session_state = excluded.session_state,
-                    last_call_at = excluded.last_call_at,
-                    last_error_at = excluded.last_error_at,
-                    failure_count = excluded.failure_count,
-                    last_latency_ms = excluded.last_latency_ms,
-                    vetting_json = excluded.vetting_json,
-                    updated_at = excluded.updated_at
-                """,
-                (server_id, *payload.values()),
-            )
+            _upsert_mcp_server_row(conn, server)
         return self.get_mcp_server(server_id)
 
     def get_mcp_server(self, server_id: str) -> dict[str, Any]:
@@ -2677,28 +2637,7 @@ class AgentStateStore:
     def upsert_skill(self, skill: dict[str, Any]) -> dict[str, Any]:
         skill_id = str(skill["id"])
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO skill_registry (id, name, description, path, manifest_json, enabled, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    description = excluded.description,
-                    path = excluded.path,
-                    manifest_json = excluded.manifest_json,
-                    enabled = excluded.enabled,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    skill_id,
-                    skill.get("name", skill_id),
-                    skill.get("description", ""),
-                    skill.get("path", ""),
-                    json.dumps(skill.get("manifest", {})),
-                    1 if skill.get("enabled", True) else 0,
-                    utc_now(),
-                ),
-            )
+            _upsert_skill_row(conn, skill)
         return self.get_skill(skill_id)
 
     def get_skill(self, skill_id: str) -> dict[str, Any]:
@@ -2727,54 +2666,8 @@ class AgentStateStore:
 
     def upsert_plugin(self, plugin: dict[str, Any]) -> dict[str, Any]:
         plugin_id = str(plugin["id"])
-        now = utc_now()
-        created_at = str(plugin.get("created_at") or now)
         with self._connect() as conn:
-            current = conn.execute(
-                "SELECT created_at FROM plugin_registry WHERE id = ?", (plugin_id,)
-            ).fetchone()
-            if current is not None:
-                created_at = str(current["created_at"])
-            conn.execute(
-                """
-                INSERT INTO plugin_registry (
-                    id, name, description, source_url, source_ref, commit_sha, install_path,
-                    manifest_json, capabilities_json, enabled, risk_report_json,
-                    install_status, format, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    description = excluded.description,
-                    source_url = excluded.source_url,
-                    source_ref = excluded.source_ref,
-                    commit_sha = excluded.commit_sha,
-                    install_path = excluded.install_path,
-                    manifest_json = excluded.manifest_json,
-                    capabilities_json = excluded.capabilities_json,
-                    enabled = excluded.enabled,
-                    risk_report_json = excluded.risk_report_json,
-                    install_status = excluded.install_status,
-                    format = excluded.format,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    plugin_id,
-                    plugin.get("name", plugin_id),
-                    plugin.get("description", ""),
-                    plugin.get("source_url", ""),
-                    plugin.get("source_ref"),
-                    plugin.get("commit_sha", ""),
-                    plugin.get("install_path", ""),
-                    json.dumps(plugin.get("manifest", {})),
-                    json.dumps(plugin.get("capabilities", [])),
-                    1 if plugin.get("enabled", False) else 0,
-                    json.dumps(plugin.get("risk_report", {})),
-                    plugin.get("install_status", "installed"),
-                    plugin.get("format", "kestrel"),
-                    created_at,
-                    now,
-                ),
-            )
+            _upsert_plugin_row(conn, plugin)
         return self.get_plugin(plugin_id)
 
     def get_plugin(self, plugin_id: str) -> dict[str, Any]:
@@ -2802,6 +2695,153 @@ class AgentStateStore:
     def delete_plugin(self, plugin_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM plugin_registry WHERE id = ?", (plugin_id,))
+
+    def replace_plugin_bundle(
+        self,
+        plugin: dict[str, Any],
+        *,
+        skills: list[dict[str, Any]],
+        mcp_servers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically replace one plugin and every namespaced extension row."""
+
+        plugin_id = str(plugin["id"])
+        prefix = f"plugin.{plugin_id}."
+        _validate_plugin_bundle_ids(prefix, skills=skills, mcp_servers=mcp_servers)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_skills, existing_servers = _plugin_extension_rows(conn, prefix)
+            desired_skill_ids = {str(skill["id"]) for skill in skills}
+            desired_server_ids = {str(server["id"]) for server in mcp_servers}
+            desired_tool_ids = {
+                str(tool["name"])
+                for server in mcp_servers
+                for tool in server.get("tools", [])
+                if isinstance(tool, dict) and tool.get("name")
+            }
+
+            _upsert_plugin_row(conn, plugin)
+            for skill_id in sorted(existing_skills.keys() - desired_skill_ids):
+                _delete_capability_override_row(conn, "skill", skill_id)
+                _delete_capability_override_row(conn, "tool", f"skill.{skill_id}.run")
+                conn.execute("DELETE FROM skill_registry WHERE id = ?", (skill_id,))
+            for server_id in sorted(existing_servers.keys() - desired_server_ids):
+                _delete_capability_override_row(conn, "mcp_server", server_id)
+                for tool_id in _mcp_tool_ids(existing_servers[server_id]):
+                    _delete_capability_override_row(conn, "tool", tool_id)
+                conn.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
+            old_tool_ids = {
+                tool_id
+                for server in existing_servers.values()
+                for tool_id in _mcp_tool_ids(server)
+            }
+            for tool_id in sorted(old_tool_ids - desired_tool_ids):
+                _delete_capability_override_row(conn, "tool", tool_id)
+            for skill in skills:
+                _upsert_skill_row(conn, skill)
+            for server in mcp_servers:
+                _upsert_mcp_server_row(conn, server)
+            row = conn.execute(
+                "SELECT * FROM plugin_registry WHERE id = ?", (plugin_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("plugin_bundle_write_lost")
+            result = _plugin_from_row(row)
+        return result
+
+    def delete_plugin_bundle(self, plugin_id: str) -> None:
+        """Atomically delete one plugin and its namespaced extension rows."""
+
+        prefix = f"plugin.{plugin_id}."
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_skills, existing_servers = _plugin_extension_rows(conn, prefix)
+            for skill_id in sorted(existing_skills):
+                _delete_capability_override_row(conn, "skill", skill_id)
+                _delete_capability_override_row(conn, "tool", f"skill.{skill_id}.run")
+                conn.execute("DELETE FROM skill_registry WHERE id = ?", (skill_id,))
+            for server_id, server in sorted(existing_servers.items()):
+                _delete_capability_override_row(conn, "mcp_server", server_id)
+                for tool_id in _mcp_tool_ids(server):
+                    _delete_capability_override_row(conn, "tool", tool_id)
+                conn.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
+            conn.execute("DELETE FROM plugin_registry WHERE id = ?", (plugin_id,))
+
+    def quiesce_plugin_bundle(self, plugin_id: str) -> dict[str, Any] | None:
+        """Disable one live plugin generation without changing row timestamps."""
+
+        prefix = f"plugin.{plugin_id}."
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            plugin = conn.execute(
+                "SELECT id, enabled FROM plugin_registry WHERE id = ?", (plugin_id,)
+            ).fetchone()
+            if plugin is None:
+                return None
+            existing_skills, existing_servers = _plugin_extension_rows(conn, prefix)
+            token: dict[str, Any] = {
+                "plugin_id": plugin_id,
+                "plugin_enabled": bool(plugin["enabled"]),
+                "skills": {
+                    skill_id: bool(skill["enabled"])
+                    for skill_id, skill in existing_skills.items()
+                },
+                "mcp_servers": {
+                    server_id: bool(server["enabled"])
+                    for server_id, server in existing_servers.items()
+                },
+            }
+            conn.execute("UPDATE plugin_registry SET enabled = 0 WHERE id = ?", (plugin_id,))
+            for skill_id in existing_skills:
+                conn.execute("UPDATE skill_registry SET enabled = 0 WHERE id = ?", (skill_id,))
+            for server_id in existing_servers:
+                conn.execute("UPDATE mcp_servers SET enabled = 0 WHERE id = ?", (server_id,))
+            return token
+
+    def restore_quiesced_plugin_bundle(self, token: dict[str, Any]) -> None:
+        """Restore exact enablement after a failed filesystem transaction."""
+
+        plugin_id = str(token["plugin_id"])
+        skills = dict(token.get("skills", {}))
+        servers = dict(token.get("mcp_servers", {}))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            plugin = conn.execute(
+                "SELECT enabled FROM plugin_registry WHERE id = ?", (plugin_id,)
+            ).fetchone()
+            if plugin is None or bool(plugin["enabled"]):
+                raise RuntimeError("plugin_quiesce_restore_conflict")
+            current_skills = {
+                str(row["id"]): bool(row["enabled"])
+                for row in conn.execute("SELECT id, enabled FROM skill_registry").fetchall()
+                if str(row["id"]).startswith(f"plugin.{plugin_id}.")
+            }
+            current_servers = {
+                str(row["id"]): bool(row["enabled"])
+                for row in conn.execute("SELECT id, enabled FROM mcp_servers").fetchall()
+                if str(row["id"]).startswith(f"plugin.{plugin_id}.")
+            }
+            if (
+                set(current_skills) != set(skills)
+                or set(current_servers) != set(servers)
+                or any(current_skills.values())
+                or any(current_servers.values())
+            ):
+                raise RuntimeError("plugin_quiesce_restore_conflict")
+            conn.execute(
+                "UPDATE plugin_registry SET enabled = ? WHERE id = ?",
+                (1 if bool(token["plugin_enabled"]) else 0, plugin_id),
+            )
+            for skill_id, enabled in skills.items():
+                conn.execute(
+                    "UPDATE skill_registry SET enabled = ? WHERE id = ?",
+                    (1 if bool(enabled) else 0, skill_id),
+                )
+            for server_id, enabled in servers.items():
+                conn.execute(
+                    "UPDATE mcp_servers SET enabled = ? WHERE id = ?",
+                    (1 if bool(enabled) else 0, server_id),
+                )
 
     def get_capability_override(
         self,
@@ -5400,6 +5440,240 @@ def _approval_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": str(row["created_at"]),
         "updated_at": str(row["updated_at"]),
     }
+
+
+def _upsert_mcp_server_row(conn: sqlite3.Connection, server: dict[str, Any]) -> None:
+    server_id = str(server["id"])
+    tools = list(server.get("tools", []))
+    capabilities = server.get("capabilities") or sorted(
+        {
+            str(capability)
+            for tool in tools
+            for capability in list(dict(tool).get("capabilities", []))
+        }
+    )
+    payload = {
+        "name": server.get("name", server_id),
+        "transport": server.get("transport", "stdio"),
+        "command": server.get("command"),
+        "args_json": json.dumps(server.get("args", [])),
+        "env_json": json.dumps(server.get("env", {})),
+        "url": server.get("url"),
+        "enabled": 1 if server.get("enabled", True) else 0,
+        "tools_json": json.dumps(tools),
+        "status": server.get("status", "configured"),
+        "error": server.get("error"),
+        "last_synced_at": server.get("last_synced_at"),
+        "last_seen_at": server.get("last_seen_at"),
+        "tool_count": int(server.get("tool_count", len(tools))),
+        "capabilities_json": json.dumps(capabilities),
+        "risk_policy": server.get("risk_policy", "approval_by_default"),
+        "secret_env_json": json.dumps(server.get("secret_env", {})),
+        "session_state": server.get("session_state", "disconnected"),
+        "last_call_at": server.get("last_call_at"),
+        "last_error_at": server.get("last_error_at"),
+        "failure_count": int(server.get("failure_count", 0)),
+        "last_latency_ms": server.get("last_latency_ms"),
+        "vetting_json": json.dumps(server.get("vetting", {})),
+        "updated_at": utc_now(),
+    }
+    conn.execute(
+        """
+        INSERT INTO mcp_servers (
+            id, name, transport, command, args_json, env_json, url, enabled,
+            tools_json, status, error, last_synced_at, last_seen_at, tool_count,
+            capabilities_json, risk_policy, secret_env_json, session_state, last_call_at,
+            last_error_at, failure_count, last_latency_ms, vetting_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            transport = excluded.transport,
+            command = excluded.command,
+            args_json = excluded.args_json,
+            env_json = excluded.env_json,
+            url = excluded.url,
+            enabled = excluded.enabled,
+            tools_json = excluded.tools_json,
+            status = excluded.status,
+            error = excluded.error,
+            last_synced_at = excluded.last_synced_at,
+            last_seen_at = excluded.last_seen_at,
+            tool_count = excluded.tool_count,
+            capabilities_json = excluded.capabilities_json,
+            risk_policy = excluded.risk_policy,
+            secret_env_json = excluded.secret_env_json,
+            session_state = excluded.session_state,
+            last_call_at = excluded.last_call_at,
+            last_error_at = excluded.last_error_at,
+            failure_count = excluded.failure_count,
+            last_latency_ms = excluded.last_latency_ms,
+            vetting_json = excluded.vetting_json,
+            updated_at = excluded.updated_at
+        """,
+        (server_id, *payload.values()),
+    )
+
+
+def _upsert_skill_row(conn: sqlite3.Connection, skill: dict[str, Any]) -> None:
+    skill_id = str(skill["id"])
+    conn.execute(
+        """
+        INSERT INTO skill_registry (id, name, description, path, manifest_json, enabled, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            description = excluded.description,
+            path = excluded.path,
+            manifest_json = excluded.manifest_json,
+            enabled = excluded.enabled,
+            updated_at = excluded.updated_at
+        """,
+        (
+            skill_id,
+            skill.get("name", skill_id),
+            skill.get("description", ""),
+            skill.get("path", ""),
+            json.dumps(skill.get("manifest", {})),
+            1 if skill.get("enabled", True) else 0,
+            utc_now(),
+        ),
+    )
+
+
+def _upsert_plugin_row(conn: sqlite3.Connection, plugin: dict[str, Any]) -> None:
+    plugin_id = str(plugin["id"])
+    now = utc_now()
+    created_at = str(plugin.get("created_at") or now)
+    current = conn.execute(
+        "SELECT created_at FROM plugin_registry WHERE id = ?", (plugin_id,)
+    ).fetchone()
+    if current is not None:
+        created_at = str(current["created_at"])
+    conn.execute(
+        """
+        INSERT INTO plugin_registry (
+            id, name, description, source_url, source_ref, commit_sha, install_path,
+            manifest_json, capabilities_json, enabled, risk_report_json,
+            install_status, format, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            description = excluded.description,
+            source_url = excluded.source_url,
+            source_ref = excluded.source_ref,
+            commit_sha = excluded.commit_sha,
+            install_path = excluded.install_path,
+            manifest_json = excluded.manifest_json,
+            capabilities_json = excluded.capabilities_json,
+            enabled = excluded.enabled,
+            risk_report_json = excluded.risk_report_json,
+            install_status = excluded.install_status,
+            format = excluded.format,
+            updated_at = excluded.updated_at
+        """,
+        (
+            plugin_id,
+            plugin.get("name", plugin_id),
+            plugin.get("description", ""),
+            plugin.get("source_url", ""),
+            plugin.get("source_ref"),
+            plugin.get("commit_sha", ""),
+            plugin.get("install_path", ""),
+            json.dumps(plugin.get("manifest", {})),
+            json.dumps(plugin.get("capabilities", [])),
+            1 if plugin.get("enabled", False) else 0,
+            json.dumps(plugin.get("risk_report", {})),
+            plugin.get("install_status", "installed"),
+            plugin.get("format", "kestrel"),
+            created_at,
+            now,
+        ),
+    )
+
+
+def _validate_plugin_bundle_ids(
+    prefix: str,
+    *,
+    skills: list[dict[str, Any]],
+    mcp_servers: list[dict[str, Any]],
+) -> None:
+    skill_ids = [str(skill["id"]) for skill in skills]
+    server_ids = [str(server["id"]) for server in mcp_servers]
+    if len(set(skill_ids)) != len(skill_ids) or any(
+        not skill_id.startswith(prefix) for skill_id in skill_ids
+    ):
+        raise ValueError("Plugin skill bundle contains an invalid or duplicate id.")
+    if len(set(server_ids)) != len(server_ids) or any(
+        not server_id.startswith(prefix) for server_id in server_ids
+    ):
+        raise ValueError("Plugin MCP bundle contains an invalid or duplicate id.")
+
+
+def _plugin_extension_rows(
+    conn: sqlite3.Connection,
+    prefix: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    skill_rows = conn.execute("SELECT * FROM skill_registry").fetchall()
+    server_rows = conn.execute("SELECT * FROM mcp_servers").fetchall()
+    skills = {
+        str(row["id"]): _skill_from_row(row)
+        for row in skill_rows
+        if str(row["id"]).startswith(prefix)
+    }
+    servers = {
+        str(row["id"]): _mcp_from_row(row)
+        for row in server_rows
+        if str(row["id"]).startswith(prefix)
+    }
+    return skills, servers
+
+
+def _mcp_tool_ids(server: dict[str, Any]) -> set[str]:
+    return {
+        str(tool["name"])
+        for tool in server.get("tools", [])
+        if isinstance(tool, dict) and tool.get("name")
+    }
+
+
+def _delete_capability_override_row(
+    conn: sqlite3.Connection,
+    kind: str,
+    capability_id: str,
+) -> None:
+    row = conn.execute(
+        """
+        SELECT * FROM capability_overrides
+        WHERE kind = ? AND capability_id = ?
+        """,
+        (kind, capability_id),
+    ).fetchone()
+    if row is None:
+        return
+    current = _capability_override_from_row(row)
+    next_revision = int(current["revision"]) + 1
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO capability_change_log (
+            kind, capability_id, previous_enabled, enabled,
+            previous_revision, revision, resource_digest, updated_by, created_at
+        ) VALUES (?, ?, ?, 0, ?, ?, ?, 'system', ?)
+        """,
+        (
+            kind,
+            capability_id,
+            1 if bool(current["enabled"]) else 0,
+            int(current["revision"]),
+            next_revision,
+            current.get("resource_digest"),
+            now,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM capability_overrides WHERE kind = ? AND capability_id = ?",
+        (kind, capability_id),
+    )
 
 
 def _mcp_from_row(row: sqlite3.Row) -> dict[str, Any]:

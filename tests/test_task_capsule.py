@@ -11,11 +11,40 @@ from nested_memvid_agent.file_lock import lock_exclusive, unlock
 from nested_memvid_agent.models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution
 from nested_memvid_agent.task_capsule import (
+    TaskCapsuleWriter,
     enforce_task_capsule_retention,
     extract_learning_signals,
     summarize_run_capsule,
     write_run_capsule,
 )
+
+
+def test_capsule_close_failure_retains_backend_for_verified_retry(tmp_path: Path) -> None:
+    writer = TaskCapsuleWriter(
+        runs_dir=tmp_path / "runs",
+        run_id="retry-close",
+    )
+    allow_close = False
+    close_calls = 0
+
+    class _Backend:
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if not allow_close:
+                raise RuntimeError("injected capsule close failure")
+
+    backend = _Backend()
+    writer.backend = backend  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="injected capsule close failure"):
+        writer.close()
+    assert writer.backend is backend
+
+    allow_close = True
+    writer.close()
+    assert writer.backend is None
+    assert close_calls == 2
 
 
 def test_writes_capsule_artifact_path(tmp_path: Path) -> None:
@@ -113,7 +142,7 @@ def test_capsule_root_links_to_candidate_frames(tmp_path: Path) -> None:
 
 
 def test_capsule_redacts_secrets_from_arguments_outputs_and_candidates(tmp_path: Path) -> None:
-    secret = "opaque-capsule-secret-12345"
+    secret = "opaque-capsule-secret-12345"  # gitleaks:allow -- synthetic fixture
     path = write_run_capsule(
         runs_dir=tmp_path / "runs",
         run_id="run_redacted",

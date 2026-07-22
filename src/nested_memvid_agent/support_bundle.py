@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
-import shutil
+import secrets
 import sqlite3
-import subprocess  # nosec B404 - fixed Git argv, no shell, bounded timeout
+import stat
+import subprocess  # nosec B404
 import zipfile
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .config import AgentConfig
 from .event_log import read_bounded_jsonl_tail, redact_secrets
 from .product_readiness import build_product_readiness_report
+from .repair_integrity import (
+    hardened_readonly_git_command,
+    hardened_readonly_git_environment,
+)
 from .setup_readiness import build_setup_readiness_report
 
 _STATE_TABLES = (
@@ -101,6 +107,8 @@ _EVENT_SAFE_TEXT_LIST_FIELDS = frozenset(
         "similar_lessons_used",
     }
 )
+_PRIVATE_BUNDLE_MODE = 0o600
+_SUPPORT_BUNDLE_TEMP_PREFIX = ".kestrel-support-"
 
 
 @dataclass(frozen=True)
@@ -124,10 +132,13 @@ def export_support_bundle(
     output_path: Path | None = None,
     log_tail: int = 100,
 ) -> SupportBundleResult:
-    """Write a redacted diagnostic bundle for local support/debugging."""
+    """Write a redacted diagnostic bundle for local support/debugging.
+
+    Bundle destinations are create-once: an existing file, hard link, symbolic
+    link, directory, or concurrent publication is refused rather than replaced.
+    """
     generated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
     bundle_path = output_path or _default_bundle_path(config, generated_at)
-    bundle_path.parent.mkdir(parents=True, exist_ok=True)
 
     sections: dict[str, Any] = {
         "product_readiness.json": build_product_readiness_report().to_dict(),
@@ -151,17 +162,20 @@ def export_support_bundle(
         "entries": list(entries),
     }
 
-    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        _write_json(archive, "manifest.json", manifest)
-        for name, payload in sections.items():
-            _write_json(archive, name, payload)
+    _write_support_archive_exclusive(
+        bundle_path,
+        manifest=manifest,
+        sections=sections,
+        expected_entries=entries,
+    )
 
     return SupportBundleResult(bundle_path=bundle_path, manifest=manifest, entries=entries)
 
 
 def _default_bundle_path(config: AgentConfig, generated_at: str) -> Path:
     timestamp = generated_at.replace(":", "").replace("+0000", "Z").replace("+00:00", "Z")
-    return config.log_dir.parent / "support-bundles" / f"kestrel-support-{timestamp}.zip"
+    nonce = secrets.token_hex(4)
+    return config.log_dir.parent / "support-bundles" / f"kestrel-support-{timestamp}-{nonce}.zip"
 
 
 def _runtime_payload(config: AgentConfig) -> dict[str, Any]:
@@ -267,25 +281,17 @@ def _git_payload(workspace: Path) -> dict[str, Any]:
 
 
 def _run_git(workspace: Path, *args: str) -> dict[str, Any]:
-    git_path = shutil.which("git")
-    if git_path is None:
-        return {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": "Git executable is unavailable.",
-        }
-    git_executable = str(Path(git_path).expanduser().resolve())
     try:
-        # shutil.which resolves the trusted executable; args are fixed internal probes.
         completed = subprocess.run(  # nosec B603
-            [git_executable, *args],
+            hardened_readonly_git_command(list(args), workspace=workspace),
             cwd=workspace,
+            env=hardened_readonly_git_environment(),
             check=False,
             capture_output=True,
             text=True,
             timeout=5,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
     return {
         "returncode": completed.returncode,
@@ -481,6 +487,339 @@ def _safe_log_file(path: Path, root: Path) -> bool:
 
 def _bounded_log_tail(limit: int) -> int:
     return max(0, min(int(limit), 500))
+
+
+def _write_support_archive_exclusive(
+    bundle_path: Path,
+    *,
+    manifest: dict[str, Any],
+    sections: dict[str, Any],
+    expected_entries: tuple[str, ...],
+) -> None:
+    """Build, validate, and publish a private ZIP without replacing a path."""
+
+    parent = bundle_path.parent
+    directory_fd = _open_bundle_directory(parent)
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    published = False
+    try:
+        _require_absent_bundle_destination(directory_fd, parent, bundle_path.name)
+        descriptor, temporary_name, temporary_identity = _create_bundle_temporary(
+            directory_fd,
+            parent,
+        )
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, _PRIVATE_BUNDLE_MODE)
+            temporary_metadata = os.fstat(descriptor)
+            _validate_bundle_file(
+                temporary_metadata,
+                path=parent / temporary_name,
+                expected_links=1,
+            )
+            if (temporary_metadata.st_dev, temporary_metadata.st_ino) != temporary_identity:
+                raise ValueError("Support bundle temporary file identity changed after creation.")
+
+            with os.fdopen(descriptor, "w+b") as handle:
+                descriptor = -1
+                _populate_support_archive(handle, manifest=manifest, sections=sections)
+                handle.flush()
+                os.fsync(handle.fileno())
+                _validate_support_archive(handle, expected_entries=expected_entries)
+                _verify_bundle_entry_identity(
+                    directory_fd,
+                    parent,
+                    temporary_name,
+                    expected_identity=temporary_identity,
+                    expected_links=1,
+                )
+                _require_absent_bundle_destination(directory_fd, parent, bundle_path.name)
+                _publish_bundle_entry(
+                    directory_fd,
+                    parent,
+                    temporary_name,
+                    bundle_path.name,
+                )
+                published = True
+                _verify_bundle_entry_identity(
+                    directory_fd,
+                    parent,
+                    bundle_path.name,
+                    expected_identity=temporary_identity,
+                    expected_links=2,
+                )
+                _remove_bundle_entry_if_identity(
+                    directory_fd,
+                    parent,
+                    temporary_name,
+                    expected_identity=temporary_identity,
+                )
+                temporary_name = None
+                _verify_bundle_entry_identity(
+                    directory_fd,
+                    parent,
+                    bundle_path.name,
+                    expected_identity=temporary_identity,
+                    expected_links=1,
+                )
+                _fsync_bundle_directory(directory_fd, parent)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except BaseException as exc:
+        if published and temporary_identity is not None:
+            try:
+                _remove_bundle_entry_if_identity(
+                    directory_fd,
+                    parent,
+                    bundle_path.name,
+                    expected_identity=temporary_identity,
+                )
+            except OSError as cleanup_error:
+                exc.add_note(f"Unable to remove failed support bundle publication: {cleanup_error}")
+        if temporary_name is not None and temporary_identity is not None:
+            try:
+                _remove_bundle_entry_if_identity(
+                    directory_fd,
+                    parent,
+                    temporary_name,
+                    expected_identity=temporary_identity,
+                )
+            except OSError as cleanup_error:
+                exc.add_note(f"Unable to remove support bundle temporary file: {cleanup_error}")
+        try:
+            _fsync_bundle_directory(directory_fd, parent)
+        except OSError as cleanup_error:
+            exc.add_note(f"Unable to sync support bundle cleanup: {cleanup_error}")
+        raise
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _populate_support_archive(
+    handle: BinaryIO,
+    *,
+    manifest: dict[str, Any],
+    sections: dict[str, Any],
+) -> None:
+    with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        _write_json(archive, "manifest.json", manifest)
+        for name, payload in sections.items():
+            _write_json(archive, name, payload)
+
+
+def _validate_support_archive(
+    handle: BinaryIO,
+    *,
+    expected_entries: tuple[str, ...],
+) -> None:
+    handle.seek(0)
+    with zipfile.ZipFile(handle, "r") as archive:
+        actual_entries = tuple(archive.namelist())
+        if actual_entries != expected_entries:
+            raise ValueError("Support bundle archive entries failed validation.")
+        corrupt_entry = archive.testzip()
+        if corrupt_entry is not None:
+            raise ValueError(f"Support bundle archive entry failed validation: {corrupt_entry}")
+
+
+def _open_bundle_directory(parent: Path) -> int | None:
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    before_open = os.lstat(parent)
+    _validate_bundle_directory(before_open, parent)
+    if not _bundle_directory_fd_supported():
+        return None
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(parent, flags)
+    try:
+        opened = os.fstat(descriptor)
+        after_open = os.lstat(parent)
+        _validate_bundle_directory(opened, parent)
+        _validate_bundle_directory(after_open, parent)
+        if not os.path.samestat(before_open, opened) or not os.path.samestat(opened, after_open):
+            raise ValueError("Support bundle destination directory changed during validation.")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _bundle_directory_fd_supported() -> bool:
+    return (
+        os.name != "nt"
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.link in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+
+
+def _validate_bundle_directory(metadata: os.stat_result, path: Path) -> None:
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"Support bundle destination directory must not be a symbolic link: {path}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(f"Support bundle destination parent is not a directory: {path}")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if os.name != "nt" and mode & 0o022 and not metadata.st_mode & stat.S_ISVTX:
+        raise PermissionError(
+            f"Support bundle destination directory must not be group/world writable: {path}"
+        )
+
+
+def _create_bundle_temporary(
+    directory_fd: int | None,
+    parent: Path,
+) -> tuple[int, str, tuple[int, int]]:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    for _attempt in range(64):
+        name = f"{_SUPPORT_BUNDLE_TEMP_PREFIX}{secrets.token_hex(16)}.tmp"
+        try:
+            if directory_fd is None:
+                descriptor = os.open(parent / name, flags, _PRIVATE_BUNDLE_MODE)
+            else:
+                descriptor = os.open(name, flags, _PRIVATE_BUNDLE_MODE, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            _unlink_bundle_entry(directory_fd, parent, name)
+            raise
+        return descriptor, name, (metadata.st_dev, metadata.st_ino)
+    raise FileExistsError("Unable to allocate an exclusive support bundle temporary file.")
+
+
+def _require_absent_bundle_destination(
+    directory_fd: int | None,
+    parent: Path,
+    name: str,
+) -> None:
+    try:
+        _bundle_entry_stat(directory_fd, parent, name)
+    except FileNotFoundError:
+        return
+    raise FileExistsError(f"Refusing to overwrite existing support bundle destination: {parent / name}")
+
+
+def _bundle_entry_stat(directory_fd: int | None, parent: Path, name: str) -> os.stat_result:
+    if directory_fd is None:
+        return os.stat(parent / name, follow_symlinks=False)
+    return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+
+
+def _verify_bundle_entry_identity(
+    directory_fd: int | None,
+    parent: Path,
+    name: str,
+    *,
+    expected_identity: tuple[int, int],
+    expected_links: int,
+) -> None:
+    metadata = _bundle_entry_stat(directory_fd, parent, name)
+    _validate_bundle_file(metadata, path=parent / name, expected_links=expected_links)
+    if (metadata.st_dev, metadata.st_ino) != expected_identity:
+        raise ValueError("Support bundle file identity changed during publication.")
+
+
+def _validate_bundle_file(
+    metadata: os.stat_result,
+    *,
+    path: Path,
+    expected_links: int,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"Support bundle artifacts must be regular files: {path}")
+    if metadata.st_nlink != expected_links:
+        raise ValueError(f"Support bundle artifact has unsafe hard-link metadata: {path}")
+    if os.name != "nt":
+        geteuid = getattr(os, "geteuid", None)
+        if callable(geteuid) and metadata.st_uid != geteuid():
+            raise PermissionError(f"Support bundle artifacts must be owned by the current user: {path}")
+        if stat.S_IMODE(metadata.st_mode) != _PRIVATE_BUNDLE_MODE:
+            raise PermissionError(f"Support bundle artifacts must be owner-only: {path}")
+
+
+def _publish_bundle_entry(
+    directory_fd: int | None,
+    parent: Path,
+    temporary_name: str,
+    destination_name: str,
+) -> None:
+    try:
+        if directory_fd is None:
+            os.link(
+                parent / temporary_name,
+                parent / destination_name,
+                follow_symlinks=False,
+            )
+        else:
+            os.link(
+                temporary_name,
+                destination_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"Refusing to overwrite existing support bundle destination: {parent / destination_name}"
+        ) from exc
+
+
+def _remove_bundle_entry_if_identity(
+    directory_fd: int | None,
+    parent: Path,
+    name: str,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        metadata = _bundle_entry_stat(directory_fd, parent, name)
+    except FileNotFoundError:
+        return
+    if (metadata.st_dev, metadata.st_ino) != expected_identity or not stat.S_ISREG(
+        metadata.st_mode
+    ):
+        return
+    _unlink_bundle_entry(directory_fd, parent, name)
+
+
+def _unlink_bundle_entry(directory_fd: int | None, parent: Path, name: str) -> None:
+    if directory_fd is None:
+        os.unlink(parent / name)
+    else:
+        os.unlink(name, dir_fd=directory_fd)
+
+
+def _fsync_bundle_directory(directory_fd: int | None, parent: Path) -> None:
+    if os.name == "nt":
+        return
+    opened_here = False
+    descriptor = directory_fd
+    if descriptor is None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(parent, flags)
+        opened_here = True
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        unsupported = {
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if exc.errno not in unsupported:
+            raise
+    finally:
+        if opened_here:
+            os.close(descriptor)
 
 
 def _write_json(archive: zipfile.ZipFile, name: str, payload: Any) -> None:

@@ -71,8 +71,11 @@ def test_memory_system_closes_partially_opened_backends_when_startup_fails(
     ]
 
 
-def test_memory_system_closes_every_backend_when_sealing_fails(tmp_path: Path) -> None:
+def test_memory_system_retains_backends_until_failed_seal_can_be_retried(
+    tmp_path: Path,
+) -> None:
     FailingSealBackend.closed_layers = []
+    FailingSealBackend.fail_seal = True
     memory = LayeredMemorySystem.from_backend_factory(tmp_path, FailingSealBackend)
     memory.put(
         MemoryRecord(
@@ -86,6 +89,10 @@ def test_memory_system_closes_every_backend_when_sealing_fails(tmp_path: Path) -
     with pytest.raises(RuntimeError, match="working seal failed"):
         memory.close_all()
 
+    assert FailingSealBackend.closed_layers == []
+
+    FailingSealBackend.fail_seal = False
+    memory.close_all()
     assert set(FailingSealBackend.closed_layers) == set(MemoryLayer)
 
 
@@ -340,9 +347,10 @@ class FailingOpenBackend(InMemoryBackend):
 
 class FailingSealBackend(InMemoryBackend):
     closed_layers: list[MemoryLayer] = []
+    fail_seal = True
 
     def seal(self) -> None:
-        if self.layer == MemoryLayer.WORKING:
+        if self.layer == MemoryLayer.WORKING and type(self).fail_seal:
             raise RuntimeError("working seal failed")
         super().seal()
 

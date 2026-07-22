@@ -12,14 +12,14 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from threading import Event, Lock, RLock, Thread, current_thread, local
+from threading import Condition, Event, Lock, RLock, Thread, current_thread, local
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
 from .agent import NestedMV2Agent, _is_validation_success, _sanitize_tool_execution
 from .app_factory import build_agent
-from .capability_policy import CapabilityPolicy, tool_spec_digest
+from .capability_policy import CapabilityPolicy, parent_resource_digest, tool_spec_digest
 from .config import AgentConfig
 from .diagnosis import classify_failure
 from .event_bus import RunEventBus
@@ -30,11 +30,16 @@ from .graph_runtime import (
     criterion_requires_validation_evidence,
     evaluate_turn_review,
 )
+from .layers import MemoryCleanupIncompleteError
 from .mcp_manager import MCPManager
 from .models import MemoryLayer
 from .nested_learning import STABLE_MEMORY_LAYERS, NestedLearningKernel
 from .plugin_manager import PluginManager
 from .process_liveness import process_is_alive
+from .repair_integrity import (
+    hardened_readonly_git_command,
+    hardened_readonly_git_environment,
+)
 from .retention import RetentionCompactor
 from .runtime_models import (
     AgentTurnResult,
@@ -74,6 +79,7 @@ from .worker_isolation import prepare_git_worktree
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "skipped"}
 _PUBLICATION_FENCE_WAIT_SECONDS = 30.0
+_CANCELLED_DURABILITY_FAILURE_REASON = "cancelled_memory_close_failed"
 _REPAIR_ARTIFACT_SCHEMA_VERSION = 1
 _MAX_REPAIR_DEPENDENCY_ARTIFACTS = 16
 _MAX_REPAIR_CHANGED_FILES = 128
@@ -129,20 +135,36 @@ class RunManager:
             self.mcp.capability_policy = self.capabilities
             self.skills.capability_policy = self.capabilities
             self._lock = Lock()
+            self._operation_condition = Condition(self._lock)
             self._approval_lock = Lock()
+            self._memvid_agent_condition = Condition(Lock())
+            self._memvid_agent_active = False
+            self._shutdown_event = Event()
             self._approval_call_arguments: dict[str, tuple[str, dict[str, Any]]] = {}
             self._execution_locks = tuple(RLock() for _ in range(64))
             self._execution_context = local()
             self._threads: dict[str, Thread] = {}
             self._thread_run_ids: dict[str, str] = {}
+            self._active_run_operations: dict[str, int] = {}
             self._publication_events: dict[str, Event] = {}
+            self._publication_counts: dict[str, int] = {}
             self._active_primary_runs: set[str] = set()
             self._reserved_primary_runs: set[str] = set()
             self._queued_primary_runs: deque[tuple[str, Any, tuple[Any, ...], Event]] = deque()
             self._cancelled: set[str] = set()
             self._lost_run_leases: set[str] = set()
+            self._cancelled_run_durability_failures: set[str] = set()
+            self._cancelled_run_durability_failure_count = 0
+            self._failed_admission_reconciliations: dict[str, str] = {}
+            self._admission_reconciliation_failure_count = 0
             self._admission_rejections = 0
             self._shutdown_cancellation_failures = 0
+            self._failed_agent_closures: dict[
+                int, tuple[str | None, NestedMV2Agent]
+            ] = {}
+            self._quarantined_memory_cleanups: list[
+                tuple[MemoryCleanupIncompleteError, Callable[[], None]]
+            ] = []
             self._shutting_down = False
             self._started = False
             self._start_lock = Lock()
@@ -211,6 +233,12 @@ class RunManager:
             raise RuntimeError(f"read_only_runtime_observer:{operation}")
         if not self._started:
             raise RuntimeError(f"runtime_not_started:{operation}")
+        with self._lock:
+            shutting_down = self._shutting_down
+        if shutting_down and operation != "cancel_run":
+            if operation in {"create_run", "create_scheduled_routine_run"}:
+                raise RunCapacityError("run_manager_shutting_down")
+            raise RuntimeError("run_manager_shutting_down")
 
     def _reconcile_startup(self) -> dict[str, list[str]]:
         """Fail interrupted work while preserving intentional approval waits."""
@@ -858,14 +886,35 @@ class RunManager:
                 yield inherited
                 return
 
-            lease = self.state.acquire_run_lease(
-                run_id,
-                owner=self._lease_owner,
-                ttl_seconds=config.run_lease_ttl_seconds,
-            )
+            # Operation admission is atomic against shutdown. Register before
+            # lease acquisition so shutdown either drains this caller or rejects
+            # it before execution ownership can be acquired.
+            with self._operation_condition:
+                if self._shutting_down or self._shutdown_event.is_set():
+                    raise RuntimeError("run_manager_shutting_down")
+                self._begin_publication_locked(run_id)
+                self._active_run_operations[run_id] = (
+                    self._active_run_operations.get(run_id, 0) + 1
+                )
+            try:
+                lease = self.state.acquire_run_lease(
+                    run_id,
+                    owner=self._lease_owner,
+                    ttl_seconds=config.run_lease_ttl_seconds,
+                )
+            except BaseException:
+                self._unregister_run_operation(run_id)
+                raise
             if lease is None:
-                self.events.publish(run_id, "run.lease_rejected", {"owner": self._lease_owner})
-                yield None
+                try:
+                    self.events.publish(
+                        run_id,
+                        "run.lease_rejected",
+                        {"owner": self._lease_owner},
+                    )
+                    yield None
+                finally:
+                    self._unregister_run_operation(run_id)
                 return
             active_leases[run_id] = lease
             with self._lock:
@@ -944,23 +993,52 @@ class RunManager:
                         mark_lost("lease_rejected")
                     return
 
-            heartbeat_thread = Thread(
-                target=heartbeat,
-                name=f"kestrel-heartbeat-{run_id}",
-                daemon=True,
-            )
-            heartbeat_thread.start()
+            try:
+                heartbeat_thread = Thread(
+                    target=heartbeat,
+                    name=f"kestrel-heartbeat-{run_id}",
+                    daemon=True,
+                )
+                heartbeat_thread.start()
+            except BaseException:
+                active_leases.pop(run_id, None)
+                try:
+                    self.state.release_run_lease(
+                        run_id,
+                        owner=self._lease_owner,
+                        generation=lease.lease_generation,
+                    )
+                finally:
+                    self._unregister_run_operation(run_id)
+                raise
             try:
                 yield lease
             finally:
                 stop.set()
-                heartbeat_thread.join(timeout=max(interval * 2, 0.1))
-                active_leases.pop(run_id, None)
-                self.state.release_run_lease(
-                    run_id,
-                    owner=self._lease_owner,
-                    generation=lease.lease_generation,
-                )
+                try:
+                    heartbeat_thread.join(timeout=max(interval * 2, 0.1))
+                finally:
+                    active_leases.pop(run_id, None)
+                    try:
+                        self.state.release_run_lease(
+                            run_id,
+                            owner=self._lease_owner,
+                            generation=lease.lease_generation,
+                        )
+                    finally:
+                        self._unregister_run_operation(run_id)
+
+    def _unregister_run_operation(self, run_id: str) -> None:
+        with self._operation_condition:
+            remaining = self._active_run_operations.get(run_id, 0) - 1
+            if remaining > 0:
+                self._active_run_operations[run_id] = remaining
+            else:
+                self._active_run_operations.pop(run_id, None)
+            publication = self._publication_events.get(run_id)
+            if publication is not None:
+                self._finish_publication_locked(run_id, publication)
+            self._operation_condition.notify_all()
 
     def _execution_lock_for(self, run_id: str) -> RLock:
         digest = hashlib.sha256(run_id.encode("utf-8")).digest()
@@ -1004,6 +1082,8 @@ class RunManager:
 
         deadline = monotonic() + max(5.0, config.run_lease_ttl_seconds * 2)
         while monotonic() < deadline:
+            if self._shutdown_event.is_set():
+                raise RuntimeError("run_manager_shutting_down")
             current = self.state.get_run(run_id)
             if current.status in _TERMINAL_RUN_STATUSES:
                 yield None
@@ -1278,7 +1358,7 @@ class RunManager:
                 model=run_config.model,
                 config_revision=str(config_snapshot["revision"]),
                 config_snapshot=config_snapshot,
-                max_nonterminal_runs=max(1, run_config.max_concurrent_runs)
+                max_nonterminal_runs=self._primary_concurrency_limit(run_config)
                 + max(0, run_config.max_queued_runs),
             )
             if not admitted:
@@ -1355,7 +1435,7 @@ class RunManager:
                 turn_source=turn_source,
                 turn_origin=turn_origin,
                 transcript_scope=transcript_scope,
-                max_nonterminal_runs=max(1, run_config.max_concurrent_runs)
+                max_nonterminal_runs=self._primary_concurrency_limit(run_config)
                 + max(0, run_config.max_queued_runs),
             )
             self._initialize_primary_run(
@@ -1522,14 +1602,19 @@ class RunManager:
         *,
         wait_for_publication: bool,
     ) -> dict[str, Any]:
-        """Hide durable terminal state until its owning cycle is fully published."""
+        """Hide terminal state until every in-process owner finishes publication."""
 
         if run.status not in _TERMINAL_RUN_STATUSES | {"blocked"}:
             return asdict(run)
+        active_leases = getattr(self._execution_context, "active_leases", {})
         with self._lock:
             publication = self._publication_events.get(run.run_id)
-            owner_thread = self._threads.get(run.run_id)
-        if publication is None or owner_thread is current_thread():
+            current = current_thread()
+            owner_is_current = any(
+                thread is current and self._thread_run_ids.get(thread_key) == run.run_id
+                for thread_key, thread in self._threads.items()
+            )
+        if publication is None or owner_is_current or run.run_id in active_leases:
             return asdict(run)
         published = publication.is_set()
         if wait_for_publication and not published:
@@ -1587,21 +1672,23 @@ class RunManager:
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         self._require_mutable_runtime("cancel_run")
-        removed_from_queue = False
         cancelled_now = False
-        queued_publication: Event | None = None
+        queued_publications: list[Event] = []
         with self._lock:
             self._cancelled.add(run_id)
             current = self.state.get_run(run_id)
             if current.status in _TERMINAL_RUN_STATUSES:
                 result = asdict(current)
             else:
-                retained = deque(item for item in self._queued_primary_runs if item[0] != run_id)
-                removed_from_queue = len(retained) != len(self._queued_primary_runs)
+                retained: deque[tuple[str, Any, tuple[Any, ...], Event]] = deque()
+                for queued in self._queued_primary_runs:
+                    if queued[0] == run_id:
+                        queued_publications.append(queued[3])
+                    else:
+                        retained.append(queued)
                 self._queued_primary_runs = retained
-                if removed_from_queue:
+                if queued_publications:
                     self._reserved_primary_runs.discard(run_id)
-                    queued_publication = self._publication_events.get(run_id)
                 run = self.state.transition_run(run_id, "cancelled", stop_reason="cancelled")
                 cancelled_now = run.status == "cancelled"
                 result = asdict(run)
@@ -1618,7 +1705,7 @@ class RunManager:
             )
         self._forget_approval_arguments_for_run(run_id)
         cancel_subprocesses_for_run(run_id)
-        if queued_publication is not None:
+        for queued_publication in queued_publications:
             self._finish_publication(run_id, queued_publication)
         return result
 
@@ -1865,6 +1952,11 @@ class RunManager:
                 "id": spec.server_id,
                 "revision": parent.revision,
                 "configured_enabled": parent.configured_enabled,
+                "resource_digest": parent_resource_digest(
+                    self.state,
+                    "mcp_server",
+                    spec.server_id,
+                ),
                 "transport": row.get("transport"),
                 "command": row.get("command"),
                 "args": row.get("args", []),
@@ -1934,11 +2026,9 @@ class RunManager:
         if run_id:
             run = self.state.get_run(run_id)
             active_config = self._config_for_run(run)
-        registry = self.build_registry(active_config)
-        agent = build_agent(
-            active_config, tools=registry, state=self.state, secret_resolver=self.secret_resolver
-        )
+        agent = self._build_agent(active_config)
         try:
+            registry = agent.tools
             call = ToolCall(name=tool_name, arguments=arguments)
             spans = SpanRecorder(state=self.state, events=self.events)
             if run_id:
@@ -1989,7 +2079,7 @@ class RunManager:
                 )
             return execution
         finally:
-            agent.close()
+            self.close_runtime_agent(agent, run_id=run_id)
 
     def task_graph(self, run_id: str) -> dict[str, Any]:
         self.state.get_run(run_id)
@@ -2577,6 +2667,7 @@ class RunManager:
                 publish_turn_observability=self._publish_turn_observability,
                 publish_tool_executions=self._publish_tool_execution_events,
                 complete_capsule=self._complete_capsule,
+                close_agent=self._close_agent_for_run,
                 run_scheduler_until_idle=lambda active_run_id, max_tasks, max_cycles: (
                     self.run_scheduler_until_idle(
                         active_run_id,
@@ -2787,7 +2878,7 @@ class RunManager:
             self.events.publish(run_id, "tool.failed", payload)
         finally:
             if agent is not None:
-                agent.close()
+                self._close_agent_for_run(run_id, agent)
             self._forget_approval_arguments(str(approval["approval_id"]))
 
     def _record_unexecuted_approval(
@@ -3110,6 +3201,13 @@ class RunManager:
                     combined_result,
                     allow_mock_provider=worker_config.provider == "mock",
                 )
+                # A worker outcome is not durable until every memory layer has
+                # force-sealed and closed. Keep the task/subagent mutable so a
+                # close failure can still be recorded as a failed worker.
+                try:
+                    self._close_agent_for_run(run_id, agent)
+                finally:
+                    agent = None
                 status = (
                     "blocked"
                     if result.stop_reason == "approval_required"
@@ -3257,7 +3355,17 @@ class RunManager:
                         {"scheduler": scheduler, "resumed_task_id": task_id},
                     )
             except Exception as exc:  # noqa: BLE001
-                error_text = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
+                error_exc = exc
+                if agent is not None:
+                    try:
+                        self._close_agent_for_run(run_id, agent)
+                    except Exception as close_exc:  # noqa: BLE001
+                        error_exc = close_exc
+                    finally:
+                        agent = None
+                error_text = str(
+                    redact_secrets(f"{type(error_exc).__name__}: {error_exc}")
+                )
                 cancelled = (
                     self._is_cancelled(run_id) or self.state.get_run(run_id).status == "cancelled"
                 )
@@ -3344,7 +3452,7 @@ class RunManager:
                     self.events.publish(run_id, "run.failed", {"error": error_text})
             finally:
                 if agent is not None:
-                    agent.close()
+                    self._close_agent_for_run(run_id, agent)
                 self._ensure_approval_result(
                     approval,
                     arguments,
@@ -3484,6 +3592,7 @@ class RunManager:
                     additional_tool_executions=(execution,),
                     lease_generation=lease.lease_generation,
                 )
+                agent = None
             except Exception as exc:  # noqa: BLE001
                 if self._is_cancelled(run_id):
                     return
@@ -3500,7 +3609,7 @@ class RunManager:
                     self.events.publish(run_id, "run.failed", {"error": error_text})
             finally:
                 if agent is not None:
-                    agent.close()
+                    self._close_agent_for_run(run_id, agent)
                 self._ensure_approval_result(
                     approval,
                     arguments,
@@ -3780,6 +3889,12 @@ class RunManager:
             span.set_result(status=str(review["status"]), output=review)
 
         status = str(review["status"])
+        if status == "completed":
+            self._complete_capsule(run_id, config, agent, result)
+        # Force-seal every layer before publishing any terminal/blocked state.
+        # If close fails, the caller can still transition the running lease to
+        # failed instead of leaving a false durable completion behind.
+        self._close_agent_for_run(run_id, agent)
         if status == "failed":
             error = str(review.get("error") or "Approval continuation failed semantic review")
             failed = self.state.transition_run(
@@ -3833,8 +3948,6 @@ class RunManager:
                 str(review.get("stop_reason") or result.stop_reason),
                 run_status == "completed",
             )
-        if status == "completed":
-            self._complete_capsule(run_id, config, agent, result)
         event_type = (
             "run.blocked"
             if status == "blocked"
@@ -3990,6 +4103,13 @@ class RunManager:
                 result,
                 allow_mock_provider=config.provider == "mock",
             )
+            # Publish blocked/completed worker receipts only after the worker's
+            # memory has force-sealed. A close failure is handled below while
+            # the task and subagent are still running.
+            try:
+                self._close_agent_for_run(run_id, agent)
+            finally:
+                agent = None
             if result.stop_reason == "approval_required":
                 task_result = {
                     "assistant_message": result.assistant_message,
@@ -4056,7 +4176,17 @@ class RunManager:
             self.events.publish(run_id, "task.completed", _task_payload(updated_task))
             self.events.publish(run_id, "subagent.completed", asdict(updated))
         except Exception as exc:  # noqa: BLE001
-            error_text = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
+            error_exc = exc
+            if agent is not None:
+                try:
+                    self._close_agent_for_run(run_id, agent)
+                except Exception as close_exc:  # noqa: BLE001
+                    error_exc = close_exc
+                finally:
+                    agent = None
+            error_text = str(
+                redact_secrets(f"{type(error_exc).__name__}: {error_exc}")
+            )
             cancelled = (
                 self._is_cancelled(run_id) or self.state.get_run(run_id).status == "cancelled"
             )
@@ -4111,7 +4241,7 @@ class RunManager:
                     self.events.publish(run_id, "subagent.failed", asdict(updated))
         finally:
             if agent is not None:
-                agent.close()
+                self._close_agent_for_run(run_id, agent)
 
     def _execute_ready_task(self, run: RunRecord, task: TaskNodeRecord) -> dict[str, Any]:
         subagent_id = f"subagent_{uuid4().hex}"
@@ -4249,6 +4379,13 @@ class RunManager:
                 result,
                 allow_mock_provider=config.provider == "mock",
             )
+            # Force-seal before any terminal task/subagent transition. This
+            # lets the exception path turn a close failure into an explicit
+            # worker failure instead of a false durable success.
+            try:
+                self._close_agent_for_run(run.run_id, agent)
+            finally:
+                agent = None
             status = (
                 "blocked"
                 if result.stop_reason == "approval_required"
@@ -4345,7 +4482,17 @@ class RunManager:
                 "worker_isolation": worker_isolation,
             }
         except Exception as exc:  # noqa: BLE001
-            error_text = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
+            error_exc = exc
+            if agent is not None:
+                try:
+                    self._close_agent_for_run(run.run_id, agent)
+                except Exception as close_exc:  # noqa: BLE001
+                    error_exc = close_exc
+                finally:
+                    agent = None
+            error_text = str(
+                redact_secrets(f"{type(error_exc).__name__}: {error_exc}")
+            )
             cancelled = (
                 self._is_cancelled(run.run_id)
                 or self.state.get_run(run.run_id).status == "cancelled"
@@ -4417,7 +4564,7 @@ class RunManager:
             }
         finally:
             if agent is not None:
-                agent.close()
+                self._close_agent_for_run(run.run_id, agent)
 
     def _worker_config(
         self,
@@ -4673,12 +4820,170 @@ class RunManager:
                 self._approval_call_arguments.pop(approval_id, None)
 
     def _build_agent(self, config: AgentConfig) -> NestedMV2Agent:
-        return build_agent(
-            config,
-            tools=self.build_registry(config),
-            state=self.state,
-            secret_resolver=self.secret_resolver,
+        if self._shutdown_event.is_set():
+            raise RuntimeError("run_manager_shutting_down")
+        release_memvid_slot: Callable[[], None] | None = None
+        if config.backend == "memvid":
+            release_memvid_slot = self._acquire_memvid_agent_slot()
+        try:
+            return build_agent(
+                config,
+                tools=self.build_registry(config),
+                state=self.state,
+                secret_resolver=self.secret_resolver,
+                close_handler=release_memvid_slot,
+            )
+        except MemoryCleanupIncompleteError as exc:
+            if release_memvid_slot is not None:
+                with self._lock:
+                    self._quarantined_memory_cleanups.append(
+                        (exc, release_memvid_slot)
+                    )
+            raise
+        except BaseException:
+            if release_memvid_slot is not None:
+                release_memvid_slot()
+            raise
+
+    def _close_agent_for_run(self, run_id: str, agent: NestedMV2Agent) -> None:
+        """Close one run-owned agent and retain cancellation durability failures."""
+
+        self.close_runtime_agent(agent, run_id=run_id)
+
+    def close_runtime_agent(
+        self,
+        agent: NestedMV2Agent,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        """Close a manager-owned agent or quarantine it for a verified retry."""
+
+        try:
+            agent.close()
+        except Exception as exc:
+            with self._lock:
+                self._failed_agent_closures[id(agent)] = (run_id, agent)
+            if run_id is not None:
+                self._record_cancelled_run_durability_failure(run_id, exc)
+            raise
+        else:
+            with self._lock:
+                self._failed_agent_closures.pop(id(agent), None)
+
+    def _retry_failed_memory_cleanup(self) -> bool:
+        """Retry quarantined owners without dropping their lock-bearing references."""
+
+        with self._lock:
+            failed_agents = tuple(self._failed_agent_closures.items())
+            construction_cleanups = tuple(self._quarantined_memory_cleanups)
+
+        for agent_id, (run_id, agent) in failed_agents:
+            try:
+                agent.close()
+            except Exception:
+                continue
+            with self._lock:
+                retained = self._failed_agent_closures.get(agent_id)
+                if retained is not None and retained[1] is agent:
+                    self._failed_agent_closures.pop(agent_id, None)
+                    if run_id is not None:
+                        self._cancelled_run_durability_failures.discard(run_id)
+
+        for cleanup in construction_cleanups:
+            error, release = cleanup
+            if not error.retry_cleanup():
+                continue
+            try:
+                release()
+            except Exception:
+                continue
+            with self._lock:
+                if cleanup in self._quarantined_memory_cleanups:
+                    self._quarantined_memory_cleanups.remove(cleanup)
+
+        with self._lock:
+            return not self._failed_agent_closures and not self._quarantined_memory_cleanups
+
+    def _record_cancelled_run_durability_failure(
+        self,
+        run_id: str,
+        error: Exception,
+    ) -> None:
+        error_text = str(
+            redact_secrets(
+                "Agent memory force-seal/close failed after cancellation: "
+                f"{type(error).__name__}: {error}"
+            )
         )
+        cancelled = False
+        applied = False
+        try:
+            updated, applied = self.state.record_cancelled_run_durability_failure(
+                run_id,
+                error=error_text,
+                recovery_reason=_CANCELLED_DURABILITY_FAILURE_REASON,
+            )
+            cancelled = updated.status == "cancelled"
+        except Exception:  # noqa: BLE001 - preserve the original close failure
+            try:
+                cancelled = self.state.get_run(run_id).status == "cancelled"
+            except Exception:
+                cancelled = False
+        if not cancelled:
+            return
+        with self._lock:
+            first_failure = run_id not in self._cancelled_run_durability_failures
+            self._cancelled_run_durability_failures.add(run_id)
+            if first_failure:
+                self._cancelled_run_durability_failure_count += 1
+        if applied and first_failure:
+            try:
+                self.events.publish(
+                    run_id,
+                    "run.cancellation_durability_failed",
+                    {
+                        "error": error_text,
+                        "recovery_reason": _CANCELLED_DURABILITY_FAILURE_REASON,
+                    },
+                )
+            except Exception:
+                pass
+
+    def build_runtime_agent(self, config: AgentConfig | None = None) -> NestedMV2Agent:
+        """Build one manager-owned agent under the runtime's Memvid admission fence."""
+
+        if self.read_only_observer:
+            raise RuntimeError("read_only_runtime_observer:build_runtime_agent")
+        return self._build_agent(config or self.config)
+
+    def _acquire_memvid_agent_slot(self) -> Callable[[], None]:
+        """Admit one cancellable Memvid owner and return its idempotent release hook."""
+
+        if not self._retry_failed_memory_cleanup():
+            raise RuntimeError("memory_cleanup_incomplete")
+        with self._memvid_agent_condition:
+            while self._memvid_agent_active:
+                if self._shutdown_event.is_set():
+                    raise RuntimeError("run_manager_shutting_down")
+                self._memvid_agent_condition.wait(timeout=0.05)
+            if self._shutdown_event.is_set():
+                raise RuntimeError("run_manager_shutting_down")
+            self._memvid_agent_active = True
+
+        release_lock = Lock()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            with release_lock:
+                if released:
+                    return
+                released = True
+            with self._memvid_agent_condition:
+                self._memvid_agent_active = False
+                self._memvid_agent_condition.notify_all()
+
+        return release
 
     def _config_for_run(self, run: RunRecord) -> AgentConfig:
         base = self.config
@@ -4908,17 +5213,26 @@ class RunManager:
                     _execution_payload(execution),
                 )
 
-    def _abort_primary_admission(self, run_id: str, error: Exception) -> None:
-        publication: Event | None = None
+    def _abort_primary_admission(
+        self,
+        run_id: str,
+        error: Exception,
+        *,
+        publication: Event | None = None,
+    ) -> None:
+        queued_publications: list[Event] = []
         with self._lock:
             self._reserved_primary_runs.discard(run_id)
             self._active_primary_runs.discard(run_id)
             self._threads.pop(run_id, None)
             self._thread_run_ids.pop(run_id, None)
-            publication = self._publication_events.get(run_id)
-            self._queued_primary_runs = deque(
-                queued for queued in self._queued_primary_runs if queued[0] != run_id
-            )
+            retained: deque[tuple[str, Any, tuple[Any, ...], Event]] = deque()
+            for queued in self._queued_primary_runs:
+                if queued[0] == run_id:
+                    queued_publications.append(queued[3])
+                else:
+                    retained.append(queued)
+            self._queued_primary_runs = retained
         try:
             try:
                 self.state.transition_run(
@@ -4929,7 +5243,29 @@ class RunManager:
                     recovery_reason="admission_setup_failed",
                 )
             except KeyError:
+                with self._lock:
+                    self._failed_admission_reconciliations.pop(run_id, None)
                 return
+            except Exception as transition_error:  # noqa: BLE001 - defer durable retry
+                with self._lock:
+                    first_failure = run_id not in self._failed_admission_reconciliations
+                    self._failed_admission_reconciliations[run_id] = type(error).__name__
+                    if first_failure:
+                        self._admission_reconciliation_failure_count += 1
+                try:
+                    self.events.publish(
+                        run_id,
+                        "run.admission_reconciliation_deferred",
+                        {
+                            "error_type": type(error).__name__,
+                            "transition_error_type": type(transition_error).__name__,
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+            with self._lock:
+                self._failed_admission_reconciliations.pop(run_id, None)
             try:
                 self.events.publish(
                     run_id,
@@ -4939,8 +5275,45 @@ class RunManager:
             except Exception:
                 pass
         finally:
+            for queued_publication in queued_publications:
+                self._finish_publication(run_id, queued_publication)
             if publication is not None:
                 self._finish_publication(run_id, publication)
+
+    def _retry_failed_admission_reconciliations(self) -> bool:
+        """Retry failed terminal admission writes without blocking queue drain."""
+
+        with self._lock:
+            pending = tuple(self._failed_admission_reconciliations.items())
+        for run_id, error_type in pending:
+            try:
+                self.state.transition_run(
+                    run_id,
+                    "failed",
+                    stop_reason="admission_setup_failed",
+                    error=f"Admission setup failed: {error_type}",
+                    recovery_reason="admission_setup_failed",
+                )
+            except KeyError:
+                resolved = True
+            except Exception:  # noqa: BLE001 - retain for the next bounded lifecycle retry
+                continue
+            else:
+                resolved = True
+                try:
+                    self.events.publish(
+                        run_id,
+                        "run.admission_failed",
+                        {"error_type": error_type, "reconciled": True},
+                    )
+                except Exception:
+                    pass
+            if resolved:
+                with self._lock:
+                    if self._failed_admission_reconciliations.get(run_id) == error_type:
+                        self._failed_admission_reconciliations.pop(run_id, None)
+        with self._lock:
+            return not self._failed_admission_reconciliations
 
     def _reserve_primary_run(self, run_id: str) -> None:
         with self._lock:
@@ -4952,7 +5325,7 @@ class RunManager:
                 # serialized continuation without consuming another run slot.
                 self._reserved_primary_runs.add(run_id)
                 return
-            capacity = max(1, self.config.max_concurrent_runs) + max(0, self.config.max_queued_runs)
+            capacity = self._primary_concurrency_limit() + max(0, self.config.max_queued_runs)
             admitted = (
                 len(self._active_primary_runs)
                 + len(self._queued_primary_runs)
@@ -4973,16 +5346,29 @@ class RunManager:
                 "active": len(self._active_primary_runs),
                 "queued": len(self._queued_primary_runs),
                 "reserved": len(self._reserved_primary_runs),
-                "max_active": max(1, self.config.max_concurrent_runs),
+                "max_active": self._primary_concurrency_limit(),
                 "max_queued": max(0, self.config.max_queued_runs),
             }
+
+    def _primary_concurrency_limit(self, config: AgentConfig | None = None) -> int:
+        active_config = config or self.config
+        # A Memvid writer owns one exclusive handle per .mv2 layer for its
+        # complete lifetime. Keep extra primary runs in the cancellable durable
+        # queue instead of starting threads that block while opening the same
+        # files. The manager-level agent fence also covers subagents and manual
+        # tool/memory endpoints that do not consume a primary slot.
+        if active_config.backend == "memvid":
+            return 1
+        return max(1, active_config.max_concurrent_runs)
 
     def shutdown(self, *, timeout_seconds: float = 5.0) -> bool:
         """Stop admission, cancel owned work, and join worker threads boundedly.
 
         Durable run and routine records retain the terminal outcome. Provider
         or tool code that ignores cancellation may outlive the bound, in which
-        case ``False`` is returned to the lifecycle caller.
+        case ``False`` is returned to the lifecycle caller. Runtime ownership
+        is released only after retained OCI cleanup and MCP session termination
+        are also verified.
         """
 
         if timeout_seconds < 0:
@@ -4996,9 +5382,13 @@ class RunManager:
                         *(item[0] for item in self._queued_primary_runs),
                         *self._reserved_primary_runs,
                         *self._thread_run_ids.values(),
+                        *self._active_run_operations,
                     ]
                 )
             )
+        self._shutdown_event.set()
+        with self._memvid_agent_condition:
+            self._memvid_agent_condition.notify_all()
         cancellation_failed = False
         for run_id in run_ids:
             try:
@@ -5033,6 +5423,7 @@ class RunManager:
                 self._forget_approval_arguments_for_run(run_id)
 
         deadline = monotonic() + timeout_seconds
+        cleanup_retry_attempted = False
         while True:
             with self._lock:
                 threads = tuple(
@@ -5042,15 +5433,53 @@ class RunManager:
                         if thread is not current_thread() and thread.is_alive()
                     )
                 )
-            if not threads:
-                completed = not cancellation_failed
+                active_run_operations = bool(self._active_run_operations)
+            if not threads and not active_run_operations:
+                self._retry_failed_admission_reconciliations()
+            if not threads and not active_run_operations and not cleanup_retry_attempted:
+                cleanup_retry_attempted = True
+                if not self._retry_failed_memory_cleanup():
+                    return False
+            with self._memvid_agent_condition:
+                memvid_agent_active = self._memvid_agent_active
+            with self._lock:
+                admission_reconciliation_pending = bool(self._failed_admission_reconciliations)
+            if not threads and not active_run_operations and not memvid_agent_active:
+                with self._lock:
+                    durability_failed = bool(self._cancelled_run_durability_failures)
+                try:
+                    skills_stopped = self.skills.shutdown(
+                        timeout_seconds=max(0.0, deadline - monotonic())
+                    )
+                except Exception:  # noqa: BLE001 - retain ownership on cleanup failure
+                    skills_stopped = False
+                try:
+                    mcp_stopped = self.mcp.shutdown()
+                except Exception:  # noqa: BLE001 - lifecycle failure is returned fail-closed
+                    mcp_stopped = False
+                completed = (
+                    not cancellation_failed
+                    and not durability_failed
+                    and not admission_reconciliation_pending
+                    and skills_stopped
+                    and mcp_stopped
+                )
                 if completed:
                     self._release_runtime_ownership()
                 return completed
             remaining = deadline - monotonic()
             if remaining <= 0:
                 return False
-            threads[0].join(timeout=min(remaining, 0.05))
+            if threads:
+                threads[0].join(timeout=min(remaining, 0.05))
+            elif active_run_operations:
+                with self._operation_condition:
+                    if self._active_run_operations:
+                        self._operation_condition.wait(timeout=min(remaining, 0.05))
+            else:
+                with self._memvid_agent_condition:
+                    if self._memvid_agent_active:
+                        self._memvid_agent_condition.wait(timeout=min(remaining, 0.05))
 
     def _release_runtime_ownership(self) -> None:
         ownership = self._runtime_ownership
@@ -5062,6 +5491,18 @@ class RunManager:
             return {
                 "admission_rejections": self._admission_rejections,
                 "shutdown_cancellation_failures": self._shutdown_cancellation_failures,
+                "cancelled_run_durability_failures": (
+                    self._cancelled_run_durability_failure_count
+                ),
+                "admission_reconciliation_failures": (
+                    self._admission_reconciliation_failure_count
+                ),
+                "admission_reconciliations_pending": len(
+                    self._failed_admission_reconciliations
+                ),
+                "oci_container_cleanups_pending": (
+                    self.skills.pending_container_cleanup_count
+                ),
                 "startup_recovered_failed": len(self.startup_recovery.get("failed", [])),
                 "startup_recovered_preserved": len(self.startup_recovery.get("preserved", [])),
                 "startup_workers_failed": len(self.startup_worker_recovery.get("failed", [])),
@@ -5081,16 +5522,15 @@ class RunManager:
         thread: Thread | None = None
         queued = False
         cancel_for_shutdown = False
-        publication = Event()
         with self._lock:
             self._reserved_primary_runs.discard(run_id)
-            self._publication_events[run_id] = publication
+            publication = self._begin_publication_locked(run_id)
             if self._shutting_down:
                 cancel_for_shutdown = True
             elif run_id in self._active_primary_runs:
                 self._queued_primary_runs.append((run_id, target, args, publication))
                 queued = True
-            elif len(self._active_primary_runs) < max(1, self.config.max_concurrent_runs):
+            elif len(self._active_primary_runs) < self._primary_concurrency_limit():
                 self._active_primary_runs.add(run_id)
                 thread = Thread(
                     target=self._run_primary_thread,
@@ -5105,6 +5545,7 @@ class RunManager:
                     self._active_primary_runs.discard(run_id)
                     self._threads.pop(run_id, None)
                     self._thread_run_ids.pop(run_id, None)
+                    self._finish_publication_locked(run_id, publication)
                     raise
             else:
                 self._queued_primary_runs.append((run_id, target, args, publication))
@@ -5131,44 +5572,99 @@ class RunManager:
                 self._finish_publication(run_id, publication)
 
     def _primary_run_finished(self, run_id: str) -> None:
-        failed_start: tuple[str, Event, Exception] | None = None
-        skipped_publications: list[tuple[str, Event]] = []
+        drain_token = f"\0primary-queue-drain:{id(current_thread())}:{run_id}"
         with self._lock:
             self._active_primary_runs.discard(run_id)
             self._threads.pop(run_id, None)
             self._thread_run_ids.pop(run_id, None)
-            while not self._shutting_down and self._queued_primary_runs:
-                next_run_id, target, args, publication = self._queued_primary_runs.popleft()
-                if self.state.get_run(next_run_id).status in _TERMINAL_RUN_STATUSES:
-                    skipped_publications.append((next_run_id, publication))
+            if not self._shutting_down and self._queued_primary_runs:
+                # Keep the newly freed slot occupied while failed starts are
+                # terminally reconciled outside the manager lock. Otherwise a
+                # concurrent admission can start ahead of the existing queue.
+                self._active_primary_runs.add(drain_token)
+
+        try:
+            while True:
+                failed_start: tuple[str, Event, Exception] | None = None
+                skipped_publication: tuple[str, Event] | None = None
+                with self._lock:
+                    if self._shutting_down or not self._queued_primary_runs:
+                        return
+                    next_run_id, target, args, publication = (
+                        self._queued_primary_runs.popleft()
+                    )
+                    try:
+                        next_status = self.state.get_run(next_run_id).status
+                    except Exception as exc:  # noqa: BLE001 - reconcile below
+                        failed_start = (next_run_id, publication, exc)
+                    else:
+                        if next_status in _TERMINAL_RUN_STATUSES:
+                            skipped_publication = (next_run_id, publication)
+                        else:
+                            self._active_primary_runs.discard(drain_token)
+                            self._active_primary_runs.add(next_run_id)
+                            try:
+                                next_thread = Thread(
+                                    target=self._run_primary_thread,
+                                    args=(next_run_id, target, args, publication),
+                                    daemon=True,
+                                )
+                                self._threads[next_run_id] = next_thread
+                                self._thread_run_ids[next_run_id] = next_run_id
+                                next_thread.start()
+                            except Exception as exc:  # noqa: BLE001 - reconcile below
+                                self._active_primary_runs.discard(next_run_id)
+                                self._threads.pop(next_run_id, None)
+                                self._thread_run_ids.pop(next_run_id, None)
+                                self._active_primary_runs.add(drain_token)
+                                failed_start = (next_run_id, publication, exc)
+                            else:
+                                return
+
+                if skipped_publication is not None:
+                    skipped_run_id, skipped_event = skipped_publication
+                    self._finish_publication(skipped_run_id, skipped_event)
                     continue
-                self._active_primary_runs.add(next_run_id)
-                next_thread = Thread(
-                    target=self._run_primary_thread,
-                    args=(next_run_id, target, args, publication),
-                    daemon=True,
-                )
-                self._threads[next_run_id] = next_thread
-                self._thread_run_ids[next_run_id] = next_run_id
-                try:
-                    next_thread.start()
-                except Exception as exc:  # noqa: BLE001 - terminally reconcile below
-                    self._active_primary_runs.discard(next_run_id)
-                    self._threads.pop(next_run_id, None)
-                    self._thread_run_ids.pop(next_run_id, None)
-                    failed_start = (next_run_id, publication, exc)
-                break
-        for skipped_run_id, skipped_publication in skipped_publications:
-            self._finish_publication(skipped_run_id, skipped_publication)
-        if failed_start is not None:
-            failed_run_id, _publication, error = failed_start
-            self._abort_primary_admission(failed_run_id, error)
+                if failed_start is not None:
+                    failed_run_id, failed_publication, error = failed_start
+                    self._abort_primary_admission(
+                        failed_run_id,
+                        error,
+                        publication=failed_publication,
+                    )
+                    self._retry_failed_admission_reconciliations()
+        finally:
+            with self._lock:
+                self._active_primary_runs.discard(drain_token)
+            self._retry_failed_admission_reconciliations()
 
     def _finish_publication(self, run_id: str, publication: Event) -> None:
-        publication.set()
         with self._lock:
-            if self._publication_events.get(run_id) is publication:
-                self._publication_events.pop(run_id, None)
+            self._finish_publication_locked(run_id, publication)
+
+    def _begin_publication_locked(self, run_id: str) -> Event:
+        """Acquire one reference on the run's bounded publication fence."""
+
+        publication = self._publication_events.get(run_id)
+        if publication is None:
+            publication = Event()
+            self._publication_events[run_id] = publication
+            self._publication_counts[run_id] = 0
+        self._publication_counts[run_id] = self._publication_counts.get(run_id, 0) + 1
+        return publication
+
+    def _finish_publication_locked(self, run_id: str, publication: Event) -> None:
+        """Release one owner and wake public readers after the last owner exits."""
+
+        if self._publication_events.get(run_id) is not publication:
+            return
+        remaining = self._publication_counts.get(run_id, 0) - 1
+        if remaining > 0:
+            self._publication_counts[run_id] = remaining
+            return
+        self._publication_counts.pop(run_id, None)
+        self._publication_events.pop(run_id, None)
+        publication.set()
 
     def _start_thread(
         self,
@@ -5177,6 +5673,8 @@ class RunManager:
         *args: Any,
         owner_run_id: str | None = None,
     ) -> None:
+        owner_publication: Event | None = None
+
         def run_and_forget() -> None:
             try:
                 target(thread_key, *args)
@@ -5185,6 +5683,8 @@ class RunManager:
                     if self._threads.get(thread_key) is current_thread():
                         self._threads.pop(thread_key, None)
                         self._thread_run_ids.pop(thread_key, None)
+                    if owner_run_id is not None and owner_publication is not None:
+                        self._finish_publication_locked(owner_run_id, owner_publication)
 
         thread = Thread(target=run_and_forget, daemon=True)
         with self._lock:
@@ -5193,11 +5693,14 @@ class RunManager:
             self._threads[thread_key] = thread
             if owner_run_id is not None:
                 self._thread_run_ids[thread_key] = owner_run_id
+                owner_publication = self._begin_publication_locked(owner_run_id)
             try:
                 thread.start()
             except Exception:
                 self._threads.pop(thread_key, None)
                 self._thread_run_ids.pop(thread_key, None)
+                if owner_run_id is not None and owner_publication is not None:
+                    self._finish_publication_locked(owner_run_id, owner_publication)
                 raise
 
     def _is_cancelled(self, run_id: str) -> bool:
@@ -6098,8 +6601,11 @@ def _workspace_supports_git_worktree(workspace: Path) -> bool:
     except (FileNotFoundError, OSError):
         return False
     completed = subprocess.run(  # noqa: S603 - fixed git executable and structured argv  # nosec
-        ["git", "rev-parse", "--show-toplevel"],
+        hardened_readonly_git_command(
+            ["rev-parse", "--show-toplevel"], workspace=root
+        ),
         cwd=root,
+        env=hardened_readonly_git_environment(),
         capture_output=True,
         text=True,
         timeout=10,

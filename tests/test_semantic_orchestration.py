@@ -661,9 +661,14 @@ def test_unavailable_provider_review_fallback_preserves_semantic_criteria(
 
 def test_approval_continuation_runs_same_reviewer_gate_and_replaces_blocked_artifact(
     tmp_path: Path,
+    contained_validation_stub: str,
 ) -> None:
     manager = _manager(tmp_path)
-    manager.config = replace(manager.config, allow_shell=True)
+    manager.config = replace(
+        manager.config,
+        allow_shell=True,
+        validation_container_image=contained_validation_stub,
+    )
     scripted = [
         LLMResponse(
             content="Approval is required for validation.",

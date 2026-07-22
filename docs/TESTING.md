@@ -9,9 +9,9 @@ Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mo
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
-npm install --prefix web
+python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+python -m pip install --no-build-isolation -e '.[memvid,openai,anthropic,gemini,server,mcp,keyring,dev]'
+npm ci --prefix web
 ```
 
 ## Core Validation
@@ -21,12 +21,22 @@ Run these for normal development:
 ```bash
 python -m compileall -q src tests scripts
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
-python scripts/run_golden_evals.py --backend memory --provider mock
+make golden
 python benchmarks/real_agent_learning_benchmark.py --output benchmark_results/agent_learning_gate.json
 PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
 ```
 
 `python -m pytest -q` is preferred over a global `pytest` binary so subprocess fixtures use the active interpreter. CI also sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` so local editor or environment plugins cannot leak into deterministic mock-backed tests.
+
+The commands in this section are direct operator/developer commands. They do not imply a host-execution path for agent tools. Agent-invoked `test.run`, `lint.run`, repair validation, and `codex.exec` always use `NEST_AGENT_VALIDATION_CONTAINER_IMAGE` through a private, networkless, secret-free, read-only OCI snapshot and fail closed when it is absent or mutable. The image must already be present locally under its immutable `name@sha256:<64 hex>` reference and contain the exact requested executable and dependencies; Kestrel launches with `--pull=never`. Check the configuration before enabling the master gate:
+
+```bash
+export VALIDATION_IMAGE='registry.example/kestrel-validation@sha256:<64 hex>'
+docker pull "$VALIDATION_IMAGE"
+nest-agent doctor --allow-shell --validation-container-image "$VALIDATION_IMAGE"
+```
+
+`doctor` validates reference shape and reports which enabled tools require the image. The actual local image and command dependencies are exercised only by a contained tool run. The pinned Python image below is sufficient for containment fixtures and their tiny scripts, but is not a general project test/lint image. `codex.exec` additionally needs a Codex binary and remains networkless and credential-free, so remote-model delegation is intentionally unavailable through that tool.
 
 The agent learning gate is not a seeded retrieval fixture. Its first task causes a deterministic
 tool failure and validated changed-strategy resolution through `NestedMV2Agent`; the runtime must
@@ -83,7 +93,7 @@ A credential-free foundation job runs the Memvid v2 and stdio MCP fixtures, and 
 
 ## Installer Validation
 
-Fast installer tests cover shell syntax, help text, dry-run defaults, Python 3.11+ detection, safe Memvid/mock commands, opt-in detached server/web UI launch planning, disabled-by-default server behavior, and refusal to overwrite non-git nonempty directories:
+Fast installer tests cover shell syntax, help text, dry-run defaults, the Python 3.11-through-3.13 cap, Linux ARM64 refusal, immutable release-SHA/moved-tag checks, safe Memvid/mock commands, opt-in detached server/web UI launch planning, disabled-by-default server behavior, and refusal to overwrite non-git nonempty directories:
 
 ```bash
 python -m pytest -q tests/test_install_script.py
@@ -105,8 +115,10 @@ The Memvid tests require `memvid-sdk` from the `memvid` extra and are skipped un
 foundation job:
 
 ```bash
+VALIDATION_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+docker pull "$VALIDATION_IMAGE"
 RUN_MEMVID_INTEGRATION=1 python -m pytest -q tests/integration/test_memvid_backend_integration.py tests/integration/test_memvid_memory_system.py tests/integration/test_memvid_context_frames.py
-RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden --validation-container-image "$VALIDATION_IMAGE"
 ```
 
 The tests create temporary `.mv2` files, write records, seal, verify, close, reopen, search, round-trip context-frame metadata, validate the Soul/self layer, and read run-scoped `complete.mv2` capsules.
@@ -160,7 +172,7 @@ python scripts/run_live_learning_eval.py \
   --timeout-seconds 180
 ```
 
-The live E2E cases cover provider handshake, durable memory retrieval after reopen, correction-frame capture, nested-learning promotion gates, task-capsule learning-signal extraction, unapproved high-risk tool blocking, and behavior-delta activation logging. Missing credentials/model configuration are reported by env-var name only; secret values are not printed. Use isolated output roots; never point this harness at an operator's real `.nest` memory.
+The live E2E cases cover provider handshake, durable memory retrieval after reopen, correction-frame capture, nested-learning promotion gates, task-capsule learning-signal extraction, unapproved high-risk tool blocking, behavior-delta activation logging, and postflight verification of all six memory layers with zero policy writes. Missing credentials/model configuration are reported by env-var name only; secret values are not printed. Each invocation creates a unique child beneath the supplied output root; never point this harness at an operator's real `.nest` memory.
 
 ## Learning Architecture Eval Harness
 
@@ -219,21 +231,23 @@ The harness proves integration of existing gates and ledgers. It does not prove 
 
 ## Golden Evals
 
-Golden evals are in `scripts/run_golden_evals.py` and cover agent behavior across turns, safety gates, memory use, consolidation expectations, provider/tool-call accuracy, durable plan completion, repair success, approval correctness, honest failure reporting, latency, cost, and repo-regression guardrails. The output includes per-case scores plus scored category summaries.
+Golden evals are in `scripts/run_golden_evals.py` and cover agent behavior across turns, safety gates, memory use, consolidation expectations, provider/tool-call accuracy, durable plan completion, repair success, approval correctness, honest failure reporting, latency, and repo-regression guardrails. The output includes per-case scores plus category summaries. Wall-clock latency is measured for every case and becomes a top-level fail-closed gate only when `--max-case-latency-ms` is configured. Provider usage and pricing are not currently supplied by every case, so cost is reported as `unmeasured` or `partially_measured`, with a `null` acceptance result; zero is never presented as a passing cost measurement.
 
 Fast path:
 
 ```bash
-python scripts/run_golden_evals.py --backend memory --provider mock
+VALIDATION_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+docker pull "$VALIDATION_IMAGE"
+python scripts/run_golden_evals.py --backend memory --provider mock --validation-container-image "$VALIDATION_IMAGE" --max-case-latency-ms 45000
 ```
 
 Memvid path:
 
 ```bash
-RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden --validation-container-image "$VALIDATION_IMAGE" --max-case-latency-ms 45000
 ```
 
-Each Memvid golden case should use its own memory/log directory to avoid `.mv2` lock contention. Live golden evals also support provider/model args; the Ollama Cloud `gpt-oss:120b` memory and Memvid paths have passed locally after deterministic `/search` routing and the durable plan wait-window hardening.
+The pinned image is part of the golden evidence: the procedural-promotion case exercises real no-network OCI repair validation and intentionally fails closed when the image is absent or mutable. The 45-second per-case ceiling is for credential-free mock-provider release jobs with the validation image already pulled; it leaves headroom for the OCI cold-start case while still catching hangs or severe regressions. Each Memvid golden case should use its own memory/log directory to avoid `.mv2` lock contention. Live-provider latency depends on model, network, and quota conditions, so measure a representative baseline and set an explicit environment-appropriate ceiling rather than reusing the mock threshold. Live golden evals also support provider/model args; the Ollama Cloud `gpt-oss:120b` memory and Memvid paths have passed locally after deterministic `/search` routing and the durable plan wait-window hardening.
 
 ## Release Validation
 

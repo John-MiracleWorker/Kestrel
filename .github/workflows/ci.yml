@@ -54,9 +54,10 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
+          python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+          python -m pip install --no-build-isolation -e '.[dev,keyring]'
           python -m pip check
+          python -c 'import keyring; assert callable(keyring.get_keyring)'
       - name: Compile
         run: python -m compileall -q src tests scripts
       - name: Validate project metadata
@@ -74,9 +75,20 @@ jobs:
         run: shellcheck install.sh scripts/*.sh
       - name: Tests
         run: pytest -q
+      - name: Preload digest-pinned golden validation image
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        env:
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE: "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
+        run: docker pull "$NEST_AGENT_VALIDATION_CONTAINER_IMAGE"
       - name: Golden evals
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
-        run: python scripts/run_golden_evals.py --backend memory --provider mock
+        env:
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE: "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
+        run: >-
+          python scripts/run_golden_evals.py
+          --backend memory
+          --provider mock
+          --max-case-latency-ms 45000
       - name: End-to-end agent learning gate
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         run: |
@@ -100,8 +112,8 @@ jobs:
           python-version: "3.11"
       - name: Install credential-free integration dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev,memvid,mcp]'
+          python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+          python -m pip install --no-build-isolation -e '.[dev,memvid,mcp]'
           python -m pip check
       - name: Test Memvid v2 and stdio MCP foundations
         run: >-
@@ -110,12 +122,19 @@ jobs:
           tests/integration/test_memvid_memory_system.py
           tests/integration/test_memvid_context_frames.py
           tests/integration/test_mcp_stdio_integration.py
+      - name: Preload digest-pinned golden validation image
+        env:
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE: "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
+        run: docker pull "$NEST_AGENT_VALIDATION_CONTAINER_IMAGE"
       - name: Run Memvid v2 golden evaluations
+        env:
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE: "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
         run: >-
           python scripts/run_golden_evals.py
           --backend memvid
           --provider mock
           --memory-dir "${RUNNER_TEMP}/kestrel-memvid-golden"
+          --max-case-latency-ms 45000
 
   extension-sandbox:
     runs-on: ubuntu-latest
@@ -132,8 +151,8 @@ jobs:
           python-version: "3.11"
       - name: Install test dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
+          python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+          python -m pip install --no-build-isolation -e '.[dev]'
           python -m pip check
       - name: Preload digest-pinned extension image
         run: docker pull "$KESTREL_EXTENSION_TEST_IMAGE"

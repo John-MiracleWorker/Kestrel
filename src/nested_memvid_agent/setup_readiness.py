@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
+from .extension_runner import _digest_pinned_image as _is_digest_pinned_oci_image
 from .llm.factory import provider_health_id
 from .llm.resilience import global_provider_health_registry
 
@@ -97,6 +98,7 @@ def build_setup_readiness_report(
             allow_directory_target=True,
         ),
         _permission_gate_check(config),
+        _validation_container_check(config),
         _repair_isolation_check(config),
         _proactive_routines_check(config),
         _api_auth_check(config),
@@ -328,6 +330,56 @@ def _permission_gate_check(config: AgentConfig) -> SetupReadinessCheck:
         SetupReadinessStatus.FAIL,
         "High-risk capabilities are enabled without exact-call approvals: " + ", ".join(risky_enabled) + ".",
         "Re-enable exact-call approvals or disable high-risk capabilities before product use.",
+    )
+
+
+def _validation_container_check(config: AgentConfig) -> SetupReadinessCheck:
+    enabled_tools: list[str] = []
+    if config.allow_shell:
+        enabled_tools.extend(
+            [
+                "test.run",
+                "lint.run",
+                "repair.validate",
+                "repair.orchestrate_validate",
+            ]
+        )
+    if config.allow_codex_cli:
+        enabled_tools.append("codex.exec")
+    if not enabled_tools:
+        return SetupReadinessCheck(
+            "validation_container",
+            "Arbitrary-code OCI isolation",
+            SetupReadinessStatus.PASS,
+            "OCI-only test, lint, repair-validation, and Codex tool master gates are disabled.",
+            "Configure a preloaded digest-pinned validation image before enabling any of them.",
+        )
+
+    image = str(config.validation_container_image or "").strip()
+    enabled = ", ".join(enabled_tools)
+    if not image:
+        return SetupReadinessCheck(
+            "validation_container",
+            "Arbitrary-code OCI isolation",
+            SetupReadinessStatus.FAIL,
+            f"Configuration gates permit OCI-only tools, but no image is configured: {enabled}.",
+            "Set NEST_AGENT_VALIDATION_CONTAINER_IMAGE to a preloaded immutable "
+            "name@sha256:<64 hex> reference containing the requested commands.",
+        )
+    if not _is_digest_pinned_oci_image(image):
+        return SetupReadinessCheck(
+            "validation_container",
+            "Arbitrary-code OCI isolation",
+            SetupReadinessStatus.FAIL,
+            f"Configuration gates permit OCI-only tools, but `{image}` is not digest-pinned: {enabled}.",
+            "Replace the image setting with a preloaded immutable name@sha256:<64 hex> reference.",
+        )
+    return SetupReadinessCheck(
+        "validation_container",
+        "Arbitrary-code OCI isolation",
+        SetupReadinessStatus.PASS,
+        f"OCI-only tool configuration gates have a digest-pinned image reference: {enabled}.",
+        "Run one contained command to verify the image is preloaded and includes its dependencies.",
     )
 
 

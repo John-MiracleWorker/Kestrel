@@ -7,6 +7,7 @@ import tomllib
 from pathlib import Path
 
 from nested_memvid_agent.config import AgentConfig
+from scripts.check_project_metadata import _release_mode_errors
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_TEST_IMAGE = (
@@ -25,6 +26,10 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     assert "setuptools>=83.0.0" in project["dependencies"]
     assert locked_versions["pip"] == "26.1.2"
     assert locked_versions["setuptools"] == "83.0.0"
+    assert locked_versions["build"] == "1.5.0"
+    assert locked_versions["keyring"] == "25.7.0"
+    keyring_deps = project["optional-dependencies"]["keyring"]
+    assert any(str(dep).startswith("keyring>=25.6.0") for dep in keyring_deps)
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
@@ -40,9 +45,107 @@ def test_python_and_web_release_metadata_stay_aligned() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "nested-memvid-agent 0.4.0 release" in result.stdout
-    assert "published release v0.4.0" in result.stdout
+    assert "nested-memvid-agent 0.4.0 development" in result.stdout
+    assert "published release v0.3.1" in result.stdout
     assert "kestrel-web 0.4.0" in result.stdout
+
+
+def test_release_metadata_gate_rejects_development_line() -> None:
+    errors = _release_mode_errors(
+        version="0.4.0",
+        release_tag="v0.4.0",
+        is_current_release=False,
+        changelog="## [Unreleased]\n",
+    )
+
+    assert any("unreleased development line" in error for error in errors)
+    assert any("dated release section" in error for error in errors)
+
+
+def test_release_metadata_gate_accepts_exact_published_dated_release() -> None:
+    errors = _release_mode_errors(
+        version="0.4.0",
+        release_tag="v0.4.0",
+        is_current_release=True,
+        changelog="## [0.4.0] - 2026-07-20\n",
+    )
+
+    assert errors == []
+
+
+def test_release_workflow_strictly_checks_and_smokes_wheel_and_sdist() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "python -m twine check --strict dist/*" in workflow
+    assert "Smoke-test built wheel" in workflow
+    assert "Smoke-test built source distribution" in workflow
+    assert "/tmp/kestrel-release-smoke/bin/python -m pip check" in workflow
+    assert "/tmp/kestrel-release-sdist-smoke/bin/python -m pip check" in workflow
+    assert '"${sdists[0]}[${RELEASE_EXTRAS}]"' in workflow
+    assert workflow.count('joinpath("THIRD_PARTY_NOTICES.txt").is_file()') >= 1
+    assert 'probe_name="kestrel-release-readonly-${architecture}"' in workflow
+    assert "--read-only" in workflow
+    assert "--tmpfs /data:rw,nosuid,nodev" in workflow
+    assert "--user 999:999" in workflow
+    assert "--runs 4" in workflow
+    assert "--response-contract mock-echo" in workflow
+
+
+def test_cross_platform_workflows_install_and_import_keyring_client() -> None:
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    exact_wheel = (ROOT / "scripts" / "verify_exact_wheel_install.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "config/python-build-bootstrap.txt" in ci
+    assert (
+        "python -m pip install --require-hashes --only-binary=:all: "
+        "-r config/python-build-bootstrap.txt"
+    ) in ci
+    assert "python -m pip install --no-build-isolation -e '.[dev,keyring]'" in ci
+    assert "python -c 'import keyring; assert callable(keyring.get_keyring)'" in ci
+    assert "python -m scripts.verify_exact_wheel_install dist" in release
+    assert '"--no-deps"' in exact_wheel
+    assert "importlib.metadata.version" in exact_wheel
+    assert "keyring, memvid_sdk, nested_memvid_agent" in exact_wheel
+
+
+def test_release_publish_is_isolated_and_provenance_attested() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "permissions:\n  actions: read\n  contents: read" in workflow
+    assert "name: Publish exact payload and multi-architecture image" in workflow
+    assert "contents: write\n      id-token: write\n      attestations: write" in workflow
+    assert "packages: write" in workflow
+    assert "Upload validated release payload" in workflow
+    assert "Download validated release payload" in workflow
+    assert "Verify downloaded payload identity and checksums" in workflow
+    assert "verify_release_payload.py dist --expected-version" in workflow
+    assert "actions/attest-build-provenance@" in workflow
+
+
+def test_release_workflow_executes_and_scans_amd64_and_arm64_images() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "docker/setup-qemu-action@" in workflow
+    assert "docker/setup-buildx-action@" in workflow
+    assert 'for architecture in amd64 arm64; do' in workflow
+    assert '--platform "linux/${architecture}"' in workflow
+    assert '-t "kestrel-agent:release-${architecture}"' in workflow
+    assert "kestrel-release-container-trivy-${architecture}.json" in workflow
+    assert '("linux", "amd64"): amd64_digest_path.read_text' in workflow
+    assert '("linux", "arm64"): arm64_digest_path.read_text' in workflow
+    assert '"$IMAGE_NAME@$amd64_digest"' in workflow
+    assert '"$IMAGE_NAME@$arm64_digest"' in workflow
 
 
 def test_default_user_facing_branding_is_kestrel() -> None:
@@ -86,7 +189,7 @@ def test_package_includes_runtime_prompt_data() -> None:
     assert "web_dist/THIRD_PARTY_NOTICES.txt" in package_data["nested_memvid_agent"]
     assert "web/public/THIRD_PARTY_NOTICES.txt" in pyproject["project"]["license-files"]
     assert any(str(dep).startswith("bandit>=") for dep in dev_deps)
-    assert any(str(dep).startswith("build>=") for dep in dev_deps)
+    assert "build==1.5.0" in dev_deps
 
 
 def test_sdist_manifest_excludes_partial_tests_and_local_evidence() -> None:
@@ -119,8 +222,15 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert f"FROM {pinned_python} AS dependency-lock" in dockerfile
     assert f"FROM {pinned_python} AS runtime" in dockerfile
     assert "MEMVID_SDK_VERSION=2.0.160" in dockerfile
+    assert (
+        "MEMVID_SDK_SDIST_URL=https://files.pythonhosted.org/packages/7e/1a/"
+        "709899b6757e1d1fde0bbe7e97fd814411931ab6c8c68b876305404b7a83/"
+        "memvid_sdk-2.0.160.tar.gz" in dockerfile
+    )
     assert "MEMVID_SDK_SDIST_SHA256=8eab5aec9a30eb459f553ed091038b6916d02a2f33569b32a7aee1b556820243" in dockerfile
     assert "UV_VERSION=0.11.16" in dockerfile
+    assert "uv --version | cut -d' ' -f1-2" in dockerfile
+    assert 'test "$(uv --version)" = "uv ${UV_VERSION}"' not in dockerfile
     assert "COPY pyproject.toml uv.lock ./" in dockerfile
     assert "COPY pyproject.toml README.md LICENSE ./" in dockerfile
     assert (
@@ -132,7 +242,7 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "--no-emit-local" in dockerfile
     assert "requirements-runtime.txt" in dockerfile
     assert "--require-hashes" in dockerfile
-    assert "--no-binary memvid-sdk" in dockerfile
+    assert "urllib.request.urlretrieve" in dockerfile
     assert "sha256sum -c -" in dockerfile
     assert "import memvid_sdk; assert callable(memvid_sdk.create)" in dockerfile
     assert "test -f /app/LICENSE" in dockerfile
@@ -147,6 +257,9 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "USER kestrel" in dockerfile
     assert "HEALTHCHECK" in dockerfile
     assert "NEST_AGENT_BACKEND=memvid" in dockerfile
+    assert "NEST_AGENT_SECRET_BACKEND=json" in dockerfile
+    assert "NEST_AGENT_PLUGINS_DIR=/data/plugins" in dockerfile
+    assert "/data/skills /data/plugins /data/config" in dockerfile
     assert "NEST_AGENT_ALLOW_SHELL=false" in dockerfile
     assert "NEST_AGENT_ALLOW_FILE_WRITE=false" in dockerfile
     assert "NEST_AGENT_ALLOW_POLICY_WRITES=false" in dockerfile
@@ -156,7 +269,9 @@ def test_dockerfile_keeps_safe_runtime_defaults() -> None:
     assert "NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false" in dockerfile
     assert "NEST_AGENT_REQUIRE_API_AUTH=true" in dockerfile
     assert "NEST_AGENT_API_TOKEN" in dockerfile
-    assert "ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini" in dockerfile
+    assert "--extra keyring" in dockerfile
+    assert "import keyring; assert callable(keyring.get_keyring)" in dockerfile
+    assert "ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini,keyring" in dockerfile
     assert 'ENTRYPOINT ["/bin/sh", "/app/scripts/docker-entrypoint.sh"]' in dockerfile
     assert "/api/health/ready" in dockerfile
     assert '"--require-api-auth"' in command
@@ -198,7 +313,7 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     command = compose.split("    command:\n", maxsplit=1)[1].split("    healthcheck:\n", maxsplit=1)[0]
 
     assert "127.0.0.1:8765:8765" in compose
-    assert "INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini" in compose
+    assert "INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini,keyring" in compose
     assert "kestrel-data:/data" in compose
     assert 'user: "999:999"' in compose
     assert "read_only: true" in compose
@@ -206,6 +321,8 @@ def test_compose_binds_localhost_and_persists_data_volume() -> None:
     assert "security_opt:\n      - no-new-privileges:true" in compose
     assert "/tmp:rw,noexec,nosuid,size=64m" in compose
     assert "NEST_AGENT_BACKEND: memvid" in compose
+    assert "NEST_AGENT_SECRET_BACKEND: json" in compose
+    assert "NEST_AGENT_PLUGINS_DIR: /data/plugins" in compose
     assert 'NEST_AGENT_ALLOW_SHELL: "false"' in compose
     assert 'NEST_AGENT_ALLOW_FILE_WRITE: "false"' in compose
     assert 'NEST_AGENT_ALLOW_POLICY_WRITES: "false"' in compose
@@ -248,15 +365,19 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
 
     assert (
         "curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/"
-        "v0.4.0/install.sh | bash"
+        "v0.3.1/install.sh | bash"
     ) in deployment
-    assert "`v0.4.0` is the current stable release" in deployment
-    assert "releases/download/v0.4.0/install.sh" in deployment
+    assert "`v0.3.1` is the current stable release" in deployment
+    assert "unreleased `v0.4.0` development line" in deployment
+    assert "releases/download/v0.3.1/install.sh" in deployment
+    assert "releases/download/v0.4.0/install.sh" not in deployment
     assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
     assert "does not start the server" in deployment
     assert "KESTREL_DRY_RUN=1 bash install.sh" in checklist
-    assert "python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'" in deployment
+    assert "python -m pip install --no-build-isolation -e '.[memvid,openai,anthropic,gemini,server,mcp,keyring,dev]'" in deployment
+    assert "stock headless container has no OS keychain service" in deployment
+    assert "Never switch a populated JSON vault in place" in deployment
     assert "docker run --rm kestrel-agent:local" in deployment
     assert "OpenAI-compatible local servers" in deployment
     assert "`Authorization: Bearer REDACTED` on API requests." in deployment
@@ -276,6 +397,16 @@ def test_one_shot_docs_match_safe_opt_in_server_defaults() -> None:
         assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh" in document
 
 
+def test_readme_behavior_delta_validation_fails_on_regression() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert (
+        "python scripts/eval_behavior_deltas.py --scenario "
+        "tests/evals/behavior_deltas/policy_write_requires_approval.json "
+        "--fail-on-regression"
+    ) in readme
+
+
 def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
@@ -293,16 +424,30 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "Stage web workbench in Python package" in workflow
     assert "python scripts/stage_web_release.py" in workflow
     assert "python -m build" in workflow
-    assert "Build and attest release container" in workflow
+    assert "Build, execute, and scan release containers" in workflow
     assert "check_container_vulnerabilities.py" in workflow
     assert "container_vulnerability_exceptions.json" in workflow
     assert 'raise SystemExit("sdist contains a partial test bundle")' in workflow
     assert "release wheel smoke" in workflow
     assert "curl -fsS http://127.0.0.1:8878/" in workflow
+    assert "export NEST_AGENT_REQUIRE_API_AUTH=1" in workflow
+    assert "export NEST_AGENT_API_TOKEN" in workflow
+    assert 'test "$unauthenticated_code" = 401' in workflow
+    assert 'Authorization: Bearer $NEST_AGENT_API_TOKEN' in workflow
     assert "Verify tag matches package version" in workflow
     assert 'test "$GITHUB_REF_NAME" = "v$VERSION"' in workflow
-    assert "python scripts/check_project_metadata.py" in workflow
+    assert 'python scripts/check_project_metadata.py --release-tag "$GITHUB_REF_NAME"' in workflow
     assert "scripts/run_golden_evals.py --backend memvid --provider mock" in workflow
+    assert workflow.count("--max-case-latency-ms 45000") == 2
+    assert "--response-contract mock-echo" in workflow
+    assert "--min-throughput 1" in workflow
+    assert "--require-overload" in workflow
+    assert "--min-completed 4" in workflow
+    assert "--max-overload-ratio 0.90" in workflow
+    assert "--min-throughput 0.5" in workflow
+    assert "NEST_AGENT_API_RATE_LIMIT_REQUESTS=100000" in workflow
+    assert "NEST_AGENT_MAX_CONCURRENT_RUNS=1" in workflow
+    assert "NEST_AGENT_MAX_QUEUED_RUNS=4" in workflow
     assert 'RUN_EXTENSION_SANDBOX_INTEGRATION: "1"' in workflow
     assert f'KESTREL_EXTENSION_TEST_IMAGE: "{EXTENSION_TEST_IMAGE}"' in workflow
     assert 'docker pull "$KESTREL_EXTENSION_TEST_IMAGE"' in workflow
@@ -312,8 +457,7 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "--require-hashes" in workflow
     assert "requirements-release.txt" in workflow
     assert "python -m pip_audit --path" in workflow
-    assert "cyclonedx-bom==7.3.0" in workflow
-    assert "pip-audit==2.10.1" in workflow
+    assert "--group release" in workflow
     assert "cyclonedx-py environment /tmp/kestrel-release-smoke/bin/python" in workflow
     assert '"nested-memvid-agent"' in workflow
     assert '"google-genai"' in workflow
@@ -323,15 +467,24 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert 'DEFAULT_REQUIREMENTS_URL=""' in workflow
     assert 'DEFAULT_WHEEL_URL=""' in workflow
     assert 'DEFAULT_CHECKSUMS_URL=""' in workflow
+    assert 'DEFAULT_RELEASE_SHA=""' in workflow
+    assert 'DEFAULT_RELEASE_VERSION=""' in workflow
+    assert 'os.environ["RELEASE_COMMIT_SHA"]' in workflow
+    assert "immutable release commit: $RELEASE_COMMIT_SHA" in workflow
+    assert "KESTREL_REF=main bash dist/install.sh" in workflow
+    assert "KESTREL_REPO=https://example.invalid/fork.git bash dist/install.sh" in workflow
     assert "{release_base}/install.sh" in workflow
     assert "${{KESTREL_REF" not in workflow
     assert "Defaults to {tag}." in workflow
     assert "Validate staged release installer plan" in workflow
+    assert "bash < dist/install.sh" in workflow
     assert "verify SHA256SUMS" in workflow
     assert 'sha256sum install.sh requirements-release.txt "${wheels[@]}"' in workflow
     assert "gh release create \"$GITHUB_REF_NAME\" dist/*" in workflow
     assert "gh release create" in workflow
     assert 'extra_args+=(--extra "$extra")' in workflow
+    assert '"keyring"' in workflow
+    assert "import keyring; assert callable(keyring.get_keyring)" in workflow
 
 
 def test_ci_runs_isolated_python_tests_and_web_build() -> None:

@@ -112,6 +112,7 @@ class AgentConfig:
     api_rate_limit_max_clients: int = 2048
     max_request_body_bytes: int = 1_000_000
     tool_timeout_seconds: float = 30.0
+    validation_container_image: str | None = None
     tool_retry_max_attempts: int = 3
     tool_retry_backoff_base_seconds: float = 1.0
     trusted_hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "::1", "[::1]", "testserver")
@@ -204,6 +205,9 @@ class AgentConfig:
             api_rate_limit_max_clients=_env_int("NEST_AGENT_API_RATE_LIMIT_MAX_CLIENTS", 2048),
             max_request_body_bytes=_env_int("NEST_AGENT_MAX_REQUEST_BODY_BYTES", 1_000_000),
             tool_timeout_seconds=_env_float("NEST_AGENT_TOOL_TIMEOUT_SECONDS", 30.0),
+            validation_container_image=_env_str_or_none(
+                "NEST_AGENT_VALIDATION_CONTAINER_IMAGE"
+            ),
             tool_retry_max_attempts=_env_int("NEST_AGENT_TOOL_RETRY_MAX_ATTEMPTS", 3),
             tool_retry_backoff_base_seconds=_env_float("NEST_AGENT_TOOL_RETRY_BACKOFF_BASE_SECONDS", 1.0),
             approval_ttl_seconds=_env_float("NEST_AGENT_APPROVAL_TTL_SECONDS", 900.0),

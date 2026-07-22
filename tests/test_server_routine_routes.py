@@ -38,8 +38,9 @@ def test_server_shutdown_always_closes_dependencies_before_reporting_failure(
         events.append("channels")
         raise RuntimeError("channel cleanup probe")
 
-    def mcp_shutdown(_manager: MCPManager) -> None:
+    def mcp_shutdown(_manager: MCPManager) -> bool:
         events.append("mcp")
+        return True
 
     monkeypatch.setattr(RunManager, "shutdown", incomplete_run_shutdown)
     monkeypatch.setattr(ChannelManager, "close", failing_channel_close)
@@ -50,6 +51,26 @@ def test_server_shutdown_always_closes_dependencies_before_reporting_failure(
             assert client.get("/api/health").status_code == 200
 
     assert events == ["runs:5.0", "runs:1.0", "channels", "mcp"]
+
+
+def test_server_shutdown_reports_unverified_mcp_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown_attempts = 0
+
+    def incomplete_mcp_shutdown(_manager: MCPManager) -> bool:
+        nonlocal shutdown_attempts
+        shutdown_attempts += 1
+        return False
+
+    monkeypatch.setattr(MCPManager, "shutdown", incomplete_mcp_shutdown)
+
+    with pytest.raises(RuntimeError, match="runtime_shutdown_incomplete"):
+        with TestClient(create_app(_config(tmp_path, require_api_auth=False))) as client:
+            assert client.get("/api/health").status_code == 200
+
+    assert shutdown_attempts >= 2
 
 
 def test_routine_read_routes_map_invalid_identifiers_to_client_errors(
@@ -496,7 +517,7 @@ def test_routine_api_rejects_registered_raw_secret_without_echo(
     monkeypatch: object,
 ) -> None:
     token = "routine-secret-auth-3b9d"
-    raw_secret = "routine-definition-secret-cc475d"
+    raw_secret = "routine-definition-secret-cc475d"  # gitleaks:allow -- synthetic fixture
     register_secret_value(raw_secret)
     monkeypatch.setenv("KESTREL_ROUTINE_TEST_TOKEN", token)  # type: ignore[attr-defined]
     config = _config(tmp_path, require_api_auth=True)

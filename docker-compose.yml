@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini
+        INSTALL_EXTRAS: server,mcp,memvid,openai,anthropic,gemini,keyring
     image: kestrel-agent:local
     user: "999:999"
     read_only: true
@@ -25,7 +25,9 @@ services:
       NEST_AGENT_LOG_DIR: /data/logs
       NEST_AGENT_STATE_PATH: /data/state/agent.db
       NEST_AGENT_SKILLS_DIR: /data/skills
+      NEST_AGENT_PLUGINS_DIR: /data/plugins
       NEST_AGENT_SECRET_STORE_PATH: /data/secrets/local_vault.json
+      NEST_AGENT_SECRET_BACKEND: json
       NEST_AGENT_MCP_CONFIG: /data/config/mcp_servers.json
       NEST_AGENT_CHANNEL_CONFIG: /data/config/channels.json
       NEST_AGENT_ALLOW_SHELL: "false"

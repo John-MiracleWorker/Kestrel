@@ -49,6 +49,8 @@ def test_tool_registry_calls_cancel_on_timeout(tmp_path: Path) -> None:
         ToolContext(memory=memory, config=AgentConfig(tool_timeout_seconds=0.01), workspace=tmp_path),
     )
 
-    assert result.success is False
-    assert result.error == "tool_timeout"
+    assert result.success is True
+    assert result.error is None
+    assert result.data["tool_deadline_exceeded"] is True
+    assert result.data["tool_timeout_seconds"] == 0.01
     assert tool.cancelled_call_ids == ["slow-call"]

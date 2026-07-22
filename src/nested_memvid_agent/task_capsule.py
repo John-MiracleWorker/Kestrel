@@ -195,10 +195,8 @@ class TaskCapsuleWriter:
                 create_private_empty_file(self.path)
             self._harden_artifacts()
         except Exception:
-            try:
-                self.backend.close()
-            finally:
-                self.backend = None
+            self.backend.close()
+            self.backend = None
             raise
 
     def put_frame(self, frame: MV2ContextFrame) -> str:
@@ -234,21 +232,10 @@ class TaskCapsuleWriter:
         self._harden_artifacts()
 
     def close(self) -> None:
-        error: BaseException | None = None
-        try:
-            if self.backend is not None:
-                self.backend.close()
-        except BaseException as exc:
-            error = exc
-        finally:
+        if self.backend is not None:
+            self.backend.close()
             self.backend = None
-            try:
-                self._harden_artifacts()
-            except BaseException as exc:
-                if error is None:
-                    error = exc
-        if error is not None:
-            raise error
+        self._harden_artifacts()
 
     def _backend(self) -> MemoryBackend:
         if self.backend is None:

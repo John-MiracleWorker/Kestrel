@@ -37,6 +37,8 @@ from nested_memvid_agent.promotion_ledger import PromotionEntry, PromotionLedger
 from nested_memvid_agent.runtime_ownership import PrimaryRuntimeOwnership
 from nested_memvid_agent.state_store import AgentStateStore, routine_session_id
 
+PINNED_VALIDATION_IMAGE = "example.invalid/kestrel-validation@sha256:" + "a" * 64
+
 
 class _ConceptEmbedder:
     model_name = "concept-test"
@@ -83,6 +85,16 @@ def test_cli_shutdown_failure_is_reported_without_runtime_traceback() -> None:
         _shutdown_run_manager(manager)
 
     assert mcp_shutdowns == [True]
+
+
+def test_cli_mcp_shutdown_failure_is_reported_without_runtime_traceback() -> None:
+    manager = SimpleNamespace(
+        shutdown=lambda **_kwargs: True,
+        mcp=SimpleNamespace(shutdown=lambda: False),
+    )
+
+    with raises(SystemExit, match="MCP worker did not stop"):
+        _shutdown_run_manager(manager)
 
 
 def test_cli_wait_does_not_cancel_a_retry_that_outlives_one_attempt(
@@ -972,7 +984,79 @@ def test_doctor_subcommand_reports_runtime_readiness(
     assert '"python"' in output
     assert '"backend": "memory"' in output
     assert '"allow_shell": false' in output
+    assert '"validation_container"' in output
+    assert '"required": false' in output
+    assert '"host_fallback": false' in output
     assert '"default_command": "pytest -q"' in output
+
+
+def test_doctor_validation_container_fails_closed_for_enabled_tools() -> None:
+    from nested_memvid_agent import cli
+
+    missing = cli._doctor_validation_container(
+        AgentConfig(allow_shell=True, allow_codex_cli=True)
+    )
+    assert missing["ok"] is False
+    assert missing["required"] is True
+    assert missing["configured"] is False
+    assert missing["required_by_config_gates"] == [
+        "test.run",
+        "lint.run",
+        "repair.validate",
+        "repair.orchestrate_validate",
+        "codex.exec",
+    ]
+
+    mutable = cli._doctor_validation_container(
+        AgentConfig(
+            allow_shell=True,
+            validation_container_image="example.invalid/kestrel-validation:latest",
+        )
+    )
+    assert mutable["ok"] is False
+    assert mutable["digest_pinned"] is False
+
+    pinned = cli._doctor_validation_container(
+        AgentConfig(
+            allow_shell=True,
+            validation_container_image=PINNED_VALIDATION_IMAGE,
+        )
+    )
+    assert pinned["ok"] is True
+    assert pinned["digest_pinned"] is True
+    assert pinned["preload_check"] == "deferred_until_execution"
+    assert pinned["host_fallback"] is False
+
+
+def test_doctor_exits_nonzero_when_enabled_tools_have_no_validation_image(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
+) -> None:
+    _clear_nest_agent_env(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "doctor",
+            "--backend",
+            "memory",
+            "--memory-dir",
+            str(tmp_path / "memory"),
+            "--workspace",
+            str(tmp_path),
+            "--allow-shell",
+        ],
+    )
+
+    with raises(SystemExit) as raised:
+        main()
+
+    assert raised.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["validation_container"]["ok"] is False
+    assert payload["validation_container"]["required"] is True
+    assert payload["validation_container"]["configured"] is False
 
 
 def test_doctor_subcommand_exits_nonzero_when_runtime_is_not_ready(
@@ -1053,6 +1137,7 @@ def test_doctor_subcommand_uses_env_config(
     monkeypatch.setenv("NEST_AGENT_MODEL", "env-model")
     monkeypatch.setenv("NEST_AGENT_BASE_URL", "http://127.0.0.1:11434/v1")
     monkeypatch.setenv("NEST_AGENT_ALLOW_SHELL", "true")
+    monkeypatch.setenv("NEST_AGENT_VALIDATION_CONTAINER_IMAGE", PINNED_VALIDATION_IMAGE)
     monkeypatch.setenv("NEST_AGENT_CONTEXT_BUDGET_CHARS", "12345")
     monkeypatch.setattr(sys, "argv", ["nest-agent", "doctor"])
 
@@ -1066,6 +1151,8 @@ def test_doctor_subcommand_uses_env_config(
     assert payload["provider"]["base_url_configured"] is True
     assert payload["tool_config"]["allow_shell"] is True
     assert payload["tool_config"]["context_budget_chars"] == 12345
+    assert payload["validation_container"]["image"] == PINNED_VALIDATION_IMAGE
+    assert payload["validation_container"]["digest_pinned"] is True
 
 
 def test_doctor_flags_override_env_config(
@@ -1078,6 +1165,10 @@ def test_doctor_flags_override_env_config(
     monkeypatch.setenv("NEST_AGENT_MODEL", "env-model")
     monkeypatch.setenv("NEST_AGENT_BASE_URL", "http://127.0.0.1:11434/v1")
     monkeypatch.setenv("NEST_AGENT_ALLOW_SHELL", "true")
+    monkeypatch.setenv(
+        "NEST_AGENT_VALIDATION_CONTAINER_IMAGE",
+        "example.invalid/kestrel-validation:latest",
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1092,6 +1183,8 @@ def test_doctor_flags_override_env_config(
             "mock",
             "--model",
             "flag-model",
+            "--validation-container-image",
+            PINNED_VALIDATION_IMAGE,
         ],
     )
 
@@ -1104,6 +1197,8 @@ def test_doctor_flags_override_env_config(
     assert payload["provider"]["model"] == "flag-model"
     assert payload["provider"]["base_url_configured"] is True
     assert payload["tool_config"]["allow_shell"] is True
+    assert payload["validation_container"]["image"] == PINNED_VALIDATION_IMAGE
+    assert payload["validation_container"]["digest_pinned"] is True
 
 
 def test_doctor_default_memory_dir_is_nest_memory(

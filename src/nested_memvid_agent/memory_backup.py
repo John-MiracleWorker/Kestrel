@@ -14,7 +14,7 @@ from uuid import uuid4
 from .file_lock import lock_exclusive, unlock
 from .layers import DEFAULT_LAYER_SPECS, LayerSpec
 from .models import MemoryLayer
-from .private_artifacts import harden_private_file
+from .private_artifacts import harden_private_file, open_private_file_descriptor
 
 _MEMORY_VALIDATION_KEY_NAME = ".validation-integrity.key"
 
@@ -70,11 +70,14 @@ class MemoryBackupManager:
                 _write_json_atomic(temporary / "manifest.json", manifest)
                 os.replace(temporary, destination)
                 _fsync_directory(self.backup_root)
-                self._prune_locked(retain=max(1, retain))
-                return manifest
             except Exception:
                 shutil.rmtree(temporary, ignore_errors=True)
                 raise
+            response = dict(manifest)
+            response["maintenance_warnings"] = _run_retention_maintenance(
+                lambda: self._prune_locked(retain=max(1, retain))
+            )
+            return response
 
     def validate(self, backup_id: str) -> dict[str, Any]:
         with self._operation_lock():
@@ -102,6 +105,8 @@ class MemoryBackupManager:
             restored_files = 0
             live_moved = False
             staging_installed = False
+            restore_succeeded = False
+            rollback_completed = False
             try:
                 for entry in manifest["files"]:
                     relative = _safe_manifest_path(str(entry["path"]))
@@ -123,23 +128,72 @@ class MemoryBackupManager:
                 os.replace(staging_dir, self.memory_dir)
                 staging_installed = True
                 _fsync_directory(parent)
-            except Exception:
-                if live_moved and rollback_dir.exists():
-                    if self.memory_dir.exists():
-                        shutil.rmtree(self.memory_dir, ignore_errors=True)
-                    os.replace(rollback_dir, self.memory_dir)
-                    _fsync_directory(parent)
+                restore_succeeded = True
+            except Exception as restore_error:
+                rollback_errors: list[str] = []
+                if live_moved:
+                    if not rollback_dir.exists():
+                        rollback_errors.append("original rollback directory is missing")
+                    else:
+                        if self.memory_dir.exists():
+                            try:
+                                shutil.rmtree(self.memory_dir)
+                            except Exception as cleanup_error:
+                                rollback_errors.append(
+                                    "installed memory cleanup failed: "
+                                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                                )
+                        if not self.memory_dir.exists():
+                            try:
+                                os.replace(rollback_dir, self.memory_dir)
+                                rollback_completed = True
+                            except Exception as rollback_error:
+                                rollback_errors.append(
+                                    "original memory rollback failed: "
+                                    f"{type(rollback_error).__name__}: {rollback_error}"
+                                )
+                            else:
+                                try:
+                                    _fsync_directory(parent)
+                                except Exception as sync_error:
+                                    rollback_errors.append(
+                                        "restored memory directory sync failed: "
+                                        f"{type(sync_error).__name__}: {sync_error}"
+                                    )
                 elif staging_installed and self.memory_dir.exists():
-                    shutil.rmtree(self.memory_dir, ignore_errors=True)
-                    _fsync_directory(parent)
+                    try:
+                        shutil.rmtree(self.memory_dir)
+                        _fsync_directory(parent)
+                    except Exception as cleanup_error:
+                        rollback_errors.append(
+                            "failed restore cleanup failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                if rollback_errors:
+                    preserved_paths = [
+                        str(path)
+                        for path in (rollback_dir, self.memory_dir)
+                        if path.exists() or path.is_symlink()
+                    ]
+                    safety_id = (
+                        "none" if safety_backup is None else str(safety_backup["backup_id"])
+                    )
+                    raise MemoryBackupError(
+                        "Memory restore failed and rollback was incomplete; "
+                        f"safety_backup_id={safety_id}; "
+                        f"restore_error={type(restore_error).__name__}: {restore_error}; "
+                        f"rollback_errors={'; '.join(rollback_errors)}; "
+                        "preserved_recovery_paths="
+                        f"{', '.join(preserved_paths) or 'none'}"
+                    ) from restore_error
                 raise
             finally:
                 shutil.rmtree(staging_dir, ignore_errors=True)
-                shutil.rmtree(rollback_dir, ignore_errors=True)
+                if restore_succeeded or rollback_completed:
+                    shutil.rmtree(rollback_dir, ignore_errors=True)
             preserved = {backup_id}
             if safety_backup is not None:
                 preserved.add(str(safety_backup["backup_id"]))
-            self._prune_locked(retain=max(2, retain), preserve=preserved)
             return {
                 "schema": "kestrel.memory_restore.v1",
                 "backup_id": backup_id,
@@ -148,6 +202,12 @@ class MemoryBackupManager:
                     safety_backup is not None and safety_backup.get("complete", False)
                 ),
                 "restored_files": restored_files,
+                "maintenance_warnings": _run_retention_maintenance(
+                    lambda: self._prune_locked(
+                        retain=max(2, retain),
+                        preserve=preserved,
+                    )
+                ),
             }
 
     def list_backups(self) -> list[dict[str, Any]]:
@@ -326,15 +386,23 @@ class MemoryBackupManager:
 
     @contextmanager
     def _operation_lock(self) -> Iterator[None]:
-        self.memory_dir.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         memory_lock_path = self.memory_dir.parent / f".{self.memory_dir.name}.kestrel-memory.lock"
-        memory_lock_path.touch(mode=0o600, exist_ok=True)
-        os.chmod(memory_lock_path, 0o600)
-        self.backup_root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(self.backup_root, 0o700)
-        self.lock_path.touch(mode=0o600, exist_ok=True)
-        os.chmod(self.lock_path, 0o600)
-        with memory_lock_path.open("r+") as memory_handle, self.lock_path.open("r+") as handle:
+        try:
+            memory_descriptor = open_private_file_descriptor(memory_lock_path)
+        except (OSError, PermissionError, ValueError) as exc:
+            raise MemoryBackupError(
+                "The shared memory lock must be an owner-only, single-link regular file"
+            ) from exc
+        try:
+            backup_descriptor = open_private_file_descriptor(self.lock_path)
+        except (OSError, PermissionError, ValueError) as exc:
+            os.close(memory_descriptor)
+            raise MemoryBackupError(
+                "The backup lock must be an owner-only, single-link regular file"
+            ) from exc
+        with os.fdopen(memory_descriptor, "r+") as memory_handle, os.fdopen(
+            backup_descriptor, "r+"
+        ) as handle:
             memory_locked = False
             backup_locked = False
             try:
@@ -385,6 +453,27 @@ def _safe_manifest_path(value: str) -> Path:
     ):
         raise MemoryBackupError(f"Unsafe manifest path: {value}")
     return Path(*posix_path.parts)
+
+
+def _run_retention_maintenance(operation: Callable[[], None]) -> list[dict[str, str]]:
+    """Return an operator-visible warning after a committed backup transaction.
+
+    Retention pruning is maintenance, not part of the create/restore commit. Once
+    the new backup or restored live data has been fsynced, a pruning failure must
+    not make callers believe that the transaction itself rolled back.
+    """
+
+    try:
+        operation()
+    except Exception as exc:  # noqa: BLE001 - committed outcome must be returned
+        return [
+            {
+                "code": "retention_prune_failed",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+        ]
+    return []
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

@@ -4,7 +4,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import shutil
 import stat
 import subprocess  # nosec B404
 import tempfile
@@ -17,7 +19,11 @@ from typing import Any
 from uuid import uuid4
 
 from .file_lock import lock_exclusive, unlock
-from .security_boundary import redact_secrets, redact_text
+from .security_boundary import (
+    redact_secrets,
+    redact_text,
+    sanitized_subprocess_environment,
+)
 
 _MAX_UNTRACKED_FILE_BYTES = 128 * 1024 * 1024
 _MAX_CHANGED_BYTES = 512 * 1024 * 1024
@@ -25,12 +31,16 @@ _MAX_CHANGED_FILES = 10_000
 _MAX_CHANGED_PATH_BYTES = 4 * 1024 * 1024
 _MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 _MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024
+_MAX_GIT_FILTER_CONFIG_BYTES = 64 * 1024
+_MAX_GIT_FILTER_DRIVERS = 256
 _SNAPSHOT_TIMEOUT_SECONDS = 30.0
 _REPAIR_ARTIFACT_ROOT = Path(".nest")
-_REPAIR_RECEIPT_KEY_FILE = "repair_receipt_signing.key"
+_REPAIR_RECEIPT_KEY_FILE = "repair_receipt_signing.v2.key"
 _REPAIR_RECEIPT_KEY_LOCK_FILE = "repair-receipt-key.lock"
-_REPAIR_RECEIPT_KEY_TEMP_FILE = ".repair_receipt_signing.key.tmp"
+_REPAIR_RECEIPT_KEY_TEMP_FILE = ".repair_receipt_signing.v2.key.tmp"
 _REPAIR_RECEIPT_KEY_BYTES = 32
+_REPAIR_RECEIPT_SCHEMA_VERSION = 2
+_REPAIR_INTEGRITY_SCHEMA_VERSION = 2
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS |= getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -76,7 +86,16 @@ def repair_snapshot(workspace: Path) -> dict[str, Any]:
     head_sha = _git_text(root, ["rev-parse", "HEAD"])
     tracked_files = _git_z_paths(
         root,
-        ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
+        [
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-z",
+            "HEAD",
+            "--",
+        ],
     )
     untracked_files = _git_z_paths(
         root,
@@ -159,7 +178,11 @@ def write_validation_receipt(
     validation_evidence: dict[str, object],
     snapshot: dict[str, Any],
     started_at: str,
+    isolation_attestation: dict[str, Any],
 ) -> dict[str, Any]:
+    trusted_isolation = _validated_isolation_attestation(
+        isolation_attestation, snapshot=snapshot
+    )
     finished_at = _now()
     safe_command = redact_secrets(command)
     if not isinstance(safe_command, list):
@@ -182,7 +205,7 @@ def write_validation_receipt(
     validation_id = f"repair_validation_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:24]}"
     content_bytes = safe_content.encode("utf-8", errors="replace")
     receipt = {
-        "schema_version": 1,
+        "schema_version": _REPAIR_RECEIPT_SCHEMA_VERSION,
         "validation_id": validation_id,
         "tool": tool_name,
         "command": safe_command,
@@ -196,7 +219,12 @@ def write_validation_receipt(
         "output_redacted": True,
         "validation_evidence": safe_evidence,
         "repair_snapshot": snapshot,
+        "execution_isolation": trusted_isolation,
     }
+    # Rotate away from every legacy or previously exposed workspace key only
+    # after the untrusted candidate has finished inside the container. A new
+    # validation invalidates earlier review gates by design.
+    _rotate_receipt_key(workspace)
     write_repair_artifact(workspace, "repair_validations", validation_id, receipt)
     return receipt
 
@@ -240,23 +268,38 @@ def write_repair_artifact(
 
 
 def load_validation_receipt(workspace: Path, validation_id: str) -> dict[str, Any]:
-    return load_repair_artifact(
+    payload = load_repair_artifact(
         workspace,
         collection="repair_validations",
         artifact_id=validation_id,
         expected_prefix="repair_validation_",
         id_field="validation_id",
     )
+    if payload.get("schema_version") != _REPAIR_RECEIPT_SCHEMA_VERSION:
+        raise ValueError(
+            "Legacy repair validation receipts are not trusted; run isolated validation again."
+        )
+    snapshot = payload.get("repair_snapshot")
+    isolation = payload.get("execution_isolation")
+    if not isinstance(snapshot, dict) or not isinstance(isolation, dict):
+        raise ValueError("Repair validation receipt has no trusted OCI attestation.")
+    _validated_isolation_attestation(isolation, snapshot=snapshot)
+    return payload
 
 
 def load_review_receipt(workspace: Path, review_id: str) -> dict[str, Any]:
-    return load_repair_artifact(
+    payload = load_repair_artifact(
         workspace,
         collection="repair_reviews",
         artifact_id=review_id,
         expected_prefix="repair_review_",
         id_field="review_id",
     )
+    if payload.get("schema_version") != _REPAIR_RECEIPT_SCHEMA_VERSION:
+        raise ValueError(
+            "Legacy repair review receipts are not trusted; validate and review again."
+        )
+    return payload
 
 
 def load_repair_artifact(
@@ -351,11 +394,13 @@ def _signed_artifact_payload(
         hashlib.sha256,
     ).hexdigest()
     copied["_integrity"] = {
+        "schema_version": _REPAIR_INTEGRITY_SCHEMA_VERSION,
         "algorithm": "hmac-sha256",
         "key_id": hashlib.sha256(signing_key).hexdigest()[:16],
         "signature": signature,
-        "key_scope": "owner_only_workspace",
+        "key_scope": "workspace_v2_excluded_from_oci_snapshot",
         "process_bound": False,
+        "legacy_workspace_key_accepted": False,
     }
     return copied
 
@@ -370,8 +415,11 @@ def _verify_artifact_signature(
     if not isinstance(integrity, dict):
         raise ValueError(f"Repair artifact is unsigned: {artifact_id}")
     if (
-        integrity.get("algorithm") != "hmac-sha256"
+        integrity.get("schema_version") != _REPAIR_INTEGRITY_SCHEMA_VERSION
+        or integrity.get("algorithm") != "hmac-sha256"
         or integrity.get("key_id") != hashlib.sha256(signing_key).hexdigest()[:16]
+        or integrity.get("key_scope") != "workspace_v2_excluded_from_oci_snapshot"
+        or integrity.get("legacy_workspace_key_accepted") is not False
     ):
         raise ValueError(
             "Repair artifact was not created by this Kestrel workspace; validate and review again."
@@ -386,55 +434,147 @@ def _verify_artifact_signature(
         raise ValueError(f"Repair artifact integrity check failed: {artifact_id}")
 
 
-def _load_or_create_receipt_key(workspace: Path) -> bytes:
-    with _receipt_key_lock(workspace):
-        with _repair_directory(workspace, create=True) as directory:
-            _recover_receipt_key_temp(directory)
-            try:
-                return _load_receipt_key_from_directory(directory)
-            except FileNotFoundError:
-                pass
+def _validated_isolation_attestation(
+    value: dict[str, Any], *, snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    copied = json.loads(json.dumps(value, ensure_ascii=True))
+    if not isinstance(copied, dict):
+        raise ValueError("Repair validation isolation attestation must be an object.")
+    image = copied.get("image")
+    digest = copied.get("source_tree_digest")
+    required = (
+        copied.get("schema_version") == 1
+        and copied.get("mode") == "oci_snapshot_v1"
+        and isinstance(image, str)
+        and "@sha256:" in image
+        and len(image.rsplit("@sha256:", 1)[-1]) == 64
+        and all(character in "0123456789abcdef" for character in image.rsplit("@sha256:", 1)[-1])
+        and copied.get("network") == "none"
+        and copied.get("workspace_mount") == "private_read_only_snapshot"
+        and copied.get("host_fallback") is False
+        and isinstance(digest, str)
+        and digest.startswith("sha256:")
+        and len(digest) == 71
+        and copied.get("repair_diff_digest") == snapshot.get("diff_digest")
+        and copied.get("repair_head_sha") == snapshot.get("head_sha")
+        and copied.get("repair_branch") == snapshot.get("branch")
+    )
+    if not required:
+        raise ValueError("Repair validation receipt has an invalid OCI isolation attestation.")
+    return copied
 
-            candidate = secrets.token_bytes(_REPAIR_RECEIPT_KEY_BYTES)
-            temp_identity: tuple[int, int] | None = None
-            try:
-                temp_identity = _write_receipt_key_temp(directory, candidate)
+
+def _rotate_receipt_key(workspace: Path) -> bytes:
+    """Atomically replace any earlier trust key after isolated validation."""
+
+    with _mcp_sensitive_material_transition():
+        with _receipt_key_lock(workspace):
+            with _repair_directory(workspace, create=True) as directory:
+                _recover_receipt_key_temp(directory)
                 try:
-                    _publish_receipt_key_temp(directory, expected_identity=temp_identity)
-                except FileExistsError:
-                    # Another same-owner publisher that does not use Kestrel's
-                    # lock may have won. Never replace it; validate and use it.
+                    _load_receipt_key_from_directory(directory)
+                except FileNotFoundError:
+                    pass
+                candidate = secrets.token_bytes(_REPAIR_RECEIPT_KEY_BYTES)
+                identity = _write_receipt_key_temp(directory, candidate)
+                try:
+                    temp_metadata = os.stat(
+                        _REPAIR_RECEIPT_KEY_TEMP_FILE,
+                        dir_fd=directory,
+                        follow_symlinks=False,
+                    )
+                    if (temp_metadata.st_dev, temp_metadata.st_ino) != identity:
+                        raise ValueError(
+                            "Temporary repair receipt signing key identity changed."
+                        )
+                    os.replace(
+                        _REPAIR_RECEIPT_KEY_TEMP_FILE,
+                        _REPAIR_RECEIPT_KEY_FILE,
+                        src_dir_fd=directory,
+                        dst_dir_fd=directory,
+                    )
+                    _sync_receipt_key_directory(directory)
+                    published = _load_receipt_key_from_directory(directory)
+                    if not hmac.compare_digest(published, candidate):
+                        raise ValueError(
+                            "Rotated repair receipt signing key identity changed."
+                        )
+                    return published
+                finally:
+                    try:
+                        _remove_receipt_key_temp(
+                            directory,
+                            expected_identity=identity,
+                            missing_ok=True,
+                        )
+                    except (FileNotFoundError, ValueError):
+                        pass
+
+
+def _load_or_create_receipt_key(workspace: Path) -> bytes:
+    with _mcp_sensitive_material_transition():
+        with _receipt_key_lock(workspace):
+            with _repair_directory(workspace, create=True) as directory:
+                _recover_receipt_key_temp(directory)
+                try:
+                    return _load_receipt_key_from_directory(directory)
+                except FileNotFoundError:
+                    pass
+
+                candidate = secrets.token_bytes(_REPAIR_RECEIPT_KEY_BYTES)
+                temp_identity: tuple[int, int] | None = None
+                try:
+                    temp_identity = _write_receipt_key_temp(directory, candidate)
+                    try:
+                        _publish_receipt_key_temp(
+                            directory, expected_identity=temp_identity
+                        )
+                    except FileExistsError:
+                        # Another same-owner publisher that does not use Kestrel's
+                        # lock may have won. Never replace it; validate and use it.
+                        _remove_receipt_key_temp(
+                            directory,
+                            expected_identity=temp_identity,
+                        )
+                        temp_identity = None
+                        _sync_receipt_key_directory(directory)
+                        return _load_receipt_key_from_directory(directory)
                     _remove_receipt_key_temp(
                         directory,
                         expected_identity=temp_identity,
                     )
                     temp_identity = None
                     _sync_receipt_key_directory(directory)
-                    return _load_receipt_key_from_directory(directory)
-                _remove_receipt_key_temp(
-                    directory,
-                    expected_identity=temp_identity,
-                )
-                temp_identity = None
-                _sync_receipt_key_directory(directory)
-                published = _load_receipt_key_from_directory(directory)
-                if not hmac.compare_digest(published, candidate):
-                    raise ValueError("Published repair receipt signing key identity changed.")
-                return published
-            except BaseException:
-                if temp_identity is not None:
-                    try:
-                        _remove_receipt_key_temp(
-                            directory,
-                            expected_identity=temp_identity,
-                            missing_ok=True,
+                    published = _load_receipt_key_from_directory(directory)
+                    if not hmac.compare_digest(published, candidate):
+                        raise ValueError(
+                            "Published repair receipt signing key identity changed."
                         )
-                        _sync_receipt_key_directory(directory)
-                    except BaseException:
-                        # Preserve the original publication failure. A safe
-                        # orphan is removed by the next locked open.
-                        pass
-                raise
+                    return published
+                except BaseException:
+                    if temp_identity is not None:
+                        try:
+                            _remove_receipt_key_temp(
+                                directory,
+                                expected_identity=temp_identity,
+                                missing_ok=True,
+                            )
+                            _sync_receipt_key_directory(directory)
+                        except BaseException:
+                            # Preserve the original publication failure. A safe
+                            # orphan is removed by the next locked open.
+                            pass
+                    raise
+
+
+@contextmanager
+def _mcp_sensitive_material_transition() -> Iterator[tuple[str, ...]]:
+    """Lazily couple receipt creation to local MCP stdio quiescence."""
+
+    from .mcp_manager import mcp_sensitive_material_transition
+
+    with mcp_sensitive_material_transition() as closed:
+        yield closed
 
 
 def _load_receipt_key(workspace: Path) -> bytes:
@@ -736,8 +876,10 @@ def _git_text(workspace: Path, arguments: list[str]) -> str:
 def _git_bytes(workspace: Path, arguments: list[str]) -> bytes:
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         completed = subprocess.run(  # noqa: S603 - fixed git executable and structured argv  # nosec
-            ["git", *arguments],
+            hardened_readonly_git_command(arguments, workspace=workspace),
             cwd=workspace,
+            env=hardened_readonly_git_environment(),
+            stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
             timeout=30,
@@ -757,6 +899,179 @@ def _git_bytes(workspace: Path, arguments: list[str]) -> bytes:
             f"git command failed ({completed.returncode}): git {' '.join(arguments)}\n{stderr}"
         )
     return stdout
+
+
+def hardened_readonly_git_command(
+    arguments: list[str],
+    *,
+    workspace: Path | None = None,
+) -> list[str]:
+    """Bind host Git probes to a resolved binary and inert execution config."""
+
+    command = [
+        trusted_git_executable(),
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "diff.external=",
+        "-c",
+        "filter.lfs.clean=",
+        "-c",
+        "filter.lfs.smudge=",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.required=false",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "protocol.ext.allow=never",
+    ]
+    if workspace is not None:
+        for driver in _configured_filter_drivers(workspace):
+            command.extend(
+                [
+                    "-c",
+                    f"filter.{driver}.clean=",
+                    "-c",
+                    f"filter.{driver}.smudge=",
+                    "-c",
+                    f"filter.{driver}.process=",
+                    "-c",
+                    f"filter.{driver}.required=false",
+                ]
+            )
+    command.extend(arguments)
+    return command
+
+
+def hardened_readonly_git_environment() -> dict[str, str]:
+    """Remove credentials and every inherited Git routing/config override."""
+
+    environment = {
+        name: value
+        for name, value in sanitized_subprocess_environment().items()
+        if not name.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            # User/system configuration is excluded. Repository-local filter
+            # names are discovered separately and explicitly neutralized on the
+            # command line because generic Git commands still consult local
+            # configuration even when GIT_CONFIG names another file.
+            "GIT_CONFIG": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+        }
+    )
+    return environment
+
+
+def _configured_filter_drivers(workspace: Path) -> tuple[str, ...]:
+    """Return bounded local filter names without evaluating filter commands."""
+
+    requested = Path(workspace)
+    if not requested.exists() or not requested.is_dir():
+        return ()
+    environment = hardened_readonly_git_environment()
+    # `git config` treats GIT_CONFIG specially; remove it so local/worktree
+    # config and their includes can be enumerated before generic commands run.
+    environment.pop("GIT_CONFIG", None)
+    command = [
+        trusted_git_executable(),
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "config",
+        "--includes",
+        "--name-only",
+        "-z",
+        "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process|required)$",
+    ]
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            completed = subprocess.run(  # noqa: S603 - trusted Git config query  # nosec
+                command,
+                cwd=requested,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                timeout=5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Timed out while neutralizing repository Git filters.") from exc
+        stdout_size = stdout_file.tell()
+        stderr_size = stderr_file.tell()
+        if (
+            stdout_size > _MAX_GIT_FILTER_CONFIG_BYTES
+            or stderr_size > _MAX_GIT_FILTER_CONFIG_BYTES
+        ):
+            raise ValueError("Repository Git filter configuration exceeds the safety budget.")
+        stdout_file.seek(0)
+        raw = stdout_file.read()
+        stderr_file.seek(0)
+        error = stderr_file.read().decode("utf-8", errors="replace").strip()
+    # Git config returns 1 when no keys match and 128 outside a repository.
+    if completed.returncode == 1:
+        return ()
+    if completed.returncode != 0:
+        if "not a git repository" in error.casefold():
+            return ()
+        raise RuntimeError("Unable to enumerate repository Git filters safely.")
+
+    drivers: set[str] = set()
+    pattern = re.compile(r"^filter\.(.+)\.(clean|smudge|process|required)$", re.IGNORECASE)
+    for encoded_key in raw.split(b"\0"):
+        if not encoded_key:
+            continue
+        try:
+            key = encoded_key.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Repository Git filter name is not valid UTF-8.") from exc
+        match = pattern.fullmatch(key)
+        if match is None:
+            raise ValueError("Repository Git filter configuration is malformed.")
+        driver = match.group(1)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", driver):
+            raise ValueError("Repository Git filter name is outside the safe grammar.")
+        drivers.add(driver)
+        if len(drivers) > _MAX_GIT_FILTER_DRIVERS:
+            raise ValueError("Repository defines too many Git filter drivers.")
+    return tuple(sorted(drivers, key=str.casefold))
+
+
+def trusted_git_executable() -> str:
+    """Resolve Git once per probe without allowing repository-controlled lookup."""
+
+    candidates = [Path("/usr/bin/git"), Path("/bin/git")]
+    discovered = shutil.which("git")
+    if discovered:
+        candidates.append(Path(discovered))
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.stat()
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+        if os.name != "nt" and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            continue
+        return str(resolved)
+    raise RuntimeError("A trusted, non-group-writable Git executable is required.")
 
 
 def _git_z_paths(workspace: Path, arguments: list[str]) -> list[str]:

@@ -97,11 +97,15 @@ Provider live integration is opt-in through `RUN_PROVIDER_INTEGRATION=1`; unit t
 Golden evals are executable today:
 
 ```bash
-python scripts/run_golden_evals.py --backend memory --provider mock
-RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden
-OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memory
-OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid
+VALIDATION_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+docker pull "$VALIDATION_IMAGE"
+python scripts/run_golden_evals.py --backend memory --provider mock --validation-container-image "$VALIDATION_IMAGE"
+RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden --validation-container-image "$VALIDATION_IMAGE"
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memory --validation-container-image "$VALIDATION_IMAGE"
+OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid --validation-container-image "$VALIDATION_IMAGE"
 ```
+
+The procedural-promotion case uses the pinned image for real private-snapshot repair validation. No image means a truthful failed golden case, never a host-process fallback.
 
 The current golden set checks behavior such as:
 
@@ -130,9 +134,16 @@ The web package uses Vite, React, and TypeScript. The test command runs the Type
 ## Packaging Validation
 
 ```bash
-python -m pip install -e '.[memvid,openai,anthropic,gemini,server,mcp,dev]'
+python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+python -m pip install --no-build-isolation -e '.[memvid,openai,anthropic,gemini,server,mcp,keyring,dev]'
 nest-agent doctor --backend memory --provider mock
 nest-agent chat --backend memory --provider mock --message "packaging smoke"
 docker build -t kestrel-agent:local .
 docker run --rm kestrel-agent:local nest-agent doctor --backend memvid --memory-dir /data/memory --provider mock
 ```
+
+For a tag, the release workflow builds one platform-independent Kestrel wheel before starting its
+artifact matrix. The identical checksummed wheel and hash-locked release requirements are then
+installed on Linux and macOS for Python 3.11, 3.12, and 3.13, plus native Windows on Python 3.11.
+Each lane exercises the installed package outside the source checkout, asserts its
+`importlib.metadata` version, and performs a real Memvid v2 persistence/reopen integration.

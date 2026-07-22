@@ -157,6 +157,37 @@ class SkillManager:
     def set_enabled(self, skill_id: str, enabled: bool) -> dict[str, Any]:
         return self.state.set_skill_enabled(skill_id, enabled)
 
+    def retry_container_cleanup(self, *, timeout_seconds: float) -> bool:
+        """Retry retained OCI cleanup without dropping the owning runner."""
+
+        retry = getattr(self.container_runner, "retry_cleanup", None)
+        if not callable(retry):
+            return True
+        return bool(retry(timeout_seconds=timeout_seconds))
+
+    @property
+    def pending_container_cleanup_count(self) -> int:
+        """Return retained OCI resources that still need exact-name cleanup."""
+
+        pending = getattr(self.container_runner, "pending_cleanup_count", 0)
+        return max(0, int(pending))
+
+    def container_cleanup_status(self) -> tuple[dict[str, object], ...]:
+        """Expose non-secret cleanup identities for operator reconciliation."""
+
+        status = getattr(self.container_runner, "pending_cleanups", None)
+        if not callable(status):
+            return ()
+        return tuple(status())
+
+    def shutdown(self, *, timeout_seconds: float) -> bool:
+        """Fail closed while any skill/validation OCI cleanup is unverified."""
+
+        shutdown = getattr(self.container_runner, "shutdown", None)
+        if callable(shutdown):
+            return bool(shutdown(timeout_seconds=timeout_seconds))
+        return self.retry_container_cleanup(timeout_seconds=timeout_seconds)
+
     def install_skill(
         self,
         *,

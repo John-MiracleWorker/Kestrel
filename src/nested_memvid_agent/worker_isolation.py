@@ -5,6 +5,11 @@ import subprocess  # nosec B404
 from dataclasses import dataclass
 from pathlib import Path
 
+from .repair_integrity import (
+    hardened_readonly_git_command,
+    hardened_readonly_git_environment,
+)
+
 
 @dataclass(frozen=True)
 class WorkerIsolation:
@@ -102,10 +107,12 @@ def _resolved_git_path(cwd: Path, *args: str) -> Path:
 
 def _git_output(cwd: Path, *args: str) -> str:
     completed = subprocess.run(  # noqa: S603 - fixed executable with argument vector  # nosec
-        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        hardened_readonly_git_command(list(args), workspace=cwd),
         cwd=cwd,
         capture_output=True,
         text=True,
+        env=hardened_readonly_git_environment(),
+        stdin=subprocess.DEVNULL,
         check=False,
         timeout=30,
     )

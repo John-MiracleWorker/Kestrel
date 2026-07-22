@@ -23,17 +23,22 @@ from ..repair_integrity import (
 )
 from ..runtime_models import StrategyProposal, ToolCall, ToolExecution, ToolSpec
 from ..security_boundary import redact_secrets, redact_text
+from ..validation_runner import IsolatedValidationResult, ValidationIsolationError
 from .base import AgentTool, ToolContext
 from .command_tools import _is_allowlisted_command, _tool_call_from_runtime_arguments
 from .diagnosis_tools import _recall_failure_lessons, _recall_hit_titles
 from .git_tools import (
     _changed_files_from_status,
     _git_output,
+    _hardened_git_command,
     _is_repair_branch,
     _safe_branch_name,
+    _sanitized_git_environment,
 )
 from .patch_helpers import _validate_patch_paths
 from .process_tools import (
+    WorkspaceSecretIsolationError,
+    _assert_repair_snapshot_workspace_safe,
     _cancel_running_subprocess,
     _normalize_python_command,
     _run_subprocess,
@@ -44,6 +49,7 @@ from .validation_helpers import (
     _merge_validation_evidence_payloads,
     _tool_validation_evidence_payload,
 )
+from .workspace_tools import _assert_workspace_path_allowed
 
 
 class RepairPrepareTool(AgentTool):
@@ -79,8 +85,9 @@ class RepairPrepareTool(AgentTool):
         try:
             root = require_git_root(context.workspace)
             base = subprocess.run(  # nosec
-                ["git", "rev-parse", "HEAD"],
+                _hardened_git_command(["rev-parse", "HEAD"], workspace=root),
                 cwd=root,
+                env=_sanitized_git_environment(None),
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -90,13 +97,14 @@ class RepairPrepareTool(AgentTool):
                 return self._result(
                     call,
                     success=False,
-                    content=f"Unable to resolve base SHA. STDERR:\n{base.stderr}",
+                    content=redact_text(f"Unable to resolve base SHA. STDERR:\n{base.stderr}"),
                     error="git_base_failed",
                     data={"returncode": base.returncode},
                 )
             status = subprocess.run(  # nosec
-                ["git", "status", "--porcelain"],
+                _hardened_git_command(["status", "--porcelain"], workspace=root),
                 cwd=root,
+                env=_sanitized_git_environment(None),
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -106,7 +114,9 @@ class RepairPrepareTool(AgentTool):
                 return self._result(
                     call,
                     success=False,
-                    content=f"Unable to inspect worktree. STDERR:\n{status.stderr}",
+                    content=redact_text(
+                        f"Unable to inspect worktree. STDERR:\n{status.stderr}"
+                    ),
                     error="git_status_failed",
                     data={"returncode": status.returncode},
                 )
@@ -116,7 +126,7 @@ class RepairPrepareTool(AgentTool):
                     success=False,
                     content="Refusing to prepare repair branch with uncommitted changes.",
                     error="dirty_worktree",
-                    data={"dirty_status": status.stdout},
+                    data={"dirty_status": redact_text(status.stdout)},
                 )
             current_branch = _git_output(root, ["git", "branch", "--show-current"])
             git_marker = root / ".git"
@@ -151,21 +161,20 @@ class RepairPrepareTool(AgentTool):
                     error="missing_branch",
                 )
             created = subprocess.run(  # nosec
-                [
-                    "git",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "switch",
-                    "-c",
-                    requested_branch,
-                ],
+                _hardened_git_command(
+                    ["switch", "-c", requested_branch], workspace=root
+                ),
                 cwd=root,
+                env=_sanitized_git_environment(None),
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
             )
-            content = f"exit_code={created.returncode}\nSTDOUT:\n{created.stdout}\nSTDERR:\n{created.stderr}"
+            content = redact_text(
+                f"exit_code={created.returncode}\nSTDOUT:\n{created.stdout}\n"
+                f"STDERR:\n{created.stderr}"
+            )
             success = created.returncode == 0
             return self._result(
                 call,
@@ -182,7 +191,10 @@ class RepairPrepareTool(AgentTool):
             )
         except Exception as exc:  # noqa: BLE001
             return self._result(
-                call, success=False, content=str(exc), error="repair_prepare_failed"
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="repair_prepare_failed",
             )
 
 
@@ -206,7 +218,9 @@ class RepairStatusTool(AgentTool):
             head = _git_output(root, ["git", "rev-parse", "HEAD"])
             status = _git_output(root, ["git", "status", "--porcelain"])
             changed_files = _changed_files_from_status(status)
+            _assert_repair_snapshot_workspace_safe(context)
             snapshot = repair_snapshot(root)
+            _assert_repair_snapshot_paths_allowed(context, root, snapshot)
             base_sha = str(arguments.get("base_sha", "")).strip() or None
             payload = {
                 "branch": branch,
@@ -224,8 +238,20 @@ class RepairStatusTool(AgentTool):
             return self._result(
                 call, success=True, content=json.dumps(payload, indent=2), data=payload
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="workspace_secret_isolation_required",
+            )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="repair_status_failed")
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="repair_status_failed",
+            )
 
 
 class RepairApplyPatchTool(AgentTool):
@@ -260,22 +286,26 @@ class RepairApplyPatchTool(AgentTool):
                         error="not_repair_branch",
                         data={"branch": branch},
                     )
-                _validate_patch_paths(root, patch_text)
+                _validate_patch_paths(root, patch_text, context=context)
                 command = (
                     ["git", "apply", "--check"]
                     if bool(arguments.get("check", False))
                     else ["git", "apply", "--whitespace=nowarn"]
                 )
                 completed = subprocess.run(  # nosec
-                    command,
+                    _hardened_git_command(command[1:], workspace=root),
                     cwd=root,
+                    env=_sanitized_git_environment(None),
                     input=patch_text,
                     capture_output=True,
                     text=True,
                     timeout=30,
                     check=False,
                 )
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            content = redact_text(
+                f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
             return self._result(
                 call,
                 success=completed.returncode == 0,
@@ -288,7 +318,12 @@ class RepairApplyPatchTool(AgentTool):
                 error=None if completed.returncode == 0 else "repair_patch_failed",
             )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="repair_patch_failed")
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="repair_patch_failed",
+            )
 
 
 class RepairValidateTool(AgentTool):
@@ -344,6 +379,7 @@ class RepairValidateTool(AgentTool):
                         error="not_repair_branch",
                     )
                 before_snapshot = repair_snapshot(root)
+                _assert_repair_snapshot_paths_allowed(context, root, before_snapshot)
                 with tempfile.TemporaryDirectory(prefix="kestrel-validation-") as cache_dir:
                     completed = _run_subprocess(
                         command,
@@ -352,6 +388,14 @@ class RepairValidateTool(AgentTool):
                         default_timeout=120,
                         sanitize_environment=True,
                         environment_overrides=_repair_validation_environment(Path(cache_dir)),
+                        requires_workspace_secret_isolation=True,
+                        require_container_isolation=True,
+                        expected_repair_snapshot=before_snapshot,
+                    )
+                if not isinstance(completed, IsolatedValidationResult):
+                    raise ValidationIsolationError(
+                        "validation_container_attestation_missing",
+                        "Repair validation did not return an OCI isolation attestation.",
                     )
                 raw_content = (
                     f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
@@ -388,6 +432,7 @@ class RepairValidateTool(AgentTool):
                     validation_evidence=validation_evidence,
                     snapshot=after_snapshot,
                     started_at=started_at,
+                    isolation_attestation=completed.isolation,
                 )
             if validation_success:
                 runtime_receipt_id = context.memory.put_runtime_validation_receipt(
@@ -427,11 +472,30 @@ class RepairValidateTool(AgentTool):
                 },
                 error=None if validation_success else "repair_validation_failed",
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
+        except ValidationIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
         except _SubprocessToolTimeout as exc:
-            return self._result(call, success=False, content=str(exc), error="tool_timeout")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="tool_timeout"
+            )
         except Exception as exc:  # noqa: BLE001
             return self._result(
-                call, success=False, content=str(exc), error="repair_validation_failed"
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="repair_validation_failed",
             )
 
     def cancel(self, call_id: str) -> None:
@@ -495,6 +559,7 @@ class RepairOrchestrateValidateTool(AgentTool):
                         data={"branch": branch},
                     )
                 before_snapshot = repair_snapshot(root)
+                _assert_repair_snapshot_paths_allowed(context, root, before_snapshot)
                 with tempfile.TemporaryDirectory(prefix="kestrel-validation-") as cache_dir:
                     completed = _run_subprocess(
                         command,
@@ -503,6 +568,14 @@ class RepairOrchestrateValidateTool(AgentTool):
                         default_timeout=120,
                         sanitize_environment=True,
                         environment_overrides=_repair_validation_environment(Path(cache_dir)),
+                        requires_workspace_secret_isolation=True,
+                        require_container_isolation=True,
+                        expected_repair_snapshot=before_snapshot,
+                    )
+                if not isinstance(completed, IsolatedValidationResult):
+                    raise ValidationIsolationError(
+                        "validation_container_attestation_missing",
+                        "Repair validation did not return an OCI isolation attestation.",
                     )
                 validation_content = redact_text(
                     f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
@@ -533,6 +606,7 @@ class RepairOrchestrateValidateTool(AgentTool):
                     validation_evidence=validation_evidence,
                     snapshot=snapshot,
                     started_at=started_at,
+                    isolation_attestation=completed.isolation,
                 )
             if validation_success:
                 runtime_receipt_id = context.memory.put_runtime_validation_receipt(
@@ -657,11 +731,30 @@ class RepairOrchestrateValidateTool(AgentTool):
             return self._result(
                 call, success=True, content=json.dumps(payload, indent=2), data=payload
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
+        except ValidationIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
         except _SubprocessToolTimeout as exc:
-            return self._result(call, success=False, content=str(exc), error="tool_timeout")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="tool_timeout"
+            )
         except Exception as exc:  # noqa: BLE001
             return self._result(
-                call, success=False, content=str(exc), error="repair_orchestration_failed"
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="repair_orchestration_failed",
             )
 
     def cancel(self, call_id: str) -> None:
@@ -714,7 +807,7 @@ class RepairReviewTool(AgentTool):
                     return self._result(
                         call,
                         success=False,
-                        content=str(exc),
+                        content=redact_text(str(exc)),
                         error="validation_receipt_invalid",
                     )
                 if validation.get("success") is not True:
@@ -733,7 +826,9 @@ class RepairReviewTool(AgentTool):
                         error="not_repair_branch",
                         data={"branch": branch},
                     )
+                _assert_repair_snapshot_workspace_safe(context)
                 snapshot = repair_snapshot(root)
+                _assert_repair_snapshot_paths_allowed(context, root, snapshot)
                 validated_snapshot = validation.get("repair_snapshot")
                 if not isinstance(validated_snapshot, dict):
                     return self._result(
@@ -799,7 +894,7 @@ class RepairReviewTool(AgentTool):
                     },
                 )
                 payload = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "review_id": review_id,
                     "validation_id": validation_id,
                     "branch": branch,
@@ -854,8 +949,20 @@ class RepairReviewTool(AgentTool):
             return self._result(
                 call, success=True, content=json.dumps(payload, indent=2), data=payload
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="workspace_secret_isolation_required",
+            )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="repair_review_failed")
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="repair_review_failed",
+            )
 
 
 class RepairRollbackTool(AgentTool):
@@ -936,7 +1043,7 @@ class RepairRollbackTool(AgentTool):
                     return self._result(
                         call,
                         success=False,
-                        content=str(exc),
+                        content=redact_text(str(exc)),
                         error="rollback_receipt_invalid",
                     )
                 branch = _git_output(root, ["git", "branch", "--show-current"])
@@ -955,6 +1062,7 @@ class RepairRollbackTool(AgentTool):
                         content="Repair rollback receipt has no candidate fingerprint.",
                         error="rollback_receipt_invalid",
                     )
+                _assert_repair_snapshot_workspace_safe(context)
                 current = repair_snapshot(root)
                 if receipt_snapshot.get("branch") != branch or receipt_snapshot.get(
                     "head_sha"
@@ -995,6 +1103,7 @@ class RepairRollbackTool(AgentTool):
                         content="Repair rollback receipt contains no changed files.",
                         error="empty_repair_diff",
                     )
+                _assert_repair_paths_allowed(context, root, target_files)
                 _preflight_rollback_targets(root, target_files)
                 artifact_seed = json.dumps(
                     {
@@ -1100,6 +1209,13 @@ class RepairRollbackTool(AgentTool):
                 },
                 error=None if success else "repair_rollback_failed",
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="workspace_secret_isolation_required",
+            )
         except Exception as exc:  # noqa: BLE001
             failure_artifact: str | None = None
             if root is not None and artifact_id is not None:
@@ -1158,6 +1274,30 @@ def _snapshot_drift_fields(
         for field in ("branch", "head_sha", "diff_digest")
         if before.get(field) != after.get(field)
     ]
+
+
+def _assert_repair_snapshot_paths_allowed(
+    context: ToolContext,
+    root: Path,
+    snapshot: dict[str, Any],
+) -> None:
+    raw_paths = snapshot.get("changed_files", [])
+    if not isinstance(raw_paths, list):
+        raise ValueError("Repair snapshot path manifest is invalid.")
+    _assert_repair_paths_allowed(context, root, [str(path) for path in raw_paths])
+
+
+def _assert_repair_paths_allowed(
+    context: ToolContext,
+    root: Path,
+    paths: list[str],
+) -> None:
+    for relative in paths:
+        _assert_workspace_path_allowed(
+            context,
+            root / Path(relative),
+            requested_path=relative,
+        )
 
 
 def _repair_validation_environment(cache_root: Path) -> dict[str, str]:
@@ -1350,8 +1490,9 @@ def _restore_tracked_paths_from_head(workspace: Path, paths: list[str]) -> list[
         if blob_size > 128 * 1024 * 1024:
             raise ValueError(f"Rollback source blob is too large: {relative}")
         blob = subprocess.run(  # nosec
-            ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "blob", object_id],
+            _hardened_git_command(["cat-file", "blob", object_id], workspace=root),
             cwd=root,
+            env=_sanitized_git_environment(None),
             capture_output=True,
             timeout=30,
             check=False,
@@ -1367,17 +1508,11 @@ def _restore_tracked_paths_from_head(workspace: Path, paths: list[str]) -> list[
         index_records.append(0)
         restored.append(relative)
     indexed = subprocess.run(  # nosec
-        [
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "update-index",
-            "-z",
-            "--index-info",
-        ],
+        _hardened_git_command(
+            ["update-index", "-z", "--index-info"], workspace=root
+        ),
         cwd=root,
+        env=_sanitized_git_environment(None),
         input=bytes(index_records),
         capture_output=True,
         timeout=30,
@@ -1393,8 +1528,11 @@ def _restore_tracked_paths_from_head(workspace: Path, paths: list[str]) -> list[
 
 def _head_tree_entry(workspace: Path, relative: str) -> tuple[str, str] | None:
     completed = subprocess.run(  # nosec
-        ["git", "-c", "core.hooksPath=/dev/null", "ls-tree", "-z", "HEAD", "--", relative],
+        _hardened_git_command(
+            ["ls-tree", "-z", "HEAD", "--", relative], workspace=workspace
+        ),
         cwd=workspace,
+        env=_sanitized_git_environment(None),
         capture_output=True,
         timeout=30,
         check=False,

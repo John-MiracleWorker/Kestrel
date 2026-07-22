@@ -58,21 +58,117 @@ npm ci --prefix web
 npm run licenses:check --prefix web
 npm run build --prefix web
 python scripts/stage_web_release.py
-rm -rf dist
-python -m build --outdir dist
+SOURCE_ROOT="$PWD"
+RELEASE_TMP="$(mktemp -d)"
+DIST_DIR="$RELEASE_TMP/dist"
+VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+RELEASE_EXTRAS='memvid,openai,anthropic,gemini,server,mcp,keyring'
+python -m pip install --require-hashes --only-binary=:all: -r config/release-build-bootstrap.txt
+uv export --frozen --no-dev --no-emit-local \
+  --extra memvid --extra openai --extra anthropic --extra gemini \
+  --extra server --extra mcp --extra keyring \
+  --format requirements.txt --output-file "$RELEASE_TMP/requirements-release.txt"
+python -m build --no-isolation --outdir "$DIST_DIR"
+python -m twine check --strict "$DIST_DIR"/*
+WHEELS=("$DIST_DIR"/*.whl)
+SDISTS=("$DIST_DIR"/*.tar.gz)
+test "${#WHEELS[@]}" -eq 1
+test "${#SDISTS[@]}" -eq 1
 # Require THIRD_PARTY_NOTICES.txt in both the packaged web_dist and license metadata.
-python -m zipfile -l dist/*.whl | grep 'nested_memvid_agent/web_dist/THIRD_PARTY_NOTICES.txt'
-tar -tzf dist/*.tar.gz | grep '/web/public/THIRD_PARTY_NOTICES.txt'
-# Validate wheel/sdist metadata, built web assets, and an isolated wheel install.
-python -m pip check
-nest-agent doctor --backend memory --provider mock
-nest-agent chat --backend memory --provider mock --message "packaging smoke"
+python -m zipfile -l "$DIST_DIR"/*.whl | grep 'nested_memvid_agent/web_dist/THIRD_PARTY_NOTICES.txt'
+tar -tzf "$DIST_DIR"/*.tar.gz | grep '/web/public/THIRD_PARTY_NOTICES.txt'
+
+# Validate the wheel from outside the checkout in a clean environment.
+python -m venv "$RELEASE_TMP/wheel-venv"
+WHEEL_PY="$RELEASE_TMP/wheel-venv/bin/python"
+"$WHEEL_PY" -m pip install --require-hashes --only-binary=:all: \
+  -r "$RELEASE_TMP/requirements-release.txt"
+"$WHEEL_PY" -m pip install --no-deps "${WHEELS[0]}[$RELEASE_EXTRAS]"
+"$WHEEL_PY" -m pip check
+(
+  cd "$RELEASE_TMP"
+  "$WHEEL_PY" -I -c 'import importlib.metadata, sys; actual=importlib.metadata.version("nested-memvid-agent"); assert actual == sys.argv[1], (actual, sys.argv[1])' "$VERSION"
+  "$WHEEL_PY" -I -m nested_memvid_agent.cli doctor --backend memvid --memory-dir "$RELEASE_TMP/wheel-doctor-memory" --provider mock --model mock
+  "$WHEEL_PY" -I -m nested_memvid_agent.cli chat --backend memvid --memory-dir "$RELEASE_TMP/wheel-chat-memory" --provider mock --model mock --message "clean wheel smoke"
+  "$WHEEL_PY" -I "$SOURCE_ROOT/scripts/verify_installed_memvid.py" --source-root "$SOURCE_ROOT" --memory-dir "$RELEASE_TMP/wheel-memvid"
+)
+
+# Validate the sdist separately with the exact build bootstrap and no build isolation.
+python -m venv "$RELEASE_TMP/sdist-venv"
+SDIST_PY="$RELEASE_TMP/sdist-venv/bin/python"
+"$SDIST_PY" -m pip install --require-hashes --only-binary=:all: \
+  -r config/release-build-bootstrap.txt
+"$SDIST_PY" -m pip install --require-hashes --only-binary=:all: \
+  -r "$RELEASE_TMP/requirements-release.txt"
+"$SDIST_PY" -m pip install --no-build-isolation --no-deps \
+  "${SDISTS[0]}[$RELEASE_EXTRAS]"
+"$SDIST_PY" -m pip check
+(
+  cd "$RELEASE_TMP"
+  "$SDIST_PY" -I -c 'import importlib.metadata, sys; from importlib.resources import files; actual=importlib.metadata.version("nested-memvid-agent"); assert actual == sys.argv[1], (actual, sys.argv[1]); web=files("nested_memvid_agent").joinpath("web_dist"); assert web.joinpath("index.html").is_file(); assert web.joinpath("THIRD_PARTY_NOTICES.txt").is_file()' "$VERSION"
+  "$SDIST_PY" -I -m nested_memvid_agent.cli doctor --backend memvid --memory-dir "$RELEASE_TMP/sdist-doctor-memory" --provider mock --model mock
+)
 bash -n install.sh
 KESTREL_DRY_RUN=1 bash install.sh
 KESTREL_DRY_RUN=1 KESTREL_START_SERVER=0 bash install.sh
 docker build -t kestrel-agent:local .
 docker run --rm kestrel-agent:local nest-agent doctor --backend memvid --memory-dir /data/memory --provider mock
 ```
+
+The tag workflow first proves that the exact tag SHA already has a successful `main` push run of
+the complete CI workflow. It then builds the wheel once and installs that identical downloaded
+wheel plus its hash-locked dependency payload on Linux x86_64, Apple-silicon macOS, and Intel
+macOS with Python 3.11, 3.12, and 3.13, and on native Windows x86_64 with Python 3.11. The macOS
+lanes use `macos-latest` (arm64) and `macos-15-intel` (x86_64); every lane asserts
+`platform.machine()` against its declared architecture before installing the candidate. Every
+lane also asserts `importlib.metadata` version, imports Memvid, runs Kestrel doctor/chat from
+outside the checkout, and performs a real Memvid v2 write/seal/verify/reopen/search integration.
+Keyring client import is required, but a usable OS keychain is not claimed on headless runners.
+The workflow also builds, executes, and Trivy-scans
+both `linux/amd64` and `linux/arm64` images under pinned Buildx/QEMU tooling; a native-only local
+image does not replace that release gate. After the image checks pass, CI archives those exact
+images and transfers them to the publication job instead of rebuilding them. Only that final job
+has `packages: write`; it runs after the wheel matrix and every candidate gate. It publishes a
+two-platform GHCR index under `sha-<full-GitHub-SHA>`. Each per-platform `docker push` result is
+parsed for the registry-returned manifest digest, the index is composed from those immutable
+`IMAGE@sha256:...` references rather than the temporary architecture tags, and the published
+platform descriptors must exactly equal the two captured digests. CI then anonymously pulls each
+platform digest and runs doctor. It resolves the current remote tag with `git ls-remote` (including
+annotated-tag peeling) without fetching it into a local tag ref before attestations, and repeats
+that full resolution after attestations immediately before the version image. It peels the remote
+tag once more in the directly adjacent step before `gh release create`. Every check requires the
+peeled commit to equal `GITHUB_SHA`; both full checks also require it to remain an ancestor of the
+current remote `main`.
+
+The workflow serializes runs per release ref, but repository administrators must also prevent
+release-tag updates/deletion and concurrent external package writers during publication. The two
+remote-tag checks and digest-addressed image composition fail closed on observable drift; they do
+not make a mutable Git ref or registry tag transactionally immutable.
+
+The GHCR package must be public so Linux ARM64 users can pull the documented fallback without a
+credential. A first publication that leaves the package private is expected to fail at the
+anonymous post-publish pull; set the linked package visibility to public, then rerun the same
+gated release job. Do not weaken or remove that anonymous-pull gate.
+
+After publication, download the complete release and verify repository provenance plus payload
+identity (replace the version as appropriate):
+
+```bash
+gh release download v0.4.0 --repo John-MiracleWorker/Kestrel --dir "$RELEASE_TMP/published"
+for artifact in "$RELEASE_TMP"/published/*; do
+  gh attestation verify "$artifact" --repo John-MiracleWorker/Kestrel
+done
+python scripts/verify_release_payload.py "$RELEASE_TMP/published" --expected-version v0.4.0
+docker buildx imagetools inspect ghcr.io/john-miracleworker/kestrel:v0.4.0
+docker pull --platform linux/amd64 ghcr.io/john-miracleworker/kestrel:v0.4.0
+docker pull --platform linux/arm64 ghcr.io/john-miracleworker/kestrel:v0.4.0
+```
+
+Require the image inspection to contain exactly `linux/amd64` and `linux/arm64`, verify the image
+attestation against its index digest, and check the source/version/revision labels on both child
+manifests. The version and `sha-<full-GitHub-SHA>` references must resolve to the same index
+digest. This verifies the released bytes and source provenance; it is not a bit-for-bit rebuild
+claim. Debian package-index inputs and frontend build tooling remain mutable build inputs.
 
 Optional one-shot installer smoke from a local repo clone:
 
@@ -107,11 +203,30 @@ Do not tag the release if any of these are true:
 - High-risk tools are enabled by default.
 - `.mv2` memory is replaced by another primary memory store.
 - Policy memory can be written from one ordinary event.
-- The exact candidate has not passed Linux, macOS, and Windows CI on supported Python versions.
+- The source candidate has not passed repository CI, including the native Windows source lane.
+- The exact release tag SHA has no successful complete CI `push` run on `main`.
+- The exact single built wheel and hash-locked dependency payload have not passed Linux x86_64,
+  Apple-silicon macOS, and Intel macOS on every supported Python version (3.11 through 3.13),
+  plus native Windows x86_64 on Python 3.11, with each runner architecture asserted explicitly.
 - The release tag is not on `main`, or the exact tag bytes have not passed the release workflow's
   cross-platform matrix before publication.
-- Wheel/sdist metadata, isolated install, packaged web assets, dependency audit, chaos recovery, or bounded soak has not passed.
+- Strict Twine metadata validation; matching distribution/version across wheel/sdist filenames,
+  wheel `METADATA`, sdist `PKG-INFO`, and CycloneDX; separate isolated wheel and sdist installs;
+  packaged web assets; dependency audit; chaos recovery; or bounded soak has not passed.
 - The generated production-web third-party notice is stale or absent from either release artifact.
+- Either `linux/amd64` or `linux/arm64` fails its executable container smoke or enforced Trivy policy.
+- The exact scanned container archives are rebuilt in the publication job, their GHCR index does
+  not contain exactly `linux/amd64` plus `linux/arm64`, their source/version/revision labels drift,
+  their public post-publish pull/doctor fails, or the version and immutable-SHA index digests differ.
+- The multi-platform index is composed from mutable architecture tags instead of the exact
+  registry-returned per-platform push digests, or either published platform descriptor differs
+  from its captured digest.
+- The current remote release tag cannot be peeled unambiguously to `GITHUB_SHA` immediately before
+  attestations and again immediately before release publication, the release commit is no longer
+  an ancestor of the current remote `main`, or release-tag immutability is not administratively
+  enforced.
+- The validated release payload lacks GitHub build-provenance attestation before publication.
+- The published multi-platform image digest lacks GitHub build-provenance attestation.
 - No enabled confidential vulnerability-reporting channel is available to security researchers.
 - A history-aware secret scan reports anything other than explicitly fingerprinted synthetic test
   fixtures, or repository secret scanning/push protection is disabled.

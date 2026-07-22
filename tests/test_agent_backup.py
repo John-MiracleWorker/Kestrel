@@ -17,7 +17,7 @@ from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayerSpec, load_laye
 from nested_memvid_agent.memory_backup import MemoryBackupError
 from nested_memvid_agent.models import MemoryLayer
 from nested_memvid_agent.repair_integrity import (
-    load_validation_receipt,
+    load_repair_artifact,
     write_repair_artifact,
 )
 from nested_memvid_agent.runtime_ownership import (
@@ -148,7 +148,7 @@ def test_agent_backup_restores_repair_signing_identity_and_receipts(
             "success": True,
         },
     )
-    key_path = paths["runtime"] / "repair_receipt_signing.key"
+    key_path = paths["runtime"] / "repair_receipt_signing.v2.key"
     original_key = key_path.read_bytes()
 
     manifest = manager.create()
@@ -159,7 +159,13 @@ def test_agent_backup_restores_repair_signing_identity_and_receipts(
     assert "repair_signing_key" in restored["restored_components"]
     assert "repair_validations" in restored["restored_components"]
     assert key_path.read_bytes() == original_key
-    receipt = load_validation_receipt(tmp_path, artifact_id)
+    receipt = load_repair_artifact(
+        tmp_path,
+        collection="repair_validations",
+        artifact_id=artifact_id,
+        expected_prefix="repair_validation_",
+        id_field="validation_id",
+    )
     assert receipt["success"] is True
     assert manifest["components"]["repair_signing_key"]["present"] is True
     assert manifest["components"]["repair_validations"]["present"] is True
@@ -190,7 +196,7 @@ def test_agent_restore_legacy_backup_removes_live_repair_trust_material(
             "success": True,
         },
     )
-    key_path = paths["runtime"] / "repair_receipt_signing.key"
+    key_path = paths["runtime"] / "repair_receipt_signing.v2.key"
     validations_path = paths["runtime"] / "repair_validations"
     assert key_path.is_file()
     assert validations_path.is_dir()
@@ -264,6 +270,62 @@ def test_agent_backup_round_trip_restores_memory_state_capsules_config_and_exten
     for spec in DEFAULT_LAYER_SPECS.values():
         assert (paths["memory"] / spec.mv2_file).read_bytes() == (
             f"{spec.layer.value}:original".encode()
+        )
+
+
+def test_agent_backup_create_reports_retention_failure_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, paths = _manager(tmp_path)
+    _seed_runtime(paths, "committed")
+
+    def fail_prune(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected retention prune failure")
+
+    monkeypatch.setattr(manager, "_prune_locked", fail_prune)
+
+    created = manager.create(retain=1)
+
+    assert (paths["backups"] / str(created["backup_id"]) / "manifest.json").is_file()
+    assert manager.validate(str(created["backup_id"]))["ok"] is True
+    assert created["maintenance_warnings"] == [
+        {
+            "code": "retention_prune_failed",
+            "error_type": "OSError",
+            "message": "injected retention prune failure",
+        }
+    ]
+
+
+def test_agent_restore_reports_retention_failure_after_live_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, paths = _manager(tmp_path)
+    _seed_runtime(paths, "backup")
+    manifest = manager.create(retain=4)
+    _seed_runtime(paths, "live")
+
+    def fail_prune(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected retention prune failure")
+
+    monkeypatch.setattr(manager, "_prune_locked", fail_prune)
+
+    restored = manager.restore(str(manifest["backup_id"]), retain=4)
+
+    assert restored["maintenance_warnings"] == [
+        {
+            "code": "retention_prune_failed",
+            "error_type": "OSError",
+            "message": "injected retention prune failure",
+        }
+    ]
+    assert (paths["backups"] / str(restored["safety_backup_id"]) / "manifest.json").is_file()
+    assert _state_value(paths["state"]) == "backup"
+    for spec in DEFAULT_LAYER_SPECS.values():
+        assert (paths["memory"] / spec.mv2_file).read_bytes() == (
+            f"{spec.layer.value}:backup".encode()
         )
 
 

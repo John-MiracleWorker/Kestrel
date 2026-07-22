@@ -1023,9 +1023,10 @@ class ChannelManager:
     def close(self) -> None:
         with self._agent_lock:
             agent = self._agent
-            self._agent = None
-        if agent is not None:
-            agent.close()
+            if agent is not None:
+                agent.close()
+                if self._agent is agent:
+                    self._agent = None
 
     def _agent_for_hot_path(self) -> NestedMV2Agent:
         if self._agent is None:

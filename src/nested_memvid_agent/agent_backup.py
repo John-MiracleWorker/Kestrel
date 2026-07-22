@@ -22,6 +22,7 @@ from .memory_backup import (
     _file_entry,
     _fsync_directory,
     _fsync_file,
+    _run_retention_maintenance,
     _safe_manifest_path,
     _sha256,
     _write_json_atomic,
@@ -102,8 +103,14 @@ class AgentBackupManager:
                 preflight()
             with self._operation_lock():
                 manifest = self._create_locked(kind="manual", require_required=True)
-                self._prune_locked(retain=max(1, retain), preserve={str(manifest["backup_id"])})
-                return manifest
+                response = dict(manifest)
+                response["maintenance_warnings"] = _run_retention_maintenance(
+                    lambda: self._prune_locked(
+                        retain=max(1, retain),
+                        preserve={str(manifest["backup_id"])},
+                    )
+                )
+                return response
 
     def validate(self, backup_id: str) -> dict[str, Any]:
         with self._operation_lock():
@@ -276,7 +283,6 @@ class AgentBackupManager:
                             _remove_path(rollback_path, ignore_errors=True)
 
             preserved = {backup_id, str(safety_backup["backup_id"])}
-            self._prune_locked(retain=max(2, retain), preserve=preserved)
             return {
                 "schema": "kestrel.agent_restore.v1",
                 "backup_id": backup_id,
@@ -287,6 +293,12 @@ class AgentBackupManager:
                 "removed_components": removed,
                 "restored_files": restored_files,
                 "secrets_restored": False,
+                "maintenance_warnings": _run_retention_maintenance(
+                    lambda: self._prune_locked(
+                        retain=max(2, retain),
+                        preserve=preserved,
+                    )
+                ),
             }
 
     @contextmanager
@@ -370,7 +382,7 @@ class AgentBackupManager:
                 "repair_signing_key",
                 None
                 if repair_artifact_root is None
-                else repair_artifact_root / "repair_receipt_signing.key",
+                else repair_artifact_root / "repair_receipt_signing.v2.key",
                 "file",
             ),
             (

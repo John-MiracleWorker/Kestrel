@@ -7,21 +7,93 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import nested_memvid_agent.repair_integrity as repair_integrity_module
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.mcp_manager import MCPLaunchIdentityError, MCPManager
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.repair_integrity import (
     _load_or_create_receipt_key,
+    load_review_receipt,
+    load_validation_receipt,
     repair_snapshot,
+    require_git_root,
+    write_repair_artifact,
+    write_validation_receipt,
 )
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution
+from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.base import ToolContext
 from nested_memvid_agent.tools.builtin import build_default_tools
 from nested_memvid_agent.tools.registry import ToolRegistry
+from nested_memvid_agent.validation_runner import (
+    IsolatedValidationResult,
+    ValidationIsolationError,
+)
 from nested_memvid_agent.worker_isolation import prepare_git_worktree
+
+
+@pytest.fixture(autouse=True)
+def _isolated_validation_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise repair gates without requiring Docker in the unit-test tier."""
+
+    def run_stub(
+        *,
+        workspace: Path,
+        image: str | None,
+        command: list[str],
+        timeout_seconds: float,
+        expected_repair_snapshot: dict[str, object] | None = None,
+    ) -> IsolatedValidationResult:
+        del image
+        root = require_git_root(workspace)
+        before = repair_snapshot(root)
+        if expected_repair_snapshot is not None:
+            assert before["diff_digest"] == expected_repair_snapshot["diff_digest"]
+        host_command = list(command)
+        if host_command and Path(host_command[0]).name.casefold().startswith("python"):
+            host_command[0] = sys.executable
+        completed = subprocess.run(
+            host_command,
+            cwd=root,
+            env={},
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        after = repair_snapshot(root)
+        if after["diff_digest"] != before["diff_digest"]:
+            raise ValidationIsolationError(
+                "validation_candidate_changed",
+                "Validation candidate changed during isolated execution: diff_digest",
+            )
+        return IsolatedValidationResult(
+            args=tuple(command),
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            isolation={
+                "schema_version": 1,
+                "mode": "oci_snapshot_v1",
+                "image": "example.invalid/kestrel-validation@sha256:" + "a" * 64,
+                "network": "none",
+                "workspace_mount": "private_read_only_snapshot",
+                "host_fallback": False,
+                "source_tree_digest": "sha256:" + "b" * 64,
+                "repair_diff_digest": before["diff_digest"],
+                "repair_head_sha": before["head_sha"],
+                "repair_branch": before["branch"],
+            },
+        )
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.tools.process_tools.run_isolated_validation",
+        run_stub,
+    )
 
 
 def test_signed_repair_receipt_survives_process_restart(tmp_path: Path) -> None:
@@ -43,10 +115,12 @@ def test_signed_repair_receipt_survives_process_restart(tmp_path: Path) -> None:
         (
             "import json",
             "from pathlib import Path",
-            "from nested_memvid_agent.repair_integrity import load_validation_receipt",
+            "from nested_memvid_agent.repair_integrity import load_repair_artifact",
             f"workspace = Path({str(repo)!r})",
             f"artifact_id = {artifact_id!r}",
-            "print(json.dumps(load_validation_receipt(workspace, artifact_id), sort_keys=True))",
+            "print(json.dumps(load_repair_artifact(workspace, collection='repair_validations', "
+            "artifact_id=artifact_id, expected_prefix='repair_validation_', "
+            "id_field='validation_id'), sort_keys=True))",
         )
     )
 
@@ -70,9 +144,172 @@ def test_signed_repair_receipt_survives_process_restart(tmp_path: Path) -> None:
     payload = json.loads(reopened.stdout)
     assert payload["validation_id"] == artifact_id
     assert payload["success"] is True
+    assert payload["_integrity"]["schema_version"] == 2
     assert payload["_integrity"]["process_bound"] is False
     if os.name != "nt":
-        assert (repo / ".nest" / "repair_receipt_signing.key").stat().st_mode & 0o777 == 0o600
+        assert (repo / ".nest" / "repair_receipt_signing.v2.key").stat().st_mode & 0o777 == 0o600
+
+
+def test_legacy_signed_validation_and_review_receipts_are_not_authorization(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    validation_id = "repair_validation_legacy_schema"
+    review_id = "repair_review_legacy_schema"
+    write_repair_artifact(
+        repo,
+        "repair_validations",
+        validation_id,
+        {
+            "schema_version": 1,
+            "validation_id": validation_id,
+            "success": True,
+        },
+    )
+    write_repair_artifact(
+        repo,
+        "repair_reviews",
+        review_id,
+        {
+            "schema_version": 1,
+            "review_id": review_id,
+            "validation_id": validation_id,
+            "commit_gate": {"commit_allowed": True},
+        },
+    )
+
+    with pytest.raises(ValueError, match="Legacy repair validation"):
+        load_validation_receipt(repo, validation_id)
+    with pytest.raises(ValueError, match="Legacy repair review"):
+        load_review_receipt(repo, review_id)
+
+
+def test_repair_snapshot_never_executes_repo_or_inherited_git_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    marker = tmp_path / "fsmonitor-executed.txt"
+    leaked = tmp_path / "fsmonitor-secret.txt"
+    filter_marker = tmp_path / "clean-filter-executed.txt"
+    filter_leaked = tmp_path / "clean-filter-secret.txt"
+    sentinel = "opaque-provider-env-sentinel-123456"
+    monitor = tmp_path / "hostile-fsmonitor.py"
+    monitor.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed')\n"
+        f"Path({str(leaked)!r}).write_text(os.environ.get('GOOGLE_API_KEY', 'missing'))\n",
+        encoding="utf-8",
+    )
+    monitor.chmod(0o700)
+    clean_filter = tmp_path / "hostile-clean-filter.py"
+    clean_filter.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "payload = sys.stdin.buffer.read()\n"
+        f"Path({str(filter_marker)!r}).write_text('executed')\n"
+        f"Path({str(filter_leaked)!r}).write_text(os.environ.get('GOOGLE_API_KEY', 'missing'))\n"
+        "sys.stdout.buffer.write(payload)\n",
+        encoding="utf-8",
+    )
+    clean_filter.chmod(0o700)
+    (repo / ".gitattributes").write_text(
+        "README.md filter=kestrel-hostile\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", ".gitattributes"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add filter attribute"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.fsmonitor", str(monitor)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "filter.kestrel-hostile.clean", str(clean_filter)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setenv("GOOGLE_API_KEY", sentinel)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(monitor))
+    (repo / "README.md").write_text("candidate\n", encoding="utf-8")
+    # Ignore any execution caused by the deliberately unhardened Git commands
+    # used to construct this hostile fixture; only Kestrel probes are in scope.
+    filter_marker.unlink(missing_ok=True)
+    filter_leaked.unlink(missing_ok=True)
+
+    snapshot = repair_snapshot(repo)
+    assert filter_marker.exists() is False
+    assert filter_leaked.exists() is False
+    memory = build_memory_system("memory", tmp_path / "memory")
+    status = build_default_tools(("git.status",)).execute(
+        ToolCall(name="git.status", arguments={}),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=repo),
+    )
+
+    assert snapshot["changed_files"] == ["README.md"]
+    assert status.success is True
+    assert marker.exists() is False
+    assert leaked.exists() is False
+    assert filter_marker.exists() is False
+    assert filter_leaked.exists() is False
+
+
+def test_each_isolated_validation_rotates_prior_receipt_trust(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / "README.md").write_text("candidate\n", encoding="utf-8")
+    snapshot = repair_snapshot(repo)
+    first = write_validation_receipt(
+        repo,
+        tool_name="repair.validate",
+        command=["python", "-m", "compileall", "src"],
+        success=True,
+        returncode=0,
+        content="first",
+        validation_evidence={},
+        snapshot=snapshot,
+        started_at="2026-07-20T00:00:00+00:00",
+        isolation_attestation=_isolation_attestation(snapshot),
+    )
+    first_key = (repo / ".nest" / "repair_receipt_signing.v2.key").read_bytes()
+    second = write_validation_receipt(
+        repo,
+        tool_name="repair.validate",
+        command=["python", "-m", "compileall", "src"],
+        success=True,
+        returncode=0,
+        content="second",
+        validation_evidence={},
+        snapshot=snapshot,
+        started_at="2026-07-20T00:00:01+00:00",
+        isolation_attestation=_isolation_attestation(snapshot),
+    )
+    second_key = (repo / ".nest" / "repair_receipt_signing.v2.key").read_bytes()
+
+    assert first_key != second_key
+    with pytest.raises(ValueError, match="not created by this Kestrel workspace"):
+        load_validation_receipt(repo, str(first["validation_id"]))
+    assert load_validation_receipt(repo, str(second["validation_id"]))["success"] is True
 
 
 def test_repair_signing_key_concurrent_first_open_is_single_identity(
@@ -85,10 +322,66 @@ def test_repair_signing_key_concurrent_first_open_is_single_identity(
 
     assert len(set(keys)) == 1
     assert len(keys[0]) == 32
-    key_path = repo / ".nest" / "repair_receipt_signing.key"
+    key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
     assert key_path.read_bytes() == keys[0]
     if os.name != "nt":
         assert key_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_repair_key_creation_closes_stdio_before_key_publication(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
+    manager = MCPManager(AgentStateStore(tmp_path / "mcp-state.db"))
+    observations: list[bool] = []
+
+    class _Worker:
+        server = SimpleNamespace(transport="stdio")
+
+        def close(self, *, timeout: float) -> bool:
+            del timeout
+            observations.append(key_path.exists())
+            return True
+
+    manager._sessions["active-repair-stdio"] = _Worker()  # type: ignore[assignment]
+
+    try:
+        key = _load_or_create_receipt_key(repo)
+    finally:
+        manager.shutdown()
+
+    assert len(key) == 32
+    assert observations == [False]
+    assert key_path.read_bytes() == key
+    assert "active-repair-stdio" not in manager._sessions
+
+
+def test_repair_key_creation_aborts_if_stdio_close_cannot_be_verified(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
+    manager = MCPManager(AgentStateStore(tmp_path / "mcp-state.db"))
+    close_attempts = 0
+
+    class _Worker:
+        server = SimpleNamespace(transport="stdio")
+
+        def close(self, *, timeout: float) -> bool:
+            nonlocal close_attempts
+            del timeout
+            close_attempts += 1
+            return close_attempts > 1
+
+    manager._sessions["stuck-repair-stdio"] = _Worker()  # type: ignore[assignment]
+
+    try:
+        with pytest.raises(MCPLaunchIdentityError) as raised:
+            _load_or_create_receipt_key(repo)
+    finally:
+        manager.shutdown()
+
+    assert raised.value.code == "mcp_stdio_quiesce_failed"
+    assert not key_path.exists()
 
 
 @pytest.mark.parametrize("failure_point", ["write", "file_fsync", "publish"])
@@ -98,8 +391,8 @@ def test_repair_signing_key_fault_before_publication_cleans_temp_and_recovers(
     failure_point: str,
 ) -> None:
     repo = _repo(tmp_path)
-    key_path = repo / ".nest" / "repair_receipt_signing.key"
-    temp_path = repo / ".nest" / ".repair_receipt_signing.key.tmp"
+    key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
+    temp_path = repo / ".nest" / ".repair_receipt_signing.v2.key.tmp"
 
     with monkeypatch.context() as fault:
         if failure_point == "write":
@@ -148,8 +441,8 @@ def test_repair_signing_key_directory_fsync_failure_leaves_valid_recoverable_key
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _repo(tmp_path)
-    key_path = repo / ".nest" / "repair_receipt_signing.key"
-    temp_path = repo / ".nest" / ".repair_receipt_signing.key.tmp"
+    key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
+    temp_path = repo / ".nest" / ".repair_receipt_signing.v2.key.tmp"
 
     with monkeypatch.context() as fault:
         fault.setattr(
@@ -174,14 +467,14 @@ def test_repair_signing_key_recovers_partial_orphan_temp(
     repo = _repo(tmp_path)
     nest = repo / ".nest"
     nest.mkdir(mode=0o700)
-    temp_path = nest / ".repair_receipt_signing.key.tmp"
+    temp_path = nest / ".repair_receipt_signing.v2.key.tmp"
     temp_path.write_bytes(b"partial")
     temp_path.chmod(0o600)
 
     recovered = _load_or_create_receipt_key(repo)
 
     assert len(recovered) == 32
-    assert (nest / "repair_receipt_signing.key").read_bytes() == recovered
+    assert (nest / "repair_receipt_signing.v2.key").read_bytes() == recovered
     assert not temp_path.exists()
 
 
@@ -191,8 +484,8 @@ def test_repair_signing_key_recovers_post_link_crash_state(
     repo = _repo(tmp_path)
     nest = repo / ".nest"
     nest.mkdir(mode=0o700)
-    temp_path = nest / ".repair_receipt_signing.key.tmp"
-    key_path = nest / "repair_receipt_signing.key"
+    temp_path = nest / ".repair_receipt_signing.v2.key.tmp"
+    key_path = nest / "repair_receipt_signing.v2.key"
     expected = os.urandom(32)
     temp_path.write_bytes(expected)
     temp_path.chmod(0o600)
@@ -211,8 +504,8 @@ def test_repair_signing_key_publish_never_overwrites_external_winner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _repo(tmp_path)
-    key_path = repo / ".nest" / "repair_receipt_signing.key"
-    temp_path = repo / ".nest" / ".repair_receipt_signing.key.tmp"
+    key_path = repo / ".nest" / "repair_receipt_signing.v2.key"
+    temp_path = repo / ".nest" / ".repair_receipt_signing.v2.key.tmp"
     winner = os.urandom(32)
     original_publish = repair_integrity_module._publish_receipt_key_temp
 
@@ -249,7 +542,7 @@ def test_repair_signing_key_rejects_link_aliases(
     nest.mkdir(mode=0o700)
     outside = tmp_path / f"{alias_kind}-repair-key"
     outside.write_bytes(b"x" * 32)
-    key_path = nest / "repair_receipt_signing.key"
+    key_path = nest / "repair_receipt_signing.v2.key"
     if alias_kind == "symlink":
         key_path.symlink_to(outside)
     else:
@@ -486,8 +779,8 @@ def test_repair_validation_rejects_candidate_drift_and_nested_workspace(
         validation_call,
         _approved(memory, repo, validation_call),
     )
-    assert validation.error == "repair_validation_failed"
-    assert validation.data["validation_drift_fields"] == ["diff_digest"]
+    assert validation.error == "validation_candidate_changed"
+    assert "diff_digest" in validation.content
 
     nested = repo / "nested"
     nested.mkdir()
@@ -776,9 +1069,11 @@ def test_nonrepair_commit_binds_approval_to_exact_staged_tree(tmp_path: Path) ->
         capture_output=True,
         text=True,
     ).stdout.strip()
+    approved_preview = _commit_preview(registry, memory, repo)
+    assert approved_preview["expected_tree_sha"] == approved_tree
     call = ToolCall(
         name="git.commit",
-        arguments={"message": "exact staged commit", "expected_tree_sha": approved_tree},
+        arguments={"message": "exact staged commit", **approved_preview},
         id="exact_staged_commit",
     )
     (repo / "extra.txt").write_text("not approved\n", encoding="utf-8")
@@ -800,6 +1095,99 @@ def test_nonrepair_commit_binds_approval_to_exact_staged_tree(tmp_path: Path) ->
         capture_output=True,
         text=True,
     ).stdout.strip() == "1"
+
+
+def test_nonrepair_commit_rejects_branch_drift_with_same_staged_tree(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    _branch(repo, "topic/approved-destination")
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    (repo / "README.md").write_text("approved staged change\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    approved_preview = _commit_preview(registry, memory, repo)
+    call = ToolCall(
+        name="git.commit",
+        arguments={"message": "must stay on approved branch", **approved_preview},
+        id="branch_drift_commit",
+    )
+
+    _branch(repo, "topic/redirected-destination")
+    drifted_preview = _commit_preview(registry, memory, repo)
+    assert drifted_preview["expected_tree_sha"] == approved_preview["expected_tree_sha"]
+    assert drifted_preview["expected_head_sha"] == approved_preview["expected_head_sha"]
+
+    stale = registry.execute(call, _approved(memory, repo, call))
+
+    assert stale.error == "commit_preview_stale"
+    assert stale.data["drift_fields"] == ["branch"]
+    assert stale.data["expected_branch"] == "topic/approved-destination"
+    assert stale.data["actual_branch"] == "topic/redirected-destination"
+    assert _commit_preview(registry, memory, repo) == drifted_preview
+
+
+def test_nonrepair_commit_rejects_head_drift_with_same_staged_tree(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    branch = "topic/approved-head"
+    _branch(repo, branch)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    (repo / "README.md").write_text("approved staged change\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    approved_preview = _commit_preview(registry, memory, repo)
+    call = ToolCall(
+        name="git.commit",
+        arguments={"message": "must retain approved parent", **approved_preview},
+        id="head_drift_commit",
+    )
+    approved_head = approved_preview["expected_head_sha"]
+    approved_head_tree = subprocess.run(
+        ["git", "rev-parse", f"{approved_head}^{{tree}}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    drifted_head = subprocess.run(
+        ["git", "commit-tree", approved_head_tree, "-p", approved_head, "-m", "concurrent"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", f"refs/heads/{branch}", drifted_head, approved_head],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    drifted_preview = _commit_preview(registry, memory, repo)
+    assert drifted_preview["expected_tree_sha"] == approved_preview["expected_tree_sha"]
+    assert drifted_preview["expected_branch"] == approved_preview["expected_branch"]
+
+    stale = registry.execute(call, _approved(memory, repo, call))
+
+    assert stale.error == "commit_preview_stale"
+    assert stale.data["drift_fields"] == ["head_sha"]
+    assert stale.data["expected_head_sha"] == approved_head
+    assert stale.data["actual_head_sha"] == drifted_head
+    assert _commit_preview(registry, memory, repo) == drifted_preview
 
 
 def _repo(tmp_path: Path) -> Path:
@@ -839,6 +1227,21 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _isolation_attestation(snapshot: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "mode": "oci_snapshot_v1",
+        "image": "example.invalid/kestrel-validation@sha256:" + "a" * 64,
+        "network": "none",
+        "workspace_mount": "private_read_only_snapshot",
+        "host_fallback": False,
+        "source_tree_digest": "sha256:" + "b" * 64,
+        "repair_diff_digest": snapshot["diff_digest"],
+        "repair_head_sha": snapshot["head_sha"],
+        "repair_branch": snapshot["branch"],
+    }
+
+
 def _branch(repo: Path, name: str) -> None:
     subprocess.run(
         ["git", "switch", "-c", name],
@@ -847,6 +1250,30 @@ def _branch(repo: Path, name: str) -> None:
         capture_output=True,
         text=True,
     )
+
+
+def _commit_preview(
+    registry: ToolRegistry,
+    memory: object,
+    repo: Path,
+) -> dict[str, str]:
+    result = registry.execute(
+        ToolCall(name="git.status", arguments={}),
+        ToolContext(
+            memory=memory,  # type: ignore[arg-type]
+            config=AgentConfig(),
+            workspace=repo,
+        ),
+    )
+    assert result.success
+    preview = result.data.get("commit_preview")
+    assert isinstance(preview, dict)
+    assert all(isinstance(preview.get(key), str) and preview[key] for key in (
+        "expected_branch",
+        "expected_head_sha",
+        "expected_tree_sha",
+    ))
+    return {key: str(value) for key, value in preview.items()}
 
 
 def _approved(

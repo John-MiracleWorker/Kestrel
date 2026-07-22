@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
 import sys
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Barrier
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
+import nested_memvid_agent.support_bundle as support_bundle
 from nested_memvid_agent.cli import main
 from nested_memvid_agent.cognition.models import FailureEpisode, ProofOfWorkSummary
 from nested_memvid_agent.config import AgentConfig
@@ -17,6 +24,24 @@ from nested_memvid_agent.event_log import AgentEvent, JsonlEventLog
 from nested_memvid_agent.server_product_routes import register_product_routes
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.support_bundle import export_support_bundle
+
+
+def test_support_bundle_git_probe_uses_absolute_resolved_executable(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="main\n", stderr="")
+
+    monkeypatch.setattr(support_bundle.subprocess, "run", fake_run)
+
+    result = support_bundle._run_git(tmp_path, "branch", "--show-current")  # noqa: SLF001
+
+    assert result["returncode"] == 0
+    assert calls[-1][-2:] == ["branch", "--show-current"]
+    assert all(Path(command[0]).is_absolute() for command in calls)
 
 
 def test_support_bundle_export_writes_redacted_archive(
@@ -34,6 +59,7 @@ def test_support_bundle_export_writes_redacted_archive(
     assert result.bundle_path == tmp_path / "bundle.zip"
     assert result.manifest["schema"] == "kestrel.support_bundle.v1"
     with zipfile.ZipFile(result.bundle_path) as archive:
+        assert archive.testzip() is None
         names = set(archive.namelist())
         assert {
             "manifest.json",
@@ -50,6 +76,9 @@ def test_support_bundle_export_writes_redacted_archive(
         )
         runtime = json.loads(archive.read("runtime.json"))
         state_summary = json.loads(archive.read("state_summary.json"))
+
+    if os.name != "nt":
+        assert stat.S_IMODE(result.bundle_path.stat().st_mode) == 0o600
 
     assert raw_secret not in combined_text
     assert "abcdefghijklmnopqrstuvwxyz" not in combined_text
@@ -78,6 +107,101 @@ def test_support_bundle_export_writes_redacted_archive(
         },
         "oldest_nonterminal": None,
     }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symbolic-link safety contract")
+def test_support_bundle_refuses_symlink_destination_without_mutating_victim(
+    tmp_path: Path,
+) -> None:
+    config = _support_config(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim_bytes = b"irreplaceable victim bytes\n"
+    victim.write_bytes(victim_bytes)
+    destination = tmp_path / "bundle.zip"
+    destination.symlink_to(victim)
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        export_support_bundle(config, output_path=destination)
+
+    assert destination.is_symlink()
+    assert victim.read_bytes() == victim_bytes
+    assert not list(tmp_path.glob(".kestrel-support-*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link safety contract")
+def test_support_bundle_refuses_hardlinked_destination_without_mutating_victim(
+    tmp_path: Path,
+) -> None:
+    config = _support_config(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim_bytes = b"hard-linked victim bytes\n"
+    victim.write_bytes(victim_bytes)
+    destination = tmp_path / "bundle.zip"
+    os.link(victim, destination)
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        export_support_bundle(config, output_path=destination)
+
+    assert destination.read_bytes() == victim_bytes
+    assert victim.read_bytes() == victim_bytes
+    assert os.path.samestat(victim.stat(), destination.stat())
+    assert not list(tmp_path.glob(".kestrel-support-*.tmp"))
+
+
+def test_support_bundle_write_failure_removes_private_temporary(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config = _support_config(tmp_path)
+    destination = tmp_path / "bundle.zip"
+
+    def fail_write_json(_archive: zipfile.ZipFile, _name: str, _payload: object) -> None:
+        raise OSError("simulated archive write failure")
+
+    monkeypatch.setattr(support_bundle, "_write_json", fail_write_json)
+
+    with pytest.raises(OSError, match="simulated archive write failure"):
+        export_support_bundle(config, output_path=destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".kestrel-support-*.tmp"))
+
+
+def test_support_bundle_concurrent_publish_is_create_once_and_leaves_valid_archive(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config = _support_config(tmp_path)
+    destination = tmp_path / "bundle.zip"
+    publish_barrier = Barrier(2)
+    real_publish = support_bundle._publish_bundle_entry
+
+    def synchronized_publish(
+        directory_fd: int | None,
+        parent: Path,
+        temporary_name: str,
+        destination_name: str,
+    ) -> None:
+        publish_barrier.wait(timeout=5)
+        real_publish(directory_fd, parent, temporary_name, destination_name)
+
+    monkeypatch.setattr(support_bundle, "_publish_bundle_entry", synchronized_publish)
+
+    def attempt_export() -> object:
+        try:
+            return export_support_bundle(config, output_path=destination)
+        except FileExistsError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _index: attempt_export(), range(2)))
+
+    assert sum(isinstance(outcome, FileExistsError) for outcome in outcomes) == 1
+    assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+    with zipfile.ZipFile(destination) as archive:
+        assert archive.testzip() is None
+        assert archive.namelist()[0] == "manifest.json"
+    assert not list(tmp_path.glob(".kestrel-support-*.tmp"))
 
 
 def test_support_bundle_reports_prompt_free_routine_aggregates(tmp_path: Path) -> None:

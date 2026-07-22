@@ -57,6 +57,7 @@ class GraphRuntimeServices:
     publish_turn_observability: Callable[[str, AgentTurnResult], None]
     publish_tool_executions: Callable[[str, tuple[ToolExecution, ...]], None]
     complete_capsule: Callable[[str, AgentConfig, NestedMV2Agent, AgentTurnResult], None]
+    close_agent: Callable[[str, NestedMV2Agent], None]
     run_scheduler_until_idle: Callable[[str, int | None, int | None], dict[str, Any]]
     scheduler_outcome: Callable[[dict[str, Any]], tuple[str, str]]
     reconcile_root_task: Callable[[str, str, str, bool], TaskNodeRecord | None]
@@ -1044,6 +1045,12 @@ class FinalizerNode:
         ) as span:
             ctx.finalized = True
             status = str(ctx.review.get("status") or "failed")
+            # A completed/blocked/failed status is not durable until every
+            # memory layer has force-sealed and closed. Keep the run mutable so
+            # a close failure can still be recorded as a failed run.
+            if ctx.agent is not None:
+                services.close_agent(ctx.run_id, ctx.agent)
+                ctx.agent = None
             if status == "blocked" and ctx.result is not None:
                 blocked = services.transition_run(
                     ctx.run_id,
@@ -1198,7 +1205,7 @@ class DurableOrchestrationRuntime:
                     FinalizerNode().run(ctx, self.services, span.span_id)
             finally:
                 if ctx.agent is not None:
-                    ctx.agent.close()
+                    self.services.close_agent(ctx.run_id, ctx.agent)
 
 
 def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:

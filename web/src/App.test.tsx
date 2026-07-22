@@ -344,6 +344,11 @@ describe("App", () => {
     const { container } = render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
+    const transcript = screen.getByRole("region", { name: "Conversation transcript" });
+    expect(transcript).toHaveAttribute("tabindex", "0");
+    transcript.focus();
+    expect(transcript).toHaveFocus();
+    expect(screen.getByRole("region", { name: "Conversation threads" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /new chat/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
     expect(screen.getByText("Safe Auto")).toBeInTheDocument();
@@ -1305,6 +1310,39 @@ describe("App", () => {
     });
   });
 
+  it("coalesces replayed run events into one authoritative refresh burst", async () => {
+    sessionRuns.session_1 = [{ ...baseRun, status: "running", assistant_message: "", stop_reason: "" }];
+    runs = [sessionRuns.session_1[0], otherRun];
+    sessions = [
+      { ...sessions[1], latest_run_id: "run_1", latest_status: "running", latest_message: "Inspect the repo" },
+      sessions[0]
+    ];
+    approvals = [];
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findAllByText("Inspect the repo");
+    const stream = await waitForEventSource();
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.some(([path]) => String(path).includes("/trace?limit=700"))).toBe(true);
+    });
+    fetchSpy.mockClear();
+
+    for (let index = 0; index < 40; index += 1) {
+      stream.emit("context.compile", { query: `replayed-${index}` });
+    }
+
+    await waitFor(() => {
+      expect(fetchSpy.mock.calls.filter(([path]) => path === "/api/runs")).toHaveLength(1);
+      expect(fetchSpy.mock.calls.filter(([path]) => String(path).includes("/trace?limit=700"))).toHaveLength(1);
+    });
+    const refreshedPaths = fetchSpy.mock.calls.map(([path]) => String(path));
+    expect(refreshedPaths.filter((path) => path === "/api/sessions")).toHaveLength(1);
+    expect(refreshedPaths.filter((path) => path === "/api/approvals?status=pending")).toHaveLength(1);
+    expect(refreshedPaths.filter((path) => path === "/api/sessions/session_1/runs")).toHaveLength(1);
+    expect(refreshedPaths.filter((path) => path === "/api/runs/run_1/task-graph")).toHaveLength(1);
+  });
+
   it("shows live thinking and tool use inside the active assistant turn", async () => {
     sessionRuns.session_1 = [{ ...baseRun, status: "running", assistant_message: "", stop_reason: "" }];
     runs = [sessionRuns.session_1[0], otherRun];
@@ -1328,6 +1366,7 @@ describe("App", () => {
     });
 
     const activity = await screen.findByLabelText("Live run activity");
+    expect(activity).toHaveAttribute("role", "status");
     expect(within(activity).getByText("Thinking")).toBeInTheDocument();
     expect(within(activity).getByText("Gathering context")).toBeInTheDocument();
     expect(within(activity).getByText("Using shell.run")).toBeInTheDocument();
@@ -2061,7 +2100,9 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Kestrel API token" })).toBeInTheDocument();
+    expect(screen.getByText("Locked")).toBeInTheDocument();
     expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
+    expect(fetchSpy.mock.calls.map(([path]) => path)).toEqual(["/api/health"]);
 
     fireEvent.change(screen.getByLabelText("API token"), { target: { value: "browser-token" } });
     fireEvent.click(screen.getByRole("button", { name: /save token/i }));

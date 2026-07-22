@@ -286,6 +286,67 @@ def test_server_enforces_one_runtime_owner_and_releases_on_clean_lifespan_shutdo
         assert restarted.get("/api/health/live").status_code == 200
 
 
+def test_unverified_mcp_shutdown_retains_primary_runtime_ownership(
+    tmp_path: Path,
+) -> None:
+    owner = _build_manager(tmp_path)
+    allow_close = False
+
+    class _Worker:
+        def close(self, *, timeout: float) -> bool:
+            del timeout
+            return allow_close
+
+    worker = _Worker()
+    owner.mcp._sessions["stuck-stdio"] = worker  # type: ignore[assignment]
+
+    assert owner.shutdown(timeout_seconds=1.0) is False
+    assert owner.mcp._sessions["stuck-stdio"] is worker
+    with pytest.raises(RuntimeOwnershipError, match=f"^{RUNTIME_OWNERSHIP_ERROR}$"):
+        _build_manager(tmp_path)
+
+    allow_close = True
+    assert owner.shutdown(timeout_seconds=1.0) is True
+    successor = _build_manager(tmp_path)
+    assert successor.shutdown(timeout_seconds=1.0) is True
+
+
+def test_unverified_oci_cleanup_retains_primary_runtime_ownership(
+    tmp_path: Path,
+) -> None:
+    owner = _build_manager(tmp_path)
+
+    class _CleanupRunner:
+        def __init__(self) -> None:
+            self.allow_cleanup = False
+            self.shutdown_calls = 0
+
+        @property
+        def pending_cleanup_count(self) -> int:
+            return 0 if self.allow_cleanup else 1
+
+        def shutdown(self, *, timeout_seconds: float) -> bool:
+            assert timeout_seconds >= 0
+            self.shutdown_calls += 1
+            return self.allow_cleanup
+
+    runner = _CleanupRunner()
+    owner.skills.container_runner = runner  # type: ignore[assignment]
+
+    assert owner.operational_counters()["oci_container_cleanups_pending"] == 1
+    assert owner.shutdown(timeout_seconds=1.0) is False
+    assert runner.shutdown_calls == 1
+    with pytest.raises(RuntimeOwnershipError, match=f"^{RUNTIME_OWNERSHIP_ERROR}$"):
+        _build_manager(tmp_path)
+
+    runner.allow_cleanup = True
+    assert owner.shutdown(timeout_seconds=1.0) is True
+    assert runner.shutdown_calls == 2
+    assert owner.operational_counters()["oci_container_cleanups_pending"] == 0
+    successor = _build_manager(tmp_path)
+    assert successor.shutdown(timeout_seconds=1.0) is True
+
+
 def test_server_app_construction_is_inert_until_lifespan_start(tmp_path: Path) -> None:
     config = AgentConfig(
         backend="memory",

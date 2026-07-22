@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
 import stat
-import subprocess  # nosec B404 - fixed argv, no shell, bounded supervisor
+import subprocess  # nosec B404
 import tempfile
 import threading
 import time
@@ -32,6 +33,7 @@ OCI_TMPFS_LIMIT = "64m"
 OCI_OUTPUT_LIMIT_BYTES = 64 * 1024
 OCI_STDIN_LIMIT_BYTES = 256 * 1024
 OCI_CLEANUP_TIMEOUT_SECONDS = 5.0
+OCI_CLEANUP_RETRY_MAX_SECONDS = 30.0
 OCI_PROCESS_EXIT_TIMEOUT_SECONDS = 2.0
 OCI_IO_JOIN_TIMEOUT_SECONDS = 1.0
 # Registry execution must leave enough time after the in-container deadline to
@@ -66,6 +68,104 @@ class ContainerExecutionResult:
     scope_digest: str | None = None
 
 
+@dataclass(frozen=True)
+class _PendingContainerCleanup:
+    engine: tuple[str, ...]
+    container_name: str
+    environment: tuple[tuple[str, str], ...]
+
+    @property
+    def key(self) -> tuple[tuple[str, ...], str]:
+        return self.engine, self.container_name
+
+
+class OCIContainerCleanupQuarantine:
+    """Retain exact OCI cleanup identities until absence is proven.
+
+    The default instance is process-wide because validation runners may be
+    short-lived.  Keeping the engine argv and generated container name here
+    lets the runtime retry cleanup without trusting extension-controlled data
+    or rediscovering a container by a broad label/name pattern.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._retry_lock = threading.Lock()
+        self._pending: dict[tuple[tuple[str, ...], str], _PendingContainerCleanup] = {}
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def status(self) -> tuple[dict[str, object], ...]:
+        with self._lock:
+            pending = tuple(self._pending.values())
+        return tuple(
+            {
+                "engine": list(item.engine),
+                "container_name": item.container_name,
+            }
+            for item in sorted(
+                pending,
+                key=lambda item: (item.engine, item.container_name),
+            )
+        )
+
+    def retain(
+        self,
+        *,
+        engine: tuple[str, ...],
+        container_name: str,
+        environment: dict[str, str],
+    ) -> None:
+        pending = _PendingContainerCleanup(
+            engine=tuple(engine),
+            container_name=container_name,
+            environment=tuple(sorted(environment.items())),
+        )
+        with self._lock:
+            self._pending[pending.key] = pending
+
+    def retry_cleanup(self, *, timeout_seconds: float) -> bool:
+        """Retry every retained exact-name cleanup within one total budget."""
+
+        with self._retry_lock:
+            with self._lock:
+                pending = tuple(self._pending.values())
+            if not pending:
+                return True
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                return False
+            deadline = time.monotonic() + min(
+                timeout_seconds,
+                OCI_CLEANUP_RETRY_MAX_SECONDS,
+            )
+            for item in pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    cleanup_verified = _remove_and_confirm_container_absent(
+                        item.engine,
+                        item.container_name,
+                        dict(item.environment),
+                        timeout_seconds=remaining,
+                    )
+                except Exception:  # noqa: BLE001 - quarantine must remain owned
+                    cleanup_verified = False
+                if not cleanup_verified:
+                    continue
+                with self._lock:
+                    if self._pending.get(item.key) is item:
+                        self._pending.pop(item.key, None)
+            with self._lock:
+                return not self._pending
+
+
+_PROCESS_OCI_CLEANUP_QUARANTINE = OCIContainerCleanupQuarantine()
+
+
 class OCIContainerRunner:
     """Run a snapshotted extension in a fixed, default-deny OCI sandbox.
 
@@ -80,13 +180,34 @@ class OCIContainerRunner:
         *,
         engine_command: tuple[str, ...] = ("docker",),
         output_limit_bytes: int = OCI_OUTPUT_LIMIT_BYTES,
+        cleanup_quarantine: OCIContainerCleanupQuarantine | None = None,
     ) -> None:
         if not engine_command or not all(isinstance(item, str) and item for item in engine_command):
             raise ValueError("engine_command must contain at least one non-empty argv item")
         self.engine_command = engine_command
         self.output_limit_bytes = max(1024, min(int(output_limit_bytes), 1024 * 1024))
+        self.cleanup_quarantine = cleanup_quarantine or _PROCESS_OCI_CLEANUP_QUARANTINE
+
+    @property
+    def pending_cleanup_count(self) -> int:
+        return self.cleanup_quarantine.pending_count
+
+    def pending_cleanups(self) -> tuple[dict[str, object], ...]:
+        return self.cleanup_quarantine.status()
+
+    def retry_cleanup(self, *, timeout_seconds: float = OCI_CLEANUP_TIMEOUT_SECONDS) -> bool:
+        return self.cleanup_quarantine.retry_cleanup(timeout_seconds=timeout_seconds)
+
+    def shutdown(self, *, timeout_seconds: float = OCI_CLEANUP_TIMEOUT_SECONDS) -> bool:
+        return self.retry_cleanup(timeout_seconds=timeout_seconds)
 
     def run(self, request: ContainerExecutionRequest) -> ContainerExecutionResult:
+        if self.pending_cleanup_count:
+            return _failure(
+                "extension_cleanup_pending",
+                "A previous OCI container cleanup is still unverified. "
+                "Retry cleanup before admitting another container.",
+            )
         engine = self._resolved_engine_command()
         if engine is None:
             return _failure("container_runtime_unavailable", "OCI container engine is unavailable.")
@@ -299,12 +420,21 @@ class OCIContainerRunner:
                     )
                 except subprocess.TimeoutExpired:
                     returncode = process.poll()
-            cleanup_verified = _remove_and_confirm_container_absent(
-                engine,
-                container_name,
-                environment,
-                timeout_seconds=OCI_CLEANUP_TIMEOUT_SECONDS,
-            )
+            try:
+                cleanup_verified = _remove_and_confirm_container_absent(
+                    engine,
+                    container_name,
+                    environment,
+                    timeout_seconds=OCI_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - retain exact cleanup ownership
+                cleanup_verified = False
+            if not cleanup_verified:
+                self.cleanup_quarantine.retain(
+                    engine=engine,
+                    container_name=container_name,
+                    environment=environment,
+                )
             for thread in started_threads:
                 thread.join(timeout=OCI_IO_JOIN_TIMEOUT_SECONDS)
             if any(thread.is_alive() for thread in started_threads):
@@ -524,7 +654,9 @@ def _remove_and_confirm_container_absent(
 ) -> bool:
     """Force-remove a named container and require repeated exact-name absence."""
 
-    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        return False
+    deadline = time.monotonic() + timeout_seconds
     consecutive_absent = 0
     while time.monotonic() < deadline:
         remaining = max(0.01, deadline - time.monotonic())

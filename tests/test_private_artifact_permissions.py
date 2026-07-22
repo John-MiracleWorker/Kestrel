@@ -761,6 +761,10 @@ def test_vector_sidecar_rejects_aliases_without_mutating_target(
     with pytest.raises(ValueError, match="symbolic links|hard-linked"):
         sidecar.open()
 
+    sidecar.record_open_error(ValueError("corrupt disposable index"))
+    with pytest.raises(ValueError, match="symbolic links|hard-linked"):
+        sidecar.rebuild(())
+
     assert outside.read_bytes() == b"outside vector"
     assert _mode(outside) == 0o644
 

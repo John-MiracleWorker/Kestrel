@@ -18,7 +18,6 @@ from uuid import uuid4
 
 from .agent import NestedMV2Agent
 from .agent_backup import AgentBackupManager
-from .app_factory import build_agent
 from .behavior_delta_extractor import BehaviorDeltaExtractor
 from .behavior_delta_ledger import BehaviorDeltaLedger
 from .behavior_delta_skill import render_skill_candidate_preview
@@ -27,6 +26,7 @@ from .config import AgentConfig
 from .context_compiler import ContextCompiler
 from .context_packer import ContextPacker, ContextPackRequest
 from .event_bus import RunEventBus
+from .extension_runner import _digest_pinned_image as _is_digest_pinned_oci_image
 from .layers import DEFAULT_LAYER_SPECS, LayerSpec, load_layer_specs
 from .llm.model_catalog import PROVIDER_OPTIONS
 from .mcp_manager import MCPManager
@@ -43,6 +43,7 @@ from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
 from .runtime_ownership import PrimaryRuntimeOwnership, RuntimeOwnershipError
 from .runtime_settings import default_runtime_settings_path
+from .secret_broker import build_secret_broker
 from .setup_readiness import build_setup_readiness_report
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RoutineConflictError
@@ -100,6 +101,14 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-file-write", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-policy-writes", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-codex-cli", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--validation-container-image",
+        default=argparse.SUPPRESS,
+        help=(
+            "Preloaded immutable name@sha256:<64 hex> OCI image used by test.run, "
+            "lint.run, repair validation, and codex.exec; there is no host fallback."
+        ),
+    )
     parser.add_argument("--allow-plugin-install", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-git-commit", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-git-push", action="store_true", default=argparse.SUPPRESS)
@@ -1017,6 +1026,7 @@ _CONFIG_ARG_FIELDS = {
     "allow_file_write": "allow_file_write",
     "allow_policy_writes": "allow_policy_writes",
     "allow_codex_cli": "allow_codex_cli",
+    "validation_container_image": "validation_container_image",
     "allow_plugin_install": "allow_plugin_install",
     "allow_git_commit": "allow_git_commit",
     "allow_git_push": "allow_git_push",
@@ -1638,6 +1648,7 @@ def _doctor_runtime(config: AgentConfig) -> dict[str, Any]:
         "provider": _doctor_provider(config),
         "workspace": _doctor_workspace(config),
         "tool_config": _doctor_tool_config(config),
+        "validation_container": _doctor_validation_container(config),
         "server": _doctor_server(),
         "tests": _doctor_tests(),
     }
@@ -1758,6 +1769,51 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
     }
 
 
+def _doctor_validation_container(config: AgentConfig) -> dict[str, Any]:
+    image = str(config.validation_container_image or "").strip()
+    configured = bool(image)
+    digest_pinned = configured and _is_digest_pinned_oci_image(image)
+    required_by: list[str] = []
+    if config.allow_shell:
+        required_by.extend(
+            [
+                "test.run",
+                "lint.run",
+                "repair.validate",
+                "repair.orchestrate_validate",
+            ]
+        )
+    if config.allow_codex_cli:
+        required_by.append("codex.exec")
+    required = bool(required_by)
+    if not configured:
+        detail = (
+            "A validation image is required by enabled arbitrary-code tools."
+            if required
+            else "No OCI-only arbitrary-code tool master gate is enabled."
+        )
+    elif not digest_pinned:
+        detail = "The configured image is not an immutable name@sha256:<64 hex> reference."
+    else:
+        detail = (
+            "The image reference is digest-pinned. Local preload and command dependencies "
+            "are verified only when a contained tool runs."
+        )
+    return {
+        "ok": digest_pinned if configured or required else True,
+        "required": required,
+        "required_by_config_gates": required_by,
+        "configured": configured,
+        "image": image or None,
+        "digest_pinned": digest_pinned,
+        "required_format": "name@sha256:<64 hex>",
+        "preload_check": "deferred_until_execution",
+        "execution_mode": "networkless_secret_free_private_read_only_snapshot",
+        "host_fallback": False,
+        "detail": detail,
+    }
+
+
 def _doctor_server() -> dict[str, Any]:
     fastapi_available = importlib.util.find_spec("fastapi") is not None
     uvicorn_available = importlib.util.find_spec("uvicorn") is not None
@@ -1839,9 +1895,27 @@ def _build_run_manager(
     enforce_single_owner: bool | None = None,
     read_only_observer: bool = False,
 ) -> RunManager:
+    workspace = config.workspace.expanduser().resolve()
+    secret_store_path = config.secret_store_path.expanduser()
+    if not secret_store_path.is_absolute():
+        secret_store_path = workspace / secret_store_path
+    secret_store_path = secret_store_path.resolve()
+    secret_resolver = None
+    if not read_only_observer:
+        secret_resolver = build_secret_broker(
+            secret_store_path,
+            backend=config.secret_backend,
+        ).resolve
     state = AgentStateStore(config.state_path)
     events = RunEventBus(state)
-    mcp = MCPManager(state, allow_network_endpoints=config.allow_mcp_network_endpoints)
+    mcp = MCPManager(
+        state,
+        allow_network_endpoints=config.allow_mcp_network_endpoints,
+        secret_resolver=secret_resolver,
+        workspace=workspace,
+        secret_store_path=secret_store_path,
+        secret_backend=config.secret_backend,
+    )
     skills = SkillManager(config.skills_dir, state)
     plugins = PluginManager(config.plugins_dir, state)
     try:
@@ -1858,6 +1932,7 @@ def _build_run_manager(
             mcp=mcp,
             skills=skills,
             plugins=plugins,
+            secret_resolver=secret_resolver,
             recover_startup_work=resolved_recovery,
             enforce_single_owner=resolved_owner,
             read_only_observer=read_only_observer,
@@ -1886,6 +1961,7 @@ def _shutdown_run_manager(manager: Any) -> None:
 
     shutdown = getattr(manager, "shutdown", None)
     stopped = True
+    mcp_stopped = True
     try:
         if callable(shutdown):
             stopped = bool(shutdown(timeout_seconds=5.0))
@@ -1893,12 +1969,21 @@ def _shutdown_run_manager(manager: Any) -> None:
         mcp = getattr(manager, "mcp", None)
         mcp_shutdown = getattr(mcp, "shutdown", None)
         if callable(mcp_shutdown):
-            mcp_shutdown()
+            # Third-party/fake managers historically returned ``None`` here;
+            # only an explicit false result means bounded MCP termination was
+            # not verified.
+            mcp_stopped = mcp_shutdown() is not False
     if not stopped:
         raise SystemExit(
             "Kestrel cancelled the run, but its worker did not stop within the bounded "
             "shutdown window. The CLI is exiting with a failure instead of abandoning "
             "background work."
+        )
+    if not mcp_stopped:
+        raise SystemExit(
+            "Kestrel stopped the run, but an MCP worker did not stop within the bounded "
+            "shutdown window. The CLI is exiting with a failure instead of reporting "
+            "a clean shutdown."
         )
 
 
@@ -2468,11 +2553,11 @@ def _handle_slash_command_for_manager(
 ) -> bool:
     if not command.startswith("/"):
         return False
-    agent = build_agent(config, tools=manager.build_registry(), state=manager.state)
+    agent = manager.build_runtime_agent(config)
     try:
         return _handle_slash_command(agent, command, session_id, manager=manager)
     finally:
-        agent.close()
+        manager.close_runtime_agent(agent)
 
 
 def _handle_slash_command(

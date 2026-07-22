@@ -139,6 +139,12 @@ nest-agent backup list --backup-dir .nest/backups/agent
 nest-agent backup verify BACKUP_ID --backup-dir .nest/backups/agent
 ```
 
+Create and restore responses include `maintenance_warnings`. A
+`retention_prune_failed` warning means the requested backup or restore was already committed and
+fsynced, but cleanup of older snapshots did not finish. Treat the committed outcome as successful,
+inspect the warning, list/verify the retained backups, and retry retention maintenance separately;
+do not repeat a restore on the assumption that it rolled back.
+
 `nest-agent memory backup` remains available for a memory-only snapshot. Use it
 only when intentionally excluding run history, ledgers, task capsules, runtime
 settings, skills, and plugins.

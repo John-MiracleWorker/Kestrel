@@ -6,8 +6,6 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-07-20
-
 ### Added
 
 - Bounded exact recent-turn reconstruction so follow-up messages retain explicit user/assistant
@@ -48,6 +46,9 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ### Fixed
 
+- Prevented Memvid run, subagent, scheduler, and manual-endpoint deadlocks by admitting one
+  cancellable agent lifecycle per runtime, keeping additional primary runs in the durable FIFO
+  queue, and releasing primary layer handles before autonomous scheduler workers start.
 - Bounded dense-vector top-k selection to the available corpus so normal retrieval remains valid
   for empty and small memory layers.
 - Confined task capsules and configured memory/vector artifacts to validated portable path
@@ -94,6 +95,9 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - Outbound channel delivery now rejects redirects, validates and pins public DNS results through
   connection setup, fails closed on rebinding, and avoids echoing token-bearing webhook URLs.
 - Docker build contexts now exclude every local `.env*` file and unrelated workspace trees.
+- Default installer, release, and container dependency graphs now include the optional OS-keyring
+  client, while keyring selection still fails closed without a usable host credential service and
+  populated JSON vaults cannot be reinterpreted in place.
 - Assistant transcript frames are redacted before persistence, and coherent backups deliberately
   exclude raw Secret Broker values.
 - Agent restore preserves recovery artifacts and surfaces its safety snapshot if rollback itself
@@ -155,8 +159,7 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.1...v0.4.0
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.1...HEAD
 [0.3.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.2.0...v0.2.1

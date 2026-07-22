@@ -121,6 +121,11 @@ skills, and plugins stay at the same point in time.
 
 Restore is fail-closed, requires `--yes`, rejects traversal, absolute paths, symlinks, hardlinks, duplicate or unlisted targets, checksum mismatches, and invalid SQLite state. It creates a pre-restore safety snapshot, stages and verifies the components, then applies the complete snapshot. If a later component swap fails, Kestrel attempts to roll back every changed component. If rollback itself fails, the command reports the safety-backup ID and preserves any unreinstated rollback artifacts for operator recovery instead of deleting them. Optional components absent from the snapshot are removed so the restored agent identity is exact. A backed-up external layer configuration is installed at `.nest/config/layers.json` by default; pass `--layer-config` only to choose another target. The target may be absent on a clean host. If the snapshot instead stored `layers.json` inside the memory directory, a default clean-host restore also materializes that checksummed configuration at the external target so custom `.mv2` filenames remain usable.
 
+If a completed create or restore returns `maintenance_warnings` with
+`retention_prune_failed`, the data transaction is committed; only post-commit removal of older
+snapshots failed. Verify the selected/safety backups and resolve retention separately rather than
+rerunning the restore as though it had failed.
+
 ```bash
 .venv/bin/nest-agent backup restore BACKUP_ID \
   --yes \
@@ -130,7 +135,7 @@ Restore is fail-closed, requires `--yes`, rejects traversal, absolute paths, sym
   --backup-dir .nest/backups/agent
 ```
 
-Raw Secret Broker values, operational logs, and disposable worker worktrees are deliberately excluded. Preserve secrets through an independently encrypted or keychain-backed recovery process. Full-agent backups preserve `.nest/repair_receipt_signing.key`, signed repair validation/review artifacts, and the memory validation key so trusted policy and stable-learning receipts remain verifiable after restore. Restoring a legacy full-agent backup that predates repair-integrity components explicitly removes any live repair signing key and receipt directories; policy evidence therefore fails closed until it is validated and approved again. `nest-agent memory backup` includes `<memory_dir>/.validation-integrity.key`, but deliberately excludes workspace repair receipts and their signing key; policy records that depend on that omitted evidence fail closed after a memory-only migration and must be validated and approved again. Memory-only backups also do not restore run history, ledgers, capsules, settings, skills, or plugins.
+Raw Secret Broker values, operational logs, and disposable worker worktrees are deliberately excluded. Preserve secrets through an independently encrypted or keychain-backed recovery process. Full-agent backups preserve the current `.nest/repair_receipt_signing.v2.key`, schema-v2 repair validation/review artifacts, and the memory validation key. Each new isolated validation rotates the repair key and intentionally invalidates older review gates. Schema-v1 receipts and `.nest/repair_receipt_signing.key` are never accepted as commit authorization. Restoring a legacy full-agent backup that predates repair-integrity components explicitly removes any live repair signing key and receipt directories; policy evidence therefore fails closed until it is validated and approved again. `nest-agent memory backup` includes `<memory_dir>/.validation-integrity.key`, but deliberately excludes workspace repair receipts and their signing key; policy records that depend on that omitted evidence fail closed after a memory-only migration and must be validated and approved again. Memory-only backups also do not restore run history, ledgers, capsules, settings, skills, or plugins.
 
 Backups and manifests are owner-only. A checksum-valid backup is necessary but not sufficient; perform a quarterly restore into an isolated runtime root and run state, search, inspect, skill, and plugin probes.
 
@@ -169,7 +174,7 @@ Expected outcome: failures are classified; retryable failures count toward the c
 
 ### Queue saturation
 
-Expected outcome: up to `max_concurrent_runs` execute, up to `max_queued_runs` wait FIFO, and further admissions return HTTP 429 without creating a durable run.
+Expected outcome: with the in-memory backend, up to `max_concurrent_runs` execute; with Memvid, one run executes because the six `.mv2` writers are exclusive for an agent lifecycle. In both cases, up to `max_queued_runs` wait FIFO, and further admissions return HTTP 429 without creating a durable run. The capacity endpoint reports the effective active limit.
 
 ### Corrupt backup
 
@@ -188,10 +193,15 @@ Run against an isolated mock-provider deployment first:
   --base-url http://127.0.0.1:8765 \
   --runs 100 \
   --concurrency 4 \
-  --timeout 120
+  --timeout 120 \
+  --max-p95 10 \
+  --min-throughput 1 \
+  --response-contract mock-echo
 ```
 
-The command exits nonzero for any unexpected failed, blocked, cancelled, or timed-out run and reports min/median/p95/max latency. A saturation drill may add `--allow-overload --min-completed 1 --max-p95 10`; HTTP 429/503 admissions then count as expected overload rather than failures, while the command still requires the declared number of completions and zero unexpected failures. For real providers, reduce concurrency to quota-safe levels and use a non-sensitive prompt.
+The mock-only response contract requires the exact deterministic echo for each submitted probe, including its request index; it cannot pass on a canned or cross-request response. Real-provider quality runs omit that flag and use the default `exact-ok` contract. The command also requires readiness and all six named memory layers to verify before and after load, exact one-to-one accounting of probe indexes and accepted run IDs, and one `capsule.completed` trace event (with no `capsule.failed` event) for every accepted completion. It exits nonzero for any unexpected failed, blocked, cancelled, timed-out, rate-limited, unavailable, or capsule-unverified run and reports min/median/p95/max latency plus accepted-completion throughput.
+
+A queue-saturation drill must use an explicit saturation gate, for example `--require-overload --min-completed 4 --max-overload-ratio 0.90 --max-p95 10 --min-throughput 0.5`. `--require-overload` implies overload is allowed but also fails unless at least one capacity rejection is observed. The JSON keeps load and saturation acceptance separate, so `--allow-overload` alone is only a tolerant load test and is never evidence that saturation occurred. Only a structured HTTP 429 with `detail=run_capacity_exhausted` counts as expected overload; rate-limit 429s and every 503 remain failures. Raise the isolated deployment's API rate-limit ceiling above the request count and use concurrency greater than `max_concurrent_runs + max_queued_runs`, or deliberately lower the isolated queue limit, so the drill measures admission capacity rather than rate limiting. The default maximum overload ratio is `0.90`, which prevents a nominal saturation pass where nearly every request is rejected. For real providers, reduce concurrency to quota-safe levels, choose an environment-specific throughput floor, and use a non-sensitive prompt.
 
 Before promotion, include the capability control-plane suites in the exact-candidate validation:
 
@@ -218,8 +228,8 @@ A release candidate is acceptable only when all of the following are green on th
 4. `python -m compileall -q src tests scripts`
 5. Golden evaluations with mock provider.
 6. Frontend tests, audit, and production build.
-7. Wheel/sdist build, `twine check` equivalent metadata validation, isolated wheel install, packaged React asset smoke.
-8. Linux/macOS/Windows and supported Python CI matrix.
+7. Wheel/sdist build, `twine check --strict`, separate clean wheel and sdist installs against the hash-locked release dependency set, and packaged React/license asset smoke in both environments.
+8. Linux/macOS Python 3.11 through 3.13, native Windows Python 3.11, and a successful exact-SHA `main` CI push run before release publication.
 9. Chaos recovery test and bounded soak.
 10. Memvid integration tests under `RUN_MEMVID_INTEGRATION=1` in a credential-safe environment.
 11. Independent security/spec/code review of the exact diff.

@@ -120,9 +120,32 @@ def hostname_from_header(value: str) -> str:
 
 
 def hostname_from_url(value: str) -> str:
-    parsed = urlparse(value)
-    host = parsed.hostname or ""
-    if parsed.hostname == "::1":
+    """Extract a hostname only from a serialized HTTP(S) origin.
+
+    Browser origins never contain credentials, paths, queries, or fragments.
+    Treating an opaque or malformed value as an empty hostname makes an ingress
+    allowlist fail open, so invalid values deliberately return an empty string.
+    """
+
+    try:
+        parsed = urlparse(value)
+        host = parsed.hostname or ""
+        _ = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return ""
+    if host == "::1":
         return "::1"
     return host
 

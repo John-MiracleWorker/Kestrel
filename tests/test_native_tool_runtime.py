@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from nested_memvid_agent.agent import (
@@ -54,6 +55,15 @@ class _CapturingProvider(LLMProvider):
 
 
 def _agent(tmp_path: Path, provider: LLMProvider) -> NestedMV2Agent:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     return NestedMV2Agent(
         AgentDependencies(
             memory=build_memory_system("memory", tmp_path / "memory"),
@@ -62,6 +72,7 @@ def _agent(tmp_path: Path, provider: LLMProvider) -> NestedMV2Agent:
             config=AgentConfig(
                 memory_dir=tmp_path / "memory",
                 log_dir=tmp_path / "logs",
+                workspace=workspace,
                 stream=False,
                 max_retries=0,
             ),

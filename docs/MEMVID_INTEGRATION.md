@@ -24,7 +24,8 @@ Current behavior:
 - Avoids scope assumptions that can trigger lexical-index errors in installed SDKs.
 - Supports context-frame round trips through `put_frame()` and `find_frames()`.
 - Replays `.mv2` timeline/frame metadata on every production open and refreshes a disposable exact-record cache for `get_record()`, `iter_records()`, exports, and conflict checks. Pagination follows descending logical commit IDs until origin frame `0`; SDK `frame_count`/`active_frame_count` are physical chunk counts and are not treated as record totals.
-- Serializes operations on each shared live SDK handle so concurrent runs cannot race Memvid or exact-record cache updates.
+- Serializes operations on each live SDK handle so one agent cannot race Memvid or its exact-record cache internally.
+- Admits one Memvid-backed agent lifecycle per `RunManager`. Additional primary runs remain in the bounded, cancellable durable queue; subagents and manual memory/tool endpoints wait on the same shutdown-cancellable fence. Primary and approval-continuation agents release their layer handles before autonomous scheduler workers start. This avoids opening the same six exclusive `.mv2` writers twice without weakening the one-file-per-layer layout.
 - Exposes `seal()`, `verify()`, `doctor(dry_run=True)`, `stats()`, and `close()`.
 
 The adapter was hardened against `memvid_sdk 2.0.160`. Re-check SDK signatures before upgrading the dependency.

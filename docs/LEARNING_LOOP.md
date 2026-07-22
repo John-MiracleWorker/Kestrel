@@ -79,6 +79,8 @@ The default rollout posture is shadow-only:
 - Guardrails block policy writes without explicit repeated validation, block further promotion from provisional records, and keep self/procedural routing behind their hard evidence gates.
 - Replay evaluation can estimate expected utility, false-positive rate, never-retrieved rate, useful rate, abstention rate, and gate violations without changing memory writes.
 
+The replay harness requires an existing regular, non-symlink SQLite state database and evaluates a consistent private SQLite backup. It never initializes, migrates, or enables WAL mode on the source database.
+
 Run the offline replay harness against the existing control-plane state:
 
 ```bash

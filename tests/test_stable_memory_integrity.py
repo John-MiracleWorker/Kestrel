@@ -23,7 +23,10 @@ from nested_memvid_agent.nested_learning import (
     resolve_validation_evidence,
 )
 from nested_memvid_agent.orchestrator import build_memory_system
-from nested_memvid_agent.repair_integrity import write_repair_artifact
+from nested_memvid_agent.repair_integrity import (
+    write_repair_artifact,
+    write_validation_receipt,
+)
 from nested_memvid_agent.retention import RetentionCompactor
 from nested_memvid_agent.runtime_models import ToolCall, ToolExecution
 from nested_memvid_agent.self_profile import (
@@ -1231,24 +1234,53 @@ def _initialize_git_workspace(workspace: Path) -> None:
 
 
 def _put_signed_policy_artifacts(workspace: Path, *, prefix: str) -> tuple[str, ...]:
-    artifact_ids: list[str] = []
-    for index in range(5):
+    stale_ids: list[str] = []
+    for index in range(1, 5):
         artifact_id = f"repair_validation_{prefix}_{index}"
         write_repair_artifact(
             workspace,
             "repair_validations",
             artifact_id,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "validation_id": artifact_id,
-                "tool": "repair.validate",
                 "success": True,
-                "returncode": 0,
-                "output_sha256": f"{index + 1:064x}",
             },
         )
-        artifact_ids.append(artifact_id)
-    return tuple(artifact_ids)
+        stale_ids.append(artifact_id)
+    snapshot: dict[str, object] = {
+        "branch": "",
+        "head_sha": "0" * 40,
+        "diff_digest": "d" * 64,
+    }
+    receipt = write_validation_receipt(
+        workspace,
+        tool_name="repair.validate",
+        command=["policy-fixture", prefix],
+        success=True,
+        returncode=0,
+        content="policy fixture validated",
+        validation_evidence={},
+        snapshot=snapshot,
+        started_at="2026-07-20T00:00:00+00:00",
+        isolation_attestation={
+            "schema_version": 1,
+            "mode": "oci_snapshot_v1",
+            "image": "example.invalid/kestrel-validation@sha256:" + "a" * 64,
+            "network": "none",
+            "workspace_mount": "private_read_only_snapshot",
+            "host_fallback": False,
+            "source_tree_digest": "sha256:" + "b" * 64,
+            "repair_diff_digest": snapshot["diff_digest"],
+            "repair_head_sha": snapshot["head_sha"],
+            "repair_branch": snapshot["branch"],
+        },
+    )
+    # The five policy evidence records are distinct runtime receipts. Only the
+    # repair/review buckets bind the current OCI-attested receipt at index 0.
+    # Its required key rotation also makes the four setup artifacts stale,
+    # preserving the raw-artifact replay test's distinct-source coverage.
+    return (str(receipt["validation_id"]), *stale_ids)
 
 
 def _promote_policy(
@@ -1378,7 +1410,7 @@ def _put_policy_receipts(
         "repair_reviews",
         review_id,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "review_id": review_id,
             "validation_id": artifact_ids[0],
             "validation": {

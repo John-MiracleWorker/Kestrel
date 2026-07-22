@@ -283,6 +283,109 @@ def harden_private_sqlite_files(path: Path) -> None:
         harden_private_file(candidate, missing_ok=True)
 
 
+def reset_disposable_private_sqlite_files(path: Path) -> None:
+    """Remove one disposable SQLite database and its exact transient siblings.
+
+    This helper is intentionally narrower than a generic recursive cleanup.  It
+    validates every existing artifact as a current-user-owned, single-link
+    regular file before unlinking any of them.  The caller can then recreate the
+    index from its canonical source of truth.
+    """
+
+    resolved = Path(path)
+    if resolved.suffix.lower() == ".mv2":
+        raise ValueError("Refusing to reset a Memvid .mv2 path as SQLite storage")
+    ensure_private_directory(resolved.parent)
+    candidates = sqlite_artifact_paths(resolved)
+    if any(candidate.parent != resolved.parent for candidate in candidates):
+        raise ValueError("SQLite cleanup candidates must share one direct parent")
+
+    if os.name == "nt":
+        # Windows cannot unlink an open file. Validate the complete set first,
+        # then remove only the four exact SQLite artifact names.
+        for candidate in candidates:
+            harden_private_file(candidate, missing_ok=True)
+        for candidate in candidates:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+        return
+
+    before_directory = os.lstat(resolved.parent)
+    _validate_directory(before_directory, resolved.parent)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_descriptor = os.open(resolved.parent, directory_flags)
+    opened: list[tuple[str, int, os.stat_result]] = []
+    try:
+        opened_directory = os.fstat(directory_descriptor)
+        after_directory = os.lstat(resolved.parent)
+        _validate_directory(opened_directory, resolved.parent)
+        _validate_directory(after_directory, resolved.parent)
+        if not os.path.samestat(before_directory, opened_directory) or not os.path.samestat(
+            opened_directory, after_directory
+        ):
+            raise ValueError(
+                f"Sensitive artifact directory changed during validation: {resolved.parent}"
+            )
+
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        file_flags |= getattr(os, "O_NOFOLLOW", 0)
+        for candidate in candidates:
+            try:
+                visible_before_open = os.stat(
+                    candidate.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            _validate_file(visible_before_open, candidate)
+            try:
+                descriptor = os.open(candidate.name, file_flags, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                raise ValueError(
+                    f"Sensitive artifact changed during validation: {candidate}"
+                ) from None
+            try:
+                metadata = os.fstat(descriptor)
+                visible = os.stat(
+                    candidate.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                _validate_file(metadata, candidate)
+                _validate_file(visible, candidate)
+                if not os.path.samestat(visible_before_open, metadata) or not os.path.samestat(
+                    metadata, visible
+                ):
+                    raise ValueError(
+                        f"Sensitive artifact changed during validation: {candidate}"
+                    )
+            except Exception:
+                os.close(descriptor)
+                raise
+            opened.append((candidate.name, descriptor, metadata))
+
+        for name, _descriptor, metadata in opened:
+            visible = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            if not os.path.samestat(metadata, visible):
+                raise ValueError(
+                    f"Sensitive artifact changed before disposable reset: {resolved.parent / name}"
+                )
+            os.unlink(name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+    finally:
+        for _name, descriptor, _metadata in opened:
+            os.close(descriptor)
+        os.close(directory_descriptor)
+
+
 def harden_memory_artifact_files(path: Path) -> bool:
     """Harden every known backend variant for one logical memory layer.
 

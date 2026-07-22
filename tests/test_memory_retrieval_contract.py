@@ -8,8 +8,13 @@ import numpy as np
 import pytest
 
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
+from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayeredMemorySystem, load_layer_specs
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from nested_memvid_agent.runtime_models import ToolCall
+from nested_memvid_agent.tools.base import ToolContext
+from nested_memvid_agent.tools.builtin import build_default_tools
+from nested_memvid_agent.vector_sidecar import VectorSidecar
 
 
 def test_default_layer_contract_has_one_mv2_file_per_permanent_layer(tmp_path: Path) -> None:
@@ -165,6 +170,251 @@ def test_hybrid_retrieval_uses_rebuildable_sidecar_without_replacing_mv2(tmp_pat
     assert (tmp_path / "memory" / "semantic.mv2").exists() or memory.backends[
         MemoryLayer.SEMANTIC
     ].path.name == "semantic.mv2"
+
+
+def test_registry_tools_can_use_vector_sidecar_across_worker_threads(tmp_path: Path) -> None:
+    config_path = tmp_path / "layers.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "working": {
+                    "search_mode": "hybrid",
+                    "vector": {
+                        "enabled": True,
+                        "embedding_provider": "local",
+                        "embedding_model": "concept-test",
+                        "index_path": "working.mv2.vector.sqlite",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        specs=load_layer_specs(config_path),
+        vector_embedder=ConceptEmbedder(),
+        enforce_stable_write_integrity=False,
+    )
+    registry = build_default_tools(("memory.write", "memory.search"))
+    context = ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path)
+
+    written = registry.execute(
+        ToolCall(
+            name="memory.write",
+            arguments={
+                "layer": "working",
+                "kind": "observation",
+                "title": "Python path fix",
+                "content": "Set PYTHONPATH so module imports resolve through sys path.",
+            },
+        ),
+        context,
+    )
+    searched = registry.execute(
+        ToolCall(
+            name="memory.search",
+            arguments={"query": "module discovery through sys", "layers": ["working"]},
+        ),
+        context,
+    )
+
+    assert written.success is True
+    assert searched.success is True
+    assert "Python path fix" in searched.content
+    status = memory.vector_index_status()[MemoryLayer.WORKING]
+    assert status.enabled is True
+    assert status.indexed_count == 1
+    memory.close_all()
+
+
+def test_vector_sidecar_failure_never_turns_canonical_write_into_false_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "layers.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "working": {
+                    "search_mode": "hybrid",
+                    "vector": {
+                        "enabled": True,
+                        "embedding_provider": "local",
+                        "embedding_model": "concept-test",
+                        "index_path": "working.mv2.vector.sqlite",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        InMemoryBackend,
+        specs=load_layer_specs(config_path),
+        vector_embedder=ConceptEmbedder(),
+        enforce_stable_write_integrity=False,
+    )
+    sidecar = memory.vector_sidecars[MemoryLayer.WORKING]
+
+    def fail_index(_record: MemoryRecord) -> bool:
+        raise OSError("injected disposable index failure")
+
+    monkeypatch.setattr(sidecar, "upsert", fail_index)
+    registry = build_default_tools(("memory.write",))
+    result = registry.execute(
+        ToolCall(
+            name="memory.write",
+            arguments={
+                "layer": "working",
+                "kind": "observation",
+                "title": "Canonical memory",
+                "content": "The mv2-style canonical backend remains authoritative.",
+                "confidence": 0.9,
+            },
+        ),
+        ToolContext(memory=memory, config=AgentConfig(), workspace=tmp_path),
+    )
+
+    assert result.success is True
+    record_id = str(result.data["record_id"])
+    assert memory.get_record(MemoryLayer.WORKING, record_id) is not None
+    status = memory.vector_index_status()[MemoryLayer.WORKING]
+    assert status.enabled is False
+    assert status.disabled_reason == "OSError: injected disposable index failure"
+    memory.close_all()
+
+
+def test_corrupt_disposable_vector_sidecar_does_not_block_canonical_startup(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "layers.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "working": {
+                    "search_mode": "hybrid",
+                    "vector": {
+                        "enabled": True,
+                        "embedding_provider": "local",
+                        "embedding_model": "concept-test",
+                        "index_path": "working.mv2.vector.sqlite",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "working.mv2.vector.sqlite").write_bytes(b"not sqlite")
+
+    memory = LayeredMemorySystem.from_backend_factory(
+        memory_dir,
+        InMemoryBackend,
+        specs=load_layer_specs(config_path),
+        vector_embedder=ConceptEmbedder(),
+        enforce_stable_write_integrity=False,
+    )
+    record = MemoryRecord(
+        layer=MemoryLayer.WORKING,
+        kind=MemoryKind.OBSERVATION,
+        title="Canonical PYTHONPATH survives",
+        content="A corrupt disposable index cannot brick canonical module memory.",
+    )
+    memory.put(record)
+
+    stored = memory.get_record(MemoryLayer.WORKING, record.id)
+    assert stored is not None
+    assert stored.content == record.content
+    hits = memory.retrieve(
+        RetrievalQuery(
+            query="canonical memory",
+            layers=(MemoryLayer.WORKING,),
+            k_per_layer=5,
+        )
+    )
+    assert any(hit.record.id == record.id for hit in hits)
+    status = memory.vector_index_status()[MemoryLayer.WORKING]
+    assert status.enabled is False
+    assert "not a database" in str(status.disabled_reason)
+
+    rebuilt = memory.rebuild_vector_indexes((MemoryLayer.WORKING,))
+    assert rebuilt[MemoryLayer.WORKING].enabled is True
+    assert rebuilt[MemoryLayer.WORKING].indexed_count == 1
+    assert rebuilt[MemoryLayer.WORKING].missing_count == 0
+    assert any(
+        hit.record.id == record.id and hit.source_backend == "vector_sidecar"
+        for hit in memory.retrieve(
+            RetrievalQuery(
+                query="module sys",
+                layers=(MemoryLayer.WORKING,),
+                k_per_layer=5,
+            )
+        )
+    )
+    memory.close_all()
+
+
+def test_vector_sidecar_model_change_invalidates_old_vectors_until_rebuild(
+    tmp_path: Path,
+) -> None:
+    class ModelA:
+        model_name = "model-a"
+
+        def embed(self, text: str) -> np.ndarray:
+            del text
+            return np.asarray([1.0, 0.0], dtype=np.float32)
+
+    class ModelB:
+        model_name = "model-b"
+
+        def embed(self, text: str) -> np.ndarray:
+            del text
+            return np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+
+    path = tmp_path / "working.mv2.vector.sqlite"
+    mv2_path = tmp_path / "working.mv2"
+    record = MemoryRecord(
+        id="model-change-record",
+        layer=MemoryLayer.WORKING,
+        kind=MemoryKind.OBSERVATION,
+        title="Model identity",
+        content="Vector identities must bind the embedding model.",
+    )
+    first = VectorSidecar(
+        path=path,
+        layer=MemoryLayer.WORKING,
+        embedder=ModelA(),
+        mv2_path=mv2_path,
+    )
+    first.open()
+    assert first.upsert(record) is True
+    assert [hit.record_id for hit in first.search("identity")] == [record.id]
+    first.close()
+
+    reopened = VectorSidecar(
+        path=path,
+        layer=MemoryLayer.WORKING,
+        embedder=ModelB(),
+        mv2_path=mv2_path,
+    )
+    reopened.open()
+    status = reopened.status(records=(record,))
+
+    assert status.enabled is False
+    assert status.indexed_count == 0
+    assert status.missing_count == 1
+    assert "embedding_model" in str(status.disabled_reason)
+    assert reopened.search("identity") == []
+
+    rebuilt = reopened.rebuild((record,))
+    assert rebuilt.enabled is True
+    assert rebuilt.indexed_count == 1
+    assert [hit.record_id for hit in reopened.search("identity")] == [record.id]
+    reopened.close()
 
 
 def test_retrieve_searches_requested_layers_and_respects_per_layer_k(tmp_path: Path) -> None:

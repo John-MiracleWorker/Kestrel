@@ -2123,6 +2123,31 @@ def test_channel_manager_reuses_agent_for_hot_path(tmp_path: Path) -> None:
     assert created == 1
 
 
+def test_channel_manager_retains_agent_when_close_must_be_retried(tmp_path: Path) -> None:
+    allow_close = False
+    close_calls = 0
+
+    class RetryAgent:
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if not allow_close:
+                raise RuntimeError("injected channel agent close failure")
+
+    agent = cast(NestedMV2Agent, RetryAgent())
+    manager = ChannelManager(_config(tmp_path), agent_factory=lambda _config: agent)
+    manager._agent = agent
+
+    with pytest.raises(RuntimeError, match="channel agent close failure"):
+        manager.close()
+    assert manager._agent is agent
+
+    allow_close = True
+    manager.close()
+    assert manager._agent is None
+    assert close_calls == 2
+
+
 def _config(tmp_path: Path) -> AgentConfig:
     return AgentConfig(
         backend="memory",

@@ -68,9 +68,10 @@ class MemvidBackend(MemoryBackend):
         self._lock_acquired = False
         self._memory_lock_handle: Any | None = None
         self._layer_lock_handle: Any | None = None
-        # One runtime owner intentionally shares each opened layer backend
-        # across concurrent runs. Memvid's Python handle and Kestrel's exact
-        # record/cache state are therefore serialized at the backend boundary.
+        # A live agent may reach one layer from concurrent internal callbacks.
+        # Memvid's Python handle and Kestrel's exact record/cache state are
+        # therefore serialized at the backend boundary. RunManager separately
+        # admits only one Memvid-backed agent lifecycle at a time.
         self._operation_lock = RLock()
         self._records: dict[str, MemoryRecord] = {}
         self._inactive_ids: set[str] = set()
@@ -88,17 +89,14 @@ class MemvidBackend(MemoryBackend):
                 self._acquire_memory_file_lock()
                 self._acquire_layer_file_lock()
                 self._open_unlocked()
-            except Exception:
-                try:
-                    if self.mem is not None:
-                        close = getattr(self.mem, "close", None)
-                        if callable(close):
-                            close()
-                finally:
-                    self.mem = None
-                    self._release_layer_file_lock()
-                    self._release_memory_file_lock()
-                    self._release_path_lock()
+            except BaseException:
+                # A partially opened SDK handle is still an exclusive owner.
+                # If its close fails, retain both the handle and all locks so a
+                # later retry (or process exit) is required before reuse.
+                self._close_live_handle_unlocked()
+                self._release_layer_file_lock()
+                self._release_memory_file_lock()
+                self._release_path_lock()
                 raise
 
     def _open_unlocked(self) -> None:
@@ -518,7 +516,8 @@ class MemvidBackend(MemoryBackend):
                 finally:
                     try:
                         self._open_unlocked()
-                    except Exception:
+                    except BaseException:
+                        self._close_live_handle_unlocked()
                         self._release_layer_file_lock()
                         self._release_memory_file_lock()
                         self._release_path_lock()
@@ -559,26 +558,26 @@ class MemvidBackend(MemoryBackend):
 
     def close(self) -> None:
         with self._operation_lock:
-            error: BaseException | None = None
+            # Do not release exclusivity until the SDK confirms that its live
+            # handle closed. A failed close remains retryable and fail-closed.
+            self._close_live_handle_unlocked()
             try:
-                if self.mem is not None:
-                    close = getattr(self.mem, "close", None)
-                    if callable(close):
-                        close()
-            except BaseException as exc:
-                error = exc
+                harden_memory_artifact_files(self.path)
             finally:
-                self.mem = None
-                try:
-                    harden_memory_artifact_files(self.path)
-                except BaseException as exc:
-                    if error is None:
-                        error = exc
                 self._release_layer_file_lock()
                 self._release_memory_file_lock()
                 self._release_path_lock()
-            if error is not None:
-                raise error
+
+    def _close_live_handle_unlocked(self) -> None:
+        mem = self.mem
+        if mem is None:
+            return
+        close = getattr(mem, "close", None)
+        if callable(close):
+            close()
+        # Assignment deliberately follows the SDK call: an exception retains
+        # the exact handle required for a later bounded shutdown retry.
+        self.mem = None
 
     def _acquire_memory_file_lock(self) -> None:
         if self._memory_lock_handle is not None:

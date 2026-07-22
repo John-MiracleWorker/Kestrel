@@ -4,6 +4,7 @@ from collections.abc import Callable
 from queue import Empty, Queue
 from threading import Thread
 from typing import Any
+from uuid import uuid4
 
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from .base import AgentTool, ToolContext
@@ -89,9 +90,15 @@ class ToolRegistry:
         if not context.tool_specs:
             context.tool_specs = tuple(self.specs())
 
-        arguments = dict(call.arguments)
+        # Underscore-prefixed fields are reserved for runtime metadata. Never
+        # let model/user arguments select process-tracking or cancellation IDs.
+        arguments = {
+            key: value
+            for key, value in call.arguments.items()
+            if not str(key).startswith("_")
+        }
         if getattr(tool, "needs_call_id", False):
-            arguments.setdefault("_tool_call_id", call.id)
+            arguments["_tool_call_id"] = call.id
 
         enabled, disabled_reason = _capability_enabled(tool, context)
         if not enabled:
@@ -155,41 +162,97 @@ def _is_exact_call_approved(call: ToolCall, arguments: dict[str, Any], context: 
 def _arguments_match(approved: dict[str, Any], actual: dict[str, Any]) -> bool:
     if approved == actual:
         return True
+    public_approved = {
+        key: value for key, value in approved.items() if not str(key).startswith("_")
+    }
     public_actual = {key: value for key, value in actual.items() if not str(key).startswith("_")}
-    return approved == public_actual
+    return public_approved == public_actual
 
 
 def _run_tool(tool: AgentTool, call: ToolCall, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
     timeout = max(float(getattr(context.config, "tool_timeout_seconds", 30.0)), 0.001)
+    public_call = _public_tool_call(call)
+    execution_id = f"tool-exec-{uuid4().hex}"
+    runtime_arguments = dict(arguments)
+    cancellation_id = call.id
+    if getattr(tool, "needs_call_id", False):
+        runtime_arguments["_tool_execution_id"] = execution_id
+        cancellation_id = execution_id
     results: Queue[ToolExecution] = Queue(maxsize=1)
 
     def target() -> None:
         try:
-            results.put(tool.run(arguments, context))
-        except Exception as exc:  # noqa: BLE001 - registry boundary must never crash agent turns
+            results.put(tool.run(runtime_arguments, context))
+        except BaseException as exc:  # noqa: BLE001 - worker must always signal quiescence
             results.put(_failure(call, content=f"{type(exc).__name__}: {exc}", error="tool_execution_failed"))
 
     thread = Thread(target=target, daemon=True)
     thread.start()
     try:
-        return results.get(timeout=timeout)
+        return _bind_execution_call(results.get(timeout=timeout), public_call)
     except Empty:
-        _cancel_tool(tool, call.id)
-        if tool.wait_for_completion_on_timeout:
-            # Transactional/high-risk tools must not keep mutating after the
-            # registry has durably reported a terminal timeout. Their own
-            # subprocesses are bounded and cancellable, so wait for the actual
-            # result after requesting cancellation.
-            return results.get()
-        return _failure(
-            call,
-            content=f"Tool {call.name} timed out after {timeout:g} seconds.",
-            error="tool_timeout",
+        _cancel_tool(tool, cancellation_id)
+        # A Python worker thread cannot be force-stopped safely. Always wait
+        # for quiescence before returning any terminal result so a late reader
+        # cannot race agent/Memory close and a late writer cannot mutate after
+        # the caller observes completion. Tool-specific cancellation and
+        # internal I/O deadlines keep normal subprocess/network paths bounded.
+        completed = _bind_execution_call(results.get(), public_call)
+        # Once quiesced, the actual outcome is known. Returning a fabricated
+        # timeout would make a committed low-risk/MCP operation look retryable.
+        # Preserve the real outcome and annotate that the response deadline was
+        # exceeded so callers can surface latency without duplicating work.
+        return ToolExecution(
+            call=completed.call,
+            success=completed.success,
+            content=completed.content,
+            data={
+                **completed.data,
+                "tool_deadline_exceeded": True,
+                "tool_timeout_seconds": timeout,
+            },
+            error=completed.error,
         )
 
 
 def _failure(call: ToolCall, *, content: str, error: str) -> ToolExecution:
-    return ToolExecution(call=call, success=False, content=content, error=error)
+    return ToolExecution(
+        call=_public_tool_call(call),
+        success=False,
+        content=content,
+        error=error,
+    )
+
+
+def _public_tool_call(call: ToolCall) -> ToolCall:
+    arguments = call.arguments if isinstance(call.arguments, dict) else {}
+    return ToolCall(
+        name=call.name,
+        arguments={
+            key: value
+            for key, value in arguments.items()
+            if not str(key).startswith("_")
+        },
+        id=call.id,
+        strategy=call.strategy,
+    )
+
+
+def _bind_execution_call(
+    execution: ToolExecution,
+    call: ToolCall,
+) -> ToolExecution:
+    """Bind all outcomes to the exact public request admitted by the registry."""
+
+    if execution.call == call:
+        return execution
+    return ToolExecution(
+        call=call,
+        success=execution.success,
+        content=execution.content,
+        data=execution.data,
+        error=execution.error,
+    )
 
 
 def _cancel_tool(tool: AgentTool, call_id: str) -> None:
@@ -238,6 +301,11 @@ _NON_RETRYABLE_ERRORS = frozenset({
     "invalid_tool_arguments",
     "retry_blocked",
     "sensitive_tool_arguments_rejected",
+    "mcp_tool_outcome_indeterminate",
+    "mcp_tool_remote_error",
+    "mcp_session_cleanup_incomplete",
+    "extension_cleanup_pending",
+    "extension_cleanup_unverified",
     "path_sandbox_violation",
 })
 

@@ -17,8 +17,10 @@ import json
 import random
 import statistics
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -26,22 +28,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
-from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayerSpec, LayeredMemorySystem
+from nested_memvid_agent.layers import LayeredMemorySystem
 from nested_memvid_agent.learned_routing import (
     OutcomeCalibratedRouter,
     RoutingExample,
     evaluate_routing_examples,
-    routing_example_from_decision,
 )
-from nested_memvid_agent.models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from nested_memvid_agent.models import (
+    EvidenceRef,
+    MemoryKind,
+    MemoryLayer,
+    MemoryRecord,
+    RetrievalQuery,
+)
 from nested_memvid_agent.nested_learning import (
     LearningSignal,
     NestedLearningKernel,
     ValidationEvidence,
     compute_validation_score,
+    resolve_validation_evidence,
+    validation_evidence_is_resolved,
 )
-from nested_memvid_agent.promotion_ledger import PromotionLedger, make_outcome
-
 
 # ────────────────────────────────
 # Dimension 1: Few-Shot Tool Selection
@@ -112,29 +119,16 @@ def _record_tool_attempt(memory: LayeredMemorySystem, task: ToolSelectionTask, c
     )
     memory.put(record)
 
-    # On repeated success, try to promote to procedural via learning kernel
-    if success and attempt >= 2:
-        signal = LearningSignal(
-            title=f"Tool selection recipe: {task.task_id}",
-            content=f"For '{task.description}', use {task.correct_tool}.",
-            kind=MemoryKind.PROCEDURE,
-            source_layer=MemoryLayer.EPISODIC,
-            validation_score=0.85,
-            repeat_count=attempt,
-        )
-        kernel = NestedLearningKernel(memory=memory)
-        decision = kernel.decide(signal)
-        if decision.accepted and decision.target_layer == MemoryLayer.PROCEDURAL:
-            proc_record = kernel.to_memory_record(signal, decision)
-            memory.put(proc_record)
+    # This dimension intentionally measures episodic few-shot recall. Durable,
+    # validated procedural promotion is exercised independently below and by
+    # ``real_agent_learning_benchmark.py``.
 
 
 def benchmark_few_shot_tool_selection(*, seed: int = 42, sessions: int = 5) -> dict[str, Any]:
     """Measure whether episodic/procedural memory improves tool selection accuracy."""
     random.seed(seed)
-    memory_dir = Path("/tmp/kestrel-learn-bench-fewshot")
-    _clear_memory_dir(memory_dir)
-
+    temporary = tempfile.TemporaryDirectory(prefix="kestrel-learn-bench-fewshot-")
+    memory_dir = Path(temporary.name) / "memory"
     memory = LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend)
     results: list[dict[str, Any]] = []
 
@@ -153,7 +147,7 @@ def benchmark_few_shot_tool_selection(*, seed: int = 42, sessions: int = 5) -> d
     last_acc = results[-1]["accuracy"]
     accuracies = [r["accuracy"] for r in results]
 
-    return {
+    payload = {
         "name": "few_shot_tool_selection",
         "description": "Does episodic/procedural memory improve tool selection over sessions?",
         "sessions": sessions,
@@ -164,6 +158,9 @@ def benchmark_few_shot_tool_selection(*, seed: int = 42, sessions: int = 5) -> d
         "improved": last_acc > first_acc,
         "avg_accuracy": round(statistics.mean(accuracies), 3),
     }
+    memory.close_all()
+    temporary.cleanup()
+    return payload
 
 
 # ────────────────────────────────
@@ -247,27 +244,15 @@ def _record_mistake(memory: LayeredMemorySystem, scenario: dict[str, Any], actio
     )
     memory.put(record)
 
-    # Promote to procedural after avoiding it once
-    if success:
-        signal = LearningSignal(
-            title=f"Avoid mistake: {scenario['id']}",
-            content=f"When '{scenario['situation']}', do '{scenario['correct_action']}' instead of '{scenario['wrong_action']}'.",
-            kind=MemoryKind.PROCEDURE,
-            source_layer=MemoryLayer.EPISODIC,
-            validation_score=0.8,
-            repeat_count=1,
-        )
-        kernel = NestedLearningKernel(memory=memory)
-        decision = kernel.decide(signal)
-        if decision.accepted and decision.target_layer == MemoryLayer.PROCEDURAL:
-            memory.put(kernel.to_memory_record(signal, decision))
+    # Mistake avoidance here is an episodic-recall measure. The separate
+    # consolidation dimension verifies the stable procedural sink.
 
 
 def benchmark_mistake_avoidance(*, seed: int = 42, rounds: int = 4) -> dict[str, Any]:
     """Measure whether the agent avoids previously-recorded mistakes."""
     random.seed(seed)
-    memory_dir = Path("/tmp/kestrel-learn-bench-mistake")
-    _clear_memory_dir(memory_dir)
+    temporary = tempfile.TemporaryDirectory(prefix="kestrel-learn-bench-mistake-")
+    memory_dir = Path(temporary.name) / "memory"
     memory = LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend)
 
     results: list[dict[str, Any]] = []
@@ -282,7 +267,7 @@ def benchmark_mistake_avoidance(*, seed: int = 42, rounds: int = 4) -> dict[str,
 
     first_rate = results[0]["avoidance_rate"]
     last_rate = results[-1]["avoidance_rate"]
-    return {
+    payload = {
         "name": "mistake_avoidance",
         "description": "Does the agent avoid previously-recorded mistakes over rounds?",
         "rounds": rounds,
@@ -292,6 +277,9 @@ def benchmark_mistake_avoidance(*, seed: int = 42, rounds: int = 4) -> dict[str,
         "avoidance_delta": round(last_rate - first_rate, 3),
         "improved": last_rate > first_rate,
     }
+    memory.close_all()
+    temporary.cleanup()
+    return payload
 
 
 # ────────────────────────────────
@@ -302,13 +290,11 @@ def benchmark_promotion_accuracy(*, seed: int = 42, n_signals: int = 100) -> dic
     """Measure whether the NestedLearningKernel correctly admits high-quality signals
     and rejects low-quality ones, using simulated outcomes."""
     random.seed(seed)
-    memory_dir = Path("/tmp/kestrel-learn-bench-promotion")
-    _clear_memory_dir(memory_dir)
-    from nested_memvid_agent.state_store import AgentStateStore
-    state_store = AgentStateStore(memory_dir / "state.db")
-    ledger = PromotionLedger(state_store)
-    memory = LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend, ledger=ledger)
-    kernel = NestedLearningKernel(memory=memory)
+    # This dimension measures only the kernel's deterministic classification
+    # rules. Synthetic evidence is explicitly resolved by the trusted benchmark
+    # harness, and no memory record is written. The stable sink is exercised by
+    # the procedural and end-to-end learning gates.
+    kernel = NestedLearningKernel()
 
     accepted_count = 0
     rejected_count = 0
@@ -326,11 +312,29 @@ def benchmark_promotion_accuracy(*, seed: int = 42, n_signals: int = 100) -> dic
         has_repair = random.random() < validation_score * 0.6
         has_review = random.random() < validation_score * 0.5
 
-        evidence = ValidationEvidence(
+        unresolved = ValidationEvidence(
             test_refs=(EvidenceRef(source="test.run", locator=f"test-{i}"),) if has_test_evidence else (),
             lint_refs=(EvidenceRef(source="lint.run", locator=f"lint-{i}"),) if has_lint_evidence else (),
             repair_refs=(EvidenceRef(source="repair.validate", locator=f"repair-{i}"),) if has_repair else (),
             review_refs=(EvidenceRef(source="repair.review", locator=f"review-{i}"),) if has_review else (),
+        )
+        artifact_ids = tuple(
+            dict.fromkeys(ref.locator for ref in unresolved.all_refs())
+        )
+        evidence = (
+            resolve_validation_evidence(
+                ValidationEvidence(
+                    test_refs=unresolved.test_refs,
+                    lint_refs=unresolved.lint_refs,
+                    repair_refs=unresolved.repair_refs,
+                    review_refs=unresolved.review_refs,
+                    task_refs=unresolved.all_refs(),
+                ),
+                status="runtime_validated",
+                artifact_ids=artifact_ids,
+            )
+            if artifact_ids
+            else unresolved
         )
 
         signal = LearningSignal(
@@ -338,6 +342,7 @@ def benchmark_promotion_accuracy(*, seed: int = 42, n_signals: int = 100) -> dic
             content=f"Content for signal {i} with score {validation_score:.2f}",
             kind=MemoryKind.FACT,
             source_layer=MemoryLayer.EPISODIC,
+            validation_score=None,
             validation_evidence=evidence,
             repeat_count=repeat_count,
         )
@@ -347,7 +352,11 @@ def benchmark_promotion_accuracy(*, seed: int = 42, n_signals: int = 100) -> dic
 
         # Ground truth: signals with computed score >= 0.65 and repeat_count >= 1 are "good"
         # This simulates that objective evidence actually correlates with usefulness
-        is_good = computed >= 0.65 and repeat_count >= 1
+        is_good = (
+            validation_evidence_is_resolved(evidence)
+            and computed >= 0.65
+            and repeat_count >= 1
+        )
 
         if decision.accepted:
             accepted_count += 1
@@ -381,6 +390,7 @@ def benchmark_promotion_accuracy(*, seed: int = 42, n_signals: int = 100) -> dic
         "recall": round(recall, 3),
         "f1_score": round(f1, 3),
         "accuracy": round(accuracy, 3),
+        "evidence_mode": "synthetic_trusted_resolution_no_memory_write",
     }
 
 
@@ -495,8 +505,8 @@ def benchmark_procedural_consolidation(*, seed: int = 42, repetitions: int = 5) 
     """Measure whether repeated successful solutions get promoted to procedural memory
     and are retrievable for future similar problems."""
     random.seed(seed)
-    memory_dir = Path("/tmp/kestrel-learn-bench-procedural")
-    _clear_memory_dir(memory_dir)
+    temporary = tempfile.TemporaryDirectory(prefix="kestrel-learn-bench-procedural-")
+    memory_dir = Path(temporary.name) / "memory"
     memory = LayeredMemorySystem.from_backend_factory(memory_dir, InMemoryBackend)
     kernel = NestedLearningKernel(memory=memory)
 
@@ -505,20 +515,88 @@ def benchmark_procedural_consolidation(*, seed: int = 42, repetitions: int = 5) 
     for task in PROCEDURE_TASKS:
         procedure_formed = False
         procedure_form_round: int | None = None
+        run_id = f"learning-benchmark-{task['id']}"
+        session_id = "learning-benchmark"
+        title = f"Solved: {task['problem']}"
+        candidate_id = memory.put(
+            MemoryRecord(
+                title=title,
+                content=task["recipe"],
+                layer=MemoryLayer.EPISODIC,
+                kind=MemoryKind.PROCEDURE,
+                confidence=0.95,
+                metadata={"session_id": session_id, "run_id": run_id},
+                evidence=[EvidenceRef(source="benchmark", locator=run_id)],
+            )
+        )
+        receipts: list[tuple[str, str]] = []
+        validation_buckets = ("test", "lint", "repair", "review")
         for r in range(1, repetitions + 1):
-            # Simulate solving the problem successfully
+            bucket = validation_buckets[min(r - 1, len(validation_buckets) - 1)]
+            receipt_id = memory.put_runtime_validation_receipt(
+                tool_name=f"benchmark.{bucket}",
+                tool_call_id=f"{task['id']}-{bucket}-{r}",
+                evidence_bucket=bucket,
+                command=("benchmark-validate", task["id"], str(r)),
+                output_sha256=sha256(
+                    f"{task['id']}:{bucket}:{r}".encode()
+                ).hexdigest(),
+                session_id=session_id,
+                run_id=run_id,
+                subject_record_id=candidate_id,
+            )
+            receipts.append((bucket, receipt_id))
+            refs_by_bucket = {
+                name: tuple(
+                    EvidenceRef(source="memory_record", locator=stored_id)
+                    for stored_bucket, stored_id in receipts
+                    if stored_bucket == name
+                )
+                for name in validation_buckets
+            }
+            task_refs = tuple(
+                EvidenceRef(source="memory_record", locator=stored_id)
+                for _stored_bucket, stored_id in receipts
+            )
+            evidence = resolve_validation_evidence(
+                ValidationEvidence(
+                    test_refs=refs_by_bucket["test"],
+                    lint_refs=refs_by_bucket["lint"],
+                    repair_refs=refs_by_bucket["repair"],
+                    review_refs=refs_by_bucket["review"],
+                    task_refs=task_refs,
+                ),
+                status="runtime_validated",
+                artifact_ids=tuple(stored_id for _bucket, stored_id in receipts),
+            )
             signal = LearningSignal(
-                title=f"Solved: {task['problem']}",
+                title=title,
                 content=task["recipe"],
                 kind=MemoryKind.PROCEDURE,
                 source_layer=MemoryLayer.EPISODIC,
-                validation_score=0.85,
+                validation_score=None,
+                validation_evidence=evidence,
                 repeat_count=r,
+                source="memory_record",
+                locator=candidate_id,
+                metadata={"session_id": session_id, "run_id": run_id},
+                requested_target_layer=MemoryLayer.PROCEDURAL,
             )
-            decision = kernel.decide(signal)
-            if decision.accepted and decision.target_layer == MemoryLayer.PROCEDURAL:
+            decision = kernel.decide(signal, action="promote")
+            if (
+                decision.action == "promote"
+                and decision.target_layer == MemoryLayer.PROCEDURAL
+            ):
                 proc_record = kernel.to_memory_record(signal, decision)
-                memory.put(proc_record)
+                memory.put_validated(
+                    proc_record,
+                    authority="nested_learning",
+                    source_record_ids=(
+                        candidate_id,
+                        *(stored_id for _bucket, stored_id in receipts),
+                    ),
+                    validation_evidence=evidence,
+                )
                 procedure_formed = True
                 procedure_form_round = r
                 break
@@ -540,7 +618,7 @@ def benchmark_procedural_consolidation(*, seed: int = 42, repetitions: int = 5) 
     formed = sum(1 for t in task_results if t["procedure_formed"])
     retrievable = sum(1 for t in task_results if t["retrieved_after_formation"])
 
-    return {
+    payload = {
         "name": "procedural_consolidation",
         "description": "Do repeated successes become reusable procedures in procedural memory?",
         "repetitions_available": repetitions,
@@ -549,19 +627,16 @@ def benchmark_procedural_consolidation(*, seed: int = 42, repetitions: int = 5) 
         "procedures_retrievable": retrievable,
         "formation_rate": round(formed / len(PROCEDURE_TASKS), 3),
         "retrieval_rate": round(retrievable / len(PROCEDURE_TASKS), 3),
+        "evidence_mode": "authenticated_runtime_receipts_and_validated_sink",
     }
+    memory.close_all()
+    temporary.cleanup()
+    return payload
 
 
 # ────────────────────────────────
 # Utilities
 # ────────────────────────────────
-
-def _clear_memory_dir(path: Path) -> None:
-    import shutil
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-
 
 # ────────────────────────────────
 # Main
@@ -585,10 +660,20 @@ def run_learning_benchmark(*, seed: int = 42) -> dict[str, Any]:
     dim5 = benchmark_procedural_consolidation(seed=seed)
     print(f"[5/5] Procedural Consolidation: formed={dim5['formation_rate']:.1%}, retrievable={dim5['retrieval_rate']:.1%}", file=sys.stderr)
 
+    assertions = {
+        "few_shot_improved": bool(dim1["improved"]),
+        "mistake_avoidance_improved": bool(dim2["improved"]),
+        "promotion_f1_at_least_0_95": float(dim3["f1_score"]) >= 0.95,
+        "router_utility_improved": bool(dim4["improvement_passes"]),
+        "all_procedures_formed": float(dim5["formation_rate"]) == 1.0,
+        "all_procedures_retrievable": float(dim5["retrieval_rate"]) == 1.0,
+    }
     return {
         "schema": "kestrel.learning_benchmark.v1",
         "config": {"seed": seed},
         "dimensions": [dim1, dim2, dim3, dim4, dim5],
+        "assertions": assertions,
+        "passed": all(assertions.values()),
         "summary": {
             "few_shot_improved": dim1["improved"],
             "mistake_avoidance_improved": dim2["improved"],
@@ -628,8 +713,9 @@ def main() -> int:
         if "formation_rate" in dim:
             print(f"  Result: {dim['formation_rate']:.1%} of tasks formed procedures, {dim['retrieval_rate']:.1%} retrievable")
     print("=" * 80)
+    print(f"Learning benchmark gate: {'PASS' if result['passed'] else 'FAIL'}")
 
-    return 0
+    return 0 if result["passed"] else 1
 
 
 if __name__ == "__main__":

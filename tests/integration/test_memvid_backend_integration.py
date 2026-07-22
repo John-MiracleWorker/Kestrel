@@ -8,17 +8,68 @@ from pathlib import Path
 
 import pytest
 
+from nested_memvid_agent.backends.base import MemoryBackend
+from nested_memvid_agent.backends.in_memory import InMemoryBackend
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend, _record_to_index_payload
 from nested_memvid_agent.cognition import FailureEpisode, LessonCard
+from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.layers import LayeredMemorySystem
 from nested_memvid_agent.memory_backup import MemoryBackupManager
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.runtime_models import StrategyProposal, ToolCall, ToolExecution
+from nested_memvid_agent.tools.base import ToolContext
+from nested_memvid_agent.tools.builtin import MemoryExportTool
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_MEMVID_INTEGRATION") != "1",
     reason="Set RUN_MEMVID_INTEGRATION=1 and install memvid-sdk to run Memvid integration tests.",
 )
+
+
+@pytest.mark.parametrize(
+    "backend_factory",
+    [InMemoryBackend, MemvidBackend],
+    ids=["memory", "memvid"],
+)
+def test_memvid_full_memory_export_is_paginated_and_never_silently_empty(
+    tmp_path: Path,
+    backend_factory: type[MemoryBackend],
+) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "export-memory",
+        backend_factory,
+    )
+    try:
+        for index in range(3):
+            memory.put(
+                MemoryRecord(
+                    id=f"portable-record-{index}",
+                    layer=MemoryLayer.EPISODIC,
+                    kind=MemoryKind.EVENT,
+                    title=f"Portable record {index}",
+                    content=f"Memvid export payload {index}.",
+                )
+            )
+        result = MemoryExportTool().run(
+            {"layers": ["episodic"], "limit": 2},
+            ToolContext(
+                memory=memory,
+                config=AgentConfig(),
+                workspace=tmp_path,
+            ),
+        )
+
+        assert result.success
+        assert result.data["count"] == 2
+        assert result.data["total"] == 3
+        assert result.data["next_offset"] == 2
+        assert result.data["truncated"] is True
+        assert [row["id"] for row in result.data["records"]] == [
+            "portable-record-0",
+            "portable-record-1",
+        ]
+    finally:
+        memory.close_all()
 
 
 def test_memvid_backend_write_seal_verify_reopen_search(tmp_path: Path) -> None:

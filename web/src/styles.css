@@ -2281,6 +2281,12 @@ textarea.input {
   padding: 32px 48px 24px;
 }
 
+.conversation-layout .transcript:focus,
+.conversation-layout .transcript:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+}
+
 .msg {
   margin-bottom: 20px;
 }
@@ -3729,6 +3735,10 @@ body:has(.chat-shell[data-active-section="chat"]) .topbar-meta {
   color: #66736f;
 }
 
+body:has(.chat-shell[data-active-section="chat"]) .primary-nav button {
+  color: #45544f;
+}
+
 body:has(.chat-shell[data-active-section="chat"]) .setup-button,
 body:has(.chat-shell[data-active-section="chat"]) .status-pill {
   background: #ffffff;
@@ -3779,6 +3789,23 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
 .chat-shell[data-active-section="chat"] .markdown-message blockquote,
 .chat-shell[data-active-section="chat"] .typing {
   color: #66736f;
+}
+
+.chat-shell[data-active-section="chat"] .rail-head h2 small,
+.chat-shell[data-active-section="chat"] .simple-meta .sep {
+  color: #596762;
+}
+
+.chat-shell[data-active-section="chat"] .act-heading,
+.chat-shell[data-active-section="chat"] .act-row .text code,
+.chat-shell[data-active-section="chat"] .act-row .text .detail,
+.chat-shell[data-active-section="chat"] .mode-select {
+  color: #45544f;
+}
+
+.chat-shell[data-active-section="chat"] .transcript:focus,
+.chat-shell[data-active-section="chat"] .transcript:focus-visible {
+  outline-color: #1f5f4e;
 }
 
 .chat-shell[data-active-section="chat"] .markdown-message code {

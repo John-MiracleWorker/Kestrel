@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import copy
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
-from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayerSpec, LayeredMemorySystem
+from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayeredMemorySystem, LayerSpec
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 
 from .base import RetrievalResult
@@ -44,20 +45,28 @@ def _hybrid_specs() -> dict[MemoryLayer, LayerSpec]:
 class KestrelAdapter:
     """Kestrel layered memory system with optional hybrid vector search."""
 
+    LEXICAL_BACKEND_NAME = "Kestrel (Layered In-Memory)"
+
     def __init__(self, hybrid: bool = True) -> None:
         specs = _hybrid_specs() if hybrid else None
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="kestrel-unified-benchmark-"
+        )
         self.memory = LayeredMemorySystem.from_backend_factory(
-            Path("/tmp/kestrel-bench-adapter"),
+            Path(self._temporary_directory.name) / "memory",
             InMemoryBackend,
             specs=specs,
             enable_vec=hybrid,
+            # Unified retrieval benchmarks seed synthetic fixtures directly;
+            # they do not claim those fixtures were promoted by the agent.
+            enforce_stable_write_integrity=False,
         )
         self._hybrid = hybrid
 
     def name(self) -> str:
         if self._hybrid:
-            return "Kestrel (Layered Memvid v2 + Hybrid BM25+Vector)"
-        return "Kestrel (Layered Memvid v2)"
+            return "Kestrel (Layered In-Memory + Hybrid BM25+Vector)"
+        return self.LEXICAL_BACKEND_NAME
 
     def ingest(self, doc_id: str, text: str, layer: str | None = None) -> None:
         layer_enum = MemoryLayer(layer or "semantic")

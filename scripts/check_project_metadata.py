@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_DISTRIBUTION = "nested-memvid-agent"
 WEB_PACKAGE = "kestrel-web"
-PUBLISHED_RELEASE = "0.4.0"
+PUBLISHED_RELEASE = "0.3.1"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -21,7 +23,13 @@ def _load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--release-tag",
+        help="Require metadata to describe an actually publishable exact tag (for example v0.4.0).",
+    )
+    args = parser.parse_args(argv)
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     uv_lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     web_package = _load_json(ROOT / "web" / "package.json")
@@ -97,6 +105,15 @@ def main() -> int:
                 errors.append(
                     f"{label} advertises unavailable development installer {development_installer!r}"
                 )
+    if args.release_tag:
+        errors.extend(
+            _release_mode_errors(
+                version=version,
+                release_tag=args.release_tag,
+                is_current_release=is_current_release,
+                changelog=changelog,
+            )
+        )
     if errors:
         raise SystemExit("Kestrel project metadata drift:\n- " + "\n- ".join(errors))
 
@@ -106,6 +123,33 @@ def main() -> int:
         f"published release {stable_tag}; private web package {WEB_PACKAGE} {version}."
     )
     return 0
+
+
+def _release_mode_errors(
+    *,
+    version: str,
+    release_tag: str,
+    is_current_release: bool,
+    changelog: str,
+) -> list[str]:
+    errors: list[str] = []
+    expected_tag = f"v{version}"
+    if release_tag != expected_tag:
+        errors.append(
+            f"release tag {release_tag!r} does not match package version {expected_tag!r}"
+        )
+    if not is_current_release:
+        errors.append(
+            f"package {version} is still declared as an unreleased development line; "
+            "update published-release metadata and stable documentation before tagging"
+        )
+    dated_heading = re.compile(
+        rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
+        flags=re.MULTILINE,
+    )
+    if dated_heading.search(changelog) is None:
+        errors.append(f"changelog is missing a dated release section for {version}")
+    return errors
 
 
 if __name__ == "__main__":

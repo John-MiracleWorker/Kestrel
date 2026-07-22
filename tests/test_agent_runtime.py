@@ -31,7 +31,10 @@ from nested_memvid_agent.models import (
 )
 from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
 from nested_memvid_agent.orchestrator import build_memory_system
-from nested_memvid_agent.repair_integrity import write_repair_artifact
+from nested_memvid_agent.repair_integrity import (
+    write_repair_artifact,
+    write_validation_receipt,
+)
 from nested_memvid_agent.runtime_models import (
     ChatMessage,
     LLMOptions,
@@ -649,23 +652,35 @@ def test_only_gate_validated_policy_memory_retains_system_priority(tmp_path: Pat
         capture_output=True,
         text=True,
     )
-    artifact_ids = []
-    for index in range(5):
-        artifact_id = f"repair_validation_policy_context_{index}"
-        write_repair_artifact(
-            tmp_path,
-            "repair_validations",
-            artifact_id,
-            {
-                "schema_version": 1,
-                "validation_id": artifact_id,
-                "tool": "repair.validate",
-                "success": True,
-                "returncode": 0,
-                "output_sha256": f"{index + 1:064x}",
-            },
-        )
-        artifact_ids.append(artifact_id)
+    snapshot: dict[str, object] = {
+        "branch": "",
+        "head_sha": "0" * 40,
+        "diff_digest": "d" * 64,
+    }
+    validation = write_validation_receipt(
+        tmp_path,
+        tool_name="repair.validate",
+        command=["policy-context-fixture"],
+        success=True,
+        returncode=0,
+        content="policy fixture validated",
+        validation_evidence={},
+        snapshot=snapshot,
+        started_at="2026-07-20T00:00:00+00:00",
+        isolation_attestation={
+            "schema_version": 1,
+            "mode": "oci_snapshot_v1",
+            "image": "example.invalid/kestrel-validation@sha256:" + "a" * 64,
+            "network": "none",
+            "workspace_mount": "private_read_only_snapshot",
+            "host_fallback": False,
+            "source_tree_digest": "sha256:" + "b" * 64,
+            "repair_diff_digest": snapshot["diff_digest"],
+            "repair_head_sha": snapshot["head_sha"],
+            "repair_branch": snapshot["branch"],
+        },
+    )
+    artifact_ids = [str(validation["validation_id"])] * 5
     memory = build_memory_system(
         "memory",
         tmp_path / "memory",
@@ -736,7 +751,7 @@ def test_only_gate_validated_policy_memory_retains_system_priority(tmp_path: Pat
         "repair_reviews",
         review_id,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "review_id": review_id,
             "validation": {
                 "validation_id": artifact_ids[0],

@@ -177,6 +177,7 @@ def test_factory_builds_provider_parity_aliases() -> None:
     [
         ("http://127.0.0.1:11434", "http://127.0.0.1:11434/v1"),
         ("http://127.0.0.1:11434/", "http://127.0.0.1:11434/v1"),
+        ("http://[::1]:11434", "http://[::1]:11434/v1"),
         ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
         ("https://proxy.example/ollama/v1", "https://proxy.example/ollama/v1"),
     ],
@@ -196,6 +197,29 @@ def test_provider_404_is_non_retryable_configuration_failure() -> None:
 
     assert error.code == "invalid_request"
     assert error.retryable is False
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///tmp/provider.sock",
+        "ftp://provider.example/v1",
+        "localhost:1234/v1",
+    ],
+)
+def test_model_catalog_rejects_non_http_provider_base_urls(base_url: str) -> None:
+    catalog = model_catalog_for_provider(
+        AgentConfig(
+            provider="openai-compatible",
+            model="local-model",
+            base_url=base_url,
+        ),
+        "openai-compatible",
+    )
+
+    assert catalog.ok is False
+    assert catalog.source == "fallback"
+    assert "http:// or https://" in str(catalog.error)
 
 
 def test_model_catalog_returns_static_models_for_mock() -> None:
@@ -600,6 +624,34 @@ def test_ollama_native_provider_uses_chat_api(monkeypatch: pytest.MonkeyPatch) -
     assert response.content == "cloud ok"
     assert response.tool_calls[0].arguments == {"query": "cloud"}
     assert response.usage == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///tmp/ollama.sock",
+        "ftp://ollama.example/api",
+        "ollama.example/api",
+        "https://user:password@ollama.example/api",
+    ],
+)
+def test_ollama_native_provider_rejects_unsafe_base_urls(base_url: str) -> None:
+    with pytest.raises(ValueError, match="Provider URL"):
+        OllamaNativeProvider(model="cloud-model", base_url=base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:11434/api",
+        "http://127.0.0.1:11434/api",
+        "http://[::1]:11434/api",
+    ],
+)
+def test_ollama_native_provider_accepts_local_http_base_urls(base_url: str) -> None:
+    provider = OllamaNativeProvider(model="local-model", base_url=base_url)
+
+    assert provider.base_url == base_url
 
 
 def test_ollama_native_provider_preserves_native_tool_continuation(

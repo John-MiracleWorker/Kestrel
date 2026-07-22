@@ -106,6 +106,8 @@ type ProviderOption = {
 
 type AppSection = "chat" | "routines" | "advanced" | "settings";
 
+const RUN_EVENT_REFRESH_DEBOUNCE_MS = 250;
+
 const providerOptions: ProviderOption[] = [
   { value: "lm-studio", label: "LM Studio", group: "Local", baseUrl: "http://localhost:1234/v1" },
   { value: "ollama", label: "Ollama (local)", group: "Local", baseUrl: "http://localhost:11434/v1" },
@@ -365,6 +367,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [authPromptOpen, setAuthPromptOpen] = useState(false);
+  const [apiReady, setApiReady] = useState(false);
   const [apiTokenDraft, setApiTokenDraft] = useState(() => getApiToken());
   const [runtime, setRuntime] = useState<Record<string, unknown> | null>(null);
   const [runtimeSettingsResult, setRuntimeSettingsResult] = useState<Record<string, unknown> | null>(null);
@@ -827,14 +830,28 @@ export function App() {
   }, [onboardingState, setupDismissed]);
 
   useEffect(() => {
-    refreshAll().catch(reportError);
-    const timer = window.setInterval(() => refreshIdleSummary().catch(reportError), 3500);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    getJson<Record<string, unknown>>("/api/health")
+      .then(() => {
+        if (!cancelled) setApiReady(true);
+      })
+      .catch(reportError);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
+    if (!apiReady) return;
+    refreshAll().catch(reportError);
+    const timer = window.setInterval(() => refreshIdleSummary().catch(reportError), 3500);
+    return () => window.clearInterval(timer);
+  }, [apiReady]);
+
+  useEffect(() => {
+    if (!apiReady) return;
     void refreshProviderModels(provider);
-  }, [provider]);
+  }, [provider, apiReady]);
 
   useEffect(() => {
     if (!HASH_ROUTING_ENABLED) return;
@@ -857,17 +874,35 @@ export function App() {
 
   useEffect(() => {
     if (!activeRun?.run_id) return;
+    const runId = activeRun.run_id;
+    const sessionId = activeRun.session_id;
+    let refreshTimer: number | null = null;
+    let closed = false;
     setEvents([]);
-    refreshRunDetails(activeRun.run_id).catch(reportError);
+    refreshRunDetails(runId).catch(reportError);
+    const scheduleAuthoritativeRefresh = () => {
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = null;
+        if (closed) return;
+        void Promise.all([
+          refreshChatSummary(sessionId),
+          refreshRunDetails(runId)
+        ]).catch(reportError);
+      }, RUN_EVENT_REFRESH_DEBOUNCE_MS);
+    };
     const appendEvent = (parsed: TraceEvent) => {
       setEvents((rows) => [...rows.slice(-120), parsed]);
       if (parsed.type !== "assistant.token") {
-        refreshChatSummary().catch(reportError);
-        refreshRunDetails(activeRun.run_id).catch(reportError);
-        refreshThreadRuns(activeRun.session_id).catch(reportError);
+        scheduleAuthoritativeRefresh();
       }
     };
-    return subscribeJsonEvents<TraceEvent>(`/api/runs/${activeRun.run_id}/events`, runEventTypes, appendEvent, reportError);
+    const unsubscribe = subscribeJsonEvents<TraceEvent>(`/api/runs/${runId}/events`, runEventTypes, appendEvent, reportError);
+    return () => {
+      closed = true;
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      unsubscribe();
+    };
   }, [activeRun?.run_id]);
 
   function applyRunSessionSelection(runList: Run[], sessionList: Session[], pendingApprovalList: Approval[]) {
@@ -887,7 +922,7 @@ export function App() {
     }
   }
 
-  async function refreshChatSummary() {
+  async function refreshChatSummary(forceThreadSessionId?: string) {
     const [runList, sessionList, pendingApprovalList] = await Promise.all([
       getJson<Run[]>("/api/runs"),
       getJson<Session[]>("/api/sessions"),
@@ -897,7 +932,11 @@ export function App() {
     setSessions(sessionList);
     setApprovals(pendingApprovalList);
     applyRunSessionSelection(runList, sessionList, pendingApprovalList);
-    await refreshSelectedThreadIfChanged(sessionList);
+    if (forceThreadSessionId && activeSessionIdRef.current === forceThreadSessionId) {
+      await refreshThreadRuns(forceThreadSessionId);
+    } else {
+      await refreshSelectedThreadIfChanged(sessionList);
+    }
   }
 
   async function refreshSummary() {
@@ -1069,6 +1108,7 @@ export function App() {
 
   function reportError(value: unknown) {
     if (value instanceof ApiAuthError) {
+      setApiReady(false);
       setAuthPromptOpen(true);
       setApiTokenDraft(getApiToken());
       setError(null);
@@ -1082,7 +1122,16 @@ export function App() {
     setApiToken(apiTokenDraft);
     setAuthPromptOpen(false);
     setError(null);
-    await refreshAll().catch(reportError);
+    try {
+      await getJson<Record<string, unknown>>("/api/health");
+      if (apiReady) {
+        await refreshAll();
+      } else {
+        setApiReady(true);
+      }
+    } catch (value) {
+      reportError(value);
+    }
   }
 
   async function saveRuntimeSettings() {
@@ -1139,7 +1188,7 @@ export function App() {
   async function submitRun(event: FormEvent) {
     event.preventDefault();
     await guarded(async () => {
-      if (!message.trim()) return;
+      if (!message.trim() || !runtime) return;
       followTranscriptRef.current = true;
       const targetSessionId = sessionId.trim() || activeSessionIdRef.current || createThreadId();
       const payload: Record<string, unknown> = {
@@ -1786,7 +1835,17 @@ export function App() {
   const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
   const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
-  const simpleStatus = simpleChatStatus(activeRun, pendingApprovalCount, setupReadiness);
+  const simpleStatus = authPromptOpen
+    ? {
+        label: "Locked",
+        detail: "Enter the local API token before using this Kestrel."
+      }
+    : !apiReady || !runtime
+      ? {
+          label: "Connecting",
+          detail: "Loading the authoritative Kestrel runtime configuration."
+        }
+    : simpleChatStatus(activeRun, pendingApprovalCount, setupReadiness);
   const chatIntro = userDisplayName
     ? `Ready when you are, ${userDisplayName}.`
     : "Ready when you are.";
@@ -1839,6 +1898,30 @@ export function App() {
             </Panel>
           </section>
         </main>
+      ) : !apiReady || !runtime ? (
+        <main className="conversation" id="workspace">
+          <section className="settings-grid" aria-label="Kestrel connection status">
+            <Panel title={`Connecting to ${agentDisplayName}`} icon={<Activity size={19} />}>
+              <p>{error || "Loading the authoritative runtime configuration before enabling the workbench."}</p>
+              {error && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setError(null);
+                    getJson<Record<string, unknown>>("/api/health")
+                      .then(() => {
+                        setApiReady(true);
+                        return refreshAll();
+                      })
+                      .catch(reportError);
+                  }}
+                >
+                  <RefreshCw size={15} /> Retry
+                </button>
+              )}
+            </Panel>
+          </section>
+        </main>
       ) : (
       <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`} data-active-section={activeSection}>
       <a className="skip-link" href="#workspace">Skip to workspace</a>
@@ -1853,7 +1936,7 @@ export function App() {
           <Search size={14} />
           <input type="text" placeholder="Search threads..." />
         </div>
-        <div className="thread-list" aria-label="Conversation threads">
+        <div className="thread-list" role="region" aria-label="Conversation threads">
           {threadSummaries.map((thread) => (
             <button
               type="button"
@@ -1911,7 +1994,9 @@ export function App() {
           <div className="transcript-inner">
             <div
               className="transcript"
+              role="region"
               aria-label="Conversation transcript"
+              tabIndex={0}
               ref={transcriptRef}
               onScroll={(event) => {
                 const transcript = event.currentTarget;
@@ -4690,7 +4775,7 @@ function LiveRunActivity({ run, events }: { run: Run; events: TraceEvent[] }) {
   const isRunning = run.status === "queued" || run.status === "running";
   if (items.length === 0 && !isRunning) return null;
   return (
-    <div className="activity" aria-label="Live run activity" aria-live="polite">
+    <div className="activity" role="status" aria-label="Live run activity" aria-live="polite">
       <div className="act-heading">
         <Brain size={15} />
         <strong>Thinking</strong>

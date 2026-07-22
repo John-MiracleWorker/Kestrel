@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess  # nosec B404
+import stat
 from pathlib import Path
 from typing import Any
 
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
-from ..security_boundary import assert_path_not_sensitive
+from ..security_boundary import redact_text
+from ..validation_runner import ValidationIsolationError
 from .base import AgentTool, ToolContext
 from .patch_helpers import _validate_patch_paths
 from .process_tools import (
+    WorkspaceSecretIsolationError,
     _cancel_running_subprocess,
     _normalize_python_command,
+    _redact_subprocess_text,
     _run_subprocess,
     _SubprocessToolTimeout,
     _truncate,
@@ -20,6 +23,16 @@ from .validation_helpers import (
     _authenticated_validation_evidence_payload,
     _tool_validation_evidence_payload,
 )
+from .workspace_tools import (
+    _assert_workspace_path_allowed,
+    _open_workspace_regular_file,
+    _safe_path,
+    _workspace_path_is_private,
+)
+
+_MAX_UTILITY_OUTPUT_CHARS = 200_000
+_MAX_UTILITY_PATHS = 16
+_MAX_UTILITY_LIST_ENTRIES = 1_000
 
 
 def _tool_call_from_runtime_arguments(name: str, arguments: dict[str, Any]) -> ToolCall:
@@ -68,13 +81,155 @@ def _is_python_executable_name(name: str) -> bool:
 def _is_allowlisted_command(command: list[str], allowed_first_tokens: set[str]) -> bool:
     if not command:
         return False
-    executable = Path(command[0]).name.lower()
+    requested = command[0]
+    # An allowlisted basename must never authorize a caller-selected executable
+    # such as ``./echo`` or ``/tmp/ls``.
+    executable = Path(requested).name.lower()
+    if requested != Path(requested).name or "/" in requested or "\\" in requested:
+        # Validation tools normalize every Python spelling to the controlled
+        # interpreter before entering the OCI snapshot. Other caller-selected
+        # executable paths remain forbidden.
+        return "python" in allowed_first_tokens and _is_python_executable_name(executable)
     if executable in allowed_first_tokens:
         return True
     return "python" in allowed_first_tokens and _is_python_executable_name(executable)
 
 
-def _validate_allowlisted_path_operands(command: list[str], workspace: Path) -> str | None:
+def _run_bounded_utility(
+    command: list[str],
+    context: ToolContext,
+) -> tuple[int, str, str]:
+    """Implement the tiny shell allowlist without launching a host executable."""
+
+    executable = command[0].lower()
+    arguments = command[1:]
+    if executable == "echo":
+        newline = True
+        if arguments[:1] == ["-n"]:
+            newline = False
+            arguments = arguments[1:]
+        output = " ".join(arguments) + ("\n" if newline else "")
+        return 0, _bounded_utility_output(output), ""
+    if executable == "pwd":
+        if arguments not in ([], ["--"]):
+            raise ValueError("pwd accepts no operands")
+        return 0, f"{context.workspace.resolve()}\n", ""
+    if executable == "cat":
+        paths = _utility_path_operands(arguments, allowed_flags=frozenset())
+        if not paths:
+            raise ValueError("cat requires at least one workspace file")
+        if len(paths) > _MAX_UTILITY_PATHS:
+            raise ValueError("cat path limit exceeded")
+        chunks: list[bytes] = []
+        total = 0
+        for requested_path in paths:
+            path = _safe_path(context.workspace, requested_path)
+            _assert_workspace_path_allowed(
+                context,
+                path,
+                requested_path=requested_path,
+            )
+            with _open_workspace_regular_file(context, path) as (handle, _):
+                raw = handle.read(_MAX_UTILITY_OUTPUT_CHARS * 4 - total + 1)
+            total += len(raw)
+            if total > _MAX_UTILITY_OUTPUT_CHARS * 4:
+                raise ValueError("cat output limit exceeded")
+            chunks.append(raw)
+        output = b"".join(chunks).decode("utf-8", errors="replace")
+        return 0, _bounded_utility_output(output), ""
+    if executable == "ls":
+        paths, flags = _utility_ls_arguments(arguments)
+        return 0, _bounded_utility_output(_list_workspace_paths(context, paths, flags)), ""
+    raise ValueError("Command is not allowlisted")
+
+
+def _utility_path_operands(
+    arguments: list[str],
+    *,
+    allowed_flags: frozenset[str],
+) -> list[str]:
+    operands: list[str] = []
+    after_options = False
+    for argument in arguments:
+        if argument == "--" and not after_options:
+            after_options = True
+            continue
+        if not after_options and argument.startswith("-"):
+            if argument == "-" or any(flag not in allowed_flags for flag in argument[1:]):
+                raise ValueError(f"Unsupported utility option: {argument}")
+            continue
+        operands.append(argument)
+    return operands
+
+
+def _utility_ls_arguments(arguments: list[str]) -> tuple[list[str], frozenset[str]]:
+    flags: set[str] = set()
+    operands: list[str] = []
+    after_options = False
+    for argument in arguments:
+        if argument == "--" and not after_options:
+            after_options = True
+            continue
+        if not after_options and argument.startswith("-"):
+            if argument == "-" or any(flag not in {"1", "a", "A", "l"} for flag in argument[1:]):
+                raise ValueError(f"Unsupported ls option: {argument}")
+            flags.update(argument[1:])
+            continue
+        operands.append(argument)
+    if len(operands) > _MAX_UTILITY_PATHS:
+        raise ValueError("ls path limit exceeded")
+    return operands or ["."], frozenset(flags)
+
+
+def _list_workspace_paths(
+    context: ToolContext,
+    requested_paths: list[str],
+    flags: frozenset[str],
+) -> str:
+    rows: list[str] = []
+    remaining = _MAX_UTILITY_LIST_ENTRIES
+    show_hidden = "a" in flags or "A" in flags
+    long_format = "l" in flags
+    multiple = len(requested_paths) > 1
+    for requested_path in requested_paths:
+        path = _safe_path(context.workspace, requested_path)
+        _assert_workspace_path_allowed(context, path, requested_path=requested_path)
+        if multiple:
+            if rows:
+                rows.append("")
+            rows.append(f"{requested_path}:")
+        if path.is_file():
+            entries = [path]
+        elif path.is_dir():
+            entries = sorted(path.iterdir(), key=lambda item: item.name.casefold())
+        else:
+            raise ValueError(f"ls target is not a regular file or directory: {requested_path}")
+        for entry in entries:
+            if remaining <= 0:
+                raise ValueError("ls entry limit exceeded")
+            if not show_hidden and entry.name.startswith("."):
+                continue
+            if _workspace_path_is_private(context, entry):
+                continue
+            remaining -= 1
+            name = entry.name + ("/" if entry.is_dir() else "")
+            if long_format:
+                metadata = entry.lstat()
+                rows.append(f"{stat.filemode(metadata.st_mode)} {metadata.st_size:>10} {name}")
+            else:
+                rows.append(name)
+    return "\n".join(rows) + ("\n" if rows else "")
+
+
+def _bounded_utility_output(value: str) -> str:
+    if len(value) > _MAX_UTILITY_OUTPUT_CHARS:
+        raise ValueError("utility output limit exceeded")
+    return _redact_subprocess_text(value)
+
+
+def _validate_allowlisted_path_operands(
+    command: list[str], context: ToolContext
+) -> str | None:
     """Keep allowlisted file-inspection commands inside the non-sensitive workspace."""
 
     if not command:
@@ -98,9 +253,9 @@ def _validate_allowlisted_path_operands(command: list[str], workspace: Path) -> 
             return "stdin operands are not allowed"
         candidate = Path(operand)
         if not candidate.is_absolute():
-            candidate = workspace / candidate
+            candidate = context.workspace / candidate
         try:
-            assert_path_not_sensitive(workspace, candidate, requested_path=operand)
+            _assert_workspace_path_allowed(context, candidate, requested_path=operand)
         except ValueError as exc:
             return str(exc)
     return None
@@ -166,7 +321,7 @@ class ShellRunTool(AgentTool):
                 content="Command is not allowlisted",
                 error="command_not_allowlisted",
             )
-        path_error = _validate_allowlisted_path_operands(command, context.workspace)
+        path_error = _validate_allowlisted_path_operands(command, context)
         if path_error is not None:
             return self._result(
                 call,
@@ -175,21 +330,22 @@ class ShellRunTool(AgentTool):
                 error="path_not_allowed",
             )
         try:
-            completed = _run_subprocess(
-                command, context=context, arguments=arguments, default_timeout=30
+            returncode, stdout, stderr = _run_bounded_utility(command, context)
+            content = _redact_subprocess_text(
+                f"exit_code={returncode}\nSTDOUT:\n{stdout}\n"
+                f"STDERR:\n{stderr}"
             )
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             return self._result(
                 call,
-                success=completed.returncode == 0,
+                success=returncode == 0,
                 content=content,
-                data={"returncode": completed.returncode},
-                error=None if completed.returncode == 0 else "nonzero_exit",
+                data={"returncode": returncode, "execution_mode": "bounded_utility"},
+                error=None if returncode == 0 else "nonzero_exit",
             )
-        except _SubprocessToolTimeout as exc:
-            return self._result(call, success=False, content=str(exc), error="tool_timeout")
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="shell_failed")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="shell_failed"
+            )
 
     def cancel(self, call_id: str) -> None:
         _cancel_running_subprocess(call_id)
@@ -198,7 +354,10 @@ class ShellRunTool(AgentTool):
 class CodexExecTool(AgentTool):
     spec = ToolSpec(
         name="codex.exec",
-        description="Delegate a bounded non-interactive task to the local Codex CLI in this workspace.",
+        description=(
+            "Delegate a bounded non-interactive task to a Codex CLI installed in the configured "
+            "digest-pinned, networkless OCI validation image. There is no host fallback."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -221,6 +380,8 @@ class CodexExecTool(AgentTool):
         requires_approval=True,
         capabilities=("codex-cli", "delegation"),
     )
+    needs_call_id = True
+    wait_for_completion_on_timeout = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
@@ -235,6 +396,16 @@ class CodexExecTool(AgentTool):
             return self._result(
                 call, success=False, content="Unsupported Codex sandbox", error="bad_sandbox"
             )
+        if sandbox == "workspace-write":
+            return self._result(
+                call,
+                success=False,
+                content=(
+                    "Workspace-write Codex execution is outside the current read-only OCI boundary. "
+                    "Use the staged repair.prepare/apply/validate/review pipeline instead."
+                ),
+                error="codex_workspace_write_uncontained",
+            )
 
         timeout = max(30, min(int(arguments.get("timeout", 600)), 3600))
         max_output_chars = max(1000, min(int(arguments.get("max_output_chars", 40_000)), 100_000))
@@ -242,7 +413,7 @@ class CodexExecTool(AgentTool):
             "codex",
             "exec",
             "--cd",
-            str(context.workspace.resolve()),
+            "/extension",
             "--sandbox",
             sandbox,
             "--color",
@@ -260,17 +431,21 @@ class CodexExecTool(AgentTool):
         command.append(prompt)
 
         try:
-            completed = subprocess.run(  # noqa: S603 - fixed executable and argument vector  # nosec
+            completed = _run_subprocess(
                 command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
+                context=context,
+                arguments=arguments,
+                default_timeout=timeout,
+                sanitize_environment=True,
+                require_container_isolation=True,
             )
-            stdout = _truncate(completed.stdout, max_output_chars)
-            stderr = _truncate(completed.stderr, max_output_chars)
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            safe_stdout = _redact_subprocess_text(completed.stdout)
+            safe_stderr = _redact_subprocess_text(completed.stderr)
+            stdout = _truncate(safe_stdout, max_output_chars)
+            stderr = _truncate(safe_stderr, max_output_chars)
+            content = _redact_subprocess_text(
+                f"exit_code={completed.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            )
             return self._result(
                 call,
                 success=completed.returncode == 0,
@@ -279,10 +454,24 @@ class CodexExecTool(AgentTool):
                     "returncode": completed.returncode,
                     "sandbox": sandbox,
                     "model": model or None,
-                    "stdout_truncated": len(completed.stdout) > max_output_chars,
-                    "stderr_truncated": len(completed.stderr) > max_output_chars,
+                    "stdout_truncated": len(safe_stdout) > max_output_chars,
+                    "stderr_truncated": len(safe_stderr) > max_output_chars,
                 },
                 error=None if completed.returncode == 0 else "codex_nonzero_exit",
+            )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
+        except ValidationIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
             )
         except FileNotFoundError:
             return self._result(
@@ -291,15 +480,20 @@ class CodexExecTool(AgentTool):
                 content="Codex CLI not found on PATH.",
                 error="codex_cli_not_found",
             )
-        except subprocess.TimeoutExpired as exc:
+        except _SubprocessToolTimeout as exc:
             return self._result(
                 call,
                 success=False,
-                content=f"Codex CLI timed out after {timeout}s: {exc}",
+                content=redact_text(f"Codex CLI timed out: {exc}"),
                 error="codex_timeout",
             )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="codex_cli_failed")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="codex_cli_failed"
+            )
+
+    def cancel(self, call_id: str) -> None:
+        _cancel_running_subprocess(call_id)
 
 
 class PatchApplyTool(AgentTool):
@@ -317,6 +511,8 @@ class PatchApplyTool(AgentTool):
         risk="high",
         requires_approval=True,
     )
+    needs_call_id = True
+    wait_for_completion_on_timeout = True
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
@@ -325,22 +521,24 @@ class PatchApplyTool(AgentTool):
         if not patch_text.strip():
             return self._result(call, success=False, content="Missing patch", error="missing_patch")
         try:
-            _validate_patch_paths(context.workspace, patch_text)
+            _validate_patch_paths(context.workspace, patch_text, context=context)
             command = (
                 ["git", "apply", "--check"]
                 if check_only
                 else ["git", "apply", "--whitespace=nowarn"]
             )
-            completed = subprocess.run(  # noqa: S603 - fixed executable and arguments  # nosec
+            completed = _run_subprocess(
                 command,
-                cwd=context.workspace,
-                input=patch_text,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
+                context=context,
+                arguments=arguments,
+                default_timeout=30,
+                sanitize_environment=True,
+                input_text=patch_text,
             )
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            content = _redact_subprocess_text(
+                f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
             return self._result(
                 call,
                 success=completed.returncode == 0,
@@ -348,14 +546,29 @@ class PatchApplyTool(AgentTool):
                 data={"returncode": completed.returncode, "check": check_only},
                 error=None if completed.returncode == 0 else "patch_apply_failed",
             )
+        except _SubprocessToolTimeout as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="tool_timeout",
+            )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="patch_apply_failed")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="patch_apply_failed"
+            )
+
+    def cancel(self, call_id: str) -> None:
+        _cancel_running_subprocess(call_id)
 
 
 class TestRunTool(AgentTool):
     spec = ToolSpec(
         name="test.run",
-        description="Run a bounded test command in the workspace. Disabled unless shell execution is enabled.",
+        description=(
+            "Run a bounded test command against a private workspace snapshot in the configured "
+            "digest-pinned OCI validation image. There is no host fallback."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -396,8 +609,13 @@ class TestRunTool(AgentTool):
                 arguments=arguments,
                 default_timeout=120,
                 sanitize_environment=True,
+                requires_workspace_secret_isolation=True,
+                require_container_isolation=True,
             )
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            content = _redact_subprocess_text(
+                f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
             validation_evidence = _tool_validation_evidence_payload(
                 "test_refs", "test.run", command, content, completed.returncode == 0
             )
@@ -429,10 +647,28 @@ class TestRunTool(AgentTool):
                 },
                 error=None if completed.returncode == 0 else "nonzero_exit",
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
+        except ValidationIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
         except _SubprocessToolTimeout as exc:
-            return self._result(call, success=False, content=str(exc), error="tool_timeout")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="tool_timeout"
+            )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="test_run_failed")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="test_run_failed"
+            )
 
     def cancel(self, call_id: str) -> None:
         _cancel_running_subprocess(call_id)
@@ -441,7 +677,10 @@ class TestRunTool(AgentTool):
 class LintRunTool(AgentTool):
     spec = ToolSpec(
         name="lint.run",
-        description="Run a bounded lint/typecheck command in the workspace. Disabled unless shell execution is enabled.",
+        description=(
+            "Run a bounded lint/typecheck command against a private workspace snapshot in the "
+            "configured digest-pinned OCI validation image. There is no host fallback."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -482,8 +721,13 @@ class LintRunTool(AgentTool):
                 arguments=arguments,
                 default_timeout=120,
                 sanitize_environment=True,
+                requires_workspace_secret_isolation=True,
+                require_container_isolation=True,
             )
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            content = _redact_subprocess_text(
+                f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
             validation_evidence = _tool_validation_evidence_payload(
                 "lint_refs", "lint.run", command, content, completed.returncode == 0
             )
@@ -515,10 +759,28 @@ class LintRunTool(AgentTool):
                 },
                 error=None if completed.returncode == 0 else "nonzero_exit",
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
+        except ValidationIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error=exc.code,
+            )
         except _SubprocessToolTimeout as exc:
-            return self._result(call, success=False, content=str(exc), error="tool_timeout")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="tool_timeout"
+            )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="lint_run_failed")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="lint_run_failed"
+            )
 
     def cancel(self, call_id: str) -> None:
         _cancel_running_subprocess(call_id)

@@ -490,8 +490,9 @@ class _FakeMCPSession:
     def __init__(self) -> None:
         self.closed_with: list[float] = []
 
-    def close(self, *, timeout: float) -> None:
+    def close(self, *, timeout: float) -> bool:
         self.closed_with.append(timeout)
+        return True
 
 
 def test_disabled_mcp_closes_session_and_rejects_every_entrypoint(

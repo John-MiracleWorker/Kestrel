@@ -244,6 +244,8 @@ def _build_single_provider(
             profile=config.codex_profile,
             skip_git_repo_check=config.codex_skip_git_repo_check,
             ephemeral=config.codex_ephemeral,
+            secret_store_path=config.secret_store_path,
+            secret_backend=config.secret_backend,
         )
     raise ValueError(f"Unsupported provider: {provider}")
 

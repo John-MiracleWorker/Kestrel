@@ -15,6 +15,7 @@ from nested_memvid_agent.extension_policy import (
     parse_extension_scopes,
 )
 from nested_memvid_agent.extension_runner import ContainerExecutionRequest, OCIContainerRunner
+from nested_memvid_agent.validation_runner import run_isolated_validation
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_EXTENSION_SANDBOX_INTEGRATION") != "1",
@@ -62,7 +63,7 @@ def test_real_container_denies_host_paths_network_and_root_identity(tmp_path: Pa
             image=image,
             command=("python", "/extension/probe.py"),
             stdin="{}",
-            timeout_seconds=5,
+            timeout_seconds=15,
         )
     )
 
@@ -132,7 +133,7 @@ def test_real_container_read_scope_is_snapshotted_and_read_only(tmp_path: Path) 
             image=image,
             command=("python", "/extension/read.py"),
             stdin="{}",
-            timeout_seconds=5,
+            timeout_seconds=15,
         )
     )
 
@@ -193,6 +194,78 @@ def test_real_container_timeout_leaves_no_orphan(tmp_path: Path) -> None:
     )
     assert probe.returncode == 0
     assert probe.stdout.strip() == ""
+
+
+def test_real_validation_container_excludes_host_trust_and_live_workspace(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repair"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "fix/contained-validation"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Kestrel Test"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / ".gitignore").write_text(".nest/\n", encoding="utf-8")
+    (repo / "probe.py").write_text(
+        "import json, os, socket\n"
+        "from pathlib import Path\n"
+        "network_blocked = False\n"
+        "try:\n"
+        "    socket.create_connection(('1.1.1.1', 443), timeout=0.25)\n"
+        "except OSError:\n"
+        "    network_blocked = True\n"
+        "write_blocked = False\n"
+        "try:\n"
+        "    Path('/extension/escape').write_text('no')\n"
+        "except OSError:\n"
+        "    write_blocked = True\n"
+        "print(json.dumps({\n"
+        "    'git_visible': Path('/extension/.git').exists(),\n"
+        "    'nest_visible': Path('/extension/.nest').exists(),\n"
+        "    'host_home': os.environ.get('HOME'),\n"
+        "    'network_blocked': network_blocked,\n"
+        "    'write_blocked': write_blocked,\n"
+        "    'uid': os.getuid(),\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", ".gitignore", "probe.py"], cwd=repo, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True
+    )
+    trust_root = repo / ".nest"
+    trust_root.mkdir()
+    (trust_root / "repair_receipt_signing.v2.key").write_bytes(b"x" * 32)
+
+    result = run_isolated_validation(
+        workspace=repo,
+        image=_test_image(),
+        command=["python", "probe.py"],
+        timeout_seconds=15,
+    )
+
+    assert json.loads(result.stdout) == {
+        "git_visible": False,
+        "nest_visible": False,
+        "host_home": "/tmp",
+        "network_blocked": True,
+        "write_blocked": True,
+        "uid": _expected_non_root_uid(),
+    }
+    assert result.isolation["host_fallback"] is False
 
 
 def _test_image() -> str:

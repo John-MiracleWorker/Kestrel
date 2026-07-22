@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from ..repair_integrity import (
+    hardened_readonly_git_command,
+    hardened_readonly_git_environment,
     load_review_receipt,
     load_validation_receipt,
     repair_action_lock,
@@ -19,8 +21,16 @@ from ..repair_integrity import (
     require_git_root,
 )
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
+from ..security_boundary import redact_text
 from .base import AgentTool, ToolContext
-from .workspace_tools import _safe_path
+from .patch_helpers import _validate_patch_paths
+from .process_tools import (
+    WorkspaceSecretIsolationError,
+    _assert_repair_snapshot_workspace_safe,
+    _run_subprocess,
+    _SubprocessToolTimeout,
+)
+from .workspace_tools import _assert_workspace_path_allowed, _safe_path
 
 
 def _safe_branch_name(name: str) -> bool:
@@ -47,18 +57,22 @@ def _is_protected_branch(name: str, protected_patterns: tuple[str, ...]) -> bool
 
 def _git_output(workspace: Path, command: list[str]) -> str:
     completed = subprocess.run(  # nosec
-        command,
+        _hardened_git_command(_git_command_arguments(command), workspace=workspace),
         cwd=workspace,
         capture_output=True,
         text=True,
+        env=_sanitized_git_environment(None),
         timeout=30,
         check=False,
     )
     if completed.returncode != 0:
         raise RuntimeError(
-            f"git command failed ({completed.returncode}): {' '.join(command)}\n{completed.stderr}"
+            redact_text(
+                f"git command failed ({completed.returncode}): {' '.join(command)}\n"
+                f"{completed.stderr}"
+            )
         )
-    return completed.stdout.strip()
+    return redact_text(completed.stdout or "").strip()
 
 
 def _validate_repair_review_gate(workspace: Path, branch: str, review_id: str) -> dict[str, Any]:
@@ -82,7 +96,7 @@ def _validate_repair_review_gate(workspace: Path, branch: str, review_id: str) -
         return {
             "ok": False,
             "error": "repair_review_invalid",
-            "content": str(exc),
+            "content": redact_text(str(exc)),
             "branch": branch,
         }
     if review.get("branch") != branch:
@@ -188,19 +202,136 @@ def _changed_files_from_status(status: str) -> list[str]:
     return files
 
 
+def _snapshot_changed_paths(snapshot: dict[str, Any]) -> list[str]:
+    raw_paths = snapshot.get("changed_files", [])
+    if not isinstance(raw_paths, list):
+        raise ValueError("Repair snapshot path manifest is invalid.")
+    return [str(path) for path in raw_paths]
+
+
+def _staged_git_paths(workspace: Path) -> list[str]:
+    return _diff_git_paths(workspace, staged=True)
+
+
+def _diff_git_paths(workspace: Path, *, staged: bool) -> list[str]:
+    arguments = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--name-only",
+        "-z",
+    ]
+    if staged:
+        arguments.insert(1, "--cached")
+    return _git_path_list(workspace, arguments, operation="diff")
+
+
+def _status_git_paths(workspace: Path) -> list[str]:
+    paths = {
+        *_diff_git_paths(workspace, staged=False),
+        *_diff_git_paths(workspace, staged=True),
+        *_git_path_list(
+            workspace,
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            operation="status",
+        ),
+    }
+    return sorted(paths)
+
+
+def _commit_git_paths(workspace: Path, commit_sha: str) -> list[str]:
+    return _git_path_list(
+        workspace,
+        [
+            "diff-tree",
+            "--root",
+            "-m",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            commit_sha,
+        ],
+        operation="commit",
+    )
+
+
+def _git_path_list(
+    workspace: Path,
+    arguments: list[str],
+    *,
+    operation: str,
+) -> list[str]:
+    completed = subprocess.run(  # noqa: S603 - fixed read-only git command  # nosec
+        _hardened_git_command(arguments, workspace=workspace),
+        cwd=workspace,
+        env=_sanitized_git_environment(None),
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            redact_text(f"Unable to inspect Git {operation} paths: {stderr}")
+        )
+    return [os.fsdecode(path) for path in completed.stdout.split(b"\0") if path]
+
+
+def _assert_git_paths_allowed(context: ToolContext, paths: list[str]) -> None:
+    for relative in paths:
+        candidate = _safe_path(context.workspace, relative)
+        _assert_workspace_path_allowed(
+            context,
+            candidate,
+            requested_path=relative,
+        )
+
+
 def _git_read(
-    call: ToolCall, context: ToolContext, command: list[str], error_code: str
+    call: ToolCall,
+    context: ToolContext,
+    command: list[str],
+    error_code: str,
+    *,
+    validate_rendered_patch: bool = False,
 ) -> ToolExecution:
     try:
         completed = subprocess.run(  # noqa: S603 - fixed read-only git commands  # nosec
-            command,
+            _hardened_git_command(
+                _git_command_arguments(command), workspace=context.workspace
+            ),
             cwd=context.workspace,
+            env=_sanitized_git_environment(None),
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-        content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+        if completed.returncode == 0 and validate_rendered_patch:
+            try:
+                _validate_patch_paths(
+                    context.workspace,
+                    completed.stdout or "",
+                    context=context,
+                )
+            except (OSError, RuntimeError, ValueError):
+                return ToolExecution(
+                    call=call,
+                    success=False,
+                    content=(
+                        "Git diff includes a protected workspace path and was not rendered."
+                    ),
+                    error="git_diff_path_blocked",
+                )
+        content = redact_text(
+            f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
         return ToolExecution(
             call=call,
             success=completed.returncode == 0,
@@ -209,13 +340,21 @@ def _git_read(
             error=None if completed.returncode == 0 else error_code,
         )
     except Exception as exc:  # noqa: BLE001
-        return ToolExecution(call=call, success=False, content=str(exc), error=error_code)
+        return ToolExecution(
+            call=call,
+            success=False,
+            content=redact_text(str(exc)),
+            error=error_code,
+        )
 
 
 class GitStatusTool(AgentTool):
     spec = ToolSpec(
         name="git.status",
-        description="Return read-only git status for the workspace.",
+        description=(
+            "Return read-only git status plus an exact branch, HEAD, and staged-tree "
+            "preview for git.commit."
+        ),
         parameters={"type": "object", "properties": {}},
         aliases=("status",),
     )
@@ -223,17 +362,44 @@ class GitStatusTool(AgentTool):
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         del arguments
         call = ToolCall(name=self.spec.name, arguments={})
+        try:
+            _assert_git_paths_allowed(context, _status_git_paths(context.workspace))
+        except (OSError, RuntimeError, ValueError):
+            return self._result(
+                call,
+                success=False,
+                content="Git status includes a protected workspace path and was not rendered.",
+                error="git_status_path_blocked",
+            )
         result = _git_read(
             call, context, ["git", "status", "--short", "--branch"], "git_status_failed"
         )
         if result.success:
             try:
-                result.data["head_sha"] = _git_output(
+                branch = _git_output(
+                    context.workspace, ["git", "branch", "--show-current"]
+                )
+                head_sha = _git_output(
                     context.workspace, ["git", "rev-parse", "HEAD"]
                 )
-                result.data["staged_tree_sha"] = _current_index_tree_sha(context.workspace)
+                staged_tree_sha = _current_index_tree_sha(context.workspace)
+                result.data.update(
+                    {
+                        "branch": branch or None,
+                        "head_sha": head_sha,
+                        "staged_tree_sha": staged_tree_sha,
+                        "commit_preview": {
+                            "expected_branch": branch,
+                            "expected_head_sha": head_sha,
+                            "expected_tree_sha": staged_tree_sha,
+                        }
+                        if branch
+                        else None,
+                    }
+                )
             except (RuntimeError, ValueError):
                 result.data["staged_tree_sha"] = None
+                result.data["commit_preview"] = None
         return result
 
 
@@ -252,10 +418,29 @@ class GitDiffTool(AgentTool):
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
-        command = (
-            ["git", "diff", "--cached"] if bool(arguments.get("staged", False)) else ["git", "diff"]
+        staged = bool(arguments.get("staged", False))
+        try:
+            _assert_git_paths_allowed(
+                context,
+                _diff_git_paths(context.workspace, staged=staged),
+            )
+        except (OSError, RuntimeError, ValueError):
+            return self._result(
+                call,
+                success=False,
+                content="Git diff includes a protected workspace path and was not rendered.",
+                error="git_diff_path_blocked",
+            )
+        command = ["git", "diff", "--no-ext-diff", "--no-textconv"]
+        if staged:
+            command.append("--cached")
+        result = _git_read(
+            call,
+            context,
+            command,
+            "git_diff_failed",
+            validate_rendered_patch=True,
         )
-        result = _git_read(call, context, command, "git_diff_failed")
         max_chars = int(arguments.get("max_chars", 40_000))
         if len(result.content) > max_chars:
             return self._result(
@@ -269,6 +454,8 @@ class GitDiffTool(AgentTool):
 
 
 class GitExportPatchTool(AgentTool):
+    needs_call_id = True
+    wait_for_completion_on_timeout = True
     spec = ToolSpec(
         name="git.export_patch",
         description="Export the current git diff to a local .kestrel/improvements patch file. Never pushes.",
@@ -285,27 +472,57 @@ class GitExportPatchTool(AgentTool):
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
-        command = (
-            ["git", "diff", "--cached"] if bool(arguments.get("staged", False)) else ["git", "diff"]
-        )
+        staged = bool(arguments.get("staged", False))
         try:
-            completed = subprocess.run(  # noqa: S603 - fixed executable and arguments  # nosec
-                command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
+            _assert_git_paths_allowed(
+                context,
+                _diff_git_paths(context.workspace, staged=staged),
+            )
+        except (OSError, RuntimeError, ValueError):
+            return self._result(
+                call,
+                success=False,
+                content="Git patch export includes a protected workspace path; nothing was written.",
+                error="git_export_path_blocked",
+            )
+        command = ["git", "diff", "--no-ext-diff", "--no-textconv"]
+        if staged:
+            command.append("--cached")
+        try:
+            completed = _run_subprocess(
+                _hardened_git_command(command[1:], workspace=context.workspace),
+                context=context,
+                arguments=arguments,
+                default_timeout=30,
+                environment=_sanitized_git_environment(None),
             )
             if completed.returncode != 0:
                 return self._result(
                     call,
                     success=False,
-                    content=f"Unable to export patch. STDERR:\n{completed.stderr}",
+                    content=redact_text(
+                        f"Unable to export patch. STDERR:\n{completed.stderr}"
+                    ),
                     error="git_export_patch_failed",
                     data={"returncode": completed.returncode},
                 )
-            patch = completed.stdout
+            try:
+                _validate_patch_paths(
+                    context.workspace,
+                    completed.stdout or "",
+                    context=context,
+                )
+            except (OSError, RuntimeError, ValueError):
+                return self._result(
+                    call,
+                    success=False,
+                    content=(
+                        "Git patch export includes a protected workspace path; "
+                        "nothing was written."
+                    ),
+                    error="git_export_path_blocked",
+                )
+            patch = redact_text(completed.stdout or "")
             if not patch.strip():
                 return self._result(
                     call, success=False, content="No diff to export.", error="empty_diff"
@@ -313,6 +530,9 @@ class GitExportPatchTool(AgentTool):
             path_arg = str(arguments.get("path", "")).strip()
             if path_arg:
                 patch_path = _safe_path(context.workspace, path_arg)
+                _assert_workspace_path_allowed(
+                    context, patch_path, requested_path=path_arg
+                )
                 relpath = patch_path.relative_to(context.workspace.resolve())
                 if relpath.parts[:2] != (".kestrel", "improvements"):
                     return self._result(
@@ -336,12 +556,22 @@ class GitExportPatchTool(AgentTool):
                 data={
                     "path": relpath.as_posix(),
                     "chars": len(patch),
-                    "staged": bool(arguments.get("staged", False)),
+                    "staged": staged,
                 },
+            )
+        except _SubprocessToolTimeout as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="tool_timeout",
             )
         except Exception as exc:  # noqa: BLE001
             return self._result(
-                call, success=False, content=str(exc), error="git_export_patch_failed"
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="git_export_patch_failed",
             )
 
 
@@ -367,6 +597,8 @@ class GitBranchTool(AgentTool):
 
 
 class GitCreateLocalBranchTool(AgentTool):
+    needs_call_id = True
+    wait_for_completion_on_timeout = True
     spec = ToolSpec(
         name="git.create_local_branch",
         description="Create a local git branch in the workspace. Never pushes or tracks a remote.",
@@ -404,18 +636,20 @@ class GitCreateLocalBranchTool(AgentTool):
                     "protected_branches": list(context.config.protected_branches),
                 },
             )
-        command = ["git", "switch", "-c", branch] if checkout else ["git", "branch", branch]
+        command = ["switch", "-c", branch] if checkout else ["branch", branch]
         try:
             before_branch = _git_output(context.workspace, ["git", "branch", "--show-current"])
-            completed = subprocess.run(  # noqa: S603 - fixed executable and arguments  # nosec
-                command,
-                cwd=context.workspace,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
+            completed = _run_subprocess(
+                _hardened_git_command(command, workspace=context.workspace),
+                context=context,
+                arguments=arguments,
+                default_timeout=30,
+                environment=_sanitized_git_environment(None),
             )
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            content = redact_text(
+                f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
             return self._result(
                 call,
                 success=completed.returncode == 0,
@@ -428,9 +662,19 @@ class GitCreateLocalBranchTool(AgentTool):
                 },
                 error=None if completed.returncode == 0 else "git_create_branch_failed",
             )
+        except _SubprocessToolTimeout as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="tool_timeout",
+            )
         except Exception as exc:  # noqa: BLE001
             return self._result(
-                call, success=False, content=str(exc), error="git_create_branch_failed"
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="git_create_branch_failed",
             )
 
 
@@ -450,13 +694,16 @@ class GitLogTool(AgentTool):
         max_count = max(1, min(int(arguments.get("max_count", 10)), 50))
         try:
             completed = subprocess.run(  # noqa: S603 - fixed read-only git command  # nosec
-                [
-                    "git",
-                    "log",
-                    f"--max-count={max_count}",
-                    "--pretty=format:%H%x1f%h%x1f%ct%x1f%an%x1f%s",
-                ],
+                _hardened_git_command(
+                    [
+                        "log",
+                        f"--max-count={max_count}",
+                        "--pretty=format:%H%x1f%h%x1f%ct%x1f%an%x1f%s",
+                    ],
+                    workspace=context.workspace,
+                ),
                 cwd=context.workspace,
+                env=_sanitized_git_environment(None),
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -466,12 +713,12 @@ class GitLogTool(AgentTool):
                 return self._result(
                     call,
                     success=False,
-                    content=completed.stderr,
+                    content=redact_text(completed.stderr or ""),
                     data={"returncode": completed.returncode},
                     error="git_log_failed",
                 )
             commits = []
-            for line in completed.stdout.splitlines():
+            for line in redact_text(completed.stdout or "").splitlines():
                 full, short, timestamp, author, subject = (
                     line.split("\x1f", maxsplit=4) + ["", "", "", "", ""]
                 )[:5]
@@ -491,7 +738,9 @@ class GitLogTool(AgentTool):
                 data={"commits": commits, "returncode": completed.returncode},
             )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="git_log_failed")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="git_log_failed"
+            )
 
 
 class GitShowTool(AgentTool):
@@ -511,23 +760,68 @@ class GitShowTool(AgentTool):
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
         rev = str(arguments.get("rev", "HEAD")).strip() or "HEAD"
-        if rev.startswith("-") or "\x00" in rev:
+        if rev.startswith("-") or "\x00" in rev or ":" in rev:
             return self._result(
                 call, success=False, content="Invalid revision.", error="invalid_revision"
             )
         max_chars = max(1000, min(int(arguments.get("max_chars", 40_000)), 200_000))
-        command = ["git", "show", "--stat", "--patch", "--format=fuller", rev]
+        try:
+            commit_sha = _git_output(
+                context.workspace,
+                ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
+            )
+        except RuntimeError:
+            return self._result(
+                call,
+                success=False,
+                content="Revision does not resolve to a commit.",
+                error="invalid_revision",
+            )
+        command = [
+            "git",
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--stat",
+            "--patch",
+            "--format=fuller",
+            commit_sha,
+        ]
         path_arg = str(arguments.get("path", "")).strip()
         if path_arg:
             try:
                 path = _safe_path(context.workspace, path_arg)
+                _assert_workspace_path_allowed(
+                    context, path, requested_path=path_arg
+                )
                 command.extend(["--", str(path.relative_to(context.workspace.resolve()))])
             except Exception as exc:  # noqa: BLE001
-                return self._result(call, success=False, content=str(exc), error="invalid_path")
+                return self._result(
+                    call,
+                    success=False,
+                    content=redact_text(str(exc)),
+                    error="invalid_path",
+                )
+        else:
+            try:
+                _assert_git_paths_allowed(
+                    context,
+                    _commit_git_paths(context.workspace, commit_sha),
+                )
+            except (OSError, RuntimeError, ValueError):
+                return self._result(
+                    call,
+                    success=False,
+                    content="Git commit includes a protected workspace path and was not rendered.",
+                    error="git_show_path_blocked",
+                )
         try:
             completed = subprocess.run(  # noqa: S603 - fixed read-only git command  # nosec
-                command,
+                _hardened_git_command(
+                    _git_command_arguments(command), workspace=context.workspace
+                ),
                 cwd=context.workspace,
+                env=_sanitized_git_environment(None),
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -537,12 +831,13 @@ class GitShowTool(AgentTool):
                 return self._result(
                     call,
                     success=False,
-                    content=completed.stderr,
+                    content=redact_text(completed.stderr or ""),
                     data={"returncode": completed.returncode},
                     error="git_show_failed",
                 )
-            truncated = len(completed.stdout) > max_chars
-            content = completed.stdout[:max_chars] + ("\n... truncated ..." if truncated else "")
+            safe_stdout = redact_text(completed.stdout or "")
+            truncated = len(safe_stdout) > max_chars
+            content = safe_stdout[:max_chars] + ("\n... truncated ..." if truncated else "")
             return self._result(
                 call,
                 success=True,
@@ -550,7 +845,9 @@ class GitShowTool(AgentTool):
                 data={"returncode": completed.returncode, "truncated": truncated},
             )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="git_show_failed")
+            return self._result(
+                call, success=False, content=redact_text(str(exc)), error="git_show_failed"
+            )
 
 
 class GitCommitTool(AgentTool):
@@ -563,9 +860,25 @@ class GitCommitTool(AgentTool):
             "properties": {
                 "message": {"type": "string"},
                 "repair_review_id": {"type": "string"},
+                "expected_branch": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255,
+                },
+                "expected_head_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
                 "expected_tree_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
             },
             "required": ["message"],
+            "anyOf": [
+                {"required": ["repair_review_id"]},
+                {
+                    "required": [
+                        "expected_branch",
+                        "expected_head_sha",
+                        "expected_tree_sha",
+                    ]
+                },
+            ],
         },
         risk="high",
         requires_approval=True,
@@ -611,6 +924,7 @@ class GitCommitTool(AgentTool):
                 )
             if _is_repair_branch(branch, context.config.worker_branch_prefix):
                 with repair_action_lock(context.workspace):
+                    _assert_repair_snapshot_workspace_safe(context)
                     review_check = _validate_repair_review_gate(
                         context.workspace,
                         branch,
@@ -647,25 +961,49 @@ class GitCommitTool(AgentTool):
                                 if key not in {"ok", "content", "error"}
                             },
                         )
+                    final_snapshot = dict(final_check["repair_snapshot"])
+                    _assert_git_paths_allowed(
+                        context,
+                        _snapshot_changed_paths(final_snapshot),
+                    )
                     completed = _run_exact_repair_commit(
                         context.workspace,
                         branch=branch,
                         expected_head=str(final_check["head_sha"]),
-                        snapshot=dict(final_check["repair_snapshot"]),
+                        snapshot=final_snapshot,
                         message=message,
                     )
             else:
+                expected_branch = str(arguments.get("expected_branch", "")).strip()
+                expected_head = str(arguments.get("expected_head_sha", "")).strip()
                 expected_tree = str(arguments.get("expected_tree_sha", "")).strip()
-                if not expected_tree:
+                if not expected_branch or not expected_head or not expected_tree:
                     return self._result(
                         call,
                         success=False,
                         content=(
-                            "Non-repair commits require expected_tree_sha from git.status so exact-call "
-                            "approval is bound to the staged tree."
+                            "Non-repair commits require expected_branch, expected_head_sha, and "
+                            "expected_tree_sha from git.status commit_preview so exact-call approval "
+                            "is bound to the destination and staged tree."
                         ),
                         error="commit_preview_required",
                     )
+                if (
+                    not _safe_branch_name(expected_branch)
+                    or not _valid_git_object_id(expected_head)
+                    or not _valid_git_object_id(expected_tree)
+                ):
+                    return self._result(
+                        call,
+                        success=False,
+                        content="The non-repair commit preview contains an invalid Git identity.",
+                        error="commit_preview_invalid",
+                    )
+                _verify_nonrepair_commit_target(
+                    context.workspace,
+                    expected_branch=expected_branch,
+                    expected_head=expected_head,
+                )
                 actual_tree = _current_index_tree_sha(context.workspace)
                 if actual_tree != expected_tree:
                     return self._result(
@@ -678,9 +1016,10 @@ class GitCommitTool(AgentTool):
                             "actual_tree_sha": actual_tree,
                         },
                     )
-                expected_head = _git_output(context.workspace, ["git", "rev-parse", "HEAD"])
+                _assert_git_paths_allowed(context, _staged_git_paths(context.workspace))
                 head_tree = _git_output(
-                    context.workspace, ["git", "rev-parse", "HEAD^{tree}"]
+                    context.workspace,
+                    ["git", "rev-parse", f"{expected_head}^{{tree}}"],
                 )
                 if actual_tree == head_tree:
                     return self._result(
@@ -691,17 +1030,23 @@ class GitCommitTool(AgentTool):
                     )
                 completed = _run_exact_index_commit(
                     context.workspace,
-                    branch=branch,
+                    branch=expected_branch,
                     expected_head=expected_head,
                     tree_sha=actual_tree,
                     message=message,
                 )
-            content = f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            content = redact_text(
+                f"exit_code={completed.returncode}\nSTDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
             data: dict[str, Any] = {"returncode": completed.returncode}
             if completed.returncode == 0:
                 sha = subprocess.run(  # nosec
-                    ["git", "rev-parse", "HEAD"],
+                    _hardened_git_command(
+                        ["rev-parse", "HEAD"], workspace=context.workspace
+                    ),
                     cwd=context.workspace,
+                    env=_sanitized_git_environment(None),
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -718,13 +1063,33 @@ class GitCommitTool(AgentTool):
                 data=data,
                 error=None if completed.returncode == 0 else "git_commit_failed",
             )
+        except WorkspaceSecretIsolationError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="workspace_secret_isolation_required",
+            )
+        except _CommitPreviewStaleError as exc:
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                data=exc.data,
+                error="commit_preview_stale",
+            )
         except Exception as exc:  # noqa: BLE001
-            return self._result(call, success=False, content=str(exc), error="git_commit_failed")
+            return self._result(
+                call,
+                success=False,
+                content=redact_text(str(exc)),
+                error="git_commit_failed",
+            )
 
 
 def _current_index_tree_sha(workspace: Path) -> str:
     completed = subprocess.run(  # noqa: S603 - fixed git executable and structured argv  # nosec
-        _hardened_git_command(["write-tree"]),
+        _hardened_git_command(["write-tree"], workspace=workspace),
         cwd=workspace,
         env=_sanitized_git_environment(None),
         capture_output=True,
@@ -733,11 +1098,53 @@ def _current_index_tree_sha(workspace: Path) -> str:
         check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError(f"Unable to preview staged Git tree: {completed.stderr}")
-    tree_sha = completed.stdout.strip()
-    if len(tree_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in tree_sha):
+        raise RuntimeError(
+            redact_text(f"Unable to preview staged Git tree: {completed.stderr}")
+        )
+    tree_sha = redact_text(completed.stdout or "").strip()
+    if not _valid_git_object_id(tree_sha):
         raise ValueError("Git returned an invalid staged tree identity.")
     return tree_sha
+
+
+def _valid_git_object_id(value: str) -> bool:
+    return len(value) in {40, 64} and all(
+        char in "0123456789abcdef" for char in value
+    )
+
+
+class _CommitPreviewStaleError(RuntimeError):
+    def __init__(self, data: dict[str, Any]) -> None:
+        super().__init__(
+            "The branch or HEAD changed after commit approval was prepared; "
+            "the approved commit was not attached."
+        )
+        self.data = data
+
+
+def _verify_nonrepair_commit_target(
+    workspace: Path,
+    *,
+    expected_branch: str,
+    expected_head: str,
+) -> None:
+    actual_branch = _git_output(workspace, ["git", "branch", "--show-current"])
+    actual_head = _git_output(workspace, ["git", "rev-parse", "HEAD"])
+    drift_fields: list[str] = []
+    if actual_branch != expected_branch:
+        drift_fields.append("branch")
+    if actual_head != expected_head:
+        drift_fields.append("head_sha")
+    if drift_fields:
+        raise _CommitPreviewStaleError(
+            {
+                "expected_branch": expected_branch,
+                "actual_branch": actual_branch or None,
+                "expected_head_sha": expected_head,
+                "actual_head_sha": actual_head,
+                "drift_fields": drift_fields,
+            }
+        )
 
 
 def _run_exact_index_commit(
@@ -750,6 +1157,11 @@ def _run_exact_index_commit(
 ) -> subprocess.CompletedProcess[str]:
     deadline = time.monotonic() + 30.0
     environment = _sanitized_git_environment(None)
+    _verify_nonrepair_commit_target(
+        workspace,
+        expected_branch=branch,
+        expected_head=expected_head,
+    )
     commit = _run_repair_git(
         workspace,
         ["commit-tree", tree_sha, "-p", expected_head, "-m", message],
@@ -759,6 +1171,11 @@ def _run_exact_index_commit(
     if commit.returncode != 0:
         return _decoded_failure(commit, "Unable to create exact staged-tree commit.")
     commit_sha = commit.stdout.decode("ascii", errors="strict").strip()
+    _verify_nonrepair_commit_target(
+        workspace,
+        expected_branch=branch,
+        expected_head=expected_head,
+    )
     updated = _run_repair_git(
         workspace,
         [
@@ -773,6 +1190,11 @@ def _run_exact_index_commit(
         deadline=deadline,
     )
     if updated.returncode != 0:
+        _verify_nonrepair_commit_target(
+            workspace,
+            expected_branch=branch,
+            expected_head=expected_head,
+        )
         return _decoded_failure(
             updated,
             "Git HEAD changed before atomic branch update; the exact commit was not attached.",
@@ -939,36 +1361,24 @@ def _run_exact_repair_commit(
                 pass
 
 
-def _hardened_git_command(arguments: list[str]) -> list[str]:
-    return [
-        "git",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "commit.gpgSign=false",
-        *arguments,
-    ]
+def _hardened_git_command(
+    arguments: list[str],
+    *,
+    workspace: Path | None = None,
+) -> list[str]:
+    return hardened_readonly_git_command(
+        ["-c", "commit.gpgSign=false", *arguments], workspace=workspace
+    )
+
+
+def _git_command_arguments(command: list[str]) -> list[str]:
+    if not command or Path(command[0]).name.casefold() not in {"git", "git.exe"}:
+        raise ValueError("Expected a structured Git command.")
+    return command[1:]
 
 
 def _sanitized_git_environment(index_path: Path | None) -> dict[str, str]:
-    environment = dict(os.environ)
-    dangerous = {
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-        "GIT_DIR",
-        "GIT_EXEC_PATH",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_WORK_TREE",
-    }
-    for key in list(environment):
-        if key in dangerous or key.startswith("GIT_CONFIG_"):
-            environment.pop(key, None)
-    environment["GIT_CONFIG_NOSYSTEM"] = "1"
-    environment["GIT_ATTR_NOSYSTEM"] = "1"
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment = hardened_readonly_git_environment()
     if index_path is not None:
         environment["GIT_INDEX_FILE"] = str(index_path)
     return environment
@@ -985,14 +1395,14 @@ def _run_repair_git(
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return subprocess.CompletedProcess(
-            _hardened_git_command(arguments),
+            _hardened_git_command(arguments, workspace=workspace),
             124,
             stdout=b"",
             stderr=b"Exact repair commit timed out.",
         )
     try:
         return subprocess.run(  # noqa: S603 - fixed git executable and structured argv  # nosec
-            _hardened_git_command(arguments),
+            _hardened_git_command(arguments, workspace=workspace),
             cwd=workspace,
             env=environment,
             input=input_bytes,
@@ -1002,7 +1412,7 @@ def _run_repair_git(
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
-            _hardened_git_command(arguments),
+            _hardened_git_command(arguments, workspace=workspace),
             124,
             stdout=b"",
             stderr=b"Exact repair commit timed out.",
@@ -1146,10 +1556,14 @@ def _decoded_failure(
     return subprocess.CompletedProcess(
         completed.args,
         completed.returncode,
-        stdout=completed.stdout.decode("utf-8", errors="replace"),
-        stderr=f"{prefix}\n{completed.stderr.decode('utf-8', errors='replace')}",
+        stdout=redact_text(completed.stdout.decode("utf-8", errors="replace")),
+        stderr=redact_text(
+            f"{prefix}\n{completed.stderr.decode('utf-8', errors='replace')}"
+        ),
     )
 
 
 def _completed_failure(command: str, message: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(command.split(), 1, stdout="", stderr=message)
+    return subprocess.CompletedProcess(
+        command.split(), 1, stdout="", stderr=redact_text(message)
+    )

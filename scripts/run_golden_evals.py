@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess  # nosec B404 - fixed local git fixture commands only
 import sys
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, Re
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.runtime_models import ToolCall
+from nested_memvid_agent.security_boundary import redact_secrets
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.task_capsule import write_run_capsule
@@ -78,7 +80,25 @@ def main() -> int:
     )
     parser.add_argument("--model", default="mock")
     parser.add_argument("--workspace", type=Path, default=Path("."))
+    parser.add_argument(
+        "--validation-container-image",
+        default=os.getenv("NEST_AGENT_VALIDATION_CONTAINER_IMAGE"),
+        help=(
+            "Preloaded digest-pinned OCI image used by repair and post-repair "
+            "validation; host fallback is never used."
+        ),
+    )
+    parser.add_argument(
+        "--max-case-latency-ms",
+        type=float,
+        help=(
+            "Optional fail-closed maximum wall-clock latency for every golden case. "
+            "Use a backend/environment-specific threshold."
+        ),
+    )
     args = parser.parse_args()
+    if args.max_case_latency_ms is not None and args.max_case_latency_ms <= 0:
+        parser.error("--max-case-latency-ms must be greater than 0")
 
     config = AgentConfig(
         backend=args.backend,
@@ -87,6 +107,7 @@ def main() -> int:
         model=args.model,
         workspace=args.workspace,
         log_dir=args.memory_dir.parent / "logs",
+        validation_container_image=args.validation_container_image,
     )
     eval_id = f"golden_{uuid4().hex}"
     results = [
@@ -185,11 +206,26 @@ def main() -> int:
             lambda: _eval_repo_regression_guard(_case_config(config, eval_id, "repo_regression")),
         ),
     ]
-    summary = _summary(results)
+    summary = _summary(results, max_case_latency_ms=args.max_case_latency_ms)
+    functional_passed = summary["fail_count"] == 0
+    latency_gate = dict(summary["acceptance"]["latency"])
+    passed = _aggregate_passed(summary)
     report = {
+        "schema": "kestrel.golden_eval_report.v2",
+        "configuration": {
+            "backend": args.backend,
+            "provider": args.provider,
+            "model": args.model,
+            "max_case_latency_ms": args.max_case_latency_ms,
+        },
         "results": results,
         "summary": summary,
-        "passed": summary["fail_count"] == 0,
+        "acceptance": {
+            "functional": {"required": True, "passed": functional_passed},
+            "latency": latency_gate,
+            "cost": dict(summary["acceptance"]["cost"]),
+        },
+        "passed": passed,
     }
     print(json.dumps(report, indent=2))
     return _report_exit_code(report)
@@ -201,13 +237,37 @@ def _report_exit_code(report: dict[str, Any]) -> int:
     return 0 if report.get("passed") is True else 1
 
 
+def _aggregate_passed(summary: dict[str, Any]) -> bool:
+    """Require functional success plus every configured performance gate."""
+
+    acceptance = summary.get("acceptance")
+    if not isinstance(acceptance, dict):
+        return False
+    latency_gate = acceptance.get("latency")
+    if not isinstance(latency_gate, dict):
+        return False
+    configured = latency_gate.get("gate_configured")
+    latency_passed = latency_gate.get("passed")
+    if configured is True:
+        performance_accepted = latency_passed is True
+    elif configured is False:
+        performance_accepted = latency_passed is None
+    else:
+        performance_accepted = False
+    return summary.get("fail_count") == 0 and performance_accepted
+
+
 def _run_case(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     started = perf_counter()
+    cost_estimate_usd: float | None = None
     try:
         result = fn()
         passed = bool(result.pop("passed"))
+        raw_cost = result.pop("cost_estimate_usd", None)
+        if raw_cost is not None:
+            cost_estimate_usd = float(raw_cost)
     except Exception as exc:  # noqa: BLE001 - eval harness reports failure data
-        result = {"error": f"{type(exc).__name__}: {exc}"}
+        result = {"error": redact_secrets(f"{type(exc).__name__}: {exc}")}
         passed = False
     return {
         "name": name,
@@ -218,7 +278,7 @@ def _run_case(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         "memory_hits": int(result.pop("memory_hits", 0)),
         "context_chars": int(result.pop("context_chars", 0)),
         "tool_count": int(result.pop("tool_count", 0)),
-        "cost_estimate_usd": float(result.pop("cost_estimate_usd", 0.0)),
+        "cost_estimate_usd": cost_estimate_usd,
         **result,
     }
 
@@ -226,11 +286,18 @@ def _run_case(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
 def _case_config(config: AgentConfig, eval_id: str, case_name: str) -> AgentConfig:
     memory_dir = config.memory_dir / eval_id / case_name
     case_root = memory_dir.parent
+    isolation_root = case_root / "isolated-runtime" / case_name
     return replace(
         config,
         memory_dir=memory_dir,
         log_dir=case_root / "logs" / case_name,
         state_path=case_root / "state" / case_name / "agent.db",
+        secret_store_path=isolation_root / "secrets" / "local_vault.json",
+        skills_dir=isolation_root / "skills",
+        plugins_dir=isolation_root / "plugins",
+        mcp_config_path=isolation_root / "config" / "mcp_servers.json",
+        channel_config_path=isolation_root / "config" / "channels.json",
+        worker_worktree_dir=isolation_root / "worktrees",
     )
 
 
@@ -936,13 +1003,19 @@ def _eval_repo_map(config: AgentConfig) -> dict[str, Any]:
         agent.close()
 
 
-def _eval_patch_and_test(config: AgentConfig) -> dict[str, Any]:
-    workspace = (
-        Path("/private/tmp") / f"kestrel-golden-{config.memory_dir.parent.name}-workspace-patch"
-    )
+def _golden_case_workspace(config: AgentConfig, label: str) -> Path:
+    """Return a case-local workspace on every supported operating system."""
+
+    workspace = config.memory_dir.parent / "workspaces" / f"{config.memory_dir.name}-{label}"
     workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+def _eval_patch_and_test(config: AgentConfig) -> dict[str, Any]:
+    workspace = _golden_case_workspace(config, "patch")
     target = workspace / "calc.txt"
     target.write_text("bad\n", encoding="utf-8")
+    _prepare_validation_workspace(workspace)
     agent = build_agent(
         replace(config, workspace=workspace, allow_file_write=True, allow_shell=True)
     )
@@ -992,7 +1065,13 @@ def _eval_patch_and_test(config: AgentConfig) -> dict[str, Any]:
 
 
 def _eval_honest_test_failure(config: AgentConfig) -> dict[str, Any]:
-    agent = build_agent(replace(config, allow_shell=True))
+    # This is a test-runner contract, not a scan of the caller's repository.
+    # Keep the synthetic failing command in its own clean workspace so ignored
+    # operator secrets correctly present in the real checkout do not make the
+    # deterministic golden gate environment-dependent.
+    workspace = config.memory_dir.parent / "test-failure-workspace"
+    _prepare_validation_workspace(workspace)
+    agent = build_agent(replace(config, workspace=workspace, allow_shell=True))
     try:
         call = ToolCall(
             name="test.run", arguments={"command": ["python3", "-c", "import sys; sys.exit(4)"]}
@@ -1154,11 +1233,7 @@ def _eval_plan_completion(config: AgentConfig) -> dict[str, Any]:
 
 
 def _eval_repo_regression_guard(config: AgentConfig) -> dict[str, Any]:
-    workspace = (
-        Path("/private/tmp")
-        / f"kestrel-golden-{config.memory_dir.parent.name}-workspace-regression"
-    )
-    workspace.mkdir(parents=True, exist_ok=True)
+    workspace = _golden_case_workspace(config, "regression")
     sentinel = workspace / "sentinel.txt"
     sentinel.write_text("unchanged\n", encoding="utf-8")
     before = {
@@ -1188,22 +1263,36 @@ def _eval_repo_regression_guard(config: AgentConfig) -> dict[str, Any]:
         agent.close()
 
 
-def _summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _summary(
+    results: list[dict[str, Any]],
+    *,
+    max_case_latency_ms: float | None = None,
+) -> dict[str, Any]:
     pass_count = sum(1 for item in results if item["passed"])
     fail_count = len(results) - pass_count
     latencies = [float(item.get("latency_ms", 0)) for item in results]
     context_sizes = [int(item.get("context_chars", 0)) for item in results]
     tool_counts = [int(item.get("tool_count", 0)) for item in results]
+    cost_measurement = _cost_measurement(results)
+    latency_acceptance = _latency_acceptance(
+        latencies,
+        max_case_latency_ms=max_case_latency_ms,
+    )
     return {
         "pass_count": pass_count,
         "fail_count": fail_count,
-        "latency_ms_max": max(latencies) if latencies else 0,
+        "latency_ms_max": max(latencies) if latencies else None,
         "context_chars_max": max(context_sizes) if context_sizes else 0,
         "tool_count_total": sum(tool_counts),
-        "cost_estimate_usd_total": round(
-            sum(float(item.get("cost_estimate_usd", 0.0)) for item in results), 6
+        "cost_estimate_usd_total": cost_measurement["cost_estimate_usd_total"],
+        "categories": _category_summary(
+            results,
+            max_case_latency_ms=max_case_latency_ms,
         ),
-        "categories": _category_summary(results),
+        "acceptance": {
+            "latency": latency_acceptance,
+            "cost": cost_measurement,
+        },
         "promotion_precision": None,
         "false_promotion_count": sum(
             1
@@ -1213,7 +1302,11 @@ def _summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _category_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _category_summary(
+    results: list[dict[str, Any]],
+    *,
+    max_case_latency_ms: float | None = None,
+) -> dict[str, Any]:
     categories: dict[str, dict[str, Any]] = {}
     for category in _REQUIRED_CATEGORIES:
         categories[category] = {
@@ -1238,30 +1331,92 @@ def _category_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         bucket["score"] = (
             None if case_count == 0 else round(int(bucket["pass_count"]) / case_count, 4)
         )
-    latency_max = max(
-        (float(item.get("latency_ms", 0.0)) for item in results),
-        default=0.0,
+    latencies = [float(item.get("latency_ms", 0.0)) for item in results]
+    latency_acceptance = _latency_acceptance(
+        latencies,
+        max_case_latency_ms=max_case_latency_ms,
     )
-    latency_score = (
-        1.0 if not results else round(max(0.0, min(1.0, 1000.0 / max(latency_max, 0.1))), 4)
+    latency_pass_count = (
+        None
+        if max_case_latency_ms is None
+        else sum(1 for latency in latencies if latency <= max_case_latency_ms)
+    )
+    latency_fail_count = (
+        None
+        if latency_pass_count is None
+        else len(latencies) - latency_pass_count
     )
     categories["latency"] = {
         "case_count": len(results),
-        "pass_count": sum(1 for item in results if float(item.get("latency_ms", 0)) <= 1000),
-        "fail_count": sum(1 for item in results if float(item.get("latency_ms", 0)) > 1000),
-        "score": latency_score,
-        "latency_ms_max": latency_max,
+        "pass_count": latency_pass_count,
+        "fail_count": latency_fail_count,
+        "score": (
+            None
+            if latency_pass_count is None or not latencies
+            else round(latency_pass_count / len(latencies), 4)
+        ),
+        **latency_acceptance,
     }
+    cost_measurement = _cost_measurement(results)
     categories["cost"] = {
         "case_count": len(results),
-        "pass_count": len(results),
-        "fail_count": 0,
-        "score": 1.0,
-        "cost_estimate_usd_total": round(
-            sum(float(item.get("cost_estimate_usd", 0.0)) for item in results), 6
-        ),
+        "pass_count": None,
+        "fail_count": None,
+        "score": None,
+        **cost_measurement,
     }
     return categories
+
+
+def _latency_acceptance(
+    latencies: list[float],
+    *,
+    max_case_latency_ms: float | None,
+) -> dict[str, Any]:
+    observed_max = max(latencies) if latencies else None
+    configured = max_case_latency_ms is not None
+    if max_case_latency_ms is None:
+        passed = None
+    else:
+        passed = observed_max is not None and observed_max <= max_case_latency_ms
+    return {
+        "measurement_status": "measured" if latencies else "unmeasured",
+        "gate_configured": configured,
+        "required": configured,
+        "threshold_max_case_latency_ms": max_case_latency_ms,
+        "latency_ms_max": observed_max,
+        "passed": passed,
+    }
+
+
+def _cost_measurement(results: list[dict[str, Any]]) -> dict[str, Any]:
+    measured = [
+        float(value)
+        for item in results
+        if (value := item.get("cost_estimate_usd")) is not None
+    ]
+    measured_count = len(measured)
+    if measured_count == 0:
+        status = "unmeasured"
+    elif measured_count == len(results):
+        status = "measured"
+    else:
+        status = "partially_measured"
+    return {
+        "measurement_status": status,
+        "gate_configured": False,
+        "required": False,
+        "measured_case_count": measured_count,
+        "unmeasured_case_count": len(results) - measured_count,
+        "cost_estimate_usd_total": round(sum(measured), 6) if measured else None,
+        "passed": None,
+        "residual": (
+            "Provider usage and pricing were not supplied for every golden case; "
+            "cost is not an acceptance gate."
+            if status != "measured"
+            else "Cost is measured but no budget threshold is configured."
+        ),
+    }
 
 
 def _tool_context(

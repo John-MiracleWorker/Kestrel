@@ -5,56 +5,20 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  cross-platform:
-    name: Cross-platform Python ${{ matrix.python }} on ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            python: "3.11"
-          - os: ubuntu-latest
-            python: "3.12"
-          - os: ubuntu-latest
-            python: "3.13"
-          - os: macos-latest
-            python: "3.11"
-          - os: macos-latest
-            python: "3.12"
-          - os: windows-latest
-            python: "3.11"
-    runs-on: ${{ matrix.os }}
-    env:
-      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: ${{ matrix.python }}
-      - name: Install exact tag source
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
-          python -m pip check
-      - name: Validate exact tag source
-        run: |
-          python -m compileall -q src tests scripts
-          ruff check scripts src tests
-          mypy src
-          pytest -q
-
-  validate-and-release:
-    needs: cross-platform
+  build-release-candidate:
+    name: Build and validate the exact release candidate
     runs-on: ubuntu-latest
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-      RELEASE_EXTRAS: "memvid,openai,anthropic,gemini,server,mcp"
+      RELEASE_EXTRAS: "memvid,openai,anthropic,gemini,server,mcp,keyring"
       GITLEAKS_IMAGE: "zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -68,11 +32,50 @@ jobs:
           TAG_COMMIT="$(git rev-parse "$GITHUB_REF^{commit}")"
           EVENT_COMMIT="$(git rev-parse "$GITHUB_SHA^{commit}")"
           test "$TAG_COMMIT" = "$EVENT_COMMIT"
+          printf 'RELEASE_COMMIT_SHA=%s\n' "$EVENT_COMMIT" >> "$GITHUB_ENV"
           git merge-base --is-ancestor "$TAG_COMMIT" origin/main
+          supervisor=scripts/installer-server-supervisor.sh
+          git ls-files --error-unmatch "$supervisor"
+          git cat-file -e "$TAG_COMMIT:$supervisor"
+          test -f "$supervisor" && test ! -L "$supervisor"
+          test "$(git hash-object "$supervisor")" = "$(git rev-parse "$TAG_COMMIT:$supervisor")"
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
+      - name: Require successful exact-SHA main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ci_runs="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="$RELEASE_COMMIT_SHA" \
+            -f branch=main \
+            -f event=push \
+            -f status=completed \
+            -f per_page=100)"
+          CI_RUNS_JSON="$ci_runs" python - <<'PY'
+          import json
+          import os
+
+          expected_sha = os.environ["RELEASE_COMMIT_SHA"]
+          runs = json.loads(os.environ["CI_RUNS_JSON"]).get("workflow_runs", [])
+          successful = [
+              run
+              for run in runs
+              if run.get("head_sha") == expected_sha
+              and run.get("head_branch") == "main"
+              and run.get("event") == "push"
+              and run.get("status") == "completed"
+              and run.get("conclusion") == "success"
+          ]
+          if not successful:
+              raise SystemExit(
+                  f"release commit {expected_sha} has no successful exact-SHA CI push run on main"
+              )
+          print(f"verified successful main CI run {successful[0].get('html_url', '')}")
+          PY
+
       - name: Install pinned uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -81,21 +84,39 @@ jobs:
         run: |
           VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           test "$GITHUB_REF_NAME" = "v$VERSION"
-          python scripts/check_project_metadata.py
+          python scripts/check_project_metadata.py --release-tag "$GITHUB_REF_NAME"
           uv lock --check
-      - name: Install Python dependencies
+      - name: Install hash-locked build bootstrap and Python dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev,memvid,mcp]'
-          python -m pip install 'cyclonedx-bom==7.3.0' 'pip-audit==2.10.1'
+          python -m pip install --require-hashes --only-binary=:all: \
+            -r config/release-build-bootstrap.txt
+          uv export --frozen --no-dev --no-emit-local \
+            --group release \
+            --extra dev \
+            --extra memvid \
+            --extra mcp \
+            --extra keyring \
+            --format requirements.txt \
+            --output-file "${RUNNER_TEMP}/requirements-validation.txt"
+          python -m pip install --require-hashes --only-binary=:all: \
+            -r "${RUNNER_TEMP}/requirements-validation.txt"
+          python -m pip install --no-build-isolation --no-deps \
+            -e '.[dev,memvid,mcp,keyring]'
       - name: Validate Python package
         run: |
           python -m compileall -q src tests scripts
           ruff check scripts src tests
           mypy src
           pytest -q
-          python scripts/run_golden_evals.py --backend memory --provider mock
-          python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir "${RUNNER_TEMP}/kestrel-memvid-golden"
+          VALIDATION_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+          docker pull "$VALIDATION_IMAGE"
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE="$VALIDATION_IMAGE" \
+            python scripts/run_golden_evals.py --backend memory --provider mock \
+              --max-case-latency-ms 45000
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE="$VALIDATION_IMAGE" \
+            python scripts/run_golden_evals.py --backend memvid --provider mock \
+              --memory-dir "${RUNNER_TEMP}/kestrel-memvid-golden" \
+              --max-case-latency-ms 45000
           ruff check benchmarks/real_agent_learning_benchmark.py tests/test_real_agent_learning_benchmark.py
           MYPYPATH=src mypy --strict benchmarks/real_agent_learning_benchmark.py
           python benchmarks/real_agent_learning_benchmark.py --output "${RUNNER_TEMP}/agent-learning-gate.json"
@@ -136,34 +157,145 @@ jobs:
         run: python scripts/stage_web_release.py
 
       - name: Build Python release artifacts
-        run: python -m build --outdir dist
-      - name: Build and attest release container
+        run: python -m build --no-isolation --outdir dist
+      - name: Validate release artifact metadata
+        run: python -m twine check --strict dist/*
+      - name: Enable ARM64 container emulation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - name: Configure Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build, execute, and scan release containers
         env:
           TRIVY_IMAGE: "aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f"
         run: |
-          docker build -t kestrel-agent:release .
-          docker run --rm --entrypoint /bin/sh kestrel-agent:release -c \
-            'set -eu;
-            test "$(id -u)" = 999;
-            test -f /app/LICENSE;
-            test -f /app/web/dist/THIRD_PARTY_NOTICES.txt;
-            test ! -u /usr/bin/mount;
-            test ! -u /usr/bin/umount;
-            test ! -u /usr/bin/su'
+          source_url="https://github.com/${GITHUB_REPOSITORY}"
+          for architecture in amd64 arm64; do
+            docker buildx build \
+              --platform "linux/${architecture}" \
+              --load \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --label "org.opencontainers.image.source=${source_url}" \
+              --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+              -t "kestrel-agent:release-${architecture}" \
+              .
+          done
+          for image in kestrel-agent:release-amd64 kestrel-agent:release-arm64; do
+            architecture="${image##*-}"
+            docker run --rm --entrypoint /bin/sh "$image" -c \
+              'set -eu;
+              test "$(id -u)" = 999;
+              test -f /app/LICENSE;
+              test -f /app/web/dist/THIRD_PARTY_NOTICES.txt;
+              test ! -u /usr/bin/mount;
+              test ! -u /usr/bin/umount;
+              test ! -u /usr/bin/su'
+            docker run --rm "$image" nest-agent doctor \
+              --backend memvid \
+              --memory-dir /tmp/kestrel-container-memory \
+              --provider mock \
+              --model mock
+            probe_name="kestrel-release-readonly-${architecture}"
+            probe_token="kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+            cleanup_probe() {
+              docker rm -f "$probe_name" >/dev/null 2>&1 || true
+            }
+            trap cleanup_probe EXIT
+            docker run -d \
+              --name "$probe_name" \
+              --platform "linux/${architecture}" \
+              --user 999:999 \
+              --read-only \
+              --tmpfs /data:rw,nosuid,nodev,size=1073741824,uid=999,gid=999,mode=0700 \
+              --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 256 \
+              --memory 1g \
+              --cpus 2 \
+              -e NEST_AGENT_API_TOKEN="$probe_token" \
+              -e NEST_AGENT_PROVIDER=mock \
+              -e NEST_AGENT_MODEL=mock \
+              -p 127.0.0.1::8765 \
+              "$image"
+            probe_port="$(docker port "$probe_name" 8765/tcp | awk -F: 'END {print $NF}')"
+            test -n "$probe_port"
+            probe_ready=0
+            for _ in {1..120}; do
+              if curl -fsS \
+                -H "Authorization: Bearer $probe_token" \
+                "http://127.0.0.1:${probe_port}/api/health/ready" \
+                >"${RUNNER_TEMP}/kestrel-readonly-${architecture}-ready.json"; then
+                probe_ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$probe_ready" -ne 1 ]; then
+              docker logs "$probe_name" >&2
+              exit 1
+            fi
+            NEST_AGENT_API_TOKEN="$probe_token" python scripts/run-soak.py \
+              --base-url "http://127.0.0.1:${probe_port}" \
+              --runs 4 \
+              --concurrency 2 \
+              --timeout 90 \
+              --response-contract mock-echo \
+              --max-p95 30 \
+              --min-throughput 0.1
+            cleanup_probe
+            trap - EXIT
+          done
           docker pull "$TRIVY_IMAGE"
           docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$RUNNER_TEMP:/reports" \
-            "$TRIVY_IMAGE" image \
+            -v "$PWD:/repo:ro" \
+            -w /repo \
+            "$TRIVY_IMAGE" config \
             --skip-version-check \
-            --scanners vuln \
-            --pkg-types os,library \
-            --format json \
-            --output /reports/kestrel-release-container-trivy.json \
-            kestrel-agent:release
-          python scripts/check_container_vulnerabilities.py \
-            "$RUNNER_TEMP/kestrel-release-container-trivy.json" \
-            --exceptions config/container_vulnerability_exceptions.json
+            --skip-check-update \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignore-policy config/trivy-dockerfile-ignore.rego \
+            Dockerfile
+          for architecture in amd64 arm64; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP:/reports" \
+              "$TRIVY_IMAGE" image \
+              --skip-version-check \
+              --scanners vuln \
+              --pkg-types os,library \
+              --format json \
+              --output "/reports/kestrel-release-container-trivy-${architecture}.json" \
+              "kestrel-agent:release-${architecture}"
+            python scripts/check_container_vulnerabilities.py \
+              "$RUNNER_TEMP/kestrel-release-container-trivy-${architecture}.json" \
+              --exceptions config/container_vulnerability_exceptions.json
+          done
+          container_artifacts="$RUNNER_TEMP/kestrel-container-artifacts"
+          mkdir -p "$container_artifacts"
+          for architecture in amd64 arm64; do
+            image="kestrel-agent:release-${architecture}"
+            test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$architecture"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "$image")" = "$GITHUB_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.source\"}}' "$image")" = "$source_url"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' "$image")" = "$GITHUB_REF_NAME"
+            docker save "$image" | gzip -1 > \
+              "$container_artifacts/kestrel-release-container-${architecture}.tar.gz"
+          done
+          (
+            cd "$container_artifacts"
+            sha256sum kestrel-release-container-*.tar.gz > SHA256SUMS
+          )
+      - name: Upload exact scanned release containers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-containers-${{ github.sha }}
+          path: ${{ runner.temp }}/kestrel-container-artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
       - name: Verify packaged licenses and web workbench
         run: |
           python - <<'PY'
@@ -206,6 +338,8 @@ jobs:
           path = Path("dist/install.sh")
           text = path.read_text(encoding="utf-8")
           tag = os.environ["GITHUB_REF_NAME"]
+          release_sha = os.environ["RELEASE_COMMIT_SHA"]
+          version = tag.removeprefix("v")
           wheels = list(Path("dist").glob("*.whl"))
           if len(wheels) != 1:
               raise SystemExit(f"expected exactly one wheel, found: {wheels}")
@@ -224,6 +358,10 @@ jobs:
                   f'DEFAULT_WHEEL_URL="{release_base}/{wheels[0].name}"',
               'DEFAULT_CHECKSUMS_URL=""':
                   f'DEFAULT_CHECKSUMS_URL="{release_base}/SHA256SUMS"',
+              'DEFAULT_RELEASE_SHA=""':
+                  f'DEFAULT_RELEASE_SHA="{release_sha}"',
+              'DEFAULT_RELEASE_VERSION=""':
+                  f'DEFAULT_RELEASE_VERSION="{version}"',
               "https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh":
                   f"{release_base}/install.sh",
               "Defaults to main.": f"Defaults to {tag}.",
@@ -240,9 +378,41 @@ jobs:
           grep -Fq "https://github.com/John-MiracleWorker/Kestrel/releases/download/$GITHUB_REF_NAME/install.sh | bash" <<< "$installer_help"
           installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-plan bash dist/install.sh)"
           grep -Fq "ref: $GITHUB_REF_NAME" <<< "$installer_plan"
+          grep -Fq "immutable release commit: $RELEASE_COMMIT_SHA" <<< "$installer_plan"
+          grep -Fq "verify checkout HEAD equals immutable release commit $RELEASE_COMMIT_SHA" <<< "$installer_plan"
           grep -Fq "verify SHA256SUMS" <<< "$installer_plan"
           grep -Fq "pip install --require-hashes" <<< "$installer_plan"
           grep -Fq "pip install --no-deps" <<< "$installer_plan"
+          stdin_installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-stdin-plan bash < dist/install.sh)"
+          grep -Fq "ref: $GITHUB_REF_NAME" <<< "$stdin_installer_plan"
+          grep -Fq "verify SHA256SUMS" <<< "$stdin_installer_plan"
+          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-ref-override \
+            KESTREL_REF=main bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_REF override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-repo-override \
+            KESTREL_REPO=https://example.invalid/fork.git bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_REPO override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-requirements-override \
+            KESTREL_REQUIREMENTS_URL=https://example.invalid/replacement-requirements.txt \
+            bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_REQUIREMENTS_URL override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-wheel-override \
+            KESTREL_WHEEL_URL=https://example.invalid/replacement.whl bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_WHEEL_URL override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-checksums-override \
+            KESTREL_CHECKSUMS_URL=https://example.invalid/replacement-SHA256SUMS \
+            bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_CHECKSUMS_URL override" >&2
+            exit 1
+          fi
       - name: Export locked default release dependencies
         run: |
           extra_args=()
@@ -260,13 +430,22 @@ jobs:
           wheels=(dist/*.whl)
           /tmp/kestrel-release-smoke/bin/python -m pip install \
             --require-hashes \
+            --only-binary=:all: \
             -r dist/requirements-release.txt
           /tmp/kestrel-release-smoke/bin/python -m pip install \
             --no-deps \
             "${wheels[0]}[${RELEASE_EXTRAS}]"
           /tmp/kestrel-release-smoke/bin/python -m pip check
+          /tmp/kestrel-release-smoke/bin/python -c 'import importlib.metadata, keyring, os; actual=importlib.metadata.version("nested-memvid-agent"); expected=os.environ["GITHUB_REF_NAME"].removeprefix("v"); assert actual == expected, (actual, expected); assert callable(keyring.get_keyring)'
           /tmp/kestrel-release-smoke/bin/nest-agent doctor --backend memvid --memory-dir /tmp/kestrel-release-memory --provider mock --model mock
           /tmp/kestrel-release-smoke/bin/nest-agent chat --backend memvid --memory-dir /tmp/kestrel-release-chat --provider mock --model mock --message "release wheel smoke"
+          NEST_AGENT_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          export NEST_AGENT_API_TOKEN
+          export NEST_AGENT_REQUIRE_API_AUTH=1
+          export NEST_AGENT_API_RATE_LIMIT_REQUESTS=100000
+          export NEST_AGENT_API_RATE_LIMIT_WINDOW_SECONDS=60
+          export NEST_AGENT_MAX_CONCURRENT_RUNS=1
+          export NEST_AGENT_MAX_QUEUED_RUNS=4
           (
             cd /tmp
             /tmp/kestrel-release-smoke/bin/nest-agent server \
@@ -289,14 +468,75 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:8878/ | grep -q '<div id="root"></div>'
+          unauthenticated_code="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8878/api/health/ready)"
+          test "$unauthenticated_code" = 401
+          curl -fsS \
+            -H "Authorization: Bearer $NEST_AGENT_API_TOKEN" \
+            http://127.0.0.1:8878/api/health/ready >/tmp/kestrel-release-readiness.json
           python scripts/run-soak.py \
             --base-url http://127.0.0.1:8878 \
             --runs 30 \
-            --concurrency 8 \
+            --concurrency 4 \
             --timeout 60 \
-            --max-p95 10
+            --response-contract mock-echo \
+            --max-p95 10 \
+            --min-throughput 1
+          python scripts/run-soak.py \
+            --base-url http://127.0.0.1:8878 \
+            --runs 40 \
+            --concurrency 40 \
+            --timeout 60 \
+            --response-contract mock-echo \
+            --require-overload \
+            --min-completed 4 \
+            --max-overload-ratio 0.90 \
+            --max-p95 10 \
+            --min-throughput 0.5
           kill "$server_pid"
           trap - EXIT
+      - name: Smoke-test built source distribution
+        run: |
+          python -m venv /tmp/kestrel-release-sdist-smoke
+          sdists=(dist/*.tar.gz)
+          test "${#sdists[@]}" -eq 1
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            -r config/release-build-bootstrap.txt
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            -r dist/requirements-release.txt
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip install \
+            --no-build-isolation \
+            --no-deps \
+            "${sdists[0]}[${RELEASE_EXTRAS}]"
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip check
+          /tmp/kestrel-release-sdist-smoke/bin/python -c \
+            'import keyring; assert callable(keyring.get_keyring)'
+          /tmp/kestrel-release-sdist-smoke/bin/nest-agent doctor \
+            --backend memvid \
+            --memory-dir /tmp/kestrel-release-sdist-memory \
+            --provider mock \
+            --model mock
+          /tmp/kestrel-release-sdist-smoke/bin/nest-agent chat \
+            --backend memvid \
+            --memory-dir /tmp/kestrel-release-sdist-chat \
+            --provider mock \
+            --model mock \
+            --message "release sdist smoke"
+          /tmp/kestrel-release-sdist-smoke/bin/python - <<'PY'
+          import importlib.metadata
+          import os
+          from importlib.resources import files
+
+          expected = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          actual = importlib.metadata.version("nested-memvid-agent")
+          assert actual == expected, (actual, expected)
+          web = files("nested_memvid_agent").joinpath("web_dist")
+          assert web.joinpath("index.html").is_file()
+          assert web.joinpath("THIRD_PARTY_NOTICES.txt").is_file()
+          PY
       - name: Audit shipped dependencies and generate release SBOM
         run: |
           RELEASE_SITE_PACKAGES="$(/tmp/kestrel-release-smoke/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
@@ -320,6 +560,7 @@ jobs:
               "openai",
               "anthropic",
               "google-genai",
+              "keyring",
               "fastapi",
               "mcp",
           }
@@ -341,6 +582,350 @@ jobs:
             test "${#sdists[@]}" -eq 1
             sha256sum install.sh requirements-release.txt "${wheels[@]}" "${sdists[@]}" sbom.cdx.json > SHA256SUMS
           )
+      - name: Verify complete release payload
+        run: python scripts/verify_release_payload.py dist --expected-version "$GITHUB_REF_NAME"
+      - name: Upload validated release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-release-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  cross-platform:
+    name: Exact wheel on ${{ format('{0}{1}', matrix.os, matrix.os_suffix) }} ${{ matrix.machine }} / Python ${{ matrix.python }}
+    needs: build-release-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+            machine: x86_64
+          - os: ubuntu-latest
+            python: "3.12"
+            machine: x86_64
+          - os: ubuntu-latest
+            python: "3.13"
+            machine: x86_64
+          - os: macos-latest
+            python: "3.11"
+            machine: arm64
+          - os: macos-latest
+            python: "3.12"
+            machine: arm64
+          - os: macos-latest
+            python: "3.13"
+            machine: arm64
+          - os: macos-15
+            os_suffix: -intel
+            python: "3.11"
+            machine: x86_64
+          - os: macos-15
+            os_suffix: -intel
+            python: "3.12"
+            machine: x86_64
+          - os: macos-15
+            os_suffix: -intel
+            python: "3.13"
+            machine: x86_64
+          - os: windows-latest
+            python: "3.11"
+            machine: AMD64
+    runs-on: ${{ format('{0}{1}', matrix.os, matrix.os_suffix) }}
+    permissions:
+      actions: read
+      contents: read
+    env:
+      PYTHONNOUSERSITE: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Verify runner architecture matches the matrix label
+        run: >-
+          python -c "import platform;
+          actual=platform.machine().casefold();
+          expected='${{ matrix.machine }}'.casefold();
+          assert actual == expected, (actual, expected)"
+      - name: Download the single validated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-release-${{ github.sha }}
+          path: dist
+      - name: Verify and install exact wheel payload
+        run: >-
+          python -m scripts.verify_exact_wheel_install dist
+          --expected-version "${{ github.ref_name }}"
+          --source-root .
+
+  publish:
+    name: Publish exact payload and multi-architecture image
+    needs:
+      - cross-platform
+      - build-release-candidate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Download validated release payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-release-${{ github.sha }}
+          path: dist
+      - name: Download exact scanned release containers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-containers-${{ github.sha }}
+          path: container-dist
+      - name: Verify downloaded payload identity and checksums
+        run: python scripts/verify_release_payload.py dist --expected-version "$GITHUB_REF_NAME"
+      - name: Verify and load exact scanned container archives
+        run: |
+          (
+            cd container-dist
+            sha256sum -c SHA256SUMS
+          )
+          for architecture in amd64 arm64; do
+            gzip -dc "container-dist/kestrel-release-container-${architecture}.tar.gz" \
+              | docker load
+            image="kestrel-agent:release-${architecture}"
+            test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$architecture"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "$image")" = "$GITHUB_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.source\"}}' "$image")" = "https://github.com/$GITHUB_REPOSITORY"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' "$image")" = "$GITHUB_REF_NAME"
+          done
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Bind the GHCR package name to this repository
+        id: image
+        run: |
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf 'name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
+      - name: Revalidate the current remote tag immediately before first publication
+        run: |
+          direct_ref="refs/tags/$GITHUB_REF_NAME"
+          peeled_ref="${direct_ref}^{}"
+          remote_tags="$(git ls-remote --tags origin "$direct_ref" "$peeled_ref")"
+          direct_count="$(awk -v ref="$direct_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          peeled_count="$(awk -v ref="$peeled_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          test "$direct_count" = 1
+          test "$peeled_count" -le 1
+          direct_sha="$(awk -v ref="$direct_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          peeled_sha="$(awk -v ref="$peeled_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          remote_tag_commit="${peeled_sha:-$direct_sha}"
+          event_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          test "$remote_tag_commit" = "$event_commit"
+
+          remote_main="$(git ls-remote --heads origin refs/heads/main)"
+          test "$(awk '$2 == "refs/heads/main" { count += 1 } END { print count + 0 }' <<< "$remote_main")" = 1
+          remote_main_commit="$(awk '$2 == "refs/heads/main" { print $1 }' <<< "$remote_main")"
+          git fetch --no-tags origin refs/heads/main
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$remote_main_commit"
+          git merge-base --is-ancestor "$event_commit" "$remote_main_commit"
+      - name: Log in only for immutable image publication
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          for architecture in amd64 arm64; do
+            target="$IMAGE_NAME:sha-${GITHUB_SHA}-${architecture}"
+            docker tag "kestrel-agent:release-${architecture}" "$target"
+            push_log="$RUNNER_TEMP/kestrel-${architecture}-push.log"
+            docker push "$target" 2>&1 | tee "$push_log"
+            python - "$push_log" "$RUNNER_TEMP/kestrel-${architecture}-pushed.digest" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          log_path, digest_path = map(Path, sys.argv[1:])
+          matches = re.findall(
+              r"(?m)^[^\s]+: digest: (sha256:[0-9a-f]{64}) size: [0-9]+\s*$",
+              log_path.read_text(encoding="utf-8"),
+          )
+          if len(matches) != 1:
+              raise SystemExit(f"expected one pushed manifest digest, found {matches}")
+          digest_path.write_text(matches[0], encoding="ascii")
+          PY
+          done
+          amd64_digest="$(cat "$RUNNER_TEMP/kestrel-amd64-pushed.digest")"
+          arm64_digest="$(cat "$RUNNER_TEMP/kestrel-arm64-pushed.digest")"
+          docker buildx imagetools create \
+            --tag "$IMAGE_NAME:sha-${GITHUB_SHA}" \
+            --metadata-file "$RUNNER_TEMP/kestrel-image-index-metadata.json" \
+            "$IMAGE_NAME@$amd64_digest" \
+            "$IMAGE_NAME@$arm64_digest"
+          docker logout ghcr.io
+      - name: Verify public multi-architecture manifest and run post-publish doctors
+        id: verify-image
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          immutable_ref="$IMAGE_NAME:sha-${GITHUB_SHA}"
+          manifest_json="$RUNNER_TEMP/kestrel-image-index.json"
+          docker buildx imagetools inspect "$immutable_ref" \
+            --format '{{json .Manifest}}' > "$manifest_json"
+          python - "$manifest_json" \
+            "$RUNNER_TEMP/kestrel-image-index-metadata.json" \
+            "$RUNNER_TEMP/kestrel-amd64-pushed.digest" \
+            "$RUNNER_TEMP/kestrel-arm64-pushed.digest" \
+            "$RUNNER_TEMP" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          (
+              manifest_path,
+              metadata_path,
+              amd64_digest_path,
+              arm64_digest_path,
+              output_dir,
+              github_output,
+          ) = map(Path, sys.argv[1:])
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          digest = manifest.get("digest")
+          metadata_digest = metadata.get("containerimage.descriptor", {}).get("digest")
+          if digest != metadata_digest or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(digest)):
+              raise SystemExit(
+                  f"published index digest mismatch: inspect={digest}, metadata={metadata_digest}"
+              )
+          descriptors = manifest.get("manifests", [])
+          platforms = {
+              (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture")):
+                  item.get("digest")
+              for item in descriptors
+          }
+          expected = {
+              ("linux", "amd64"): amd64_digest_path.read_text(encoding="ascii"),
+              ("linux", "arm64"): arm64_digest_path.read_text(encoding="ascii"),
+          }
+          if len(descriptors) != 2 or platforms != expected:
+              raise SystemExit(
+                  f"published platform descriptors do not match pushed digests: "
+                  f"actual={platforms}, expected={expected}"
+              )
+          for (_os_name, architecture), platform_digest in platforms.items():
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(platform_digest)):
+                  raise SystemExit(f"invalid {architecture} digest: {platform_digest}")
+              (output_dir / f"kestrel-{architecture}.digest").write_text(
+                  str(platform_digest), encoding="ascii"
+              )
+          with github_output.open("a", encoding="utf-8") as output:
+              output.write(f"digest={digest}\n")
+          PY
+          for architecture in amd64 arm64; do
+            platform_digest="$(cat "$RUNNER_TEMP/kestrel-${architecture}.digest")"
+            image_ref="$IMAGE_NAME@$platform_digest"
+            docker pull --platform "linux/${architecture}" "$image_ref"
+            test "$(docker image inspect --format '{{.Architecture}}' "$image_ref")" = "$architecture"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "$image_ref")" = "$GITHUB_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.source\"}}' "$image_ref")" = "https://github.com/$GITHUB_REPOSITORY"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' "$image_ref")" = "$GITHUB_REF_NAME"
+            docker run --rm --platform "linux/${architecture}" "$image_ref" \
+              nest-agent doctor \
+              --backend memvid \
+              --memory-dir "/tmp/kestrel-post-publish-${architecture}" \
+              --provider mock \
+              --model mock
+          done
+      - name: Revalidate the current remote tag immediately before attestations
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          direct_ref="refs/tags/$GITHUB_REF_NAME"
+          peeled_ref="${direct_ref}^{}"
+          remote_tags="$(git ls-remote --tags origin "$direct_ref" "$peeled_ref")"
+          direct_count="$(awk -v ref="$direct_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          peeled_count="$(awk -v ref="$peeled_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          test "$direct_count" = 1
+          test "$peeled_count" -le 1
+          direct_sha="$(awk -v ref="$direct_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          peeled_sha="$(awk -v ref="$peeled_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          remote_tag_commit="${peeled_sha:-$direct_sha}"
+          event_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          test "$remote_tag_commit" = "$event_commit"
+
+          remote_main="$(git ls-remote --heads origin refs/heads/main)"
+          test "$(awk '$2 == "refs/heads/main" { count += 1 } END { print count + 0 }' <<< "$remote_main")" = 1
+          remote_main_commit="$(awk '$2 == "refs/heads/main" { print $1 }' <<< "$remote_main")"
+          git fetch --no-tags origin refs/heads/main
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$remote_main_commit"
+          git merge-base --is-ancestor "$event_commit" "$remote_main_commit"
+
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Attest multi-architecture container provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.verify-image.outputs.digest }}
+          push-to-registry: true
+      - name: Attest release payload provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*
+      - name: Revalidate remote tag and publish version immediately before GitHub release
+        env:
+          EXPECTED_IMAGE_DIGEST: ${{ steps.verify-image.outputs.digest }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          direct_ref="refs/tags/$GITHUB_REF_NAME"
+          peeled_ref="${direct_ref}^{}"
+          remote_tags="$(git ls-remote --tags origin "$direct_ref" "$peeled_ref")"
+          direct_count="$(awk -v ref="$direct_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          peeled_count="$(awk -v ref="$peeled_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          test "$direct_count" = 1
+          test "$peeled_count" -le 1
+          direct_sha="$(awk -v ref="$direct_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          peeled_sha="$(awk -v ref="$peeled_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          remote_tag_commit="${peeled_sha:-$direct_sha}"
+          event_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          test "$remote_tag_commit" = "$event_commit"
+
+          remote_main="$(git ls-remote --heads origin refs/heads/main)"
+          test "$(awk '$2 == "refs/heads/main" { count += 1 } END { print count + 0 }' <<< "$remote_main")" = 1
+          remote_main_commit="$(awk '$2 == "refs/heads/main" { print $1 }' <<< "$remote_main")"
+          git fetch --no-tags origin refs/heads/main
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$remote_main_commit"
+          git merge-base --is-ancestor "$event_commit" "$remote_main_commit"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE_NAME:$GITHUB_REF_NAME" \
+            --metadata-file "$RUNNER_TEMP/kestrel-version-image-metadata.json" \
+            "$IMAGE_NAME@$EXPECTED_IMAGE_DIGEST"
+          version_digest="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["containerimage.descriptor"]["digest"])' "$RUNNER_TEMP/kestrel-version-image-metadata.json")"
+          test "$version_digest" = "$EXPECTED_IMAGE_DIGEST"
+      - name: Re-peel the remote tag immediately before GitHub release creation
+        run: |
+          direct_ref="refs/tags/$GITHUB_REF_NAME"
+          peeled_ref="${direct_ref}^{}"
+          remote_tags="$(git ls-remote --tags origin "$direct_ref" "$peeled_ref")"
+          direct_count="$(awk -v ref="$direct_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          peeled_count="$(awk -v ref="$peeled_ref" '$2 == ref { count += 1 } END { print count + 0 }' <<< "$remote_tags")"
+          test "$direct_count" = 1
+          test "$peeled_count" -le 1
+          direct_sha="$(awk -v ref="$direct_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          peeled_sha="$(awk -v ref="$peeled_ref" '$2 == ref { print $1 }' <<< "$remote_tags")"
+          remote_tag_commit="${peeled_sha:-$direct_sha}"
+          test "$remote_tag_commit" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -349,3 +934,6 @@ jobs:
           --verify-tag
           --generate-notes
           --title "Kestrel $GITHUB_REF_NAME"
+      - name: Remove registry credentials from the runner
+        if: always()
+        run: docker logout ghcr.io || true

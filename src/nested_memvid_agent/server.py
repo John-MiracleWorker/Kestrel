@@ -8,7 +8,6 @@ from threading import Thread
 from typing import Any
 from uuid import uuid4
 
-from .app_factory import build_agent
 from .behavior_delta_ledger import BehaviorDeltaLedger
 from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
@@ -20,9 +19,8 @@ from .layers import (
     prepare_private_runs_root,
 )
 from .llm.model_catalog import DEFAULT_API_KEY_ENVS
-from .mcp_manager import MCPManager
+from .mcp_manager import MCPManager, mcp_sensitive_material_transition
 from .models import MemoryLayer, RetrievalQuery
-from .orchestrator import build_memory_system
 from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
 from .routine_loop import RoutineLoop
@@ -81,6 +79,38 @@ from .server_support import (
 )
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, CapabilityConflictError
+
+_BROWSER_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "base-uri 'none'; "
+        "connect-src 'self'; "
+        "font-src 'self' data:; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "img-src 'self' data: https:; "
+        "manifest-src 'self'; "
+        "object-src 'none'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "worker-src 'self' blob:"
+    ),
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": (
+        "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+        "magnetometer=(), microphone=(), payment=(), usb=()"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
+def _apply_browser_security_headers(response: Any) -> None:
+    for name, value in _BROWSER_SECURITY_HEADERS.items():
+        if name not in response.headers:
+            response.headers[name] = value
 
 
 def create_app(config: AgentConfig | None = None) -> Any:
@@ -163,8 +193,13 @@ def _create_app(
     runtime_settings_store = RuntimeSettingsStore(default_runtime_settings_path(base_config))
     active_config = apply_runtime_settings(base_config, runtime_settings_store.load(base_config))
     _prepare_private_runtime_artifacts(active_config)
+    workspace = active_config.workspace.expanduser().resolve()
+    secret_store_path = active_config.secret_store_path.expanduser()
+    if not secret_store_path.is_absolute():
+        secret_store_path = workspace / secret_store_path
+    secret_store_path = secret_store_path.resolve()
     secret_broker = build_secret_broker(
-        active_config.secret_store_path, backend=active_config.secret_backend
+        secret_store_path, backend=active_config.secret_backend
     )
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
@@ -172,6 +207,9 @@ def _create_app(
         state,
         allow_network_endpoints=active_config.allow_mcp_network_endpoints,
         secret_resolver=secret_broker.resolve,
+        workspace=workspace,
+        secret_store_path=secret_store_path,
+        secret_backend=active_config.secret_backend,
     )
     skills = SkillManager(active_config.skills_dir, state)
     plugins = PluginManager(active_config.plugins_dir, state)
@@ -188,10 +226,12 @@ def _create_app(
     )
 
     def abort_runtime_construction() -> None:
-        try:
-            runs.shutdown(timeout_seconds=5.0)
-        finally:
-            mcp.shutdown()
+        runs_stopped = runs.shutdown(timeout_seconds=5.0)
+        if not runs_stopped:
+            runs_stopped = runs.shutdown(timeout_seconds=1.0)
+        mcp_stopped = mcp.shutdown()
+        if not runs_stopped or not mcp_stopped:
+            raise RuntimeError("runtime_shutdown_incomplete")
 
     construction_cleanup.append(abort_runtime_construction)
     channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve, run_manager=runs)
@@ -240,11 +280,11 @@ def _create_app(
         return True
 
     def audit_plugin(action: str, plugin: dict[str, Any]) -> None:
-        memory = build_memory_system(active_config.backend, active_config.memory_dir)
+        agent = runs.build_runtime_agent(active_config)
         try:
-            plugins.write_audit_memory(memory, action=action, plugin=plugin)
+            plugins.write_audit_memory(agent.memory, action=action, plugin=plugin)
         finally:
-            memory.close_all()
+            runs.close_runtime_agent(agent)
 
     def inspect_memory_payload(
         *, query: str | None, layers: list[str] | None, k: int, include_inactive: bool = False
@@ -322,7 +362,8 @@ def _create_app(
             except Exception:  # noqa: BLE001 - MCP cleanup must still run
                 shutdown_incomplete = True
             try:
-                mcp.shutdown()
+                mcp_stopped = mcp.shutdown()
+                shutdown_incomplete = shutdown_incomplete or not mcp_stopped
             except Exception:  # noqa: BLE001 - report a fixed, non-secret lifecycle error
                 shutdown_incomplete = True
             if shutdown_incomplete:
@@ -351,7 +392,7 @@ def _create_app(
         origin = str(headers.get("origin", "")).strip()
         if origin:
             origin_host = _hostname_from_url(origin)
-            if origin_host and not _host_is_trusted(origin_host, trusted_hosts):  # nosec
+            if not origin_host or not _host_is_trusted(origin_host, trusted_hosts):  # nosec
                 return responses_module.JSONResponse(
                     {"detail": "untrusted_origin"}, status_code=403
                 )
@@ -415,6 +456,7 @@ def _create_app(
         request.state.request_id = request_id
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
+        _apply_browser_security_headers(response)
         return response
 
     register_runtime_routes(
@@ -446,6 +488,7 @@ def _create_app(
         app,
         http_exception=HTTPException,
         secret_broker=secret_broker,
+        sensitive_material_transition=mcp_sensitive_material_transition,
     )
     register_product_routes(app, active_config=lambda: active_config, secret_resolver=secret_broker.resolve)
     register_channel_routes(
@@ -873,7 +916,7 @@ def _create_app(
             raise HTTPException(status_code=400, detail="k must be between 1 and 50")
         if mode not in {"auto", "lex", "vec", "vector", "hybrid"}:
             raise HTTPException(status_code=400, detail="mode must be auto, lex, vector, or hybrid")
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
+        agent = runs.build_runtime_agent(active_config)
         try:
             selected_layers = (
                 tuple(MemoryLayer(layer) for layer in layers) if layers else tuple(MemoryLayer)
@@ -902,7 +945,7 @@ def _create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
-            agent.close()
+            runs.close_runtime_agent(agent)
 
     @app.get("/api/memory/search")  # type: ignore[untyped-decorator]
     def search_memory_get(
@@ -928,15 +971,15 @@ def _create_app(
 
     @app.get("/api/memory/verify")  # type: ignore[untyped-decorator]
     def verify_memory() -> dict[str, bool]:
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
+        agent = runs.build_runtime_agent(active_config)
         try:
             return {layer.value: ok for layer, ok in agent.memory.verify_all().items()}
         finally:
-            agent.close()
+            runs.close_runtime_agent(agent)
 
     @app.get("/api/memory/layers")  # type: ignore[untyped-decorator]
     def memory_layers() -> list[dict[str, object]]:
-        agent = build_agent(active_config, tools=runs.build_registry(), state=state, secret_resolver=secret_broker.resolve)
+        agent = runs.build_runtime_agent(active_config)
         try:
             verify = agent.memory.verify_all()
             vector_status = agent.memory.vector_index_status()
@@ -956,7 +999,7 @@ def _create_app(
                 )
             return rows
         finally:
-            agent.close()
+            runs.close_runtime_agent(agent)
 
     @app.get("/api/memory/inspect")  # type: ignore[untyped-decorator]
     def inspect_memory_get(

@@ -125,6 +125,48 @@ def test_setup_readiness_reports_first_run_prerequisites(tmp_path: Path) -> None
     assert checks["memory_storage"].status == SetupReadinessStatus.PASS
     assert checks["api_auth"].status == SetupReadinessStatus.WARN
     assert checks["proactive_routines"].status == SetupReadinessStatus.PASS
+    assert checks["validation_container"].status == SetupReadinessStatus.PASS
+
+
+def test_setup_readiness_requires_pinned_oci_image_for_arbitrary_code_tools(
+    tmp_path: Path,
+) -> None:
+    missing = build_setup_readiness_report(
+        AgentConfig(workspace=tmp_path, allow_shell=True, allow_codex_cli=True)
+    )
+    missing_check = {check.check_id: check for check in missing.checks}[
+        "validation_container"
+    ]
+    assert missing.ready is False
+    assert missing_check.status == SetupReadinessStatus.FAIL
+    assert "test.run" in missing_check.detail
+    assert "codex.exec" in missing_check.detail
+
+    mutable = build_setup_readiness_report(
+        AgentConfig(
+            workspace=tmp_path,
+            allow_shell=True,
+            validation_container_image="example.invalid/kestrel-validation:latest",
+        )
+    )
+    mutable_check = {check.check_id: check for check in mutable.checks}[
+        "validation_container"
+    ]
+    assert mutable_check.status == SetupReadinessStatus.FAIL
+
+    pinned = build_setup_readiness_report(
+        AgentConfig(
+            workspace=tmp_path,
+            allow_shell=True,
+            validation_container_image=(
+                "example.invalid/kestrel-validation@sha256:" + "a" * 64
+            ),
+        )
+    )
+    pinned_check = {check.check_id: check for check in pinned.checks}[
+        "validation_container"
+    ]
+    assert pinned_check.status == SetupReadinessStatus.PASS
 
 
 def test_setup_readiness_warns_when_proactive_api_owner_gate_is_open(

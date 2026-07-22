@@ -17,6 +17,7 @@ from nested_memvid_agent.extension_policy import (
 from nested_memvid_agent.extension_runner import (
     OCI_STDIN_LIMIT_BYTES,
     ContainerExecutionRequest,
+    OCIContainerCleanupQuarantine,
     OCIContainerRunner,
 )
 
@@ -196,6 +197,29 @@ def test_container_runner_rejects_remote_or_ambiguous_docker_configuration(
     assert not log_path.exists()
 
 
+def test_container_runner_fails_closed_when_docker_endpoint_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, log_path = _fake_engine(tmp_path)
+    source = _skill_tree(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(extension_runner.shutil, "which", lambda _name: engine[0])
+    monkeypatch.setattr(
+        extension_runner,
+        "_verified_docker_endpoint",
+        lambda _engine, _environment: (None, None),
+    )
+
+    result = OCIContainerRunner(engine_command=("docker",)).run(
+        _request(source, workspace)
+    )
+
+    assert result.error == "container_runtime_nonlocal"
+    assert "could not be verified as local" in result.content
+    assert not log_path.exists()
+
+
 def test_container_argv_rejects_unexpected_internal_write_mount(tmp_path: Path) -> None:
     source = _skill_tree(tmp_path)
     workspace = tmp_path / "workspace"
@@ -221,20 +245,124 @@ def test_container_argv_rejects_unexpected_internal_write_mount(tmp_path: Path) 
         )
 
 
-def test_container_runner_returns_cleanup_unverified_on_nonempty_probe(
+def test_container_runner_quarantines_unverified_cleanup_until_retry_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engine, _ = _fake_engine(tmp_path, cleanup_visible=True)
+    engine, log_path = _fake_engine(tmp_path, cleanup_visible=True)
     source = _skill_tree(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(extension_runner, "OCI_CLEANUP_TIMEOUT_SECONDS", 0.1)
-
-    result = OCIContainerRunner(engine_command=engine).run(
-        _request(source, workspace)
+    quarantine = OCIContainerCleanupQuarantine()
+    runner = OCIContainerRunner(
+        engine_command=engine,
+        cleanup_quarantine=quarantine,
     )
 
+    result = runner.run(_request(source, workspace))
+
     assert result.error == "extension_cleanup_unverified"
+    assert runner.pending_cleanup_count == 1
+    pending = runner.pending_cleanups()
+    first_run = next(call for call in _engine_calls(log_path) if call[0] == "run")
+    assert pending == (
+        {
+            "engine": list(engine),
+            "container_name": first_run[first_run.index("--name") + 1],
+        },
+    )
+
+    run_count = sum(call[0] == "run" for call in _engine_calls(log_path))
+    blocked = OCIContainerRunner(
+        engine_command=engine,
+        cleanup_quarantine=quarantine,
+    ).run(_request(source, workspace))
+    assert blocked.error == "extension_cleanup_pending"
+    assert sum(call[0] == "run" for call in _engine_calls(log_path)) == run_count
+
+    _fake_engine(tmp_path, cleanup_visible=False)
+    monkeypatch.setattr(extension_runner, "OCI_ABSENCE_CONFIRMATIONS", 1)
+    assert runner.retry_cleanup(timeout_seconds=1.0) is True
+    assert runner.pending_cleanup_count == 0
+
+    resumed = runner.run(_request(source, workspace))
+    assert resumed.success is True
+
+
+def test_default_runners_share_process_cleanup_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = OCIContainerCleanupQuarantine()
+    monkeypatch.setattr(
+        extension_runner,
+        "_PROCESS_OCI_CLEANUP_QUARANTINE",
+        quarantine,
+    )
+    engine, log_path = _fake_engine(tmp_path)
+    first = OCIContainerRunner(engine_command=engine)
+    second = OCIContainerRunner(engine_command=engine)
+    quarantine.retain(
+        engine=engine,
+        container_name="kestrel-skill-process-owned-deadbeef",
+        environment={"PATH": "/trusted/bin"},
+    )
+
+    source = _skill_tree(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    result = second.run(_request(source, workspace))
+
+    assert first.cleanup_quarantine is quarantine
+    assert second.cleanup_quarantine is quarantine
+    assert result.error == "extension_cleanup_pending"
+    assert not log_path.exists()
+
+
+def test_container_cleanup_retry_is_bounded_and_retains_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = OCIContainerCleanupQuarantine()
+    quarantine.retain(
+        engine=("/trusted/engine", "--host", "unix:///trusted.sock"),
+        container_name="kestrel-skill-exact-deadbeef",
+        environment={"PATH": "/trusted/bin"},
+    )
+    attempted: list[tuple[tuple[str, ...], str, dict[str, str], float]] = []
+
+    def fail_cleanup(
+        engine: tuple[str, ...],
+        name: str,
+        environment: dict[str, str],
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        attempted.append((engine, name, environment, timeout_seconds))
+        raise OSError("injected engine failure")
+
+    monkeypatch.setattr(
+        extension_runner,
+        "_remove_and_confirm_container_absent",
+        fail_cleanup,
+    )
+
+    assert quarantine.retry_cleanup(timeout_seconds=float("inf")) is False
+    assert attempted == []
+    assert quarantine.retry_cleanup(timeout_seconds=60.0) is False
+    assert attempted == [
+        (
+            ("/trusted/engine", "--host", "unix:///trusted.sock"),
+            "kestrel-skill-exact-deadbeef",
+            {"PATH": "/trusted/bin"},
+            pytest.approx(extension_runner.OCI_CLEANUP_RETRY_MAX_SECONDS),
+        )
+    ]
+    assert quarantine.status() == (
+        {
+            "engine": ["/trusted/engine", "--host", "unix:///trusted.sock"],
+            "container_name": "kestrel-skill-exact-deadbeef",
+        },
+    )
 
 
 def test_container_timeout_kills_late_mutation_before_return(tmp_path: Path) -> None:

@@ -396,6 +396,37 @@ def _stable_claim_digest(record: MemoryRecord) -> str:
     return "sha256:" + sha256(encoded).hexdigest()
 
 
+class MemoryCleanupIncompleteError(RuntimeError):
+    """Retain memory owners whose close could not be verified for a later retry."""
+
+    code = "memory_cleanup_incomplete"
+
+    def __init__(self, resources: Iterable[object], *, phase: str) -> None:
+        self.phase = phase
+        self._resources = list(resources)
+        super().__init__(f"{self.code}:{phase}")
+
+    @property
+    def pending_resource_count(self) -> int:
+        return len(self._resources)
+
+    def retry_cleanup(self) -> bool:
+        pending: list[object] = []
+        for resource in self._resources:
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                close = getattr(resource, "close_all", None)
+            if not callable(close):
+                pending.append(resource)
+                continue
+            try:
+                close()
+            except BaseException:
+                pending.append(resource)
+        self._resources = pending
+        return not pending
+
+
 class LayeredMemorySystem:
     """Routes reads/writes across nested memory layers."""
 
@@ -459,18 +490,30 @@ class LayeredMemorySystem:
                 )
                 if sidecar is not None:
                     vector_sidecars[layer] = sidecar
-                    sidecar.open()
-        except Exception:
+                    try:
+                        sidecar.open()
+                    except Exception as exc:  # noqa: BLE001 - index is disposable
+                        # Canonical layer construction must not fail because a
+                        # rebuildable vector cache is corrupt or unavailable.
+                        sidecar.record_open_error(exc)
+        except BaseException:
+            cleanup_failures: list[tuple[object, BaseException]] = []
             for sidecar in reversed(tuple(vector_sidecars.values())):
                 try:
                     sidecar.close()
-                except Exception:
-                    pass
+                except BaseException as exc:
+                    cleanup_failures.append((sidecar, exc))
             for backend in reversed(tuple(backends.values())):
                 try:
                     backend.close()
-                except Exception:
-                    pass
+                except BaseException as exc:
+                    cleanup_failures.append((backend, exc))
+            if cleanup_failures:
+                error = MemoryCleanupIncompleteError(
+                    (resource for resource, _exc in cleanup_failures),
+                    phase="memory_construction",
+                )
+                raise error from cleanup_failures[0][1]
             raise
         return cls(
             backends=backends,
@@ -1125,11 +1168,12 @@ class LayeredMemorySystem:
         return {layer: backend.verify() for layer, backend in self.backends.items()}
 
     def close_all(self) -> None:
+        # A failed force-seal is an unverified durability boundary. Retain all
+        # live backend handles and their exclusivity locks so close can be
+        # retried; releasing them here would allow another writer to observe a
+        # partially durable layer.
+        self.maybe_seal_all(force=True)
         first_error: Exception | None = None
-        try:
-            self.maybe_seal_all(force=True)
-        except Exception as exc:
-            first_error = exc
         for backend in self.backends.values():
             try:
                 backend.close()
@@ -1178,9 +1222,13 @@ class LayeredMemorySystem:
                     layer, "vector sidecar not configured"
                 )
                 continue
-            rebuilt[layer] = sidecar.rebuild(
-                tuple(self.backends[layer].iter_records(include_inactive=True))
-            )
+            try:
+                rebuilt[layer] = sidecar.rebuild(
+                    tuple(self.backends[layer].iter_records(include_inactive=True))
+                )
+            except Exception as exc:  # noqa: BLE001 - canonical memory stays available
+                sidecar.record_error(exc)
+                rebuilt[layer] = sidecar.status()
         return rebuilt
 
     def _with_conflict_metadata(
@@ -1224,12 +1272,18 @@ class LayeredMemorySystem:
     def _update_vector_sidecar(self, record: MemoryRecord) -> None:
         sidecar = self.vector_sidecars.get(record.layer)
         if sidecar is not None:
-            sidecar.upsert(record)
+            try:
+                sidecar.upsert(record)
+            except Exception as exc:  # noqa: BLE001 - sidecar is disposable/rebuildable
+                sidecar.record_error(exc)
 
     def _tombstone_vector_sidecar(self, layer: MemoryLayer, record_id: str) -> None:
         sidecar = self.vector_sidecars.get(layer)
         if sidecar is not None:
-            sidecar.tombstone(record_id)
+            try:
+                sidecar.tombstone(record_id)
+            except Exception as exc:  # noqa: BLE001 - canonical memory remains authoritative
+                sidecar.record_error(exc)
 
     def _find_layer_hits(
         self,
@@ -1329,9 +1383,14 @@ class LayeredMemorySystem:
         if sidecar is None:
             return []
         hits: list[MemoryHit] = []
-        for vector_hit in sidecar.search(
-            query, k=k, min_score=min_relevancy, include_inactive=include_inactive
-        ):
+        try:
+            vector_hits = sidecar.search(
+                query, k=k, min_score=min_relevancy, include_inactive=include_inactive
+            )
+        except Exception as exc:  # noqa: BLE001 - hybrid search falls back to canonical lexical
+            sidecar.record_error(exc)
+            return []
+        for vector_hit in vector_hits:
             record = self.backends[layer].get_record(
                 vector_hit.record_id, include_inactive=include_inactive
             )

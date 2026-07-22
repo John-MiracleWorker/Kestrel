@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
+from typing import cast
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -32,8 +33,14 @@ from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.factory import build_llm_provider
 from nested_memvid_agent.llm.model_catalog import DEFAULT_API_KEY_ENVS, PROVIDER_OPTIONS
 from nested_memvid_agent.models import EvidenceRef, MemoryKind, MemoryLayer, RetrievalQuery
-from nested_memvid_agent.nested_learning import LearningSignal, NestedLearningKernel
+from nested_memvid_agent.nested_learning import (
+    LearningSignal,
+    NestedLearningKernel,
+    ValidationEvidence,
+    resolve_validation_evidence,
+)
 from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions, ToolCall
+from nested_memvid_agent.security_boundary import redact_secrets
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.task_capsule import summarize_run_capsule, write_run_capsule
 from nested_memvid_agent.tools.base import ToolContext
@@ -95,7 +102,12 @@ class LiveEvalCaseResult:
 
 def provider_readiness(provider: str, *, model: str | None = None) -> ProviderReadiness:
     if provider not in PROVIDER_OPTIONS:
-        return ProviderReadiness(provider=provider, model=model or "", available=False, reason=f"unsupported provider: {provider}")
+        return ProviderReadiness(
+            provider=provider,
+            model=model or "",
+            available=False,
+            reason=f"unsupported provider: {provider}",
+        )
     model_env = DEFAULT_MODEL_ENV_BY_PROVIDER.get(provider)
     resolved_model = model or (os.getenv(model_env) if model_env else None) or ""
     key_env = DEFAULT_API_KEY_ENVS.get(provider)
@@ -140,6 +152,11 @@ def build_live_eval_config(
         state_path=output_root / "state" / "agent.db",
         secret_store_path=output_root / "secrets" / "local_vault.json",
         workspace=output_root / "workspace",
+        skills_dir=output_root / "skills",
+        plugins_dir=output_root / "plugins",
+        mcp_config_path=output_root / "config" / "mcp_servers.json",
+        channel_config_path=output_root / "config" / "channels.json",
+        worker_worktree_dir=output_root / "worktrees",
         timeout_seconds=timeout_seconds,
         max_retries=0,
         temperature=0.0,
@@ -162,11 +179,13 @@ def summarize_results(results: list[LiveEvalCaseResult]) -> dict[str, object]:
         "case_count": len(results),
         "pass_count": pass_count,
         "fail_count": fail_count,
-        "passed": fail_count == 0,
+        "passed": bool(results) and fail_count == 0,
         "memory_writes": sum(_metric_int(result, "memory_writes") for result in results),
         "memory_hits": sum(_metric_int(result, "memory_hits") for result in results),
         "tool_count": sum(_metric_int(result, "tool_count") for result in results),
-        "behavior_delta_activations": sum(_metric_int(result, "behavior_delta_activations") for result in results),
+        "behavior_delta_activations": sum(
+            _metric_int(result, "behavior_delta_activations") for result in results
+        ),
     }
 
 
@@ -184,7 +203,9 @@ def _metric_int(result: LiveEvalCaseResult, key: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a guarded live-provider Kestrel learning/capability E2E eval.")
+    parser = argparse.ArgumentParser(
+        description="Run a guarded live-provider Kestrel learning/capability E2E eval."
+    )
     parser.add_argument("--provider", default="ollama-cloud", choices=list(PROVIDER_OPTIONS))
     parser.add_argument("--model", default=None)
     parser.add_argument("--backend", default="memory", choices=["memory", "memvid"])
@@ -194,6 +215,7 @@ def main() -> int:
     args = parser.parse_args()
 
     readiness = provider_readiness(args.provider, model=args.model)
+    payload: dict[str, object]
     if not readiness.available:
         payload = {
             "schema": "kestrel.live_learning_eval.v1",
@@ -214,7 +236,8 @@ def main() -> int:
                 timeout_seconds=args.timeout_seconds,
             )
     else:
-        output_root = args.output_root or Path("./tmp-live-kestrel") / f"{readiness.provider}-{args.backend}-{uuid4().hex[:8]}"
+        output_parent = args.output_root or Path("./tmp-live-kestrel")
+        output_root = output_parent / f"{readiness.provider}-{args.backend}-{uuid4().hex[:12]}"
         payload = run_live_learning_eval(
             provider=readiness.provider,
             model=readiness.model,
@@ -222,8 +245,9 @@ def main() -> int:
             output_root=output_root,
             timeout_seconds=args.timeout_seconds,
         )
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if payload["summary"]["passed"] else 1
+    print(json.dumps(redact_secrets(payload), indent=2, sort_keys=True))
+    summary = cast(dict[str, object], payload["summary"])
+    return 0 if summary.get("passed") is True else 1
 
 
 def run_live_learning_eval(
@@ -235,6 +259,10 @@ def run_live_learning_eval(
     timeout_seconds: int = 120,
 ) -> dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
+    if any(output_root.iterdir()):
+        raise ValueError(
+            f"Live learning eval output root must be empty to prevent stale evidence reuse: {output_root}"
+        )
     config = build_live_eval_config(
         provider=provider,
         model=model,
@@ -252,6 +280,7 @@ def run_live_learning_eval(
         ("task_capsule_learning_signal", lambda: _case_task_capsule(config, marker)),
         ("approval_gate_blocks_unapproved_high_risk_tool", lambda: _case_approval_gate(config)),
         ("behavior_delta_activation_log", lambda: _case_behavior_delta_activation(config, marker)),
+        ("postflight_memory_integrity", lambda: _case_postflight_memory_integrity(config)),
     ]
     results = [_run_case(name, fn) for name, fn in cases]
     return {
@@ -272,26 +301,34 @@ def _run_case(name: str, fn: Callable[[], dict[str, object]]) -> LiveEvalCaseRes
     try:
         payload = fn()
         passed = bool(payload.pop("passed"))
-        return LiveEvalCaseResult(name=name, passed=passed, latency_ms=(perf_counter() - started) * 1000, metrics=payload)
+        return LiveEvalCaseResult(
+            name=name, passed=passed, latency_ms=(perf_counter() - started) * 1000, metrics=payload
+        )
     except Exception as exc:  # noqa: BLE001 - eval harness reports all diagnostics as JSON
         return LiveEvalCaseResult(
             name=name,
             passed=False,
             latency_ms=(perf_counter() - started) * 1000,
-            error=f"{type(exc).__name__}: {exc}",
+            error=str(redact_secrets(f"{type(exc).__name__}: {exc}")),
         )
 
 
 def _case_provider_handshake(config: AgentConfig, marker: str) -> dict[str, object]:
     provider = build_llm_provider(config)
     response = provider.generate(
-        [ChatMessage(role="user", content=f"Reply with exactly this marker and nothing else: {marker}")],
+        [
+            ChatMessage(
+                role="user", content=f"Reply with exactly this marker and nothing else: {marker}"
+            )
+        ],
         tools=[],
         options=LLMOptions(timeout_seconds=config.timeout_seconds, max_retries=0, temperature=0.0),
     )
     text = response.content.strip()
+    marker_match = text == marker
     return {
-        "passed": bool(text),
+        "passed": marker_match,
+        "marker_match": marker_match,
         "content_chars": len(text),
         "usage": response.usage,
     }
@@ -300,16 +337,26 @@ def _case_provider_handshake(config: AgentConfig, marker: str) -> dict[str, obje
 def _case_durable_memory_reopen(config: AgentConfig, marker: str) -> dict[str, object]:
     agent = build_agent(config)
     try:
-        first = agent.chat(f"Remember: {marker} means live durable learning eval marker.", session_id=marker)
+        first = agent.chat(
+            "Do not call any tool. Reply with exactly ACK. "
+            f"User-provided fact: {marker} means live durable learning eval marker.",
+            session_id=marker,
+        )
     finally:
         agent.close()
     reopened = build_agent(config)
     try:
         hits = reopened.memory.retrieve(RetrievalQuery(query=marker, k_per_layer=5))
+        tool_count = len(getattr(first, "tool_executions", ()))
         return {
-            "passed": bool(hits) and len(first.memory_writes) >= 2,
+            "passed": bool(hits)
+            and len(first.memory_writes) >= 2
+            and first.stop_reason == "complete"
+            and bool(first.assistant_message.strip())
+            and tool_count == 0,
             "memory_writes": len(first.memory_writes),
             "memory_hits": len(hits),
+            "tool_count": tool_count,
             "context_chars": first.context_chars,
             "stop_reason": first.stop_reason,
         }
@@ -320,12 +367,36 @@ def _case_durable_memory_reopen(config: AgentConfig, marker: str) -> dict[str, o
 def _case_correction_frame(config: AgentConfig, marker: str) -> dict[str, object]:
     agent = build_agent(config)
     try:
-        result = agent.chat(f"Remember: correction for {marker}: prefer evidence before claims.", session_id=f"{marker}-correction")
-        corrections = [record for record in agent.memory.iter_records(include_inactive=True) if record.kind == MemoryKind.CORRECTION]
+        session_id = f"{marker}-correction"
+        before_ids = {record.id for record in agent.memory.iter_records(include_inactive=True)}
+        result = agent.chat(
+            "Do not call any tool. Reply with exactly ACK. "
+            f"Correction: for {marker}, prefer evidence before claims.",
+            session_id=session_id,
+        )
+        current_write_ids = set(result.memory_writes) - before_ids
+        all_corrections = [
+            record
+            for record in agent.memory.iter_records(include_inactive=True)
+            if record.kind == MemoryKind.CORRECTION
+        ]
+        current_corrections = [
+            record
+            for record in all_corrections
+            if record.id in current_write_ids
+            and marker in record.content
+            and record.metadata.get("session_id") == session_id
+        ]
+        tool_count = len(getattr(result, "tool_executions", ()))
         return {
-            "passed": bool(corrections),
+            "passed": bool(current_corrections)
+            and result.stop_reason == "complete"
+            and bool(result.assistant_message.strip())
+            and tool_count == 0,
             "memory_writes": len(result.memory_writes),
-            "correction_count": len(corrections),
+            "correction_count": len(current_corrections),
+            "total_correction_count": len(all_corrections),
+            "tool_count": tool_count,
             "stop_reason": result.stop_reason,
         }
     finally:
@@ -333,6 +404,24 @@ def _case_correction_frame(config: AgentConfig, marker: str) -> dict[str, object
 
 
 def _case_procedural_promotion_gate() -> dict[str, object]:
+    def trusted_evidence(prefix: str, observations: int) -> ValidationEvidence:
+        task_refs = tuple(
+            EvidenceRef(source="runtime.validation", locator=f"{prefix}-{index}")
+            for index in range(observations)
+        )
+        evidence = ValidationEvidence(
+            test_refs=(task_refs[0],),
+            lint_refs=(task_refs[0],),
+            repair_refs=(task_refs[0],),
+            review_refs=(task_refs[0],),
+            task_refs=task_refs,
+        )
+        return resolve_validation_evidence(
+            evidence,
+            status="runtime_validated",
+            artifact_ids=tuple(ref.locator for ref in task_refs),
+        )
+
     kernel = NestedLearningKernel()
     one = kernel.decide(
         LearningSignal(
@@ -340,7 +429,8 @@ def _case_procedural_promotion_gate() -> dict[str, object]:
             content="One success is not enough to promote a procedure.",
             kind=MemoryKind.PROCEDURE,
             source_layer=MemoryLayer.EPISODIC,
-            validation_score=0.95,
+            validation_score=None,
+            validation_evidence=trusted_evidence("one-off", 1),
             repeat_count=1,
             requested_target_layer=MemoryLayer.PROCEDURAL,
         )
@@ -351,7 +441,8 @@ def _case_procedural_promotion_gate() -> dict[str, object]:
             content="Repeated validated success can promote a procedure.",
             kind=MemoryKind.PROCEDURE,
             source_layer=MemoryLayer.EPISODIC,
-            validation_score=0.95,
+            validation_score=None,
+            validation_evidence=trusted_evidence("repeated", 2),
             repeat_count=2,
             requested_target_layer=MemoryLayer.PROCEDURAL,
         )
@@ -362,7 +453,8 @@ def _case_procedural_promotion_gate() -> dict[str, object]:
             content="Ordinary events must not promote to policy.",
             kind=MemoryKind.POLICY,
             source_layer=MemoryLayer.EPISODIC,
-            validation_score=0.99,
+            validation_score=None,
+            validation_evidence=trusted_evidence("policy", 5),
             repeat_count=5,
             explicit_instruction=False,
             requested_target_layer=MemoryLayer.POLICY,
@@ -373,6 +465,7 @@ def _case_procedural_promotion_gate() -> dict[str, object]:
         "one_off_action": one.action,
         "repeated_action": repeated.action,
         "policy_action": policy.action,
+        "evidence_mode": "synthetic_trusted_kernel_gate_no_memory_write",
     }
 
 
@@ -380,7 +473,13 @@ def _case_task_capsule(config: AgentConfig, marker: str) -> dict[str, object]:
     agent = build_agent(config)
     run_id = f"run_{marker}_capsule"
     try:
-        result = agent.chat(f"Remember: capsule candidate fact for {marker}.", session_id=f"{marker}-capsule", run_id=run_id)
+        result = agent.chat(
+            "Do not call any tool. Reply with exactly ACK. "
+            f"User-provided fact: capsule candidate fact for {marker}.",
+            session_id=f"{marker}-capsule",
+            run_id=run_id,
+        )
+        tool_count = len(getattr(result, "tool_executions", ()))
         capsule_path = write_run_capsule(
             runs_dir=config.memory_dir.parent / "runs",
             run_id=run_id,
@@ -389,15 +488,28 @@ def _case_task_capsule(config: AgentConfig, marker: str) -> dict[str, object]:
             selected_context=result.context_prompt,
             tool_executions=result.tool_executions,
             final_response=result.assistant_message,
-            candidate_facts=(f"{marker} produced a live provider turn stored in an isolated task capsule.",),
-            candidate_procedures=("For live learning evals, write explicit capsule candidates so extraction does not depend on model wording.",),
+            candidate_facts=(
+                f"{marker} produced a live provider turn stored in an isolated task capsule.",
+            ),
+            candidate_procedures=(
+                "For live learning evals, write explicit capsule candidates so extraction does not depend on model wording.",
+            ),
         )
-        summary = summarize_run_capsule(runs_dir=config.memory_dir.parent / "runs", run_id=run_id, backend=config.backend)
+        summary = summarize_run_capsule(
+            runs_dir=config.memory_dir.parent / "runs", run_id=run_id, backend=config.backend
+        )
         return {
-            "passed": capsule_path.exists() and summary.telemetry.get("exists") is True and len(summary.learning_signals) >= 2,
+            "passed": result.stop_reason == "complete"
+            and bool(result.assistant_message.strip())
+            and tool_count == 0
+            and capsule_path.exists()
+            and summary.telemetry.get("exists") is True
+            and len(summary.learning_signals) >= 2,
             "capsule_path": str(capsule_path),
             "learning_signal_count": len(summary.learning_signals),
             "memory_writes": len(result.memory_writes),
+            "tool_count": tool_count,
+            "stop_reason": result.stop_reason,
         }
     finally:
         agent.close()
@@ -411,7 +523,9 @@ def _case_approval_gate(config: AgentConfig) -> dict[str, object]:
     try:
         execution = registry.execute(
             call,
-            ToolContext(memory=agent.memory, config=approval_config, workspace=approval_config.workspace),
+            ToolContext(
+                memory=agent.memory, config=approval_config, workspace=approval_config.workspace
+            ),
         )
         return {
             "passed": not execution.success and execution.error == "approval_required",
@@ -433,8 +547,14 @@ def _case_behavior_delta_activation(config: AgentConfig, marker: str) -> dict[st
         status=BehaviorDeltaStatus.ACTIVE,
         trigger=TriggerSpec(query_patterns=(marker,), semantic_hint="Live eval marker task."),
         behavior_change="When this live eval marker appears, mention that active behavior deltas are compiled only when relevant.",
-        evidence_refs=(EvidenceRef(source="live_eval", locator=marker, quote="operator-approved isolated live eval"),),
-        validation_plan=ValidationPlan(required_checks=("live_eval_behavior_delta_activation",), min_validation_score=0.1),
+        evidence_refs=(
+            EvidenceRef(
+                source="live_eval", locator=marker, quote="operator-approved isolated live eval"
+            ),
+        ),
+        validation_plan=ValidationPlan(
+            required_checks=("live_eval_behavior_delta_activation",), min_validation_score=0.1
+        ),
         metadata={"explicit_instruction": True, "replay_passed": True},
     )
     ledger.record_delta(delta)
@@ -452,6 +572,28 @@ def _case_behavior_delta_activation(config: AgentConfig, marker: str) -> dict[st
         "behavior_delta_activations": len(activations),
         "compiled_chars": len(compiled.text),
     }
+
+
+def _case_postflight_memory_integrity(config: AgentConfig) -> dict[str, object]:
+    agent = build_agent(config)
+    try:
+        verification = agent.memory.verify_all()
+        layers = {layer.value: bool(ok) for layer, ok in verification.items()}
+        policy_records = list(
+            agent.memory.iter_records(
+                layer=MemoryLayer.POLICY,
+                include_inactive=True,
+            )
+        )
+        return {
+            "passed": set(layers) == {layer.value for layer in MemoryLayer}
+            and all(layers.values())
+            and not policy_records,
+            "verified_layers": layers,
+            "policy_write_count": len(policy_records),
+        }
+    finally:
+        agent.close()
 
 
 if __name__ == "__main__":

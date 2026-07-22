@@ -1,4 +1,4 @@
-from .base import RetrievalResult
+from .base import OptionalDependencyUnavailable, RetrievalResult
 from .baseline_rag_flat import BaselineRAG
 from .chroma_adapter import ChromaAdapter
 from .kestrel_adapter import KestrelAdapter
@@ -10,6 +10,7 @@ __all__ = [
     "BaselineRAG",
     "ChromaAdapter",
     "KestrelAdapter",
+    "OptionalDependencyUnavailable",
     "QdrantAdapter",
     "VectorRAG",
 ]
