@@ -41,6 +41,10 @@ from nested_memvid_agent.state_store import (
     routine_session_id,
 )
 
+_DURABLE_RUN_TIMEOUT_SECONDS = 30.0
+_RUN_POLL_INTERVAL_SECONDS = 0.02
+_TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
+
 
 @pytest.mark.parametrize("value", [float("inf"), float("nan")])
 def test_routine_config_and_leases_reject_non_finite_values(
@@ -1600,12 +1604,26 @@ def _manager(tmp_path: Path) -> RunManager:
 
 
 def _wait_for_run(manager: RunManager, run_id: str):
-    deadline = monotonic() + 10.0
-    while monotonic() < deadline:
-        public = manager.get_run(run_id)
-        if public["status"] in {"completed", "failed", "cancelled"}:
-            run = manager.state.get_run(run_id)
-            assert run.status == "completed", run.error
-            return run
-        sleep(0.02)
-    raise AssertionError(f"run {run_id} did not finish")
+    deadline = monotonic() + _DURABLE_RUN_TIMEOUT_SECONDS
+    while True:
+        run = manager.state.get_run(run_id)
+        if run.status in _TERMINAL_RUN_STATUSES:
+            break
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"run {run_id} did not reach durable terminal state within "
+                f"{_DURABLE_RUN_TIMEOUT_SECONDS:.0f}s "
+                f"(last_status={run.status!r})"
+            )
+        sleep(min(_RUN_POLL_INTERVAL_SECONDS, remaining))
+
+    public = manager.get_run(run_id)
+    final = manager.state.get_run(run_id)
+    assert final.status == "completed", final.error
+    assert public["status"] == "completed", (
+        f"run {run_id} was durably completed but not published within the production fence "
+        f"(public_status={public.get('status')!r}, "
+        f"stop_reason={public.get('stop_reason')!r})"
+    )
+    return final

@@ -1846,6 +1846,108 @@ def test_offline_preflight_detects_untracked_standard_server_without_pid_file(
 
 
 @POSIX_SHELL_ONLY
+@pytest.mark.parametrize(
+    ("termination_function", "identity_function", "liveness_polls"),
+    (
+        (
+            "terminate_expected_kestrel_server_status",
+            "process_is_expected_kestrel_server",
+            50,
+        ),
+        (
+            "terminate_expected_kestrel_supervisor_status",
+            "process_is_expected_kestrel_supervisor",
+            80,
+        ),
+    ),
+)
+def test_termination_accepts_exit_at_final_identity_boundary(
+    tmp_path: Path,
+    termination_function: str,
+    identity_function: str,
+    liveness_polls: int,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    result = _run_installer_function(
+        f"""
+identity_checks=0
+existence_checks=0
+{identity_function}() {{
+  identity_checks=$((identity_checks + 1))
+  [[ "$identity_checks" -eq 1 ]]
+}}
+process_exists() {{
+  existence_checks=$((existence_checks + 1))
+  [[ "$existence_checks" -le {liveness_polls} ]]
+}}
+kill() {{ return 0; }}
+sleep() {{ return 0; }}
+{termination_function} 4242
+""",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+    )
+
+    diagnostics = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert result.returncode == 0, diagnostics
+    assert "changed identity while stopping" not in result.stdout
+
+
+@POSIX_SHELL_ONLY
+@pytest.mark.parametrize(
+    ("termination_function", "identity_function"),
+    (
+        (
+            "terminate_expected_kestrel_server_status",
+            "process_is_expected_kestrel_server",
+        ),
+        (
+            "terminate_expected_kestrel_supervisor_status",
+            "process_is_expected_kestrel_supervisor",
+        ),
+    ),
+)
+def test_termination_keeps_live_identity_change_fail_closed(
+    tmp_path: Path,
+    termination_function: str,
+    identity_function: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    result = _run_installer_function(
+        f"""
+identity_checks=0
+sigkill_calls=0
+{identity_function}() {{
+  identity_checks=$((identity_checks + 1))
+  [[ "$identity_checks" -eq 1 ]]
+}}
+process_exists() {{ return 0; }}
+kill() {{
+  if [[ "${{1:-}}" == "-9" ]]; then
+    sigkill_calls=$((sigkill_calls + 1))
+  fi
+  return 0
+}}
+sleep() {{ return 0; }}
+if {termination_function} 4242; then
+  exit 1
+fi
+[[ "$sigkill_calls" -eq 0 ]]
+""",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+    )
+
+    diagnostics = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert result.returncode == 0, diagnostics
+    assert "changed identity while stopping" in result.stdout
+
+
+@POSIX_SHELL_ONLY
 def test_failed_server_health_stops_tracked_supervisor_and_child(tmp_path: Path) -> None:
     home = tmp_path / "home"
     executable = home / ".venv" / "bin" / "nest-agent"

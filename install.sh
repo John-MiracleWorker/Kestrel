@@ -1948,6 +1948,12 @@ terminate_expected_kestrel_server_status() {
   # Revalidate immediately before SIGKILL so PID reuse cannot redirect the
   # destructive signal to a different process during the grace period.
   if ! process_is_expected_kestrel_server "$pid"; then
+    # The verified process may have exited between the final liveness poll and
+    # this identity probe. Treat proven absence as success, while continuing to
+    # fail closed for any live PID whose identity cannot be re-established.
+    if ! process_exists "$pid"; then
+      return 0
+    fi
     log "ERROR: PID ${pid} changed identity while stopping. Refusing to send SIGKILL."
     return 1
   fi
@@ -2321,6 +2327,12 @@ terminate_expected_kestrel_supervisor_status() {
     sleep 0.1
   done
   if ! process_is_expected_kestrel_supervisor "$pid"; then
+    # The verified supervisor may have exited between the final liveness poll
+    # and this identity probe. Never signal an unverifiable live PID, but do not
+    # mistake proven process absence for identity reuse.
+    if ! process_exists "$pid"; then
+      return 0
+    fi
     log "ERROR: supervisor PID ${pid} changed identity while stopping."
     return 1
   fi
