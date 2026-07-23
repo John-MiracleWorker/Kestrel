@@ -1,6 +1,7 @@
 name: Routing Source Snapshot
 
 on:
+  pull_request:
   push:
     branches:
       - codex/adaptive-flock-ledger
