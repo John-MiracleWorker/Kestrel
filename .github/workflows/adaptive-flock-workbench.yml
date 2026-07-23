@@ -1,0 +1,52 @@
+name: Apply Adaptive Flock Workbench Integration
+
+on:
+  push:
+    branches:
+      - codex/adaptive-flock-workbench
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'push'
+        with:
+          ref: codex/adaptive-flock-workbench
+          persist-credentials: true
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Apply deterministic Routing Center integration
+        run: python scripts/apply_adaptive_flock_workbench_v2.py
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Validate bundled dependency notices
+        working-directory: web
+        run: npm run licenses:check
+      - name: Test Workbench
+        working-directory: web
+        run: npm test
+      - name: Build Workbench
+        working-directory: web
+        run: npm run build
+      - name: Commit validated Workbench integration
+        if: github.event_name == 'push'
+        run: |
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: integrate Adaptive Flock Routing Center"
+          git push origin HEAD:codex/adaptive-flock-workbench
