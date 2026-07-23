@@ -142,7 +142,7 @@ jobs:
             tests/test_agent_routing_foundation.py \
             tests/test_agent_routing_guardrails.py \
             tests/test_agent_routing_ledger.py \
-            tests/test_agent_routing_outcome_semantics.py \
+            tests/test_agent_routing_cancellation.py \
             tests/test_agent_routing_metadata.py \
             tests/test_adaptive_flock_run_manager.py \
             tests/test_adaptive_flock_start_failures.py \
