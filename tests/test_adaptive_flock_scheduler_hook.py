@@ -180,6 +180,5 @@ def test_scheduler_route_is_applied_and_terminal_outcome_is_recorded(
     assert result == {"status": "completed"}
     assert coordinator.outcomes
     assert coordinator.outcomes[0]["validation_passed"] is True
-    assert "routing.attempt_started" in {
-        event_type for _, event_type, _ in events.items
-    }
+    event_types = {event_type for _, event_type, _ in events.items}
+    assert {"routing.selected", "routing.attempt_started", "routing.outcome_recorded"} <= event_types
