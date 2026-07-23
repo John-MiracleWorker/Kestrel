@@ -1,0 +1,27 @@
+name: Routing Source Snapshot
+
+on:
+  push:
+    branches:
+      - codex/adaptive-flock-ledger
+
+permissions:
+  contents: read
+
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Upload routing sources
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: adaptive-flock-routing-sources-${{ github.sha }}
+          path: |
+            src/nested_memvid_agent/routing/ledger_serialization.py
+            src/nested_memvid_agent/routing/ledger_registry.py
+            tests/test_agent_routing_ledger.py
+          if-no-files-found: error
+          retention-days: 1
