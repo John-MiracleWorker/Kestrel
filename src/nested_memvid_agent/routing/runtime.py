@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 from ..config import AgentConfig
 from ..event_bus import RunEventBus
@@ -45,7 +46,7 @@ class AdaptiveFlockRuntimeConfig:
         policy_id = os.getenv("NEST_AGENT_ADAPTIVE_FLOCK_POLICY", "balanced").strip()
         return cls(
             enabled=enabled,
-            mode=mode_raw,  # type: ignore[arg-type]
+            mode=cast(RoutingMode, mode_raw),
             policy_id=policy_id,
         )
 
@@ -80,19 +81,18 @@ def build_run_manager(
     active_routing = routing_config or AdaptiveFlockRuntimeConfig.from_env()
     ledger = RoutingLedger(state)
     _ensure_policy(ledger, active_routing.policy_id)
-    shared = {
-        "config": config,
-        "state": state,
-        "events": events,
-        "mcp": mcp,
-        "skills": skills,
-        "plugins": plugins,
-        "secret_resolver": secret_resolver,
-        "enforce_single_owner": enforce_single_owner,
-        "auto_start": auto_start,
-    }
     if not active_routing.enabled:
-        runs: RunManager = RunManager(**shared)
+        runs: RunManager = RunManager(
+            config=config,
+            state=state,
+            events=events,
+            mcp=mcp,
+            skills=skills,
+            plugins=plugins,
+            secret_resolver=secret_resolver,
+            enforce_single_owner=enforce_single_owner,
+            auto_start=auto_start,
+        )
     else:
         coordinator = DurableRoutingCoordinator(
             ledger,
@@ -101,7 +101,15 @@ def build_run_manager(
         )
         runs = AdaptiveFlockRunManager(
             routing_coordinator=coordinator,
-            **shared,
+            config=config,
+            state=state,
+            events=events,
+            mcp=mcp,
+            skills=skills,
+            plugins=plugins,
+            secret_resolver=secret_resolver,
+            enforce_single_owner=enforce_single_owner,
+            auto_start=auto_start,
         )
     return RunManagerBuild(
         runs=runs,
