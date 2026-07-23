@@ -25,7 +25,8 @@ from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
 from .routine_loop import RoutineLoop
 from .routines import RoutineService
-from .run_manager import RunCapacityError, RunManager
+from .routing.runtime import build_run_manager
+from .run_manager import RunCapacityError
 from .runtime_settings import (
     RuntimeSettingsStore,
     apply_runtime_settings,
@@ -173,6 +174,7 @@ def _create_app(
         from .server_observability_routes import register_observability_routes
         from .server_product_routes import register_product_routes
         from .server_routine_routes import register_routine_routes
+        from .server_routing_routes import register_routing_routes
         from .server_runtime_routes import register_runtime_routes
         from .server_secret_routes import register_secret_routes
         from .server_tool_routes import register_tool_routes, tool_invoke_response
@@ -213,7 +215,7 @@ def _create_app(
     )
     skills = SkillManager(active_config.skills_dir, state)
     plugins = PluginManager(active_config.plugins_dir, state)
-    runs = RunManager(
+    run_manager_build = build_run_manager(
         config=active_config,
         state=state,
         events=events,
@@ -224,6 +226,9 @@ def _create_app(
         enforce_single_owner=True,
         auto_start=False,
     )
+    runs = run_manager_build.runs
+    routing_ledger = run_manager_build.routing_ledger
+    routing_config = run_manager_build.routing_config
 
     def abort_runtime_construction() -> None:
         runs_stopped = runs.shutdown(timeout_seconds=5.0)
@@ -474,6 +479,12 @@ def _create_app(
             config=active_config,
             secret_resolver=secret_broker.resolve,
         ),
+    )
+    register_routing_routes(
+        app,
+        ledger=routing_ledger,
+        runtime=routing_config,
+        http_exception=HTTPException,
     )
     register_routine_routes(
         app,
