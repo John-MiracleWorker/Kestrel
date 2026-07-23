@@ -4301,6 +4301,25 @@ class RunManager:
             if agent is not None:
                 self._close_agent_for_run(run_id, agent)
 
+    def _prepare_scheduler_task_config(
+        self,
+        config: AgentConfig,
+        *,
+        run: RunRecord,
+        task: TaskNodeRecord,
+        subagent: SubagentRunRecord,
+    ) -> AgentConfig:
+        """Return the provider configuration for one claimed scheduler task.
+
+        The default implementation is deliberately neutral. Specialized
+        runtimes may choose a provider here, after the task claim and
+        subagent identity exist but before worker isolation and model
+        construction.
+        """
+
+        del run, task, subagent
+        return config
+
     def _execute_ready_task(self, run: RunRecord, task: TaskNodeRecord) -> dict[str, Any]:
         subagent_id = f"subagent_{uuid4().hex}"
         if run.lease_owner != self._lease_owner or run.status not in {"queued", "running"}:
@@ -4387,6 +4406,12 @@ class RunManager:
             ) as worker_lost:
                 if worker_lost.is_set():
                     raise RuntimeError("worker_execution_fence_lost")
+                config = self._prepare_scheduler_task_config(
+                    config,
+                    run=run,
+                    task=task,
+                    subagent=subagent,
+                )
                 config, worker_isolation = self._worker_config(
                     config,
                     run_id=run.run_id,

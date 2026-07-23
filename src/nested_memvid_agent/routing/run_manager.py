@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict
+from threading import Lock
 from time import monotonic
 from typing import Any
 
@@ -12,7 +13,12 @@ from ..plugin_manager import PluginManager
 from ..run_manager import RunManager, _task_payload
 from ..security_boundary import redact_secrets
 from ..skill_manager import SkillManager
-from ..state_store import AgentStateStore, TaskNodeRecord
+from ..state_store import (
+    AgentStateStore,
+    RunRecord,
+    SubagentRunRecord,
+    TaskNodeRecord,
+)
 from .coordinator import DurableRoutingAssignment, DurableRoutingCoordinator
 from .router import RoutingUnavailableError
 
@@ -45,6 +51,10 @@ class AdaptiveFlockRunManager(RunManager):
         auto_start: bool = True,
     ) -> None:
         self.routing_coordinator = routing_coordinator
+        self._scheduler_routing_lock = Lock()
+        self._scheduler_routing_attempts: dict[
+            tuple[str, str], tuple[DurableRoutingAssignment, float]
+        ] = {}
         super().__init__(
             config=config,
             state=state,
@@ -58,6 +68,162 @@ class AdaptiveFlockRunManager(RunManager):
             read_only_observer=read_only_observer,
             auto_start=auto_start,
         )
+
+    def _prepare_scheduler_task_config(
+        self,
+        config: AgentConfig,
+        *,
+        run: RunRecord,
+        task: TaskNodeRecord,
+        subagent: SubagentRunRecord,
+    ) -> AgentConfig:
+        attempt = max(1, task.attempt_count + 1)
+        durable: DurableRoutingAssignment | None = None
+        try:
+            durable = self.routing_coordinator.assign(
+                config,
+                task,
+                subagent_id=subagent.subagent_id,
+                attempt=attempt,
+            )
+            self.events.publish(
+                run.run_id,
+                "routing.selected",
+                _routing_decision_payload(durable),
+            )
+            self.routing_coordinator.mark_started(durable)
+        except Exception as exc:  # noqa: BLE001 - mode selects fail-open or fail-closed
+            return self._handle_scheduler_routing_failure(
+                exc,
+                config=config,
+                run=run,
+                task=task,
+                subagent=subagent,
+                attempt=attempt,
+                durable=durable,
+            )
+        self.events.publish(
+            run.run_id,
+            "routing.attempt_started",
+            {
+                "decision_id": durable.record.decision_id,
+                "task_id": task.task_id,
+                "subagent_id": subagent.subagent_id,
+                "attempt": attempt,
+                "selected_target_id": durable.record.selected_target_id,
+                "selected_provider": durable.record.selected_provider,
+                "selected_model": durable.record.selected_model,
+                "actionable": durable.record.actionable,
+                "scheduler": True,
+            },
+        )
+        with self._scheduler_routing_lock:
+            self._scheduler_routing_attempts[(run.run_id, task.task_id)] = (
+                durable,
+                monotonic(),
+            )
+        return durable.assignment.config
+
+    def _execute_ready_task(self, run: RunRecord, task: TaskNodeRecord) -> dict[str, Any]:
+        try:
+            return super()._execute_ready_task(run, task)
+        finally:
+            with self._scheduler_routing_lock:
+                context = self._scheduler_routing_attempts.pop(
+                    (run.run_id, task.task_id),
+                    None,
+                )
+            if context is not None:
+                durable, started_at = context
+                subagent_id = durable.record.subagent_id
+                if subagent_id is not None:
+                    self._record_terminal_routing_outcome(
+                        durable,
+                        started_at=started_at,
+                        task_id=task.task_id,
+                        subagent_id=subagent_id,
+                        run_id=run.run_id,
+                    )
+
+    def _handle_scheduler_routing_failure(
+        self,
+        exc: Exception,
+        *,
+        config: AgentConfig,
+        run: RunRecord,
+        task: TaskNodeRecord,
+        subagent: SubagentRunRecord,
+        attempt: int,
+        durable: DurableRoutingAssignment | None,
+    ) -> AgentConfig:
+        phase = "assignment" if durable is None else "start"
+        if isinstance(exc, RoutingUnavailableError):
+            unavailable = True
+            reason_codes = tuple(exc.reason_codes)
+        else:
+            unavailable = False
+            reason_codes = (f"routing_{phase}_failed",)
+        category = "routing_unavailable" if unavailable else "routing_persistence_failed"
+        error = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
+        payload: dict[str, Any] = {
+            "task_id": task.task_id,
+            "subagent_id": subagent.subagent_id,
+            "attempt": attempt,
+            "phase": phase,
+            "mode": self.routing_coordinator.mode,
+            "reason_codes": list(reason_codes),
+            "error": error,
+            "scheduler": True,
+        }
+        if durable is not None:
+            payload["decision_id"] = durable.record.decision_id
+            try:
+                outcome = self.routing_coordinator.record_outcome(
+                    durable,
+                    execution_status=f"routing_{phase}_failed",
+                    validation_passed=False,
+                    validation_codes=reason_codes,
+                    failure_category=category,
+                    reward_components={"completion": -1.0},
+                    outcome_labels=(f"routing_{phase}_failed",),
+                )
+                self.events.publish(
+                    run.run_id,
+                    "routing.outcome_recorded",
+                    outcome.to_payload(),
+                )
+            except Exception as outcome_exc:  # noqa: BLE001 - retain root failure
+                self.events.publish(
+                    run.run_id,
+                    "routing.outcome_failed",
+                    {
+                        "decision_id": durable.record.decision_id,
+                        "task_id": task.task_id,
+                        "subagent_id": subagent.subagent_id,
+                        "error": str(
+                            redact_secrets(
+                                f"{type(outcome_exc).__name__}: {outcome_exc}"
+                            )
+                        ),
+                    },
+                )
+        if self.routing_coordinator.mode == "shadow":
+            event_type = (
+                "routing.shadow_unavailable"
+                if unavailable and phase == "assignment"
+                else f"routing.{phase}_failed"
+            )
+            self.events.publish(run.run_id, event_type, payload)
+            return config
+        event_type = (
+            "routing.guardrail_blocked"
+            if unavailable
+            else f"routing.{phase}_failed"
+        )
+        self.events.publish(run.run_id, event_type, payload)
+        raise RuntimeError(
+            f"{category}:{','.join(reason_codes)}:{error}"
+        ) from exc
 
     def _run_subagent(
         self,

@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from nested_memvid_agent.config import AgentConfig
-from nested_memvid_agent.routing.run_manager import AdaptiveFlockRunManager
 from nested_memvid_agent.routing.router import RoutingUnavailableError
+from nested_memvid_agent.routing.run_manager import AdaptiveFlockRunManager
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.state_store import RunRecord, SubagentRunRecord, TaskNodeRecord
 
