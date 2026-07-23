@@ -75,6 +75,42 @@ class AgentTaskContract:
 
 
 @dataclass(frozen=True)
+class ProviderProfile:
+    profile_id: str
+    display_name: str
+    adapter: str
+    base_url: str | None = None
+    secret_ref: str | None = None
+    enabled: bool = True
+    locality: TargetLocality = "cloud"
+    trust_class: str = "standard"
+    max_concurrency: int = 1
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.profile_id.strip():
+            raise ValueError("profile_id is required")
+        if not self.adapter.strip():
+            raise ValueError("adapter is required")
+        if self.max_concurrency < 1:
+            raise ValueError("max_concurrency must be positive")
+
+    def to_public_payload(self) -> dict[str, Any]:
+        return {
+            "profile_id": self.profile_id,
+            "display_name": self.display_name,
+            "adapter": self.adapter,
+            "base_url_configured": bool(self.base_url),
+            "secret_configured": bool(self.secret_ref),
+            "enabled": self.enabled,
+            "locality": self.locality,
+            "trust_class": self.trust_class,
+            "max_concurrency": self.max_concurrency,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
 class ModelTarget:
     target_id: str
     provider_profile_id: str
