@@ -160,7 +160,7 @@ describe("RoutingCenter", () => {
     expect(await screen.findByText("Local server")).toBeInTheDocument();
     expect(screen.getAllByText("local-worker").length).toBeGreaterThan(0);
     expect(screen.getAllByText("balanced").length).toBeGreaterThan(0);
-    expect(screen.getByText("1 decisions").toBeInTheDocument);
+    expect(screen.getByText("0 decisions")).toBeInTheDocument();
     expect(screen.getByText("Runtime")).toBeInTheDocument();
     expect(screen.getByText("off")).toBeInTheDocument();
   });
