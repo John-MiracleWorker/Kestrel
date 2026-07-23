@@ -21,9 +21,49 @@ jobs:
           persist-credentials: ${{ github.event_name == 'push' }}
           fetch-depth: 0
       - name: Merge current scheduler-routing base
+        shell: bash
         run: |
           git fetch origin codex/adaptive-flock-subagents
+          set +e
           git merge --no-ff --no-commit origin/codex/adaptive-flock-subagents
+          merge_status=$?
+          set -e
+          if [ "$merge_status" -ne 0 ]; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            printf 'Resolving expected Adaptive Flock conflicts:\n%s\n' "$conflicts"
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              case "$path" in
+                src/nested_memvid_agent/routing/__init__.py)
+                  # The control-plane branch owns the public runtime-factory exports.
+                  git checkout --ours -- "$path"
+                  ;;
+                src/nested_memvid_agent/run_manager.py|\
+                src/nested_memvid_agent/routing/contracts.py|\
+                src/nested_memvid_agent/routing/run_manager.py|\
+                src/nested_memvid_agent/routing/ledger.py|\
+                src/nested_memvid_agent/routing/ledger_serialization.py|\
+                tests/test_adaptive_flock_start_failures.py|\
+                tests/test_adaptive_flock_scheduler_hook.py|\
+                tests/test_agent_routing_foundation.py|\
+                tests/test_agent_routing_cancellation.py|\
+                tests/test_agent_routing_metadata.py)
+                  # These files are owned by the newly validated scheduler-routing base.
+                  git checkout --theirs -- "$path"
+                  ;;
+                *)
+                  printf 'Unexpected merge conflict: %s\n' "$path" >&2
+                  exit 1
+                  ;;
+              esac
+              git add "$path"
+            done <<< "$conflicts"
+            remaining="$(git diff --name-only --diff-filter=U)"
+            if [ -n "$remaining" ]; then
+              printf 'Unresolved conflicts remain:\n%s\n' "$remaining" >&2
+              exit 1
+            fi
+          fi
           rm .github/workflows/adaptive-flock-sync-base.yml
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
