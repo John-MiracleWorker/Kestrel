@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.routing import (
+    AdaptiveFlockRoutingService,
     ModelTarget,
+    ProviderProfile,
     ReviewDiversityContext,
     RoutePolicy,
     RoutingUnavailableError,
@@ -52,6 +56,17 @@ def _target(target_id: str, **changes: Any) -> ModelTarget:
     }
     values.update(changes)
     return ModelTarget(**values)
+
+
+def _local_profile(*, adapter: str = "openai-compatible") -> ProviderProfile:
+    return ProviderProfile(
+        profile_id="local",
+        display_name="Local coder",
+        adapter=adapter,
+        base_url="http://127.0.0.1:1234/v1",
+        secret_ref="secret://local-router-key",
+        locality="local",
+    )
 
 
 def test_contract_preserves_authoritative_task_requirements() -> None:
@@ -193,3 +208,67 @@ def test_routing_tie_break_is_stable() -> None:
     assert first.selected_target.target_id == "alpha"
     assert second.selected_target.target_id == "alpha"
     assert first.score == second.score
+
+
+def test_service_shadow_assignment_preserves_static_config() -> None:
+    base = AgentConfig(
+        provider="openai",
+        model="orchestrator",
+        workspace=Path("/workspace"),
+        allow_shell=True,
+        allow_file_write=True,
+        allow_git_commit=False,
+    )
+    service = AdaptiveFlockRoutingService(
+        profiles=[_local_profile()],
+        targets=[_target("worker", provider_profile_id="local")],
+        mode="shadow",
+    )
+
+    assignment = service.assign(base, _Task())
+
+    assert assignment.executes_selected_target is False
+    assert assignment.config is base
+    assert assignment.decision.selected_target.target_id == "worker"
+
+
+def test_service_applies_target_without_expanding_authority() -> None:
+    base = AgentConfig(
+        provider="openai",
+        model="orchestrator",
+        fallback_provider="anthropic",
+        fallback_model="reviewer",
+        workspace=Path("/workspace"),
+        allow_shell=True,
+        allow_file_write=False,
+        allow_git_commit=False,
+        require_approval_for_high_risk_tools=True,
+    )
+    service = AdaptiveFlockRoutingService(
+        profiles=[_local_profile()],
+        targets=[_target("worker", provider_profile_id="local")],
+        mode="constrained",
+    )
+
+    assignment = service.assign(base, _Task())
+
+    assert assignment.executes_selected_target is True
+    assert assignment.config.provider == "openai-compatible"
+    assert assignment.config.model == "worker"
+    assert assignment.config.base_url == "http://127.0.0.1:1234/v1"
+    assert assignment.config.api_key_env == "secret://local-router-key"
+    assert assignment.config.fallback_provider is None
+    assert assignment.config.workspace == Path("/workspace")
+    assert assignment.config.allow_shell is True
+    assert assignment.config.allow_file_write is False
+    assert assignment.config.allow_git_commit is False
+    assert assignment.config.require_approval_for_high_risk_tools is True
+
+
+def test_service_rejects_target_profile_adapter_mismatch() -> None:
+    with pytest.raises(ValueError, match="does not match profile adapter"):
+        AdaptiveFlockRoutingService(
+            profiles=[_local_profile(adapter="ollama")],
+            targets=[_target("worker", provider_profile_id="local")],
+            mode="shadow",
+        )
