@@ -39,7 +39,9 @@ def compile_task_contract(
 
     guidance = planner_guidance or {}
     proposed_family = _clean_optional_string(guidance.get("task_family"))
-    if proposed_family in _TASK_FAMILIES:
+    if proposed_family in _TASK_FAMILIES and (
+        task_family not in _PROTECTED_TASK_FAMILIES or proposed_family == task_family
+    ):
         task_family = proposed_family
     complexity = max(complexity, _bounded_float(guidance.get("complexity"), default=complexity))
     ambiguity = max(ambiguity, _bounded_float(guidance.get("ambiguity"), default=ambiguity))
@@ -49,6 +51,10 @@ def compile_task_contract(
     proposed_context = _positive_int_or_none(guidance.get("minimum_context_tokens"))
     if proposed_context is not None:
         minimum_context = max(minimum_context or 0, proposed_context)
+    preferred_tags.update(_preferred_tags(task_family, task.profile))
+    minimum_context = max(minimum_context or 0, _minimum_context_tokens(task_family, complexity))
+    if "image" in modalities:
+        capabilities.add("vision")
 
     deterministic_local = local_required or default_privacy_class == "local_required"
     privacy_class: PrivacyClass = "local_required" if deterministic_local else default_privacy_class
@@ -76,6 +82,8 @@ def compile_task_contract(
         preferred_target_tags=tuple(sorted(preferred_tags)),
     )
 
+
+_PROTECTED_TASK_FAMILIES = {"planning", "architecture", "security_review", "review"}
 
 _TASK_FAMILIES = {
     "planning",
@@ -114,7 +122,14 @@ def _task_family(text: str, tools: tuple[str, ...], profile: str) -> str:
         return "backend_implementation"
     if tool_set & {"test.run", "lint.run", "repair.validate", "repair.orchestrate_validate"}:
         return "test_and_validation"
-    if tool_set and tool_set <= {"repo.search", "repo.map", "memory.search", "context.pack", "file.read", "file.list"}:
+    if tool_set and tool_set <= {
+        "repo.search",
+        "repo.map",
+        "memory.search",
+        "context.pack",
+        "file.read",
+        "file.list",
+    }:
         return "repository_inspection"
     if any(term in text for term in ("rename", "replace", "mechanical", "repetitive", "all occurrences")):
         return "mechanical_refactor"
@@ -132,19 +147,47 @@ def _complexity(text: str, task: TaskLike) -> float:
     value += min(len(tuple(task.required_tools)), 6) * 0.055
     value += min(len(tuple(task.dependencies)), 4) * 0.035
     value += min(len(tuple(task.acceptance_criteria)), 4) * 0.04
-    value += {"low": 0.0, "medium": 0.10, "high": 0.22, "critical": 0.34}.get(task.risk, 0.08)
-    if any(term in text for term in ("architecture", "security", "concurrency", "race condition", "redesign", "migration")):
+    value += {"low": 0.0, "medium": 0.10, "high": 0.22, "critical": 0.34}.get(
+        task.risk, 0.08
+    )
+    if any(
+        term in text
+        for term in (
+            "architecture",
+            "security",
+            "concurrency",
+            "race condition",
+            "redesign",
+            "migration",
+        )
+    ):
         value += 0.22
-    if any(term in text for term in ("repository-wide", "entire repository", "multi-file", "across the codebase")):
+    if any(
+        term in text
+        for term in ("repository-wide", "entire repository", "multi-file", "across the codebase")
+    ):
         value += 0.15
     return min(1.0, value)
 
 
 def _ambiguity(text: str, task: TaskLike) -> float:
     value = 0.22
-    if any(term in text for term in ("design", "best", "improve", "investigate", "determine", "figure out", "architecture")):
+    if any(
+        term in text
+        for term in (
+            "design",
+            "best",
+            "improve",
+            "investigate",
+            "determine",
+            "figure out",
+            "architecture",
+        )
+    ):
         value += 0.30
-    if any(term in text for term in ("only", "exactly", "rename", "replace", "specified", "targeted")):
+    if any(
+        term in text for term in ("only", "exactly", "rename", "replace", "specified", "targeted")
+    ):
         value -= 0.16
     if task.acceptance_criteria:
         value -= min(len(tuple(task.acceptance_criteria)), 3) * 0.04
@@ -159,7 +202,9 @@ def _required_capabilities(task: TaskLike, text: str) -> tuple[str, ...]:
         capabilities.add("tools")
     if task.acceptance_criteria:
         capabilities.add("structured_output")
-    if task.profile in {"planner", "reviewer"} or any(term in text for term in ("architecture", "security", "reason")):
+    if task.profile in {"planner", "reviewer"} or any(
+        term in text for term in ("architecture", "security", "reason")
+    ):
         capabilities.add("reasoning")
     if _required_modalities(text):
         capabilities.add("vision")
@@ -167,7 +212,14 @@ def _required_capabilities(task: TaskLike, text: str) -> tuple[str, ...]:
 
 
 def _required_modalities(text: str) -> tuple[str, ...]:
-    return ("image",) if any(term in text for term in ("screenshot", "image", "figma", "mockup", "visual reference")) else ()
+    return (
+        ("image",)
+        if any(
+            term in text
+            for term in ("screenshot", "image", "figma", "mockup", "visual reference")
+        )
+        else ()
+    )
 
 
 def _preferred_tags(task_family: str, role: str) -> tuple[str, ...]:
