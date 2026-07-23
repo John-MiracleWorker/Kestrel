@@ -1,0 +1,25 @@
+name: Adaptive Flock Server Snapshot
+
+on:
+  pull_request:
+  push:
+    branches:
+      - codex/adaptive-flock-control-plane
+
+permissions:
+  contents: read
+
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Upload server source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: adaptive-flock-server-${{ github.sha }}
+          path: src/nested_memvid_agent/server.py
+          if-no-files-found: error
+          retention-days: 1
