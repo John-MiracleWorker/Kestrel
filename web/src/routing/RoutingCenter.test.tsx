@@ -157,7 +157,7 @@ describe("RoutingCenter", () => {
   it("loads routing status, inventory, policies, and active run history", async () => {
     render(<RoutingCenter activeRunId="run-1" activeTaskId="task-1" />);
 
-    expect(await screen.findByText("Local server")).toBeInTheDocument();
+    expect((await screen.findAllByText("Local server")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("local-worker").length).toBeGreaterThan(0);
     expect(screen.getAllByText("balanced").length).toBeGreaterThan(0);
     expect(screen.getByText("0 decisions")).toBeInTheDocument();
@@ -167,7 +167,7 @@ describe("RoutingCenter", () => {
 
   it("previews a task without executing it", async () => {
     render(<RoutingCenter activeTaskId="task-1" />);
-    await screen.findByText("Local server");
+    await screen.findAllByText("Local server");
 
     fireEvent.click(screen.getByRole("button", { name: "Preview decision" }));
 
@@ -180,11 +180,17 @@ describe("RoutingCenter", () => {
 
   it("sends but never renders a provider secret reference", async () => {
     render(<RoutingCenter />);
-    await screen.findByText("Local server");
+    await screen.findAllByText("Local server");
 
-    fireEvent.change(screen.getByLabelText("Profile ID"), { target: { value: "cloud" } });
-    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Cloud account" } });
-    fireEvent.change(screen.getByLabelText("Secret reference"), {
+    const profileIdField = screen.getByText("Profile ID").closest("label");
+    expect(profileIdField).not.toBeNull();
+    fireEvent.change(profileIdField!.querySelector("input")!, { target: { value: "cloud" } });
+    const displayNameField = screen.getByText("Display name").closest("label");
+    expect(displayNameField).not.toBeNull();
+    fireEvent.change(displayNameField!.querySelector("input")!, { target: { value: "Cloud account" } });
+    const secretField = screen.getByText("Secret reference").closest("label");
+    expect(secretField).not.toBeNull();
+    fireEvent.change(secretField!.querySelector("input")!, {
       target: { value: "secret://cloud-key" }
     });
     fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
