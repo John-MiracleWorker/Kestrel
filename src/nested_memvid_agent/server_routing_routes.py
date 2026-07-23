@@ -7,11 +7,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .routing.ledger import RoutingLedger
 from .routing.ledger_records import RoutingRevisionConflict
-from .routing.models import ModelTarget, ProviderProfile, RoutePolicy
+from .routing.models import ModelTarget, ProviderProfile, RoutePolicy, RoutingMode
+from .routing.router import RoutingUnavailableError
 from .routing.runtime import AdaptiveFlockRuntimeConfig
+from .routing.service import AdaptiveFlockRoutingService
 
 RoutingLocality = Literal["local", "cloud", "hybrid"]
 RoutingHealth = Literal["unknown", "healthy", "degraded", "open", "unavailable"]
+RoutingPrivacy = Literal["local_required", "local_preferred", "approved_cloud", "any"]
 
 
 class ProviderProfileRequest(BaseModel):
@@ -81,6 +84,19 @@ class RoutePolicyRequest(BaseModel):
         default_factory=lambda: {"low": 1, "medium": 2, "high": 3, "critical": 4}
     )
     expected_revision: int | None = Field(default=None, ge=0)
+
+
+class RoutingPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, max_length=240)
+    task_id: str = Field(min_length=1, max_length=240)
+    policy_id: str | None = Field(default=None, min_length=1, max_length=240)
+    direct_target_id: str | None = Field(default=None, min_length=1, max_length=240)
+    default_privacy_class: RoutingPrivacy = "approved_cloud"
+    local_required: bool = False
+    maximum_cost_usd: float | None = Field(default=None, ge=0)
+    planner_guidance: dict[str, Any] = Field(default_factory=dict)
 
 
 def register_routing_routes(
@@ -222,6 +238,58 @@ def register_routing_routes(
             return entry.to_public_payload()
         except RoutingRevisionConflict as exc:
             raise http_exception(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/routing/preview")  # type: ignore[untyped-decorator]
+    def preview_route(request: RoutingPreviewRequest) -> dict[str, object]:
+        try:
+            task = ledger.state.get_task_node(request.task_id)
+            if task.run_id != request.run_id:
+                raise ValueError("preview task does not belong to run")
+            policy_id = request.policy_id or runtime.policy_id
+            policy_entry = ledger.get_policy(policy_id)
+            if policy_entry is None or not policy_entry.enabled:
+                raise RoutingUnavailableError(
+                    f"route policy is unavailable: {policy_id}",
+                    reason_codes=("route_policy_unavailable",),
+                )
+            preview_mode: RoutingMode = (
+                "shadow" if runtime.mode == "off" else runtime.mode
+            )
+            service = AdaptiveFlockRoutingService(
+                profiles=[item.profile for item in ledger.list_provider_profiles()],
+                targets=[item.target for item in ledger.list_model_targets()],
+                policy=policy_entry.policy,
+                mode=preview_mode,
+            )
+            contract, decision = service.preview(
+                task,
+                planner_guidance=request.planner_guidance,
+                default_privacy_class=request.default_privacy_class,
+                local_required=request.local_required,
+                maximum_cost_usd=request.maximum_cost_usd,
+                direct_target_id=request.direct_target_id,
+            )
+            return {
+                "schema": "kestrel.adaptive_flock.preview.v1",
+                "run_id": request.run_id,
+                "task_id": request.task_id,
+                "policy_revision": policy_entry.revision,
+                "contract": contract.to_payload(),
+                "decision": decision.to_payload(),
+            }
+        except KeyError as exc:
+            raise http_exception(status_code=404, detail=str(exc)) from exc
+        except RoutingUnavailableError as exc:
+            raise http_exception(
+                status_code=409,
+                detail={
+                    "code": "routing_unavailable",
+                    "message": str(exc),
+                    "reason_codes": list(exc.reason_codes),
+                },
+            ) from exc
         except ValueError as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
 
