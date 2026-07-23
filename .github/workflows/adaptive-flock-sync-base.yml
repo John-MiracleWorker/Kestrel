@@ -1,0 +1,66 @@
+name: Sync Adaptive Flock Scheduler Base
+
+on:
+  push:
+    branches:
+      - codex/adaptive-flock-control-plane
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: codex/adaptive-flock-control-plane
+          persist-credentials: ${{ github.event_name == 'push' }}
+          fetch-depth: 0
+      - name: Merge current scheduler-routing base
+        run: |
+          git fetch origin codex/adaptive-flock-subagents
+          git merge --no-ff --no-commit origin/codex/adaptive-flock-subagents
+          rm .github/workflows/adaptive-flock-sync-base.yml
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+          python -m pip install --no-build-isolation -e '.[dev,memvid,mcp,keyring]'
+          python -m pip check
+      - name: Validate merged Adaptive Flock stack
+        run: |
+          ruff check --fix scripts src tests
+          ruff check scripts src tests
+          mypy src
+          python -m compileall -q src tests scripts
+          pytest -q \
+            tests/test_agent_routing_foundation.py \
+            tests/test_agent_routing_guardrails.py \
+            tests/test_agent_routing_ledger.py \
+            tests/test_agent_routing_cancellation.py \
+            tests/test_agent_routing_metadata.py \
+            tests/test_adaptive_flock_run_manager.py \
+            tests/test_adaptive_flock_start_failures.py \
+            tests/test_adaptive_flock_scheduler_hook.py \
+            tests/test_adaptive_flock_control_plane.py \
+            tests/test_adaptive_flock_env_config.py \
+            tests/test_adaptive_flock_preview.py
+          python scripts/run_golden_evals.py \
+            --backend memory \
+            --provider mock \
+            --max-case-latency-ms 45000
+      - name: Commit validated base sync
+        if: github.event_name == 'push'
+        run: |
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: sync Adaptive Flock scheduler routing"
+          git push origin HEAD:codex/adaptive-flock-control-plane
