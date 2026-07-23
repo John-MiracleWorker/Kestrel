@@ -135,13 +135,21 @@ def register_routing_routes(
     @app.post("/api/routing/providers")  # type: ignore[untyped-decorator]
     def put_provider_profile(request: ProviderProfileRequest) -> dict[str, Any]:
         try:
+            current = ledger.get_provider_profile(request.profile_id)
+            base_url = request.base_url
+            secret_ref = request.secret_ref
+            if current is not None and request.expected_revision is not None:
+                if "base_url" not in request.model_fields_set:
+                    base_url = current.profile.base_url
+                if "secret_ref" not in request.model_fields_set:
+                    secret_ref = current.profile.secret_ref
             entry = ledger.put_provider_profile(
                 ProviderProfile(
                     profile_id=request.profile_id,
                     display_name=request.display_name,
                     adapter=request.adapter,
-                    base_url=request.base_url,
-                    secret_ref=request.secret_ref,
+                    base_url=base_url,
+                    secret_ref=secret_ref,
                     enabled=request.enabled,
                     locality=request.locality,
                     trust_class=request.trust_class,
@@ -275,6 +283,12 @@ def register_routing_routes(
                 "schema": "kestrel.adaptive_flock.preview.v1",
                 "run_id": request.run_id,
                 "task_id": request.task_id,
+                "task": {
+                    "task_id": task.task_id,
+                    "run_id": task.run_id,
+                    "title": task.title,
+                    "status": task.status,
+                },
                 "policy_revision": policy_entry.revision,
                 "contract": contract.to_payload(),
                 "decision": decision.to_payload(),
