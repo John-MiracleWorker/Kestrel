@@ -456,8 +456,16 @@ def _optional_str(value: object) -> str | None:
 
 
 def _optional_int(value: object) -> int | None:
-    return None if value is None else int(value)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str, bytes, bytearray)):
+        raise ValueError("SQLite integer value has an unsupported type")
+    return int(value)
 
 
 def _optional_float(value: object) -> float | None:
-    return None if value is None else float(value)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, bytes, bytearray)):
+        raise ValueError("SQLite floating-point value has an unsupported type")
+    return float(value)
