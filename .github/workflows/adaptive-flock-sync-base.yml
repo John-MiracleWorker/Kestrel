@@ -47,7 +47,6 @@ jobs:
                 tests/test_agent_routing_foundation.py|\
                 tests/test_agent_routing_cancellation.py|\
                 tests/test_agent_routing_metadata.py)
-                  # Exact file ownership is overlaid below after conflicts are staged.
                   git checkout --ours -- "$path"
                   git add "$path"
                   ;;
@@ -117,24 +116,33 @@ jobs:
             > adaptive-flock-pytest.txt 2>&1
           printf '%s\n' "$?" > adaptive-flock-pytest-exit.txt
           exit 0
-      - name: Upload focused test report
+      - name: Capture memory golden evaluation
+        shell: bash
+        run: |
+          set +e
+          python scripts/run_golden_evals.py \
+            --backend memory \
+            --provider mock \
+            --max-case-latency-ms 45000 \
+            > adaptive-flock-golden.txt 2>&1
+          printf '%s\n' "$?" > adaptive-flock-golden-exit.txt
+          exit 0
+      - name: Upload validation reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: adaptive-flock-sync-tests-${{ github.sha }}
+          name: adaptive-flock-sync-validation-${{ github.sha }}
           path: |
             adaptive-flock-pytest.txt
             adaptive-flock-pytest-exit.txt
+            adaptive-flock-golden.txt
+            adaptive-flock-golden-exit.txt
           if-no-files-found: error
           retention-days: 1
       - name: Enforce focused Adaptive Flock tests
         run: test "$(cat adaptive-flock-pytest-exit.txt)" = 0
-      - name: Run memory golden validation
-        run: |
-          python scripts/run_golden_evals.py \
-            --backend memory \
-            --provider mock \
-            --max-case-latency-ms 45000
+      - name: Enforce memory golden validation
+        run: test "$(cat adaptive-flock-golden-exit.txt)" = 0
       - name: Commit validated base sync
         if: github.event_name == 'push'
         run: |
