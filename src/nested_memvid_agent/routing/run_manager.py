@@ -166,12 +166,12 @@ class AdaptiveFlockRunManager(RunManager):
         attempt: int,
         decision_id: str | None = None,
     ) -> None:
-        unavailable = isinstance(exc, RoutingUnavailableError)
-        reason_codes = (
-            tuple(exc.reason_codes)
-            if unavailable
-            else (f"routing_{phase}_failed",)
-        )
+        if isinstance(exc, RoutingUnavailableError):
+            unavailable = True
+            reason_codes = tuple(exc.reason_codes)
+        else:
+            unavailable = False
+            reason_codes = (f"routing_{phase}_failed",)
         error = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
         payload: dict[str, Any] = {
             "task_id": task.task_id,
