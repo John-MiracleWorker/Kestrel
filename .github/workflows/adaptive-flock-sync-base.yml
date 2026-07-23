@@ -79,8 +79,10 @@ jobs:
         run: mypy src
       - name: Validate compilation
         run: python -m compileall -q src tests scripts
-      - name: Run focused Adaptive Flock tests
+      - name: Capture focused Adaptive Flock test report
+        shell: bash
         run: |
+          set +e
           pytest -q \
             tests/test_agent_routing_foundation.py \
             tests/test_agent_routing_guardrails.py \
@@ -92,7 +94,22 @@ jobs:
             tests/test_adaptive_flock_scheduler_hook.py \
             tests/test_adaptive_flock_control_plane.py \
             tests/test_adaptive_flock_env_config.py \
-            tests/test_adaptive_flock_preview.py
+            tests/test_adaptive_flock_preview.py \
+            > adaptive-flock-pytest.txt 2>&1
+          printf '%s\n' "$?" > adaptive-flock-pytest-exit.txt
+          exit 0
+      - name: Upload focused test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: adaptive-flock-sync-tests-${{ github.sha }}
+          path: |
+            adaptive-flock-pytest.txt
+            adaptive-flock-pytest-exit.txt
+          if-no-files-found: error
+          retention-days: 1
+      - name: Enforce focused Adaptive Flock tests
+        run: test "$(cat adaptive-flock-pytest-exit.txt)" = 0
       - name: Run memory golden validation
         run: |
           python scripts/run_golden_evals.py \
