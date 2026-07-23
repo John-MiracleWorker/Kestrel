@@ -315,7 +315,13 @@ class RoutingLedger(RoutingRegistry):
                 """,
                 values,
             )
-            terminal_status = "completed" if validation_passed else "failed"
+            terminal_status = (
+                "completed"
+                if validation_passed
+                else "cancelled"
+                if execution_status == "cancelled"
+                else "failed"
+            )
             conn.execute(
                 """
                 UPDATE routing_decisions
