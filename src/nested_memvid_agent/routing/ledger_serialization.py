@@ -16,6 +16,29 @@ from .ledger_records import (
 )
 from .models import ModelTarget, ProviderProfile, RoutePolicy
 
+_SECRET_METADATA_KEYS = {
+    "secret",
+    "client_secret",
+    "password",
+    "authorization",
+    "cookie",
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "bearer_token",
+    "id_token",
+    "session_token",
+}
+_SECRET_METADATA_SUFFIXES = (
+    "_secret",
+    "_password",
+    "_api_key",
+    "_apikey",
+)
+
 
 def _validate_route_binding(
     conn: sqlite3.Connection,
@@ -82,25 +105,20 @@ def _validate_base_url(value: str | None) -> None:
 def _validate_metadata(value: object, *, path: str = "metadata") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            normalized = str(key).lower().replace("-", "_")
-            if any(
-                marker in normalized
-                for marker in (
-                    "secret",
-                    "token",
-                    "password",
-                    "api_key",
-                    "apikey",
-                    "authorization",
-                    "cookie",
-                )
-            ):
+            normalized = str(key).strip().lower().replace("-", "_")
+            if _metadata_key_is_secret_bearing(normalized):
                 raise ValueError(f"{path} contains a secret-bearing key: {key}")
             _validate_metadata(item, path=f"{path}.{key}")
         return
     if isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
             _validate_metadata(item, path=f"{path}[{index}]")
+
+
+def _metadata_key_is_secret_bearing(normalized: str) -> bool:
+    return normalized in _SECRET_METADATA_KEYS or any(
+        normalized.endswith(suffix) for suffix in _SECRET_METADATA_SUFFIXES
+    )
 
 
 def _target_values(
