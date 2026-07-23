@@ -35,7 +35,6 @@ jobs:
               [ -n "$path" ] || continue
               case "$path" in
                 src/nested_memvid_agent/routing/__init__.py)
-                  # The control-plane branch owns the public runtime-factory exports.
                   git checkout --ours -- "$path"
                   ;;
                 src/nested_memvid_agent/run_manager.py|\
@@ -48,7 +47,6 @@ jobs:
                 tests/test_agent_routing_foundation.py|\
                 tests/test_agent_routing_cancellation.py|\
                 tests/test_agent_routing_metadata.py)
-                  # These files are owned by the newly validated scheduler-routing base.
                   git checkout --theirs -- "$path"
                   ;;
                 *)
@@ -73,12 +71,16 @@ jobs:
           python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
           python -m pip install --no-build-isolation -e '.[dev,memvid,mcp,keyring]'
           python -m pip check
-      - name: Validate merged Adaptive Flock stack
+      - name: Auto-fix Ruff findings
+        run: ruff check --fix scripts src tests
+      - name: Validate Ruff
+        run: ruff check scripts src tests
+      - name: Validate mypy
+        run: mypy src
+      - name: Validate compilation
+        run: python -m compileall -q src tests scripts
+      - name: Run focused Adaptive Flock tests
         run: |
-          ruff check --fix scripts src tests
-          ruff check scripts src tests
-          mypy src
-          python -m compileall -q src tests scripts
           pytest -q \
             tests/test_agent_routing_foundation.py \
             tests/test_agent_routing_guardrails.py \
@@ -91,6 +93,8 @@ jobs:
             tests/test_adaptive_flock_control_plane.py \
             tests/test_adaptive_flock_env_config.py \
             tests/test_adaptive_flock_preview.py
+      - name: Run memory golden validation
+        run: |
           python scripts/run_golden_evals.py \
             --backend memory \
             --provider mock \
