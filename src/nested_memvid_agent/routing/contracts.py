@@ -29,6 +29,7 @@ def compile_task_contract(
 ) -> AgentTaskContract:
     text = f"{task.title} {task.goal}".strip()
     lowered = text.lower()
+    plan = task.plan or {}
     task_family = _task_family(lowered, tuple(task.required_tools), task.profile)
     complexity = _complexity(lowered, task)
     ambiguity = _ambiguity(lowered, task)
@@ -36,6 +37,7 @@ def compile_task_contract(
     modalities = set(_required_modalities(lowered))
     preferred_tags = set(_preferred_tags(task_family, task.profile))
     minimum_context = _minimum_context_tokens(task_family, complexity)
+    structured_output_required = _structured_output_required(plan)
 
     guidance = planner_guidance or {}
     proposed_family = _clean_optional_string(guidance.get("task_family"))
@@ -51,15 +53,17 @@ def compile_task_contract(
     proposed_context = _positive_int_or_none(guidance.get("minimum_context_tokens"))
     if proposed_context is not None:
         minimum_context = max(minimum_context or 0, proposed_context)
+    if _structured_output_required(guidance):
+        structured_output_required = True
     preferred_tags.update(_preferred_tags(task_family, task.profile))
     minimum_context = max(minimum_context or 0, _minimum_context_tokens(task_family, complexity))
     if "image" in modalities:
         capabilities.add("vision")
+    if structured_output_required:
+        capabilities.add("structured_output")
 
     deterministic_local = local_required or default_privacy_class == "local_required"
     privacy_class: PrivacyClass = "local_required" if deterministic_local else default_privacy_class
-    plan = task.plan or {}
-    acceptance_modes = tuple(_string_items(plan.get("acceptance_evidence")))
 
     return AgentTaskContract(
         task_id=task.task_id,
@@ -74,7 +78,7 @@ def compile_task_contract(
         required_capabilities=tuple(sorted(capabilities)),
         required_modalities=tuple(sorted(modalities)),
         minimum_context_tokens=minimum_context,
-        structured_output_required=bool(task.acceptance_criteria or acceptance_modes),
+        structured_output_required=structured_output_required,
         privacy_class=privacy_class,
         local_preferred=privacy_class == "local_preferred" or deterministic_local,
         local_required=deterministic_local,
@@ -200,8 +204,6 @@ def _required_capabilities(task: TaskLike, text: str) -> tuple[str, ...]:
     capabilities: set[str] = set()
     if task.required_tools:
         capabilities.add("tools")
-    if task.acceptance_criteria:
-        capabilities.add("structured_output")
     if task.profile in {"planner", "reviewer"} or any(
         term in text for term in ("architecture", "security", "reason")
     ):
@@ -242,6 +244,12 @@ def _minimum_context_tokens(task_family: str, complexity: float) -> int:
     if complexity >= 0.8:
         baseline = max(baseline, 96_000)
     return baseline
+
+
+def _structured_output_required(value: Mapping[str, Any]) -> bool:
+    return value.get("structured_output_required") is True or value.get(
+        "requires_structured_output"
+    ) is True
 
 
 def _string_items(value: object) -> tuple[str, ...]:
