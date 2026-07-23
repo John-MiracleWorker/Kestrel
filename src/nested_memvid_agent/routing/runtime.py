@@ -35,18 +35,21 @@ class AdaptiveFlockRuntimeConfig:
     @classmethod
     def from_env(cls) -> AdaptiveFlockRuntimeConfig:
         enabled = _env_bool("NEST_AGENT_ENABLE_ADAPTIVE_FLOCK")
-        mode_raw = os.getenv(
+        configured_mode = os.getenv(
             "NEST_AGENT_ADAPTIVE_FLOCK_MODE",
-            "shadow" if enabled else "off",
+            "shadow",
         ).strip().lower()
-        if mode_raw not in {"off", "shadow", "constrained", "adaptive"}:
+        if configured_mode not in {"off", "shadow", "constrained", "adaptive"}:
             raise ValueError(
                 "NEST_AGENT_ADAPTIVE_FLOCK_MODE must be off, shadow, constrained, or adaptive"
             )
+        if enabled and configured_mode == "off":
+            raise ValueError("Adaptive Flock mode must not be off when the runtime is enabled")
         policy_id = os.getenv("NEST_AGENT_ADAPTIVE_FLOCK_POLICY", "balanced").strip()
+        effective_mode = configured_mode if enabled else "off"
         return cls(
             enabled=enabled,
-            mode=cast(RoutingMode, mode_raw),
+            mode=cast(RoutingMode, effective_mode),
             policy_id=policy_id,
         )
 
