@@ -126,14 +126,18 @@ jobs:
           python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
           python -m pip install --no-build-isolation -e '.[dev,memvid,mcp,keyring]'
           python -m pip check
-      - name: Auto-fix and validate Python
+      - name: Auto-fix Ruff findings
+        run: ruff check --fix scripts src tests
+      - name: Capture validation output
+        shell: bash
         run: |
-          ruff check --fix scripts src tests
-          ruff check scripts src tests
-          mypy src
-          python -m compileall -q src tests scripts
-      - name: Run focused Adaptive Flock tests
-        run: |
+          set +e
+          ruff check scripts src tests > ruff-output.txt 2>&1
+          printf '%s\n' "$?" > ruff-exit-code.txt
+          mypy src > mypy-output.txt 2>&1
+          printf '%s\n' "$?" > mypy-exit-code.txt
+          python -m compileall -q src tests scripts > compile-output.txt 2>&1
+          printf '%s\n' "$?" > compile-exit-code.txt
           pytest -q \
             tests/test_agent_routing_foundation.py \
             tests/test_agent_routing_guardrails.py \
@@ -141,18 +145,52 @@ jobs:
             tests/test_agent_routing_outcome_semantics.py \
             tests/test_agent_routing_metadata.py \
             tests/test_adaptive_flock_run_manager.py \
-            tests/test_adaptive_flock_run_manager_hardening.py \
+            tests/test_adaptive_flock_start_failures.py \
             tests/test_adaptive_flock_control_plane.py \
             tests/test_adaptive_flock_env_config.py \
-            tests/test_adaptive_flock_preview.py
-      - name: Run Memvid golden validation
-        run: |
-          docker pull "$NEST_AGENT_VALIDATION_CONTAINER_IMAGE"
+            tests/test_adaptive_flock_preview.py \
+            > pytest-output.txt 2>&1
+          printf '%s\n' "$?" > pytest-exit-code.txt
+          docker pull "$NEST_AGENT_VALIDATION_CONTAINER_IMAGE" > docker-output.txt 2>&1
+          printf '%s\n' "$?" > docker-exit-code.txt
           python scripts/run_golden_evals.py \
             --backend memvid \
             --provider mock \
             --memory-dir "${RUNNER_TEMP}/kestrel-memvid-golden" \
-            --max-case-latency-ms 45000
+            --max-case-latency-ms 45000 \
+            > golden-output.txt 2>&1
+          printf '%s\n' "$?" > golden-exit-code.txt
+          exit 0
+      - name: Upload exact validation output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: adaptive-flock-integration-validation-${{ github.sha }}
+          path: |
+            ruff-output.txt
+            ruff-exit-code.txt
+            mypy-output.txt
+            mypy-exit-code.txt
+            compile-output.txt
+            compile-exit-code.txt
+            pytest-output.txt
+            pytest-exit-code.txt
+            docker-output.txt
+            docker-exit-code.txt
+            golden-output.txt
+            golden-exit-code.txt
+            src/nested_memvid_agent/server.py
+            tests/test_adaptive_flock_control_plane.py
+          if-no-files-found: error
+          retention-days: 1
+      - name: Enforce validation results
+        run: |
+          test "$(cat ruff-exit-code.txt)" = 0
+          test "$(cat mypy-exit-code.txt)" = 0
+          test "$(cat compile-exit-code.txt)" = 0
+          test "$(cat pytest-exit-code.txt)" = 0
+          test "$(cat docker-exit-code.txt)" = 0
+          test "$(cat golden-exit-code.txt)" = 0
       - name: Commit validated integration
         if: github.event_name == 'push'
         run: |
