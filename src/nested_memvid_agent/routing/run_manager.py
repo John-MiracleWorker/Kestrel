@@ -89,31 +89,37 @@ class AdaptiveFlockRunManager(RunManager):
                 subagent_id=subagent_id,
                 attempt=attempt,
             )
-        except RoutingUnavailableError as exc:
-            payload = {
-                "task_id": task_id,
-                "subagent_id": subagent_id,
-                "attempt": attempt,
-                "mode": self.routing_coordinator.mode,
-                "reason_codes": list(exc.reason_codes),
-                "error": str(redact_secrets(str(exc))),
-            }
-            if self.routing_coordinator.mode == "shadow":
-                self.events.publish(run_id, "routing.shadow_unavailable", payload)
-                super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
-                return
-            self.events.publish(run_id, "routing.guardrail_blocked", payload)
-            self._fail_routing_assignment(
-                run_id=run_id,
-                task=task,
+        except Exception as exc:  # noqa: BLE001 - mode determines fail-open versus fail-closed
+            self._handle_pre_execution_routing_failure(
+                exc,
+                phase="assignment",
+                thread_key=thread_key,
+                config=config,
                 subagent_id=subagent_id,
-                error=str(payload["error"]),
-                reason_codes=tuple(exc.reason_codes),
+                run_id=run_id,
+                session_id=session_id,
+                task=task,
+                attempt=attempt,
             )
             return
 
         self.events.publish(run_id, "routing.selected", _routing_decision_payload(durable))
-        self.routing_coordinator.mark_started(durable)
+        try:
+            self.routing_coordinator.mark_started(durable)
+        except Exception as exc:  # noqa: BLE001 - mode determines fail-open versus fail-closed
+            self._handle_pre_execution_routing_failure(
+                exc,
+                phase="start",
+                thread_key=thread_key,
+                config=config,
+                subagent_id=subagent_id,
+                run_id=run_id,
+                session_id=session_id,
+                task=task,
+                attempt=attempt,
+                decision_id=durable.record.decision_id,
+            )
+            return
         self.events.publish(
             run_id,
             "routing.attempt_started",
@@ -146,6 +152,65 @@ class AdaptiveFlockRunManager(RunManager):
                 run_id=run_id,
             )
 
+    def _handle_pre_execution_routing_failure(
+        self,
+        exc: Exception,
+        *,
+        phase: str,
+        thread_key: str,
+        config: AgentConfig,
+        subagent_id: str,
+        run_id: str,
+        session_id: str,
+        task: TaskNodeRecord,
+        attempt: int,
+        decision_id: str | None = None,
+    ) -> None:
+        unavailable = isinstance(exc, RoutingUnavailableError)
+        reason_codes = (
+            tuple(exc.reason_codes)
+            if unavailable
+            else (f"routing_{phase}_failed",)
+        )
+        error = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
+        payload: dict[str, Any] = {
+            "task_id": task.task_id,
+            "subagent_id": subagent_id,
+            "attempt": attempt,
+            "phase": phase,
+            "mode": self.routing_coordinator.mode,
+            "reason_codes": list(reason_codes),
+            "error": error,
+        }
+        if decision_id is not None:
+            payload["decision_id"] = decision_id
+        if self.routing_coordinator.mode == "shadow":
+            event_type = (
+                "routing.shadow_unavailable"
+                if unavailable and phase == "assignment"
+                else f"routing.{phase}_failed"
+            )
+            self.events.publish(run_id, event_type, payload)
+            super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
+            return
+
+        category = "routing_unavailable" if unavailable else "routing_persistence_failed"
+        event_type = "routing.guardrail_blocked" if unavailable else f"routing.{phase}_failed"
+        self.events.publish(run_id, event_type, payload)
+        self._fail_routing_assignment(
+            run_id=run_id,
+            task=task,
+            subagent_id=subagent_id,
+            error=error,
+            reason_codes=reason_codes,
+            category=category,
+            retry_reason=(
+                "No policy-admissible routing target was available."
+                if unavailable
+                else "The durable routing decision could not be safely persisted or started."
+            ),
+        )
+
     def _fail_routing_assignment(
         self,
         *,
@@ -154,6 +219,8 @@ class AdaptiveFlockRunManager(RunManager):
         subagent_id: str,
         error: str,
         reason_codes: tuple[str, ...],
+        category: str,
+        retry_reason: str,
     ) -> None:
         failed_task, failed_subagent, applied = self.state.transition_scheduler_task_and_subagent(
             task.task_id,
@@ -165,13 +232,13 @@ class AdaptiveFlockRunManager(RunManager):
             task_fields={
                 "failure_reason": error,
                 "diagnosis": {
-                    "category": "routing_unavailable",
+                    "category": category,
                     "reason_codes": list(reason_codes),
                 },
                 "retry_strategy": {
                     "requires_changed_strategy": True,
                     "retry_allowed": False,
-                    "reason": "No policy-admissible routing target was available.",
+                    "reason": retry_reason,
                 },
                 "result": {
                     "error": error,
