@@ -135,7 +135,11 @@ def _manager(state: _State, events: _Events, coordinator: _Coordinator) -> Adapt
     manager.routing_coordinator = coordinator  # type: ignore[assignment]
     manager._lease_owner = "manager-test"
     manager._cancelled = set()
-    manager._maybe_complete_root_task = lambda _run_id: None  # type: ignore[method-assign]
+
+    def complete_root(_run_id: str) -> None:
+        return
+
+    manager._maybe_complete_root_task = complete_root  # type: ignore[method-assign]
     return manager
 
 
