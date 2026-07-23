@@ -354,6 +354,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /new chat/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
     expect(screen.getByText("Safe Auto")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /routing/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /advanced/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /chats/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /details/i })).toBeInTheDocument();
@@ -368,6 +369,17 @@ describe("App", () => {
       }
     });
     expect(results.violations).toEqual([]);
+  });
+
+  it("opens the Adaptive Flock Routing Center from primary navigation", async () => {
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /routing/i }));
+
+    expect(await screen.findByRole("heading", { name: "Adaptive Flock Routing" })).toBeInTheDocument();
+    expect((await screen.findAllByText("Local server")).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /preview decision/i })).toBeInTheDocument();
   });
 
   it("keeps idle chat polling lightweight", async () => {
@@ -2609,6 +2621,95 @@ function payloadFor(path: string): unknown {
   if (path === "/api/plugins") return [];
   if (path === "/api/channels") return channelsPayload;
   if (path === "/api/secrets") return secrets;
+
+  if (path === "/api/routing/status") {
+    return {
+      schema: "kestrel.adaptive_flock.status.v1",
+      runtime: { enabled: false, mode: "off", policy_id: "balanced" },
+      routing_schema_version: 1,
+      counts: {
+        provider_profiles: 1,
+        enabled_provider_profiles: 1,
+        model_targets: 1,
+        enabled_model_targets: 1,
+        policies: 1,
+        enabled_policies: 1
+      }
+    };
+  }
+  if (path === "/api/routing/providers") {
+    return [{
+      profile_id: "local",
+      display_name: "Local server",
+      adapter: "openai-compatible",
+      base_url_configured: true,
+      secret_configured: false,
+      enabled: true,
+      locality: "local",
+      trust_class: "standard",
+      max_concurrency: 1,
+      metadata: {},
+      revision: 1,
+      created_at: "2026-05-16T00:00:00Z",
+      updated_at: "2026-05-16T00:00:00Z"
+    }];
+  }
+  if (path === "/api/routing/targets") {
+    return [{
+      target_id: "local-worker",
+      provider_profile_id: "local",
+      provider: "openai-compatible",
+      model: "qwen-coder",
+      enabled: true,
+      locality: "local",
+      trust_class: "standard",
+      capability_tags: ["worker"],
+      role_affinities: ["worker"],
+      task_family_affinities: [],
+      max_context_tokens: 32768,
+      supports_tools: true,
+      supports_json: false,
+      supports_vision: false,
+      supports_reasoning: false,
+      supports_streaming: true,
+      quality_tier: 2,
+      latency_tier: 2,
+      operator_priority: 0,
+      estimated_cost_usd: 0,
+      health: "healthy",
+      recent_failure_rate: 0,
+      predicted_success: null,
+      metadata: {},
+      revision: 1,
+      created_at: "2026-05-16T00:00:00Z",
+      updated_at: "2026-05-16T00:00:00Z"
+    }];
+  }
+  if (path === "/api/routing/policies") {
+    return [{
+      policy_id: "balanced",
+      enabled: true,
+      quality_weight: 0.4,
+      affinity_weight: 0.16,
+      health_weight: 0.1,
+      context_weight: 0.08,
+      locality_weight: 0.08,
+      operator_weight: 0.05,
+      cost_weight: 0.08,
+      latency_weight: 0.03,
+      failure_weight: 0.12,
+      require_different_target_for_review: false,
+      require_different_model_family_for_review: false,
+      prefer_different_provider_for_review: false,
+      minimum_quality_by_risk: { low: 1, medium: 2, high: 3, critical: 4 },
+      revision: 1,
+      created_at: "2026-05-16T00:00:00Z",
+      updated_at: "2026-05-16T00:00:00Z"
+    }];
+  }
+  if (/^\/api\/runs\/[^/]+\/routing(?:\?.*)?$/.test(path)) {
+    return { run_id: "run_2", task_id: null, decisions: [], outcomes: [] };
+  }
 
 
   if (path === "/api/learning/dashboard?since=all") {
