@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      NEST_AGENT_VALIDATION_CONTAINER_IMAGE: "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -116,6 +117,8 @@ jobs:
             > adaptive-flock-pytest.txt 2>&1
           printf '%s\n' "$?" > adaptive-flock-pytest-exit.txt
           exit 0
+      - name: Preload trusted validation image
+        run: docker pull "$NEST_AGENT_VALIDATION_CONTAINER_IMAGE"
       - name: Capture memory golden evaluation
         shell: bash
         run: |
