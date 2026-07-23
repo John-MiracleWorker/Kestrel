@@ -7,16 +7,35 @@ from .models import AgentTaskContract, PrivacyClass
 
 
 class TaskLike(Protocol):
-    task_id: str
-    run_id: str
-    title: str
-    goal: str
-    profile: str
-    risk: str
-    required_tools: Sequence[str]
-    acceptance_criteria: Sequence[str]
-    dependencies: Sequence[str]
-    plan: Mapping[str, Any] | None
+    @property
+    def task_id(self) -> str: ...
+
+    @property
+    def run_id(self) -> str: ...
+
+    @property
+    def title(self) -> str: ...
+
+    @property
+    def goal(self) -> str: ...
+
+    @property
+    def profile(self) -> str: ...
+
+    @property
+    def risk(self) -> str: ...
+
+    @property
+    def required_tools(self) -> Sequence[str]: ...
+
+    @property
+    def acceptance_criteria(self) -> Sequence[str]: ...
+
+    @property
+    def dependencies(self) -> Sequence[str]: ...
+
+    @property
+    def plan(self) -> Mapping[str, Any] | None: ...
 
 
 def compile_task_contract(
