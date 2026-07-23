@@ -76,8 +76,24 @@ def test_contract_preserves_authoritative_task_requirements() -> None:
     assert contract.risk == "low"
     assert contract.required_tools == ("patch.apply", "test.run")
     assert "tools" in contract.required_capabilities
-    assert contract.structured_output_required is True
+    assert "structured_output" not in contract.required_capabilities
+    assert contract.structured_output_required is False
     assert contract.minimum_context_tokens == 32_000
+
+
+def test_structured_output_must_be_requested_explicitly() -> None:
+    planned = compile_task_contract(
+        _Task(plan={"structured_output_required": True})
+    )
+    guided = compile_task_contract(
+        _Task(),
+        planner_guidance={"requires_structured_output": True},
+    )
+
+    assert planned.structured_output_required is True
+    assert guided.structured_output_required is True
+    assert "structured_output" in planned.required_capabilities
+    assert "structured_output" in guided.required_capabilities
 
 
 def test_planner_guidance_can_enrich_but_not_lower_deterministic_requirements() -> None:
@@ -95,6 +111,7 @@ def test_planner_guidance_can_enrich_but_not_lower_deterministic_requirements() 
             "ambiguity": 0.1,
             "required_capabilities": ["vision"],
             "minimum_context_tokens": 16_000,
+            "structured_output_required": True,
         },
     )
 
