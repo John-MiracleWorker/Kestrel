@@ -13,6 +13,7 @@ from nested_memvid_agent.routing.runtime import (
     build_run_manager,
 )
 from nested_memvid_agent.run_manager import RunManager
+from nested_memvid_agent.server import create_app
 from nested_memvid_agent.server_routing_routes import register_routing_routes
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
@@ -72,7 +73,7 @@ def test_manager_factory_preserves_default_run_manager(tmp_path: Path) -> None:
         routing_config=AdaptiveFlockRuntimeConfig(),
     )
     try:
-        assert type(build.runs) is RunManager
+        assert build.runs.__class__ is RunManager
         assert build.routing_ledger.get_policy("balanced") is not None
     finally:
         assert build.runs.shutdown(timeout_seconds=1.0)
@@ -202,3 +203,32 @@ def test_routing_api_returns_revision_conflict(tmp_path: Path) -> None:
     finally:
         assert build.runs.shutdown(timeout_seconds=1.0)
         assert build.runs.mcp.shutdown()
+
+
+def test_create_app_registers_default_off_routing_control_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
+    monkeypatch.setenv("NEST_AGENT_ENABLE_ADAPTIVE_FLOCK", "false")
+    monkeypatch.setenv("NEST_AGENT_ADAPTIVE_FLOCK_MODE", "shadow")
+    config = AgentConfig(
+        provider="mock",
+        model="mock",
+        state_path=tmp_path / "state" / "agent.db",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        workspace=tmp_path,
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        require_api_auth=False,
+    )
+
+    with fastapi_testclient.TestClient(create_app(config)) as client:
+        response = client.get("/api/routing/status")
+
+    assert response.status_code == 200
+    assert response.json()["runtime"] == {
+        "enabled": False,
+        "mode": "off",
+        "policy_id": "balanced",
+    }
