@@ -166,3 +166,8 @@ class AdaptiveFlockRoutingService:
                     f"model target {target.target_id} provider {target.provider} does not "
                     f"match profile adapter {profile.adapter}"
                 )
+            if profile.locality != "hybrid" and target.locality != profile.locality:
+                raise ValueError(
+                    f"model target {target.target_id} locality {target.locality} does not "
+                    f"match profile locality {profile.locality}"
+                )
