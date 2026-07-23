@@ -1,6 +1,7 @@
 name: Routing Mypy Diagnostic
 
 on:
+  pull_request:
   push:
     branches:
       - codex/adaptive-flock-ledger
