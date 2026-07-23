@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -8,6 +9,9 @@ from .routing.ledger import RoutingLedger
 from .routing.ledger_records import RoutingRevisionConflict
 from .routing.models import ModelTarget, ProviderProfile, RoutePolicy
 from .routing.runtime import AdaptiveFlockRuntimeConfig
+
+RoutingLocality = Literal["local", "cloud", "hybrid"]
+RoutingHealth = Literal["unknown", "healthy", "degraded", "open", "unavailable"]
 
 
 class ProviderProfileRequest(BaseModel):
@@ -19,7 +23,7 @@ class ProviderProfileRequest(BaseModel):
     base_url: str | None = None
     secret_ref: str | None = None
     enabled: bool = True
-    locality: str = "cloud"
+    locality: RoutingLocality = "cloud"
     trust_class: str = "standard"
     max_concurrency: int = Field(default=1, ge=1, le=1024)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -34,7 +38,7 @@ class ModelTargetRequest(BaseModel):
     provider: str = Field(min_length=1, max_length=120)
     model: str = Field(min_length=1, max_length=512)
     enabled: bool = True
-    locality: str = "cloud"
+    locality: RoutingLocality = "cloud"
     trust_class: str = "standard"
     capability_tags: list[str] = Field(default_factory=list)
     role_affinities: list[str] = Field(default_factory=list)
@@ -49,7 +53,7 @@ class ModelTargetRequest(BaseModel):
     latency_tier: int = Field(default=3, ge=1, le=5)
     operator_priority: int = Field(default=0, ge=-10, le=10)
     estimated_cost_usd: float | None = Field(default=None, ge=0)
-    health: str = "unknown"
+    health: RoutingHealth = "unknown"
     recent_failure_rate: float = Field(default=0.0, ge=0, le=1)
     predicted_success: float | None = Field(default=None, ge=0, le=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -84,7 +88,7 @@ def register_routing_routes(
     *,
     ledger: RoutingLedger,
     runtime: AdaptiveFlockRuntimeConfig,
-    http_exception: type[Exception],
+    http_exception: Callable[..., Exception],
 ) -> None:
     @app.get("/api/routing/status")  # type: ignore[untyped-decorator]
     def routing_status() -> dict[str, object]:
@@ -123,7 +127,7 @@ def register_routing_routes(
                     base_url=request.base_url,
                     secret_ref=request.secret_ref,
                     enabled=request.enabled,
-                    locality=request.locality,  # type: ignore[arg-type]
+                    locality=request.locality,
                     trust_class=request.trust_class,
                     max_concurrency=request.max_concurrency,
                     metadata=request.metadata,
@@ -153,7 +157,7 @@ def register_routing_routes(
                     provider=request.provider,
                     model=request.model,
                     enabled=request.enabled,
-                    locality=request.locality,  # type: ignore[arg-type]
+                    locality=request.locality,
                     trust_class=request.trust_class,
                     capability_tags=tuple(request.capability_tags),
                     role_affinities=tuple(request.role_affinities),
@@ -168,7 +172,7 @@ def register_routing_routes(
                     latency_tier=request.latency_tier,
                     operator_priority=request.operator_priority,
                     estimated_cost_usd=request.estimated_cost_usd,
-                    health=request.health,  # type: ignore[arg-type]
+                    health=request.health,
                     recent_failure_rate=request.recent_failure_rate,
                     predicted_success=request.predicted_success,
                     metadata=request.metadata,
