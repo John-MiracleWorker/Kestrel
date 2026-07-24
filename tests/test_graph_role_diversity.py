@@ -10,18 +10,13 @@ from __future__ import annotations
 
 import pytest
 
-from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.routing.models import (
     AgentTaskContract,
     ModelTarget,
     ProviderProfile,
     RoutePolicy,
 )
-from nested_memvid_agent.routing.router import (
-    ReviewDiversityContext,
-    RoutingUnavailableError,
-    route_task,
-)
+from nested_memvid_agent.routing.router import RoutingUnavailableError
 from nested_memvid_agent.routing.role_resolver import (
     GraphRoleAssignment,
     RoleAssignmentResolver,
