@@ -44,6 +44,11 @@ from .native_worker import (
     start_native_worker,
 )
 from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
+from .role_resolver import (
+    GraphRoleAssignment,
+    RoleAssignmentResolver,
+    resolve_graph_roles,
+)
 from .run_manager import AdaptiveFlockRunManager
 from .runtime import AdaptiveFlockRuntimeConfig, RunManagerBuild, build_run_manager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
@@ -55,6 +60,7 @@ __all__ = [
     "AgentTaskContract",
     "DurableRoutingAssignment",
     "DurableRoutingCoordinator",
+    "GraphRoleAssignment",
     "LearnedRouterConfig",
     "LearnedRouterState",
     "ModelTarget",
@@ -66,6 +72,7 @@ __all__ = [
     "ProviderProfile",
     "ProviderProfileEntry",
     "ReviewDiversityContext",
+    "RoleAssignmentResolver",
     "RouteCandidate",
     "RouteDecision",
     "RouteDecisionEntry",
@@ -91,6 +98,7 @@ __all__ = [
     "compile_task_contract",
     "evaluate_shadow",
     "replay_history",
+    "resolve_graph_roles",
     "route_task",
     "should_activate_learned_policy",
     "start_native_worker",
