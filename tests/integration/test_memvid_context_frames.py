@@ -7,7 +7,9 @@ import pytest
 
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
 from nested_memvid_agent.context_frames import MV2ContextFrame
-from nested_memvid_agent.models import MemoryKind, MemoryLayer
+from nested_memvid_agent.context_packer import ContextPacker, ContextPackRequest
+from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.task_capsule import summarize_run_capsule, write_run_capsule
 
 pytestmark = pytest.mark.skipif(
@@ -52,6 +54,67 @@ def test_memvid_context_frame_metadata_round_trip(tmp_path: Path) -> None:
         assert metadata["source_span"] == {"line": 7}
     finally:
         reopened.close()
+
+
+def test_memvid_summary_expands_linked_raw_child_on_demand(
+    tmp_path: Path,
+) -> None:
+    memory = build_memory_system(
+        "memvid",
+        tmp_path / "memory",
+        enforce_stable_write_integrity=False,
+    )
+    try:
+        marker = "memvid-linked-summary-4b2a"
+        summary_id = "memvid_linked_summary"
+        raw_id = "memvid_linked_raw"
+        raw_payload = "child-only-payload-8f31 includes the complete command output."
+        memory.put(
+            MemoryRecord(
+                id=summary_id,
+                title=f"{marker} summary",
+                content=f"{marker} compact result.",
+                layer=MemoryLayer.EPISODIC,
+                kind=MemoryKind.SUMMARY,
+                confidence=0.8,
+                importance=0.8,
+                metadata={
+                    "frame_type": "task_summary",
+                    "frame_id": summary_id,
+                    "child_ids": [raw_id],
+                },
+            )
+        )
+        memory.put(
+            MemoryRecord(
+                id=raw_id,
+                title="Supporting raw evidence",
+                content=raw_payload,
+                layer=MemoryLayer.EPISODIC,
+                kind=MemoryKind.EVENT,
+                confidence=0.8,
+                importance=0.7,
+                metadata={
+                    "frame_type": "raw_chunk",
+                    "frame_id": raw_id,
+                    "parent_ids": [summary_id],
+                },
+            )
+        )
+
+        compact = ContextPacker(memory).pack(
+            ContextPackRequest(objective=marker, query=marker)
+        )
+        expanded = ContextPacker(memory).pack(
+            ContextPackRequest(objective=marker, query=marker, expand_raw=True)
+        )
+
+        assert raw_payload not in compact.prompt
+        assert raw_payload in expanded.prompt
+        summary_item = next(item for item in expanded.items if item.frame.id == summary_id)
+        assert summary_item.reason == "expanded_child_frames"
+    finally:
+        memory.close_all()
 
 
 def test_memvid_capsule_summary_reads_complete_mv2(tmp_path: Path) -> None:

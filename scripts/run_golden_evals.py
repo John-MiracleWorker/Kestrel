@@ -627,26 +627,42 @@ def _eval_summary_first_expand_raw(config: AgentConfig, eval_id: str) -> dict[st
     agent = build_agent(config)
     try:
         marker = f"{eval_id} summary expand"
+        summary_id = f"summary_{uuid4().hex}"
+        raw_id = f"raw_{uuid4().hex}"
+        raw_payload = (
+            f"{raw_id}: Raw exact evidence includes verbose logs and complete command output."
+        )
+        summary_title = f"{marker} summary"
         agent.memory.put(
             MemoryRecord(
+                id=summary_id,
                 layer=MemoryLayer.EPISODIC,
                 kind=MemoryKind.SUMMARY,
-                title=f"{marker} summary",
+                title=summary_title,
                 content=f"{marker}: Summary says the fix is to pack summaries before raw evidence.",
                 confidence=0.8,
                 importance=0.8,
-                metadata={"frame_type": "task_summary"},
+                metadata={
+                    "frame_type": "task_summary",
+                    "frame_id": summary_id,
+                    "child_ids": [raw_id],
+                },
             )
         )
         agent.memory.put(
             MemoryRecord(
+                id=raw_id,
                 layer=MemoryLayer.EPISODIC,
                 kind=MemoryKind.EVENT,
-                title=f"{marker} raw",
-                content=f"{marker}: Raw exact evidence includes verbose logs and complete command output.",
+                title="Supporting raw evidence",
+                content=raw_payload,
                 confidence=0.8,
                 importance=0.7,
-                metadata={"frame_type": "raw_chunk"},
+                metadata={
+                    "frame_type": "raw_chunk",
+                    "frame_id": raw_id,
+                    "parent_ids": [summary_id],
+                },
             )
         )
         # Force the vector sidecar to index both records so retrieval is
@@ -662,11 +678,16 @@ def _eval_summary_first_expand_raw(config: AgentConfig, eval_id: str) -> dict[st
             ContextPackRequest(objective=marker, query=marker, expand_raw=True, **pack_kwargs)
         )
         compact_titles = {item.frame.title for item in compact.items}
-        expanded_titles = {item.frame.title for item in expanded.items}
+        expanded_summary = next(
+            (item for item in expanded.items if item.frame.id == summary_id),
+            None,
+        )
         return {
-            "passed": f"{marker} summary" in compact_titles
-            and f"{marker} raw" not in compact_titles
-            and f"{marker} raw" in expanded_titles,
+            "passed": summary_title in compact_titles
+            and raw_payload not in compact.prompt
+            and raw_payload in expanded.prompt
+            and expanded_summary is not None
+            and expanded_summary.reason == "expanded_child_frames",
             "memory_hits": len(expanded.items),
             "context_chars": len(expanded.prompt),
         }

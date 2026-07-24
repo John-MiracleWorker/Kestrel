@@ -5280,7 +5280,7 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
         )
 
     def wait_for_terminal_event() -> tuple[str, list[dict[str, Any]]]:
-        deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
+        deadline = monotonic() + _PUBLIC_RUN_TIMEOUT_SECONDS
         observed: list[dict[str, Any]] = []
         while monotonic() < deadline:
             try:
