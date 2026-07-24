@@ -41,6 +41,7 @@ import remarkGfm from "remark-gfm";
 import { ApiAuthError, ApiResponseError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
+import { RoutingCenter } from "./routing/RoutingCenter";
 import {
   activityItemsForEvents,
   assistantTextForRun,
@@ -104,7 +105,7 @@ type ProviderOption = {
   requiresKey?: boolean;
 };
 
-type AppSection = "chat" | "routines" | "advanced" | "settings";
+type AppSection = "chat" | "routines" | "routing" | "advanced" | "settings";
 
 const RUN_EVENT_REFRESH_DEBOUNCE_MS = 250;
 
@@ -309,7 +310,15 @@ const runEventTypes = [
   "subagent.completed",
   "subagent.blocked",
   "worker.isolated",
-  "subagent.failed"
+  "subagent.failed",
+  "routing.selected",
+  "routing.attempt_started",
+  "routing.shadow_unavailable",
+  "routing.guardrail_blocked",
+  "routing.assignment_failed",
+  "routing.start_failed",
+  "routing.outcome_recorded",
+  "routing.outcome_failed"
 ];
 const SETUP_DISMISSED_KEY = "kestrel.setup.dismissed";
 const defaultPersonaPresets: PersonaPreset[] = [
@@ -1866,6 +1875,7 @@ export function App() {
           <nav className="primary-nav" aria-label="Primary">
             <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => routeToSection("chat")}>Chat</button>
             <button type="button" className={activeSection === "routines" ? "active" : ""} onClick={() => routeToSection("routines")}>Routines</button>
+            <button type="button" className={activeSection === "routing" ? "active" : ""} onClick={() => routeToSection("routing")}>Routing</button>
             <button type="button" className={activeSection === "settings" ? "active" : ""} onClick={() => routeToSection("settings")}>Settings</button>
             <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => routeToSection("advanced")}>Advanced</button>
           </nav>
@@ -2069,6 +2079,37 @@ export function App() {
             setAuthPromptOpen(true);
             setApiTokenDraft(getApiToken());
           }} />
+        )}
+        {activeSection === "routing" && (
+          <section
+            id="routing-workbench"
+            className="shell page-shell advanced-page"
+            ref={conversationRef}
+            tabIndex={0}
+            aria-label="Adaptive Flock routing workbench"
+          >
+            <header className="page-header advanced-header">
+              <div>
+                <span className="eyebrow">Adaptive execution</span>
+                <h1>Adaptive Flock Routing</h1>
+                <p>Configure provider pools, inspect route policies, and preview why Kestrel selects a worker.</p>
+              </div>
+              <button type="button" className="secondary-button" onClick={() => routeToSection("chat")}>
+                Back to chat
+              </button>
+            </header>
+            {error && <div className="banner error">{error}</div>}
+            {notice && <div className="banner success">{notice}</div>}
+            <RoutingCenter
+              activeRunId={activeRun?.run_id ?? null}
+              activeTaskId={
+                taskGraph?.tasks.find((task) => ["running", "blocked", "pending"].includes(task.status))?.task_id ??
+                null
+              }
+              onError={setError}
+              onNotice={setNotice}
+            />
+          </section>
         )}
         {activeSection === "advanced" && (
           <section id="advanced" className="shell page-shell advanced-page" data-section="advanced" aria-label="Advanced Operator Console">
@@ -5093,7 +5134,11 @@ function createThreadId(): string {
 
 function sectionFromHash(hash: string): AppSection | null {
   const normalized = hash.replace(/^#/, "").toLowerCase();
-  return normalized === "chat" || normalized === "routines" || normalized === "advanced" || normalized === "settings"
+  return normalized === "chat" ||
+    normalized === "routines" ||
+    normalized === "routing" ||
+    normalized === "advanced" ||
+    normalized === "settings"
     ? normalized
     : null;
 }
