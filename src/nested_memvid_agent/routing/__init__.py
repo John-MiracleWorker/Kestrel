@@ -24,6 +24,16 @@ from .models import (
     RoutingMode,
 )
 from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
+from .learned_router import (
+    LearnedRouterConfig,
+    LearnedRouterState,
+    RouteExample,
+    ShadowEvaluation,
+    build_route_examples,
+    evaluate_shadow,
+    replay_history,
+    should_activate_learned_policy,
+)
 from .run_manager import AdaptiveFlockRunManager
 from .runtime import AdaptiveFlockRuntimeConfig, RunManagerBuild, build_run_manager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
