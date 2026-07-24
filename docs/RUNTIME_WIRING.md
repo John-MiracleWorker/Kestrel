@@ -310,9 +310,30 @@ Successful isolated validation writes schema-v2 authorization receipts and rotat
 
 Plugin-provided MCP stdio servers carry `connect_requires_approval` vetting metadata. Connect, test, sync, and invoke paths refuse to start the process until `POST /api/mcp/servers/{server_id}/approve-connect` records approval for the current command hash.
 
-## Support Bundle Wiring
+## Provider Certification and Support Bundle Wiring
 
-`nest-agent product provider-certification` and `GET /api/product/provider-certification` expose a redacted provider matrix. The report marks deterministic mock coverage as certified, records credential/base-url presence for real providers, identifies host-local manual checks such as `codex-cli`, and returns the live-validation commands needed to turn configured providers into release evidence. It never returns raw API keys.
+`nest-agent product provider-certification` and `GET /api/product/provider-certification` expose a
+redacted `kestrel.provider_certification.v2` matrix in deterministic provider order. Legacy
+`status`, credential/base-URL presence, host checks, `next_action`, and validation-command fields
+remain configuration-readiness diagnostics; they are not assurance. The separate
+`certification_state` and `generate`, `stream`, `native_tools`, `tool_normalization`, and
+`learning_e2e` dimensions are derived only from accepted evidence for the report's exact commit and
+tree digest. A no-receipt runtime report therefore describes implemented or experimental surfaces
+and current readiness without silently claiming mock, live, or release certification.
+
+The HTTP route never accepts a caller-selected evidence path. Exact-schema evidence is handled by
+the offline `scripts/run_provider_certification.py collect`, `build`, and `check` workflow so an
+API request cannot turn an arbitrary local file into authority. Built reports retain tested models,
+profile, evidence IDs, latest exact-scoped receipt time, freshness, and missing requirements. They
+expose only credential environment-variable names or presence and pass through the normal
+redaction path; raw API keys are never returned.
+
+Receipt collection can safely occur after a credentialed job has removed its ephemeral secret:
+the collector normalizes persisted results and requires only structural provider identity. Report
+building captures the redacted readiness snapshot, while the checker gates evidence-backed
+assurance without requiring an ephemeral credential to remain present. Evidence history therefore
+survives secret cleanup without masquerading as current setup readiness; callers must run the
+separate product setup/readiness gate when the deployed profile needs to call that provider.
 
 `nest-agent product support-bundle` and `POST /api/product/support-bundle` write a local zip archive under the requested output path or `.nest/support-bundles/` by default. The archive is diagnostic only: it includes product/setup readiness, runtime metadata with environment-variable presence only, git status, SQLite table counts, log file metadata, and a bounded `events.jsonl` tail. Event-tail sanitization is default-deny for strings: only explicitly allowlisted operational identifiers, timestamps, statuses, categories, and tool/provider labels survive; prompts, messages, proof objectives, commands, diagnoses, strategies, errors, and other arbitrary nested text become `<redacted>`. The archive does not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
 
