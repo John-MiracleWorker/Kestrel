@@ -21,13 +21,10 @@ from nested_memvid_agent.routing.native_worker import (
     NativeWorkerAdapter,
     NativeWorkerConfig,
     NativeWorkerStatus,
-    WorkerArtifact,
     WorkerCredentials,
-    WorkerLifecycleState,
     WorkerState,
     start_native_worker,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

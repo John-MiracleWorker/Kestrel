@@ -15,12 +15,10 @@ Key safety properties:
 """
 from __future__ import annotations
 
-import os
 import subprocess
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal
-
 
 WorkerLifecycleState = Literal[
     "pending",

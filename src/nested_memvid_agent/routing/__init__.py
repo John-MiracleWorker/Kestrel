@@ -33,7 +33,6 @@ from .models import (
     RoutePolicy,
     RoutingMode,
 )
-from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
 from .native_worker import (
     NativeWorkerAdapter,
     NativeWorkerConfig,
@@ -44,6 +43,7 @@ from .native_worker import (
     WorkerState,
     start_native_worker,
 )
+from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
 from .run_manager import AdaptiveFlockRunManager
 from .runtime import AdaptiveFlockRuntimeConfig, RunManagerBuild, build_run_manager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
@@ -59,6 +59,9 @@ __all__ = [
     "LearnedRouterState",
     "ModelTarget",
     "ModelTargetEntry",
+    "NativeWorkerAdapter",
+    "NativeWorkerConfig",
+    "NativeWorkerStatus",
     "PrivacyClass",
     "ProviderProfile",
     "ProviderProfileEntry",
@@ -79,6 +82,10 @@ __all__ = [
     "RunManagerBuild",
     "ShadowEvaluation",
     "TaskLike",
+    "WorkerArtifact",
+    "WorkerCredentials",
+    "WorkerLifecycleState",
+    "WorkerState",
     "build_route_examples",
     "build_run_manager",
     "compile_task_contract",
@@ -86,6 +93,7 @@ __all__ = [
     "replay_history",
     "route_task",
     "should_activate_learned_policy",
+    "start_native_worker",
     "stable_decision_id",
     "stable_outcome_id",
 ]
