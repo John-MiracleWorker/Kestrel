@@ -10,7 +10,6 @@ approvals, cancellation, and terminal transitions.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import cast
 
 from .models import (
     AgentTaskContract,
@@ -125,7 +124,7 @@ class RoleAssignmentResolver:
             contract,
             eligible_targets,
             policy=self.policy,
-            mode=cast(RoutingMode, self.mode),
+            mode=self.mode,
             review_context=review_context,
         )
 
