@@ -24,10 +24,12 @@ from .models import (
     RoutingMode,
 )
 from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
+from .run_manager import AdaptiveFlockRunManager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
 
 __all__ = [
     "AdaptiveFlockRoutingService",
+    "AdaptiveFlockRunManager",
     "AgentTaskContract",
     "DurableRoutingAssignment",
     "DurableRoutingCoordinator",
