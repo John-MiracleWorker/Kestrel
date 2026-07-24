@@ -16,13 +16,12 @@ from nested_memvid_agent.routing.models import (
     ProviderProfile,
     RoutePolicy,
 )
-from nested_memvid_agent.routing.router import RoutingUnavailableError
 from nested_memvid_agent.routing.role_resolver import (
     GraphRoleAssignment,
     RoleAssignmentResolver,
     resolve_graph_roles,
 )
-
+from nested_memvid_agent.routing.router import RoutingUnavailableError
 
 # ---------------------------------------------------------------------------
 # Helpers

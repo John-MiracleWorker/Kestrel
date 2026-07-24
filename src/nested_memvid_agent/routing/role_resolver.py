@@ -10,6 +10,7 @@ approvals, cancellation, and terminal transitions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 from .models import (
     AgentTaskContract,
@@ -20,7 +21,6 @@ from .models import (
     RoutingMode,
 )
 from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
-from typing import cast
 
 
 @dataclass(frozen=True)

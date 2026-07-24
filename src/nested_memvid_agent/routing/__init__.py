@@ -49,6 +49,7 @@ from .role_resolver import (
     RoleAssignmentResolver,
     resolve_graph_roles,
 )
+from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
 from .run_manager import AdaptiveFlockRunManager
 from .runtime import AdaptiveFlockRuntimeConfig, RunManagerBuild, build_run_manager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
