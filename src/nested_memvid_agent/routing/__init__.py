@@ -4,6 +4,16 @@ from .coordinator import (
     DurableRoutingCoordinator,
     RoutingLeaseConflict,
 )
+from .learned_router import (
+    LearnedRouterConfig,
+    LearnedRouterState,
+    RouteExample,
+    ShadowEvaluation,
+    build_route_examples,
+    evaluate_shadow,
+    replay_history,
+    should_activate_learned_policy,
+)
 from .ledger import RoutingLedger, stable_decision_id, stable_outcome_id
 from .ledger_records import (
     ModelTargetEntry,
@@ -35,6 +45,8 @@ __all__ = [
     "AgentTaskContract",
     "DurableRoutingAssignment",
     "DurableRoutingCoordinator",
+    "LearnedRouterConfig",
+    "LearnedRouterState",
     "ModelTarget",
     "ModelTargetEntry",
     "PrivacyClass",
@@ -44,6 +56,7 @@ __all__ = [
     "RouteCandidate",
     "RouteDecision",
     "RouteDecisionEntry",
+    "RouteExample",
     "RouteOutcomeEntry",
     "RoutePolicy",
     "RoutePolicyEntry",
@@ -54,10 +67,15 @@ __all__ = [
     "RoutingRevisionConflict",
     "RoutingUnavailableError",
     "RunManagerBuild",
+    "ShadowEvaluation",
     "TaskLike",
+    "build_route_examples",
     "build_run_manager",
     "compile_task_contract",
+    "evaluate_shadow",
+    "replay_history",
     "route_task",
+    "should_activate_learned_policy",
     "stable_decision_id",
     "stable_outcome_id",
 ]
