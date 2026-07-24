@@ -128,10 +128,6 @@ class LearnedRouterState:
                 ex for ex in target_exs
                 if ex.failure_category != "provider_outage"
             ]
-            provider_outage_exs = [
-                ex for ex in target_exs
-                if ex.failure_category == "provider_outage"
-            ]
 
             # Validation rate is based on task-quality outcomes only
             if task_quality_exs:

@@ -15,19 +15,15 @@ RED tests:
 """
 from __future__ import annotations
 
-import pytest
-
 from nested_memvid_agent.routing.learned_router import (
     LearnedRouterConfig,
     LearnedRouterState,
     RouteExample,
-    ShadowEvaluation,
     build_route_examples,
     evaluate_shadow,
     replay_history,
     should_activate_learned_policy,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
