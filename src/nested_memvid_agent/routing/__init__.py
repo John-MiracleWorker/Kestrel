@@ -34,6 +34,16 @@ from .models import (
     RoutingMode,
 )
 from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
+from .native_worker import (
+    NativeWorkerAdapter,
+    NativeWorkerConfig,
+    NativeWorkerStatus,
+    WorkerArtifact,
+    WorkerCredentials,
+    WorkerLifecycleState,
+    WorkerState,
+    start_native_worker,
+)
 from .run_manager import AdaptiveFlockRunManager
 from .runtime import AdaptiveFlockRuntimeConfig, RunManagerBuild, build_run_manager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
