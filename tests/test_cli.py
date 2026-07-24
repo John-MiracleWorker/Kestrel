@@ -1803,9 +1803,47 @@ def test_product_provider_certification_subcommand_can_emit_json(
     main()
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema"] == "kestrel.provider_certification.v1"
+    assert payload["schema"] == "kestrel.provider_certification.v2"
+    assert payload["policy_version"] == "kestrel.provider_certification_policy.v1"
     assert payload["headline"]["release_certified"] is False
-    assert any(provider["provider"] == "mock" for provider in payload["providers"])
+    mock = next(provider for provider in payload["providers"] if provider["provider"] == "mock")
+    assert mock["status"] == "certified"
+    assert mock["readiness"]["status"] == "configured"
+    assert mock["certification_state"] == "implemented"
+    assert mock["generate"]["status"] == "not_run"
+
+
+def test_product_provider_certification_human_output_separates_readiness_and_assurance(
+    monkeypatch: MonkeyPatch,
+    capsys: object,
+) -> None:
+    secret = "provider-certification-human-secret-7d91"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "nest-agent",
+            "product",
+            "provider-certification",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-test",
+        ],
+    )
+
+    main()
+
+    output = capsys.readouterr().out
+    assert "Policy: kestrel.provider_certification_policy.v1" in output
+    assert "Assurance: 0 release certified" in output
+    assert "Readiness:" in output
+    assert "openai: readiness=configured certification=implemented" in output
+    assert "generate=not_run" in output
+    assert "learning_e2e=not_run" in output
+    assert "Last tested: never" in output
+    assert secret not in output
 
 
 def test_routines_cli_creates_enables_ticks_and_reports_history(

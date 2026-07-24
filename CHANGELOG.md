@@ -6,6 +6,22 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+### Added
+
+- Evidence-backed provider certification reports with explicit generation, streaming, native-tool,
+  tool-normalization, learning-E2E, tested-model, freshness, exact-subject, and missing-requirement
+  fields across every implemented provider surface.
+- A deterministic `collect` / `build` / `check` provider-certification runner that consumes exact
+  JSON evidence schemas and conservatively scoped provider-test JUnit XML, binds canonical receipt
+  IDs to every source digest, keeps credentials redacted, and fails closed for missing or
+  insufficient evidence.
+
+### Changed
+
+- Advanced the provider-certification schema from v1 to v2 while retaining the existing command,
+  API route, and legacy readiness fields. Implementation, current-machine readiness, and
+  evidence-backed assurance are now reported as separate concepts.
+
 ### Fixed
 
 - Made behavior-delta activation logs report only trigger predicates that actually matched,
