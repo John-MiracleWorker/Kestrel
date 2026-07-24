@@ -174,15 +174,15 @@ def build_product_readiness_report() -> ProductReadinessReport:
             title="Provider certification",
             status=ProductReadinessStatus.PARTIAL,
             evidence=(
-                "Mock provider is deterministic; OpenAI, OpenAI-compatible, Anthropic, Gemini, OpenRouter/Ollama aliases, Ollama Cloud, and Codex CLI paths exist.",
-                "Live learning and provider integration harnesses are present but opt-in.",
-                "`nest-agent product provider-certification` and `GET /api/product/provider-certification` expose a redacted per-provider status report.",
+                "All registered provider adapters appear in one deterministic matrix; adapter availability is reported separately from current-machine readiness.",
+                "Live learning and exact provider integration harnesses are present but remain opt-in and credential dependent.",
+                "`nest-agent product provider-certification`, the matching API route, and `scripts/run_provider_certification.py` expose evidence-backed, redacted assurance without treating configuration as certification.",
             ),
             remaining_work=(
-                "Run credentialed CI/release validation across the full provider matrix.",
-                "Add provider-specific golden suites and promote live validation results into release certification evidence.",
+                "Run credentialed CI/release validation for every provider and model claimed by a release.",
+                "Retain exact-subject certification reports as reviewed release artifacts and keep their evidence fresh.",
             ),
-            next_action="Wire credentialed provider matrix results into release gates without exposing secrets.",
+            next_action="Execute and authenticate the v2 evidence flow for each release-claimed provider without exposing secrets.",
         ),
         ProductReadinessCategory(
             category_id="product_ux_onboarding",

@@ -350,7 +350,15 @@ nest-agent product support-bundle --backend memory --provider mock --output /tmp
 
 Support bundles are redacted diagnostic archives. They include readiness reports, runtime metadata, git status, state-table counts, log file metadata, and a bounded redacted event-log tail; they do not include raw Secret Broker vault contents, raw environment variable values, or `.mv2` memory files.
 
-Provider certification reports are read-only and redacted. They record per-provider readiness, credential/base-url presence, manual host checks, and the validation commands needed before treating live providers as release-certified.
+Provider reporting deliberately separates three different claims: an adapter can be implemented,
+the current machine can be configured to use it, and a particular provider/model can have
+evidence-backed assurance. `product provider-certification` is a read-only, redacted
+`kestrel.provider_certification.v2` matrix. Without authenticated evidence receipts it reports the
+implementation and local-readiness baseline only; credentials, an installed executable, or a
+configured base URL never upgrade certification. See
+[Provider certification evidence](docs/TESTING.md#provider-certification-evidence) for the
+`collect`, `build`, and fail-closed `check` workflow used to create an exact-subject release
+artifact.
 
 Plugin registry commands:
 
@@ -397,6 +405,11 @@ The Memvid adapter is lexical-first by default (`enable_vec=False`, `enable_lex=
 
 ## Local Providers
 
+Being listed here means that Kestrel implements an adapter; it does not mean every provider or
+model has equal live or release assurance. The certification matrix records the models and profile
+actually tested, evidence-backed results for each required dimension, the latest exact-scoped
+receipt time, and any missing requirements.
+
 OpenAI-compatible local/model-server endpoints:
 
 ```bash
@@ -409,7 +422,10 @@ nest-agent chat \
 ```
 
 Use `--api-key-env NAME` when the endpoint needs a non-default API key environment variable.
-Provider aliases are also available for `openrouter`, `deepseek`, `kimi`, `ollama`, `ollama-cloud`, `anthropic`, and `gemini`. OpenRouter, DeepSeek, Kimi, and local Ollama use the OpenAI-compatible contract; Ollama Cloud uses Ollama's native cloud API; Anthropic and Gemini use their native surfaces.
+Provider names are also available for `lm-studio`, `openrouter`, `deepseek`, `kimi`, `ollama`,
+`ollama-cloud`, `anthropic`, `grok`, and `gemini`. LM Studio, OpenRouter, DeepSeek, Kimi, Grok,
+and local Ollama use the OpenAI-compatible contract; Ollama Cloud uses Ollama's native cloud API;
+Anthropic and Gemini use their native surfaces.
 
 DeepSeek:
 
@@ -636,7 +652,7 @@ Operational docs:
 
 These capabilities are outside the supported single-user, single-node profile or remain optional-surface hardening work; they do not imply hosted/team support:
 
-- Broader live-provider CI/release coverage beyond the locally validated Ollama Cloud path.
+- Fresh authenticated live-provider CI/release evidence across the full provider/model matrix.
 - Richer provider-specific JSON/context/streaming hardening for every native provider surface.
 - Hosted/team identity, distinct administrator principals, hardened sessions, workspace ownership, role-scoped capability policy, and tenant isolation.
 - Real MCP SSE/streamable HTTP fixtures and soak testing.

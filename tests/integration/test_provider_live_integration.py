@@ -10,6 +10,8 @@ from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.factory import build_llm_provider
 from nested_memvid_agent.runtime_models import ChatMessage, LLMOptions, ToolSpec
 
+CERTIFICATION_MARKER = "kestrel-provider-certification-7d91"
+
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_PROVIDER_INTEGRATION") != "1",
     reason="set RUN_PROVIDER_INTEGRATION=1 and provider env vars to run live provider tests",
@@ -30,12 +32,22 @@ def test_live_provider_generate_smoke(provider_case: ProviderCase) -> None:
     provider = build_llm_provider(provider_case.config)
 
     response = provider.generate(
-        [ChatMessage(role="user", content="Reply with the word kestrel only.")],
+        [
+            ChatMessage(
+                role="user",
+                content=f"Reply with {CERTIFICATION_MARKER} exactly and nothing else.",
+            )
+        ],
         tools=[],
-        options=LLMOptions(timeout_seconds=provider_case.config.timeout_seconds, max_retries=0, temperature=0.0),
+        options=LLMOptions(
+            timeout_seconds=provider_case.config.timeout_seconds,
+            max_retries=0,
+            temperature=0.0,
+        ),
     )
 
-    assert response.content.strip() or response.tool_calls
+    assert response.content.strip() == CERTIFICATION_MARKER
+    assert response.tool_calls == ()
 
 
 def test_live_provider_stream_smoke(provider_case: ProviderCase) -> None:
@@ -47,15 +59,31 @@ def test_live_provider_stream_smoke(provider_case: ProviderCase) -> None:
 
     events = list(
         provider.stream(
-            [ChatMessage(role="user", content="Reply with the word kestrel only.")],
+            [
+                ChatMessage(
+                    role="user",
+                    content=f"Reply with {CERTIFICATION_MARKER} exactly and nothing else.",
+                )
+            ],
             tools=[],
-            options=LLMOptions(stream=True, timeout_seconds=provider_case.config.timeout_seconds, max_retries=0, temperature=0.0),
+            options=LLMOptions(
+                stream=True,
+                timeout_seconds=provider_case.config.timeout_seconds,
+                max_retries=0,
+                temperature=0.0,
+            ),
         )
     )
 
     assert events
-    assert events[-1].type in {"message_complete", "provider_error"}
     assert events[-1].type == "message_complete"
+    streamed_text = "".join(event.content for event in events if event.type == "token").strip()
+    completed_text = (
+        events[-1].response.content.strip()
+        if events[-1].response is not None
+        else ""
+    )
+    assert streamed_text == CERTIFICATION_MARKER or completed_text == CERTIFICATION_MARKER
 
 
 def test_live_provider_native_tool_call_certification(provider_case: ProviderCase) -> None:
@@ -105,6 +133,17 @@ def test_live_provider_native_tool_call_certification(provider_case: ProviderCas
 def _provider_cases() -> list[ProviderCase]:
     return [
         ProviderCase(
+            name="lm-studio",
+            config=AgentConfig(
+                provider="lm-studio",
+                model=os.getenv("KESTREL_IT_LM_STUDIO_MODEL", ""),
+                base_url=os.getenv("KESTREL_IT_LM_STUDIO_BASE_URL"),
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("KESTREL_IT_LM_STUDIO_MODEL")),
+            reason="set KESTREL_IT_LM_STUDIO_MODEL and optionally KESTREL_IT_LM_STUDIO_BASE_URL",
+        ),
+        ProviderCase(
             name="openai",
             config=AgentConfig(
                 provider="openai",
@@ -125,6 +164,17 @@ def _provider_cases() -> list[ProviderCase]:
             ),
             available=bool(os.getenv("ANTHROPIC_API_KEY") and os.getenv("KESTREL_IT_ANTHROPIC_MODEL")),
             reason="set ANTHROPIC_API_KEY and KESTREL_IT_ANTHROPIC_MODEL",
+        ),
+        ProviderCase(
+            name="grok",
+            config=AgentConfig(
+                provider="grok",
+                model=os.getenv("KESTREL_IT_GROK_MODEL", ""),
+                api_key_env="XAI_API_KEY",
+                timeout_seconds=_timeout(),
+            ),
+            available=bool(os.getenv("XAI_API_KEY") and os.getenv("KESTREL_IT_GROK_MODEL")),
+            reason="set XAI_API_KEY and KESTREL_IT_GROK_MODEL",
         ),
         ProviderCase(
             name="gemini",

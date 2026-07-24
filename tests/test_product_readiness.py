@@ -8,12 +8,15 @@ from pytest import MonkeyPatch
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.factory import provider_health_id
+from nested_memvid_agent.llm.model_catalog import PROVIDER_OPTIONS
 from nested_memvid_agent.llm.resilience import global_provider_health_registry
 from nested_memvid_agent.product_readiness import (
     ProductReadinessStatus,
     build_product_readiness_report,
 )
 from nested_memvid_agent.provider_certification import (
+    PROVIDER_CERTIFICATION_POLICY_VERSION,
+    ProviderCertificationState,
     ProviderCertificationStatus,
     build_provider_certification_report,
 )
@@ -323,13 +326,24 @@ def test_provider_certification_report_is_redacted_and_actionable(
     )
     payload = report.to_dict()
 
-    assert payload["schema"] == "kestrel.provider_certification.v1"
-    assert payload["headline"]["total_providers"] >= 10
+    assert payload["schema"] == "kestrel.provider_certification.v2"
+    assert payload["policy_version"] == PROVIDER_CERTIFICATION_POLICY_VERSION
+    assert payload["subject"] == {"commit": "unknown", "tree_digest": "unknown"}
+    assert payload["headline"]["total_providers"] == len(PROVIDER_OPTIONS)
+    assert payload["headline"]["release_certified"] is False
     assert "sk-proj-providerCertificationSecret" not in str(payload)
 
     providers = {provider["provider"]: provider for provider in payload["providers"]}
+    assert tuple(providers) == PROVIDER_OPTIONS
     assert providers["mock"]["status"] == ProviderCertificationStatus.CERTIFIED.value
+    assert (
+        providers["mock"]["readiness"]["status"]
+        == ProviderCertificationStatus.CONFIGURED.value
+    )
+    assert providers["mock"]["certification_state"] == ProviderCertificationState.IMPLEMENTED.value
+    assert providers["mock"]["last_tested"] is None
     assert providers["openai"]["status"] == ProviderCertificationStatus.CONFIGURED.value
+    assert providers["openai"]["certification_state"] == ProviderCertificationState.IMPLEMENTED.value
     assert providers["openai"]["api_key_env"] == {"name": "OPENAI_API_KEY", "present": True}
     assert providers["anthropic"]["status"] == ProviderCertificationStatus.BLOCKED.value
     assert providers["anthropic"]["api_key_env"]["present"] is False
@@ -349,5 +363,8 @@ def test_product_provider_certification_route_uses_active_config(tmp_path: Path)
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["schema"] == "kestrel.provider_certification.v1"
-    assert any(provider["provider"] == "mock" for provider in payload["providers"])
+    assert payload["schema"] == "kestrel.provider_certification.v2"
+    assert [provider["provider"] for provider in payload["providers"]] == list(PROVIDER_OPTIONS)
+    mock = next(provider for provider in payload["providers"] if provider["provider"] == "mock")
+    assert mock["certification_state"] == ProviderCertificationState.IMPLEMENTED.value
+    assert mock["generate"]["status"] == "not_run"
