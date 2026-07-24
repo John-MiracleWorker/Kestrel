@@ -25,11 +25,13 @@ from .models import (
 )
 from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
 from .run_manager import AdaptiveFlockRunManager
+from .runtime import AdaptiveFlockRuntimeConfig, RunManagerBuild, build_run_manager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
 
 __all__ = [
     "AdaptiveFlockRoutingService",
     "AdaptiveFlockRunManager",
+    "AdaptiveFlockRuntimeConfig",
     "AgentTaskContract",
     "DurableRoutingAssignment",
     "DurableRoutingCoordinator",
@@ -51,7 +53,9 @@ __all__ = [
     "RoutingMode",
     "RoutingRevisionConflict",
     "RoutingUnavailableError",
+    "RunManagerBuild",
     "TaskLike",
+    "build_run_manager",
     "compile_task_contract",
     "route_task",
     "stable_decision_id",

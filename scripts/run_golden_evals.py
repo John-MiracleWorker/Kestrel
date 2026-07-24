@@ -649,11 +649,17 @@ def _eval_summary_first_expand_raw(config: AgentConfig, eval_id: str) -> dict[st
                 metadata={"frame_type": "raw_chunk"},
             )
         )
+        # Force the vector sidecar to index both records so retrieval is
+        # deterministic regardless of the environment's numpy/vector state.
+        agent.memory.seal_all()
+        # Use a broad k_per_layer so the raw record is not excluded by
+        # environment-specific vector scoring differences.
+        pack_kwargs = {"k_per_layer": 16}
         compact = ContextPacker(agent.memory).pack(
-            ContextPackRequest(objective=marker, query=marker, expand_raw=False)
+            ContextPackRequest(objective=marker, query=marker, expand_raw=False, **pack_kwargs)
         )
         expanded = ContextPacker(agent.memory).pack(
-            ContextPackRequest(objective=marker, query=marker, expand_raw=True)
+            ContextPackRequest(objective=marker, query=marker, expand_raw=True, **pack_kwargs)
         )
         compact_titles = {item.frame.title for item in compact.items}
         expanded_titles = {item.frame.title for item in expanded.items}
