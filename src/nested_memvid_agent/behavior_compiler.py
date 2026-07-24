@@ -223,22 +223,27 @@ def _render_tool_preflight_sections(deltas: list[BehaviorDelta]) -> str:
     return "\n".join(lines).strip()
 
 
-def _matches(delta: BehaviorDelta, request: BehaviorCompileRequest) -> bool:
+def _match_reasons(delta: BehaviorDelta, request: BehaviorCompileRequest) -> tuple[str, ...]:
     trigger = delta.trigger
     haystack = " ".join(part for part in (request.objective, request.query or "") if part).lower()
+    matched: list[str] = []
     if trigger.query_patterns and any(pattern.lower() in haystack for pattern in trigger.query_patterns):
-        return True
+        matched.append("matched_query_pattern")
     if request.task_type and request.task_type in trigger.task_types:
-        return True
+        matched.append("matched_task_type")
     if request.tool_names and set(request.tool_names).intersection(trigger.tool_names):
-        return True
+        matched.append("matched_tool_name")
     if request.memory_layers and set(request.memory_layers).intersection(trigger.memory_layers):
-        return True
+        matched.append("matched_memory_layer")
     if request.path and trigger.path_globs and any(fnmatch(request.path, glob) for glob in trigger.path_globs):
-        return True
+        matched.append("matched_path_glob")
     if trigger.risk_tags and any(tag.lower() in haystack for tag in trigger.risk_tags):
-        return True
-    return False
+        matched.append("matched_risk_tag")
+    return tuple(matched)
+
+
+def _matches(delta: BehaviorDelta, request: BehaviorCompileRequest) -> bool:
+    return bool(_match_reasons(delta, request))
 
 
 def _tool_call_match_reasons(delta: BehaviorDelta, context: ToolPreflightContext) -> tuple[str, ...]:
@@ -320,16 +325,7 @@ def _section_for(delta: BehaviorDelta) -> str:
 
 
 def _activation_reason(delta: BehaviorDelta, request: BehaviorCompileRequest) -> str:
-    matched = []
-    if delta.trigger.query_patterns:
-        matched.append("matched_query_pattern")
-    if request.task_type and request.task_type in delta.trigger.task_types:
-        matched.append("matched_task_type")
-    if request.tool_names and set(request.tool_names).intersection(delta.trigger.tool_names):
-        matched.append("matched_tool_name")
-    if request.memory_layers and set(request.memory_layers).intersection(delta.trigger.memory_layers):
-        matched.append("matched_memory_layer")
-    return ",".join(matched or ["matched_semantic_context"])
+    return ",".join(_match_reasons(delta, request))
 
 
 def _activation_id(delta_id: str, run_id: str | None, task_id: str | None, section: str) -> str:

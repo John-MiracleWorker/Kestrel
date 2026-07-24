@@ -345,6 +345,9 @@ Compiler requirements:
 - Deduplicate overlapping instructions.
 - Prioritize policy > self > procedural > semantic > episodic > working.
 - Log one activation per run per delta.
+- Use the same deterministic trigger evaluation for relevance selection and activation reasons;
+  audit rows name only query-pattern, task-type, tool-name, memory-layer, path-glob, and risk-tag
+  predicates that actually matched. A `semantic_hint` alone is not a match.
 - Refuse silent policy activation without evidence.
 - Disabled flag must preserve byte-for-byte or semantically equivalent current behavior.
 - Tool-call preflight must remain gated by `NEST_AGENT_ENABLE_BEHAVIOR_DELTAS`.

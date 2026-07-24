@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from nested_memvid_agent.behavior_compiler import (
     BehaviorCompiler,
     BehaviorCompilerConfig,
@@ -204,6 +206,165 @@ def test_compiler_records_one_activation_per_run_per_delta(tmp_path: Path) -> No
     assert activations[0].run_id == "run-1"
     assert activations[0].task_id == "task-1"
     assert activations[0].compiled_section == "ACTIVE POLICY CONSTRAINTS"
+
+
+@pytest.mark.parametrize(
+    ("trigger", "compile_request", "expected_reason"),
+    (
+        pytest.param(
+            TriggerSpec(query_patterns=("unrelated",), tool_names=("test.run",)),
+            BehaviorCompileRequest(
+                objective="Run the validation suite",
+                tool_names=("test.run",),
+                run_id="run-tool-only",
+            ),
+            "matched_tool_name",
+            id="tool-only-ignores-unmatched-query-pattern",
+        ),
+        pytest.param(
+            TriggerSpec(path_globs=("docs/*.md",)),
+            BehaviorCompileRequest(
+                objective="Update the operator guide",
+                path="docs/OPERATIONS.md",
+                run_id="run-path-only",
+            ),
+            "matched_path_glob",
+            id="path-glob-only",
+        ),
+        pytest.param(
+            TriggerSpec(risk_tags=("approval_required",)),
+            BehaviorCompileRequest(
+                objective="Handle an APPROVAL_REQUIRED operation",
+                run_id="run-risk-only",
+            ),
+            "matched_risk_tag",
+            id="risk-tag-only",
+        ),
+        pytest.param(
+            TriggerSpec(task_types=("debugging",)),
+            BehaviorCompileRequest(
+                objective="Investigate the failure",
+                task_type="debugging",
+                run_id="run-task-only",
+            ),
+            "matched_task_type",
+            id="task-type-only",
+        ),
+        pytest.param(
+            TriggerSpec(query_patterns=("memory repair",)),
+            BehaviorCompileRequest(
+                objective="Investigate the failure",
+                query="Plan a MEMORY REPAIR",
+                run_id="run-query-only",
+            ),
+            "matched_query_pattern",
+            id="query-pattern-only",
+        ),
+        pytest.param(
+            TriggerSpec(memory_layers=(MemoryLayer.PROCEDURAL,)),
+            BehaviorCompileRequest(
+                objective="Review stored guidance",
+                memory_layers=(MemoryLayer.PROCEDURAL,),
+                run_id="run-layer-only",
+            ),
+            "matched_memory_layer",
+            id="memory-layer-only",
+        ),
+    ),
+)
+def test_compiler_activation_reason_records_only_actual_match(
+    tmp_path: Path,
+    trigger: TriggerSpec,
+    compile_request: BehaviorCompileRequest,
+    expected_reason: str,
+) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    delta = _delta(
+        "delta_exact_reason",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        layer=MemoryLayer.PROCEDURAL,
+        trigger=trigger,
+    )
+    ledger.record_delta(delta)
+
+    compiled = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True)).compile(
+        compile_request
+    )
+
+    assert compiled.deltas == (delta,)
+    activations = ledger.list_activations(delta.id)
+    assert len(activations) == 1
+    assert activations[0].activation_reason == expected_reason
+
+
+def test_compiler_activation_reason_records_all_simultaneous_matches(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    delta = _delta(
+        "delta_all_reasons",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        layer=MemoryLayer.PROCEDURAL,
+        trigger=TriggerSpec(
+            query_patterns=("policy change",),
+            task_types=("debugging",),
+            tool_names=("test.run",),
+            memory_layers=(MemoryLayer.POLICY,),
+            path_globs=("docs/*.md",),
+            risk_tags=("approval_required",),
+        ),
+    )
+    ledger.record_delta(delta)
+    request = BehaviorCompileRequest(
+        objective="Debug an approval_required policy change",
+        query="policy change",
+        task_type="debugging",
+        tool_names=("test.run",),
+        memory_layers=(MemoryLayer.POLICY,),
+        path="docs/SECURITY.md",
+        run_id="run-all-reasons",
+    )
+
+    compiled = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True)).compile(request)
+
+    assert compiled.deltas == (delta,)
+    assert ledger.list_activations(delta.id)[0].activation_reason == (
+        "matched_query_pattern,matched_task_type,matched_tool_name,matched_memory_layer,"
+        "matched_path_glob,matched_risk_tag"
+    )
+
+
+def test_compiler_does_not_activate_without_a_real_predicate_match(tmp_path: Path) -> None:
+    ledger = BehaviorDeltaLedger(AgentStateStore(tmp_path / "state.db"))
+    delta = _delta(
+        "delta_no_match",
+        kind=BehaviorDeltaKind.PROCEDURE,
+        layer=MemoryLayer.PROCEDURAL,
+        trigger=TriggerSpec(
+            query_patterns=("unrelated",),
+            task_types=("deployment",),
+            tool_names=("git.commit",),
+            memory_layers=(MemoryLayer.POLICY,),
+            path_globs=("src/*.py",),
+            risk_tags=("critical",),
+            semantic_hint="No semantic matcher is configured.",
+        ),
+    )
+    ledger.record_delta(delta)
+    request = BehaviorCompileRequest(
+        objective="Review documentation",
+        query="operator guide",
+        task_type="documentation",
+        tool_names=("file.read",),
+        memory_layers=(MemoryLayer.PROCEDURAL,),
+        path="docs/OPERATIONS.md",
+        run_id="run-no-match",
+    )
+
+    compiled = BehaviorCompiler(ledger=ledger, config=BehaviorCompilerConfig(enabled=True)).compile(request)
+
+    assert compiled.text == ""
+    assert compiled.deltas == ()
+    assert compiled.activation_reasons == {}
+    assert ledger.list_activations(delta.id) == []
 
 
 def test_compile_for_tool_call_returns_empty_when_no_active_delta_matches(tmp_path: Path) -> None:
