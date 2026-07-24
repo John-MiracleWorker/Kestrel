@@ -90,7 +90,7 @@ class NativeWorkerStatus:
     state: WorkerLifecycleState = "pending"
     worker_id: str = ""
     sanitized_env: dict[str, str] = field(default_factory=dict)
-    _process: subprocess.Popen | None = None
+    _process: subprocess.Popen[bytes] | None = None
     _artifacts: list[WorkerArtifact] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
