@@ -6,7 +6,10 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
-No changes yet.
+### Fixed
+
+- Made behavior-delta activation logs report only trigger predicates that actually matched,
+  including path-glob and risk-tag matches, without inventing a semantic-context fallback.
 
 ## [0.4.0] - 2026-07-20
 
