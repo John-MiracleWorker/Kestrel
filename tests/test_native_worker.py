@@ -15,11 +15,6 @@ RED tests:
 """
 from __future__ import annotations
 
-import os
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from nested_memvid_agent.routing.native_worker import (
