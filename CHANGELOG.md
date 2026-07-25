@@ -31,6 +31,9 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - Sanitized dotted tool names (`tool.registry` → `tool_registry`) on the OpenAI-compatible wire
   and restored canonical names on the response path, fixing native tool calling against providers
   that reject dots in function names (e.g. Kimi).
+- Made temperature optional end to end and omitted it from provider requests unless explicitly
+  configured via `NEST_AGENT_TEMPERATURE`, fixing planner/reviewer and eval calls against
+  providers that reject pinned temperature values (e.g. Kimi, which requires exactly 1).
 
 ### Added
 
