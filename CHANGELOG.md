@@ -6,6 +6,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-24
+
 ### Added
 
 - Evidence-backed provider certification reports with explicit generation, streaming, native-tool,
@@ -26,8 +28,9 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 - Made behavior-delta activation logs report only trigger predicates that actually matched,
   including path-glob and risk-tag matches, without inventing a semantic-context fallback.
-
-## [0.4.0] - 2026-07-20
+- Sanitized dotted tool names (`tool.registry` → `tool_registry`) on the OpenAI-compatible wire
+  and restored canonical names on the response path, fixing native tool calling against providers
+  that reject dots in function names (e.g. Kimi).
 
 ### Added
 
