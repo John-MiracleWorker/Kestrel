@@ -282,13 +282,15 @@ nest-agent product provider-certification \
 
 The repository contains `v0.4.0` release metadata, but release commands should only be used after the matching Git tag and exact-tag artifacts have been published.
 
+The installer is conservative by default: it does not start the server or open a browser unless explicitly enabled.
+
 ```bash
 curl -fsSL \
   https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.0/install.sh \
   | bash
 ```
 
-To explicitly start the local workbench and open a browser during installation:
+To explicitly start the local workbench and open a browser during installation, pass the opt-in flags (`KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh` when running a downloaded copy):
 
 ```bash
 curl -fsSL \
@@ -601,6 +603,8 @@ python -m ruff check scripts src tests
 python -m mypy src
 python -m pytest -q
 make golden
+python benchmarks/real_agent_learning_benchmark.py --output benchmark_results/agent_learning_gate.json
+python scripts/eval_behavior_deltas.py --scenario tests/evals/behavior_deltas/policy_write_requires_approval.json --fail-on-regression
 npm run test --prefix web
 npm run build --prefix web
 ```
