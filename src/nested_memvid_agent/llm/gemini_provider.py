@@ -35,7 +35,7 @@ class GeminiProvider(LLMProvider):
         api_key_env: str | None = None,
         timeout_seconds: int = 60,
         max_retries: int = 2,
-        temperature: float = 0.2,
+        temperature: float | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.getenv(api_key_env or "GEMINI_API_KEY")
