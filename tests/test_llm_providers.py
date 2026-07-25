@@ -446,7 +446,9 @@ def test_openai_compatible_provider_uses_chat_completions(monkeypatch: pytest.Mo
 def test_openai_compatible_provider_normalizes_native_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeCompletions:
         def create(self, **kwargs: Any) -> Any:
-            assert kwargs["tools"][0]["function"]["name"] == "memory.search"
+            # Wire format sanitizes canonical dotted names for providers that
+            # reject dots in function names (e.g. Kimi).
+            assert kwargs["tools"][0]["function"]["name"] == "memory_search"
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
@@ -456,7 +458,7 @@ def test_openai_compatible_provider_normalizes_native_tool_calls(monkeypatch: py
                             tool_calls=[
                                 SimpleNamespace(
                                     id="call_local",
-                                    function=SimpleNamespace(name="memory.search", arguments='{"query":"local","k":1}'),
+                                    function=SimpleNamespace(name="memory_search", arguments='{"query":"local","k":1}'),
                                 )
                             ],
                         ),
@@ -493,6 +495,8 @@ def test_openai_compatible_provider_normalizes_native_tool_calls(monkeypatch: py
     )
 
     assert response.tool_calls[0].id == "call_local"
+    # Canonical dotted name is restored on the response path.
+    assert response.tool_calls[0].name == "memory.search"
     assert response.tool_calls[0].arguments == {"query": "local", "k": 1}
     assert response.usage == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
 
@@ -563,7 +567,8 @@ def test_openai_compatible_provider_preserves_native_tool_call_result_pair(
                 "id": "call_continuity",
                 "type": "function",
                 "function": {
-                    "name": "memory.search",
+                    # History replay uses the same sanitized wire name.
+                    "name": "memory_search",
                     "arguments": '{"k":1,"query":"continuity"}',
                 },
             }
