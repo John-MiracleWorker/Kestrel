@@ -297,9 +297,9 @@ jobs:
           for architecture in amd64 arm64; do
             image="kestrel-agent:release-${architecture}"
             test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$architecture"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "$image")" = "$GITHUB_SHA"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.source\"}}' "$image")" = "$source_url"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' "$image")" = "$GITHUB_REF_NAME"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$GITHUB_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image")" = "$source_url"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$GITHUB_REF_NAME"
             docker save "$image" | gzip -1 > \
               "$container_artifacts/kestrel-release-container-${architecture}.tar.gz"
           done
@@ -730,9 +730,9 @@ jobs:
               | docker load
             image="kestrel-agent:release-${architecture}"
             test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$architecture"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "$image")" = "$GITHUB_SHA"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.source\"}}' "$image")" = "https://github.com/$GITHUB_REPOSITORY"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' "$image")" = "$GITHUB_REF_NAME"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$GITHUB_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image")" = "https://github.com/$GITHUB_REPOSITORY"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$GITHUB_REF_NAME"
           done
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
@@ -1098,9 +1098,9 @@ jobs:
             image_ref="$IMAGE_NAME@$platform_digest"
             docker pull --platform "linux/${architecture}" "$image_ref"
             test "$(docker image inspect --format '{{.Architecture}}' "$image_ref")" = "$architecture"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "$image_ref")" = "$GITHUB_SHA"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.source\"}}' "$image_ref")" = "https://github.com/$GITHUB_REPOSITORY"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' "$image_ref")" = "$GITHUB_REF_NAME"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_ref")" = "$GITHUB_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image_ref")" = "https://github.com/$GITHUB_REPOSITORY"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image_ref")" = "$GITHUB_REF_NAME"
             docker run --rm --platform "linux/${architecture}" --entrypoint /bin/sh "$image_ref" \
               -c 'mkdir -p /data/doctor-memory-post && exec nest-agent doctor \
               --backend memvid \

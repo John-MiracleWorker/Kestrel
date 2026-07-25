@@ -6,6 +6,16 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-07-25
+
+### Fixed
+
+- Fixed the release workflow's OCI label verification: the `docker image inspect --format`
+  Go templates wrapped label keys in `\"` escapes that YAML block scalars pass through
+  literally, so Go template parsing failed (`unexpected "\" in operand`) after the
+  container scan had already passed. Label keys are now quoted correctly (verified live
+  against a labeled image).
+
 ## [0.4.4] - 2026-07-25
 
 ### Fixed
@@ -256,7 +266,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.1...v0.4.2
