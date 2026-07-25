@@ -6,6 +6,15 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-25
+
+### Fixed
+
+- Fixed the release workflow's read-only container probe soak budget: the arm64 probe runs
+  under QEMU emulation (~20x slower than native), so a shared 30s p95 budget was unreachable
+  despite 4/4 runs completing with zero failures. The budget is now per-architecture (30s
+  native amd64, 120s emulated arm64) with identical functional assertions for both.
+
 ## [0.4.2] - 2026-07-25
 
 ### Fixed
@@ -234,7 +243,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.1...v0.4.0
