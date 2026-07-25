@@ -29,6 +29,8 @@ It combines:
 
 Kestrel is currently designed for **one trusted user running one local or privately networked node**. It is not yet a hosted, multi-user, or multi-tenant agent platform.
 
+`v0.4.0` is the current stable release for that supported profile: one trusted user, one Kestrel server or worker process, and one local or privately networked node. This source tree contains tag-ready release metadata; the installer and exact-tag artifacts become available once the `v0.4.0` release workflow publishes them.
+
 ---
 
 ## Why Kestrel Exists
