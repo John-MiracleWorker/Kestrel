@@ -73,12 +73,13 @@ class GeminiProvider(LLMProvider):
             ) from exc
 
         client = genai_module.Client(api_key=self.api_key)
-        config = {
-            "temperature": active_options.temperature,
+        config: dict[str, Any] = {
             "tools": [{"function_declarations": [_gemini_function(tool) for tool in tools]}]
             if tools
             else None,
         }
+        if active_options.temperature is not None:
+            config["temperature"] = active_options.temperature
         try:
             response = client.models.generate_content(
                 model=self.model,
@@ -113,12 +114,13 @@ class GeminiProvider(LLMProvider):
         if not callable(stream_fn):
             yield from super().stream(messages, tools, active_options)
             return
-        config = {
-            "temperature": active_options.temperature,
+        config: dict[str, Any] = {
             "tools": [{"function_declarations": [_gemini_function(tool) for tool in tools]}]
             if tools
             else None,
         }
+        if active_options.temperature is not None:
+            config["temperature"] = active_options.temperature
         text_parts: list[str] = []
         native_calls: list[ToolCall] = []
         usage: dict[str, Any] | None = None

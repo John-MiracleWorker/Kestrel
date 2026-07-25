@@ -82,7 +82,11 @@ class AnthropicMessagesProvider(LLMProvider):
                 system=_system_prompt(messages),
                 messages=_anthropic_messages(messages),
                 tools=[_anthropic_tool(tool) for tool in tools] or None,
-                temperature=active_options.temperature,
+                **(
+                    {"temperature": active_options.temperature}
+                    if active_options.temperature is not None
+                    else {}
+                ),
                 max_tokens=self.max_tokens,
             )
         except ControlMessageError:
@@ -123,7 +127,11 @@ class AnthropicMessagesProvider(LLMProvider):
                 system=_system_prompt(messages),
                 messages=_anthropic_messages(messages),
                 tools=[_anthropic_tool(tool) for tool in tools] or None,
-                temperature=active_options.temperature,
+                **(
+                    {"temperature": active_options.temperature}
+                    if active_options.temperature is not None
+                    else {}
+                ),
                 max_tokens=self.max_tokens,
             ) as stream:
                 for event in stream:

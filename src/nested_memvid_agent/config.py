@@ -38,7 +38,7 @@ class AgentConfig:
     run_heartbeat_interval_seconds: float = 10.0
     max_concurrent_runs: int = 4
     max_queued_runs: int = 100
-    temperature: float = 0.2
+    temperature: float | None = None
     codex_sandbox: str = "read-only"
     codex_profile: str | None = None
     codex_skip_git_repo_check: bool = False
@@ -212,7 +212,7 @@ class AgentConfig:
             ),
             max_concurrent_runs=_env_int("NEST_AGENT_MAX_CONCURRENT_RUNS", 4),
             max_queued_runs=_env_int("NEST_AGENT_MAX_QUEUED_RUNS", 100),
-            temperature=_env_float("NEST_AGENT_TEMPERATURE", 0.2),
+            temperature=_env_float_or_none("NEST_AGENT_TEMPERATURE"),
             codex_sandbox=os.getenv("NEST_AGENT_CODEX_SANDBOX", "read-only"),
             codex_profile=_env_str_or_none("NEST_AGENT_CODEX_PROFILE"),
             codex_skip_git_repo_check=_env_bool("NEST_AGENT_CODEX_SKIP_GIT_REPO_CHECK"),
@@ -420,6 +420,13 @@ def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
+    return float(raw)
+
+
+def _env_float_or_none(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
     return float(raw)
 
 

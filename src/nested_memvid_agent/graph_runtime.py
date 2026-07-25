@@ -499,7 +499,6 @@ def _request_provider_plan(
             stream=False,
             timeout_seconds=agent.config.timeout_seconds,
             max_retries=agent.config.max_retries,
-            temperature=0.0,
         ),
     )
     if response.tool_calls:
@@ -641,7 +640,6 @@ def _request_provider_review(
             stream=False,
             timeout_seconds=agent.config.timeout_seconds,
             max_retries=agent.config.max_retries,
-            temperature=0.0,
         ),
     )
     if response.tool_calls:

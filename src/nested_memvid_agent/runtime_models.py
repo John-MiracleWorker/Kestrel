@@ -91,7 +91,7 @@ class LLMOptions:
     stream: bool = False
     timeout_seconds: int = 60
     max_retries: int = 2
-    temperature: float = 0.2
+    temperature: float | None = None
 
 
 LLMStreamEventType = Literal[
