@@ -21,7 +21,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     project = pyproject["project"]
     locked_versions = {package["name"]: package["version"] for package in lock["package"]}
 
-    assert project["version"] == "0.4.1"
+    assert project["version"] == "0.4.2"
     assert "pip>=26.1.2" in project["dependencies"]
     assert "setuptools>=83.0.0" in project["dependencies"]
     assert locked_versions["pip"] == "26.1.2"
@@ -45,16 +45,16 @@ def test_python_and_web_release_metadata_stay_aligned() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert PUBLISHED_RELEASE == "0.4.1"
-    assert "nested-memvid-agent 0.4.1 release" in result.stdout
-    assert "stable release metadata v0.4.1" in result.stdout
-    assert "kestrel-web 0.4.1" in result.stdout
+    assert PUBLISHED_RELEASE == "0.4.2"
+    assert "nested-memvid-agent 0.4.2 release" in result.stdout
+    assert "stable release metadata v0.4.2" in result.stdout
+    assert "kestrel-web 0.4.2" in result.stdout
 
 
 def test_release_metadata_gate_rejects_development_line() -> None:
     errors = _release_mode_errors(
-        version="0.4.1",
-        release_tag="v0.4.1",
+        version="0.4.2",
+        release_tag="v0.4.2",
         is_current_release=False,
         changelog="## [Unreleased]\n",
     )
@@ -65,10 +65,10 @@ def test_release_metadata_gate_rejects_development_line() -> None:
 
 def test_release_metadata_gate_accepts_exact_published_dated_release() -> None:
     errors = _release_mode_errors(
-        version="0.4.1",
-        release_tag="v0.4.1",
+        version="0.4.2",
+        release_tag="v0.4.2",
         is_current_release=True,
-        changelog="## [0.4.1] - 2026-07-20\n",
+        changelog="## [0.4.2] - 2026-07-20\n",
     )
 
     assert errors == []
@@ -367,11 +367,11 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
 
     assert (
         "curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/"
-        "v0.4.1/install.sh | bash"
+        "v0.4.2/install.sh | bash"
     ) in deployment
-    assert "`v0.4.1` is the current stable release" in deployment
+    assert "`v0.4.2` is the current stable release" in deployment
     assert "release artifacts are not claimed to exist" in deployment
-    assert "releases/download/v0.4.1/install.sh" in deployment
+    assert "releases/download/v0.4.2/install.sh" in deployment
     assert "releases/download/v0.3.1/install.sh" not in deployment
     assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment

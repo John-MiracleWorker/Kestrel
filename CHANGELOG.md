@@ -6,6 +6,18 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-25
+
+### Fixed
+
+- Fixed the release workflow's smoke/doctor memory-dir parents: `MemvidBackend` places its
+  memory lock file in the memory directory's parent, and the v0.4.x lock hardening validates
+  parent ownership — so any doctor or smoke run whose memory dir sat directly under
+  root-owned `/tmp` failed with `Sensitive artifacts must be owned by the current user: /tmp`.
+  Container doctors now use `/data/doctor-memory*` (owned by the runtime user in the image)
+  and runner-side wheel/sdist/server smokes use `$RUNNER_TEMP`. Verified live in the built
+  release image: doctor green with all six memory layers verified.
+
 ## [0.4.1] - 2026-07-25
 
 ### Fixed
@@ -222,7 +234,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.0...v0.3.1
