@@ -10,7 +10,7 @@ credential-free, read-only OCI snapshot; there is no host fallback and the runti
 `--pull=never`. Run `nest-agent doctor` after changing these gates. Direct operator maintenance
 commands are separate from agent tool execution.
 
-`v0.4.2` is the current stable release for the supported local/private deployment profile. This
+`v0.4.3` is the current stable release for the supported local/private deployment profile. This
 source tree contains tag-ready release metadata, but its release artifacts are not claimed to exist
 until the exact-tag workflow publishes them.
 
@@ -18,7 +18,7 @@ until the exact-tag workflow publishes them.
 
 The one-shot Bash installer supports Intel/Apple-silicon macOS and Linux x86_64,
 including x86_64 Linux inside WSL. It deliberately rejects Linux `aarch64`/`arm64`;
-use the published `linux/arm64` container image for `v0.4.2` and later. The `v0.4.2`
+use the published `linux/arm64` container image for `v0.4.3` and later. The `v0.4.3`
 links in this guide become usable only after that workflow succeeds; this pre-publication
 checkout does not claim that a GitHub release or GHCR artifact already exists.
 Native Windows users should install the wheel instead of using Git Bash or the Windows
@@ -31,10 +31,10 @@ coverage.
 For a local Memvid-backed Kestrel install:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.2/install.sh | bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.3/install.sh | bash
 ```
 
-Once published, the release installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, requires Python 3.11, 3.12, or 3.13, creates `.venv`, installs the published release payload, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use. The `v0.4.2` payload includes the hash-locked wheel, OS-keyring extra, immutable-commit installer binding, and strengthened packaging path described below. This candidate checkout describes those artifacts without claiming they have already been published.
+Once published, the release installer clones or updates `https://github.com/John-MiracleWorker/Kestrel.git` into `${KESTREL_HOME:-$HOME/.kestrel-agent}`, requires Python 3.11, 3.12, or 3.13, creates `.venv`, installs the published release payload, initializes `.nest/memory` with Memvid `.mv2` layers, verifies memory, and runs doctor plus a deterministic `mock` chat smoke check. For a safer first install, it does not start the server or open a browser unless explicitly enabled. The smoke check proves the CLI path without requiring secrets; it is not the recommended provider for real use. The `v0.4.3` payload includes the hash-locked wheel, OS-keyring extra, immutable-commit installer binding, and strengthened packaging path described below. This candidate checkout describes those artifacts without claiming they have already been published.
 
 Production installs should use the immutable GitHub release installer above after publication. The
 moving `main` branch remains a development source, and this tag-ready candidate checkout is not by
@@ -63,21 +63,21 @@ exact, uploading only a missing wheel or sdist and failing on conflicting or unk
 long-lived PyPI token is stored in GitHub. Once that job succeeds, a direct package install is:
 
 ```bash
-python -m pip install "nested-memvid-agent[memvid,server,mcp,keyring]==0.4.2"
+python -m pip install "nested-memvid-agent[memvid,server,mcp,keyring]==0.4.3"
 ```
 
 The package command is a publication target until the exact tag workflow completes.
 
-For `v0.4.2` and later, download the complete payload and verify both its GitHub
+For `v0.4.3` and later, download the complete payload and verify both its GitHub
 provenance and its internal identity before installing it:
 
 ```bash
-mkdir kestrel-release-v0.4.2
-gh release download v0.4.2 --repo John-MiracleWorker/Kestrel --dir kestrel-release-v0.4.2
-for artifact in kestrel-release-v0.4.2/*; do
+mkdir kestrel-release-v0.4.3
+gh release download v0.4.3 --repo John-MiracleWorker/Kestrel --dir kestrel-release-v0.4.3
+for artifact in kestrel-release-v0.4.3/*; do
   gh attestation verify "$artifact" --repo John-MiracleWorker/Kestrel
 done
-python scripts/verify_release_payload.py kestrel-release-v0.4.2 --expected-version v0.4.2
+python scripts/verify_release_payload.py kestrel-release-v0.4.3 --expected-version v0.4.3
 ```
 
 `gh attestation verify` binds each downloaded artifact to the repository's GitHub
@@ -91,7 +91,7 @@ images, Python bootstrap artifacts, actions, and JavaScript dependency integrity
 To install and explicitly launch the localhost workbench in one command:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.2/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.3/install.sh | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
 Useful options:
@@ -195,14 +195,14 @@ Build:
 docker build -t kestrel-agent:local .
 ```
 
-For a published `v0.4.2` or later release, the Linux ARM64 installer fallback is the
+For a published `v0.4.3` or later release, the Linux ARM64 installer fallback is the
 public GHCR image. The same tag is a two-platform index for `linux/amd64` and
 `linux/arm64`:
 
 ```bash
-docker pull --platform linux/arm64 ghcr.io/john-miracleworker/kestrel:v0.4.2
+docker pull --platform linux/arm64 ghcr.io/john-miracleworker/kestrel:v0.4.3
 docker run --rm --platform linux/arm64 \
-  ghcr.io/john-miracleworker/kestrel:v0.4.2 \
+  ghcr.io/john-miracleworker/kestrel:v0.4.3 \
   nest-agent doctor --backend memvid --memory-dir /tmp/kestrel-doctor --provider mock
 ```
 

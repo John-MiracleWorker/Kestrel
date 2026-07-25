@@ -1069,7 +1069,7 @@ wheels = [
 
 [[package]]
 name = "nested-memvid-agent"
-version = "0.4.2"
+version = "0.4.3"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
@@ -1446,7 +1446,7 @@ wheels = [
 
 [[package]]
 name = "pyasn1-modules"
-version = "0.4.2"
+version = "0.4.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pyasn1" },
@@ -2096,7 +2096,7 @@ wheels = [
 
 [[package]]
 name = "typing-inspection"
-version = "0.4.2"
+version = "0.4.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
