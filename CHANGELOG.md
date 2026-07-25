@@ -6,6 +6,24 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-25
+
+### Fixed
+
+- Fixed the release workflow's container validation step: `nest-agent doctor` runs as the
+  image's non-root runtime user (uid 999), but the Memvid memory directory was created under
+  root-owned `/tmp`, tripping the sensitive-artifact ownership guard and aborting the release
+  before artifacts published. The workflow now creates the directory inside the container as
+  the runtime user before running doctor.
+- Made `temperature` optional across every provider adapter, the agent config, runtime
+  settings, planner/reviewer diversity calls, and learning evaluation. When unset, no
+  temperature field is sent on the wire and each provider applies its own default. This fixes
+  hard failures on providers that pin temperature (e.g. Kimi requiring exactly 1), including
+  the planner/reviewer sub-calls that previously hardcoded `0.0`.
+- Sanitized dotted tool names on the OpenAI-compatible wire (dots to underscores) with
+  canonical-name restoration on responses, fixing HTTP 400 rejections from providers that
+  disallow `.` in function names.
+
 ## [0.4.0] - 2026-07-24
 
 ### Added
@@ -204,7 +222,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.2.1...v0.3.0
