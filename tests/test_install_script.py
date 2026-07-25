@@ -801,7 +801,7 @@ def test_staged_release_installer_uses_verified_locked_artifacts(tmp_path: Path)
         ),
         (
             "KESTREL_WHEEL_URL",
-            "https://replacement.invalid/nested_memvid_agent-0.4.3-py3-none-any.whl",
+            "https://replacement.invalid/nested_memvid_agent-0.4.4-py3-none-any.whl",
             "KESTREL_WHEEL_URL cannot override",
         ),
         (
@@ -816,9 +816,9 @@ def test_staged_release_installer_rejects_source_overrides(
 ) -> None:
     staged = _stage_release_installer(
         tmp_path / "install.sh",
-        release_base="https://example.invalid/releases/download/v0.4.3",
+        release_base="https://example.invalid/releases/download/v0.4.4",
         release_sha=TEST_RELEASE_SHA,
-        version="0.4.3",
+        version="0.4.4",
     )
 
     result = _run_install(
@@ -844,16 +844,16 @@ def test_staged_release_installer_rejects_moved_tag(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
     ).stdout.strip()
-    subprocess.run(["git", "tag", "v0.4.3", original_sha], cwd=source, check=True)
+    subprocess.run(["git", "tag", "v0.4.4", original_sha], cwd=source, check=True)
     (source / "moved-tag.txt").write_text("moved\n", encoding="utf-8")
     subprocess.run(["git", "add", "moved-tag.txt"], cwd=source, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "move tag target"], cwd=source, check=True)
-    subprocess.run(["git", "tag", "-f", "v0.4.3"], cwd=source, check=True)
+    subprocess.run(["git", "tag", "-f", "v0.4.4"], cwd=source, check=True)
     staged = _stage_release_installer(
         tmp_path / "install.sh",
-        release_base="https://example.invalid/releases/download/v0.4.3",
+        release_base="https://example.invalid/releases/download/v0.4.4",
         release_sha=original_sha,
-        version="0.4.3",
+        version="0.4.4",
         repository=str(source),
     )
 
@@ -880,9 +880,9 @@ def test_staged_release_installer_rejects_mismatched_repository_head(
     embedded_sha = "0" * 40
     staged = _stage_release_installer(
         tmp_path / "install.sh",
-        release_base="https://example.invalid/releases/download/v0.4.3",
+        release_base="https://example.invalid/releases/download/v0.4.4",
         release_sha=embedded_sha,
-        version="0.4.3",
+        version="0.4.4",
         repository=str(source),
         ref="HEAD",
     )
@@ -920,13 +920,13 @@ def test_release_artifact_urls_must_be_complete_and_https(tmp_path: Path) -> Non
 def test_source_installer_cannot_enter_unbound_release_artifact_mode(
     tmp_path: Path,
 ) -> None:
-    release_base = "https://example.invalid/releases/download/v0.4.3"
+    release_base = "https://example.invalid/releases/download/v0.4.4"
     result = _run_install(
         env={
             "KESTREL_DRY_RUN": "1",
             "KESTREL_HOME": str(tmp_path / "home"),
             "KESTREL_REQUIREMENTS_URL": f"{release_base}/requirements-release.txt",
-            "KESTREL_WHEEL_URL": (f"{release_base}/nested_memvid_agent-0.4.3-py3-none-any.whl"),
+            "KESTREL_WHEEL_URL": (f"{release_base}/nested_memvid_agent-0.4.4-py3-none-any.whl"),
             "KESTREL_CHECKSUMS_URL": f"{release_base}/SHA256SUMS",
         }
     )
