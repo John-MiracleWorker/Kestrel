@@ -40,7 +40,7 @@ class OllamaNativeProvider(LLMProvider):
         api_key_env: str | None = None,
         timeout_seconds: int = 60,
         max_retries: int = 2,
-        temperature: float = 0.2,
+        temperature: float | None = None,
         provider_name: str = "ollama-cloud",
     ) -> None:
         self.model = model
@@ -161,8 +161,9 @@ class OllamaNativeProvider(LLMProvider):
             "model": self.model,
             "messages": [_to_ollama_message(message) for message in messages],
             "stream": stream,
-            "options": {"temperature": options.temperature},
         }
+        if options.temperature is not None:
+            request["options"] = {"temperature": options.temperature}
         if tools:
             request["tools"] = [_to_ollama_tool(tool) for tool in tools]
         return request

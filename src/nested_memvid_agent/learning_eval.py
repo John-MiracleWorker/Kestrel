@@ -671,7 +671,7 @@ def _stage_provider_smoke(ctx: _RunContext) -> LearningEvalStep:
             ChatMessage(role="user", content="Reply with a short readiness acknowledgement."),
         ],
         [],
-        LLMOptions(timeout_seconds=ctx.config.timeout_seconds, max_retries=0, temperature=0.0),
+        LLMOptions(timeout_seconds=ctx.config.timeout_seconds, max_retries=0),
     )
     ctx.limits.add_usage(response.usage)
     return LearningEvalStep(
@@ -1150,7 +1150,6 @@ def _eval_agent_config(
         api_key_env=options.api_key_env,
         timeout_seconds=timeout_seconds,
         max_retries=0,
-        temperature=0.0,
         memory_dir=memory_dir,
         log_dir=workspace / ".nest" / "logs",
         state_path=workspace / ".nest" / "state" / "agent.db",

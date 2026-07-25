@@ -36,7 +36,7 @@ class AnthropicMessagesProvider(LLMProvider):
         api_key_env: str | None = None,
         timeout_seconds: int = 60,
         max_retries: int = 2,
-        temperature: float = 0.2,
+        temperature: float | None = None,
         max_tokens: int = 4096,
     ) -> None:
         self.model = model
@@ -82,7 +82,11 @@ class AnthropicMessagesProvider(LLMProvider):
                 system=_system_prompt(messages),
                 messages=_anthropic_messages(messages),
                 tools=[_anthropic_tool(tool) for tool in tools] or None,
-                temperature=active_options.temperature,
+                **(
+                    {"temperature": active_options.temperature}
+                    if active_options.temperature is not None
+                    else {}
+                ),
                 max_tokens=self.max_tokens,
             )
         except ControlMessageError:
@@ -123,7 +127,11 @@ class AnthropicMessagesProvider(LLMProvider):
                 system=_system_prompt(messages),
                 messages=_anthropic_messages(messages),
                 tools=[_anthropic_tool(tool) for tool in tools] or None,
-                temperature=active_options.temperature,
+                **(
+                    {"temperature": active_options.temperature}
+                    if active_options.temperature is not None
+                    else {}
+                ),
                 max_tokens=self.max_tokens,
             ) as stream:
                 for event in stream:

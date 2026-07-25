@@ -42,7 +42,7 @@ class OpenAIResponsesProvider(LLMProvider):
         api_key_env: str | None = None,
         timeout_seconds: int = 60,
         max_retries: int = 2,
-        temperature: float = 0.2,
+        temperature: float | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.getenv(api_key_env or "OPENAI_API_KEY")
@@ -152,8 +152,9 @@ class OpenAIResponsesProvider(LLMProvider):
         request: dict[str, Any] = {
             "model": self.model,
             "input": _to_responses_input(messages),
-            "temperature": options.temperature,
         }
+        if options.temperature is not None:
+            request["temperature"] = options.temperature
         if tools:
             request["tools"] = [_to_responses_tool(tool) for tool in tools]
         return request

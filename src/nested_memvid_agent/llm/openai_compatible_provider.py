@@ -37,7 +37,7 @@ class OpenAICompatibleProvider(LLMProvider):
         api_key_env: str | None = None,
         timeout_seconds: int = 60,
         max_retries: int = 2,
-        temperature: float = 0.2,
+        temperature: float | None = None,
         provider_name: str = "openai-compatible",
     ) -> None:
         self.model = model
@@ -176,8 +176,12 @@ class OpenAICompatibleProvider(LLMProvider):
         request: dict[str, Any] = {
             "model": self.model,
             "messages": [_to_chat_completion_dict(message) for message in messages],
-            "temperature": options.temperature,
         }
+        if options.temperature is not None:
+            # Only pin temperature when explicitly configured; otherwise let the
+            # provider apply its own default (Kimi requires exactly 1, several
+            # reasoning models reject the field outright).
+            request["temperature"] = options.temperature
         if tools:
             request["tools"] = [_to_chat_completion_tool(tool) for tool in tools]
             request["tool_choice"] = "auto"

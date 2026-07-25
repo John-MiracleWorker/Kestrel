@@ -59,7 +59,7 @@ class RuntimeSettings:
     backend: str
     memory_dir: str
     workspace: str
-    temperature: float
+    temperature: float | None
     max_tool_rounds: int
     stream: bool
     require_api_auth: bool
@@ -467,7 +467,9 @@ def _clean_bool(value: object) -> bool:
     return bool(value)
 
 
-def _clean_temperature(value: object) -> float:
+def _clean_temperature(value: object) -> float | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise ValueError("temperature must be a number")
     try:
