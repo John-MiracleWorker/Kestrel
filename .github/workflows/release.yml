@@ -196,10 +196,10 @@ jobs:
               test ! -u /usr/bin/su'
             docker run --rm --entrypoint /bin/sh "$image" -c \
               'set -eu;
-              mkdir -p /tmp/kestrel-container-memory;
+              mkdir -p /data/doctor-memory;
               exec nest-agent doctor \
               --backend memvid \
-              --memory-dir /tmp/kestrel-container-memory \
+              --memory-dir /data/doctor-memory \
               --provider mock \
               --model mock'
             probe_name="kestrel-release-readonly-${architecture}"
@@ -443,8 +443,8 @@ jobs:
             "${wheels[0]}[${RELEASE_EXTRAS}]"
           /tmp/kestrel-release-smoke/bin/python -m pip check
           /tmp/kestrel-release-smoke/bin/python -c 'import importlib.metadata, keyring, os; actual=importlib.metadata.version("nested-memvid-agent"); expected=os.environ["GITHUB_REF_NAME"].removeprefix("v"); assert actual == expected, (actual, expected); assert callable(keyring.get_keyring)'
-          /tmp/kestrel-release-smoke/bin/nest-agent doctor --backend memvid --memory-dir /tmp/kestrel-release-memory --provider mock --model mock
-          /tmp/kestrel-release-smoke/bin/nest-agent chat --backend memvid --memory-dir /tmp/kestrel-release-chat --provider mock --model mock --message "release wheel smoke"
+          /tmp/kestrel-release-smoke/bin/nest-agent doctor --backend memvid --memory-dir "$RUNNER_TEMP/kestrel-release-memory" --provider mock --model mock
+          /tmp/kestrel-release-smoke/bin/nest-agent chat --backend memvid --memory-dir "$RUNNER_TEMP/kestrel-release-chat" --provider mock --model mock --message "release wheel smoke"
           NEST_AGENT_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
           export NEST_AGENT_API_TOKEN
           export NEST_AGENT_REQUIRE_API_AUTH=1
@@ -456,10 +456,10 @@ jobs:
             cd /tmp
             /tmp/kestrel-release-smoke/bin/nest-agent server \
               --backend memory \
-              --memory-dir /tmp/kestrel-release-server/memory \
-              --state-path /tmp/kestrel-release-server/state/agent.sqlite3 \
-              --log-dir /tmp/kestrel-release-server/logs \
-              --secret-store-path /tmp/kestrel-release-server/secrets/store.json \
+              --memory-dir "$RUNNER_TEMP/kestrel-release-server/memory" \
+              --state-path "$RUNNER_TEMP/kestrel-release-server/state/agent.sqlite3" \
+              --log-dir "$RUNNER_TEMP/kestrel-release-server/logs" \
+              --secret-store-path "$RUNNER_TEMP/kestrel-release-server/secrets/store.json" \
               --provider mock \
               --model mock \
               --host 127.0.0.1 \
@@ -522,12 +522,12 @@ jobs:
             'import keyring; assert callable(keyring.get_keyring)'
           /tmp/kestrel-release-sdist-smoke/bin/nest-agent doctor \
             --backend memvid \
-            --memory-dir /tmp/kestrel-release-sdist-memory \
+            --memory-dir "$RUNNER_TEMP/kestrel-release-sdist-memory" \
             --provider mock \
             --model mock
           /tmp/kestrel-release-sdist-smoke/bin/nest-agent chat \
             --backend memvid \
-            --memory-dir /tmp/kestrel-release-sdist-chat \
+            --memory-dir "$RUNNER_TEMP/kestrel-release-sdist-chat" \
             --provider mock \
             --model mock \
             --message "release sdist smoke"
@@ -1088,12 +1088,12 @@ jobs:
             test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "$image_ref")" = "$GITHUB_SHA"
             test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.source\"}}' "$image_ref")" = "https://github.com/$GITHUB_REPOSITORY"
             test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' "$image_ref")" = "$GITHUB_REF_NAME"
-            docker run --rm --platform "linux/${architecture}" "$image_ref" \
-              nest-agent doctor \
+            docker run --rm --platform "linux/${architecture}" --entrypoint /bin/sh "$image_ref" \
+              -c 'mkdir -p /data/doctor-memory-post && exec nest-agent doctor \
               --backend memvid \
-              --memory-dir "/tmp/kestrel-post-publish-${architecture}" \
+              --memory-dir /data/doctor-memory-post \
               --provider mock \
-              --model mock
+              --model mock'
           done
       - name: Bind the verified OCI digest into the release payload
         if: steps.release-state.outputs.complete != 'true'
