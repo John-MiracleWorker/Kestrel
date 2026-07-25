@@ -150,7 +150,9 @@ class OpenAICompatibleProvider(LLMProvider):
 
         text = "".join(content_parts)
         parsed = parse_agent_response(text, tools=tools, strict=True)
-        native_calls = normalize_tool_calls(_buffered_tool_calls(tool_buffers), tools=tools)
+        native_calls = normalize_tool_calls(
+            _buffered_tool_calls(tool_buffers, tools=tools), tools=tools
+        )
         response = LLMResponse(
             content=parsed.content if parsed.raw is not None else text.strip(),
             tool_calls=native_calls or parsed.tool_calls,
@@ -206,6 +208,13 @@ def _to_chat_completion_dict(message: ChatMessage) -> dict[str, Any]:
         # by a tool result carrying the same tool_call_id.  The agent runtime
         # now preserves that pair in provider-neutral ChatMessage fields.
         payload.pop("name", None)
+    if payload["role"] == "assistant" and payload.get("tool_calls"):
+        # Replayed assistant tool calls must carry the same wire names that
+        # were advertised in the request's tools array.
+        for call in payload["tool_calls"]:
+            function = call.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                function["name"] = _wire_tool_name(function["name"])
     return payload
 
 
@@ -213,11 +222,30 @@ def _to_chat_completion_tool(tool: ToolSpec) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": _wire_tool_name(tool.name),
             "description": tool.description,
             "parameters": tool.parameters,
         },
     }
+
+
+def _wire_tool_name(name: str) -> str:
+    """Map a canonical Kestrel tool name to a provider-safe wire name.
+
+    Several OpenAI-compatible providers (e.g. Kimi) reject function names
+    containing dots. Canonical names like ``tool.registry`` are therefore
+    sent as ``tool_registry`` on the wire and restored on the response path
+    by :func:`_canonical_tool_name`.
+    """
+    return name.replace(".", "_")
+
+
+def _canonical_tool_name(name: str, *, tools: list[ToolSpec] | tuple[ToolSpec, ...]) -> str:
+    """Restore a wire tool name to its canonical dotted form when known."""
+    for tool in tools:
+        if _wire_tool_name(tool.name) == name:
+            return tool.name
+    return name
 
 
 def _chat_completion_to_llm_response(
@@ -225,7 +253,9 @@ def _chat_completion_to_llm_response(
 ) -> LLMResponse:
     text = _first_choice_text(response)
     parsed = parse_agent_response(text, tools=tools, strict=True)
-    native_calls = normalize_tool_calls(_chat_completion_tool_calls(response), tools=tools)
+    native_calls = normalize_tool_calls(
+        _chat_completion_tool_calls(response, tools=tools), tools=tools
+    )
     return LLMResponse(
         content=parsed.content if parsed.raw is not None else text.strip(),
         tool_calls=native_calls or parsed.tool_calls,
@@ -252,7 +282,9 @@ def _first_choice(response: Any) -> Any | None:
     return None
 
 
-def _chat_completion_tool_calls(response: Any) -> list[ToolCall]:
+def _chat_completion_tool_calls(
+    response: Any, *, tools: list[ToolSpec] | tuple[ToolSpec, ...] = ()
+) -> list[ToolCall]:
     choice = _first_choice(response)
     if choice is None:
         return []
@@ -269,7 +301,10 @@ def _chat_completion_tool_calls(response: Any) -> list[ToolCall]:
     for index, item in enumerate(raw_calls):
         location = f"chat.completions.tool_calls[{index}]"
         function = _native_function_block(item, location=location)
-        name = native_tool_name(_item_value(function, "name"), location=location)
+        name = _canonical_tool_name(
+            native_tool_name(_item_value(function, "name"), location=location),
+            tools=tools,
+        )
         arguments = native_tool_arguments(
             _item_value(function, "arguments"),
             tool_name=name,
@@ -347,11 +382,18 @@ def _accumulate_delta_tool_calls(buffers: dict[int, dict[str, str]], raw_calls: 
             buffer["arguments"] += arguments
 
 
-def _buffered_tool_calls(buffers: dict[int, dict[str, str]]) -> list[ToolCall]:
+def _buffered_tool_calls(
+    buffers: dict[int, dict[str, str]],
+    *,
+    tools: list[ToolSpec] | tuple[ToolSpec, ...] = (),
+) -> list[ToolCall]:
     calls: list[ToolCall] = []
     for index, item in sorted(buffers.items()):
         location = f"chat.completions.delta.tool_calls[{index}]"
-        name = native_tool_name(item["name"], location=location)
+        name = _canonical_tool_name(
+            native_tool_name(item["name"], location=location),
+            tools=tools,
+        )
         arguments = native_tool_arguments(
             item["arguments"],
             tool_name=name,
