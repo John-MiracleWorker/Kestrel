@@ -194,11 +194,14 @@ jobs:
               test ! -u /usr/bin/mount;
               test ! -u /usr/bin/umount;
               test ! -u /usr/bin/su'
-            docker run --rm "$image" nest-agent doctor \
+            docker run --rm --entrypoint /bin/sh "$image" -c \
+              'set -eu;
+              mkdir -p /tmp/kestrel-container-memory;
+              exec nest-agent doctor \
               --backend memvid \
               --memory-dir /tmp/kestrel-container-memory \
               --provider mock \
-              --model mock
+              --model mock'
             probe_name="kestrel-release-readonly-${architecture}"
             probe_token="kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
             cleanup_probe() {
