@@ -6,6 +6,19 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-25
+
+### Fixed
+
+- Fixed the release probe's minimum-throughput acceptance check under QEMU emulation: the
+  soak measures throughput against wall-clock load time, so 4 emulated runs (~30s each)
+  landed at 0.066 runs/s against the 0.1 floor despite 4/4 completion, p95 within budget,
+  and exact request accounting. The throughput floor is now per-architecture (0.1 runs/s
+  native amd64, 0.01 runs/s emulated arm64).
+- Fixed `uv.lock` corruption from the 0.4.3 version bump: the string replace also rewrote
+  two upstream packages at 0.4.2 (`pyasn1-modules`, `typing-inspection`), desyncing their
+  version fields from wheel URLs and breaking the hash-locked container build.
+
 ## [0.4.3] - 2026-07-25
 
 ### Fixed
@@ -243,7 +256,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.0...v0.4.1

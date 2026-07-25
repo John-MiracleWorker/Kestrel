@@ -243,13 +243,17 @@ jobs:
               exit 1
             fi
             # The arm64 probe runs under QEMU emulation (roughly 20x slower than
-            # native), so the p95 budget is per-architecture: 30s native, 120s
-            # emulated. Functional assertions (completion, accounting, contract)
+            # native), so the p95/throughput budgets are per-architecture: 30s p95
+            # and 0.1 runs/s native, 120s p95 and 0.01 runs/s emulated (the soak
+            # measures throughput against wall-clock load time, which emulation
+            # inflates). Functional assertions (completion, accounting, contract)
             # stay identical for both.
             if [ "${architecture}" = "amd64" ]; then
               soak_max_p95=30
+              soak_min_throughput=0.1
             else
               soak_max_p95=120
+              soak_min_throughput=0.01
             fi
             NEST_AGENT_API_TOKEN="$probe_token" python scripts/run-soak.py \
               --base-url "http://127.0.0.1:${probe_port}" \
@@ -258,7 +262,7 @@ jobs:
               --timeout 90 \
               --response-contract mock-echo \
               --max-p95 "$soak_max_p95" \
-              --min-throughput 0.1
+              --min-throughput "$soak_min_throughput"
             cleanup_probe
             trap - EXIT
           done
