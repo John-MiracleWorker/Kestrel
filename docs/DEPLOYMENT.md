@@ -16,14 +16,15 @@ until the exact-tag workflow publishes them.
 
 ## One-Shot GitHub Install
 
-The one-shot Bash installer supports Intel/Apple-silicon macOS and Linux x86_64,
-including x86_64 Linux inside WSL. It deliberately rejects Linux `aarch64`/`arm64`;
-use the published `linux/arm64` container image for `v0.4.6` and later. The `v0.4.6`
+The one-shot Bash installer supports Apple-silicon macOS and Linux x86_64,
+including x86_64 Linux inside WSL. It deliberately rejects Linux `aarch64`/`arm64`
+and Intel macOS (the `cryptography` dependency no longer publishes Intel wheels);
+use the published container image for those platforms. The `v0.4.6`
 links in this guide become usable only after that workflow succeeds; this pre-publication
 checkout does not claim that a GitHub release or GHCR artifact already exists.
 Native Windows users should install the wheel instead of using Git Bash or the Windows
 `bash.exe` launcher. The exact downloaded wheel is release-gated on native Windows,
-Linux x86_64, Apple-silicon macOS, and Intel macOS with Python 3.11, 3.12, and 3.13.
+Linux x86_64, and Apple-silicon macOS with Python 3.11, 3.12, and 3.13.
 The matrix asserts `platform.machine()` in
 each lane so a hosted-runner architecture or label drift cannot silently reduce that
 coverage.

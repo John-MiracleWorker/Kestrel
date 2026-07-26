@@ -1308,6 +1308,7 @@ def test_installer_rejects_explicit_unsupported_python(tmp_path: Path) -> None:
     ("system", "architecture", "accepted"),
     [
         ("Darwin", "arm64", True),
+        ("Darwin", "x86_64", False),
         ("Linux", "x86_64", True),
         ("Linux", "aarch64", False),
         ("Linux", "arm64", False),
@@ -1337,9 +1338,12 @@ def test_one_shot_platform_support_is_explicit(
     )
 
     assert (result.returncode == 0) is accepted, result.stderr
-    if not accepted:
+    if not accepted and system == "Linux":
         assert "one-shot installer does not support Linux ARM64" in result.stderr
         assert "published linux/arm64 container image" in result.stderr
+    if not accepted and system == "Darwin":
+        assert "Apple-silicon macOS only" in result.stderr
+        assert "published container image" in result.stderr
 
 
 def test_install_script_clears_pythonpath_before_creating_the_venv() -> None:
