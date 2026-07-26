@@ -6,6 +6,16 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-07-26
+
+### Fixed
+
+- Re-tag of the v0.4.6 content: the `v0.4.6` tag was inadvertently pushed pointing
+  at the v0.4.5 commit before its release PR merged, and repository rulesets block
+  tag deletion. `v0.4.6` should be treated as a burned tag; this release carries the
+  identical code that was reviewed and merged as PR #306 (Intel macOS support
+  removal across the release matrix, installer, and docs).
+
 ## [0.4.6] - 2026-07-25
 
 ### Removed
@@ -275,8 +285,9 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.6...HEAD
-[0.4.6]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.5...v0.4.6
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.5...v0.4.7
+[0.4.6]: https://github.com/John-MiracleWorker/Kestrel/releases/tag/v0.4.6
 [0.4.5]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.2...v0.4.3
