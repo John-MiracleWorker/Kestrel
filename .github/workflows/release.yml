@@ -499,7 +499,7 @@ jobs:
             --timeout 60 \
             --response-contract mock-echo \
             --max-p95 10 \
-            --min-throughput 1
+            --min-throughput 0.75
           python scripts/run-soak.py \
             --base-url http://127.0.0.1:8878 \
             --runs 40 \

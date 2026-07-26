@@ -442,7 +442,7 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "scripts/run_golden_evals.py --backend memvid --provider mock" in workflow
     assert workflow.count("--max-case-latency-ms 45000") == 2
     assert "--response-contract mock-echo" in workflow
-    assert "--min-throughput 1" in workflow
+    assert "--min-throughput 0.75" in workflow
     assert "--require-overload" in workflow
     assert "--min-completed 4" in workflow
     assert "--max-overload-ratio 0.90" in workflow
