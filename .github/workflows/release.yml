@@ -857,7 +857,9 @@ jobs:
       - name: Require immutable GitHub releases before any publication mutation
         if: steps.release-state.outputs.complete != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Admin-settings endpoint: github.token (GITHUB_TOKEN) is 403 here.
+          # Needs a PAT with Administration read on the repo.
+          GH_TOKEN: ${{ secrets.RELEASE_GUARD_TOKEN }}
         run: |
           enabled="$(gh api \
             -H "Accept: application/vnd.github+json" \
