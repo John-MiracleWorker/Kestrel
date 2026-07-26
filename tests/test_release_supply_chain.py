@@ -111,24 +111,24 @@ def _rewrite_manifest(root: Path) -> None:
 def _write_payload(
     root: Path,
     *,
-    wheel_metadata_version: str = "0.4.9",
-    sdist_metadata_version: str = "0.4.9",
-    sbom_version: str = "0.4.9",
+    wheel_metadata_version: str = "0.4.10",
+    sdist_metadata_version: str = "0.4.10",
+    sbom_version: str = "0.4.10",
 ) -> None:
-    wheel = root / "nested_memvid_agent-0.4.9-py3-none-any.whl"
+    wheel = root / "nested_memvid_agent-0.4.10-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(
-            "nested_memvid_agent-0.4.9.dist-info/METADATA",
+            "nested_memvid_agent-0.4.10.dist-info/METADATA",
             "Metadata-Version: 2.4\n"
             "Name: nested-memvid-agent\n"
             f"Version: {wheel_metadata_version}\n",
         )
-    sdist = root / "nested_memvid_agent-0.4.9.tar.gz"
+    sdist = root / "nested_memvid_agent-0.4.10.tar.gz"
     package_info = (
         f"Metadata-Version: 2.4\nName: nested-memvid-agent\nVersion: {sdist_metadata_version}\n"
     ).encode()
     with tarfile.open(sdist, "w:gz") as archive:
-        member = tarfile.TarInfo("nested_memvid_agent-0.4.9/PKG-INFO")
+        member = tarfile.TarInfo("nested_memvid_agent-0.4.10/PKG-INFO")
         member.size = len(package_info)
         archive.addfile(member, io.BytesIO(package_info))
     artifacts = {
@@ -176,25 +176,25 @@ def test_release_payload_verifier_covers_every_artifact_and_detects_tampering(
 ) -> None:
     _write_payload(tmp_path)
 
-    report = verify_release_payload(tmp_path, expected_version="v0.4.9")
+    report = verify_release_payload(tmp_path, expected_version="v0.4.10")
 
     assert report["verified"] is True
     assert report["artifact_count"] == 5
     assert report["requirement_count"] == 1
     assert report["distribution"] == "nested-memvid-agent"
-    assert report["version"] == "0.4.9"
+    assert report["version"] == "0.4.10"
 
     (tmp_path / "install.sh").write_bytes(b"tampered")
     with pytest.raises(ValueError, match="SHA-256 mismatch for install.sh"):
-        verify_release_payload(tmp_path, expected_version="0.4.9")
+        verify_release_payload(tmp_path, expected_version="0.4.10")
 
 
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"wheel_metadata_version": "0.4.10"}, "wheel METADATA version mismatch"),
-        ({"sdist_metadata_version": "0.4.10"}, "sdist PKG-INFO version mismatch"),
-        ({"sbom_version": "0.4.10"}, "CycloneDX Kestrel component identity mismatch"),
+        ({"wheel_metadata_version": "0.4.11"}, "wheel METADATA version mismatch"),
+        ({"sdist_metadata_version": "0.4.11"}, "sdist PKG-INFO version mismatch"),
+        ({"sbom_version": "0.4.11"}, "CycloneDX Kestrel component identity mismatch"),
     ],
 )
 def test_release_payload_verifier_rejects_internal_identity_drift(
@@ -203,17 +203,17 @@ def test_release_payload_verifier_rejects_internal_identity_drift(
     _write_payload(tmp_path, **kwargs)
 
     with pytest.raises(ValueError, match=message):
-        verify_release_payload(tmp_path, expected_version="0.4.9")
+        verify_release_payload(tmp_path, expected_version="0.4.10")
 
 
 def test_release_payload_verifier_rejects_filename_identity_drift(tmp_path: Path) -> None:
     _write_payload(tmp_path)
-    wheel = tmp_path / "nested_memvid_agent-0.4.9-py3-none-any.whl"
-    wheel.rename(tmp_path / "nested_memvid_agent-0.4.10-py3-none-any.whl")
+    wheel = tmp_path / "nested_memvid_agent-0.4.10-py3-none-any.whl"
+    wheel.rename(tmp_path / "nested_memvid_agent-0.4.11-py3-none-any.whl")
     _rewrite_manifest(tmp_path)
 
     with pytest.raises(ValueError, match="wheel filename version mismatch"):
-        verify_release_payload(tmp_path, expected_version="0.4.9")
+        verify_release_payload(tmp_path, expected_version="0.4.10")
 
 
 def test_release_payload_verifier_rejects_checksummed_unknown_artifact(tmp_path: Path) -> None:
@@ -222,7 +222,7 @@ def test_release_payload_verifier_rejects_checksummed_unknown_artifact(tmp_path:
     _rewrite_manifest(tmp_path)
 
     with pytest.raises(ValueError, match="unexpected artifacts.*unexpected.bin"):
-        verify_release_payload(tmp_path, expected_version="0.4.9")
+        verify_release_payload(tmp_path, expected_version="0.4.10")
 
 
 def test_oci_record_is_identity_bound_and_added_to_the_release_manifest(
@@ -236,7 +236,7 @@ def test_oci_record_is_identity_bound_and_added_to_the_release_manifest(
     record_path = write_oci_record(
         tmp_path,
         repository="John-MiracleWorker/Kestrel",
-        tag="v0.4.9",
+        tag="v0.4.10",
         commit="d" * 40,
         image="ghcr.io/john-miracleworker/kestrel",
         index_digest=index_digest,
@@ -244,14 +244,14 @@ def test_oci_record_is_identity_bound_and_added_to_the_release_manifest(
         arm64_digest=arm64_digest,
     )
 
-    report = verify_release_payload(tmp_path, expected_version="v0.4.9")
+    report = verify_release_payload(tmp_path, expected_version="v0.4.10")
     assert report["artifact_count"] == 6
     sums = (tmp_path / "SHA256SUMS").read_text(encoding="ascii")
     assert f"  {OCI_RECORD_NAME}\n" in sums
     record = validate_oci_record(
         json.loads(record_path.read_text(encoding="utf-8")),
         repository="John-MiracleWorker/Kestrel",
-        tag="v0.4.9",
+        tag="v0.4.10",
         commit="d" * 40,
         image="ghcr.io/john-miracleworker/kestrel",
     )
@@ -275,7 +275,7 @@ def test_oci_record_is_identity_bound_and_added_to_the_release_manifest(
         validate_oci_record(
             record,
             repository="attacker/Kestrel",
-            tag="v0.4.9",
+            tag="v0.4.10",
             commit="d" * 40,
             image="ghcr.io/john-miracleworker/kestrel",
         )
@@ -324,18 +324,18 @@ def test_release_asset_guard_rejects_unknown_missing_and_changed_assets(
 
 def test_pypi_partial_recovery_skips_only_exact_existing_files(tmp_path: Path) -> None:
     _write_payload(tmp_path)
-    wheel = tmp_path / "nested_memvid_agent-0.4.9-py3-none-any.whl"
-    sdist = tmp_path / "nested_memvid_agent-0.4.9.tar.gz"
+    wheel = tmp_path / "nested_memvid_agent-0.4.10-py3-none-any.whl"
+    sdist = tmp_path / "nested_memvid_agent-0.4.10.tar.gz"
     wheel_record = {
         "filename": wheel.name,
         "digests": {"sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()},
         "yanked": False,
     }
-    remote = {"info": {"version": "0.4.9"}, "urls": [wheel_record]}
+    remote = {"info": {"version": "0.4.10"}, "urls": [wheel_record]}
 
-    assert plan_pypi_files(tmp_path, remote, expected_version="0.4.9") == [sdist]
+    assert plan_pypi_files(tmp_path, remote, expected_version="0.4.10") == [sdist]
     exact = {
-        "info": {"version": "0.4.9"},
+        "info": {"version": "0.4.10"},
         "urls": [
             wheel_record,
             {
@@ -345,30 +345,30 @@ def test_pypi_partial_recovery_skips_only_exact_existing_files(tmp_path: Path) -
             },
         ],
     }
-    assert plan_pypi_files(tmp_path, exact, expected_version="0.4.9") == []
+    assert plan_pypi_files(tmp_path, exact, expected_version="0.4.10") == []
 
     mismatched = json.loads(json.dumps(remote))
     mismatched["urls"][0]["digests"]["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="PyPI SHA-256 mismatch"):
-        plan_pypi_files(tmp_path, mismatched, expected_version="0.4.9")
+        plan_pypi_files(tmp_path, mismatched, expected_version="0.4.10")
     yanked = json.loads(json.dumps(remote))
     yanked["urls"][0]["yanked"] = True
     with pytest.raises(ValueError, match="PyPI file is yanked"):
-        plan_pypi_files(tmp_path, yanked, expected_version="0.4.9")
+        plan_pypi_files(tmp_path, yanked, expected_version="0.4.10")
     with pytest.raises(ValueError, match="unexpected files"):
         plan_pypi_files(
             tmp_path,
             {
-                "info": {"version": "0.4.9"},
+                "info": {"version": "0.4.10"},
                 "urls": [
                     *exact["urls"],
                     {
-                        "filename": "attacker-0.4.9.whl",
+                        "filename": "attacker-0.4.10.whl",
                         "digests": {"sha256": "0" * 64},
                     },
                 ],
             },
-            expected_version="0.4.9",
+            expected_version="0.4.10",
         )
 
 
@@ -376,7 +376,7 @@ def test_oci_record_builder_rejects_non_digest_inputs() -> None:
     with pytest.raises(ValueError, match="invalid index digest"):
         build_oci_record(
             repository="John-MiracleWorker/Kestrel",
-            tag="v0.4.9",
+            tag="v0.4.10",
             commit="d" * 40,
             image="ghcr.io/john-miracleworker/kestrel",
             index_digest="latest",
