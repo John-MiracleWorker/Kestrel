@@ -1273,7 +1273,16 @@ jobs:
               --generate-notes \
               --title "Kestrel $GITHUB_REF_NAME"
           fi
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+          # Under immutable releases, a draft release is UNTAGGED until it is
+          # published (--draft=false). The releases/tags/<tag> REST endpoint
+          # 404s for an untagged draft (gh CLI resolves it, the raw endpoint
+          # does not), so the intermediate pre-publish checks must query the
+          # release BY numeric databaseId, not by tag. (--json id returns the
+          # GraphQL node_id, which releases/<id> does NOT accept.)
+          release_id="$(gh release view "$GITHUB_REF_NAME" \
+            --json databaseId --jq '.databaseId')"
+          test -n "$release_id"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             > "$RUNNER_TEMP/kestrel-draft-before-upload.json"
           jq -e '.draft == true and (.immutable // false) == false' \
             "$RUNNER_TEMP/kestrel-draft-before-upload.json" >/dev/null
@@ -1282,7 +1291,7 @@ jobs:
             "$RUNNER_TEMP/kestrel-draft-before-upload.json" \
             --allow-missing
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             > "$RUNNER_TEMP/kestrel-draft-after-upload.json"
           jq -e '.draft == true and (.immutable // false) == false' \
             "$RUNNER_TEMP/kestrel-draft-after-upload.json" >/dev/null
