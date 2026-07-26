@@ -29,7 +29,7 @@ It combines:
 
 Kestrel is currently designed for **one trusted user running one local or privately networked node**. It is not yet a hosted, multi-user, or multi-tenant agent platform.
 
-`v0.4.8` is the current stable release for that supported profile: one trusted user, one Kestrel server or worker process, and one local or privately networked node. This source tree contains tag-ready release metadata; the installer and exact-tag artifacts become available once the `v0.4.8` release workflow publishes them.
+`v0.4.9` is the current stable release for that supported profile: one trusted user, one Kestrel server or worker process, and one local or privately networked node. This source tree contains tag-ready release metadata; the installer and exact-tag artifacts become available once the `v0.4.9` release workflow publishes them.
 
 ---
 
@@ -280,13 +280,13 @@ nest-agent product provider-certification \
 
 ## Published Release Installation
 
-The repository contains `v0.4.8` release metadata, but release commands should only be used after the matching Git tag and exact-tag artifacts have been published.
+The repository contains `v0.4.9` release metadata, but release commands should only be used after the matching Git tag and exact-tag artifacts have been published.
 
 The installer is conservative by default: it does not start the server or open a browser unless explicitly enabled.
 
 ```bash
 curl -fsSL \
-  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.8/install.sh \
+  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.9/install.sh \
   | bash
 ```
 
@@ -294,7 +294,7 @@ To explicitly start the local workbench and open a browser during installation, 
 
 ```bash
 curl -fsSL \
-  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.8/install.sh \
+  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.9/install.sh \
   | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
