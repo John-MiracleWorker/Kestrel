@@ -142,12 +142,41 @@ SQLite is not used as a substitute for Kestrel's layered memory model.
 | Context compilation | Token-aware retrieval, deduplication, conflict warnings, summary-first packing, and raw evidence expansion. |
 | Failure-aware execution | Failure classification, recalled lessons, proof-of-work summaries, and changed-strategy retry gates. |
 | Controlled learning | Run capsules, promotion decisions, validation evidence, behavior deltas, activation metrics, outcome records, and rollback. |
+| Adaptive Flock | Inspectable, policy-bound routing across configured model targets, with shadow-first rollout, hard eligibility filters, review diversity, and durable outcomes. |
 | Safe repair | Repair branches or worktrees, approval-gated patching, isolated validation, review artifacts, literal-tree commits, and rollback quarantine. |
 | Capability control | Per-tool, MCP-server, and skill switches with configured state, effective state, revision history, and blocker explanations. |
 | Proactive routines | Disabled-by-default one-shot and interval routines with revision checks, leased occurrences, overlap suppression, and manual run-now. |
 | Extensibility | Built-in tools, managed MCP sessions, local skills, and a review-first GitHub plugin flow. |
 | Channels | Telegram-shaped, Discord-shaped, generic webhook, and custom JSON ingress with outbound delivery disabled by default. |
 | Operations | Doctor checks, setup readiness, provider certification, support bundles, backups, restores, traces, tests, and golden evals. |
+
+---
+
+## Adaptive Flock: Route the Work, Preserve the Guardrails
+
+Adaptive Flock lets Kestrel assign planner, executor, and reviewer work to
+different configured model targets. Each decision starts from a typed task
+contract and applies hard constraints before scoring eligible candidates:
+locality, tools, context size, structured output, risk quality floors, cost
+budgets, health, and reviewer independence.
+
+Routing does not grant authority. The selected target receives only the tools,
+workspace scope, and approvals already permitted for that task. Disabled
+routing preserves the static provider/model path, while `shadow` mode records a
+counterfactual choice without making it actionable.
+
+Run the deterministic, provider-free demo:
+
+```bash
+python scripts/demo_adaptive_flock.py
+python scripts/demo_adaptive_flock.py --json
+```
+
+The demo uses Kestrel's real routing contracts and scoring logic to route a
+planner, local tool-capable executor, and independent reviewer. It makes no
+provider calls, executes no assignment, modifies no files, and performs no Git
+operations. See [the Adaptive Flock demo guide](docs/ADAPTIVE_FLOCK_DEMO.md)
+for the output contract, modes, and safe rollout path.
 
 ---
 
