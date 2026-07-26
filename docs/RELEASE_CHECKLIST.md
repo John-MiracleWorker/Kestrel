@@ -238,7 +238,7 @@ The tag workflow first proves that the exact tag SHA already has a successful `m
 the complete CI workflow. It then builds the wheel once and installs that identical downloaded
 wheel plus its hash-locked dependency payload on Linux x86_64, Apple-silicon macOS,
 and native Windows x86_64 with Python 3.11, 3.12, and 3.13. The macOS
-lanes use `macos-latest` (arm64); Intel macOS was dropped in v0.4.7 because the
+lanes use `macos-latest` (arm64); Intel macOS was dropped in v0.4.8 because the
 `cryptography` dependency no longer publishes Intel wheels. Every lane asserts
 `platform.machine()` against its declared architecture before installing the candidate. Every
 lane also asserts `importlib.metadata` version, imports Memvid, runs Kestrel doctor/chat from

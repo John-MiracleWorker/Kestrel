@@ -6,6 +6,13 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-07-26
+
+### Fixed
+
+- Wheel-smoke soak throughput floor given shared-runner headroom (1.0 → 0.75
+  runs/s) after v0.4.7's release run missed by 1.7% on runner noise (#309).
+
 ## [0.4.7] - 2026-07-26
 
 ### Fixed
@@ -285,7 +292,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.7...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.5...v0.4.7
 [0.4.6]: https://github.com/John-MiracleWorker/Kestrel/releases/tag/v0.4.6
 [0.4.5]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.4...v0.4.5
