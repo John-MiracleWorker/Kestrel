@@ -6,6 +6,24 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-07-26
+
+### Fixed
+
+- Recovery release for the burned `v0.4.10` tag — the third burned tag in a
+  row. `v0.4.10`'s tag-triggered release workflow published its GHCR images
+  and attestations successfully, but the GitHub Release step failed: under
+  immutable releases, `gh release create --draft` produces an *untagged*
+  release, and the workflow then queried `releases/tags/<tag>`, which 404s
+  on untagged drafts. Nothing for `v0.4.10` was ever fully published as a
+  GitHub Release or uploaded to PyPI (the leftover empty draft release was
+  deleted), and repository rulesets block tag deletion, so `v0.4.10` must be
+  treated as a burned tag. This `v0.4.11` release ships the same content plus
+  the query-by-`databaseId` immutable-draft fix (commit 9a3e778), and carries
+  forward the `v0.4.8` publish-gate fix (PR #312: the immutable-releases gate
+  is read via a PAT stored as `RELEASE_GUARD_TOKEN`) and the `v0.4.9`
+  GET-not-HEAD GHCR manifest existence check fix (commit 5126c16).
+
 ## [0.4.10] - 2026-07-26
 
 ### Fixed
@@ -324,7 +342,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.10...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.11...HEAD
+[0.4.11]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.10...v0.4.11
 [0.4.10]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.9...v0.4.10
 [0.4.9]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.7...v0.4.8
