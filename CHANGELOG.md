@@ -6,6 +6,15 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-07-25
+
+### Removed
+
+- Dropped the release workflow's `macos-15-intel` exact-wheel verification rows. The
+  `cryptography` dependency stopped shipping Intel-macOS wheels in 49.0.0, so pip cannot
+  resolve a binary distribution on that platform. Kestrel never claimed Intel-mac support
+  (docs and CI only cover arm64 macOS); the release gate now matches reality.
+
 ## [0.4.5] - 2026-07-25
 
 ### Fixed
@@ -266,7 +275,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.2...v0.4.3

@@ -612,7 +612,7 @@ jobs:
           retention-days: 1
 
   cross-platform:
-    name: Exact wheel on ${{ format('{0}{1}', matrix.os, matrix.os_suffix) }} ${{ matrix.machine }} / Python ${{ matrix.python }}
+    name: Exact wheel on ${{ matrix.os }} ${{ matrix.machine }} / Python ${{ matrix.python }}
     needs: build-release-candidate
     strategy:
       fail-fast: false
@@ -636,18 +636,6 @@ jobs:
           - os: macos-latest
             python: "3.13"
             machine: arm64
-          - os: macos-15
-            os_suffix: -intel
-            python: "3.11"
-            machine: x86_64
-          - os: macos-15
-            os_suffix: -intel
-            python: "3.12"
-            machine: x86_64
-          - os: macos-15
-            os_suffix: -intel
-            python: "3.13"
-            machine: x86_64
           - os: windows-latest
             python: "3.11"
             machine: AMD64
@@ -657,7 +645,7 @@ jobs:
           - os: windows-latest
             python: "3.13"
             machine: AMD64
-    runs-on: ${{ format('{0}{1}', matrix.os, matrix.os_suffix) }}
+    runs-on: ${{ matrix.os }}
     permissions:
       actions: read
       contents: read

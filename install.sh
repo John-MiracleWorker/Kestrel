@@ -85,7 +85,7 @@ Safe default runtime:
   backend=memvid, provider=mock, model=mock, high-risk tool flags disabled.
 
 Supported installer platforms:
-  macOS (Intel or Apple silicon) and Linux x86_64, including x86_64 Linux inside WSL.
+  macOS (Apple silicon) and Linux x86_64, including x86_64 Linux inside WSL.
   Native Windows is unsupported. Linux ARM64 users should use the release container image.
 EOF
 }
@@ -277,7 +277,15 @@ require_supported_platform() {
   local platform architecture
   platform="$(uname -s 2>/dev/null || true)"
   case "$platform" in
-    Darwin) return 0 ;;
+    Darwin)
+      architecture="$(uname -m 2>/dev/null || true)"
+      case "$architecture" in
+        arm64) return 0 ;;
+        *)
+          die "install.sh supports Apple-silicon macOS only (detected ${architecture:-unknown}). Intel macOS is unsupported because the cryptography dependency no longer publishes Intel wheels; use the published container image instead."
+          ;;
+      esac
+      ;;
     Linux)
       architecture="$(uname -m 2>/dev/null || true)"
       case "$architecture" in
