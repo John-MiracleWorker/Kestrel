@@ -69,7 +69,7 @@ python -m pip install "nested-memvid-agent[memvid,server,mcp,keyring]==0.4.8"
 
 The package command is a publication target until the exact tag workflow completes.
 
-For `v0.4.8` and later, download the complete payload and verify both its GitHub
+For `v0.4.5` and later, download the complete payload and verify both its GitHub
 provenance and its internal identity before installing it:
 
 ```bash
