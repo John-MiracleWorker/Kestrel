@@ -1069,7 +1069,7 @@ wheels = [
 
 [[package]]
 name = "nested-memvid-agent"
-version = "0.4.8"
+version = "0.4.9"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },

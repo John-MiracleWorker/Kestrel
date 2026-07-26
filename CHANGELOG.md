@@ -6,6 +6,20 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-07-26
+
+### Fixed
+
+- Recovery release for the burned `v0.4.8` tag. `v0.4.8` was tagged at a pre-fix
+  commit, and its tag-triggered release workflow failed at the publish gate with a
+  403 reading the repository's immutable-releases admin setting: the default
+  `GITHUB_TOKEN` cannot read admin settings. Nothing for `v0.4.8` was ever
+  published — no GitHub Release, no PyPI upload, no GHCR image — and repository
+  rulesets block tag deletion, so `v0.4.8` must be treated as a burned tag. This
+  `v0.4.9` release ships the same content plus the publish-gate workflow fix
+  (PR #312): the immutable-releases gate is now read via a PAT stored as
+  `RELEASE_GUARD_TOKEN`, and immutable releases are enabled on the repository.
+
 ## [0.4.8] - 2026-07-26
 
 ### Fixed
@@ -292,7 +306,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.8...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.9...HEAD
+[0.4.9]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.5...v0.4.7
 [0.4.6]: https://github.com/John-MiracleWorker/Kestrel/releases/tag/v0.4.6
