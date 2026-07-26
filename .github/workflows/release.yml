@@ -897,19 +897,23 @@ jobs:
             local reference="$1"
             local tag="${reference##*:}"
             local headers="$RUNNER_TEMP/kestrel-ghcr-${tag}.headers"
-            local body="$RUNNER_TEMP/kestrel-ghcr-${tag}.body"
             local status
             if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
               echo "unsafe OCI tag: $tag" >&2
               return 2
             fi
+            # Use GET, not HEAD. GHCR answers a HEAD manifest request with a
+            # content-length header but no body, so curl aborts with
+            # (18) "transfer closed with N bytes remaining" under set -e.
+            # GET returns the same status line and docker-content-digest
+            # header (the only two things consumed here) without the phantom
+            # body. Body is discarded to /dev/null.
             status="$(curl --silent --show-error \
               --proto '=https' \
               --tlsv1.2 \
               --config "$curl_config" \
-              --request HEAD \
               --dump-header "$headers" \
-              --output "$body" \
+              --output /dev/null \
               --write-out '%{http_code}' \
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
               "https://ghcr.io/v2/${registry_path}/manifests/${tag}")"
@@ -1200,14 +1204,15 @@ jobs:
           rm -f "$auth_file" "$token_response"
           version_ref="$IMAGE_NAME:$GITHUB_REF_NAME"
           headers="$RUNNER_TEMP/kestrel-version-ref.headers"
-          body="$RUNNER_TEMP/kestrel-version-ref.body"
+          # GET, not HEAD: GHCR answers HEAD with content-length but no body,
+          # so curl aborts (18) "transfer closed with N bytes remaining".
+          # GET returns the same status + docker-content-digest; body to /dev/null.
           status="$(curl --silent --show-error \
             --proto '=https' \
             --tlsv1.2 \
             --config "$curl_config" \
-            --request HEAD \
             --dump-header "$headers" \
-            --output "$body" \
+            --output /dev/null \
             --write-out '%{http_code}' \
             -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
             "https://ghcr.io/v2/${registry_path}/manifests/${GITHUB_REF_NAME}")"
@@ -1230,9 +1235,8 @@ jobs:
                   --proto '=https' \
                   --tlsv1.2 \
                   --config "$curl_config" \
-                  --request HEAD \
                   --dump-header "$headers" \
-                  --output "$body" \
+                  --output /dev/null \
                   --write-out '%{http_code}' \
                   -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
                   "https://ghcr.io/v2/${registry_path}/manifests/${GITHUB_REF_NAME}")"
