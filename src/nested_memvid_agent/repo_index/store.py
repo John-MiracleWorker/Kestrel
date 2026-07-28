@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -26,8 +28,10 @@ from .models import (
     TestRelationshipRecord,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _APPLICATION_ID = 0x4B535452
+_GENERATION_HISTORY_LIMIT = 64
+_LOCK_SECRET_PREFIX = b"KESTREL-REPO-INDEX-LOCK-V1\n"
 StoreRecordT = TypeVar("StoreRecordT")
 
 
@@ -87,6 +91,9 @@ class _GenerationState:
     generation_id: str
     sequence: int
     binding: _FileBinding
+    lineage_id: str | None
+    authorization_tag: str | None
+    previous_generation_id: str | None
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,7 @@ class RepoIndexStore:
         self._parent_bindings: tuple[_PathBinding, ...] = ()
         self._generation: _GenerationState | None = None
         self._lock_binding: _FileBinding | None = None
+        self._lock_secret: bytes | None = None
         self._thread_lock = threading.RLock()
 
     def initialize(
@@ -124,11 +132,21 @@ class RepoIndexStore:
         project_id: str,
         root_identity: RootIdentity,
         parser_versions: dict[str, str],
+        allow_migration: bool = True,
     ) -> None:
-        self._prepare_sidecar_parent()
+        self._prepare_sidecar_parent(allow_create=allow_migration)
+        if self._initialize_current_read_only(
+            project_id=project_id,
+            allow_lock_creation=allow_migration,
+        ):
+            return
+        if not allow_migration:
+            raise RepositoryIndexError(
+                "a current repository index is required; creation and migration are disabled"
+            )
         with self._connection(write=True, integrity_check=True) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, 4, SCHEMA_VERSION}:
                 raise RepositoryIndexError(f"unsupported repository index schema version {version}")
             if version == 0:
                 self._create_schema(connection)
@@ -136,11 +154,16 @@ class RepoIndexStore:
                 self._migrate_schema_v1(connection)
                 self._migrate_schema_v2(connection)
                 self._migrate_schema_v3(connection)
+                self._migrate_schema_v4(connection)
             elif version == 2:
                 self._migrate_schema_v2(connection)
                 self._migrate_schema_v3(connection)
+                self._migrate_schema_v4(connection)
             elif version == 3:
                 self._migrate_schema_v3(connection)
+                self._migrate_schema_v4(connection)
+            elif version == 4:
+                self._migrate_schema_v4(connection)
             application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
             if application_id != _APPLICATION_ID:
                 raise RepositoryIndexError("repository index database identity marker is invalid")
@@ -166,6 +189,98 @@ class RepoIndexStore:
                 )
             elif str(existing["project_id"]) != project_id:
                 raise RepositoryIndexError("repository index belongs to a different project")
+
+    def _initialize_current_read_only(
+        self,
+        *,
+        project_id: str,
+        allow_lock_creation: bool,
+    ) -> bool:
+        """Bind a current sidecar without copying or rewriting its database image."""
+        with self._locked_parent(allow_create=allow_lock_creation) as parent_descriptor:
+            parent_snapshot = self._directory_snapshot(parent_descriptor)
+            binding = self._relative_file_binding(
+                self.path.name,
+                parent_descriptor=parent_descriptor,
+                allow_missing=True,
+            )
+            if binding is None:
+                return False
+            descriptor, opened_binding = self._open_database_descriptor(parent_descriptor)
+            connection: sqlite3.Connection | None = None
+            try:
+                if opened_binding != binding:
+                    raise RepositoryIndexError(
+                        "repository index database changed during initialization"
+                    )
+                connection = self._connect_pinned_read(descriptor)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA foreign_keys = ON")
+                self._verify_snapshot_unchanged(
+                    parent_descriptor,
+                    parent_snapshot=parent_snapshot,
+                    database_binding=binding,
+                    operation="initialization",
+                )
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if version == SCHEMA_VERSION:
+                    self._validate_and_bind_generation(
+                        connection,
+                        binding=binding,
+                        parent_descriptor=parent_descriptor,
+                    )
+                    self._assert_project_id(connection, project_id=project_id)
+                    self._verify_snapshot_unchanged(
+                        parent_descriptor,
+                        parent_snapshot=parent_snapshot,
+                        database_binding=binding,
+                        operation="initialization",
+                    )
+                    if _file_binding(os.fstat(descriptor)) != binding:
+                        raise RepositoryIndexError(
+                            "repository index database changed during initialization"
+                        )
+                    return True
+                self._validate_legacy_admission(
+                    connection,
+                    version=version,
+                    binding=binding,
+                    parent_descriptor=parent_descriptor,
+                )
+                self._verify_snapshot_unchanged(
+                    parent_descriptor,
+                    parent_snapshot=parent_snapshot,
+                    database_binding=binding,
+                    operation="initialization",
+                )
+                if _file_binding(os.fstat(descriptor)) != binding:
+                    raise RepositoryIndexError(
+                        "repository index database changed during initialization"
+                    )
+                return False
+            except sqlite3.DatabaseError as exc:
+                raise RepositoryIndexError(
+                    "repository index database could not be inspected"
+                ) from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+                os.close(descriptor)
+
+    def _assert_project_id(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+    ) -> None:
+        existing = connection.execute(
+            "SELECT project_id FROM index_metadata WHERE singleton = 1"
+        ).fetchone()
+        if existing is None:
+            raise RepositoryIndexError("repository index metadata is missing")
+        if str(existing["project_id"]) != project_id:
+            raise RepositoryIndexError("repository index belongs to a different project")
 
     def metadata(self) -> StoredMetadata:
         with self._connection() as connection:
@@ -678,6 +793,14 @@ class RepoIndexStore:
                 )
             );
 
+            CREATE TABLE index_generation_checkpoint (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                lineage_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence > 0),
+                generation_id TEXT NOT NULL,
+                authorization_tag TEXT NOT NULL
+            );
+
             CREATE INDEX symbols_name_idx ON symbols(name);
             CREATE INDEX imports_module_idx ON imports(module);
             CREATE INDEX references_name_nocase_idx
@@ -685,6 +808,55 @@ class RepoIndexStore:
             CREATE INDEX files_test_idx ON files(is_test);
             """
         )
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+
+    def _migrate_schema_v4(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE index_generation_checkpoint (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                lineage_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence > 0),
+                generation_id TEXT NOT NULL,
+                authorization_tag TEXT NOT NULL
+            )
+            """
+        )
+        row = connection.execute(
+            """
+            SELECT sequence, generation_id, previous_generation_id
+            FROM index_generations
+            ORDER BY sequence DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is not None:
+            sequence = int(row["sequence"])
+            generation_id = str(row["generation_id"])
+            previous_generation_id = _optional_str(row["previous_generation_id"])
+            self._validate_generation_row_identifiers(
+                generation_id=generation_id,
+                previous_generation_id=previous_generation_id,
+            )
+            lineage_id = secrets.token_hex(16)
+            authorization_tag = self._generation_authorization_tag(
+                connection,
+                lineage_id=lineage_id,
+                sequence=sequence,
+                generation_id=generation_id,
+                previous_generation_id=previous_generation_id,
+            )
+            connection.execute(
+                """
+                INSERT INTO index_generation_checkpoint (
+                    singleton, lineage_id, sequence, generation_id,
+                    authorization_tag
+                ) VALUES (1, ?, ?, ?, ?)
+                """,
+                (lineage_id, sequence, generation_id, authorization_tag),
+            )
+            self._compact_generation_history(connection, current_sequence=sequence)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
 
@@ -721,7 +893,7 @@ class RepoIndexStore:
             )
             """
         )
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 4")
         connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
 
     def _rebuild_test_relationships(self, connection: sqlite3.Connection) -> None:
@@ -741,7 +913,7 @@ class RepoIndexStore:
             """
         )
 
-    def _prepare_sidecar_parent(self) -> None:
+    def _prepare_sidecar_parent(self, *, allow_create: bool) -> None:
         if self._custom_parent:
             if not self.path.parent.exists():
                 raise RepositoryIndexError(
@@ -759,6 +931,8 @@ class RepoIndexStore:
                         label="repository index sidecar parent",
                     )
                     continue
+                if not allow_create:
+                    raise RepositoryIndexError("repository index sidecar parent does not exist")
                 try:
                     directory.mkdir(mode=0o700)
                 except OSError as exc:
@@ -822,23 +996,32 @@ class RepoIndexStore:
                 raise RepositoryIndexError("repository index sidecar parent identity changed")
 
     @contextmanager
-    def _locked_parent(self) -> Iterator[int | None]:
+    def _locked_parent(self, *, allow_create: bool = True) -> Iterator[int | None]:
         """Pin the sidecar parent and serialize snapshot publication."""
         with self._thread_lock:
             self._verify_parent_bindings()
             parent_descriptor = self._open_parent_descriptor()
             lock_descriptor: int | None = None
             try:
-                lock_descriptor = self._open_relative(
-                    f".{self.path.name}.lock",
-                    os.O_RDWR | os.O_CREAT | _no_follow_flag(),
-                    mode=0o600,
-                    parent_descriptor=parent_descriptor,
-                )
+                try:
+                    lock_descriptor = self._open_relative(
+                        f".{self.path.name}.lock",
+                        (
+                            os.O_RDWR | os.O_CREAT | _no_follow_flag()
+                            if allow_create
+                            else os.O_RDONLY | _no_follow_flag()
+                        ),
+                        mode=0o600,
+                        parent_descriptor=parent_descriptor,
+                    )
+                except OSError as exc:
+                    raise RepositoryIndexError(
+                        "repository index lock is missing or inaccessible"
+                    ) from exc
                 lock_info = os.fstat(lock_descriptor)
                 if not stat.S_ISREG(lock_info.st_mode):
                     raise RepositoryIndexError("repository index lock must be a regular file")
-                if os.name == "posix":
+                if os.name == "posix" and allow_create:
                     os.fchmod(lock_descriptor, 0o600)
                     lock_info = os.fstat(lock_descriptor)
                 observed_lock = _file_binding(lock_info)
@@ -852,7 +1035,18 @@ class RepoIndexStore:
                 if os.name == "posix":
                     import fcntl
 
-                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                    fcntl.flock(
+                        lock_descriptor,
+                        fcntl.LOCK_EX if allow_create else fcntl.LOCK_SH,
+                    )
+                observed_secret = self._load_or_create_lock_secret(
+                    lock_descriptor,
+                    allow_create=allow_create,
+                )
+                if self._lock_secret is None:
+                    self._lock_secret = observed_secret
+                elif not hmac.compare_digest(self._lock_secret, observed_secret):
+                    raise RepositoryIndexError("repository index lock authorization changed")
                 self._verify_parent_descriptor(parent_descriptor)
                 yield parent_descriptor
             finally:
@@ -864,6 +1058,39 @@ class RepoIndexStore:
                     os.close(lock_descriptor)
                 if parent_descriptor is not None:
                     os.close(parent_descriptor)
+
+    def _load_or_create_lock_secret(
+        self,
+        descriptor: int,
+        *,
+        allow_create: bool,
+    ) -> bytes:
+        info = os.fstat(descriptor)
+        if info.st_size == 0:
+            if not allow_create:
+                raise RepositoryIndexError("repository index lock authorization is missing")
+            secret = secrets.token_bytes(32)
+            payload = _LOCK_SECRET_PREFIX + secret.hex().encode("ascii") + b"\n"
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            return secret
+        if info.st_size > 256:
+            raise RepositoryIndexError("repository index lock authorization is invalid")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        payload = os.read(descriptor, int(info.st_size))
+        expected_size = len(_LOCK_SECRET_PREFIX) + 65
+        if len(payload) != expected_size or not payload.startswith(_LOCK_SECRET_PREFIX):
+            raise RepositoryIndexError("repository index lock authorization is invalid")
+        encoded = payload[len(_LOCK_SECRET_PREFIX) : -1]
+        try:
+            secret = bytes.fromhex(encoded.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RepositoryIndexError("repository index lock authorization is invalid") from exc
+        if len(secret) != 32:
+            raise RepositoryIndexError("repository index lock authorization is invalid")
+        return secret
 
     def _open_parent_descriptor(self) -> int | None:
         if not hasattr(os, "O_DIRECTORY"):
@@ -1004,33 +1231,121 @@ class RepoIndexStore:
         connection: sqlite3.Connection,
         *,
         binding: _FileBinding,
-        allow_missing: bool,
+        allow_empty: bool = False,
     ) -> _GenerationState | None:
+        try:
+            checkpoint = connection.execute(
+                """
+                SELECT lineage_id, sequence, generation_id, authorization_tag
+                FROM index_generation_checkpoint
+                WHERE singleton = 1
+                """
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise RepositoryIndexError("repository index generation checkpoint is missing") from exc
+        if checkpoint is None:
+            if allow_empty:
+                return None
+            raise RepositoryIndexError("repository index generation checkpoint is empty")
+        lineage_id = str(checkpoint["lineage_id"])
+        sequence = int(checkpoint["sequence"])
+        checkpoint_generation_id = str(checkpoint["generation_id"])
+        authorization_tag = str(checkpoint["authorization_tag"])
+        if not _valid_generation_id(lineage_id):
+            raise RepositoryIndexError("repository index generation lineage identifier is invalid")
+        if not _valid_generation_id(checkpoint_generation_id):
+            raise RepositoryIndexError("repository index generation identifier is invalid")
+        if not _valid_authorization_tag(authorization_tag):
+            raise RepositoryIndexError(
+                "repository index generation checkpoint authorization is invalid"
+            )
+        row = connection.execute(
+            """
+            SELECT generation_id, previous_generation_id
+            FROM index_generations
+            WHERE sequence = ?
+            """,
+            (sequence,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryIndexError(
+                "repository index generation ledger does not contain its checkpoint"
+            )
+        generation_id = str(row["generation_id"])
+        previous_generation_id = _optional_str(row["previous_generation_id"])
+        self._validate_generation_row_identifiers(
+            generation_id=generation_id,
+            previous_generation_id=previous_generation_id,
+        )
+        if generation_id != checkpoint_generation_id:
+            raise RepositoryIndexError(
+                "repository index generation checkpoint does not match its ledger"
+            )
+        expected_tag = self._generation_authorization_tag(
+            connection,
+            lineage_id=lineage_id,
+            sequence=sequence,
+            generation_id=generation_id,
+            previous_generation_id=previous_generation_id,
+        )
+        if not hmac.compare_digest(authorization_tag, expected_tag):
+            raise RepositoryIndexError(
+                "repository index generation checkpoint authorization is invalid"
+            )
+        observed = _GenerationState(
+            generation_id=generation_id,
+            sequence=sequence,
+            binding=binding,
+            lineage_id=lineage_id,
+            authorization_tag=authorization_tag,
+            previous_generation_id=previous_generation_id,
+        )
+        self._validate_recent_generation_history(
+            connection,
+            current=observed,
+            enforce_limit=True,
+        )
+        return observed
+
+    def _read_legacy_generation_state(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        binding: _FileBinding,
+    ) -> _GenerationState:
         try:
             row = connection.execute(
                 """
-                SELECT sequence, generation_id
+                SELECT sequence, generation_id, previous_generation_id
                 FROM index_generations
                 ORDER BY sequence DESC
                 LIMIT 1
                 """
             ).fetchone()
         except sqlite3.OperationalError as exc:
-            if allow_missing and "no such table" in str(exc).casefold():
-                return None
             raise RepositoryIndexError("repository index generation ledger is missing") from exc
         if row is None:
-            if allow_missing:
-                return None
             raise RepositoryIndexError("repository index generation ledger is empty")
         generation_id = str(row["generation_id"])
-        if not _valid_generation_id(generation_id):
-            raise RepositoryIndexError("repository index generation identifier is invalid")
-        return _GenerationState(
+        previous_generation_id = _optional_str(row["previous_generation_id"])
+        self._validate_generation_row_identifiers(
+            generation_id=generation_id,
+            previous_generation_id=previous_generation_id,
+        )
+        observed = _GenerationState(
             generation_id=generation_id,
             sequence=int(row["sequence"]),
             binding=binding,
+            lineage_id=None,
+            authorization_tag=None,
+            previous_generation_id=previous_generation_id,
         )
+        self._validate_recent_generation_history(
+            connection,
+            current=observed,
+            enforce_limit=False,
+        )
+        return observed
 
     def _validate_and_bind_generation(
         self,
@@ -1038,38 +1353,115 @@ class RepoIndexStore:
         *,
         binding: _FileBinding,
         parent_descriptor: int | None,
-        allow_legacy: bool,
-    ) -> _GenerationState | None:
+    ) -> _GenerationState:
         application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if not allow_legacy and (application_id != _APPLICATION_ID or version != SCHEMA_VERSION):
+        if application_id != _APPLICATION_ID or version != SCHEMA_VERSION:
             raise RepositoryIndexError("repository index database identity marker is invalid")
         observed = self._read_generation_state(
             connection,
             binding=binding,
-            allow_missing=allow_legacy,
         )
-        expected = self._generation
         if observed is None:
-            if expected is not None:
-                raise RepositoryIndexError("repository index database identity changed")
-            return None
+            raise RepositoryIndexError("repository index generation checkpoint is empty")
         self._validate_generation_manifest(
             observed,
             parent_descriptor=parent_descriptor,
-            allow_missing=(allow_legacy and version < SCHEMA_VERSION and self._generation is None),
+            allow_missing=False,
         )
+        self._bind_observed_generation(connection, observed=observed)
+        return observed
+
+    def _validate_write_source(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        binding: _FileBinding,
+        parent_descriptor: int | None,
+    ) -> _GenerationState | None:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version == SCHEMA_VERSION:
+            return self._validate_and_bind_generation(
+                connection,
+                binding=binding,
+                parent_descriptor=parent_descriptor,
+            )
+        return self._validate_legacy_admission(
+            connection,
+            version=version,
+            binding=binding,
+            parent_descriptor=parent_descriptor,
+        )
+
+    def _validate_legacy_admission(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        version: int,
+        binding: _FileBinding,
+        parent_descriptor: int | None,
+    ) -> _GenerationState | None:
+        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        if version == 4:
+            if application_id != _APPLICATION_ID:
+                raise RepositoryIndexError(
+                    "legacy repository index database identity marker is invalid"
+                )
+            if self._table_exists(connection, "index_generation_checkpoint"):
+                raise RepositoryIndexError(
+                    "legacy repository index contains current generation artifacts"
+                )
+            observed = self._read_legacy_generation_state(
+                connection,
+                binding=binding,
+            )
+            self._validate_generation_manifest(
+                observed,
+                parent_descriptor=parent_descriptor,
+                allow_missing=False,
+            )
+            self._bind_observed_generation(connection, observed=observed)
+            return observed
+        if version not in {0, 1, 2, 3}:
+            raise RepositoryIndexError(f"unsupported repository index schema version {version}")
+        if application_id not in {0, _APPLICATION_ID}:
+            raise RepositoryIndexError(
+                "legacy repository index database identity marker is invalid"
+            )
+        if (
+            self._table_exists(connection, "index_generations")
+            or self._table_exists(connection, "index_generation_checkpoint")
+            or self._generation_manifest_names(parent_descriptor)
+        ):
+            raise RepositoryIndexError(
+                "legacy repository index contains durable generation artifacts"
+            )
+        if self._generation is not None:
+            raise RepositoryIndexError("repository index database identity changed")
+        return None
+
+    def _bind_observed_generation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        observed: _GenerationState,
+    ) -> None:
+        expected = self._generation
         if expected is None:
             self._generation = observed
-            return observed
-        if binding == expected.binding:
+            return
+        if observed.binding == expected.binding:
             if (
                 observed.generation_id != expected.generation_id
                 or observed.sequence != expected.sequence
+                or observed.lineage_id != expected.lineage_id
             ):
                 raise RepositoryIndexError("repository index generation changed in place")
-            return expected
-        if binding.device == expected.binding.device and binding.inode == expected.binding.inode:
+            return
+        if (
+            observed.binding.device == expected.binding.device
+            and observed.binding.inode == expected.binding.inode
+        ):
             raise RepositoryIndexError("repository index generation changed in place")
         self._validate_generation_lineage(
             connection,
@@ -1077,7 +1469,6 @@ class RepoIndexStore:
             observed=observed,
         )
         self._generation = observed
-        return observed
 
     def _validate_generation_manifest(
         self,
@@ -1110,49 +1501,180 @@ class RepoIndexStore:
         expected: _GenerationState,
         observed: _GenerationState,
     ) -> None:
-        if observed.sequence <= expected.sequence:
+        if (
+            observed.sequence <= expected.sequence
+            or expected.lineage_id is None
+            or observed.lineage_id is None
+            or observed.lineage_id != expected.lineage_id
+        ):
             raise RepositoryIndexError("repository index database identity changed")
+        rows = self._recent_generation_rows(connection, enforce_limit=True)
+        if not rows:
+            raise RepositoryIndexError("repository index generation ledger is empty")
+        oldest_sequence = int(rows[0]["sequence"])
+        if expected.sequence < oldest_sequence:
+            return
+        expected_row = next(
+            (row for row in rows if int(row["sequence"]) == expected.sequence),
+            None,
+        )
+        if expected_row is None or str(expected_row["generation_id"]) != expected.generation_id:
+            raise RepositoryIndexError("repository index database identity changed")
+
+    def _validate_recent_generation_history(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        current: _GenerationState,
+        enforce_limit: bool,
+    ) -> None:
+        rows = self._recent_generation_rows(
+            connection,
+            enforce_limit=enforce_limit,
+        )
+        if not rows:
+            raise RepositoryIndexError("repository index generation ledger is empty")
+        previous_id: str | None = None
+        previous_sequence: int | None = None
+        for row in rows:
+            sequence = int(row["sequence"])
+            generation_id = str(row["generation_id"])
+            previous_generation_id = _optional_str(row["previous_generation_id"])
+            self._validate_generation_row_identifiers(
+                generation_id=generation_id,
+                previous_generation_id=previous_generation_id,
+            )
+            if sequence == 1:
+                if previous_generation_id is not None:
+                    raise RepositoryIndexError("repository index generation lineage is invalid")
+            elif previous_generation_id is None:
+                raise RepositoryIndexError("repository index generation lineage is invalid")
+            if previous_sequence is not None:
+                if sequence != previous_sequence + 1:
+                    raise RepositoryIndexError(
+                        "repository index generation lineage is not contiguous"
+                    )
+                if previous_generation_id != previous_id:
+                    raise RepositoryIndexError("repository index generation lineage is invalid")
+            previous_sequence = sequence
+            previous_id = generation_id
+        if previous_sequence != current.sequence or previous_id != current.generation_id:
+            raise RepositoryIndexError("repository index generation lineage does not reach current")
+
+    def _recent_generation_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        enforce_limit: bool,
+    ) -> list[sqlite3.Row]:
+        limit = _generation_history_limit()
         rows = connection.execute(
             """
             SELECT sequence, generation_id, previous_generation_id
             FROM index_generations
-            WHERE sequence BETWEEN ? AND ?
-            ORDER BY sequence
+            ORDER BY sequence DESC
+            LIMIT ?
             """,
-            (expected.sequence, observed.sequence),
+            (limit + 1,),
         ).fetchall()
-        if len(rows) != observed.sequence - expected.sequence + 1:
-            raise RepositoryIndexError("repository index generation lineage is incomplete")
-        previous_id: str | None = None
-        for position, row in enumerate(rows):
-            sequence = int(row["sequence"])
-            generation_id = str(row["generation_id"])
-            previous_generation_id = _optional_str(row["previous_generation_id"])
-            if not _valid_generation_id(generation_id) or (
-                previous_generation_id is not None
-                and not _valid_generation_id(previous_generation_id)
-            ):
+        if len(rows) > limit:
+            if enforce_limit:
                 raise RepositoryIndexError(
-                    "repository index generation lineage identifier is invalid"
+                    "repository index generation ledger exceeds its bounded history"
                 )
-            if sequence != expected.sequence + position:
-                raise RepositoryIndexError("repository index generation lineage is not contiguous")
-            if position == 0:
-                if generation_id != expected.generation_id:
-                    raise RepositoryIndexError("repository index database identity changed")
-            elif previous_generation_id != previous_id:
-                raise RepositoryIndexError("repository index generation lineage is invalid")
-            previous_id = generation_id
-        if previous_id != observed.generation_id:
-            raise RepositoryIndexError("repository index generation lineage does not reach current")
+            rows = rows[:limit]
+        rows.reverse()
+        return rows
+
+    def _validate_generation_row_identifiers(
+        self,
+        *,
+        generation_id: str,
+        previous_generation_id: str | None,
+    ) -> None:
+        if not _valid_generation_id(generation_id):
+            raise RepositoryIndexError("repository index generation identifier is invalid")
+        if previous_generation_id is not None and not _valid_generation_id(previous_generation_id):
+            raise RepositoryIndexError("repository index generation lineage identifier is invalid")
+
+    def _generation_authorization_tag(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        lineage_id: str,
+        sequence: int,
+        generation_id: str,
+        previous_generation_id: str | None,
+    ) -> str:
+        secret = self._lock_secret
+        if secret is None:
+            raise RepositoryIndexError("repository index lock authorization is unavailable")
+        row = connection.execute(
+            """
+            SELECT project_id, root_path, root_device, root_inode
+            FROM index_metadata
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        if row is None:
+            raise RepositoryIndexError("repository index metadata is missing")
+        payload = "\0".join(
+            (
+                "kestrel-repo-index-generation-v1",
+                str(row["project_id"]),
+                str(row["root_path"]),
+                str(int(row["root_device"])),
+                str(int(row["root_inode"])),
+                lineage_id,
+                str(sequence),
+                generation_id,
+                previous_generation_id or "",
+            )
+        ).encode("utf-8")
+        return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+    def _table_exists(self, connection: sqlite3.Connection, table: str) -> bool:
+        return (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table' AND name = ?
+                LIMIT 1
+                """,
+                (table,),
+            ).fetchone()
+            is not None
+        )
+
+    def _generation_manifest_names(
+        self,
+        parent_descriptor: int | None,
+    ) -> tuple[str, ...]:
+        prefix = f".{self.path.name}.generation-"
+        try:
+            names = (
+                os.listdir(parent_descriptor)
+                if parent_descriptor is not None
+                else os.listdir(self.path.parent)
+            )
+        except OSError as exc:
+            raise RepositoryIndexError(
+                "repository index generation artifacts could not be inspected"
+            ) from exc
+        return tuple(sorted(name for name in names if name.startswith(prefix)))
 
     def _append_generation(
         self,
         connection: sqlite3.Connection,
         previous: _GenerationState | None,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, str, str, str | None]:
         generation_id = secrets.token_hex(16)
         sequence = 1 if previous is None else previous.sequence + 1
+        lineage_id = secrets.token_hex(16) if previous is None else previous.lineage_id
+        if lineage_id is None:
+            raise RepositoryIndexError("repository index generation lineage is unavailable")
+        previous_generation_id = None if previous is None else previous.generation_id
         connection.execute(
             """
             INSERT INTO index_generations (
@@ -1162,10 +1684,53 @@ class RepoIndexStore:
             (
                 sequence,
                 generation_id,
-                None if previous is None else previous.generation_id,
+                previous_generation_id,
             ),
         )
-        return generation_id, sequence
+        authorization_tag = self._generation_authorization_tag(
+            connection,
+            lineage_id=lineage_id,
+            sequence=sequence,
+            generation_id=generation_id,
+            previous_generation_id=previous_generation_id,
+        )
+        connection.execute(
+            """
+            INSERT INTO index_generation_checkpoint (
+                singleton, lineage_id, sequence, generation_id,
+                authorization_tag
+            ) VALUES (1, ?, ?, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+                lineage_id = excluded.lineage_id,
+                sequence = excluded.sequence,
+                generation_id = excluded.generation_id,
+                authorization_tag = excluded.authorization_tag
+            """,
+            (lineage_id, sequence, generation_id, authorization_tag),
+        )
+        self._compact_generation_history(
+            connection,
+            current_sequence=sequence,
+        )
+        return (
+            generation_id,
+            sequence,
+            lineage_id,
+            authorization_tag,
+            previous_generation_id,
+        )
+
+    def _compact_generation_history(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        current_sequence: int,
+    ) -> None:
+        first_retained = max(1, current_sequence - _generation_history_limit() + 1)
+        connection.execute(
+            "DELETE FROM index_generations WHERE sequence < ?",
+            (first_retained,),
+        )
 
     def _publish_database(
         self,
@@ -1388,7 +1953,7 @@ class RepoIndexStore:
 
     @contextmanager
     def _read_connection(self) -> Iterator[sqlite3.Connection]:
-        with self._locked_parent() as parent_descriptor:
+        with self._locked_parent(allow_create=False) as parent_descriptor:
             parent_snapshot = self._directory_snapshot(parent_descriptor)
             descriptor, database_binding = self._open_database_descriptor(parent_descriptor)
             connection: sqlite3.Connection | None = None
@@ -1407,7 +1972,6 @@ class RepoIndexStore:
                     connection,
                     binding=database_binding,
                     parent_descriptor=parent_descriptor,
-                    allow_legacy=False,
                 )
                 yield connection
                 self._verify_snapshot_unchanged(
@@ -1453,11 +2017,10 @@ class RepoIndexStore:
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA foreign_keys = ON")
                 current_generation = (
-                    self._validate_and_bind_generation(
+                    self._validate_write_source(
                         connection,
                         binding=database_binding,
                         parent_descriptor=parent_descriptor,
-                        allow_legacy=integrity_check,
                     )
                     if database_binding is not None
                     else None
@@ -1478,24 +2041,40 @@ class RepoIndexStore:
                 )
                 serialized = connection.serialize()
                 if database_binding is None or current_generation is None or serialized != payload:
-                    with connection:
-                        generation_id, sequence = self._append_generation(
+                    append_previous = (
+                        self._read_generation_state(
                             connection,
-                            current_generation,
+                            binding=database_binding,
+                            allow_empty=True,
+                        )
+                        if database_binding is not None
+                        else None
+                    )
+                    with connection:
+                        (
+                            generation_id,
+                            sequence,
+                            lineage_id,
+                            authorization_tag,
+                            previous_generation_id,
+                        ) = self._append_generation(
+                            connection,
+                            append_previous,
                         )
                     published_binding = self._publish_database(
                         parent_descriptor,
                         payload=connection.serialize(),
                         expected_binding=database_binding,
                         generation_id=generation_id,
-                        previous_generation_id=(
-                            None if current_generation is None else current_generation.generation_id
-                        ),
+                        previous_generation_id=previous_generation_id,
                     )
                     self._generation = _GenerationState(
                         generation_id=generation_id,
                         sequence=sequence,
                         binding=published_binding,
+                        lineage_id=lineage_id,
+                        authorization_tag=authorization_tag,
+                        previous_generation_id=previous_generation_id,
                     )
             finally:
                 connection.close()
@@ -1550,6 +2129,26 @@ def _no_follow_flag() -> int:
 
 def _valid_generation_id(value: str) -> bool:
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
+
+
+def _valid_authorization_tag(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _generation_history_limit() -> int:
+    if _GENERATION_HISTORY_LIMIT < 2:
+        raise RepositoryIndexError("repository index generation history limit must be at least two")
+    return _GENERATION_HISTORY_LIMIT
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(descriptor, view[written:])
+        if count == 0:
+            raise RepositoryIndexError("repository index snapshot write made no progress")
+        written += count
 
 
 def _absolute_components(path: Path) -> tuple[Path, ...]:

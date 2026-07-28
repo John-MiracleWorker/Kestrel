@@ -71,7 +71,7 @@ def test_build_records_identity_content_and_multilanguage_relationships(tmp_path
     assert status.project_id == "project-1"
     assert status.repository_root == repository.resolve()
     assert status.aggregate_digest == report.aggregate_digest
-    assert status.schema_version == 4
+    assert status.schema_version == 5
     assert status.parser_versions["python"] == "ast-v1"
     assert status.git_head is None
     assert status.git_tree is None
@@ -264,13 +264,17 @@ def test_schema_v1_sidecar_migrates_and_forces_digest_revalidation(tmp_path: Pat
     with sqlite3.connect(index.index_path) as connection:
         connection.execute("ALTER TABLE files DROP COLUMN device")
         connection.execute("ALTER TABLE files DROP COLUMN inode")
+        connection.execute("DROP TABLE index_generation_checkpoint")
+        connection.execute("DROP TABLE index_generations")
         connection.execute("PRAGMA user_version = 1")
         connection.execute("PRAGMA application_id = 0")
+    for artifact in index.index_path.parent.glob(f".{index.index_path.name}.generation-*"):
+        artifact.unlink()
 
     reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
     rebuilt = reopened.rebuild()
 
-    assert reopened.status().schema_version == 4
+    assert reopened.status().schema_version == 5
     assert rebuilt.changed_files == 10
     assert rebuilt.reused_files == 0
 
@@ -418,6 +422,68 @@ def test_durable_generation_manifest_rejects_replacement_after_restart(
         RepositoryIndex(project_id="project-1", repository_root=repository)
 
 
+def test_schema_v4_with_missing_generation_ledger_cannot_be_readmitted(
+    tmp_path: Path,
+) -> None:
+    """A forged current-format sidecar must not be republished as fresh legacy."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        connection.execute("PRAGMA user_version = 4")
+        connection.execute("DROP TABLE IF EXISTS index_generation_checkpoint")
+        connection.execute("DELETE FROM index_generations")
+        connection.execute(
+            """
+            UPDATE index_metadata
+            SET aggregate_digest = 'forged', project_id = 'project-1'
+            WHERE singleton = 1
+            """
+        )
+
+    with pytest.raises(RepositoryIndexError, match="generation ledger"):
+        RepositoryIndex(project_id="project-1", repository_root=repository)
+
+
+def test_schema_v4_with_durable_generation_migrates_to_checkpoint(tmp_path: Path) -> None:
+    """A genuine v4 sidecar remains eligible for the one-time v5 migration."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        connection.execute("DROP TABLE index_generation_checkpoint")
+        connection.execute("PRAGMA user_version = 4")
+
+    reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
+
+    assert reopened.status().schema_version == 5
+    with sqlite3.connect(reopened.index_path) as connection:
+        checkpoint = connection.execute(
+            """
+            SELECT lineage_id, sequence, generation_id, authorization_tag
+            FROM index_generation_checkpoint
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    assert checkpoint is not None
+    assert len(str(checkpoint[0])) == 32
+    assert int(checkpoint[1]) > 0
+    assert len(str(checkpoint[2])) == 32
+    assert len(str(checkpoint[3])) == 64
+
+
+def test_schema_downgrade_with_generation_manifest_fails_closed(tmp_path: Path) -> None:
+    """Durable generation artifacts make a user-version downgrade ineligible."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        connection.execute("PRAGMA user_version = 3")
+
+    with pytest.raises(RepositoryIndexError, match="legacy"):
+        RepositoryIndex(project_id="project-1", repository_root=repository)
+
+
 def test_generation_identifier_cannot_escape_the_sidecar_parent(tmp_path: Path) -> None:
     """Generation-ledger text must never become an unchecked relative path."""
     repository = _copy_fixture(tmp_path)
@@ -449,6 +515,50 @@ def test_reopening_an_unchanged_index_preserves_the_bound_database_inode(
 
     assert first.index_path.stat().st_ino == inode_before
     assert first.status().project_id == "project-1"
+
+
+def test_create_false_opens_only_an_existing_current_sidecar(tmp_path: Path) -> None:
+    """Read-only consumers must never create or migrate repository indexes."""
+    repository = _copy_fixture(tmp_path)
+    missing_path = tmp_path / "missing.sqlite"
+
+    with pytest.raises(RepositoryIndexError, match="lock|current repository index"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            index_path=missing_path,
+            create=False,
+        )
+    assert not missing_path.exists()
+    assert not (tmp_path / ".missing.sqlite.lock").exists()
+
+    built = RepositoryIndex(project_id="project-1", repository_root=repository)
+    built.rebuild()
+    opened = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        create=False,
+    )
+    assert opened.status().freshness is Freshness.CURRENT
+
+    with sqlite3.connect(built.index_path) as connection:
+        connection.execute("DROP TABLE index_generation_checkpoint")
+        connection.execute("PRAGMA user_version = 4")
+    with pytest.raises(RepositoryIndexError, match="creation and migration are disabled"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            create=False,
+        )
+    with sqlite3.connect(built.index_path) as connection:
+        assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == 4
+        checkpoint = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'index_generation_checkpoint'
+            """
+        ).fetchone()
+    assert checkpoint is None
 
 
 def test_long_lived_instances_accept_lock_coordinated_generation_advances(
@@ -559,6 +669,52 @@ def test_bounded_query_opens_a_pinned_immutable_generation_without_copying(
     assert all(uri and "immutable=1" in database for database, uri in opened)
 
 
+def test_current_schema_construction_and_bounded_query_are_read_only_pinned_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reopening a current sidecar must not copy or quick-check the database."""
+    repository = _copy_fixture(tmp_path)
+    built = RepositoryIndex(project_id="project-1", repository_root=repository)
+    built.rebuild()
+    real_connect = sqlite3.connect
+    opened: list[tuple[str, bool]] = []
+    statements: list[str] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            statements.append(sql)
+            return super().execute(sql, parameters)
+
+    def tracking_connect(
+        database: str | Path,
+        timeout: float = 5.0,
+        *,
+        uri: bool = False,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+    ) -> sqlite3.Connection:
+        opened.append((str(database), uri))
+        return real_connect(
+            database,
+            timeout=timeout,
+            uri=uri,
+            factory=TrackingConnection,
+        )
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store.sqlite3.connect",
+        tracking_connect,
+    )
+
+    reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
+    result = reopened.symbols(limit=1)
+
+    assert len(result.records) == 1
+    assert opened
+    assert all(database != ":memory:" for database, _uri in opened)
+    assert all(uri and "immutable=1" in database for database, uri in opened)
+    assert "PRAGMA quick_check" not in statements
+
+
 def test_query_metadata_and_rows_do_not_cross_a_publication_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -596,6 +752,42 @@ def test_query_metadata_and_rows_do_not_cross_a_publication_generation(
     assert result.authoritative is False
     assert result.index_digest == writer.status().aggregate_digest
     assert [record.name for record in result.records] == ["generation_safe"]
+
+
+def test_compacted_checkpoint_advances_a_reader_older_than_retained_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pruning recent rows must not strand a valid long-lived reader."""
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store._GENERATION_HISTORY_LIMIT",
+        4,
+    )
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = repository / "module.py"
+    source.write_text("VALUE = 0\n", encoding="utf-8")
+    reader = RepositoryIndex(project_id="project-1", repository_root=repository)
+    reader.rebuild()
+    writer = RepositoryIndex(project_id="project-1", repository_root=repository)
+
+    for value in range(1, 9):
+        source.write_text(f"VALUE = {value}\n", encoding="utf-8")
+        writer.rebuild()
+
+    assert reader.status().freshness is Freshness.CURRENT
+    with sqlite3.connect(reader.index_path) as connection:
+        retained = int(connection.execute("SELECT COUNT(*) FROM index_generations").fetchone()[0])
+        checkpoint_sequence = int(
+            connection.execute(
+                "SELECT sequence FROM index_generation_checkpoint WHERE singleton = 1"
+            ).fetchone()[0]
+        )
+        oldest_retained = int(
+            connection.execute("SELECT MIN(sequence) FROM index_generations").fetchone()[0]
+        )
+
+    assert retained <= 4
+    assert checkpoint_sequence - oldest_retained >= 3
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode contract")

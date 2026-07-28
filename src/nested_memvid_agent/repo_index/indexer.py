@@ -88,6 +88,7 @@ class RepositoryIndex:
         repository_root: Path,
         index_path: Path | None = None,
         limits: IndexLimits | None = None,
+        create: bool = True,
     ) -> None:
         if _VALID_PROJECT_ID.fullmatch(project_id) is None:
             raise ValueError(
@@ -130,6 +131,7 @@ class RepositoryIndex:
             project_id=self.project_id,
             root_identity=self._observed_root_identity(),
             parser_versions=self._parser_versions,
+            allow_migration=create,
         )
 
     def rebuild(self) -> BuildReport:
