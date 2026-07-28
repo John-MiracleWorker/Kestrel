@@ -311,6 +311,9 @@ class SystemProcessInspector:
     def port_is_bindable(self, host: str, port: int) -> bool:
         candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            # Match the server's listener semantics so recently closed client
+            # connections in TIME_WAIT do not masquerade as a live listener.
+            candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             candidate.bind((host, port))
         except OSError:
             return False

@@ -1590,6 +1590,20 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
                         time.sleep(0.05)
 
 
+def test_system_port_bindability_ignores_closed_connection_residue() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.listen()
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            connection, _address = listener.accept()
+            with connection:
+                connection.shutdown(socket.SHUT_WR)
+                assert client.recv(1) == b""
+
+    assert SystemProcessInspector().port_is_bindable("127.0.0.1", port) is True
+
+
 @pytest.mark.parametrize(
     ("lsof_output", "expected"),
     [
