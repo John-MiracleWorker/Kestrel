@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -11,6 +13,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from ..config import AgentConfig
+from ..security_boundary import REDACTED, redact_text
 from .provider_urls import normalize_ollama_openai_base_url, validate_provider_http_url
 
 PROVIDER_OPTIONS: tuple[str, ...] = (
@@ -67,6 +70,14 @@ DEFAULT_BASE_URLS: dict[str, str] = {
 }
 
 SecretResolver = Callable[[str | None], str | None]
+MAX_MODEL_CATALOG_BYTES = 2 * 1024 * 1024
+MAX_MODEL_CATALOG_ENTRIES = 2048
+MAX_MODEL_ID_CHARS = 512
+_SENSITIVE_QUERY_VALUE = re.compile(
+    r"([?&](?:api[_-]?key|key|token|access[_-]?token)=)[^&\s]+",
+    flags=re.IGNORECASE,
+)
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,511}\Z")
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,26 @@ class ProviderModelCatalog:
     api_key_env: str | None = None
     api_key_configured: bool = False
     fetched_at: str | None = None
+    declared_capabilities: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def digest(self) -> str:
+        payload = {
+            "provider": self.provider,
+            "models": list(self.models),
+            "source": self.source,
+            "declared_capabilities": {
+                model: list(capabilities)
+                for model, capabilities in sorted(self.declared_capabilities.items())
+            },
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def to_public_dict(self) -> dict[str, object]:
         return {
@@ -96,6 +127,11 @@ class ProviderModelCatalog:
             "api_key_env": self.api_key_env,
             "api_key_configured": self.api_key_configured,
             "fetched_at": self.fetched_at,
+            "catalog_digest": self.digest,
+            "declared_capabilities": {
+                model: list(capabilities)
+                for model, capabilities in sorted(self.declared_capabilities.items())
+            },
         }
 
 
@@ -183,7 +219,7 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=api_key,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", None, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", None, api_key_env, secret_resolver=secret_resolver)
     if provider in {"lm-studio", "openai-compatible"}:
         base_url = _base_url_for_provider(config, provider)
         if not base_url:
@@ -195,7 +231,7 @@ def _fetch_provider_models(
         )
         return _catalog(
             provider,
-            _model_ids(payload),
+            payload,
             fallback,
             "provider",
             base_url,
@@ -210,7 +246,7 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=_optional_api_key(api_key_env, secret_resolver=secret_resolver),
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
     if provider == "deepseek":
         api_key_env = _api_key_env_for_provider(config, provider)
         api_key = _required_api_key(api_key_env, secret_resolver=secret_resolver)
@@ -220,7 +256,7 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=api_key,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
     if provider == "kimi":
         api_key_env = _api_key_env_for_provider(config, provider)
         api_key = _required_api_key(api_key_env, secret_resolver=secret_resolver)
@@ -230,7 +266,7 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=api_key,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
     if provider == "ollama":
         base_url = normalize_ollama_openai_base_url(_base_url_for_provider(config, provider))
         payload = _fetch_json(
@@ -238,7 +274,7 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=None,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", base_url, None, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", base_url, None, secret_resolver=secret_resolver)
     if provider == "ollama-cloud":
         api_key_env = _api_key_env_for_provider(config, provider)
         api_key = _required_api_key(api_key_env, secret_resolver=secret_resolver)
@@ -248,7 +284,7 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=api_key,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
     if provider == "anthropic":
         api_key_env = _api_key_env_for_provider(config, provider)
         api_key = _required_api_key(api_key_env, secret_resolver=secret_resolver)
@@ -259,7 +295,7 @@ def _fetch_provider_models(
             headers={"anthropic-version": "2023-06-01", "x-api-key": api_key},
             use_bearer=False,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", None, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", None, api_key_env, secret_resolver=secret_resolver)
     if provider == "grok":
         api_key_env = _api_key_env_for_provider(config, provider)
         api_key = _required_api_key(api_key_env, secret_resolver=secret_resolver)
@@ -269,7 +305,7 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=api_key,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", base_url, api_key_env, secret_resolver=secret_resolver)
     if provider == "gemini":
         api_key_env = _api_key_env_for_provider(config, provider)
         api_key = _required_api_key(api_key_env, secret_resolver=secret_resolver)
@@ -278,13 +314,13 @@ def _fetch_provider_models(
             timeout_seconds=_catalog_timeout(config),
             api_key=None,
         )
-        return _catalog(provider, _model_ids(payload), fallback, "provider", None, api_key_env, secret_resolver=secret_resolver)
+        return _catalog(provider, payload, fallback, "provider", None, api_key_env, secret_resolver=secret_resolver)
     raise ValueError(f"unsupported provider: {provider}")
 
 
 def _catalog(
     provider: str,
-    models: tuple[str, ...],
+    payload: Any,
     fallback: tuple[str, ...],
     source: str,
     base_url: str | None,
@@ -292,7 +328,8 @@ def _catalog(
     *,
     secret_resolver: SecretResolver | None = None,
 ) -> ProviderModelCatalog:
-    unique_models = _unique(models)
+    unique_models = _unique(_model_ids(payload))
+    declared_capabilities = _model_capability_declarations(payload)
     if not unique_models:
         return ProviderModelCatalog(
             provider=provider,
@@ -317,6 +354,11 @@ def _catalog(
         api_key_env=api_key_env,
         api_key_configured=_api_key_configured_for_env(api_key_env, secret_resolver=secret_resolver),
         fetched_at=datetime.now(UTC).isoformat(),
+        declared_capabilities={
+            model: declared_capabilities[model]
+            for model in unique_models
+            if model in declared_capabilities
+        },
     )
 
 
@@ -336,13 +378,21 @@ def _fetch_json(
     try:
         # The URL is restricted to HTTP(S) with a host immediately above.
         with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
-            body = response.read().decode("utf-8")
+            raw_body = response.read(MAX_MODEL_CATALOG_BYTES + 1)
     except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"model list failed with HTTP {exc.code}: {detail[:240]}") from exc
+        detail = exc.read(241).decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"model list failed with HTTP {exc.code}: "
+            f"{_safe_catalog_error(detail, secret=api_key)[:240]}"
+        ) from exc
     except URLError as exc:
         reason = getattr(exc, "reason", exc)
-        raise RuntimeError(f"model list request failed: {reason}") from exc
+        raise RuntimeError(
+            f"model list request failed: {_safe_catalog_error(str(reason), secret=api_key)}"
+        ) from exc
+    if len(raw_body) > MAX_MODEL_CATALOG_BYTES:
+        raise ValueError("model catalog response exceeded the byte limit")
+    body = raw_body.decode("utf-8")
     return json.loads(body)
 
 
@@ -354,21 +404,104 @@ def _model_ids(payload: Any) -> tuple[str, ...]:
             if isinstance(value, list):
                 rows.extend(value)
     ids: list[str] = []
-    for row in rows:
+    for row in rows[:MAX_MODEL_CATALOG_ENTRIES]:
         if isinstance(row, str):
-            ids.append(row)
+            string_model_id = row.strip()
+            if _MODEL_ID.fullmatch(string_model_id):
+                ids.append(string_model_id)
             continue
         if not isinstance(row, dict):
             continue
-        raw_id = row.get("id") or row.get("model") or row.get("name")
-        if raw_id is None:
-            continue
-        model_id = str(raw_id).strip()
-        if model_id.startswith("models/"):
-            model_id = model_id.removeprefix("models/")
-        if model_id:
+        model_id = _model_id(row)
+        if model_id is not None:
             ids.append(model_id)
     return tuple(ids)
+
+
+def _model_capability_declarations(payload: Any) -> dict[str, tuple[str, ...]]:
+    rows: list[Any] = []
+    if isinstance(payload, dict):
+        for key in ("data", "models"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                rows.extend(value)
+    declarations: dict[str, tuple[str, ...]] = {}
+    for row in rows[:MAX_MODEL_CATALOG_ENTRIES]:
+        if not isinstance(row, dict):
+            continue
+        model_id = _model_id(row)
+        if model_id is None:
+            continue
+        capabilities: set[str] = set()
+        raw_capabilities = row.get("capabilities")
+        if isinstance(raw_capabilities, list):
+            for value in raw_capabilities:
+                normalized = _normalized_capability(value)
+                if normalized is not None:
+                    capabilities.add(normalized)
+        supported_parameters = row.get("supported_parameters")
+        if isinstance(supported_parameters, list):
+            for value in supported_parameters:
+                normalized = _normalized_capability(value)
+                if normalized is not None:
+                    capabilities.add(normalized)
+        architecture = row.get("architecture")
+        modality_sources: list[Any] = [
+            row.get("input_modalities"),
+            row.get("modalities"),
+        ]
+        if isinstance(architecture, dict):
+            modality_sources.extend(
+                [
+                    architecture.get("input_modalities"),
+                    architecture.get("modalities"),
+                ]
+            )
+        for raw_modalities in modality_sources:
+            if isinstance(raw_modalities, list):
+                values = {str(value).strip().lower() for value in raw_modalities}
+                if values & {"image", "images", "vision"}:
+                    capabilities.add("vision")
+        if capabilities:
+            declarations[model_id] = tuple(sorted(capabilities))
+    return declarations
+
+
+def _model_id(row: dict[Any, Any]) -> str | None:
+    raw_id = row.get("id") or row.get("model") or row.get("name")
+    if raw_id is None:
+        return None
+    model_id = str(raw_id).strip()
+    if model_id.startswith("models/"):
+        model_id = model_id.removeprefix("models/")
+    if not _MODEL_ID.fullmatch(model_id):
+        return None
+    return model_id
+
+
+def _normalized_capability(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("-", "_")
+    aliases = {
+        "generate": "generation",
+        "generation": "generation",
+        "text": "generation",
+        "stream": "streaming",
+        "streaming": "streaming",
+        "json": "structured_output",
+        "json_mode": "structured_output",
+        "response_format": "structured_output",
+        "structured_output": "structured_output",
+        "structured_outputs": "structured_output",
+        "tool_calling": "tools",
+        "tool_use": "tools",
+        "tools": "tools",
+        "image": "vision",
+        "images": "vision",
+        "vision": "vision",
+    }
+    return aliases.get(normalized)
 
 
 def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
@@ -440,4 +573,10 @@ def _api_key_env_for_provider(config: AgentConfig, provider: str) -> str | None:
 
 
 def _error_message(exc: Exception) -> str:
-    return str(exc) or type(exc).__name__
+    return _safe_catalog_error(str(exc) or type(exc).__name__, secret=None)
+
+
+def _safe_catalog_error(value: str, *, secret: str | None) -> str:
+    safe = value.replace(secret, REDACTED) if secret else value
+    safe = _SENSITIVE_QUERY_VALUE.sub(r"\1<redacted>", safe)
+    return redact_text(safe)[:512]
