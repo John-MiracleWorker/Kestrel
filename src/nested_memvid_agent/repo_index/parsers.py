@@ -12,7 +12,7 @@ PARSER_VERSIONS: dict[str, str] = {
     "javascript": "structural-regex-v2",
     "typescript": "structural-regex-v2",
     "go": "structural-regex-v2",
-    "rust": "structural-regex-v2",
+    "rust": "structural-regex-v3",
     "java": "structural-regex-v2",
     "kotlin": "structural-regex-v2",
     "swift": "structural-regex-v2",
@@ -233,7 +233,7 @@ def _parse_python(content: str) -> ParsedFile:
 
 
 def _parse_javascript(content: str) -> ParsedFile:
-    import_source, code_source = _structural_sources(content)
+    import_source, code_source = _structural_sources(content, language="javascript")
     patterns = (
         (re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)"), "class"),
         (
@@ -273,7 +273,7 @@ def _parse_javascript(content: str) -> ParsedFile:
 
 
 def _parse_go(content: str) -> ParsedFile:
-    import_source, code_source = _structural_sources(content)
+    import_source, code_source = _structural_sources(content, language="go")
     patterns = (
         (re.compile(r"(?m)^\s*type\s+([A-Za-z_]\w*)\s+"), "type"),
         (
@@ -290,7 +290,7 @@ def _parse_go(content: str) -> ParsedFile:
 
 
 def _parse_rust(content: str) -> ParsedFile:
-    import_source, code_source = _structural_sources(content)
+    import_source, code_source = _structural_sources(content, language="rust")
     patterns = (
         (re.compile(r"\bstruct\s+([A-Za-z_]\w*)"), "struct"),
         (re.compile(r"\benum\s+([A-Za-z_]\w*)"), "enum"),
@@ -307,7 +307,7 @@ def _parse_rust(content: str) -> ParsedFile:
 
 
 def _parse_java(content: str) -> ParsedFile:
-    import_source, code_source = _structural_sources(content)
+    import_source, code_source = _structural_sources(content, language="java")
     patterns = (
         (
             re.compile(r"\b(?:class|record)\s+([A-Za-z_]\w*)"),
@@ -334,7 +334,7 @@ def _parse_java(content: str) -> ParsedFile:
 
 
 def _parse_kotlin(content: str) -> ParsedFile:
-    import_source, code_source = _structural_sources(content)
+    import_source, code_source = _structural_sources(content, language="kotlin")
     patterns = (
         (
             re.compile(r"\b(?:data\s+|sealed\s+)?class\s+([A-Za-z_]\w*)"),
@@ -353,7 +353,7 @@ def _parse_kotlin(content: str) -> ParsedFile:
 
 
 def _parse_swift(content: str) -> ParsedFile:
-    import_source, code_source = _structural_sources(content)
+    import_source, code_source = _structural_sources(content, language="swift")
     patterns = (
         (re.compile(r"\bclass\s+([A-Za-z_]\w*)"), "class"),
         (re.compile(r"\bstruct\s+([A-Za-z_]\w*)"), "struct"),
@@ -370,16 +370,20 @@ def _parse_swift(content: str) -> ParsedFile:
     return _parse_structural(code_source, patterns, imports)
 
 
-def _structural_sources(content: str) -> tuple[str, str]:
-    comment_free = _mask_non_code(content, mask_strings=False)
-    return comment_free, _mask_non_code(comment_free, mask_strings=True)
+def _structural_sources(content: str, *, language: str) -> tuple[str, str]:
+    comment_free = _mask_non_code(content, mask_strings=False, language=language)
+    return comment_free, _mask_non_code(
+        comment_free,
+        mask_strings=True,
+        language=language,
+    )
 
 
 def _match_has_code_prefix(code_source: str, match: re.Match[str]) -> bool:
     return any(not character.isspace() for character in code_source[match.start() : match.start(1)])
 
 
-def _mask_non_code(content: str, *, mask_strings: bool) -> str:
+def _mask_non_code(content: str, *, mask_strings: bool, language: str) -> str:
     masked = list(content)
     index = 0
     length = len(content)
@@ -392,6 +396,9 @@ def _mask_non_code(content: str, *, mask_strings: bool) -> str:
             continue
         quote = content[index]
         if quote in {"'", '"', "`"}:
+            if quote == "'" and language == "rust" and _is_rust_lifetime(content, index):
+                index += 1
+                continue
             index = _consume_string(
                 masked,
                 content,
@@ -402,6 +409,17 @@ def _mask_non_code(content: str, *, mask_strings: bool) -> str:
             continue
         index += 1
     return "".join(masked)
+
+
+def _is_rust_lifetime(content: str, start: int) -> bool:
+    """Distinguish Rust lifetime/loop labels from single-quoted character literals."""
+    index = start + 1
+    if index >= len(content) or not (content[index].isalpha() or content[index] == "_"):
+        return False
+    index += 1
+    while index < len(content) and (content[index].isalnum() or content[index] == "_"):
+        index += 1
+    return index >= len(content) or content[index] != "'"
 
 
 def _mask_line_comment(masked: list[str], content: str, start: int) -> int:

@@ -7,6 +7,7 @@ from typing import Generic, TypeVar
 
 DEFAULT_QUERY_LIMIT = 100
 MAX_QUERY_LIMIT = 1_000
+MAX_QUERY_OFFSET = 1_000_000_000
 
 
 class Freshness(StrEnum):
@@ -135,6 +136,8 @@ class IndexQueryResult(Generic[RecordT]):
     freshness: Freshness
     authoritative: bool
     index_digest: str
+    truncated: bool = False
+    next_offset: int | None = None
 
 
 @dataclass(frozen=True)

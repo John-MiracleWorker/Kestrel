@@ -14,6 +14,7 @@ from typing import TypeVar
 from .models import (
     DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
+    MAX_QUERY_OFFSET,
     BuildReport,
     CandidateFile,
     FileRecord,
@@ -33,7 +34,7 @@ from .models import (
     TestRelationshipRecord,
 )
 from .parsers import PARSER_VERSIONS, language_for_path, parse_file, parser_version
-from .store import SCHEMA_VERSION, RepoIndexStore
+from .store import SCHEMA_VERSION, RepoIndexStore, StoreQueryPage
 
 _VALID_PROJECT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _GIT_OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{40,64}\Z")
@@ -216,11 +217,13 @@ class RepositoryIndex:
         self,
         *,
         limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[FileRecord]:
         bounded_limit = _validate_query_limit(limit)
+        bounded_offset = _validate_query_offset(offset)
         return self._query(
-            lambda: self._store.files(limit=bounded_limit),
+            lambda: self._store.files(limit=bounded_limit, offset=bounded_offset),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -229,11 +232,13 @@ class RepositoryIndex:
         query: str | None = None,
         *,
         limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[SymbolRecord]:
         bounded_limit = _validate_query_limit(limit)
+        bounded_offset = _validate_query_offset(offset)
         return self._query(
-            lambda: self._store.symbols(query, limit=bounded_limit),
+            lambda: self._store.symbols(query, limit=bounded_limit, offset=bounded_offset),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -242,11 +247,13 @@ class RepositoryIndex:
         query: str | None = None,
         *,
         limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[ImportRecord]:
         bounded_limit = _validate_query_limit(limit)
+        bounded_offset = _validate_query_offset(offset)
         return self._query(
-            lambda: self._store.imports(query, limit=bounded_limit),
+            lambda: self._store.imports(query, limit=bounded_limit, offset=bounded_offset),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -255,11 +262,13 @@ class RepositoryIndex:
         name: str | None = None,
         *,
         limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[ReferenceRecord]:
         bounded_limit = _validate_query_limit(limit)
+        bounded_offset = _validate_query_offset(offset)
         return self._query(
-            lambda: self._store.references(name, limit=bounded_limit),
+            lambda: self._store.references(name, limit=bounded_limit, offset=bounded_offset),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -268,28 +277,40 @@ class RepositoryIndex:
         symbol_name: str,
         *,
         limit: int = DEFAULT_QUERY_LIMIT,
+        offset: int = 0,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[TestRelationshipRecord]:
         bounded_limit = _validate_query_limit(limit)
+        bounded_offset = _validate_query_offset(offset)
         return self._query(
-            lambda: self._store.tests_for(symbol_name, limit=bounded_limit),
+            lambda: self._store.tests_for(
+                symbol_name,
+                limit=bounded_limit,
+                offset=bounded_offset,
+            ),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
     def _query(
         self,
-        load: Callable[[], tuple[ResultT, ...]],
+        load: Callable[[], StoreQueryPage[ResultT]],
         *,
         include_stale_diagnostics: bool,
     ) -> IndexQueryResult[ResultT]:
         status = self.status()
         authoritative = status.freshness is Freshness.CURRENT
-        records = load() if authoritative or include_stale_diagnostics else ()
+        page = (
+            load()
+            if authoritative or include_stale_diagnostics
+            else StoreQueryPage(records=(), truncated=False, next_offset=None)
+        )
         return IndexQueryResult(
-            records=records,
+            records=page.records,
             freshness=status.freshness,
             authoritative=authoritative,
             index_digest=status.aggregate_digest,
+            truncated=page.truncated,
+            next_offset=page.next_offset,
         )
 
     def _snapshot(self, root_descriptor: int | None) -> RepositorySnapshot:
@@ -663,11 +684,8 @@ def _open_candidate(
 
 
 def _has_binary_control_density(payload: bytes) -> bool:
-    if not payload:
-        return False
     allowed_controls = {9, 10, 12, 13}
-    disallowed = sum(1 for value in payload if value < 32 and value not in allowed_controls)
-    return disallowed / len(payload) > 0.01
+    return any((value < 32 and value not in allowed_controls) or value == 127 for value in payload)
 
 
 def _freshness_fingerprint(
@@ -747,3 +765,9 @@ def _validate_query_limit(limit: int) -> int:
     if isinstance(limit, bool) or not 1 <= limit <= MAX_QUERY_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_QUERY_LIMIT}")
     return limit
+
+
+def _validate_query_offset(offset: int) -> int:
+    if isinstance(offset, bool) or not 0 <= offset <= MAX_QUERY_OFFSET:
+        raise ValueError(f"offset must be between 0 and {MAX_QUERY_OFFSET}")
+    return offset

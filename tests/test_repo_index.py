@@ -71,7 +71,7 @@ def test_build_records_identity_content_and_multilanguage_relationships(tmp_path
     assert status.project_id == "project-1"
     assert status.repository_root == repository.resolve()
     assert status.aggregate_digest == report.aggregate_digest
-    assert status.schema_version == 2
+    assert status.schema_version == 3
     assert status.parser_versions["python"] == "ast-v1"
     assert status.git_head is None
     assert status.git_tree is None
@@ -270,7 +270,7 @@ def test_schema_v1_sidecar_migrates_and_forces_digest_revalidation(tmp_path: Pat
     reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
     rebuilt = reopened.rebuild()
 
-    assert reopened.status().schema_version == 2
+    assert reopened.status().schema_version == 3
     assert rebuilt.changed_files == 10
     assert rebuilt.reused_files == 0
 
@@ -403,6 +403,55 @@ def test_sidecar_file_replacement_is_rejected_on_next_open(tmp_path: Path) -> No
         index.status()
 
 
+def test_reopening_an_unchanged_index_preserves_the_bound_database_inode(
+    tmp_path: Path,
+) -> None:
+    """A read-only initialization must not invalidate an existing inode binding."""
+    repository = _copy_fixture(tmp_path)
+    first = RepositoryIndex(project_id="project-1", repository_root=repository)
+    first.rebuild()
+    inode_before = first.index_path.stat().st_ino
+
+    RepositoryIndex(project_id="project-1", repository_root=repository)
+
+    assert first.index_path.stat().st_ino == inode_before
+    assert first.status().project_id == "project-1"
+
+
+def test_wrapped_sqlite_connect_aba_is_rejected_before_returning_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening SQLite by pathname after verification must fail this ABA repro."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    real_connect = sqlite3.connect
+    parked = tmp_path / "parked.sqlite"
+    decoy = tmp_path / "decoy.sqlite"
+    shutil.copy2(index.index_path, decoy)
+    with sqlite3.connect(decoy) as connection:
+        connection.execute(
+            "UPDATE index_metadata SET aggregate_digest = 'decoy' WHERE singleton = 1"
+        )
+
+    def aba_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
+        assert str(database) == ":memory:"
+        os.replace(index.index_path, parked)
+        os.replace(decoy, index.index_path)
+        connection = real_connect(database, timeout=timeout)
+        os.replace(index.index_path, decoy)
+        os.replace(parked, index.index_path)
+        return connection
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store.sqlite3.connect",
+        aba_connect,
+    )
+
+    with pytest.raises(RepositoryIndexError, match="changed during read"):
+        index.symbols()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode contract")
 def test_custom_sidecar_parent_is_validated_without_chmod(tmp_path: Path) -> None:
     """Mutating a caller-owned custom parent mode must fail this test."""
@@ -468,10 +517,10 @@ def test_structural_parsers_ignore_comments_and_literals_and_keep_offsets(
     assert [(record.module, record.line) for record in index.imports().records] == [("./real", 4)]
     reference_names = {record.name for record in index.references().records}
     assert {
-            "CommentGhost",
-            "StringGhost",
-            "comment",
-            "module",
+        "CommentGhost",
+        "StringGhost",
+        "comment",
+        "module",
     }.isdisjoint(reference_names)
 
 
@@ -525,6 +574,96 @@ def test_query_limits_are_bounded_and_filter_before_limiting(tmp_path: Path) -> 
         index.symbols(limit=MAX_QUERY_LIMIT + 1)
 
 
+def test_query_pages_report_truncation_and_continue_deterministically(
+    tmp_path: Path,
+) -> None:
+    """Silently truncating a bounded result without continuation must fail this test."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "symbols.py").write_text(
+        "".join(f"def item_{number:02d}(): ...\n" for number in range(8)),
+        encoding="utf-8",
+    )
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+
+    first = index.symbols("item", limit=3)
+    second = index.symbols("item", limit=3, offset=first.next_offset or 0)
+    third = index.symbols("item", limit=3, offset=second.next_offset or 0)
+
+    assert [record.name for record in first.records] == ["item_00", "item_01", "item_02"]
+    assert first.truncated is True
+    assert first.next_offset == 3
+    assert [record.name for record in second.records] == ["item_03", "item_04", "item_05"]
+    assert second.truncated is True
+    assert second.next_offset == 6
+    assert [record.name for record in third.records] == ["item_06", "item_07"]
+    assert third.truncated is False
+    assert third.next_offset is None
+
+
+def test_reference_point_lookup_uses_nocase_index(tmp_path: Path) -> None:
+    """Scanning the lexical-reference table for an exact lookup must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT id
+            FROM lexical_references
+            WHERE name = ? COLLATE NOCASE
+            ORDER BY name COLLATE NOCASE, name, id
+            LIMIT ? OFFSET ?
+            """,
+            ("helper", 11, 0),
+        ).fetchall()
+
+    assert any("references_name_nocase_idx" in str(row[3]) for row in plan)
+    assert [record.name for record in index.references("HELPER").records] == [
+        "helper",
+        "helper",
+        "helper",
+        "helper",
+    ]
+
+
+@pytest.mark.parametrize("control_byte", [b"\x01", b"\x7f"])
+def test_single_disallowed_control_byte_is_binary(
+    tmp_path: Path,
+    control_byte: bytes,
+) -> None:
+    """Accepting a low-density forbidden control byte as source must fail this test."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "mostly-text.txt").write_bytes(b"a" * 4_096 + control_byte)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+
+    report = index.rebuild()
+
+    assert index.files().records == ()
+    assert report.skipped_files == 1
+
+
+def test_rust_lifetimes_do_not_mask_following_symbols(tmp_path: Path) -> None:
+    """Treating Rust lifetimes as quoted strings must fail this test."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "lib.rs").write_text(
+        "pub fn borrow<'a>(value: &'a str) -> &'a str { value }\n"
+        'pub fn after_lifetime() -> &\'static str { "ready" }\n',
+        encoding="utf-8",
+    )
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+
+    assert [(record.name, record.line) for record in index.symbols().records] == [
+        ("borrow", 1),
+        ("after_lifetime", 2),
+    ]
+
+
 def test_parser_and_database_order_is_hash_seed_independent(tmp_path: Path) -> None:
     """Set iteration or incomplete tie keys must fail this subprocess test."""
     worktree = Path(__file__).parents[1]
@@ -566,36 +705,36 @@ def test_parser_and_database_order_is_hash_seed_independent(tmp_path: Path) -> N
     }
 
 
-@pytest.mark.skipif(os.name != "posix", reason="chmod setup failure is POSIX-only")
-def test_connection_closes_when_chmod_setup_fails(
+def test_connection_closes_when_serialize_setup_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Leaving a connection open after chmod failure must fail this test."""
+    """Leaving a connection open after snapshot serialization failure must fail."""
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     index.rebuild()
     real_connect = sqlite3.connect
     opened: list[sqlite3.Connection] = []
 
+    class FailingSerializeConnection(sqlite3.Connection):
+        def serialize(self, *args: Any, **kwargs: Any) -> bytes:
+            raise sqlite3.OperationalError("injected serialize failure")
+
     def tracking_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
-        connection = real_connect(database, timeout=timeout)
+        connection = real_connect(
+            database,
+            timeout=timeout,
+            factory=FailingSerializeConnection,
+        )
         opened.append(connection)
         return connection
-
-    def fail_chmod(path: Path, mode: int) -> None:
-        raise PermissionError("injected chmod failure")
 
     monkeypatch.setattr(
         "nested_memvid_agent.repo_index.store.sqlite3.connect",
         tracking_connect,
     )
-    monkeypatch.setattr(
-        "nested_memvid_agent.repo_index.store.os.chmod",
-        fail_chmod,
-    )
 
-    with pytest.raises(PermissionError, match="injected"):
-        index.status()
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        index.rebuild()
     with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
         opened[-1].execute("SELECT 1")
 
@@ -634,6 +773,34 @@ def test_connection_closes_when_pragma_setup_fails(
         index.status()
     with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
         opened[-1].execute("SELECT 1")
+
+
+def test_routine_queries_do_not_run_full_database_integrity_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adding a full-database quick check to every bounded read must fail."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    real_connect = sqlite3.connect
+    statements: list[str] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            statements.append(sql)
+            return super().execute(sql, parameters)
+
+    def tracking_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
+        return real_connect(database, timeout=timeout, factory=TrackingConnection)
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store.sqlite3.connect",
+        tracking_connect,
+    )
+
+    index.symbols("Widget")
+
+    assert "PRAGMA quick_check" not in statements
 
 
 def test_results_have_deterministic_tie_order(tmp_path: Path) -> None:
