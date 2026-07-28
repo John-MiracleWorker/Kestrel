@@ -438,6 +438,33 @@ def _preflight_artifact(path: Path, *, kind: str) -> bool:
     return True
 
 
+def _managed_artifact_identity(path: Path, *, kind: str) -> os.stat_result:
+    with _pinned_directory(path.parent, uid=_current_uid()) as parent_fd:
+        with _verified_artifact_fd(parent_fd, path.name, kind=kind) as artifact_fd:
+            return os.fstat(artifact_fd)
+
+
+def _transaction_artifact_identity(
+    path: Path, *, kind: str, transaction_id: str,
+) -> os.stat_result:
+    with _pinned_directory(path.parent, uid=_current_uid()) as parent_fd:
+        with _verified_artifact_fd(parent_fd, path.name, kind=kind) as artifact_fd:
+            identity = os.fstat(artifact_fd)
+            artifact = {
+                "kind": kind,
+                "expected_device": identity.st_dev,
+                "expected_inode": identity.st_ino,
+            }
+            if not _artifact_belongs_to_transaction_at(
+                parent_fd, path.name, artifact=artifact,
+                transaction_id=transaction_id,
+            ):
+                raise LauncherArtifactError(
+                    f"Staged launcher identity changed before manifest: {path}"
+                )
+            return identity
+
+
 def _artifact_is_managed(path: Path, *, kind: str) -> bool:
     if path.is_symlink():
         return False
