@@ -318,7 +318,7 @@ def test_schema_18_to_19_preserves_scheduled_occurrences(tmp_path: Path) -> None
     migrated = AgentStateStore(path)
     preserved = migrated.get_routine_occurrence(occurrence.occurrence_id)
 
-    assert migrated.schema_version() == 19
+    assert migrated.schema_version() == 20
     assert preserved.trigger_kind == "scheduled"
     assert preserved.trigger_key_digest is None
     assert preserved.requested_at is None

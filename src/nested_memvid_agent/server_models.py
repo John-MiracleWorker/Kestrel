@@ -87,6 +87,56 @@ class CapabilityToggleRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+class ProjectRecipeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: str = Field(min_length=1, max_length=128)
+    command: str = Field(min_length=1, max_length=8_192)
+    working_directory: str | None = Field(default=None, max_length=1_024)
+
+
+class ProjectCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    project_id: str | None = Field(default=None, min_length=1, max_length=128)
+    display_name: str = Field(min_length=1, max_length=256)
+    repository_path: str = Field(min_length=1, max_length=4_096)
+    remote: str | None = Field(default=None, max_length=2_048)
+    default_branch: str = Field(default="main", min_length=1, max_length=256)
+    allowed_paths: list[str] = Field(default_factory=lambda: ["."])
+    provider_policy: dict[str, Any] = Field(default_factory=dict)
+    cost_budget: float | None = Field(default=None, ge=0)
+    privacy_class: str = "local_required"
+    test_recipes: list[ProjectRecipeRequest] = Field(default_factory=list)
+    build_recipes: list[ProjectRecipeRequest] = Field(default_factory=list)
+    capability_ceiling: list[str] | None = None
+    baseline_index_digest: str | None = Field(default=None, max_length=512)
+
+
+class ProjectUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_revision: Annotated[int, Field(strict=True, ge=1)]
+    display_name: str | None = Field(default=None, min_length=1, max_length=256)
+    repository_path: str | None = Field(default=None, min_length=1, max_length=4_096)
+    remote: str | None = Field(default=None, max_length=2_048)
+    default_branch: str | None = Field(default=None, min_length=1, max_length=256)
+    allowed_paths: list[str] | None = None
+    provider_policy: dict[str, Any] | None = None
+    cost_budget: float | None = Field(default=None, ge=0)
+    privacy_class: str | None = None
+    test_recipes: list[ProjectRecipeRequest] | None = None
+    build_recipes: list[ProjectRecipeRequest] | None = None
+    capability_ceiling: list[str] | None = None
+    baseline_index_digest: str | None = Field(default=None, max_length=512)
+
+
+class ProjectImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    document: dict[str, Any]
+
+
 class ApprovalDecisionRequest(BaseModel):
     approved: bool
     arguments: dict[str, Any] | None = None

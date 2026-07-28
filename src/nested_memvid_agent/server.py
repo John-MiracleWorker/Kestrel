@@ -173,6 +173,7 @@ def _create_app(
         )
         from .server_observability_routes import register_observability_routes
         from .server_product_routes import register_product_routes
+        from .server_project_routes import register_project_routes
         from .server_routine_routes import register_routine_routes
         from .server_routing_routes import register_routing_routes
         from .server_runtime_routes import register_runtime_routes
@@ -502,6 +503,13 @@ def _create_app(
         sensitive_material_transition=mcp_sensitive_material_transition,
     )
     register_product_routes(app, active_config=lambda: active_config, secret_resolver=secret_broker.resolve)
+    register_project_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        runs=runs,
+        http_exception=HTTPException,
+    )
     register_channel_routes(
         app,
         http_exception=HTTPException,

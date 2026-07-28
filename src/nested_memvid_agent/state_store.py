@@ -13,11 +13,17 @@ from math import isfinite
 from pathlib import Path
 from threading import RLock
 from time import sleep
-from typing import Any
+from typing import Any, cast
 
 from .file_lock import lock_exclusive, unlock
 from .platform_primitives import chmod_descriptor
 from .private_artifacts import open_private_file_descriptor
+from .projects import (
+    ProjectConflictError,
+    ProjectRecord,
+    canonical_repository_path,
+    normalize_project_fields,
+)
 from .routine_limits import (
     MAX_ROUTINE_INTERVAL_SECONDS,
     MAX_ROUTINE_MISFIRE_GRACE_SECONDS,
@@ -32,7 +38,7 @@ from .routine_limits import (
 )
 from .security_boundary import redact_text
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 DEFAULT_APPROVAL_TTL_SECONDS = 900.0
 CAPABILITY_KINDS = frozenset({"tool", "mcp_server", "skill"})
 _STATE_DIRECTORY_MODE = 0o700
@@ -118,6 +124,7 @@ class RunRecord:
     turn_source: dict[str, Any] | None = None
     turn_origin: str = "primary_user"
     transcript_scope: str = "primary"
+    project_id: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -267,11 +274,26 @@ class AgentStateStore:
         turn_source: dict[str, Any] | None = None,
         turn_origin: str = "primary_user",
         transcript_scope: str = "primary",
+        project_id: str | None = None,
         max_nonterminal_runs: int | None = None,
     ) -> RunRecord:
         now = utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if project_id is not None:
+                project_row = conn.execute(
+                    "SELECT * FROM projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if project_row is None:
+                    raise KeyError(f"Unknown project: {project_id}")
+                project = _project_from_row(project_row)
+                if project.archived_at is not None:
+                    raise ValueError("cannot bind a new run to an archived project")
+                if str(canonical_repository_path(workspace)) != project.repository_path:
+                    raise ValueError(
+                        "project-bound run workspace must equal the canonical repository path"
+                    )
             if max_nonterminal_runs is not None:
                 row = conn.execute(
                     "SELECT COUNT(*) AS count FROM runs WHERE status IN ('queued', 'running', 'blocked')"
@@ -285,8 +307,8 @@ class AgentStateStore:
                     run_id, status, message, session_id, workspace, provider, model,
                     assistant_message, context_chars, tool_count, stop_reason, error,
                     config_revision, config_snapshot_json, turn_source_json,
-                    turn_origin, transcript_scope, created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?, ?, ?, ?)
+                    turn_origin, transcript_scope, project_id, created_at, updated_at
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -300,6 +322,7 @@ class AgentStateStore:
                     _encode(turn_source) if turn_source is not None else None,
                     turn_origin,
                     transcript_scope,
+                    project_id,
                     now,
                     now,
                 ),
@@ -4415,6 +4438,288 @@ class AgentStateStore:
             ).fetchall()
         return [_trace_span_from_row(row) for row in rows]
 
+    def create_project(
+        self,
+        *,
+        project_id: str,
+        display_name: str,
+        repository_path: str | Path,
+        remote: str | None = None,
+        default_branch: str = "main",
+        allowed_paths: tuple[str, ...] = (".",),
+        provider_policy: dict[str, Any] | None = None,
+        cost_budget: float | int | None = None,
+        privacy_class: str = "local_required",
+        test_recipes: tuple[dict[str, str], ...] = (),
+        build_recipes: tuple[dict[str, str], ...] = (),
+        capability_ceiling: tuple[str, ...] | None = None,
+        active_capability_keys: set[str] | frozenset[str] = frozenset(),
+        baseline_index_digest: str | None = None,
+    ) -> ProjectRecord:
+        fields = normalize_project_fields(
+            project_id=project_id,
+            display_name=display_name,
+            repository_path=repository_path,
+            remote=remote,
+            default_branch=default_branch,
+            allowed_paths=allowed_paths,
+            provider_policy=provider_policy,
+            cost_budget=cost_budget,
+            privacy_class=privacy_class,
+            test_recipes=test_recipes,
+            build_recipes=build_recipes,
+            capability_ceiling=capability_ceiling,
+            active_capability_keys=active_capability_keys,
+            baseline_index_digest=baseline_index_digest,
+        )
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO projects (
+                    project_id, display_name, repository_path, remote,
+                    default_branch, allowed_paths_json, provider_policy_json,
+                    cost_budget, privacy_class, test_recipes_json,
+                    build_recipes_json, capability_ceiling_json,
+                    baseline_index_digest, revision, archived_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                """,
+                (
+                    fields["project_id"],
+                    fields["display_name"],
+                    fields["repository_path"],
+                    fields["remote"],
+                    fields["default_branch"],
+                    _encode(fields["allowed_paths"]),
+                    _encode(fields["provider_policy"]),
+                    fields["cost_budget"],
+                    fields["privacy_class"],
+                    _encode(fields["test_recipes"]),
+                    _encode(fields["build_recipes"]),
+                    _encode(fields["capability_ceiling"]),
+                    fields["baseline_index_digest"],
+                    now,
+                    now,
+                ),
+            )
+        return self.get_project(str(fields["project_id"]))
+
+    def get_project(self, project_id: str) -> ProjectRecord:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown project: {project_id}")
+        return _project_from_row(row)
+
+    def list_projects(self, *, include_archived: bool = False) -> list[ProjectRecord]:
+        query = "SELECT * FROM projects"
+        if not include_archived:
+            query += " WHERE archived_at IS NULL"
+        query += " ORDER BY project_id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(query).fetchall()
+        return [_project_from_row(row) for row in rows]
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        expected_revision: int,
+        active_capability_keys: set[str] | frozenset[str],
+        **updates: object,
+    ) -> ProjectRecord:
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        allowed = {
+            "display_name",
+            "repository_path",
+            "remote",
+            "default_branch",
+            "allowed_paths",
+            "provider_policy",
+            "cost_budget",
+            "privacy_class",
+            "test_recipes",
+            "build_recipes",
+            "capability_ceiling",
+            "baseline_index_digest",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"unsupported project update fields: {sorted(unknown)}")
+        if not updates:
+            raise ValueError("project update must change at least one field")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown project: {project_id}")
+            current = _project_from_row(row)
+            if current.revision != expected_revision:
+                raise ProjectConflictError(current)
+            if current.archived_at is not None:
+                raise ValueError("archived projects cannot be updated")
+
+            merged: dict[str, object] = {
+                "project_id": current.project_id,
+                "display_name": current.display_name,
+                "repository_path": current.repository_path,
+                "remote": current.remote,
+                "default_branch": current.default_branch,
+                "allowed_paths": current.allowed_paths,
+                "provider_policy": current.provider_policy,
+                "cost_budget": current.cost_budget,
+                "privacy_class": current.privacy_class,
+                "test_recipes": current.test_recipes,
+                "build_recipes": current.build_recipes,
+                "capability_ceiling": current.capability_ceiling,
+                "baseline_index_digest": current.baseline_index_digest,
+            }
+            merged.update(updates)
+            validation_capabilities = set(active_capability_keys)
+            if "capability_ceiling" not in updates:
+                validation_capabilities.update(current.capability_ceiling)
+            normalized = normalize_project_fields(
+                project_id=str(merged["project_id"]),
+                display_name=cast(str, merged["display_name"]),
+                repository_path=cast(str | Path, merged["repository_path"]),
+                remote=cast(str | None, merged["remote"]),
+                default_branch=cast(str, merged["default_branch"]),
+                allowed_paths=cast(tuple[str, ...], merged["allowed_paths"]),
+                provider_policy=cast(dict[str, Any], merged["provider_policy"]),
+                cost_budget=cast(float | int | None, merged["cost_budget"]),
+                privacy_class=cast(str, merged["privacy_class"]),
+                test_recipes=cast(
+                    tuple[dict[str, str], ...],
+                    merged["test_recipes"],
+                ),
+                build_recipes=cast(
+                    tuple[dict[str, str], ...],
+                    merged["build_recipes"],
+                ),
+                capability_ceiling=cast(
+                    tuple[str, ...],
+                    merged["capability_ceiling"],
+                ),
+                active_capability_keys=validation_capabilities,
+                baseline_index_digest=cast(
+                    str | None,
+                    merged["baseline_index_digest"],
+                ),
+            )
+            next_revision = current.revision + 1
+            cursor = conn.execute(
+                """
+                UPDATE projects SET
+                    display_name = ?, repository_path = ?, remote = ?,
+                    default_branch = ?, allowed_paths_json = ?,
+                    provider_policy_json = ?, cost_budget = ?, privacy_class = ?,
+                    test_recipes_json = ?, build_recipes_json = ?,
+                    capability_ceiling_json = ?, baseline_index_digest = ?,
+                    revision = ?, updated_at = ?
+                WHERE project_id = ? AND revision = ? AND archived_at IS NULL
+                """,
+                (
+                    normalized["display_name"],
+                    normalized["repository_path"],
+                    normalized["remote"],
+                    normalized["default_branch"],
+                    _encode(normalized["allowed_paths"]),
+                    _encode(normalized["provider_policy"]),
+                    normalized["cost_budget"],
+                    normalized["privacy_class"],
+                    _encode(normalized["test_recipes"]),
+                    _encode(normalized["build_recipes"]),
+                    _encode(normalized["capability_ceiling"]),
+                    normalized["baseline_index_digest"],
+                    next_revision,
+                    utc_now(),
+                    current.project_id,
+                    current.revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT * FROM projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if latest is None:
+                    raise KeyError(f"Unknown project: {project_id}")
+                raise ProjectConflictError(_project_from_row(latest))
+            updated = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("project update was not durable")
+            return _project_from_row(updated)
+
+    def archive_project(
+        self,
+        project_id: str,
+        *,
+        expected_revision: int,
+    ) -> ProjectRecord:
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown project: {project_id}")
+            current = _project_from_row(row)
+            if current.revision != expected_revision or current.archived_at is not None:
+                raise ProjectConflictError(current)
+            cursor = conn.execute(
+                """
+                UPDATE projects SET archived_at = ?, revision = ?, updated_at = ?
+                WHERE project_id = ? AND revision = ? AND archived_at IS NULL
+                """,
+                (
+                    now,
+                    current.revision + 1,
+                    now,
+                    project_id,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT * FROM projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if latest is None:
+                    raise KeyError(f"Unknown project: {project_id}")
+                raise ProjectConflictError(_project_from_row(latest))
+            archived = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if archived is None:
+                raise RuntimeError("project archive was not durable")
+            return _project_from_row(archived)
+
     def schema_version(self) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
@@ -4516,6 +4821,9 @@ class AgentStateStore:
             if current < 19:
                 _apply_schema_v19(conn)
                 current = 19
+            if current < 20:
+                _apply_schema_v20(conn)
+                current = 20
             if current < SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}"
@@ -5150,6 +5458,55 @@ def _apply_schema_v19(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v20(conn: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            project_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            repository_path TEXT NOT NULL UNIQUE,
+            remote TEXT,
+            default_branch TEXT NOT NULL,
+            allowed_paths_json TEXT NOT NULL,
+            provider_policy_json TEXT NOT NULL,
+            cost_budget REAL,
+            privacy_class TEXT NOT NULL
+                CHECK (
+                    privacy_class IN (
+                        'local_required',
+                        'local_preferred',
+                        'approved_cloud'
+                    )
+                ),
+            test_recipes_json TEXT NOT NULL,
+            build_recipes_json TEXT NOT NULL,
+            capability_ceiling_json TEXT NOT NULL,
+            baseline_index_digest TEXT,
+            revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+            archived_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_projects_active
+            ON projects(archived_at, display_name, project_id);
+        """
+    )
+    run_columns = _columns(conn, "runs")
+    if run_columns and "project_id" not in run_columns:
+        conn.execute(
+            """
+            ALTER TABLE runs
+            ADD COLUMN project_id TEXT REFERENCES projects(project_id)
+        """
+        )
+    if run_columns:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_project_id ON runs(project_id, created_at)"
+        )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -5455,6 +5812,56 @@ def _run_from_row(row: sqlite3.Row) -> RunRecord:
         turn_source=_json_dict_or_none(_row_get(row, "turn_source_json")),
         turn_origin=str(_row_get(row, "turn_origin", "primary_user") or "primary_user"),
         transcript_scope=str(_row_get(row, "transcript_scope", "primary") or "primary"),
+        project_id=_optional_str(_row_get(row, "project_id")),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _project_from_row(row: sqlite3.Row) -> ProjectRecord:
+    return ProjectRecord(
+        project_id=str(row["project_id"]),
+        display_name=str(row["display_name"]),
+        repository_path=str(row["repository_path"]),
+        remote=_optional_str(row["remote"]),
+        default_branch=str(row["default_branch"]),
+        allowed_paths=tuple(
+            str(item) for item in json.loads(str(row["allowed_paths_json"]))
+        ),
+        provider_policy=cast(
+            dict[str, Any],
+            json.loads(str(row["provider_policy_json"])),
+        ),
+        cost_budget=(
+            None if row["cost_budget"] is None else float(row["cost_budget"])
+        ),
+        privacy_class=str(row["privacy_class"]),
+        test_recipes=tuple(
+            {
+                str(key): str(value)
+                for key, value in item.items()
+            }
+            for item in cast(
+                list[dict[str, object]],
+                json.loads(str(row["test_recipes_json"])),
+            )
+        ),
+        build_recipes=tuple(
+            {
+                str(key): str(value)
+                for key, value in item.items()
+            }
+            for item in cast(
+                list[dict[str, object]],
+                json.loads(str(row["build_recipes_json"])),
+            )
+        ),
+        capability_ceiling=tuple(
+            str(item) for item in json.loads(str(row["capability_ceiling_json"]))
+        ),
+        baseline_index_digest=_optional_str(row["baseline_index_digest"]),
+        revision=int(row["revision"]),
+        archived_at=_optional_str(row["archived_at"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
