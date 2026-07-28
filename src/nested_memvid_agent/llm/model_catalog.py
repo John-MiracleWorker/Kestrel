@@ -7,6 +7,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Event, Lock, Thread
 from time import monotonic
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -75,6 +77,8 @@ MAX_MODEL_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_MODEL_CATALOG_ENTRIES = 2048
 MAX_MODEL_ID_CHARS = 512
 _HTTP_READ_CHUNK_BYTES = 16 * 1024
+MAX_CONCURRENT_PROVIDER_HTTP_EXCHANGES = 8
+_PROVIDER_HTTP_WORKER_SLOTS = BoundedSemaphore(MAX_CONCURRENT_PROVIDER_HTTP_EXCHANGES)
 _SENSITIVE_QUERY_VALUE = re.compile(
     r"([?&](?:api[_-]?key|key|token|access[_-]?token)=)[^&\s]+",
     flags=re.IGNORECASE,
@@ -395,30 +399,18 @@ def _fetch_json(
         request_headers["Authorization"] = f"Bearer {api_key}"
     request = Request(safe_url, headers=request_headers)
     try:
-        # The URL is restricted to HTTP(S) with a host immediately above.
-        with urlopen(
+        raw_body = request_bytes_with_deadline(
             request,
-            timeout=_remaining_http_seconds(deadline, monotonic_clock),
-        ) as response:  # nosec B310
-            raw_body = read_bounded_http_body(
-                response,
-                max_bytes=MAX_MODEL_CATALOG_BYTES,
-                deadline=deadline,
-                monotonic_clock=monotonic_clock,
-            )
-    except HTTPError as exc:
-        try:
-            detail_bytes = read_bounded_http_body(
-                exc,
-                max_bytes=240,
-                deadline=deadline,
-                monotonic_clock=monotonic_clock,
-            )
-            detail = detail_bytes.decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - error-body diagnostics are best effort
-            detail = "response detail unavailable"
+            max_bytes=MAX_MODEL_CATALOG_BYTES,
+            error_max_bytes=240,
+            deadline=deadline,
+            monotonic_clock=monotonic_clock,
+            open_request=urlopen,
+        )
+    except BoundedHTTPStatusError as exc:
+        detail = exc.detail.decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"model list failed with HTTP {exc.code}: "
+            f"model list failed with HTTP {exc.status_code}: "
             f"{_safe_catalog_error(detail, secret=api_key)[:240]}"
         ) from exc
     except URLError as exc:
@@ -449,6 +441,140 @@ def urlopen(request: Request, timeout: float) -> Any:
 
     opener = build_opener(_RejectRedirectHandler())
     return opener.open(request, timeout=timeout)  # nosec B310
+
+
+class BoundedHTTPStatusError(RuntimeError):
+    def __init__(self, status_code: int, detail: bytes) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"provider returned HTTP {status_code}")
+
+
+@dataclass(frozen=True)
+class _HTTPWorkerResult:
+    body: bytes | None = None
+    error: Exception | None = None
+
+
+def request_bytes_with_deadline(
+    request: Request,
+    *,
+    max_bytes: int,
+    error_max_bytes: int,
+    deadline: float,
+    monotonic_clock: Callable[[], float] = monotonic,
+    open_request: Callable[[Request, float], Any],
+) -> bytes:
+    """Run a complete HTTP exchange behind one absolute caller wall deadline.
+
+    Socket timeouts alone are inactivity timers: DNS, connect, response
+    headers, and a slow-drip body can each consume a fresh timeout. The daemon
+    worker keeps those blocking operations off the caller, while cancellation
+    closes any response that has become available and prevents a late response
+    from being consumed after the deadline.
+    """
+
+    if max_bytes < 1 or error_max_bytes < 1:
+        raise ValueError("HTTP response byte limits must be positive")
+    remaining = _remaining_http_seconds(deadline, monotonic_clock)
+    cancelled = Event()
+    response_lock = Lock()
+    active_response: list[Any] = []
+    outcome: Queue[_HTTPWorkerResult] = Queue(maxsize=1)
+
+    def publish(result: _HTTPWorkerResult) -> None:
+        if not cancelled.is_set():
+            outcome.put_nowait(result)
+
+    def register_response(response: Any) -> bool:
+        with response_lock:
+            if cancelled.is_set():
+                return False
+            active_response.append(response)
+            return True
+
+    def clear_response(response: Any) -> None:
+        with response_lock:
+            if active_response and active_response[0] is response:
+                active_response.clear()
+
+    def read_response(response: Any, *, byte_limit: int) -> bytes:
+        if not register_response(response):
+            _close_http_response(response)
+            raise TimeoutError("provider response deadline exceeded")
+        try:
+            return read_bounded_http_body(
+                response,
+                max_bytes=byte_limit,
+                deadline=deadline,
+                monotonic_clock=monotonic_clock,
+            )
+        finally:
+            clear_response(response)
+            _close_http_response(response)
+
+    def exchange() -> None:
+        try:
+            try:
+                # The caller validates the URL before constructing the request.
+                response = open_request(
+                    request,
+                    _remaining_http_seconds(deadline, monotonic_clock),
+                )
+                publish(_HTTPWorkerResult(body=read_response(response, byte_limit=max_bytes)))
+            except HTTPError as exc:
+                try:
+                    detail = read_response(exc, byte_limit=error_max_bytes)
+                except Exception:  # noqa: BLE001 - status diagnostics are best effort
+                    detail = b"response detail unavailable"
+                publish(
+                    _HTTPWorkerResult(
+                        error=BoundedHTTPStatusError(int(exc.code), detail),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - propagated across worker boundary
+                publish(_HTTPWorkerResult(error=exc))
+        finally:
+            _PROVIDER_HTTP_WORKER_SLOTS.release()
+
+    if not _PROVIDER_HTTP_WORKER_SLOTS.acquire(timeout=remaining):
+        raise TimeoutError("provider response deadline exceeded")
+    try:
+        remaining = _remaining_http_seconds(deadline, monotonic_clock)
+        worker = Thread(
+            target=exchange,
+            name="kestrel-provider-http-deadline",
+            daemon=True,
+        )
+        worker.start()
+    except Exception:
+        _PROVIDER_HTTP_WORKER_SLOTS.release()
+        raise
+    try:
+        result = outcome.get(timeout=remaining)
+    except Empty as exc:
+        cancelled.set()
+        with response_lock:
+            response = active_response[0] if active_response else None
+        _close_http_response(response)
+        raise TimeoutError("provider response deadline exceeded") from exc
+    if monotonic_clock() >= deadline:
+        cancelled.set()
+        raise TimeoutError("provider response deadline exceeded")
+    if result.error is not None:
+        raise result.error
+    if result.body is None:
+        raise RuntimeError("provider HTTP worker returned no result")
+    return result.body
+
+
+def _close_http_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - cancellation cleanup is best effort
+            pass
 
 
 def read_bounded_http_body(

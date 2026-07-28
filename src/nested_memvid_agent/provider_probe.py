@@ -7,16 +7,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, Literal, Protocol
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request
 
 from .config import AgentConfig
 from .llm.model_catalog import (
     DEFAULT_BASE_URLS,
+    BoundedHTTPStatusError,
     ProviderModelCatalog,
     model_catalog_for_provider,
-    read_bounded_http_body,
+    request_bytes_with_deadline,
     urlopen,
 )
 from .llm.provider_urls import normalize_ollama_openai_base_url, validate_provider_http_url
@@ -686,13 +687,6 @@ def _join_url(base_url: str, suffix: str) -> str:
     return validate_provider_http_url(urljoin(f"{safe_base_url.rstrip('/')}/", suffix))
 
 
-def _remaining_seconds(deadline: float, clock: Callable[[], float]) -> float:
-    remaining = deadline - clock()
-    if remaining <= 0:
-        raise TimeoutError("provider probe deadline exceeded")
-    return max(0.001, remaining)
-
-
 def _post_json(
     url: str,
     payload: Mapping[str, object],
@@ -744,30 +738,18 @@ def _post_bytes(
         method="POST",
     )
     try:
-        # URL schemes and hosts are validated immediately above.
-        with urlopen(
+        body = request_bytes_with_deadline(
             request,
-            timeout=_remaining_seconds(active_deadline, monotonic_clock),
-        ) as response:  # nosec B310
-            body = read_bounded_http_body(
-                response,
-                max_bytes=MAX_PROBE_RESPONSE_BYTES,
-                deadline=active_deadline,
-                monotonic_clock=monotonic_clock,
-            )
-    except HTTPError as exc:
-        try:
-            detail_bytes = read_bounded_http_body(
-                exc,
-                max_bytes=240,
-                deadline=active_deadline,
-                monotonic_clock=monotonic_clock,
-            )
-            detail = detail_bytes.decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - error-body diagnostics are best effort
-            detail = "response detail unavailable"
+            max_bytes=MAX_PROBE_RESPONSE_BYTES,
+            error_max_bytes=240,
+            deadline=active_deadline,
+            monotonic_clock=monotonic_clock,
+            open_request=urlopen,
+        )
+    except BoundedHTTPStatusError as exc:
+        detail = exc.detail.decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"provider probe failed with HTTP {exc.code}: "
+            f"provider probe failed with HTTP {exc.status_code}: "
             f"{_safe_error(detail, secrets=(secret,))}"
         ) from exc
     except URLError as exc:

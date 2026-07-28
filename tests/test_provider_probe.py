@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Lock, Thread
+from time import monotonic, sleep
 from typing import Any
 
 import pytest
@@ -460,6 +462,142 @@ def _serve(handler: type[BaseHTTPRequestHandler]) -> Any:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+class _SlowHeaderHandler(BaseHTTPRequestHandler):
+    def _respond(self) -> None:
+        try:
+            self.connection.sendall(b"HTTP/1.1 200 OK\r\nX-Kestrel-Slow: ")
+            for value in b"deadline-must-cover-headers":
+                self.connection.sendall(bytes((value,)))
+                sleep(0.03)
+            self.connection.sendall(
+                b"\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+            )
+        except OSError:
+            # The bounded client is expected to close the connection while this
+            # adversarial peer is still trickling headers.
+            return
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._respond()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._respond()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return None
+
+
+def test_catalog_wall_deadline_covers_slow_response_headers() -> None:
+    with _serve(_SlowHeaderHandler) as base_url:
+        started = monotonic()
+        with pytest.raises(TimeoutError, match="deadline"):
+            _fetch_json(
+                f"{base_url}/models",
+                timeout_seconds=0.25,
+                api_key=None,
+            )
+        elapsed = monotonic() - started
+
+    assert elapsed < 0.75
+
+
+def test_probe_wall_deadline_covers_slow_response_headers() -> None:
+    with _serve(_SlowHeaderHandler) as base_url:
+        started = monotonic()
+        with pytest.raises(TimeoutError, match="deadline"):
+            _post_bytes(
+                f"{base_url}/chat/completions",
+                {"model": "local"},
+                timeout_seconds=0.25,
+                secret=None,
+            )
+        elapsed = monotonic() - started
+
+    assert elapsed < 0.75
+
+
+def test_provider_wall_deadline_bounds_stuck_transport_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = Event()
+    drained = Event()
+    lock = Lock()
+    active = 0
+    maximum_active = 0
+
+    def blocked_open(_request: object, _timeout: float) -> Any:
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            release.wait(timeout=2)
+        finally:
+            with lock:
+                active -= 1
+                if active == 0:
+                    drained.set()
+        raise TimeoutError("blocked transport released")
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.model_catalog.urlopen",
+        blocked_open,
+    )
+
+    def fetch() -> None:
+        with pytest.raises(TimeoutError, match="deadline"):
+            _fetch_json(
+                "http://127.0.0.1:1234/v1/models",
+                timeout_seconds=0.3,
+                api_key=None,
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            futures = [pool.submit(fetch) for _index in range(12)]
+            for future in futures:
+                future.result(timeout=1)
+    finally:
+        release.set()
+
+    assert maximum_active <= 8
+    assert drained.wait(timeout=1)
+
+
+class _BlockingBodyResponse:
+    def __init__(self) -> None:
+        self.read_started = Event()
+        self.closed = Event()
+
+    def read1(self, _limit: int) -> bytes:
+        self.read_started.set()
+        self.closed.wait(timeout=2)
+        return b""
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+def test_provider_wall_deadline_cancels_an_active_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _BlockingBodyResponse()
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.model_catalog.urlopen",
+        lambda _request, _timeout: response,
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        _fetch_json(
+            "http://127.0.0.1:1234/v1/models",
+            timeout_seconds=0.1,
+            api_key=None,
+        )
+
+    assert response.read_started.wait(timeout=0.2)
+    assert response.closed.wait(timeout=0.2)
 
 
 def test_catalog_redirect_never_forwards_authorization_cross_host() -> None:

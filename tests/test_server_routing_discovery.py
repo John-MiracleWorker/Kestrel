@@ -16,7 +16,8 @@ from nested_memvid_agent.provider_probe import (
     ProviderProbeService,
 )
 from nested_memvid_agent.routing.ledger import RoutingLedger
-from nested_memvid_agent.routing.models import ProviderProfile
+from nested_memvid_agent.routing.models import AgentTaskContract, ProviderProfile
+from nested_memvid_agent.routing.router import RoutingUnavailableError, route_task
 from nested_memvid_agent.routing.runtime import AdaptiveFlockRuntimeConfig, build_run_manager
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.server_routing_routes import register_routing_routes
@@ -30,6 +31,7 @@ def _routing_app(
     models: list[str],
     catalog_ok: bool = True,
     catalog_complete: list[bool] | None = None,
+    probe_evidence: list[CapabilityEvidence] | None = None,
 ) -> tuple[Any, Any, ProviderProbeService]:
     fastapi = pytest.importorskip("fastapi")
     testclient = pytest.importorskip("fastapi.testclient")
@@ -73,11 +75,15 @@ def _routing_app(
                 model=model,
                 model_identity=model,
                 latency_ms=25.0,
-                capabilities=(
-                    CapabilityEvidence.observed_pass("generation"),
-                    CapabilityEvidence.observed_pass("streaming"),
-                    CapabilityEvidence.observed_pass("structured_output"),
-                    CapabilityEvidence.observed_pass("tools"),
+                capabilities=tuple(
+                    probe_evidence
+                    if probe_evidence is not None
+                    else (
+                        CapabilityEvidence.observed_pass("generation"),
+                        CapabilityEvidence.observed_pass("streaming"),
+                        CapabilityEvidence.observed_pass("structured_output"),
+                        CapabilityEvidence.observed_pass("tools"),
+                    )
                 ),
             )
 
@@ -330,6 +336,118 @@ def test_operator_confirmation_preserves_discovery_provenance_when_omitted(
         assert confirmed.status_code == 200
         assert confirmed.json()["metadata"]["discovery"]["managed"] is True
         assert confirmed.json()["enabled"] is True
+    finally:
+        assert build.runs.shutdown(timeout_seconds=1.0)
+        assert build.runs.mcp.shutdown()
+
+
+def test_failed_reprobe_revokes_confirmed_target_health_and_capability_authority(
+    tmp_path: Path,
+) -> None:
+    evidence = [
+        CapabilityEvidence.observed_pass("generation"),
+        CapabilityEvidence.observed_pass("streaming"),
+        CapabilityEvidence.observed_pass("structured_output"),
+        CapabilityEvidence.observed_pass("tools"),
+    ]
+    client, build, _service = _routing_app(
+        tmp_path,
+        models=["qwen-coder"],
+        probe_evidence=evidence,
+    )
+    try:
+        _create_profile(client)
+        discovered = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": "local",
+                "expected_profile_revision": 1,
+                "probe_capabilities": True,
+            },
+        )
+        assert discovered.status_code == 200
+        draft = discovered.json()["targets"][0]
+
+        confirmed = client.post(
+            "/api/routing/targets",
+            json={
+                "target_id": draft["target_id"],
+                "provider_profile_id": "local",
+                "provider": "openai-compatible",
+                "model": "qwen-coder",
+                "enabled": True,
+                "locality": "local",
+                "trust_class": "operator_confirmed",
+                "capability_tags": [
+                    "frontier-review",
+                    "generation",
+                    "streaming",
+                    "structured_output",
+                    "tools",
+                ],
+                "role_affinities": ["reviewer"],
+                "task_family_affinities": ["code-repair"],
+                "supports_tools": True,
+                "supports_json": True,
+                "supports_vision": True,
+                "supports_streaming": True,
+                "operator_priority": 7,
+                "estimated_cost_usd": 0.004,
+                "health": "healthy",
+                "expected_revision": draft["revision"],
+            },
+        )
+        assert confirmed.status_code == 200
+
+        evidence[:] = [
+            CapabilityEvidence.observed_failure("generation", "probe timed out"),
+            CapabilityEvidence.observed_failure("streaming", "probe timed out"),
+            CapabilityEvidence.observed_failure("structured_output", "invalid response"),
+            CapabilityEvidence.observed_failure("tools", "invalid tool call"),
+            CapabilityEvidence.observed_failure("vision", "not observed"),
+        ]
+        refreshed = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": "local",
+                "expected_profile_revision": 2,
+                "probe_capabilities": True,
+            },
+        )
+
+        assert refreshed.status_code == 200
+        target_payload = refreshed.json()["targets"][0]
+        assert target_payload["enabled"] is True
+        assert target_payload["health"] == "unavailable"
+        assert target_payload["supports_tools"] is False
+        assert target_payload["supports_json"] is False
+        assert target_payload["supports_vision"] is False
+        assert target_payload["supports_streaming"] is False
+        assert target_payload["capability_tags"] == ["frontier-review"]
+        assert target_payload["trust_class"] == "operator_confirmed"
+        assert target_payload["locality"] == "local"
+        assert target_payload["estimated_cost_usd"] == 0.004
+        assert target_payload["operator_priority"] == 7
+        assert target_payload["role_affinities"] == ["reviewer"]
+        assert target_payload["task_family_affinities"] == ["code-repair"]
+
+        persisted = build.routing_ledger.get_model_target(target_payload["target_id"])
+        assert persisted is not None
+        with pytest.raises(RoutingUnavailableError) as raised:
+            route_task(
+                AgentTaskContract(
+                    task_id="task-1",
+                    run_id="run-1",
+                    role="implementer",
+                    task_family="code-repair",
+                    objective="repair the failing test",
+                    complexity=0.4,
+                    ambiguity=0.2,
+                    risk="low",
+                ),
+                [persisted.target],
+            )
+        assert "target_health_unavailable" in raised.value.reason_codes
     finally:
         assert build.runs.shutdown(timeout_seconds=1.0)
         assert build.runs.mcp.shutdown()

@@ -512,6 +512,8 @@ def _plan_discovered_targets(
                 supports_streaming="streaming" in supported,
                 health="healthy" if _generation_observed(model_probe) else "unknown",
             )
+        else:
+            updated = _apply_observed_probe_authority(updated, model_probe)
         updates.append((updated, existing.revision))
 
     available_models = set(discovery.catalog_models)
@@ -677,6 +679,51 @@ def _generation_observed(model_probe: DiscoveredModelProbe) -> bool:
         and evidence.status == "pass"
         and evidence.provenance == "observed"
         for evidence in model_probe.capabilities
+    )
+
+
+def _apply_observed_probe_authority(
+    target: ModelTarget,
+    model_probe: DiscoveredModelProbe,
+) -> ModelTarget:
+    observed = {
+        evidence.capability: evidence
+        for evidence in model_probe.capabilities
+        if evidence.provenance == "observed" and evidence.status in {"pass", "fail"}
+    }
+    if not observed:
+        return target
+
+    capability_tags = set(target.capability_tags)
+    for capability, evidence in observed.items():
+        if evidence.status == "pass" and evidence.supported is True:
+            capability_tags.add(capability)
+        else:
+            capability_tags.discard(capability)
+
+    health = target.health
+    generation = observed.get("generation")
+    if generation is not None:
+        health = (
+            "healthy"
+            if generation.status == "pass" and generation.supported is True
+            else "unavailable"
+        )
+
+    def observed_support(capability: str, current: bool) -> bool:
+        evidence = observed.get(capability)
+        if evidence is None:
+            return current
+        return evidence.status == "pass" and evidence.supported is True
+
+    return replace(
+        target,
+        capability_tags=tuple(sorted(capability_tags)),
+        supports_tools=observed_support("tools", target.supports_tools),
+        supports_json=observed_support("structured_output", target.supports_json),
+        supports_vision=observed_support("vision", target.supports_vision),
+        supports_streaming=observed_support("streaming", target.supports_streaming),
+        health=health,
     )
 
 
