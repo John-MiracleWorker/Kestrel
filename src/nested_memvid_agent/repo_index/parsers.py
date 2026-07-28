@@ -9,13 +9,13 @@ from .models import ParsedFile, ParsedImport, ParsedReference, ParsedSymbol
 
 PARSER_VERSIONS: dict[str, str] = {
     "python": "ast-v1",
-    "javascript": "structural-regex-v1",
-    "typescript": "structural-regex-v1",
-    "go": "structural-regex-v1",
-    "rust": "structural-regex-v1",
-    "java": "structural-regex-v1",
-    "kotlin": "structural-regex-v1",
-    "swift": "structural-regex-v1",
+    "javascript": "structural-regex-v2",
+    "typescript": "structural-regex-v2",
+    "go": "structural-regex-v2",
+    "rust": "structural-regex-v2",
+    "java": "structural-regex-v2",
+    "kotlin": "structural-regex-v2",
+    "swift": "structural-regex-v2",
     "text": "lexical-v1",
 }
 
@@ -120,13 +120,13 @@ def parse_file(path: Path, content: str, language: str) -> ParsedFile:
 
 class _PythonVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
-        self._scope: list[str] = []
+        self._scope: list[tuple[str, str]] = []
         self.symbols: list[ParsedSymbol] = []
         self.imports: list[ParsedImport] = []
         self.references: list[ParsedReference] = []
 
     def _add_symbol(self, node: ast.AST, name: str, kind: str) -> None:
-        qualified = ".".join((*self._scope, name))
+        qualified = ".".join((*[scope[0] for scope in self._scope], name))
         self.symbols.append(
             ParsedSymbol(
                 name=name,
@@ -139,19 +139,21 @@ class _PythonVisitor(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._add_symbol(node, node.name, "class")
-        self._scope.append(node.name)
+        self._scope.append((node.name, "class"))
         self.generic_visit(node)
         self._scope.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._add_symbol(node, node.name, "method" if self._scope else "function")
-        self._scope.append(node.name)
+        kind = "method" if self._scope and self._scope[-1][1] == "class" else "function"
+        self._add_symbol(node, node.name, kind)
+        self._scope.append((node.name, "function"))
         self.generic_visit(node)
         self._scope.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._add_symbol(node, node.name, "method" if self._scope else "function")
-        self._scope.append(node.name)
+        kind = "method" if self._scope and self._scope[-1][1] == "class" else "function"
+        self._add_symbol(node, node.name, kind)
+        self._scope.append((node.name, "function"))
         self.generic_visit(node)
         self._scope.pop()
 
@@ -231,6 +233,7 @@ def _parse_python(content: str) -> ParsedFile:
 
 
 def _parse_javascript(content: str) -> ParsedFile:
+    import_source, code_source = _structural_sources(content)
     patterns = (
         (re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)"), "class"),
         (
@@ -257,14 +260,20 @@ def _parse_javascript(content: str) -> ParsedFile:
         (re.compile(r"\btype\s+([A-Za-z_$][\w$]*)\s*="), "type"),
     )
     imports: list[ParsedImport] = []
-    for match in re.finditer(r"\bimport(?:\s+[\s\S]*?\s+from\s+|\s*)[\"']([^\"']+)[\"']", content):
-        imports.append(_parsed_import(content, match, match.group(1)))
-    for match in re.finditer(r"\brequire\s*\(\s*[\"']([^\"']+)[\"']\s*\)", content):
-        imports.append(_parsed_import(content, match, match.group(1)))
-    return _parse_structural(content, patterns, imports)
+    for match in re.finditer(
+        r"\bimport(?:\s+[\s\S]*?\s+from\s+|\s*)[\"']([^\"']+)[\"']",
+        import_source,
+    ):
+        if _match_has_code_prefix(code_source, match):
+            imports.append(_parsed_import(import_source, match, match.group(1)))
+    for match in re.finditer(r"\brequire\s*\(\s*[\"']([^\"']+)[\"']\s*\)", import_source):
+        if _match_has_code_prefix(code_source, match):
+            imports.append(_parsed_import(import_source, match, match.group(1)))
+    return _parse_structural(code_source, patterns, imports)
 
 
 def _parse_go(content: str) -> ParsedFile:
+    import_source, code_source = _structural_sources(content)
     patterns = (
         (re.compile(r"(?m)^\s*type\s+([A-Za-z_]\w*)\s+"), "type"),
         (
@@ -273,13 +282,15 @@ def _parse_go(content: str) -> ParsedFile:
         ),
     )
     imports = [
-        _parsed_import(content, match, match.group(1))
-        for match in re.finditer(r"(?m)^\s*(?:import\s+)?[\"`]([^\"`]+)[\"`]", content)
+        _parsed_import(import_source, match, match.group(1))
+        for match in re.finditer(r"(?m)^\s*(?:import\s+)?[\"`]([^\"`]+)[\"`]", import_source)
+        if _match_has_code_prefix(code_source, match)
     ]
-    return _parse_structural(content, patterns, imports)
+    return _parse_structural(code_source, patterns, imports)
 
 
 def _parse_rust(content: str) -> ParsedFile:
+    import_source, code_source = _structural_sources(content)
     patterns = (
         (re.compile(r"\bstruct\s+([A-Za-z_]\w*)"), "struct"),
         (re.compile(r"\benum\s+([A-Za-z_]\w*)"), "enum"),
@@ -288,13 +299,15 @@ def _parse_rust(content: str) -> ParsedFile:
         (re.compile(r"\btype\s+([A-Za-z_]\w*)\s*="), "type"),
     )
     imports = [
-        _parsed_import(content, match, match.group(1).strip())
-        for match in re.finditer(r"(?m)^\s*use\s+([^;]+);", content)
+        _parsed_import(import_source, match, match.group(1).strip())
+        for match in re.finditer(r"(?m)^\s*use\s+([^;]+);", import_source)
+        if _match_has_code_prefix(code_source, match)
     ]
-    return _parse_structural(content, patterns, imports)
+    return _parse_structural(code_source, patterns, imports)
 
 
 def _parse_java(content: str) -> ParsedFile:
+    import_source, code_source = _structural_sources(content)
     patterns = (
         (
             re.compile(r"\b(?:class|record)\s+([A-Za-z_]\w*)"),
@@ -313,13 +326,15 @@ def _parse_java(content: str) -> ParsedFile:
         ),
     )
     imports = [
-        _parsed_import(content, match, match.group(1))
-        for match in re.finditer(r"(?m)^\s*import\s+(?:static\s+)?([^;]+);", content)
+        _parsed_import(import_source, match, match.group(1))
+        for match in re.finditer(r"(?m)^\s*import\s+(?:static\s+)?([^;]+);", import_source)
+        if _match_has_code_prefix(code_source, match)
     ]
-    return _parse_structural(content, patterns, imports)
+    return _parse_structural(code_source, patterns, imports)
 
 
 def _parse_kotlin(content: str) -> ParsedFile:
+    import_source, code_source = _structural_sources(content)
     patterns = (
         (
             re.compile(r"\b(?:data\s+|sealed\s+)?class\s+([A-Za-z_]\w*)"),
@@ -330,13 +345,15 @@ def _parse_kotlin(content: str) -> ParsedFile:
         (re.compile(r"\bfun\s+([A-Za-z_]\w*)\s*\("), "function"),
     )
     imports = [
-        _parsed_import(content, match, match.group(1))
-        for match in re.finditer(r"(?m)^\s*import\s+([^\s;]+)", content)
+        _parsed_import(import_source, match, match.group(1))
+        for match in re.finditer(r"(?m)^\s*import\s+([^\s;]+)", import_source)
+        if _match_has_code_prefix(code_source, match)
     ]
-    return _parse_structural(content, patterns, imports)
+    return _parse_structural(code_source, patterns, imports)
 
 
 def _parse_swift(content: str) -> ParsedFile:
+    import_source, code_source = _structural_sources(content)
     patterns = (
         (re.compile(r"\bclass\s+([A-Za-z_]\w*)"), "class"),
         (re.compile(r"\bstruct\s+([A-Za-z_]\w*)"), "struct"),
@@ -346,10 +363,109 @@ def _parse_swift(content: str) -> ParsedFile:
         (re.compile(r"\btypealias\s+([A-Za-z_]\w*)\s*="), "type"),
     )
     imports = [
-        _parsed_import(content, match, match.group(1))
-        for match in re.finditer(r"(?m)^\s*import\s+([A-Za-z_][\w.]*)", content)
+        _parsed_import(import_source, match, match.group(1))
+        for match in re.finditer(r"(?m)^\s*import\s+([A-Za-z_][\w.]*)", import_source)
+        if _match_has_code_prefix(code_source, match)
     ]
-    return _parse_structural(content, patterns, imports)
+    return _parse_structural(code_source, patterns, imports)
+
+
+def _structural_sources(content: str) -> tuple[str, str]:
+    comment_free = _mask_non_code(content, mask_strings=False)
+    return comment_free, _mask_non_code(comment_free, mask_strings=True)
+
+
+def _match_has_code_prefix(code_source: str, match: re.Match[str]) -> bool:
+    return any(not character.isspace() for character in code_source[match.start() : match.start(1)])
+
+
+def _mask_non_code(content: str, *, mask_strings: bool) -> str:
+    masked = list(content)
+    index = 0
+    length = len(content)
+    while index < length:
+        if content.startswith("//", index):
+            index = _mask_line_comment(masked, content, index)
+            continue
+        if content.startswith("/*", index):
+            index = _mask_block_comment(masked, content, index)
+            continue
+        quote = content[index]
+        if quote in {"'", '"', "`"}:
+            index = _consume_string(
+                masked,
+                content,
+                index,
+                quote=quote,
+                mask=mask_strings,
+            )
+            continue
+        index += 1
+    return "".join(masked)
+
+
+def _mask_line_comment(masked: list[str], content: str, start: int) -> int:
+    index = start
+    while index < len(content) and content[index] != "\n":
+        masked[index] = " "
+        index += 1
+    return index
+
+
+def _mask_block_comment(masked: list[str], content: str, start: int) -> int:
+    index = start
+    depth = 0
+    while index < len(content):
+        if content.startswith("/*", index):
+            depth += 1
+            masked[index : index + 2] = [" ", " "]
+            index += 2
+            continue
+        if content.startswith("*/", index):
+            depth -= 1
+            masked[index : index + 2] = [" ", " "]
+            index += 2
+            if depth == 0:
+                return index
+            continue
+        if content[index] != "\n":
+            masked[index] = " "
+        index += 1
+    return index
+
+
+def _consume_string(
+    masked: list[str],
+    content: str,
+    start: int,
+    *,
+    quote: str,
+    mask: bool,
+) -> int:
+    delimiter = quote * 3 if content.startswith(quote * 3, start) else quote
+    index = start
+    for offset in range(len(delimiter)):
+        if mask:
+            masked[index + offset] = " "
+    index += len(delimiter)
+    while index < len(content):
+        if content.startswith(delimiter, index):
+            for offset in range(len(delimiter)):
+                if mask:
+                    masked[index + offset] = " "
+            return index + len(delimiter)
+        if content[index] == "\\" and len(delimiter) == 1 and index + 1 < len(content):
+            if mask:
+                if content[index] != "\n":
+                    masked[index] = " "
+                if content[index + 1] != "\n":
+                    masked[index + 1] = " "
+            index += 2
+            continue
+        if mask and content[index] != "\n":
+            masked[index] = " "
+        index += 1
+    return index
 
 
 def _parse_structural(
@@ -419,7 +535,9 @@ def _dedupe_symbols(values: list[ParsedSymbol]) -> tuple[ParsedSymbol, ...]:
                 item.line,
                 item.column,
                 item.name.casefold(),
+                item.name,
                 item.kind,
+                item.qualified_name.casefold(),
                 item.qualified_name,
             ),
         )
@@ -434,6 +552,8 @@ def _dedupe_imports(values: list[ParsedImport]) -> tuple[ParsedImport, ...]:
                 item.line,
                 item.column,
                 item.module.casefold(),
+                item.module,
+                (item.imported_name or "").casefold(),
                 item.imported_name or "",
             ),
         )
@@ -444,7 +564,12 @@ def _dedupe_references(values: list[ParsedReference]) -> tuple[ParsedReference, 
     return tuple(
         sorted(
             set(values),
-            key=lambda item: (item.line, item.column, item.name.casefold()),
+            key=lambda item: (
+                item.line,
+                item.column,
+                item.name.casefold(),
+                item.name,
+            ),
         )
     )
 

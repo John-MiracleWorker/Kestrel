@@ -1,5 +1,7 @@
 from .indexer import RepositoryIndex
 from .models import (
+    DEFAULT_QUERY_LIMIT,
+    MAX_QUERY_LIMIT,
     BuildReport,
     FileRecord,
     Freshness,
@@ -16,6 +18,7 @@ from .models import (
 )
 
 __all__ = [
+    "DEFAULT_QUERY_LIMIT",
     "BuildReport",
     "FileRecord",
     "Freshness",
@@ -23,6 +26,7 @@ __all__ = [
     "IndexLimits",
     "IndexQueryResult",
     "IndexStatus",
+    "MAX_QUERY_LIMIT",
     "ReferenceRecord",
     "RepositoryChangedDuringIndexingError",
     "RepositoryIndex",

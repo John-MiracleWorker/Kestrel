@@ -5,6 +5,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Generic, TypeVar
 
+DEFAULT_QUERY_LIMIT = 100
+MAX_QUERY_LIMIT = 1_000
+
 
 class Freshness(StrEnum):
     CURRENT = "current"
@@ -169,6 +172,8 @@ class ParsedFile:
 class CandidateFile:
     path: Path
     relative_path: str
+    device: int
+    inode: int
     size: int
     mtime_ns: int
     ctime_ns: int

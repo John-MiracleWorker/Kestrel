@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from .models import (
+    MAX_QUERY_LIMIT,
     FileRecord,
     ImportRecord,
     IndexedCandidate,
@@ -20,7 +22,8 @@ from .models import (
     TestRelationshipRecord,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_APPLICATION_ID = 0x4B535452
 
 
 @dataclass(frozen=True)
@@ -42,14 +45,33 @@ class StoredFileState:
     id: int
     path: str
     digest: str
+    device: int
+    inode: int
     size: int
     mtime_ns: int
     ctime_ns: int
 
 
+@dataclass(frozen=True)
+class _PathBinding:
+    path: Path
+    device: int
+    inode: int
+
+
 class RepoIndexStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        managed_directories: tuple[Path, ...] = (),
+        custom_parent: bool = False,
+    ) -> None:
         self.path = path
+        self._managed_directories = managed_directories
+        self._custom_parent = custom_parent
+        self._parent_bindings: tuple[_PathBinding, ...] = ()
+        self._database_binding: _PathBinding | None = None
 
     def initialize(
         self,
@@ -58,17 +80,18 @@ class RepoIndexStore:
         root_identity: RootIdentity,
         parser_versions: dict[str, str],
     ) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass
+        self._prepare_sidecar_parent()
         with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, SCHEMA_VERSION}:
+            if version not in {0, 1, SCHEMA_VERSION}:
                 raise RepositoryIndexError(f"unsupported repository index schema version {version}")
             if version == 0:
                 self._create_schema(connection)
+            elif version == 1:
+                self._migrate_schema_v1(connection)
+            application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+            if application_id != _APPLICATION_ID:
+                raise RepositoryIndexError("repository index database identity marker is invalid")
             existing = connection.execute(
                 "SELECT project_id FROM index_metadata WHERE singleton = 1"
             ).fetchone()
@@ -126,7 +149,7 @@ class RepoIndexStore:
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT id, path, digest, size, mtime_ns, ctime_ns
+                SELECT id, path, digest, device, inode, size, mtime_ns, ctime_ns
                 FROM files
                 ORDER BY path
                 """
@@ -136,6 +159,8 @@ class RepoIndexStore:
                 id=int(row["id"]),
                 path=str(row["path"]),
                 digest=str(row["digest"]),
+                device=int(row["device"]),
+                inode=int(row["inode"]),
                 size=int(row["size"]),
                 mtime_ns=int(row["mtime_ns"]),
                 ctime_ns=int(row["ctime_ns"]),
@@ -176,13 +201,15 @@ class RepoIndexStore:
                 cursor = connection.execute(
                     """
                     INSERT INTO files (
-                        path, digest, size, mtime_ns, ctime_ns, language,
+                        path, digest, device, inode, size, mtime_ns, ctime_ns, language,
                         parser_version, is_test
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         item.candidate.relative_path,
                         item.digest,
+                        item.candidate.device,
+                        item.candidate.inode,
                         item.candidate.size,
                         item.candidate.mtime_ns,
                         item.candidate.ctime_ns,
@@ -270,14 +297,17 @@ class RepoIndexStore:
                 ),
             )
 
-    def files(self) -> tuple[FileRecord, ...]:
+    def files(self, *, limit: int) -> tuple[FileRecord, ...]:
+        bounded_limit = _validated_query_limit(limit)
         with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT id, path, digest, size, language, parser_version, is_test
                 FROM files
-                ORDER BY path
-                """
+                ORDER BY path, id
+                LIMIT ?
+                """,
+                (bounded_limit,),
             ).fetchall()
         return tuple(
             FileRecord(
@@ -292,17 +322,30 @@ class RepoIndexStore:
             for row in rows
         )
 
-    def symbols(self, query: str | None = None) -> tuple[SymbolRecord, ...]:
+    def symbols(self, query: str | None = None, *, limit: int) -> tuple[SymbolRecord, ...]:
+        bounded_limit = _validated_query_limit(limit)
+        predicate = ""
+        parameters: list[object] = []
+        if query is not None:
+            predicate = (
+                "WHERE instr(lower(s.name), lower(?)) > 0 "
+                "OR instr(lower(s.qualified_name), lower(?)) > 0"
+            )
+            parameters.extend((query, query))
+        parameters.append(bounded_limit)
         rows = self._select_records(
-            """
+            f"""
             SELECT s.id, f.path, f.digest, s.name, s.qualified_name, s.kind,
                    s.line, s.column_number
             FROM symbols AS s
             JOIN files AS f ON f.id = s.file_id
-            ORDER BY f.path, s.line, s.column_number, lower(s.name), s.kind
-            """
+            {predicate}
+            ORDER BY f.path, s.line, s.column_number, lower(s.name), s.name,
+                     s.kind, lower(s.qualified_name), s.qualified_name, s.id
+            LIMIT ?
+            """,
+            tuple(parameters),
         )
-        folded = query.casefold() if query else None
         return tuple(
             SymbolRecord(
                 id=int(row["id"]),
@@ -315,22 +358,30 @@ class RepoIndexStore:
                 column=int(row["column_number"]),
             )
             for row in rows
-            if folded is None
-            or folded in str(row["name"]).casefold()
-            or folded in str(row["qualified_name"]).casefold()
         )
 
-    def imports(self, query: str | None = None) -> tuple[ImportRecord, ...]:
+    def imports(self, query: str | None = None, *, limit: int) -> tuple[ImportRecord, ...]:
+        bounded_limit = _validated_query_limit(limit)
+        predicate = ""
+        parameters: list[object] = []
+        if query is not None:
+            predicate = "WHERE instr(lower(i.module), lower(?)) > 0"
+            parameters.append(query)
+        parameters.append(bounded_limit)
         rows = self._select_records(
-            """
+            f"""
             SELECT i.id, f.path, f.digest, i.module, i.imported_name,
                    i.line, i.column_number
             FROM imports AS i
             JOIN files AS f ON f.id = i.file_id
-            ORDER BY f.path, i.line, i.column_number, lower(i.module)
-            """
+            {predicate}
+            ORDER BY f.path, i.line, i.column_number, lower(i.module), i.module,
+                     lower(coalesce(i.imported_name, '')),
+                     coalesce(i.imported_name, ''), i.id
+            LIMIT ?
+            """,
+            tuple(parameters),
         )
-        folded = query.casefold() if query else None
         return tuple(
             ImportRecord(
                 id=int(row["id"]),
@@ -342,19 +393,27 @@ class RepoIndexStore:
                 column=int(row["column_number"]),
             )
             for row in rows
-            if folded is None or folded in str(row["module"]).casefold()
         )
 
-    def references(self, name: str | None = None) -> tuple[ReferenceRecord, ...]:
+    def references(self, name: str | None = None, *, limit: int) -> tuple[ReferenceRecord, ...]:
+        bounded_limit = _validated_query_limit(limit)
+        predicate = ""
+        parameters: list[object] = []
+        if name is not None:
+            predicate = "WHERE lower(r.name) = lower(?)"
+            parameters.append(name)
+        parameters.append(bounded_limit)
         rows = self._select_records(
-            """
+            f"""
             SELECT r.id, f.path, f.digest, r.name, r.line, r.column_number
             FROM lexical_references AS r
             JOIN files AS f ON f.id = r.file_id
-            ORDER BY f.path, r.line, r.column_number, lower(r.name)
-            """
+            {predicate}
+            ORDER BY f.path, r.line, r.column_number, lower(r.name), r.name, r.id
+            LIMIT ?
+            """,
+            tuple(parameters),
         )
-        folded = name.casefold() if name else None
         return tuple(
             ReferenceRecord(
                 id=int(row["id"]),
@@ -365,10 +424,10 @@ class RepoIndexStore:
                 column=int(row["column_number"]),
             )
             for row in rows
-            if folded is None or folded == str(row["name"]).casefold()
         )
 
-    def tests_for(self, symbol_name: str) -> tuple[TestRelationshipRecord, ...]:
+    def tests_for(self, symbol_name: str, *, limit: int) -> tuple[TestRelationshipRecord, ...]:
+        bounded_limit = _validated_query_limit(limit)
         with self._connection() as connection:
             rows = connection.execute(
                 """
@@ -379,9 +438,11 @@ class RepoIndexStore:
                 JOIN files AS sf ON sf.id = s.file_id
                 JOIN files AS tf ON tf.id = tr.test_file_id
                 WHERE lower(s.name) = lower(?)
-                ORDER BY tf.path, sf.path, s.line, tr.evidence_line
+                ORDER BY tf.path, sf.path, s.line, tr.evidence_line,
+                         lower(s.name), s.name, tr.id
+                LIMIT ?
                 """,
-                (symbol_name,),
+                (symbol_name, bounded_limit),
             ).fetchall()
         return tuple(
             TestRelationshipRecord(
@@ -395,9 +456,9 @@ class RepoIndexStore:
             for row in rows
         )
 
-    def _select_records(self, statement: str) -> list[sqlite3.Row]:
+    def _select_records(self, statement: str, parameters: tuple[object, ...]) -> list[sqlite3.Row]:
         with self._connection() as connection:
-            return connection.execute(statement).fetchall()
+            return connection.execute(statement, parameters).fetchall()
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -420,6 +481,8 @@ class RepoIndexStore:
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
                 digest TEXT NOT NULL,
+                device INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
                 size INTEGER NOT NULL CHECK (size >= 0),
                 mtime_ns INTEGER NOT NULL,
                 ctime_ns INTEGER NOT NULL,
@@ -471,6 +534,16 @@ class RepoIndexStore:
             """
         )
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+
+    def _migrate_schema_v1(self, connection: sqlite3.Connection) -> None:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(files)")}
+        if "device" not in columns:
+            connection.execute("ALTER TABLE files ADD COLUMN device INTEGER NOT NULL DEFAULT -1")
+        if "inode" not in columns:
+            connection.execute("ALTER TABLE files ADD COLUMN inode INTEGER NOT NULL DEFAULT -1")
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
 
     def _rebuild_test_relationships(self, connection: sqlite3.Connection) -> None:
         connection.execute("DELETE FROM test_relationships")
@@ -489,18 +562,134 @@ class RepoIndexStore:
             """
         )
 
+    def _prepare_sidecar_parent(self) -> None:
+        if self._custom_parent:
+            if not self.path.parent.exists():
+                raise RepositoryIndexError(
+                    "custom repository index sidecar parent must already exist"
+                )
+            self._require_safe_directory(
+                self.path.parent,
+                label="custom repository index sidecar parent",
+            )
+        else:
+            for directory in self._managed_directories:
+                if os.path.lexists(directory):
+                    self._require_safe_directory(
+                        directory,
+                        label="repository index sidecar parent",
+                    )
+                    continue
+                try:
+                    directory.mkdir(mode=0o700)
+                except OSError as exc:
+                    raise RepositoryIndexError(
+                        "could not create repository index sidecar parent"
+                    ) from exc
+                if os.name == "posix":
+                    os.chmod(directory, 0o700)
+                self._require_safe_directory(
+                    directory,
+                    label="repository index sidecar parent",
+                )
+        try:
+            resolved_parent = self.path.parent.resolve(strict=True)
+        except OSError as exc:
+            raise RepositoryIndexError("repository index sidecar parent is inaccessible") from exc
+        if resolved_parent != self.path.parent:
+            raise RepositoryIndexError(
+                "repository index sidecar parent path contains a symbolic link"
+            )
+        self._parent_bindings = tuple(
+            self._directory_binding(component)
+            for component in _absolute_components(self.path.parent)
+        )
+
+    def _require_safe_directory(self, path: Path, *, label: str) -> None:
+        binding = self._directory_binding(path)
+        try:
+            info = os.lstat(binding.path)
+        except OSError as exc:
+            raise RepositoryIndexError(f"{label} is inaccessible") from exc
+        if os.name == "posix":
+            if info.st_uid != os.getuid():
+                raise RepositoryIndexError(f"{label} has an unsafe owner")
+            if stat.S_IMODE(info.st_mode) & 0o022:
+                raise RepositoryIndexError(f"{label} has unsafe write permissions")
+
+    def _directory_binding(self, path: Path) -> _PathBinding:
+        try:
+            info = os.lstat(path)
+        except OSError as exc:
+            raise RepositoryIndexError(
+                "repository index sidecar parent is missing or inaccessible"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise RepositoryIndexError(
+                "repository index sidecar parent must not be a symbolic link"
+            )
+        if not stat.S_ISDIR(info.st_mode):
+            raise RepositoryIndexError("repository index sidecar parent must be a directory")
+        return _PathBinding(
+            path=path,
+            device=int(info.st_dev),
+            inode=int(info.st_ino),
+        )
+
+    def _verify_parent_bindings(self) -> None:
+        for expected in self._parent_bindings:
+            observed = self._directory_binding(expected.path)
+            if observed.device != expected.device or observed.inode != expected.inode:
+                raise RepositoryIndexError("repository index sidecar parent identity changed")
+
+    def _database_path_binding(self) -> _PathBinding:
+        try:
+            info = os.lstat(self.path)
+        except OSError as exc:
+            raise RepositoryIndexError(
+                "repository index database is missing or inaccessible"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise RepositoryIndexError("repository index database must not be a symbolic link")
+        if not stat.S_ISREG(info.st_mode):
+            raise RepositoryIndexError("repository index database must be a regular file")
+        return _PathBinding(
+            path=self.path,
+            device=int(info.st_dev),
+            inode=int(info.st_ino),
+        )
+
+    def _bind_or_verify_database(self) -> None:
+        observed = self._database_path_binding()
+        if self._database_binding is None:
+            self._database_binding = observed
+            return
+        if (
+            observed.device != self._database_binding.device
+            or observed.inode != self._database_binding.inode
+        ):
+            raise RepositoryIndexError("repository index database identity changed")
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        if self.path.is_symlink():
-            raise RepositoryIndexError("repository index sidecar must not be a symbolic link")
+        self._verify_parent_bindings()
+        if self._database_binding is not None:
+            self._bind_or_verify_database()
         connection = sqlite3.connect(self.path, timeout=5.0)
-        if os.name == "posix":
-            os.chmod(self.path, 0o600)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
         try:
+            self._bind_or_verify_database()
+            if os.name == "posix":
+                os.chmod(self.path, 0o600)
+                self._bind_or_verify_database()
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or str(quick_check[0]) != "ok":
+                raise RepositoryIndexError("repository index database integrity check failed")
             with connection:
                 yield connection
+            self._verify_parent_bindings()
+            self._bind_or_verify_database()
         finally:
             connection.close()
 
@@ -509,3 +698,20 @@ def _optional_str(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _validated_query_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not 1 <= limit <= MAX_QUERY_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_QUERY_LIMIT}")
+    return limit
+
+
+def _absolute_components(path: Path) -> tuple[Path, ...]:
+    if not path.is_absolute():
+        raise RepositoryIndexError("repository index sidecar path must be absolute")
+    current = Path(path.anchor)
+    components = [current]
+    for part in path.parts[1:]:
+        current /= part
+        components.append(current)
+    return tuple(components)

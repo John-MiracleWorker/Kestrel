@@ -5,12 +5,15 @@ import os
 import re
 import stat
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar
 
 from .models import (
+    DEFAULT_QUERY_LIMIT,
+    MAX_QUERY_LIMIT,
     BuildReport,
     CandidateFile,
     FileRecord,
@@ -100,10 +103,22 @@ class RepositoryIndex:
         )
         self._parser_versions = {
             **PARSER_VERSIONS,
-            "scanner": "bounded-stat-v1",
+            "scanner": "descriptor-bounded-stat-v2",
             "scanner_limits": (f"files={self.limits.max_files};bytes={self.limits.max_file_bytes}"),
         }
-        self._store = RepoIndexStore(self.index_path)
+        managed_directories = (
+            (
+                self.repository_root / ".nest",
+                self.repository_root / ".nest" / "repo-index",
+            )
+            if default_index_path
+            else ()
+        )
+        self._store = RepoIndexStore(
+            self.index_path,
+            managed_directories=managed_directories,
+            custom_parent=not default_index_path,
+        )
         self._store.initialize(
             project_id=self.project_id,
             root_identity=self._observed_root_identity(),
@@ -111,96 +126,101 @@ class RepositoryIndex:
         )
 
     def rebuild(self) -> BuildReport:
-        root_identity = self._observed_root_identity()
-        self._store.assert_root_identity(root_identity)
-        before = self._snapshot()
-        force_reparse = self._store.metadata().parser_versions != self._parser_versions
-        stored = self._store.stored_files()
-        changed: list[IndexedCandidate] = []
-        reused_digests: dict[str, str] = {}
-        skipped = before.skipped_files
+        with self._root_descriptor() as (root_descriptor, root_identity):
+            self._store.assert_root_identity(root_identity)
+            before = self._snapshot(root_descriptor)
+            force_reparse = self._store.metadata().parser_versions != self._parser_versions
+            stored = self._store.stored_files()
+            changed: list[IndexedCandidate] = []
+            reused_digests: dict[str, str] = {}
+            skipped = before.skipped_files
 
-        for candidate in before.candidates:
-            previous = stored.get(candidate.relative_path)
-            if (
-                previous is not None
-                and not force_reparse
-                and previous.size == candidate.size
-                and previous.mtime_ns == candidate.mtime_ns
-                and previous.ctime_ns == candidate.ctime_ns
-            ):
-                reused_digests[candidate.relative_path] = previous.digest
-                continue
-            indexed = self._index_candidate(candidate)
-            if indexed is None:
-                skipped += 1
-                continue
-            changed.append(indexed)
+            for candidate in before.candidates:
+                previous = stored.get(candidate.relative_path)
+                if (
+                    previous is not None
+                    and not force_reparse
+                    and previous.device == candidate.device
+                    and previous.inode == candidate.inode
+                    and previous.size == candidate.size
+                    and previous.mtime_ns == candidate.mtime_ns
+                    and previous.ctime_ns == candidate.ctime_ns
+                ):
+                    reused_digests[candidate.relative_path] = previous.digest
+                    continue
+                indexed = self._index_candidate(candidate, root_descriptor)
+                if indexed is None:
+                    skipped += 1
+                    continue
+                changed.append(indexed)
 
-        current_digests = dict(reused_digests)
-        current_digests.update((item.candidate.relative_path, item.digest) for item in changed)
-        deleted = sorted(set(stored) - set(current_digests))
-        aggregate_digest = _aggregate_digest(current_digests)
+            current_digests = dict(reused_digests)
+            current_digests.update((item.candidate.relative_path, item.digest) for item in changed)
+            deleted = sorted(set(stored) - set(current_digests))
+            aggregate_digest = _aggregate_digest(current_digests)
 
-        after = self._snapshot()
-        if after.fingerprint != before.fingerprint:
-            raise RepositoryChangedDuringIndexingError(
-                "repository changed while the index snapshot was being built"
+            after = self._snapshot(root_descriptor)
+            if after.fingerprint != before.fingerprint:
+                raise RepositoryChangedDuringIndexingError(
+                    "repository changed while the index snapshot was being built"
+                )
+            self._store.apply_rebuild(
+                observed_root=root_identity,
+                changed=changed,
+                deleted_paths=deleted,
+                aggregate_digest=aggregate_digest,
+                freshness_fingerprint=after.fingerprint,
+                indexed_at=datetime.now(UTC).isoformat(),
+                parser_versions=self._parser_versions,
+                git_head=after.git_head,
+                git_tree=after.git_tree,
             )
-        final_identity = self._observed_root_identity()
-        if final_identity != root_identity:
-            raise RepositoryRootMismatchError("repository root identity changed while indexing")
-        self._store.apply_rebuild(
-            observed_root=final_identity,
-            changed=changed,
-            deleted_paths=deleted,
-            aggregate_digest=aggregate_digest,
-            freshness_fingerprint=after.fingerprint,
-            indexed_at=datetime.now(UTC).isoformat(),
-            parser_versions=self._parser_versions,
-            git_head=after.git_head,
-            git_tree=after.git_tree,
-        )
-        return BuildReport(
-            aggregate_digest=aggregate_digest,
-            changed_files=len(changed),
-            reused_files=len(reused_digests),
-            deleted_files=len(deleted),
-            skipped_files=skipped,
-            indexed_files=len(current_digests),
-            git_head=after.git_head,
-            git_tree=after.git_tree,
-        )
+            return BuildReport(
+                aggregate_digest=aggregate_digest,
+                changed_files=len(changed),
+                reused_files=len(reused_digests),
+                deleted_files=len(deleted),
+                skipped_files=skipped,
+                indexed_files=len(current_digests),
+                git_head=after.git_head,
+                git_tree=after.git_tree,
+            )
 
     def status(self) -> IndexStatus:
-        observed_root = self._observed_root_identity()
-        self._store.assert_root_identity(observed_root)
-        metadata = self._store.metadata()
-        observed = self._snapshot()
-        freshness = (
-            Freshness.CURRENT
-            if metadata.freshness_fingerprint
-            and metadata.freshness_fingerprint == observed.fingerprint
-            and metadata.parser_versions == self._parser_versions
-            else Freshness.STALE
-        )
-        return IndexStatus(
-            schema_version=SCHEMA_VERSION,
-            project_id=metadata.project_id,
-            repository_root=Path(metadata.root_path),
-            aggregate_digest=metadata.aggregate_digest,
-            freshness=freshness,
-            indexed_at=metadata.indexed_at,
-            parser_versions=metadata.parser_versions,
-            git_head=metadata.git_head,
-            git_tree=metadata.git_tree,
-            indexed_fingerprint=metadata.freshness_fingerprint,
-            observed_fingerprint=observed.fingerprint,
-        )
+        with self._root_descriptor() as (root_descriptor, observed_root):
+            self._store.assert_root_identity(observed_root)
+            metadata = self._store.metadata()
+            observed = self._snapshot(root_descriptor)
+            freshness = (
+                Freshness.CURRENT
+                if metadata.freshness_fingerprint
+                and metadata.freshness_fingerprint == observed.fingerprint
+                and metadata.parser_versions == self._parser_versions
+                else Freshness.STALE
+            )
+            return IndexStatus(
+                schema_version=SCHEMA_VERSION,
+                project_id=metadata.project_id,
+                repository_root=Path(metadata.root_path),
+                aggregate_digest=metadata.aggregate_digest,
+                freshness=freshness,
+                indexed_at=metadata.indexed_at,
+                parser_versions=metadata.parser_versions,
+                git_head=metadata.git_head,
+                git_tree=metadata.git_tree,
+                indexed_fingerprint=metadata.freshness_fingerprint,
+                observed_fingerprint=observed.fingerprint,
+            )
 
-    def files(self, *, include_stale_diagnostics: bool = False) -> IndexQueryResult[FileRecord]:
+    def files(
+        self,
+        *,
+        limit: int = DEFAULT_QUERY_LIMIT,
+        include_stale_diagnostics: bool = False,
+    ) -> IndexQueryResult[FileRecord]:
+        bounded_limit = _validate_query_limit(limit)
         return self._query(
-            self._store.files,
+            lambda: self._store.files(limit=bounded_limit),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -208,10 +228,12 @@ class RepositoryIndex:
         self,
         query: str | None = None,
         *,
+        limit: int = DEFAULT_QUERY_LIMIT,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[SymbolRecord]:
+        bounded_limit = _validate_query_limit(limit)
         return self._query(
-            lambda: self._store.symbols(query),
+            lambda: self._store.symbols(query, limit=bounded_limit),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -219,10 +241,12 @@ class RepositoryIndex:
         self,
         query: str | None = None,
         *,
+        limit: int = DEFAULT_QUERY_LIMIT,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[ImportRecord]:
+        bounded_limit = _validate_query_limit(limit)
         return self._query(
-            lambda: self._store.imports(query),
+            lambda: self._store.imports(query, limit=bounded_limit),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -230,10 +254,12 @@ class RepositoryIndex:
         self,
         name: str | None = None,
         *,
+        limit: int = DEFAULT_QUERY_LIMIT,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[ReferenceRecord]:
+        bounded_limit = _validate_query_limit(limit)
         return self._query(
-            lambda: self._store.references(name),
+            lambda: self._store.references(name, limit=bounded_limit),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -241,10 +267,12 @@ class RepositoryIndex:
         self,
         symbol_name: str,
         *,
+        limit: int = DEFAULT_QUERY_LIMIT,
         include_stale_diagnostics: bool = False,
     ) -> IndexQueryResult[TestRelationshipRecord]:
+        bounded_limit = _validate_query_limit(limit)
         return self._query(
-            lambda: self._store.tests_for(symbol_name),
+            lambda: self._store.tests_for(symbol_name, limit=bounded_limit),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -264,12 +292,11 @@ class RepositoryIndex:
             index_digest=status.aggregate_digest,
         )
 
-    def _snapshot(self) -> RepositorySnapshot:
-        root_identity = self._observed_root_identity()
-        self._store.assert_root_identity(root_identity)
+    def _snapshot(self, root_descriptor: int | None) -> RepositorySnapshot:
         candidates, skipped = _scan_candidates(
             self.repository_root,
             self.limits,
+            root_descriptor=root_descriptor,
         )
         git_head, git_tree = _git_identity(self.repository_root)
         fingerprint = _freshness_fingerprint(candidates, git_head, git_tree)
@@ -283,9 +310,11 @@ class RepositoryIndex:
 
     def _observed_root_identity(self) -> RootIdentity:
         try:
-            info = self.repository_root.stat()
+            info = os.lstat(self.repository_root)
         except OSError as exc:
             raise RepositoryRootMismatchError("repository root is missing or inaccessible") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise RepositoryRootMismatchError("repository root must not be a symbolic link")
         if not stat.S_ISDIR(info.st_mode):
             raise RepositoryRootMismatchError("repository root is not a directory")
         return RootIdentity(
@@ -294,8 +323,14 @@ class RepositoryIndex:
             inode=int(info.st_ino),
         )
 
-    def _index_candidate(self, candidate: CandidateFile) -> IndexedCandidate | None:
-        content = _read_stable_text(candidate, self.limits.max_file_bytes)
+    def _index_candidate(
+        self, candidate: CandidateFile, root_descriptor: int | None
+    ) -> IndexedCandidate | None:
+        content = _read_stable_text(
+            candidate,
+            self.limits.max_file_bytes,
+            root_descriptor=root_descriptor,
+        )
         if content is None:
             return None
         language = language_for_path(candidate.path)
@@ -308,6 +343,40 @@ class RepositoryIndex:
             is_test=_is_test_path(Path(candidate.relative_path)),
             parsed=parse_file(candidate.path, content, language),
         )
+
+    @contextmanager
+    def _root_descriptor(self) -> Iterator[tuple[int | None, RootIdentity]]:
+        before = self._observed_root_identity()
+        descriptor: int | None = None
+        if hasattr(os, "O_DIRECTORY"):
+            flags = os.O_RDONLY | os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(self.repository_root, flags)
+            except OSError as exc:
+                raise RepositoryRootMismatchError(
+                    "repository root could not be opened without following links"
+                ) from exc
+            opened = os.fstat(descriptor)
+            opened_identity = RootIdentity(
+                path=self.repository_root,
+                device=int(opened.st_dev),
+                inode=int(opened.st_ino),
+            )
+            if opened_identity != before or not stat.S_ISDIR(opened.st_mode):
+                os.close(descriptor)
+                raise RepositoryRootMismatchError("repository root identity changed while opening")
+        try:
+            yield descriptor, before
+            after = self._observed_root_identity()
+            if after != before:
+                raise RepositoryRootMismatchError(
+                    "repository root identity changed during index operation"
+                )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _canonical_root(path: Path) -> Path:
@@ -348,6 +417,82 @@ def _validate_sidecar_path(
 def _scan_candidates(
     repository_root: Path,
     limits: IndexLimits,
+    *,
+    root_descriptor: int | None,
+) -> tuple[list[CandidateFile], int]:
+    if root_descriptor is not None and hasattr(os, "fwalk"):
+        return _scan_candidates_from_descriptor(
+            repository_root,
+            limits,
+            root_descriptor=root_descriptor,
+        )
+    return _scan_candidates_from_path(repository_root, limits)
+
+
+def _scan_candidates_from_descriptor(
+    repository_root: Path,
+    limits: IndexLimits,
+    *,
+    root_descriptor: int,
+) -> tuple[list[CandidateFile], int]:
+    candidates: list[CandidateFile] = []
+    skipped = 0
+    for current, directory_names, file_names, current_descriptor in os.fwalk(
+        ".",
+        topdown=True,
+        follow_symlinks=False,
+        dir_fd=root_descriptor,
+    ):
+        retained_directories: list[str] = []
+        for name in sorted(directory_names):
+            if name.casefold() in _IGNORED_DIRECTORIES:
+                continue
+            try:
+                info = os.stat(
+                    name,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                continue
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                retained_directories.append(name)
+        directory_names[:] = retained_directories
+
+        for name in sorted(file_names):
+            relative_parent = Path() if current == "." else Path(current)
+            relative_path = (relative_parent / name).as_posix()
+            display_path = repository_root / relative_path
+            if _ignored_file(display_path):
+                skipped += 1
+                continue
+            try:
+                info = os.stat(
+                    name,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                skipped += 1
+                continue
+            candidate = _candidate_from_stat(
+                path=display_path,
+                relative_path=relative_path,
+                info=info,
+                limits=limits,
+                candidate_count=len(candidates),
+            )
+            if candidate is None:
+                skipped += 1
+                continue
+            candidates.append(candidate)
+    candidates.sort(key=lambda item: item.relative_path)
+    return candidates, skipped
+
+
+def _scan_candidates_from_path(
+    repository_root: Path,
+    limits: IndexLimits,
 ) -> tuple[list[CandidateFile], int]:
     candidates: list[CandidateFile] = []
     skipped = 0
@@ -360,41 +505,65 @@ def _scan_candidates(
         retained_directories: list[str] = []
         for name in sorted(directory_names):
             candidate_directory = current_path / name
-            if name.casefold() in _IGNORED_DIRECTORIES or candidate_directory.is_symlink():
+            try:
+                info = os.lstat(candidate_directory)
+            except OSError:
                 continue
-            retained_directories.append(name)
+            if (
+                name.casefold() not in _IGNORED_DIRECTORIES
+                and stat.S_ISDIR(info.st_mode)
+                and not stat.S_ISLNK(info.st_mode)
+            ):
+                retained_directories.append(name)
         directory_names[:] = retained_directories
-
         for name in sorted(file_names):
             path = current_path / name
-            if path.is_symlink() or _ignored_file(path):
+            if _ignored_file(path):
                 skipped += 1
                 continue
             try:
-                info = path.stat(follow_symlinks=False)
+                info = os.lstat(path)
             except OSError:
                 skipped += 1
                 continue
-            if not stat.S_ISREG(info.st_mode):
-                skipped += 1
-                continue
-            if info.st_size > limits.max_file_bytes:
-                skipped += 1
-                continue
-            if len(candidates) >= limits.max_files:
-                skipped += 1
-                continue
-            candidates.append(
-                CandidateFile(
-                    path=path,
-                    relative_path=path.relative_to(repository_root).as_posix(),
-                    size=int(info.st_size),
-                    mtime_ns=int(info.st_mtime_ns),
-                    ctime_ns=int(info.st_ctime_ns),
-                )
+            candidate = _candidate_from_stat(
+                path=path,
+                relative_path=path.relative_to(repository_root).as_posix(),
+                info=info,
+                limits=limits,
+                candidate_count=len(candidates),
             )
+            if candidate is None:
+                skipped += 1
+                continue
+            candidates.append(candidate)
     candidates.sort(key=lambda item: item.relative_path)
     return candidates, skipped
+
+
+def _candidate_from_stat(
+    *,
+    path: Path,
+    relative_path: str,
+    info: os.stat_result,
+    limits: IndexLimits,
+    candidate_count: int,
+) -> CandidateFile | None:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_size > limits.max_file_bytes
+        or candidate_count >= limits.max_files
+    ):
+        return None
+    return CandidateFile(
+        path=path,
+        relative_path=relative_path,
+        device=int(info.st_dev),
+        inode=int(info.st_ino),
+        size=int(info.st_size),
+        mtime_ns=int(info.st_mtime_ns),
+        ctime_ns=int(info.st_ctime_ns),
+    )
 
 
 def _ignored_file(path: Path) -> bool:
@@ -404,18 +573,29 @@ def _ignored_file(path: Path) -> bool:
     return path.suffix.casefold() in _IGNORED_FILE_SUFFIXES
 
 
-def _read_stable_text(candidate: CandidateFile, max_bytes: int) -> str | None:
+def _read_stable_text(
+    candidate: CandidateFile,
+    max_bytes: int,
+    *,
+    root_descriptor: int | None,
+) -> str | None:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(candidate.path, flags)
+        descriptor = _open_candidate(
+            candidate,
+            flags=flags,
+            root_descriptor=root_descriptor,
+        )
     except OSError:
         return None
     try:
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
+            or before.st_dev != candidate.device
+            or before.st_ino != candidate.inode
             or before.st_size != candidate.size
             or before.st_mtime_ns != candidate.mtime_ns
             or before.st_ctime_ns != candidate.ctime_ns
@@ -443,12 +623,51 @@ def _read_stable_text(candidate: CandidateFile, max_bytes: int) -> str | None:
             )
     finally:
         os.close(descriptor)
-    if len(payload) > max_bytes or b"\x00" in payload:
+    if len(payload) > max_bytes or b"\x00" in payload or _has_binary_control_density(payload):
         return None
     try:
         return payload.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def _open_candidate(
+    candidate: CandidateFile,
+    *,
+    flags: int,
+    root_descriptor: int | None,
+) -> int:
+    if root_descriptor is None:
+        return os.open(candidate.path, flags)
+    parts = Path(candidate.relative_path).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise OSError("invalid repository-relative candidate path")
+    parent_descriptor = os.dup(root_descriptor)
+    try:
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        for part in parts[:-1]:
+            next_descriptor = os.open(
+                part,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        return os.open(parts[-1], flags, dir_fd=parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _has_binary_control_density(payload: bytes) -> bool:
+    if not payload:
+        return False
+    allowed_controls = {9, 10, 12, 13}
+    disallowed = sum(1 for value in payload if value < 32 and value not in allowed_controls)
+    return disallowed / len(payload) > 0.01
 
 
 def _freshness_fingerprint(
@@ -462,7 +681,8 @@ def _freshness_fingerprint(
     for candidate in candidates:
         digest.update(
             (
-                f"{candidate.relative_path}\0{candidate.size}\0"
+                f"{candidate.relative_path}\0{candidate.device}\0{candidate.inode}\0"
+                f"{candidate.size}\0"
                 f"{candidate.mtime_ns}\0{candidate.ctime_ns}\n"
             ).encode()
         )
@@ -521,3 +741,9 @@ def _is_test_path(path: Path) -> bool:
         or ".spec." in name
         or name.endswith("_test.go")
     )
+
+
+def _validate_query_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not 1 <= limit <= MAX_QUERY_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_QUERY_LIMIT}")
+    return limit

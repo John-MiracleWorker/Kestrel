@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from nested_memvid_agent.repo_index import (
+    DEFAULT_QUERY_LIMIT,
+    MAX_QUERY_LIMIT,
     Freshness,
     IndexLimits,
     RepositoryIndex,
@@ -66,7 +71,7 @@ def test_build_records_identity_content_and_multilanguage_relationships(tmp_path
     assert status.project_id == "project-1"
     assert status.repository_root == repository.resolve()
     assert status.aggregate_digest == report.aggregate_digest
-    assert status.schema_version == 1
+    assert status.schema_version == 2
     assert status.parser_versions["python"] == "ast-v1"
     assert status.git_head is None
     assert status.git_tree is None
@@ -251,6 +256,25 @@ def test_parser_version_change_marks_stale_and_forces_reparse(tmp_path: Path) ->
     assert reopened.status().freshness is Freshness.CURRENT
 
 
+def test_schema_v1_sidecar_migrates_and_forces_digest_revalidation(tmp_path: Path) -> None:
+    """Leaving migrated rows without filesystem identity must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        connection.execute("ALTER TABLE files DROP COLUMN device")
+        connection.execute("ALTER TABLE files DROP COLUMN inode")
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute("PRAGMA application_id = 0")
+
+    reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
+    rebuilt = reopened.rebuild()
+
+    assert reopened.status().schema_version == 2
+    assert rebuilt.changed_files == 10
+    assert rebuilt.reused_files == 0
+
+
 def test_root_move_or_replacement_fails_closed(tmp_path: Path) -> None:
     """Following a moved or replacement root by path must fail this test."""
     repository = _copy_fixture(tmp_path)
@@ -278,6 +302,23 @@ def test_root_move_or_replacement_fails_closed(tmp_path: Path) -> None:
         replacement.rebuild()
 
 
+def test_renamed_root_replaced_by_symlink_to_original_fails_closed(tmp_path: Path) -> None:
+    """Following a replacement symlink to the original inode must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        index_path=tmp_path / "index.sqlite",
+    )
+    index.rebuild()
+    moved = tmp_path / "moved"
+    repository.rename(moved)
+    os.symlink(moved, repository, target_is_directory=True)
+
+    with pytest.raises(RepositoryRootMismatchError, match="symbolic link"):
+        index.status()
+
+
 def test_scan_ignores_symlinks_private_build_vendor_binary_and_oversize(
     tmp_path: Path,
 ) -> None:
@@ -294,6 +335,7 @@ def test_scan_ignores_symlinks_private_build_vendor_binary_and_oversize(
     (repository / "dist").mkdir()
     (repository / "dist" / "bundle.js").write_text("class BuiltArtifact {}\n", encoding="utf-8")
     (repository / "binary.dat").write_bytes(b"\x00\x01\x02")
+    (repository / "control.txt").write_bytes(b"\x01\x02\x03printable-text")
     (repository / "oversize.py").write_text(
         "class TooLarge:\n    pass\n" + ("#" * 100), encoding="utf-8"
     )
@@ -312,6 +354,7 @@ def test_scan_ignores_symlinks_private_build_vendor_binary_and_oversize(
         "node_modules/package/vendor.ts",
         "dist/bundle.js",
         "binary.dat",
+        "control.txt",
         "oversize.py",
         "linked.py",
     }.isdisjoint(paths)
@@ -331,6 +374,266 @@ def test_default_sidecar_does_not_follow_private_directory_symlink(
         RepositoryIndex(project_id="project-1", repository_root=repository)
 
     assert not (outside / "repo-index").exists()
+
+
+def test_sidecar_parent_substitution_is_rejected_on_every_open(tmp_path: Path) -> None:
+    """Following a substituted sidecar parent after initialization must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    sidecar_parent = index.index_path.parent
+    original_parent = sidecar_parent.with_name("repo-index-original")
+    sidecar_parent.rename(original_parent)
+    os.symlink(original_parent, sidecar_parent, target_is_directory=True)
+
+    with pytest.raises(RepositoryIndexError, match="sidecar parent"):
+        index.status()
+
+
+def test_sidecar_file_replacement_is_rejected_on_next_open(tmp_path: Path) -> None:
+    """Trusting a replacement database with copied metadata must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    replacement = tmp_path / "replacement.sqlite"
+    shutil.copy2(index.index_path, replacement)
+    os.replace(replacement, index.index_path)
+
+    with pytest.raises(RepositoryIndexError, match="database identity"):
+        index.status()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode contract")
+def test_custom_sidecar_parent_is_validated_without_chmod(tmp_path: Path) -> None:
+    """Mutating a caller-owned custom parent mode must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    custom_parent = tmp_path / "custom-index"
+    custom_parent.mkdir(mode=0o755)
+    custom_parent.chmod(0o755)
+
+    index = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        index_path=custom_parent / "index.sqlite",
+    )
+
+    assert custom_parent.stat().st_mode & 0o777 == 0o755
+    index.rebuild()
+    assert custom_parent.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode contract")
+def test_world_writable_custom_sidecar_parent_is_rejected_without_chmod(
+    tmp_path: Path,
+) -> None:
+    """Silently repairing an unsafe caller-owned directory must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    custom_parent = tmp_path / "unsafe-index"
+    custom_parent.mkdir()
+    custom_parent.chmod(0o777)
+
+    with pytest.raises(RepositoryIndexError, match="unsafe"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            index_path=custom_parent / "index.sqlite",
+        )
+
+    assert custom_parent.stat().st_mode & 0o777 == 0o777
+
+
+def test_structural_parsers_ignore_comments_and_literals_and_keep_offsets(
+    tmp_path: Path,
+) -> None:
+    """Treating comment or string examples as code symbols must fail this test."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "sample.ts").write_text(
+        "/* class CommentGhost {} */\n"
+        "const example = 'function StringGhost() {}; import \"string-module\"';\n"
+        '// import "comment-module";\n'
+        'import { real } from "./real";\n'
+        "export class RealWidget {\n"
+        "  render(): string { return real(); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+
+    assert [(record.name, record.line) for record in index.symbols().records] == [
+        ("RealWidget", 5),
+        ("render", 6),
+    ]
+    assert [(record.module, record.line) for record in index.imports().records] == [("./real", 4)]
+    reference_names = {record.name for record in index.references().records}
+    assert {
+            "CommentGhost",
+            "StringGhost",
+            "comment",
+            "module",
+    }.isdisjoint(reference_names)
+
+
+def test_python_nested_functions_are_not_classified_as_methods(tmp_path: Path) -> None:
+    """Using any enclosing scope as evidence of a method must fail this test."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "nested.py").write_text(
+        "def outer():\n"
+        "    def inner():\n"
+        "        return None\n"
+        "    return inner()\n\n"
+        "class Container:\n"
+        "    def method(self):\n"
+        "        def local():\n"
+        "            return None\n"
+        "        return local()\n",
+        encoding="utf-8",
+    )
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+
+    assert [(record.qualified_name, record.kind) for record in index.symbols().records] == [
+        ("outer", "function"),
+        ("outer.inner", "function"),
+        ("Container", "class"),
+        ("Container.method", "method"),
+        ("Container.method.local", "function"),
+    ]
+
+
+def test_query_limits_are_bounded_and_filter_before_limiting(tmp_path: Path) -> None:
+    """Unbounded loads or applying a limit before a filter must fail this test."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    content = "".join(f"def noise_{number}(): ...\n" for number in range(120))
+    content += "".join(f"def wanted_{number}(): ...\n" for number in range(12))
+    (repository / "many.py").write_text(content, encoding="utf-8")
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+
+    assert len(index.symbols().records) == DEFAULT_QUERY_LIMIT == 100
+    assert [record.name for record in index.symbols("wanted", limit=5).records] == [
+        "wanted_0",
+        "wanted_1",
+        "wanted_2",
+        "wanted_3",
+        "wanted_4",
+    ]
+    with pytest.raises(ValueError, match="limit"):
+        index.symbols(limit=MAX_QUERY_LIMIT + 1)
+
+
+def test_parser_and_database_order_is_hash_seed_independent(tmp_path: Path) -> None:
+    """Set iteration or incomplete tie keys must fail this subprocess test."""
+    worktree = Path(__file__).parents[1]
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from nested_memvid_agent.repo_index import RepositoryIndex\n"
+        "root = Path(sys.argv[1]); root.mkdir()\n"
+        "(root / 'case.py').write_text('import Alpha, alpha\\n', encoding='utf-8')\n"
+        "index = RepositoryIndex(project_id='case', repository_root=root)\n"
+        "index.rebuild()\n"
+        "print(json.dumps({\n"
+        "  'imports': [(r.id, r.module) for r in index.imports().records],\n"
+        "  'references': [(r.id, r.name) for r in index.references().records],\n"
+        "}, sort_keys=True))\n"
+    )
+    outputs: list[str] = []
+    for seed in ("1", "2", "3", "5", "8"):
+        root = tmp_path / f"seed-{seed}"
+        environment = {
+            **os.environ,
+            "PYTHONHASHSEED": seed,
+            "PYTHONPATH": str(worktree / "src"),
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(root)],
+            cwd=worktree,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs.append(result.stdout.strip())
+
+    assert len(set(outputs)) == 1
+    assert json.loads(outputs[0]) == {
+        "imports": [[1, "Alpha"], [2, "alpha"]],
+        "references": [[1, "Alpha"], [2, "alpha"]],
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="chmod setup failure is POSIX-only")
+def test_connection_closes_when_chmod_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving a connection open after chmod failure must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []
+
+    def tracking_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
+        connection = real_connect(database, timeout=timeout)
+        opened.append(connection)
+        return connection
+
+    def fail_chmod(path: Path, mode: int) -> None:
+        raise PermissionError("injected chmod failure")
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store.sqlite3.connect",
+        tracking_connect,
+    )
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store.os.chmod",
+        fail_chmod,
+    )
+
+    with pytest.raises(PermissionError, match="injected"):
+        index.status()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        opened[-1].execute("SELECT 1")
+
+
+def test_connection_closes_when_pragma_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving a connection open after PRAGMA failure must fail this test."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []
+
+    class FailingPragmaConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            if sql == "PRAGMA foreign_keys = ON":
+                raise sqlite3.OperationalError("injected PRAGMA failure")
+            return super().execute(sql, parameters)
+
+    def failing_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
+        connection = real_connect(
+            database,
+            timeout=timeout,
+            factory=FailingPragmaConnection,
+        )
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store.sqlite3.connect",
+        failing_connect,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        index.status()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        opened[-1].execute("SELECT 1")
 
 
 def test_results_have_deterministic_tie_order(tmp_path: Path) -> None:
