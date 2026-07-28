@@ -590,7 +590,7 @@ def _interrupted_replacement(module: ModuleType, tmp_path: Path) -> tuple[dict[s
         "schema": module.MANIFEST_SCHEMA, "transaction_id": transaction_id,
         "kestrel_home": str(replacement_home), "user_home": str(user_home),
         "platform": "linux", "bin_dir": str(bin_dir), "artifacts": artifacts,
-        "codesign": "not_applicable",
+        "codesign": "not_applicable", "phase": "prepared",
     }
     module._write_manifest(manifest, payload)
     return payload, manifest, bin_dir / "kestrel", replacement_home
@@ -634,7 +634,7 @@ def test_commit_refuses_initial_crash_manifest_without_mutating_artifacts(tmp_pa
 
 
 def _replace_quarantine_with_marker(parent: Path) -> None:
-    quarantines = list(parent.glob(".kestrel-quarantine-*"))
+    quarantines = list(parent.glob(".kestrel-quarantine-*")) + list(parent.glob(".*.tombstone"))
     assert len(quarantines) == 1
     quarantine = quarantines[0]
     quarantine.rename(quarantine.with_name(quarantine.name + ".preserved"))
@@ -663,11 +663,7 @@ def test_final_delete_race_preserves_swapped_shim_and_quarantine(
         and path.read_text(encoding="utf-8") == "attacker marker must survive"
     )
     assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
-    preserved = next(
-        path
-        for path in quarantines
-        if path.name.endswith(".preserved")
-    )
+    preserved = next(path for path in bin_dir.glob("*.preserved"))
     assert preserved.is_file()
     assert module.SHIM_MARKER in preserved.read_text(encoding="utf-8")
 
@@ -703,11 +699,7 @@ def test_final_delete_race_preserves_swapped_backup_and_app(tmp_path: Path, monk
         and path.read_text(encoding="utf-8") == "attacker marker must survive"
     )
     assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
-    preserved = next(
-        path
-        for path in quarantines
-        if path.name.endswith(".preserved")
-    )
+    preserved = next(path for path in app_parent.glob("*.preserved"))
     assert preserved.is_dir()
     assert (
         preserved / "Contents" / "Resources" / module.APP_MARKER_FILENAME
@@ -726,7 +718,7 @@ def test_final_delete_race_preserves_swapped_manifest(tmp_path: Path, monkeypatc
     monkeypatch.setattr(module, "_before_quarantine_delete", _replace_quarantine_with_marker)
     with pytest.raises(module.LauncherArtifactError, match="quarantined"):
         module.commit_launchers(manifest)
-    quarantines = list(manifest.parent.glob(".kestrel-quarantine-*"))
+    quarantines = list(manifest.parent.glob(".*.tombstone"))
     attacker = next(
         path
         for path in quarantines
@@ -734,13 +726,45 @@ def test_final_delete_race_preserves_swapped_manifest(tmp_path: Path, monkeypatc
         and path.read_text(encoding="utf-8") == "attacker marker must survive"
     )
     assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
-    preserved = next(
-        path
-        for path in quarantines
-        if path.name.endswith(".preserved")
-    )
+    preserved = next(path for path in manifest.parent.glob("*.preserved"))
     assert preserved.is_file()
     assert (
         json.loads(preserved.read_text(encoding="utf-8"))["schema"]
         == module.MANIFEST_SCHEMA
     )
+
+
+def test_commit_resume_after_each_artifact_boundary_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module()
+    first = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    initial = first / ".nest" / "transactions" / "initial.json"
+    module.prepare_launchers(kestrel_home=first, user_home=user_home, manifest_path=initial,
+                             bin_dir=bin_dir, platform="darwin", environ={"PATH": str(bin_dir)}, which=lambda _name: None)
+    module.commit_launchers(initial)
+    replacement = _kestrel_home(tmp_path / "replacement")
+    manifest = first / ".nest" / "transactions" / "replacement.json"
+    module.prepare_launchers(kestrel_home=replacement, user_home=user_home, manifest_path=manifest,
+                             bin_dir=bin_dir, platform="darwin", environ={"PATH": str(bin_dir)}, which=lambda _name: None)
+    original_remove = module._remove_if_present
+    calls = 0
+
+    def crash_after_delete(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        original_remove(*args, **kwargs)
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated crash after second backup retirement")
+
+    monkeypatch.setattr(module, "_remove_if_present", crash_after_delete)
+    with pytest.raises(OSError, match="simulated crash"):
+        module.commit_launchers(manifest)
+    with pytest.raises(module.LauncherArtifactError, match="commit has started"):
+        module.rollback_launchers(manifest)
+    monkeypatch.setattr(module, "_remove_if_present", original_remove)
+    assert module.commit_launchers(manifest)["committed"] is True
+    assert not manifest.exists()
+    assert (bin_dir / "kestrel").is_file()
+    assert (user_home / "Applications" / "Kestrel.app").is_dir()

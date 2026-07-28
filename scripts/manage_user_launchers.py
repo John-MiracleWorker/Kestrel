@@ -9,6 +9,7 @@ on different filesystems.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import plistlib
@@ -27,7 +28,7 @@ from uuid import uuid4
 SHIM_MARKER = "KESTREL_MANAGED_COMMAND_SHIM_V1"
 APP_MARKER = "KESTREL_MANAGED_MACOS_APP_V1"
 APP_MARKER_FILENAME = "kestrel-managed-launcher-v1"
-MANIFEST_SCHEMA = "kestrel.user_launchers.v2"
+MANIFEST_SCHEMA = "kestrel.user_launchers.v3"
 _MAX_MANIFEST_BYTES = 1_000_000
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -97,7 +98,7 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
         "schema": MANIFEST_SCHEMA, "transaction_id": transaction_id,
         "kestrel_home": str(home), "user_home": str(user),
         "platform": selected_platform, "bin_dir": str(selected_bin),
-        "artifacts": artifacts, "codesign": codesign_status,
+        "artifacts": artifacts, "codesign": codesign_status, "phase": "prepared",
     }
     _validate_payload(payload, manifest_path=manifest, uid=uid)
     _write_manifest(manifest, payload)
@@ -123,10 +124,21 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
 
 def commit_launchers(manifest_path: str | Path) -> dict[str, Any]:
     manifest = _canonical_path(Path(manifest_path))
+    if not manifest.exists():
+        # A completed transaction leaves only an inert, bounded tombstone.
+        return {"committed": True, "manifest_path": str(manifest)}
     payload = _read_manifest(manifest)
     _require_terminal_transaction(payload)
+    if payload["phase"] == "prepared":
+        payload["phase"] = "committing"
+        _write_manifest(manifest, payload)
     for artifact in payload["artifacts"]:
-        _remove_if_present(artifact, "backup")
+        if not artifact["commit_deleted"]:
+            _remove_if_present(artifact, "backup")
+            artifact["commit_deleted"] = True
+            _write_manifest(manifest, payload)
+    payload["phase"] = "committed"
+    _write_manifest(manifest, payload)
     _unlink_manifest(manifest, expected_payload=payload)
     return {"committed": True, "manifest_path": str(manifest)}
 
@@ -134,6 +146,8 @@ def commit_launchers(manifest_path: str | Path) -> dict[str, Any]:
 def rollback_launchers(manifest_path: str | Path) -> dict[str, Any]:
     manifest = _canonical_path(Path(manifest_path))
     payload = _read_manifest(manifest)
+    if payload["phase"] != "prepared":
+        raise LauncherArtifactError("Rollback is unavailable after commit has started")
     _rollback_payload(payload, manifest_path=manifest, remove_manifest=True)
     return {"rolled_back": True, "manifest_path": str(manifest)}
 
@@ -145,7 +159,7 @@ def _derived_artifacts(bin_dir: Path, user_home: Path, platform: str, transactio
     return [{"kind": kind, "target": str(target),
              "staged": str(target.parent / f".kestrel-stage-{transaction_id}-{kind}"),
              "backup": str(target.parent / f".kestrel-backup-{transaction_id}-{kind}"),
-             "had_previous": False, "backed_up": False, "installed": False}
+             "had_previous": False, "backed_up": False, "installed": False, "commit_deleted": False}
             for kind, target in specs]
 
 
@@ -160,12 +174,12 @@ def _install_prepared_artifact(artifact: dict[str, Any], *, payload: dict[str, A
                 raise LauncherArtifactError(f"Managed launcher disappeared before replacement: {target}")
             if _entry_exists(parent_fd, backup_name):
                 raise LauncherArtifactError(f"Launcher backup path already exists: {backup}")
-            _final_replace(target.parent, parent_fd, target_name, backup_name)
+            _final_rename_no_replace(target.parent, parent_fd, target_name, backup_name)
             artifact["backed_up"] = True
             _write_manifest(manifest_path, payload)
         elif _entry_exists(parent_fd, target_name):
             raise LauncherArtifactError(f"Launcher target appeared before installation: {target}")
-        _final_replace(target.parent, parent_fd, staged_name, target_name)
+        _final_rename_no_replace(target.parent, parent_fd, staged_name, target_name)
         artifact["installed"] = True
         _write_manifest(manifest_path, payload)
 
@@ -186,7 +200,7 @@ def _rollback_payload(payload: dict[str, Any], *, manifest_path: Path, remove_ma
                     if not _artifact_is_managed_at(parent_fd, target.name, kind=artifact["kind"]):
                         raise LauncherArtifactError(f"Rollback target changed or is unrelated: {target}")
                     _remove_managed_at(parent_fd, target.name, kind=artifact["kind"], parent=target.parent)
-                _final_replace(target.parent, parent_fd, backup.name, target.name)
+                _final_rename_no_replace(target.parent, parent_fd, backup.name, target.name)
             elif target_exists and not bool(artifact["had_previous"]):
                 # With no predecessor, a managed target can only be our newly
                 # installed artifact.  Remove it.  With a predecessor and no
@@ -227,8 +241,10 @@ def _require_terminal_transaction(payload: dict[str, Any]) -> None:
             if _entry_exists(parent_fd, staged.name):
                 raise LauncherArtifactError("Launcher transaction staging artifact remains")
             if bool(artifact["had_previous"]):
-                if not _artifact_is_managed_at(parent_fd, backup.name, kind=artifact["kind"]):
+                if payload["phase"] == "prepared" and not _artifact_is_managed_at(parent_fd, backup.name, kind=artifact["kind"]):
                     raise LauncherArtifactError("Launcher transaction backup is not terminal")
+                if _entry_exists(parent_fd, backup.name) and not _artifact_is_managed_at(parent_fd, backup.name, kind=artifact["kind"]):
+                    raise LauncherArtifactError("Launcher transaction backup changed during commit")
             elif _entry_exists(parent_fd, backup.name):
                 raise LauncherArtifactError("Launcher transaction has an unexpected backup")
 
@@ -370,15 +386,15 @@ def _artifact_is_managed_at(parent_fd: int, name: str, *, kind: str) -> bool:
 def _remove_managed_at(parent_fd: int, name: str, *, kind: str, parent: Path) -> None:
     with _verified_artifact_fd(parent_fd, name, kind=kind) as verified_fd:
         quarantine = f".kestrel-quarantine-{uuid4().hex}-{kind}"
-        _final_replace(parent, parent_fd, name, quarantine)
+        _final_rename_no_replace(parent, parent_fd, name, quarantine)
         try:
             _assert_entry_matches_fd(parent_fd, quarantine, verified_fd)
-            _before_quarantine_delete(parent)
+            _before_tombstone_clear(parent, kind)
             _assert_entry_matches_fd(parent_fd, quarantine, verified_fd)
             if kind == "shim":
-                os.unlink(quarantine, dir_fd=parent_fd)
+                os.ftruncate(verified_fd, 0)
             else:
-                _remove_tree_at(parent_fd, quarantine)
+                _clear_tree_fd(verified_fd)
         except Exception as exc:
             raise LauncherArtifactError(
                 f"Refusing to delete changed launcher artifact; quarantined at {parent / quarantine}"
@@ -399,15 +415,34 @@ def _remove_tree_at(parent_fd: int, name: str) -> None:
     os.rmdir(name, dir_fd=parent_fd)
 
 
+def _clear_tree_fd(directory_fd: int) -> None:
+    """Clear only descendants reached from an already verified directory inode.
+
+    The top-level tombstone is never unlinked: a racing replacement at its
+    name is therefore outside this fd and cannot be destroyed.
+    """
+    with os.scandir(directory_fd) as entries:
+        names = [(entry.name, entry.is_dir(follow_symlinks=False), entry.is_symlink()) for entry in entries]
+    for child_name, is_dir, is_link in names:
+        if is_link:
+            raise LauncherArtifactError("Refusing symlink in managed app tombstone")
+        if is_dir:
+            with _open_dir_at(directory_fd, child_name, uid=_current_uid()) as child_fd:
+                _clear_tree_fd(child_fd)
+            os.rmdir(child_name, dir_fd=directory_fd)
+        else:
+            os.unlink(child_name, dir_fd=directory_fd)
+
+
 def _validate_payload(payload: dict[str, Any], *, manifest_path: Path, uid: int) -> None:
-    required = {"schema", "transaction_id", "kestrel_home", "user_home", "platform", "bin_dir", "artifacts", "codesign"}
+    required = {"schema", "transaction_id", "kestrel_home", "user_home", "platform", "bin_dir", "artifacts", "codesign", "phase"}
     if not isinstance(payload, dict) or set(payload) != required or payload.get("schema") != MANIFEST_SCHEMA:
         raise LauncherArtifactError("Launcher transaction manifest has an unknown schema")
     transaction_id = payload.get("transaction_id")
     platform = payload.get("platform")
     if not isinstance(transaction_id, str) or len(transaction_id) != 32 or any(char not in "0123456789abcdef" for char in transaction_id) or platform not in {"linux", "darwin"}:
         raise LauncherArtifactError("Launcher transaction manifest has invalid transaction metadata")
-    if not all(isinstance(payload.get(key), str) for key in ("kestrel_home", "user_home", "bin_dir", "codesign")):
+    if not all(isinstance(payload.get(key), str) for key in ("kestrel_home", "user_home", "bin_dir", "codesign", "phase")):
         raise LauncherArtifactError("Launcher transaction manifest has invalid path metadata")
     home = _validate_kestrel_home(_canonical_path(Path(payload["kestrel_home"])), uid=uid)
     user = _validated_user_home(_canonical_path(Path(payload["user_home"])), uid=uid)
@@ -424,11 +459,13 @@ def _validate_payload(payload: dict[str, Any], *, manifest_path: Path, uid: int)
         for key in ("kind", "target", "staged", "backup"):
             if actual.get(key) != derived[key]:
                 raise LauncherArtifactError("Launcher transaction manifest artifact paths do not match transaction")
-        if not all(isinstance(actual.get(key), bool) for key in ("had_previous", "backed_up", "installed")):
+        if not all(isinstance(actual.get(key), bool) for key in ("had_previous", "backed_up", "installed", "commit_deleted")):
             raise LauncherArtifactError("Launcher transaction manifest has invalid artifact state")
     allowed_codesign = {"not_applicable"} if platform == "linux" else {"unavailable", "verified"}
     if payload["codesign"] not in allowed_codesign:
         raise LauncherArtifactError("Launcher transaction manifest has invalid signing state")
+    if payload["phase"] not in {"prepared", "committing", "committed"}:
+        raise LauncherArtifactError("Launcher transaction manifest has invalid commit phase")
     # Bind validation to the supplied manifest's own safe, pinned parent too.
     _validate_manifest_parent(manifest_path, uid=uid)
 
@@ -461,13 +498,16 @@ def _write_manifest(path: Path, payload: Mapping[str, Any]) -> None:
 def _unlink_manifest(path: Path, *, expected_payload: Mapping[str, Any] | None = None) -> None:
     with _pinned_directory(path.parent, uid=_current_uid()) as parent_fd:
         with _verified_manifest_fd(parent_fd, path.name, expected_payload=expected_payload) as verified_fd:
-            quarantine = f".kestrel-quarantine-{uuid4().hex}-manifest"
-            _final_replace(path.parent, parent_fd, path.name, quarantine)
+            transaction_id = str(expected_payload["transaction_id"]) if expected_payload is not None else uuid4().hex
+            quarantine = f".{path.name}.kestrel-retired-{transaction_id}.tombstone"
+            if _entry_exists(parent_fd, quarantine):
+                raise LauncherArtifactError("Launcher transaction manifest tombstone already exists")
+            _final_rename_no_replace(path.parent, parent_fd, path.name, quarantine)
             try:
                 _assert_entry_matches_fd(parent_fd, quarantine, verified_fd)
-                _before_quarantine_delete(path.parent)
+                _before_tombstone_clear(path.parent, "manifest")
                 _assert_entry_matches_fd(parent_fd, quarantine, verified_fd)
-                os.unlink(quarantine, dir_fd=parent_fd)
+                os.ftruncate(verified_fd, 0)
             except Exception as exc:
                 raise LauncherArtifactError(
                     f"Refusing to delete changed transaction manifest; quarantined at {path.parent / quarantine}"
@@ -503,7 +543,7 @@ def _read_file_at(parent_fd: int, name: str) -> bytes:
 
 @contextmanager
 def _verified_artifact_fd(parent_fd: int, name: str, *, kind: str) -> Iterator[int]:
-    flags = os.O_RDONLY | _CLOEXEC | _NOFOLLOW
+    flags = (os.O_RDONLY if kind == "app" else os.O_RDWR) | _CLOEXEC | _NOFOLLOW
     if kind == "app":
         flags |= _DIRECTORY
     fd = os.open(name, flags, dir_fd=parent_fd)
@@ -543,7 +583,7 @@ def _artifact_matches_open_fd(fd: int, *, kind: str) -> bool:
 
 @contextmanager
 def _verified_manifest_fd(parent_fd: int, name: str, *, expected_payload: Mapping[str, Any] | None) -> Iterator[int]:
-    fd = os.open(name, os.O_RDONLY | _CLOEXEC | _NOFOLLOW, dir_fd=parent_fd)
+    fd = os.open(name, os.O_RDWR | _CLOEXEC | _NOFOLLOW, dir_fd=parent_fd)
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != _current_uid() or stat.S_IMODE(metadata.st_mode) != 0o600:
@@ -584,12 +624,53 @@ def _final_replace(parent: Path, parent_fd: int, source: str, destination: str) 
     os.replace(source, destination, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
 
+def _final_rename_no_replace(parent: Path, parent_fd: int, source: str, destination: str) -> None:
+    """Move an inode only into an absent destination, then bind its identity."""
+    source_fd = os.open(source, os.O_RDONLY | _CLOEXEC | _NOFOLLOW, dir_fd=parent_fd)
+    try:
+        source_stat = os.fstat(source_fd)
+        _assert_directory_current(parent, parent_fd)
+        _before_final_mutation(parent)
+        _assert_directory_current(parent, parent_fd)
+        _rename_no_replace(parent_fd, source, parent_fd, destination)
+        destination_stat = os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
+        if (destination_stat.st_dev, destination_stat.st_ino) != (source_stat.st_dev, source_stat.st_ino):
+            raise LauncherArtifactError("Launcher source changed during no-replace rename")
+    finally:
+        os.close(source_fd)
+
+
+def _rename_no_replace(source_dir_fd: int, source: str, destination_dir_fd: int, destination: str) -> None:
+    """Use the native exclusive rename primitive; never emulate overwrite."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        function = libc.renameatx_np
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        result = function(source_dir_fd, source.encode(), destination_dir_fd, destination.encode(), 0x00000004)
+    else:
+        function = getattr(libc, "renameat2", None)
+        if function is None:
+            raise LauncherArtifactError("Exclusive rename is unavailable on this platform")
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        result = function(source_dir_fd, source.encode(), destination_dir_fd, destination.encode(), 1)
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in {17, 39}:
+            raise LauncherArtifactError(f"Launcher destination appeared before rename: {destination}")
+        raise LauncherArtifactError(f"Exclusive launcher rename failed: {os.strerror(error)}")
+
+
 def _before_final_mutation(parent: Path) -> None:
     """Test seam immediately before an irreversible directory-fd mutation."""
 
 
 def _before_quarantine_delete(parent: Path) -> None:
     """Test seam after quarantine identity verification and before deletion."""
+
+
+def _before_tombstone_clear(parent: Path, kind: str) -> None:
+    """Test seam at the actual destructive operation on a verified inode."""
+    _before_quarantine_delete(parent)
 
 
 @contextmanager
