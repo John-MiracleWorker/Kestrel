@@ -8,6 +8,7 @@ import time
 import webbrowser
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, NoReturn, TextIO
 from uuid import uuid4
@@ -167,13 +168,17 @@ class LauncherApplication:
         return 2
 
     def _start(self, args: argparse.Namespace) -> int:
-        status = self.controller.start(readiness_timeout=args.wait_timeout)
+        status = self.controller.start(
+            readiness_timeout=args.wait_timeout,
+            clock=self.clock,
+            sleep=self.sleep,
+        )
         view = self._status_view(status)
         self._print_status(view)
         return _view_exit_code(view)
 
     def _stop(self) -> int:
-        status = self.controller.stop()
+        status = self.controller.stop(clock=self.clock, sleep=self.sleep)
         self.stdout.write(f"{status.detail}\n")
         return 0 if status.state == ServiceState.STOPPED else 1
 
@@ -186,7 +191,11 @@ class LauncherApplication:
         return _view_exit_code(view)
 
     def _open(self, args: argparse.Namespace) -> int:
-        status = self.controller.start(readiness_timeout=args.wait_timeout)
+        status = self.controller.start(
+            readiness_timeout=args.wait_timeout,
+            clock=self.clock,
+            sleep=self.sleep,
+        )
         if status.state != ServiceState.RUNNING:
             self._print_status(self._status_view(status))
             return 2 if status.state == ServiceState.CONFLICT else 1
@@ -220,7 +229,7 @@ class LauncherApplication:
     def _chat(self, args: argparse.Namespace) -> int:
         if args.prompt is not None and args.message is not None:
             raise ValueError("Provide a positional prompt or --message, not both")
-        status = self.controller.start()
+        status = self.controller.start(clock=self.clock, sleep=self.sleep)
         if status.state != ServiceState.RUNNING:
             self._print_status(self._status_view(status))
             return 2 if status.state == ServiceState.CONFLICT else 1
@@ -527,11 +536,15 @@ def _view_exit_code(view: Mapping[str, Any]) -> int:
     )
 
 
-def _default_offline_doctor(paths: ServicePaths) -> dict[str, Any]:
+def _default_offline_doctor(
+    paths: ServicePaths,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     from .cli import _doctor_runtime
 
     config = replace(
-        AgentConfig.from_env(),
+        AgentConfig.from_env(environ),
         backend="memvid",
         memory_dir=paths.memory_dir,
         state_path=paths.state_path,
@@ -559,7 +572,10 @@ def _default_application(
         controller=controller,
         client=client,
         browser_open=webbrowser.open,
-        offline_doctor=_default_offline_doctor,
+        offline_doctor=partial(
+            _default_offline_doctor,
+            environ=environment,
+        ),
         input_fn=input,
         stdout=stdout,
         stderr=stderr,

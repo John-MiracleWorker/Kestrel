@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.launcher import (
     LauncherApplication,
     _default_application,
@@ -32,17 +33,21 @@ class FakeController:
     def __init__(self, status: ServiceStatus) -> None:
         self.current = status
         self.calls: list[str] = []
+        self.start_kwargs: list[dict[str, object]] = []
+        self.stop_kwargs: list[dict[str, object]] = []
 
     def status(self) -> ServiceStatus:
         self.calls.append("status")
         return self.current
 
-    def start(self, **_kwargs: object) -> ServiceStatus:
+    def start(self, **kwargs: object) -> ServiceStatus:
         self.calls.append("start")
+        self.start_kwargs.append(kwargs)
         return self.current
 
-    def stop(self, **_kwargs: object) -> ServiceStatus:
+    def stop(self, **kwargs: object) -> ServiceStatus:
         self.calls.append("stop")
+        self.stop_kwargs.append(kwargs)
         return self.current
 
 
@@ -544,6 +549,47 @@ def test_chat_wait_uses_the_application_clock_and_sleep(tmp_path: Path) -> None:
     assert wait["sleep"] is sleep
 
 
+@pytest.mark.parametrize(
+    ("argv", "lifecycle_method"),
+    [
+        (["start"], "start"),
+        (["open", "--no-browser"], "start"),
+        (["chat", "--message", "hello"], "start"),
+        (["stop"], "stop"),
+    ],
+)
+def test_lifecycle_commands_use_the_application_clock_and_sleep(
+    tmp_path: Path,
+    argv: list[str],
+    lifecycle_method: str,
+) -> None:
+    controller = FakeController(_status())
+
+    def clock() -> float:
+        return 7.0
+
+    def sleep(_seconds: float) -> None:
+        return None
+
+    app, _stdout, _stderr = _application(
+        tmp_path,
+        controller=controller,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    app.execute(build_parser().parse_args(argv))
+
+    calls = (
+        controller.start_kwargs
+        if lifecycle_method == "start"
+        else controller.stop_kwargs
+    )
+    assert len(calls) == 1
+    assert calls[0]["clock"] is clock
+    assert calls[0]["sleep"] is sleep
+
+
 def test_default_application_uses_injected_environment_for_shared_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -584,6 +630,33 @@ def test_default_application_uses_injected_environment_for_shared_client(
     assert app.environ is environment
     assert app.clock is clock
     assert app.sleep is sleep
+
+
+def test_default_offline_doctor_uses_only_the_injected_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEST_AGENT_PROVIDER", "host-provider")
+    monkeypatch.setenv("NEST_AGENT_API_KEY_ENV", "HOST_PROVIDER_SECRET")
+    environment = {
+        "NEST_AGENT_PROVIDER": "injected-provider",
+        "NEST_AGENT_API_KEY_ENV": "INJECTED_PROVIDER_SECRET",
+    }
+    observed: dict[str, AgentConfig] = {}
+
+    def doctor_runtime(config: AgentConfig) -> dict[str, object]:
+        observed["config"] = config
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.cli._doctor_runtime",
+        doctor_runtime,
+    )
+    app = _default_application(_paths(tmp_path), environ=environment)
+
+    assert app.offline_doctor(app.paths) == {"ok": True}
+    assert observed["config"].provider == "injected-provider"
+    assert observed["config"].api_key_env == "INJECTED_PROVIDER_SECRET"
 
 
 def test_run_passes_the_exact_injected_environment_to_the_default_factory(
