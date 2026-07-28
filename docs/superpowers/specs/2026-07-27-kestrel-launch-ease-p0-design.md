@@ -1,7 +1,7 @@
 # Kestrel Launch Ease P0 Design
 
 **Date:** 2026-07-27
-**Status:** Approved product design; awaiting implementation-plan approval
+**Status:** Approved product design; implementation authorized 2026-07-27
 **Baseline:** `main` at `1b46381` (`v0.4.11`)
 **Scope:** Single-user, local/private Kestrel on macOS and Linux
 
