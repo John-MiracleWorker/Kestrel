@@ -1,3 +1,5 @@
+# ruff: noqa: E402 - evaluation scripts add repository-local import roots explicitly
+
 from __future__ import annotations
 
 import argparse
@@ -13,7 +15,9 @@ from time import monotonic, perf_counter, sleep
 from typing import Any
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 from nested_memvid_agent.app_factory import build_agent
 from nested_memvid_agent.config import AgentConfig
@@ -32,30 +36,13 @@ from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.task_capsule import write_run_capsule
 from nested_memvid_agent.tools.base import ToolContext
+from scripts.bounded_process import run_bounded_process
+from scripts.golden_eval_contract import (
+    GOLDEN_CASE_CATEGORIES,
+    GOLDEN_REPORT_SCHEMA,
+)
 
-_CATEGORY_BY_CASE = {
-    "remember_correction_across_sessions": "memory_precision_recall",
-    "retrieve_prior_failure": "memory_precision_recall",
-    "use_procedural_recipe_after_repeats": "memory_precision_recall",
-    "refuse_path_escape": "approval_correctness",
-    "block_shell_without_enablement": "approval_correctness",
-    "verify_mv2_files": "repo_regression",
-    "compile_context_under_budget": "memory_precision_recall",
-    "summary_first_expand_raw_on_demand": "memory_precision_recall",
-    "flag_conflicting_facts": "memory_precision_recall",
-    "create_capsule_and_consolidate_validated_lessons": "memory_precision_recall",
-    "mv2_not_sqlite_or_vector_db_substrate": "repo_regression",
-    "avoid_policy_from_ordinary_event": "approval_correctness",
-    "explain_memory_promotion_gates": "approval_correctness",
-    "map_repository": "repo_regression",
-    "apply_patch_and_run_tests": "repair_success_rate",
-    "report_test_failure_honestly": "hallucinated_success_rate",
-    "no_success_claim_without_evidence": "hallucinated_success_rate",
-    "tool_call_accuracy_search": "tool_call_accuracy",
-    "approval_requires_exact_call": "approval_correctness",
-    "durable_plan_completion": "plan_completion_rate",
-    "repo_regression_guard": "repo_regression",
-}
+_CATEGORY_BY_CASE = GOLDEN_CASE_CATEGORIES
 
 _REQUIRED_CATEGORIES = (
     "tool_call_accuracy",
@@ -71,6 +58,8 @@ _REQUIRED_CATEGORIES = (
 
 _ID_SEED: int | None = None
 _ID_COUNTER = 0
+DEFAULT_CASE_TIMEOUT_SECONDS = 120.0
+_CASE_RECEIPT_SCHEMA = "kestrel.golden_eval_case_receipt.v1"
 
 
 def main() -> int:
@@ -110,11 +99,27 @@ def main() -> int:
             "Use a backend/environment-specific threshold."
         ),
     )
+    parser.add_argument(
+        "--case-timeout-seconds",
+        type=float,
+        default=DEFAULT_CASE_TIMEOUT_SECONDS,
+        help=(
+            "Hard monotonic deadline for each isolated golden case. The complete "
+            "case process tree is terminated when this deadline expires."
+        ),
+    )
+    parser.add_argument(
+        "--_case-name",
+        choices=sorted(GOLDEN_CASE_CATEGORIES),
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     if args.max_case_latency_ms is not None and args.max_case_latency_ms <= 0:
         parser.error("--max-case-latency-ms must be greater than 0")
     if args.seed is not None and not 0 <= args.seed <= 4_294_967_295:
         parser.error("--seed must be between 0 and 4294967295")
+    if args.case_timeout_seconds <= 0:
+        parser.error("--case-timeout-seconds must be greater than 0")
     _configure_ids(args.seed)
 
     config = AgentConfig(
@@ -127,140 +132,305 @@ def main() -> int:
         validation_container_image=args.validation_container_image,
     )
     eval_id = _eval_identifier(args.seed)
+    case_functions = _golden_case_functions(config, eval_id)
+    if args._case_name is not None:
+        result = _run_case(args._case_name, case_functions[args._case_name])
+        receipt = _redact_json(
+            {
+                "schema": _CASE_RECEIPT_SCHEMA,
+                "case": args._case_name,
+                "status": "worker_completed",
+                "result": result,
+            }
+        )
+        rendered = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+        if args.output is None:
+            parser.error("--output is required for an isolated case worker")
+        _write_report(args.output, rendered)
+        print(rendered, end="")
+        return 0 if result["passed"] is True else 1
+
+    case_receipt_root = args.memory_dir.parent / "case-receipts"
     results = _sort_case_results(
         [
-            _run_case(
-                "remember_correction_across_sessions",
-                lambda: _eval_correction_persists(
-                    _case_config(config, eval_id, "correction"), eval_id
-                ),
-            ),
-            _run_case(
-                "retrieve_prior_failure",
-                lambda: _eval_prior_failure_context(
-                    _case_config(config, eval_id, "prior_failure"), eval_id
-                ),
-            ),
-            _run_case(
-                "use_procedural_recipe_after_repeats",
-                lambda: _eval_procedural_promotion(
-                    _case_config(config, eval_id, "procedure"), eval_id
-                ),
-            ),
-            _run_case(
-                "refuse_path_escape",
-                lambda: _eval_path_escape(_case_config(config, eval_id, "path_escape")),
-            ),
-            _run_case(
-                "block_shell_without_enablement",
-                lambda: _eval_shell_block(_case_config(config, eval_id, "shell")),
-            ),
-            _run_case(
-                "verify_mv2_files",
-                lambda: _eval_verify_memory(_case_config(config, eval_id, "verify")),
-            ),
-            _run_case(
-                "compile_context_under_budget",
-                lambda: _eval_context_budget(
-                    _case_config(config, eval_id, "context_budget"), eval_id
-                ),
-            ),
-            _run_case(
-                "summary_first_expand_raw_on_demand",
-                lambda: _eval_summary_first_expand_raw(
-                    _case_config(config, eval_id, "summary_expand"), eval_id
-                ),
-            ),
-            _run_case(
-                "flag_conflicting_facts",
-                lambda: _eval_conflict_warning(_case_config(config, eval_id, "conflicts"), eval_id),
-            ),
-            _run_case(
-                "create_capsule_and_consolidate_validated_lessons",
-                lambda: _eval_task_capsule_consolidation(
-                    _case_config(config, eval_id, "capsule"), eval_id
-                ),
-            ),
-            _run_case(
-                "mv2_not_sqlite_or_vector_db_substrate",
-                lambda: _eval_mv2_substrate_contract(_case_config(config, eval_id, "substrate")),
-            ),
-            _run_case(
-                "avoid_policy_from_ordinary_event",
-                lambda: _eval_no_policy_from_event(
-                    _case_config(config, eval_id, "ordinary_event"), eval_id
-                ),
-            ),
-            _run_case(
-                "explain_memory_promotion_gates",
-                lambda: _eval_memory_promotion_gate_metadata(
-                    _case_config(config, eval_id, "promotion_gates"), eval_id
-                ),
-            ),
-            _run_case(
-                "map_repository", lambda: _eval_repo_map(_case_config(config, eval_id, "repo_map"))
-            ),
-            _run_case(
-                "apply_patch_and_run_tests",
-                lambda: _eval_patch_and_test(_case_config(config, eval_id, "patch_test")),
-            ),
-            _run_case(
-                "report_test_failure_honestly",
-                lambda: _eval_honest_test_failure(_case_config(config, eval_id, "test_failure")),
-            ),
-            _run_case(
-                "no_success_claim_without_evidence",
-                lambda: _eval_no_success_without_evidence(
-                    _case_config(config, eval_id, "no_evidence"), eval_id
-                ),
-            ),
-            _run_case(
-                "tool_call_accuracy_search",
-                lambda: _eval_tool_call_accuracy(_case_config(config, eval_id, "tool_accuracy")),
-            ),
-            _run_case(
-                "approval_requires_exact_call",
-                lambda: _eval_approval_correctness(_case_config(config, eval_id, "approval_exact")),
-            ),
-            _run_case(
-                "durable_plan_completion",
-                lambda: _eval_plan_completion(_case_config(config, eval_id, "plan_completion")),
-            ),
-            _run_case(
-                "repo_regression_guard",
-                lambda: _eval_repo_regression_guard(
-                    _case_config(config, eval_id, "repo_regression")
-                ),
-            ),
+            _run_isolated_case(
+                name=name,
+                category=GOLDEN_CASE_CATEGORIES[name],
+                receipt_path=case_receipt_root / f"{name}.json",
+                timeout_seconds=args.case_timeout_seconds,
+                backend=args.backend,
+                memory_dir=args.memory_dir,
+                provider=args.provider,
+                model=args.model,
+                workspace=args.workspace,
+                seed=args.seed,
+                validation_container_image=args.validation_container_image,
+            )
+            for name in sorted(case_functions)
         ]
     )
     summary = _summary(results, max_case_latency_ms=args.max_case_latency_ms)
     functional_passed = summary["fail_count"] == 0
     latency_gate = dict(summary["acceptance"]["latency"])
     passed = _aggregate_passed(summary)
-    report = {
-        "schema": "kestrel.golden_eval_report.v2",
-        "configuration": {
-            "backend": args.backend,
-            "provider": args.provider,
-            "model": args.model,
-            "seed": args.seed,
-            "max_case_latency_ms": args.max_case_latency_ms,
-        },
-        "results": results,
-        "summary": summary,
-        "acceptance": {
-            "functional": {"required": True, "passed": functional_passed},
-            "latency": latency_gate,
-            "cost": dict(summary["acceptance"]["cost"]),
-        },
-        "passed": passed,
-    }
+    report = _redact_json(
+        {
+            "schema": GOLDEN_REPORT_SCHEMA,
+            "configuration": {
+                "backend": args.backend,
+                "provider": args.provider,
+                "model": args.model,
+                "seed": args.seed,
+                "max_case_latency_ms": args.max_case_latency_ms,
+            },
+            "results": results,
+            "summary": summary,
+            "acceptance": {
+                "functional": {"required": True, "passed": functional_passed},
+                "latency": latency_gate,
+                "cost": dict(summary["acceptance"]["cost"]),
+            },
+            "passed": passed,
+        }
+    )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         _write_report(args.output, rendered)
     print(rendered, end="")
     return _report_exit_code(report)
+
+
+def _golden_case_functions(
+    config: AgentConfig,
+    eval_id: str,
+) -> dict[str, Callable[[], dict[str, Any]]]:
+    return {
+        "remember_correction_across_sessions": lambda: _eval_correction_persists(
+            _case_config(config, eval_id, "correction"), eval_id
+        ),
+        "retrieve_prior_failure": lambda: _eval_prior_failure_context(
+            _case_config(config, eval_id, "prior_failure"), eval_id
+        ),
+        "use_procedural_recipe_after_repeats": lambda: _eval_procedural_promotion(
+            _case_config(config, eval_id, "procedure"), eval_id
+        ),
+        "refuse_path_escape": lambda: _eval_path_escape(
+            _case_config(config, eval_id, "path_escape")
+        ),
+        "block_shell_without_enablement": lambda: _eval_shell_block(
+            _case_config(config, eval_id, "shell")
+        ),
+        "verify_mv2_files": lambda: _eval_verify_memory(_case_config(config, eval_id, "verify")),
+        "compile_context_under_budget": lambda: _eval_context_budget(
+            _case_config(config, eval_id, "context_budget"), eval_id
+        ),
+        "summary_first_expand_raw_on_demand": lambda: _eval_summary_first_expand_raw(
+            _case_config(config, eval_id, "summary_expand"), eval_id
+        ),
+        "flag_conflicting_facts": lambda: _eval_conflict_warning(
+            _case_config(config, eval_id, "conflicts"), eval_id
+        ),
+        "create_capsule_and_consolidate_validated_lessons": (
+            lambda: _eval_task_capsule_consolidation(
+                _case_config(config, eval_id, "capsule"), eval_id
+            )
+        ),
+        "mv2_not_sqlite_or_vector_db_substrate": lambda: _eval_mv2_substrate_contract(
+            _case_config(config, eval_id, "substrate")
+        ),
+        "avoid_policy_from_ordinary_event": lambda: _eval_no_policy_from_event(
+            _case_config(config, eval_id, "ordinary_event"), eval_id
+        ),
+        "explain_memory_promotion_gates": lambda: _eval_memory_promotion_gate_metadata(
+            _case_config(config, eval_id, "promotion_gates"), eval_id
+        ),
+        "map_repository": lambda: _eval_repo_map(_case_config(config, eval_id, "repo_map")),
+        "apply_patch_and_run_tests": lambda: _eval_patch_and_test(
+            _case_config(config, eval_id, "patch_test")
+        ),
+        "report_test_failure_honestly": lambda: _eval_honest_test_failure(
+            _case_config(config, eval_id, "test_failure")
+        ),
+        "no_success_claim_without_evidence": lambda: _eval_no_success_without_evidence(
+            _case_config(config, eval_id, "no_evidence"), eval_id
+        ),
+        "tool_call_accuracy_search": lambda: _eval_tool_call_accuracy(
+            _case_config(config, eval_id, "tool_accuracy")
+        ),
+        "approval_requires_exact_call": lambda: _eval_approval_correctness(
+            _case_config(config, eval_id, "approval_exact")
+        ),
+        "durable_plan_completion": lambda: _eval_plan_completion(
+            _case_config(config, eval_id, "plan_completion")
+        ),
+        "repo_regression_guard": lambda: _eval_repo_regression_guard(
+            _case_config(config, eval_id, "repo_regression")
+        ),
+    }
+
+
+def _redact_json(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [_redact_json(item) for item in value]
+    if isinstance(value, dict):
+        return {redact_secrets(str(key)): _redact_json(item) for key, item in value.items()}
+    return value
+
+
+def _case_failure_result(
+    name: str,
+    category: str,
+    *,
+    elapsed_seconds: float,
+    error: str,
+    process_status: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "category": category,
+        "passed": False,
+        "score": 0.0,
+        "latency_ms": round(elapsed_seconds * 1000, 2),
+        "memory_hits": 0,
+        "context_chars": 0,
+        "tool_count": 0,
+        "cost_estimate_usd": None,
+        "error": redact_secrets(error),
+        "process": _redact_json(process_status),
+    }
+
+
+def _run_isolated_case(
+    *,
+    name: str,
+    category: str,
+    receipt_path: Path,
+    timeout_seconds: float,
+    backend: str,
+    memory_dir: Path,
+    provider: str,
+    model: str,
+    workspace: Path,
+    seed: int | None,
+    validation_container_image: str | None,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--backend",
+        backend,
+        "--memory-dir",
+        str(memory_dir),
+        "--provider",
+        provider,
+        "--model",
+        model,
+        "--workspace",
+        str(workspace),
+        "--output",
+        str(receipt_path),
+        "--_case-name",
+        name,
+    ]
+    if seed is not None:
+        command.extend(["--seed", str(seed)])
+    if validation_container_image:
+        command.extend(["--validation-container-image", validation_container_image])
+    environment = os.environ.copy()
+    if seed is not None:
+        environment["PYTHONHASHSEED"] = str(seed)
+    process = run_bounded_process(
+        command,
+        cwd=ROOT,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+    )
+    process_status = {
+        "returncode": process.returncode,
+        "elapsed_seconds": process.elapsed_seconds,
+        "timed_out": process.timed_out,
+        "deadline_seconds": timeout_seconds,
+        "deadline_clock": process.deadline_clock,
+        "cleanup": {
+            "attempted": process.cleanup_attempted,
+            "succeeded": process.cleanup_succeeded,
+            "method": process.termination_method,
+        },
+        "stdout": process.stdout,
+        "stderr": process.stderr,
+    }
+    result: dict[str, Any]
+    status: str
+    if process.timed_out:
+        status = "timed_out"
+        result = _case_failure_result(
+            name,
+            category,
+            elapsed_seconds=process.elapsed_seconds,
+            error=f"case exceeded monotonic deadline of {timeout_seconds} seconds",
+            process_status=process_status,
+        )
+    elif not process.cleanup_succeeded:
+        status = "cleanup_unverified"
+        result = _case_failure_result(
+            name,
+            category,
+            elapsed_seconds=process.elapsed_seconds,
+            error="case process-tree cleanup could not be verified",
+            process_status=process_status,
+        )
+    elif not receipt_path.is_file():
+        status = "missing_receipt"
+        result = _case_failure_result(
+            name,
+            category,
+            elapsed_seconds=process.elapsed_seconds,
+            error=f"case worker exited {process.returncode} without a receipt",
+            process_status=process_status,
+        )
+    else:
+        try:
+            raw_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(raw_receipt, dict)
+                or set(raw_receipt) != {"schema", "case", "status", "result"}
+                or raw_receipt.get("schema") != _CASE_RECEIPT_SCHEMA
+                or raw_receipt.get("case") != name
+            ):
+                raise ValueError("case worker receipt schema or identity is invalid")
+            raw_result = raw_receipt.get("result")
+            if not isinstance(raw_result, dict):
+                raise ValueError("case worker result is not an object")
+            if raw_result.get("name") != name or raw_result.get("category") != category:
+                raise ValueError("case worker result identity is invalid")
+            result = _redact_json(raw_result)
+            expected_exit = 0 if result.get("passed") is True else 1
+            if process.returncode != expected_exit:
+                raise ValueError(f"case worker exit {process.returncode} disagrees with result")
+            status = "completed"
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            status = "invalid_receipt"
+            result = _case_failure_result(
+                name,
+                category,
+                elapsed_seconds=process.elapsed_seconds,
+                error=f"{type(exc).__name__}: {exc}",
+                process_status=process_status,
+            )
+
+    receipt = _redact_json(
+        {
+            "schema": _CASE_RECEIPT_SCHEMA,
+            "case": name,
+            "status": status,
+            "process": process_status,
+            "result": result,
+        }
+    )
+    _write_report(receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    return result
 
 
 def _eval_identifier(seed: int | None) -> str:
@@ -720,12 +890,21 @@ def _eval_summary_first_expand_raw(config: AgentConfig, eval_id: str) -> dict[st
         agent.memory.seal_all()
         # Use a broad k_per_layer so the raw record is not excluded by
         # environment-specific vector scoring differences.
-        pack_kwargs = {"k_per_layer": 16}
         compact = ContextPacker(agent.memory).pack(
-            ContextPackRequest(objective=marker, query=marker, expand_raw=False, **pack_kwargs)
+            ContextPackRequest(
+                objective=marker,
+                query=marker,
+                expand_raw=False,
+                k_per_layer=16,
+            )
         )
         expanded = ContextPacker(agent.memory).pack(
-            ContextPackRequest(objective=marker, query=marker, expand_raw=True, **pack_kwargs)
+            ContextPackRequest(
+                objective=marker,
+                query=marker,
+                expand_raw=True,
+                k_per_layer=16,
+            )
         )
         compact_titles = {item.frame.title for item in compact.items}
         expanded_titles = {item.frame.title for item in expanded.items}
@@ -1413,11 +1592,7 @@ def _category_summary(
         if max_case_latency_ms is None
         else sum(1 for latency in latencies if latency <= max_case_latency_ms)
     )
-    latency_fail_count = (
-        None
-        if latency_pass_count is None
-        else len(latencies) - latency_pass_count
-    )
+    latency_fail_count = None if latency_pass_count is None else len(latencies) - latency_pass_count
     categories["latency"] = {
         "case_count": len(results),
         "pass_count": latency_pass_count,
@@ -1463,9 +1638,7 @@ def _latency_acceptance(
 
 def _cost_measurement(results: list[dict[str, Any]]) -> dict[str, Any]:
     measured = [
-        float(value)
-        for item in results
-        if (value := item.get("cost_estimate_usd")) is not None
+        float(value) for item in results if (value := item.get("cost_estimate_usd")) is not None
     ]
     measured_count = len(measured)
     if measured_count == 0:

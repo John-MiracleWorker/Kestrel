@@ -156,6 +156,93 @@ def _publish_exact(source: Path, target: Path) -> str:
     return "published"
 
 
+def _publish_finalized_exact(source: Path, target: Path, marker: Path) -> str:
+    """Verify an exact replay without permitting any finalized-state mutation."""
+
+    if marker.is_symlink() or not marker.is_file():
+        raise ValueError("release is not finalized by a regular marker")
+    if marker.stat().st_nlink != 1:
+        raise ValueError("release finalization marker has an unsafe link count")
+    try:
+        marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("release finalization marker is invalid") from exc
+    if not isinstance(marker_payload, dict) or marker_payload.get("state") != "finalized":
+        raise ValueError("release finalization marker does not declare finalized state")
+    manifest = marker_payload.get("artifacts")
+    if not isinstance(manifest, dict):
+        raise ValueError("release finalization marker has no artifact manifest")
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"publication source is not a regular file: {source}")
+    if target.is_symlink() or not target.is_file():
+        raise ValueError(
+            f"finalized release refuses mutation for missing or unsafe target: {target}"
+        )
+    if target.stat().st_nlink != 1:
+        raise ValueError(f"finalized release refuses mutation for linked target: {target}")
+    declared_digest = manifest.get(target.name)
+    source_digest = _sha256(source)
+    target_digest = _sha256(target)
+    if (
+        not isinstance(declared_digest, str)
+        or declared_digest != source_digest
+        or source_digest != target_digest
+    ):
+        raise ValueError(f"finalized release refuses mutation for {target.name}")
+    return "already_exact"
+
+
+def _create_ref(repository: Path, ref: str, commit: str, *, cwd: Path) -> None:
+    """Create one rehearsal ref only when it does not already exist."""
+
+    try:
+        _git(
+            [
+                f"--git-dir={repository}",
+                "update-ref",
+                ref,
+                commit,
+                "0" * 40,
+            ],
+            cwd=cwd,
+        )
+    except ValueError as exc:
+        raise ValueError(f"rehearsal ref already exists or is invalid: {ref}") from exc
+
+
+def _write_finalization_marker(
+    marker: Path,
+    *,
+    commit: str,
+    namespace: str,
+    tag_ref: str,
+    artifacts: list[Path],
+) -> None:
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "state": "finalized",
+        "commit": commit,
+        "namespace": namespace,
+        "tag_ref": tag_ref,
+        "artifacts": {artifact.name: _sha256(artifact) for artifact in artifacts},
+    }
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(marker, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        marker.unlink(missing_ok=True)
+        raise
+
+
 def _build_distributions(
     checkout: Path,
     output_root: Path,
@@ -265,7 +352,7 @@ def run_release_rehearsal(
     head_ref = f"refs/heads/rehearsal/{namespace}"
     tag_ref = f"refs/tags/rehearsal/{namespace}/{commit[:12]}"
     for ref in (head_ref, tag_ref):
-        _git([f"--git-dir={remote}", "update-ref", ref, commit], cwd=sandbox_root)
+        _create_ref(remote, ref, commit, cwd=sandbox_root)
     refs_text = _git(
         [
             f"--git-dir={remote}",
@@ -324,35 +411,51 @@ def run_release_rehearsal(
     _verify_exact_set(candidate_root, downloaded_root)
     steps.append("downloaded_assets_verified")
 
-    immutable_marker = release_root / "IMMUTABLE.json"
-    immutable_marker.write_text(
-        json.dumps(
-            {
-                "commit": commit,
-                "namespace": namespace,
-                "tag_ref": tag_ref,
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    steps.append("release_marked_immutable")
-
     package_root = sandbox_root / "package-index" / namespace / distribution / version
     package_status = {
         artifact.name: _publish_exact(artifact, package_root / artifact.name)
         for artifact in artifacts
     }
     steps.append("package_files_published")
+    mutation_probe = sandbox_root / "conflicting-post-finalization-probe"
+    mutation_probe.write_bytes(b"kestrel-finalized-mutation-probe")
+    finalization_marker = release_root / "FINALIZED.json"
+    _write_finalization_marker(
+        finalization_marker,
+        commit=commit,
+        namespace=namespace,
+        tag_ref=tag_ref,
+        artifacts=artifacts,
+    )
+    steps.append("release_marked_immutable")
     replay_status = {
-        artifact.name: _publish_exact(artifact, package_root / artifact.name)
+        artifact.name: _publish_finalized_exact(
+            artifact,
+            package_root / artifact.name,
+            finalization_marker,
+        )
         for artifact in artifacts
     }
     if set(replay_status.values()) != {"already_exact"}:
         raise ValueError(f"rehearsal replay was not an exact no-op: {replay_status}")
     _verify_exact_set(candidate_root, package_root)
     steps.append("exact_replay_verified")
+    conflicting_target = package_root / artifacts[0].name
+    before_conflict = _sha256(conflicting_target)
+    try:
+        _publish_finalized_exact(
+            mutation_probe,
+            conflicting_target,
+            finalization_marker,
+        )
+    except ValueError as exc:
+        if "finalized release refuses mutation" not in str(exc):
+            raise
+    else:
+        raise ValueError("finalized rehearsal unexpectedly permitted conflicting mutation")
+    if _sha256(conflicting_target) != before_conflict:
+        raise ValueError("finalized rehearsal mutation probe changed published bytes")
+    steps.append("conflicting_post_finalization_mutation_rejected")
 
     artifact_reports = [
         {
@@ -378,6 +481,10 @@ def run_release_rehearsal(
             "refs": refs,
         },
         "artifacts": artifact_reports,
+        "finalization": {
+            "marker": finalization_marker.relative_to(sandbox_root).as_posix(),
+            "conflicting_mutation_rejected": True,
+        },
         "steps": steps,
         "production_targets_blocked": True,
         "passed": True,

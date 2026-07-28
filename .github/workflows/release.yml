@@ -110,6 +110,101 @@ jobs:
           print(f"verified successful rehearsal {successful[0].get('html_url', '')}")
           PY
 
+      - name: Require successful exact-SHA determinism receipt before build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          determinism_runs="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/determinism.yml/runs" \
+            -f head_sha="$RELEASE_COMMIT_SHA" \
+            -f branch=main \
+            -f event=push \
+            -f status=completed \
+            -f per_page=100)"
+          DETERMINISM_RUN_ID="$(
+            DETERMINISM_RUNS_JSON="$determinism_runs" python - <<'PY'
+          import json
+          import os
+
+          expected_sha = os.environ["RELEASE_COMMIT_SHA"]
+          runs = json.loads(os.environ["DETERMINISM_RUNS_JSON"]).get("workflow_runs", [])
+          successful = [
+              run
+              for run in runs
+              if run.get("head_sha") == expected_sha
+              and run.get("head_branch") == "main"
+              and run.get("event") == "push"
+              and run.get("status") == "completed"
+              and run.get("conclusion") == "success"
+          ]
+          if not successful:
+              raise SystemExit(
+                  f"release commit {expected_sha} has no successful exact-SHA "
+                  "determinism push run on main"
+              )
+          run_id = successful[0].get("id")
+          if not isinstance(run_id, int):
+              raise SystemExit("successful determinism workflow has no numeric run id")
+          print(run_id)
+          PY
+          )"
+          export DETERMINISM_RUN_ID
+          determinism_receipt_dir="${RUNNER_TEMP}/determinism-receipt-${GITHUB_RUN_ID}"
+          mkdir "$determinism_receipt_dir"
+          gh run download "$DETERMINISM_RUN_ID" \
+            -n "kestrel-determinism-${RELEASE_COMMIT_SHA}" \
+            -D "$determinism_receipt_dir"
+          DETERMINISM_REPORT="${determinism_receipt_dir}/kestrel-determinism-report.json" \
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected_sha = os.environ["RELEASE_COMMIT_SHA"]
+          report_path = Path(os.environ["DETERMINISM_REPORT"])
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          if not isinstance(report, dict):
+              raise SystemExit("determinism receipt is not a JSON object")
+          if report.get("schema") != "kestrel.determinism_eval_report.v2":
+              raise SystemExit("determinism receipt schema is not accepted")
+          configuration = report.get("configuration")
+          summary = report.get("summary")
+          runs = report.get("runs")
+          if not isinstance(configuration, dict) or not isinstance(summary, dict):
+              raise SystemExit("determinism receipt metadata is incomplete")
+          if configuration.get("source_commit") != expected_sha:
+              raise SystemExit("determinism receipt is not bound to the release commit")
+          if (
+              configuration.get("seed") != 1729
+              or configuration.get("required_repeats") != 20
+              or configuration.get("case_timeout_seconds") != 60.0
+              or configuration.get("iteration_timeout_seconds") != 1500.0
+          ):
+              raise SystemExit("determinism receipt configuration is not release-qualified")
+          if (
+              summary.get("completed_repeats") != 20
+              or summary.get("required_repeats") != 20
+              or summary.get("all_runs_passed") is not True
+              or summary.get("unique_outcome_signatures") != 1
+              or summary.get("determinism_streak") != 20
+              or summary.get("observed_flake_count") != 0
+          ):
+              raise SystemExit("determinism receipt does not prove a 20-run stable streak")
+          if (
+              report.get("passed") is not True
+              or not isinstance(runs, list)
+              or len(runs) != 20
+              or [run.get("repeat") for run in runs if isinstance(run, dict)]
+              != list(range(1, 21))
+              or any(
+                  not isinstance(run, dict) or run.get("passed") is not True
+                  for run in runs
+              )
+          ):
+              raise SystemExit("determinism receipt run records are incomplete or failing")
+          print(f"verified exact-SHA determinism receipt from run {os.environ['DETERMINISM_RUN_ID']}")
+          PY
+
       - name: Install pinned uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:

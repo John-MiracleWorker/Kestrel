@@ -360,8 +360,9 @@ Do not tag the release if any of these are true:
 - The exact release tag SHA has no successful complete CI `push` run on `main`.
 - The exact release tag SHA has no successful `release-rehearsal.yml` `push` run on `main`, or the
   production tag was created before that rehearsal completed.
-- The twenty-repeat everyday golden lane reports more than one functional signature, a streak
-  below twenty, an underlying failed run, or missing flake evidence.
+- The exact release tag SHA has no successful `determinism.yml` `push` run on `main`, or its
+  downloaded commit-bound machine receipt does not prove twenty derived passes, one functional
+  signature, a streak of twenty, zero observed flakes, and the release-qualified deadlines.
 - The exact single built wheel and hash-locked dependency payload have not passed Linux x86_64
   and Apple-silicon macOS on every supported Python version (3.11 through 3.13),
   plus native Windows x86_64 on every supported Python version, with each runner architecture

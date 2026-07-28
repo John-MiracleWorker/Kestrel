@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from scripts.run_release_rehearsal import _publish_exact, run_release_rehearsal
+from scripts.run_release_rehearsal import (
+    _create_ref,
+    _publish_exact,
+    _publish_finalized_exact,
+    run_release_rehearsal,
+)
 
 
 def _candidate_repository(root: Path) -> tuple[Path, str]:
@@ -102,9 +109,10 @@ def test_rehearsal_uses_disposable_refs_and_exact_package_bytes(tmp_path: Path) 
         "draft_created",
         "exact_assets_uploaded",
         "downloaded_assets_verified",
-        "release_marked_immutable",
         "package_files_published",
+        "release_marked_immutable",
         "exact_replay_verified",
+        "conflicting_post_finalization_mutation_rejected",
     ]
     package_root = (
         sandbox / "package-index" / "kestrel-rehearsal-ci-12345" / "nested-memvid-agent" / "1.2.3"
@@ -113,6 +121,7 @@ def test_rehearsal_uses_disposable_refs_and_exact_package_bytes(tmp_path: Path) 
     assert any(name.endswith(".whl") for name in published)
     assert any(name.endswith(".tar.gz") for name in published)
     assert all(item["replay"] == "already_exact" for item in report["artifacts"])
+    assert report["finalization"]["conflicting_mutation_rejected"] is True
 
 
 def test_exact_publication_refuses_collision_without_changing_existing_bytes(
@@ -128,6 +137,75 @@ def test_exact_publication_refuses_collision_without_changing_existing_bytes(
     assert _publish_exact(first, target) == "already_exact"
     with pytest.raises(ValueError, match="publication collision"):
         _publish_exact(conflicting, target)
+
+    assert target.read_bytes() == b"trusted"
+
+
+def test_rehearsal_ref_creation_is_create_only(tmp_path: Path) -> None:
+    repository = tmp_path / "repository.git"
+    subprocess.run(["git", "init", "--bare", "-q", repository], check=True)
+    ref = "refs/tags/rehearsal/kestrel-rehearsal-test"
+    first = (
+        subprocess.run(
+            ["git", f"--git-dir={repository}", "hash-object", "-w", "--stdin"],
+            input=b"first",
+            check=True,
+            capture_output=True,
+            text=False,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    second = (
+        subprocess.run(
+            ["git", f"--git-dir={repository}", "hash-object", "-w", "--stdin"],
+            input=b"second",
+            check=True,
+            capture_output=True,
+            text=False,
+        )
+        .stdout.decode()
+        .strip()
+    )
+
+    _create_ref(repository, ref, first, cwd=tmp_path)
+    with pytest.raises(ValueError, match="already exists"):
+        _create_ref(repository, ref, second, cwd=tmp_path)
+
+    actual = subprocess.run(
+        ["git", f"--git-dir={repository}", "rev-parse", ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual == first
+
+
+def test_finalized_publication_allows_exact_replay_and_rejects_mutation(
+    tmp_path: Path,
+) -> None:
+    trusted = tmp_path / "trusted.whl"
+    conflicting = tmp_path / "conflicting.whl"
+    target = tmp_path / "index" / "candidate.whl"
+    marker = tmp_path / "release" / "FINALIZED.json"
+    trusted.write_bytes(b"trusted")
+    conflicting.write_bytes(b"different")
+    assert _publish_exact(trusted, target) == "published"
+    marker.parent.mkdir()
+    marker.write_text(
+        json.dumps(
+            {
+                "state": "finalized",
+                "artifacts": {target.name: hashlib.sha256(trusted.read_bytes()).hexdigest()},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert _publish_finalized_exact(trusted, target, marker) == "already_exact"
+    with pytest.raises(ValueError, match="finalized release refuses mutation"):
+        _publish_finalized_exact(conflicting, target, marker)
 
     assert target.read_bytes() == b"trusted"
 

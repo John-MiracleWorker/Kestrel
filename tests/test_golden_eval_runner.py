@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import scripts.run_golden_evals as golden_runner
 from nested_memvid_agent.config import AgentConfig
+from scripts.bounded_process import BoundedProcessResult
 from scripts.run_golden_evals import (
     _aggregate_passed,
     _case_config,
@@ -11,6 +13,7 @@ from scripts.run_golden_evals import (
     _golden_case_workspace,
     _report_exit_code,
     _run_case,
+    _run_isolated_case,
     _sort_case_results,
     _summary,
 )
@@ -168,6 +171,54 @@ def test_golden_case_errors_are_redacted() -> None:
 
     assert result["passed"] is False
     assert "validationsecret" not in str(result["error"])
+
+
+def test_isolated_case_timeout_writes_machine_receipt(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    seen_command: list[str] = []
+
+    def fake_bounded_process(
+        command: list[str],
+        **_kwargs: object,
+    ) -> BoundedProcessResult:
+        seen_command.extend(command)
+        return BoundedProcessResult(
+            returncode=-9,
+            stdout="",
+            stderr="",
+            elapsed_seconds=0.25,
+            timed_out=True,
+            cleanup_attempted=True,
+            cleanup_succeeded=True,
+            termination_method="test_process_group",
+        )
+
+    monkeypatch.setattr(golden_runner, "run_bounded_process", fake_bounded_process)  # type: ignore[attr-defined]
+    receipt_path = tmp_path / "receipts" / "map_repository.json"
+
+    result = _run_isolated_case(
+        name="map_repository",
+        category="repo_regression",
+        receipt_path=receipt_path,
+        timeout_seconds=0.25,
+        backend="memory",
+        memory_dir=tmp_path / "memory",
+        provider="mock",
+        model="mock",
+        workspace=tmp_path,
+        seed=1729,
+        validation_container_image=None,
+    )
+
+    assert result["passed"] is False
+    assert result["error"] == "case exceeded monotonic deadline of 0.25 seconds"
+    assert "--_case-name" in seen_command
+    receipt = receipt_path.read_text(encoding="utf-8")
+    assert '"status": "timed_out"' in receipt
+    assert '"deadline_clock": "monotonic"' in receipt
+    assert '"succeeded": true' in receipt
 
 
 def test_honest_failure_fixture_isolated_from_caller_workspace_secrets(

@@ -67,9 +67,11 @@ doctor first:
 ```
 
 `Bootstrap` prints reviewed next-step commands; it does not enable WSL2, install Docker Desktop,
-Python, Git, or Kestrel. The report distinguishes the native exact-wheel, x86_64 WSL2, and Docker
-Desktop paths. See the [deployment guide](docs/DEPLOYMENT.md#windows-diagnostic-and-bootstrap-plan)
-for checksum verification and path requirements.
+Python, Git, or Kestrel. The report distinguishes the native Python, x86_64 WSL2, and Docker
+Desktop paths. The native command is explicitly labeled as a version-pinned package-index install,
+not a hash-bound local-wheel install. See the
+[deployment guide](docs/DEPLOYMENT.md#windows-diagnostic-and-bootstrap-plan) for checksum
+verification and path requirements.
 
 Prefer a checkout? Use the [source quick start](#quick-start-from-source). Need full runtime controls? See [advanced `nest-agent` operation](#advanced-nest-agent-operation).
 

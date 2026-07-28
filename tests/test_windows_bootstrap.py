@@ -19,6 +19,37 @@ def test_windows_bootstrap_is_shipped_at_the_repository_root() -> None:
     assert BOOTSTRAP.is_file()
 
 
+def test_windows_doctor_source_binds_and_validates_each_supported_path() -> None:
+    source = BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert "struct.calcsize" in source
+    assert '"pip", "--version"' in source
+    assert '"--distribution", $wslDistribution' in source
+    assert '"--exec", "sh", "-c"' in source
+    assert '"--exec", "sh", "-lc"' not in source
+    assert "guest_python_supported" in source
+    assert "guest_python_64_bit" in source
+    assert "guest_pip" in source
+    assert "distribution_architecture" in source
+    assert '"context", "show"' in source
+    assert "desktop-linux" in source
+    assert ".Endpoints.docker.Host" in source
+    assert "dockerDesktopLinuxEngine" in source
+    assert ".DockerRootDir" in source
+    assert ".OSType" in source
+    assert ".Architecture" in source
+    assert "linux_engine" in source
+    assert "local_desktop_context" in source
+
+
+def test_native_bootstrap_discloses_version_pinned_index_install_assurance() -> None:
+    source = BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert "version_pinned_package_index" in source
+    assert "not hash-bound" in source
+    assert "Published exact wheel" not in source
+
+
 @pytest.mark.skipif(_powershell() is None, reason="PowerShell is not available")
 def test_windows_doctor_reports_supported_paths_without_mutation() -> None:
     completed = subprocess.run(
@@ -45,6 +76,7 @@ def test_windows_doctor_reports_supported_paths_without_mutation() -> None:
     assert set(report["checks"]) == {"docker_desktop", "git", "python", "wsl2"}
     assert set(report["paths"]) == {"docker_desktop", "native_wheel", "wsl2"}
     assert report["bootstrap"]["commands"] == []
+    assert report["paths"]["native_wheel"]["install_assurance"] == "version_pinned_package_index"
     assert completed.returncode == (0 if report["passed"] else 1)
 
 

@@ -424,10 +424,15 @@ RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --p
 ```
 
 The dedicated determinism lane runs the credential-free everyday golden set twenty times with the
-same seed and isolated state roots. It sorts cases before comparison and excludes wall-clock
-latency from the equality signature while still requiring each configured latency gate to pass.
-The JSON receipt reports unique functional signatures, differing cases, determinism streak, and
-observed flake rate:
+same seed and isolated state roots. Every case and every aggregate iteration runs in a separately
+terminable process tree behind a monotonic deadline. Timeout/hang receipts are written atomically
+and record descendant cleanup. The aggregate rejects a nonzero runner exit even if a report file
+claims success, validates the exact golden schema and expected 21-case set, and derives acceptance
+from case/evidence fields rather than the top-level `passed` claim. It recursively redacts imported
+and final machine reports. It sorts cases before comparison and excludes wall-clock latency from
+the equality signature while still requiring each configured latency gate to pass. The
+commit-bound JSON receipt reports unique functional signatures, differing cases, determinism
+streak, and observed flake rate:
 
 ```bash
 DETERMINISM_PARENT="$(mktemp -d)"
@@ -437,6 +442,8 @@ python scripts/run_determinism_evals.py \
   --run-root "$DETERMINISM_PARENT/runs" \
   --output "$DETERMINISM_PARENT/report.json" \
   --validation-container-image "$VALIDATION_IMAGE" \
+  --case-timeout-seconds 60 \
+  --iteration-timeout-seconds 1500 \
   --max-case-latency-ms 45000
 ```
 
@@ -449,9 +456,10 @@ compile, metadata alignment, lint, typecheck, unit tests, golden evals, the dete
 end-to-end agent learning gate, web build/test, required
 credential-free Memvid/MCP integration, executable-skill OCI containment, and packaging/Docker smoke checks.
 The exact clean candidate must also pass `release-rehearsal.yml`. Its local-only script creates a
-new disposable Git repository with `refs/heads/rehearsal/*` and `refs/tags/rehearsal/*`, builds the
-real wheel/sdist without dependency downloads, verifies their identities, simulates immutable
-release and package-index publication, and proves exact replay is a no-op. It accepts no remote
+new disposable Git repository with create-only `refs/heads/rehearsal/*` and
+`refs/tags/rehearsal/*`, builds the real wheel/sdist without dependency downloads, verifies their
+identities, simulates immutable release and package-index publication, proves exact replay is a
+no-op, and proves a conflicting post-finalization mutation is rejected. It accepts no remote
 repository, registry, GitHub release, or package-index URL.
 
 ## Failure Handling

@@ -41,9 +41,12 @@ jobs:
           python scripts/run_determinism_evals.py
           --repeats 20
           --seed 1729
+          --source-commit "${GITHUB_SHA}"
           --run-root "${RUNNER_TEMP}/kestrel-determinism-runs"
           --output "${RUNNER_TEMP}/kestrel-determinism-report.json"
           --workspace .
+          --case-timeout-seconds 60
+          --iteration-timeout-seconds 1500
           --max-case-latency-ms 45000
       - name: Upload the machine-readable flake report
         if: always()

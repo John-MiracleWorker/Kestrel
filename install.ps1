@@ -159,6 +159,7 @@ function New-Check {
 $isWindows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 $checks = [ordered] @{}
 
+$gitReady = $false
 $gitExecutable = Resolve-Executable -Name "git.exe"
 if ($null -eq $gitExecutable) {
     $checks.git = New-Check -Status "missing" `
@@ -168,6 +169,7 @@ if ($null -eq $gitExecutable) {
 else {
     $gitProbe = Invoke-BoundedProbe -Executable $gitExecutable -Arguments @("--version")
     if ($gitProbe.exit_code -eq 0) {
+        $gitReady = $true
         $checks.git = New-Check -Status "ready" `
             -Evidence $gitProbe.stdout `
             -Remediation ""
@@ -193,15 +195,26 @@ foreach ($candidate in $pythonCandidates) {
     }
     $pythonArguments = @($candidate.prefix) + @(
         "-c",
-        "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"
+        'import struct,sys;print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{struct.calcsize(''P'') * 8}")'
     )
     $pythonProbe = Invoke-BoundedProbe -Executable $candidateExecutable -Arguments $pythonArguments
-    if ($pythonProbe.exit_code -eq 0 -and $pythonProbe.stdout -match '^3\.(11|12|13)\.[0-9]+$') {
+    $pythonMatch = [regex]::Match(
+        [string] $pythonProbe.stdout,
+        '^(3\.(?:11|12|13)\.[0-9]+)\|(64)$'
+    )
+    if (-not $pythonMatch.Success) {
+        continue
+    }
+    $pipArguments = @($candidate.prefix) + @("-m", "pip", "--version")
+    $pipProbe = Invoke-BoundedProbe -Executable $candidateExecutable -Arguments $pipArguments
+    if ($pipProbe.exit_code -eq 0 -and $pipProbe.stdout -match '^pip\s+[0-9]') {
         $pythonSelection = [ordered] @{
             executable = $candidateExecutable
             prefix = @($candidate.prefix)
             display = $candidate.display
-            version = $pythonProbe.stdout
+            version = $pythonMatch.Groups[1].Value
+            bitness = [int] $pythonMatch.Groups[2].Value
+            pip = $pipProbe.stdout
         }
         break
     }
@@ -213,12 +226,14 @@ if ($null -eq $pythonSelection) {
 }
 else {
     $checks.python = New-Check -Status "ready" `
-        -Evidence "$($pythonSelection.display) reports $($pythonSelection.version)" `
+        -Evidence "$($pythonSelection.display) reports Python $($pythonSelection.version), $($pythonSelection.bitness)-bit, $($pythonSelection.pip)" `
         -Remediation ""
+    $checks.python["target"] = $pythonSelection.display
 }
 
 $wslExecutable = Resolve-Executable -Name "wsl.exe"
 $wslReady = $false
+$wslDistribution = $null
 if ($null -eq $wslExecutable) {
     $checks.wsl2 = New-Check -Status "missing" `
         -Evidence "wsl.exe was not found" `
@@ -226,81 +241,197 @@ if ($null -eq $wslExecutable) {
 }
 else {
     $wslList = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @("--list", "--verbose")
-    $wslArchitecture = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
-        "--exec", "uname", "-m"
-    )
-    $wslPrerequisites = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
-        "--exec", "sh", "-lc", "command -v git >/dev/null && command -v python3 >/dev/null"
-    )
-    $hasVersionTwo = $wslList.exit_code -eq 0 -and $wslList.stdout -match '(?m)\s2\s*$'
+    $wslQuiet = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @("--list", "--quiet")
+    $verboseText = ([string] $wslList.stdout) -replace "`0", ""
+    $quietText = ([string] $wslQuiet.stdout) -replace "`0", ""
+    if ($wslList.exit_code -eq 0 -and $wslQuiet.exit_code -eq 0) {
+        foreach ($candidateDistribution in ($quietText -split '[\r\n]+' | ForEach-Object {
+            $_.Trim()
+        } | Where-Object { $_.Length -gt 0 })) {
+            $distributionPattern = (
+                '(?m)^\s*\*?\s*' +
+                [regex]::Escape($candidateDistribution) +
+                '\s+\S+\s+2\s*$'
+            )
+            if ($verboseText -match $distributionPattern) {
+                $wslDistribution = $candidateDistribution
+                break
+            }
+        }
+    }
+    $wslArchitecture = $null
+    $wslPython = $null
+    $wslPip = $null
+    $wslGit = $null
+    if ($null -ne $wslDistribution) {
+        $wslArchitecture = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
+            "--distribution", $wslDistribution, "--exec", "uname", "-m"
+        )
+        $wslPython = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
+            "--distribution", $wslDistribution, "--exec", "python3", "-c",
+            'import struct,sys;print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{struct.calcsize(''P'') * 8}")'
+        )
+        $wslPip = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
+            "--distribution", $wslDistribution, "--exec", "python3", "-m", "pip", "--version"
+        )
+        $wslGit = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
+            "--distribution", $wslDistribution, "--exec", "sh", "-c",
+            "command -v git >/dev/null && git --version"
+        )
+    }
+    $hasVersionTwo = $null -ne $wslDistribution
+    $distributionArchitecture = if ($null -ne $wslArchitecture) {
+        ([string] $wslArchitecture.stdout).Trim()
+    } else {
+        ""
+    }
     $hasSupportedArchitecture = (
+        $null -ne $wslArchitecture -and
         $wslArchitecture.exit_code -eq 0 -and
-        $wslArchitecture.stdout.Trim() -eq "x86_64"
+        $distributionArchitecture -eq "x86_64"
     )
-    $hasGuestPrerequisites = $wslPrerequisites.exit_code -eq 0
-    $wslReady = $hasVersionTwo -and $hasSupportedArchitecture -and $hasGuestPrerequisites
+    $guestPythonMatch = if ($null -ne $wslPython) {
+        [regex]::Match(
+            [string] $wslPython.stdout,
+            '^(3\.(?:11|12|13)\.[0-9]+)\|(64)$'
+        )
+    } else {
+        [regex]::Match("", "never")
+    }
+    $guestPythonSupported = $null -ne $wslPython -and $wslPython.exit_code -eq 0 -and $guestPythonMatch.Success
+    $guestPython64Bit = $guestPythonSupported -and $guestPythonMatch.Groups[2].Value -eq "64"
+    $guestPip = $null -ne $wslPip -and $wslPip.exit_code -eq 0 -and $wslPip.stdout -match '^pip\s+[0-9]'
+    $guestGit = $null -ne $wslGit -and $wslGit.exit_code -eq 0 -and $wslGit.stdout -match '^git version '
+    $wslReady = (
+        $hasVersionTwo -and
+        $hasSupportedArchitecture -and
+        $guestPythonSupported -and
+        $guestPython64Bit -and
+        $guestPip -and
+        $guestGit
+    )
     if ($wslReady) {
         $checks.wsl2 = New-Check -Status "ready" `
-            -Evidence "A WSL2 x86_64 distribution has git and python3." `
+            -Evidence "distribution=$wslDistribution; distribution_architecture=$distributionArchitecture; guest_python_supported=$guestPythonSupported; guest_python_64_bit=$guestPython64Bit; guest_pip=$guestPip; guest_git=$guestGit" `
             -Remediation ""
+        $checks.wsl2["target"] = $wslDistribution
     }
     else {
         $wslEvidence = @(
+            "distribution=$wslDistribution",
             "version2=$hasVersionTwo",
-            "architecture=$($wslArchitecture.stdout)",
-            "guest_git_python=$hasGuestPrerequisites",
+            "distribution_architecture=$distributionArchitecture",
+            "guest_python_supported=$guestPythonSupported",
+            "guest_python_64_bit=$guestPython64Bit",
+            "guest_pip=$guestPip",
+            "guest_git=$guestGit",
             $wslList.stderr,
-            $wslArchitecture.stderr,
-            $wslPrerequisites.stderr
+            $wslQuiet.stderr
         ) -join "; "
         $checks.wsl2 = New-Check -Status "incomplete" `
             -Evidence $wslEvidence `
-            -Remediation "Configure an x86_64 WSL2 distribution with git and Python 3.11-3.13; this script will not enable or install them."
+            -Remediation "Configure one x86_64 WSL2 distribution with git, 64-bit Python 3.11-3.13, and pip; this script will not enable or install them."
+        $checks.wsl2["target"] = $wslDistribution
     }
 }
 
 $dockerExecutable = Resolve-Executable -Name "docker.exe"
 $dockerReady = $false
+$dockerContext = $null
 if ($null -eq $dockerExecutable) {
     $checks.docker_desktop = New-Check -Status "missing" `
         -Evidence "docker.exe was not found on PATH" `
         -Remediation "Install and start Docker Desktop explicitly, then enable its Linux container engine."
 }
 else {
-    $dockerProbe = Invoke-BoundedProbe -Executable $dockerExecutable -Arguments @(
-        "version", "--format", "{{.Server.Version}}"
+    $dockerContextProbe = Invoke-BoundedProbe -Executable $dockerExecutable -Arguments @(
+        "context", "show"
     )
-    $dockerReady = $dockerProbe.exit_code -eq 0 -and $dockerProbe.stdout.Length -gt 0
+    if ($dockerContextProbe.exit_code -eq 0) {
+        $dockerContext = ([string] $dockerContextProbe.stdout).Trim()
+    }
+    $dockerEndpointProbe = Invoke-BoundedProbe -Executable $dockerExecutable -Arguments @(
+        "context", "inspect", ([string] $dockerContext), "--format",
+        "{{.Endpoints.docker.Host}}"
+    )
+    $dockerEndpoint = if ($dockerEndpointProbe.exit_code -eq 0) {
+        ([string] $dockerEndpointProbe.stdout).Trim()
+    } else {
+        ""
+    }
+    $dockerProbe = Invoke-BoundedProbe -Executable $dockerExecutable -Arguments @(
+        "--context", ([string] $dockerContext), "info", "--format",
+        "{{.OSType}}|{{.Architecture}}|{{.DockerRootDir}}|{{.Name}}"
+    )
+    $dockerParts = @(([string] $dockerProbe.stdout) -split '\|', 4)
+    $dockerOsType = if ($dockerParts.Count -ge 1) { $dockerParts[0].Trim() } else { "" }
+    $dockerArchitecture = if ($dockerParts.Count -ge 2) { $dockerParts[1].Trim() } else { "" }
+    $dockerRootDir = if ($dockerParts.Count -ge 3) { $dockerParts[2].Trim() } else { "" }
+    $dockerServerName = if ($dockerParts.Count -ge 4) { $dockerParts[3].Trim() } else { "" }
+    $localDesktopContext = $dockerContext -eq "desktop-linux"
+    $localDesktopEndpoint = (
+        $dockerEndpoint -match '(?i)^npipe://' -and
+        $dockerEndpoint -match '(?i)dockerDesktopLinuxEngine'
+    )
+    $linuxEngine = $dockerOsType -eq "linux"
+    $supportedDockerArchitecture = $dockerArchitecture -in @(
+        "x86_64", "amd64", "aarch64", "arm64"
+    )
+    $localLinuxRoot = $dockerRootDir.StartsWith("/")
+    $desktopServer = $dockerServerName -match '(?i)docker-desktop'
+    $dockerReady = (
+        $dockerContextProbe.exit_code -eq 0 -and
+        $dockerProbe.exit_code -eq 0 -and
+        $localDesktopContext -and
+        $localDesktopEndpoint -and
+        $linuxEngine -and
+        $supportedDockerArchitecture -and
+        $localLinuxRoot -and
+        $desktopServer
+    )
     if ($dockerReady) {
         $checks.docker_desktop = New-Check -Status "ready" `
-            -Evidence "Docker engine $($dockerProbe.stdout) is reachable." `
+            -Evidence "docker context show=$dockerContext; local_desktop_context=$localDesktopContext; local_endpoint=$localDesktopEndpoint; linux_engine=$linuxEngine; architecture=$dockerArchitecture; root=$dockerRootDir; server=$dockerServerName" `
             -Remediation ""
+        $checks.docker_desktop["target"] = $dockerContext
     }
     else {
         $checks.docker_desktop = New-Check -Status "unavailable" `
-            -Evidence "$($dockerProbe.stdout) $($dockerProbe.stderr)" `
-            -Remediation "Start Docker Desktop and verify the Linux container engine before retrying."
+            -Evidence "docker context show=$dockerContext; local_desktop_context=$localDesktopContext; local_endpoint=$localDesktopEndpoint; linux_engine=$linuxEngine; architecture=$dockerArchitecture; root=$dockerRootDir; server=$dockerServerName; $($dockerContextProbe.stderr); $($dockerEndpointProbe.stderr); $($dockerProbe.stderr)" `
+            -Remediation "Select the local Docker Desktop desktop-linux context and verify its Linux engine and supported architecture before retrying."
+        $checks.docker_desktop["target"] = $dockerContext
     }
 }
 
-$nativeReady = $isWindows -and $null -ne $pythonSelection
+$nativeReady = $isWindows -and $gitReady -and $null -ne $pythonSelection
 $wslPathReady = $isWindows -and $wslReady
 $dockerPathReady = $isWindows -and $dockerReady
 $paths = [ordered] @{
     native_wheel = [ordered] @{
         ready = $nativeReady
-        requires = @("Python 3.11-3.13")
-        trust_boundary = "Published exact wheel; no shell installer."
+        requires = @("Git for Windows", "64-bit Python 3.11-3.13", "pip")
+        trust_boundary = "Version-pinned package-index resolution; not hash-bound to a verified local wheel."
+        install_assurance = "version_pinned_package_index"
     }
     wsl2 = [ordered] @{
         ready = $wslPathReady
-        requires = @("WSL2", "x86_64 Linux distribution", "git", "Python 3.11-3.13")
+        target = $wslDistribution
+        requires = @(
+            "WSL2",
+            "x86_64 Linux distribution",
+            "git",
+            "64-bit Python 3.11-3.13",
+            "pip"
+        )
         trust_boundary = "The existing Bash installer runs inside WSL2, not Git Bash."
+        install_assurance = "release_script_transport"
     }
     docker_desktop = [ordered] @{
         ready = $dockerPathReady
-        requires = @("Docker Desktop Linux engine")
+        target = $dockerContext
+        requires = @("local Docker Desktop desktop-linux context", "Linux engine")
         trust_boundary = "Published Kestrel container; host prerequisites are not modified."
+        install_assurance = "version_pinned_container_tag"
     }
 }
 
@@ -339,14 +470,25 @@ if ($Action -eq "Bootstrap" -and $selectedReady) {
     }
     elseif ($selectedPath -eq "wsl2") {
         $commands = @(
-            "wsl.exe -- bash -lc `"curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v$Version/install.sh | bash`"",
-            "wsl.exe -- kestrel doctor"
+            "wsl.exe --distribution `"$wslDistribution`" -- bash -c `"curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v$Version/install.sh | bash`"",
+            "wsl.exe --distribution `"$wslDistribution`" -- kestrel doctor"
         )
     }
     elseif ($selectedPath -eq "docker_desktop") {
         $commands = @(
-            "docker pull ghcr.io/john-miracleworker/kestrel:v$Version",
-            "docker run --rm ghcr.io/john-miracleworker/kestrel:v$Version nest-agent doctor --backend memory --provider mock"
+            "docker --context desktop-linux pull ghcr.io/john-miracleworker/kestrel:v$Version",
+            "docker --context desktop-linux run --rm ghcr.io/john-miracleworker/kestrel:v$Version nest-agent doctor --backend memory --provider mock"
+        )
+    }
+}
+$installAssurance = $null
+$assuranceNote = ""
+if ($null -ne $selectedPath) {
+    $installAssurance = $paths[$selectedPath].install_assurance
+    if ($selectedPath -eq "native_wheel") {
+        $assuranceNote = (
+            "This is a version-pinned package-index install, not hash-bound to a " +
+            "verified local wheel. Review index and provenance before execution."
         )
     }
 }
@@ -366,6 +508,8 @@ $report = [ordered] @{
         commands = $commands
         operator_execution_required = $Action -eq "Bootstrap"
         prerequisites_were_installed = $false
+        install_assurance = $installAssurance
+        assurance_note = $assuranceNote
     }
     mutation_performed = $false
     passed = $selectedReady
@@ -383,6 +527,9 @@ else {
     if ($Action -eq "Bootstrap" -and $commands.Count -gt 0) {
         Write-Output ""
         Write-Output "Review and run these commands yourself:"
+        if ($assuranceNote.Length -gt 0) {
+            Write-Output "  Assurance: $assuranceNote"
+        }
         foreach ($command in $commands) {
             Write-Output "  $command"
         }
