@@ -624,15 +624,14 @@ def _scan_candidates_from_descriptor(
                     skipped += 1
                     if stat.S_ISREG(info.st_mode):
                         coverage_complete = False
-                    if len(candidates) >= limits.max_files:
+                    if (
+                        len(candidates) >= limits.max_files
+                        and stat.S_ISREG(info.st_mode)
+                    ):
                         stop = True
                         return
                     continue
                 candidates.append(candidate)
-                if len(candidates) >= limits.max_files:
-                    coverage_complete = False
-                    stop = True
-                    return
 
     visit(root_descriptor, Path())
     candidates.sort(key=lambda item: item.relative_path)
@@ -696,15 +695,14 @@ def _scan_candidates_from_path(
                     skipped += 1
                     if stat.S_ISREG(info.st_mode):
                         coverage_complete = False
-                    if len(candidates) >= limits.max_files:
+                    if (
+                        len(candidates) >= limits.max_files
+                        and stat.S_ISREG(info.st_mode)
+                    ):
                         stop = True
                         return
                     continue
                 candidates.append(candidate)
-                if len(candidates) >= limits.max_files:
-                    coverage_complete = False
-                    stop = True
-                    return
 
     visit(repository_root, Path())
     candidates.sort(key=lambda item: item.relative_path)

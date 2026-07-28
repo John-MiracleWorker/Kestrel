@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Generic, TypeVar, cast
 
-from ..file_lock import lock_exclusive, unlock
+from ..file_lock import lock_exclusive, lock_shared, unlock
 from .models import (
     MAX_QUERY_LIMIT,
     MAX_QUERY_OFFSET,
@@ -1171,13 +1171,21 @@ class RepoIndexStore:
                     or observed_lock.inode != self._lock_binding.inode
                 ):
                     raise RepositoryIndexError("repository index lock identity changed")
-                binary_handle = os.fdopen(lock_descriptor, "r+b", closefd=False)
+                lock_mode = "r+b" if self._writes_allowed else "rb"
+                binary_handle = os.fdopen(
+                    lock_descriptor,
+                    lock_mode,
+                    closefd=False,
+                )
                 lock_handle = cast(IO[str], binary_handle)
-                # An authenticated publication may need its final high-water
-                # write completed during create=False recovery. The lock file
-                # must already exist, but admission is always exclusive so the
-                # reconciliation cannot race another reader or writer.
-                lock_exclusive(lock_handle)
+                if self._writes_allowed:
+                    # Writable admission may reconcile one fully authenticated
+                    # publication whose final high-water append was interrupted.
+                    lock_exclusive(lock_handle)
+                else:
+                    # Read-only callers validate durable authority but never
+                    # repair it as a side effect.
+                    lock_shared(lock_handle)
                 lock_acquired = True
                 locked_info = os.fstat(lock_descriptor)
                 self._require_safe_private_file(
@@ -1230,7 +1238,12 @@ class RepoIndexStore:
             return (
                 self._open_relative(
                     name,
-                    os.O_RDWR | _no_follow_flag(),
+                    (
+                        os.O_RDWR
+                        if self._writes_allowed
+                        else os.O_RDONLY
+                    )
+                    | _no_follow_flag(),
                     parent_descriptor=parent_descriptor,
                 ),
                 False,
@@ -1504,6 +1517,10 @@ class RepoIndexStore:
         os.fsync(descriptor)
 
     def _persist_lock_authority(self, receipt: _GenerationReceipt) -> None:
+        if not self._writes_allowed:
+            raise RepositoryIndexError(
+                "read-only repository index cannot persist lock authority"
+            )
         descriptor = self._active_lock_descriptor
         secret = self._lock_secret
         if descriptor is None or secret is None:
@@ -2058,7 +2075,23 @@ class RepoIndexStore:
     ) -> None:
         authority = self._lock_authority
         if authority is None:
-            raise RepositoryIndexError("repository index rollback authority is missing")
+            if (
+                self._writes_allowed
+                and generation.sequence == 1
+                and generation.previous_generation_id is None
+                and receipt.previous_generation_id is None
+            ):
+                self._persist_lock_authority(receipt)
+                authority = self._lock_authority
+                if authority is None:
+                    raise RepositoryIndexError(
+                        "repository index initial publication recovery did not "
+                        "persist authority"
+                    )
+            else:
+                raise RepositoryIndexError(
+                    "repository index rollback authority is missing"
+                )
         if (
             generation.sequence < authority.sequence
             or generation.lineage_id != authority.lineage_id
@@ -2073,6 +2106,10 @@ class RepoIndexStore:
                 and generation.previous_generation_id == authority.generation_id
                 and receipt.previous_generation_id == authority.generation_id
             ):
+                if not self._writes_allowed:
+                    raise RepositoryIndexError(
+                        "repository index publication recovery requires a writable open"
+                    )
                 self._persist_lock_authority(receipt)
                 authority = self._lock_authority
                 if authority is None:

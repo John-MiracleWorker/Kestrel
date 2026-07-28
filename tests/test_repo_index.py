@@ -938,17 +938,136 @@ def test_interrupted_publication_recovers_authenticated_generation(
         original,
     )
 
+    lock_path = index.index_path.parent / f".{index.index_path.name}.lock"
+    before_read = lock_path.read_bytes()
+    before_metadata = lock_path.stat()
+    with pytest.raises(RepositoryIndexError, match="writable open"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            create=False,
+        )
+    after_metadata = lock_path.stat()
+    assert lock_path.read_bytes() == before_read
+    assert (
+        after_metadata.st_size,
+        after_metadata.st_mtime_ns,
+    ) == (
+        before_metadata.st_size,
+        before_metadata.st_mtime_ns,
+    )
+    writable = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+    )
+    recovered = writable.status()
+    assert recovered.freshness is Freshness.CURRENT
     reopened = RepositoryIndex(
         project_id="project-1",
         repository_root=repository,
         create=False,
     )
-    assert reopened.status().freshness is Freshness.CURRENT
-    writable = RepositoryIndex(
+    assert reopened.status().aggregate_digest == recovered.aggregate_digest
+
+
+def test_interrupted_initial_publication_requires_writable_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first-generation crash is recoverable without a read-side mutation."""
+    repository = _copy_fixture(tmp_path)
+    original = repo_store.RepoIndexStore._persist_lock_authority
+
+    def interrupted(
+        self: repo_store.RepoIndexStore,
+        receipt: Any,
+    ) -> None:
+        del self, receipt
+        raise OSError("injected initial authority persistence interruption")
+
+    monkeypatch.setattr(
+        repo_store.RepoIndexStore,
+        "_persist_lock_authority",
+        interrupted,
+    )
+    with pytest.raises(OSError, match="initial authority"):
+        RepositoryIndex(project_id="project-1", repository_root=repository)
+    monkeypatch.setattr(
+        repo_store.RepoIndexStore,
+        "_persist_lock_authority",
+        original,
+    )
+
+    index_path = repository / ".nest" / "repo-index" / "project-1.sqlite"
+    lock_path = index_path.parent / f".{index_path.name}.lock"
+    before_read = lock_path.read_bytes()
+    before_metadata = lock_path.stat()
+    with pytest.raises(RepositoryIndexError, match="authority is missing"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            create=False,
+        )
+    after_metadata = lock_path.stat()
+    assert lock_path.read_bytes() == before_read
+    assert (
+        after_metadata.st_size,
+        after_metadata.st_mtime_ns,
+    ) == (
+        before_metadata.st_size,
+        before_metadata.st_mtime_ns,
+    )
+
+    recovered = RepositoryIndex(
         project_id="project-1",
         repository_root=repository,
     )
-    assert writable.rebuild().aggregate_digest == reopened.status().aggregate_digest
+    rebuilt = recovered.rebuild()
+    assert rebuilt.indexed_files == 10
+    assert recovered.status().freshness is Freshness.CURRENT
+
+
+def test_exact_max_files_keeps_complete_coverage_for_both_scanners(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = repository / "only.py"
+    source.write_text("def only() -> None:\n    pass\n", encoding="utf-8")
+    limits = IndexLimits(max_files=1)
+
+    candidates, skipped, complete = repo_indexer._scan_candidates_from_path(
+        repository,
+        limits,
+    )
+    assert [candidate.relative_path for candidate in candidates] == ["only.py"]
+    assert skipped == 0
+    assert complete is True
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(repository, flags)
+    try:
+        candidates, skipped, complete = (
+            repo_indexer._scan_candidates_from_descriptor(
+                repository,
+                limits,
+                root_descriptor=descriptor,
+            )
+        )
+    finally:
+        os.close(descriptor)
+    assert [candidate.relative_path for candidate in candidates] == ["only.py"]
+    assert skipped == 0
+    assert complete is True
+
+    index = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        limits=limits,
+    )
+    assert index.rebuild().indexed_files == 1
+    assert index.status().coverage_complete is True
+    assert index.status().freshness is Freshness.CURRENT
 
 
 def test_interrupted_lock_authority_append_preserves_last_committed_record(
