@@ -472,7 +472,6 @@ def test_var_compatibility_is_lexical_and_user_symlink_is_still_rejected(
     module = _module()
     # macOS exposes this test directory through both /var and /private/var.
     assert str(tmp_path).startswith("/private/var/")
-    var_alias = Path("/var") / tmp_path.relative_to("/private/var")
     user_home = tmp_path / "user"
     user_home.mkdir()
     alias_home = Path("/var") / user_home.relative_to("/private/var")
@@ -585,7 +584,16 @@ def _interrupted_replacement(module: ModuleType, tmp_path: Path) -> tuple[dict[s
     artifacts = module._derived_artifacts(bin_dir, user_home, "linux", transaction_id)
     artifact = artifacts[0]
     artifact["had_previous"] = True
-    module._write_staged_shim(artifact, module._shim_text(replacement_home), uid=os.getuid())
+    previous = os.lstat(artifact["target"])
+    artifact["previous_device"] = previous.st_dev
+    artifact["previous_inode"] = previous.st_ino
+    module._write_staged_shim(
+        artifact, module._shim_text(replacement_home, transaction_id),
+        uid=os.getuid(),
+    )
+    expected = os.lstat(artifact["staged"])
+    artifact["expected_device"] = expected.st_dev
+    artifact["expected_inode"] = expected.st_ino
     payload: dict[str, Any] = {
         "schema": module.MANIFEST_SCHEMA, "transaction_id": transaction_id,
         "kestrel_home": str(replacement_home), "user_home": str(user_home),
@@ -768,3 +776,83 @@ def test_commit_resume_after_each_artifact_boundary_is_idempotent(tmp_path: Path
     assert not manifest.exists()
     assert (bin_dir / "kestrel").is_file()
     assert (user_home / "Applications" / "Kestrel.app").is_dir()
+
+
+def test_racing_managed_destination_survives_failed_install_and_retry_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    racer_home = _kestrel_home(tmp_path / "racer")
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    target = bin_dir / "kestrel"
+    racer_bytes = module._shim_text(racer_home).encode("utf-8")
+    raced = False
+
+    def create_destination(parent: Path) -> None:
+        nonlocal raced
+        if parent == bin_dir and not raced:
+            raced = True
+            target.write_bytes(racer_bytes)
+            target.chmod(0o755)
+
+    monkeypatch.setattr(module, "_before_final_mutation", create_destination)
+    with pytest.raises(module.LauncherArtifactError, match="rolled back"):
+        module.prepare_launchers(
+            kestrel_home=home, user_home=user_home, manifest_path=manifest,
+            bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)},
+        )
+
+    assert target.read_bytes() == racer_bytes
+    assert not manifest.exists()
+
+    monkeypatch.setattr(module, "_before_final_mutation", lambda _parent: None)
+    retry_manifest = home / ".nest" / "transactions" / "retry.json"
+    module.prepare_launchers(
+        kestrel_home=home, user_home=user_home, manifest_path=retry_manifest,
+        bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)},
+    )
+    module.rollback_launchers(retry_manifest)
+    assert target.read_bytes() == racer_bytes
+
+
+def test_substituted_staged_source_never_remains_public_and_is_preserved_as_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    racer_home = _kestrel_home(tmp_path / "racer")
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    target = bin_dir / "kestrel"
+    substituted = module._shim_text(racer_home).encode("utf-8")
+    preserved_stage = bin_dir / "preserved-original-stage"
+    raced = False
+
+    def substitute_source(parent: Path, _source: str, _destination: str) -> None:
+        nonlocal raced
+        if parent != bin_dir or raced:
+            return
+        staged = next(bin_dir.glob(".kestrel-stage-*-shim"))
+        raced = True
+        staged.rename(preserved_stage)
+        staged.write_bytes(substituted)
+        staged.chmod(0o755)
+
+    monkeypatch.setattr(module, "_before_native_rename", substitute_source)
+    with pytest.raises(module.LauncherArtifactError):
+        module.prepare_launchers(
+            kestrel_home=home, user_home=user_home, manifest_path=manifest,
+            bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)},
+        )
+
+    assert not target.exists()
+    assert preserved_stage.is_file()
+    evidence = list(bin_dir.glob(".kestrel-race-*.tombstone"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == substituted

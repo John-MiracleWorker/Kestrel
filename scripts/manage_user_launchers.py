@@ -19,16 +19,18 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, NoReturn
+from typing import Any, NoReturn
 from uuid import uuid4
 
 SHIM_MARKER = "KESTREL_MANAGED_COMMAND_SHIM_V1"
 APP_MARKER = "KESTREL_MANAGED_MACOS_APP_V1"
 APP_MARKER_FILENAME = "kestrel-managed-launcher-v1"
-MANIFEST_SCHEMA = "kestrel.user_launchers.v3"
+APP_TRANSACTION_FILENAME = "kestrel-launcher-transaction-v1"
+TRANSACTION_MARKER_PREFIX = "# KESTREL_TRANSACTION_ID="
+MANIFEST_SCHEMA = "kestrel.user_launchers.v4"
 _MAX_MANIFEST_BYTES = 1_000_000
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -85,15 +87,30 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
     transaction_id = uuid4().hex
     artifacts = _derived_artifacts(selected_bin, user, selected_platform, transaction_id)
     for artifact in artifacts:
-        artifact["had_previous"] = _preflight_artifact(Path(artifact["target"]), kind=artifact["kind"])
+        target = Path(artifact["target"])
+        artifact["had_previous"] = _preflight_artifact(target, kind=artifact["kind"])
+        if artifact["had_previous"]:
+            previous = _managed_artifact_identity(
+                target, kind=artifact["kind"],
+            )
+            artifact["previous_device"] = previous.st_dev
+            artifact["previous_inode"] = previous.st_ino
     codesign_status = "not_applicable"
     shim = artifacts[0]
-    _write_staged_shim(shim, _shim_text(home), uid=uid)
+    _write_staged_shim(shim, _shim_text(home, transaction_id), uid=uid)
     if selected_platform == "darwin":
         app = artifacts[1]
         _build_staged_app(app, shim_path=Path(shim["target"]),
-                          log_path=home / ".nest" / "server.log", uid=uid)
+                          log_path=home / ".nest" / "server.log",
+                          transaction_id=transaction_id, uid=uid)
         codesign_status = _codesign_app(Path(app["staged"]), which=which)
+    for artifact in artifacts:
+        staged = _transaction_artifact_identity(
+            Path(artifact["staged"]), kind=artifact["kind"],
+            transaction_id=transaction_id,
+        )
+        artifact["expected_device"] = staged.st_dev
+        artifact["expected_inode"] = staged.st_ino
     payload: dict[str, Any] = {
         "schema": MANIFEST_SCHEMA, "transaction_id": transaction_id,
         "kestrel_home": str(home), "user_home": str(user),
@@ -159,7 +176,9 @@ def _derived_artifacts(bin_dir: Path, user_home: Path, platform: str, transactio
     return [{"kind": kind, "target": str(target),
              "staged": str(target.parent / f".kestrel-stage-{transaction_id}-{kind}"),
              "backup": str(target.parent / f".kestrel-backup-{transaction_id}-{kind}"),
-             "had_previous": False, "backed_up": False, "installed": False, "commit_deleted": False}
+             "had_previous": False, "backed_up": False, "installed": False,
+             "commit_deleted": False, "expected_device": 0, "expected_inode": 0,
+             "previous_device": 0, "previous_inode": 0}
             for kind, target in specs]
 
 
@@ -174,12 +193,19 @@ def _install_prepared_artifact(artifact: dict[str, Any], *, payload: dict[str, A
                 raise LauncherArtifactError(f"Managed launcher disappeared before replacement: {target}")
             if _entry_exists(parent_fd, backup_name):
                 raise LauncherArtifactError(f"Launcher backup path already exists: {backup}")
-            _final_rename_no_replace(target.parent, parent_fd, target_name, backup_name)
+            _final_rename_no_replace(
+                target.parent, parent_fd, target_name, backup_name,
+                expected_identity=(artifact["previous_device"], artifact["previous_inode"]),
+            )
             artifact["backed_up"] = True
             _write_manifest(manifest_path, payload)
         elif _entry_exists(parent_fd, target_name):
             raise LauncherArtifactError(f"Launcher target appeared before installation: {target}")
-        _final_rename_no_replace(target.parent, parent_fd, staged_name, target_name)
+        _final_rename_no_replace(
+            target.parent, parent_fd, staged_name, target_name,
+            expected_identity=(artifact["expected_device"], artifact["expected_inode"]),
+            mismatched_destination_kind=artifact["kind"],
+        )
         artifact["installed"] = True
         _write_manifest(manifest_path, payload)
 
@@ -197,19 +223,51 @@ def _rollback_payload(payload: dict[str, Any], *, manifest_path: Path, remove_ma
                 if not _artifact_is_managed_at(parent_fd, backup.name, kind=artifact["kind"]):
                     raise LauncherArtifactError(f"Rollback backup changed or is unrelated: {backup}")
                 if target_exists:
-                    if not _artifact_is_managed_at(parent_fd, target.name, kind=artifact["kind"]):
-                        raise LauncherArtifactError(f"Rollback target changed or is unrelated: {target}")
-                    _remove_managed_at(parent_fd, target.name, kind=artifact["kind"], parent=target.parent)
-                _final_rename_no_replace(target.parent, parent_fd, backup.name, target.name)
+                    if not _artifact_belongs_to_transaction_at(
+                        parent_fd, target.name, artifact=artifact,
+                        transaction_id=payload["transaction_id"],
+                    ):
+                        raise LauncherArtifactError(
+                            f"Rollback target is not owned by this transaction: {target}"
+                        )
+                    _remove_managed_at(
+                        parent_fd, target.name, kind=artifact["kind"],
+                        parent=target.parent,
+                        expected_identity=(
+                            artifact["expected_device"],
+                            artifact["expected_inode"],
+                        ),
+                    )
+                _final_rename_no_replace(
+                    target.parent, parent_fd, backup.name, target.name,
+                    expected_identity=(artifact["previous_device"], artifact["previous_inode"]),
+                )
             elif target_exists and not bool(artifact["had_previous"]):
-                # With no predecessor, a managed target can only be our newly
-                # installed artifact.  Remove it.  With a predecessor and no
-                # backup, leaving the target intact is the only lossless choice.
-                if not _artifact_is_managed_at(parent_fd, target.name, kind=artifact["kind"]):
-                    raise LauncherArtifactError(f"Rollback target changed or is unrelated: {target}")
-                _remove_managed_at(parent_fd, target.name, kind=artifact["kind"], parent=target.parent)
+                if _artifact_belongs_to_transaction_at(
+                    parent_fd, target.name, artifact=artifact,
+                    transaction_id=payload["transaction_id"],
+                ):
+                    _remove_managed_at(
+                        parent_fd, target.name, kind=artifact["kind"],
+                        parent=target.parent,
+                        expected_identity=(
+                            artifact["expected_device"],
+                            artifact["expected_inode"],
+                        ),
+                    )
             if _entry_exists(parent_fd, staged.name):
-                _remove_managed_at(parent_fd, staged.name, kind=artifact["kind"], parent=target.parent)
+                if _entry_matches_identity(
+                    parent_fd, staged.name,
+                    artifact["expected_device"], artifact["expected_inode"],
+                ):
+                    _remove_managed_at(
+                        parent_fd, staged.name, kind=artifact["kind"],
+                        parent=target.parent,
+                        expected_identity=(
+                            artifact["expected_device"],
+                            artifact["expected_inode"],
+                        ),
+                    )
     if remove_manifest:
         _unlink_manifest(manifest_path, expected_payload=payload)
 
@@ -218,15 +276,30 @@ def _remove_staged_leftovers(payload: dict[str, Any]) -> None:
     for artifact in payload["artifacts"]:
         target, staged = Path(artifact["target"]), Path(artifact["staged"])
         with _pinned_directory(target.parent, uid=_current_uid()) as parent_fd:
-            if _entry_exists(parent_fd, staged.name):
-                _remove_managed_at(parent_fd, staged.name, kind=artifact["kind"], parent=target.parent)
+            if _entry_matches_identity(
+                parent_fd, staged.name,
+                artifact["expected_device"], artifact["expected_inode"],
+            ):
+                _remove_managed_at(
+                    parent_fd, staged.name, kind=artifact["kind"],
+                    parent=target.parent,
+                    expected_identity=(
+                        artifact["expected_device"], artifact["expected_inode"],
+                    ),
+                )
 
 
 def _remove_if_present(artifact: dict[str, Any], field: str) -> None:
     target, candidate = Path(artifact["target"]), Path(artifact[field])
     with _pinned_directory(target.parent, uid=_current_uid()) as parent_fd:
         if _entry_exists(parent_fd, candidate.name):
-            _remove_managed_at(parent_fd, candidate.name, kind=artifact["kind"], parent=target.parent)
+            expected_identity = (
+                artifact["previous_device"], artifact["previous_inode"],
+            )
+            _remove_managed_at(
+                parent_fd, candidate.name, kind=artifact["kind"],
+                parent=target.parent, expected_identity=expected_identity,
+            )
 
 
 def _require_terminal_transaction(payload: dict[str, Any]) -> None:
@@ -236,14 +309,21 @@ def _require_terminal_transaction(payload: dict[str, Any]) -> None:
             raise LauncherArtifactError("Launcher transaction is incomplete and cannot be committed")
         target, staged, backup = (Path(artifact[key]) for key in ("target", "staged", "backup"))
         with _pinned_directory(target.parent, uid=_current_uid()) as parent_fd:
-            if not _artifact_is_managed_at(parent_fd, target.name, kind=artifact["kind"]):
+            if not _artifact_belongs_to_transaction_at(
+                parent_fd, target.name, artifact=artifact,
+                transaction_id=payload["transaction_id"],
+            ):
                 raise LauncherArtifactError("Launcher transaction target is not terminal")
             if _entry_exists(parent_fd, staged.name):
                 raise LauncherArtifactError("Launcher transaction staging artifact remains")
             if bool(artifact["had_previous"]):
-                if payload["phase"] == "prepared" and not _artifact_is_managed_at(parent_fd, backup.name, kind=artifact["kind"]):
+                backup_matches = _entry_matches_identity(
+                    parent_fd, backup.name,
+                    artifact["previous_device"], artifact["previous_inode"],
+                )
+                if payload["phase"] == "prepared" and not backup_matches:
                     raise LauncherArtifactError("Launcher transaction backup is not terminal")
-                if _entry_exists(parent_fd, backup.name) and not _artifact_is_managed_at(parent_fd, backup.name, kind=artifact["kind"]):
+                if _entry_exists(parent_fd, backup.name) and not backup_matches:
                     raise LauncherArtifactError("Launcher transaction backup changed during commit")
             elif _entry_exists(parent_fd, backup.name):
                 raise LauncherArtifactError("Launcher transaction has an unexpected backup")
@@ -255,22 +335,33 @@ def _write_staged_shim(artifact: dict[str, Any], text: str, *, uid: int) -> None
         _write_file_at(parent_fd, staged.name, text.encode("utf-8"), 0o755)
 
 
-def _build_staged_app(artifact: dict[str, Any], *, shim_path: Path, log_path: Path, uid: int) -> None:
+def _build_staged_app(
+    artifact: dict[str, Any], *, shim_path: Path, log_path: Path,
+    transaction_id: str, uid: int,
+) -> None:
     target, staged = Path(artifact["target"]), Path(artifact["staged"])
     with _pinned_directory(target.parent, uid=uid) as parent_fd:
         os.mkdir(staged.name, 0o755, dir_fd=parent_fd)
         with _open_dir_at(parent_fd, staged.name, uid=uid) as app_fd:
-            _build_macos_app_at(app_fd, shim_path=shim_path, log_path=log_path)
+            _build_macos_app_at(
+                app_fd, shim_path=shim_path, log_path=log_path,
+                transaction_id=transaction_id,
+            )
 
 
-def _shim_text(kestrel_home: Path) -> str:
+def _shim_text(kestrel_home: Path, transaction_id: str = "0" * 32) -> str:
     executable = kestrel_home / ".venv" / "bin" / "kestrel"
-    return ("#!/bin/bash\n" f"# {SHIM_MARKER}\n" "set -euo pipefail\n"
+    return ("#!/bin/bash\n" f"# {SHIM_MARKER}\n"
+            f"{TRANSACTION_MARKER_PREFIX}{transaction_id}\n"
+            "set -euo pipefail\n"
             f"export KESTREL_HOME={shlex.quote(str(kestrel_home))}\n"
             f"exec {shlex.quote(str(executable))} \"$@\"\n")
 
 
-def _build_macos_app(app_path: Path, *, shim_path: Path, log_path: Path) -> None:
+def _build_macos_app(
+    app_path: Path, *, shim_path: Path, log_path: Path,
+    transaction_id: str = "0" * 32,
+) -> None:
     contents, macos_dir, resources_dir = app_path / "Contents", app_path / "Contents" / "MacOS", app_path / "Contents" / "Resources"
     macos_dir.mkdir(parents=True, mode=0o755)
     resources_dir.mkdir(parents=True, mode=0o755)
@@ -282,6 +373,10 @@ def _build_macos_app(app_path: Path, *, shim_path: Path, log_path: Path) -> None
                        "CFBundleVersion": "1", "LSMinimumSystemVersion": "12.0"}, handle, sort_keys=True)
     (resources_dir / APP_MARKER_FILENAME).write_text(f"{APP_MARKER}\n", encoding="utf-8")
     (resources_dir / APP_MARKER_FILENAME).chmod(0o644)
+    (resources_dir / APP_TRANSACTION_FILENAME).write_text(
+        f"{transaction_id}\n", encoding="utf-8",
+    )
+    (resources_dir / APP_TRANSACTION_FILENAME).chmod(0o600)
     recovery = f"Kestrel could not start. See {log_path}. Run: {shim_path} doctor"
     applescript = 'display alert "Kestrel could not start" message ' + f'"{_escape_applescript(recovery)}" as critical'
     _write_executable(macos_dir / "Kestrel", "#!/bin/bash\n" f"# {APP_MARKER}\nset -u\n"
@@ -289,7 +384,9 @@ def _build_macos_app(app_path: Path, *, shim_path: Path, log_path: Path) -> None
                       f"  /usr/bin/osascript -e {shlex.quote(applescript)} >/dev/null 2>&1 || true\n  exit 1\nfi\n")
 
 
-def _build_macos_app_at(app_fd: int, *, shim_path: Path, log_path: Path) -> None:
+def _build_macos_app_at(
+    app_fd: int, *, shim_path: Path, log_path: Path, transaction_id: str,
+) -> None:
     """Build the app entirely below an already pinned staging-directory fd."""
     os.mkdir("Contents", 0o755, dir_fd=app_fd)
     with _open_dir_at(app_fd, "Contents", uid=_current_uid()) as contents_fd:
@@ -306,6 +403,10 @@ def _build_macos_app_at(app_fd: int, *, shim_path: Path, log_path: Path) -> None
         _write_file_at(contents_fd, "Info.plist", plist_buffer.getvalue(), 0o644)
         with _open_dir_at(contents_fd, "Resources", uid=_current_uid()) as resources_fd:
             _write_file_at(resources_fd, APP_MARKER_FILENAME, f"{APP_MARKER}\n".encode(), 0o644)
+            _write_file_at(
+                resources_fd, APP_TRANSACTION_FILENAME,
+                f"{transaction_id}\n".encode(), 0o600,
+            )
         recovery = f"Kestrel could not start. See {log_path}. Run: {shim_path} doctor"
         applescript = 'display alert "Kestrel could not start" message ' + f'"{_escape_applescript(recovery)}" as critical'
         executable = ("#!/bin/bash\n" f"# {APP_MARKER}\nset -u\n"
@@ -343,17 +444,29 @@ def _artifact_is_managed(path: Path, *, kind: str) -> bool:
     try:
         if kind == "shim":
             lines = path.read_text(encoding="utf-8").splitlines()
-            return len(lines) >= 5 and lines[0] == "#!/bin/bash" and lines[1] == f"# {SHIM_MARKER}" and lines[2] == "set -euo pipefail" and lines[-1].startswith("exec ")
+            return (
+                len(lines) >= 6
+                and lines[0] == "#!/bin/bash"
+                and lines[1] == f"# {SHIM_MARKER}"
+                and _valid_transaction_marker(lines[2])
+                and lines[3] == "set -euo pipefail"
+                and lines[-1].startswith("exec ")
+            )
         if kind == "app":
             marker = path / "Contents" / "Resources" / APP_MARKER_FILENAME
+            transaction = path / "Contents" / "Resources" / APP_TRANSACTION_FILENAME
             executable = path / "Contents" / "MacOS" / "Kestrel"
             plist = path / "Contents" / "Info.plist"
-            if marker.is_symlink() or executable.is_symlink() or plist.is_symlink():
+            if (
+                marker.is_symlink() or transaction.is_symlink()
+                or executable.is_symlink() or plist.is_symlink()
+            ):
                 return False
             lines = executable.read_text(encoding="utf-8").splitlines()
             with plist.open("rb") as handle:
                 data = plistlib.load(handle)
             return (marker.read_text(encoding="utf-8") == f"{APP_MARKER}\n" and
+                    _valid_transaction_id(transaction.read_text(encoding="utf-8").strip()) and
                     data.get("CFBundleIdentifier") == "com.kestrel.local-launcher" and
                     data.get("CFBundleExecutable") == "Kestrel" and len(lines) >= 2 and
                     lines[0] == "#!/bin/bash" and lines[1] == f"# {APP_MARKER}")
@@ -366,27 +479,107 @@ def _artifact_is_managed_at(parent_fd: int, name: str, *, kind: str) -> bool:
     try:
         if kind == "shim":
             lines = _read_file_at(parent_fd, name).decode("utf-8").splitlines()
-            return len(lines) >= 5 and lines[0] == "#!/bin/bash" and lines[1] == f"# {SHIM_MARKER}" and lines[2] == "set -euo pipefail" and lines[-1].startswith("exec ")
+            return (
+                len(lines) >= 6
+                and lines[0] == "#!/bin/bash"
+                and lines[1] == f"# {SHIM_MARKER}"
+                and _valid_transaction_marker(lines[2])
+                and lines[3] == "set -euo pipefail"
+                and lines[-1].startswith("exec ")
+            )
         if kind != "app":
             raise LauncherArtifactError(f"Unknown launcher artifact kind: {kind}")
         with _open_dir_at(parent_fd, name, uid=_current_uid()) as app_fd:
             with _open_dir_at(app_fd, "Contents", uid=_current_uid()) as contents_fd:
                 with _open_dir_at(contents_fd, "Resources", uid=_current_uid()) as resources_fd:
                     marker = _read_file_at(resources_fd, APP_MARKER_FILENAME).decode("utf-8")
+                    transaction = _read_file_at(
+                        resources_fd, APP_TRANSACTION_FILENAME,
+                    ).decode("utf-8").strip()
                 with _open_dir_at(contents_fd, "MacOS", uid=_current_uid()) as macos_fd:
                     executable = _read_file_at(macos_fd, "Kestrel").decode("utf-8").splitlines()
                 data = plistlib.loads(_read_file_at(contents_fd, "Info.plist"))
-        return (marker == f"{APP_MARKER}\n" and data.get("CFBundleIdentifier") == "com.kestrel.local-launcher" and
+        return (marker == f"{APP_MARKER}\n" and _valid_transaction_id(transaction) and
+                data.get("CFBundleIdentifier") == "com.kestrel.local-launcher" and
                 data.get("CFBundleExecutable") == "Kestrel" and len(executable) >= 2 and
                 executable[0] == "#!/bin/bash" and executable[1] == f"# {APP_MARKER}")
     except (OSError, UnicodeDecodeError, plistlib.InvalidFileException):
         return False
 
 
-def _remove_managed_at(parent_fd: int, name: str, *, kind: str, parent: Path) -> None:
+def _valid_transaction_id(value: str) -> bool:
+    return (
+        len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _valid_transaction_marker(line: str) -> bool:
+    return (
+        line.startswith(TRANSACTION_MARKER_PREFIX)
+        and _valid_transaction_id(line.removeprefix(TRANSACTION_MARKER_PREFIX))
+    )
+
+
+def _entry_matches_identity(
+    parent_fd: int, name: str, expected_device: int, expected_inode: int,
+) -> bool:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return (
+        metadata.st_dev == expected_device
+        and metadata.st_ino == expected_inode
+    )
+
+
+def _artifact_belongs_to_transaction_at(
+    parent_fd: int, name: str, *, artifact: Mapping[str, Any],
+    transaction_id: str,
+) -> bool:
+    if not _entry_matches_identity(
+        parent_fd, name,
+        int(artifact["expected_device"]), int(artifact["expected_inode"]),
+    ):
+        return False
+    try:
+        if artifact["kind"] == "shim":
+            lines = _read_file_at(parent_fd, name).decode("utf-8").splitlines()
+            return (
+                len(lines) >= 3
+                and lines[2] == f"{TRANSACTION_MARKER_PREFIX}{transaction_id}"
+            )
+        with _open_dir_at(parent_fd, name, uid=_current_uid()) as app_fd:
+            with _open_dir_at(app_fd, "Contents", uid=_current_uid()) as contents_fd:
+                with _open_dir_at(
+                    contents_fd, "Resources", uid=_current_uid(),
+                ) as resources_fd:
+                    token = _read_file_at(
+                        resources_fd, APP_TRANSACTION_FILENAME,
+                    ).decode("utf-8").strip()
+        return token == transaction_id
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _remove_managed_at(
+    parent_fd: int, name: str, *, kind: str, parent: Path,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     with _verified_artifact_fd(parent_fd, name, kind=kind) as verified_fd:
         quarantine = f".kestrel-quarantine-{uuid4().hex}-{kind}"
-        _final_rename_no_replace(parent, parent_fd, name, quarantine)
+        verified = os.fstat(verified_fd)
+        if expected_identity is not None and (
+            verified.st_dev, verified.st_ino
+        ) != expected_identity:
+            raise LauncherArtifactError(
+                f"Launcher artifact is not owned by this transaction: {name}"
+            )
+        _final_rename_no_replace(
+            parent, parent_fd, name, quarantine,
+            expected_identity=(verified.st_dev, verified.st_ino),
+        )
         try:
             _assert_entry_matches_fd(parent_fd, quarantine, verified_fd)
             _before_tombstone_clear(parent, kind)
@@ -461,6 +654,29 @@ def _validate_payload(payload: dict[str, Any], *, manifest_path: Path, uid: int)
                 raise LauncherArtifactError("Launcher transaction manifest artifact paths do not match transaction")
         if not all(isinstance(actual.get(key), bool) for key in ("had_previous", "backed_up", "installed", "commit_deleted")):
             raise LauncherArtifactError("Launcher transaction manifest has invalid artifact state")
+        identity_keys = (
+            "expected_device", "expected_inode",
+            "previous_device", "previous_inode",
+        )
+        if not all(
+            isinstance(actual.get(key), int)
+            and not isinstance(actual.get(key), bool)
+            and actual[key] >= 0
+            for key in identity_keys
+        ):
+            raise LauncherArtifactError(
+                "Launcher transaction manifest has invalid artifact identity"
+            )
+        if actual["expected_device"] <= 0 or actual["expected_inode"] <= 0:
+            raise LauncherArtifactError(
+                "Launcher transaction manifest is missing installed identity"
+            )
+        if bool(actual["had_previous"]) != (
+            actual["previous_device"] > 0 and actual["previous_inode"] > 0
+        ):
+            raise LauncherArtifactError(
+                "Launcher transaction manifest has inconsistent predecessor identity"
+            )
     allowed_codesign = {"not_applicable"} if platform == "linux" else {"unavailable", "verified"}
     if payload["codesign"] not in allowed_codesign:
         raise LauncherArtifactError("Launcher transaction manifest has invalid signing state")
@@ -502,7 +718,11 @@ def _unlink_manifest(path: Path, *, expected_payload: Mapping[str, Any] | None =
             quarantine = f".{path.name}.kestrel-retired-{transaction_id}.tombstone"
             if _entry_exists(parent_fd, quarantine):
                 raise LauncherArtifactError("Launcher transaction manifest tombstone already exists")
-            _final_rename_no_replace(path.parent, parent_fd, path.name, quarantine)
+            verified = os.fstat(verified_fd)
+            _final_rename_no_replace(
+                path.parent, parent_fd, path.name, quarantine,
+                expected_identity=(verified.st_dev, verified.st_ino),
+            )
             try:
                 _assert_entry_matches_fd(parent_fd, quarantine, verified_fd)
                 _before_tombstone_clear(path.parent, "manifest")
@@ -567,15 +787,33 @@ def _artifact_matches_open_fd(fd: int, *, kind: str) -> bool:
             os.lseek(fd, 0, os.SEEK_SET)
             text = b"".join(iter(lambda: os.read(fd, 65536), b"")).decode("utf-8")
             lines = text.splitlines()
-            return len(lines) >= 5 and lines[0] == "#!/bin/bash" and lines[1] == f"# {SHIM_MARKER}" and lines[2] == "set -euo pipefail" and lines[-1].startswith("exec ")
+            return (
+                len(lines) >= 6
+                and lines[0] == "#!/bin/bash"
+                and lines[1] == f"# {SHIM_MARKER}"
+                and _valid_transaction_marker(lines[2])
+                and lines[3] == "set -euo pipefail"
+                and lines[-1].startswith("exec ")
+            )
         if kind == "app":
             with _open_dir_at(fd, "Contents", uid=_current_uid()) as contents_fd:
                 with _open_dir_at(contents_fd, "Resources", uid=_current_uid()) as resources_fd:
                     marker = _read_file_at(resources_fd, APP_MARKER_FILENAME).decode("utf-8")
+                    transaction = _read_file_at(
+                        resources_fd, APP_TRANSACTION_FILENAME,
+                    ).decode("utf-8").strip()
                 with _open_dir_at(contents_fd, "MacOS", uid=_current_uid()) as macos_fd:
                     executable = _read_file_at(macos_fd, "Kestrel").decode("utf-8").splitlines()
                 data = plistlib.loads(_read_file_at(contents_fd, "Info.plist"))
-            return marker == f"{APP_MARKER}\n" and data.get("CFBundleIdentifier") == "com.kestrel.local-launcher" and data.get("CFBundleExecutable") == "Kestrel" and len(executable) >= 2 and executable[0] == "#!/bin/bash" and executable[1] == f"# {APP_MARKER}"
+            return (
+                marker == f"{APP_MARKER}\n"
+                and _valid_transaction_id(transaction)
+                and data.get("CFBundleIdentifier") == "com.kestrel.local-launcher"
+                and data.get("CFBundleExecutable") == "Kestrel"
+                and len(executable) >= 2
+                and executable[0] == "#!/bin/bash"
+                and executable[1] == f"# {APP_MARKER}"
+            )
     except (OSError, UnicodeDecodeError, plistlib.InvalidFileException):
         return False
     raise LauncherArtifactError(f"Unknown launcher artifact kind: {kind}")
@@ -611,7 +849,9 @@ def _write_executable(path: Path, text: str) -> None:
     try:
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
-            handle.write(text.encode("utf-8")); handle.flush(); os.fsync(handle.fileno())
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -624,18 +864,46 @@ def _final_replace(parent: Path, parent_fd: int, source: str, destination: str) 
     os.replace(source, destination, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
 
-def _final_rename_no_replace(parent: Path, parent_fd: int, source: str, destination: str) -> None:
+def _final_rename_no_replace(
+    parent: Path, parent_fd: int, source: str, destination: str, *,
+    expected_identity: tuple[int, int] | None = None,
+    mismatched_destination_kind: str | None = None,
+) -> None:
     """Move an inode only into an absent destination, then bind its identity."""
     source_fd = os.open(source, os.O_RDONLY | _CLOEXEC | _NOFOLLOW, dir_fd=parent_fd)
     try:
         source_stat = os.fstat(source_fd)
+        if expected_identity is not None and (
+            source_stat.st_dev, source_stat.st_ino
+        ) != expected_identity:
+            raise LauncherArtifactError(
+                f"Launcher source identity changed before rename: {source}"
+            )
         _assert_directory_current(parent, parent_fd)
         _before_final_mutation(parent)
         _assert_directory_current(parent, parent_fd)
+        _assert_entry_matches_fd(parent_fd, source, source_fd)
+        _before_native_rename(parent, source, destination)
         _rename_no_replace(parent_fd, source, parent_fd, destination)
         destination_stat = os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
         if (destination_stat.st_dev, destination_stat.st_ino) != (source_stat.st_dev, source_stat.st_ino):
-            raise LauncherArtifactError("Launcher source changed during no-replace rename")
+            evidence = (
+                f".kestrel-race-{uuid4().hex}-"
+                f"{mismatched_destination_kind or 'artifact'}.tombstone"
+            )
+            try:
+                _rename_no_replace(
+                    parent_fd, destination, parent_fd, evidence,
+                )
+            except LauncherArtifactError as retire_exc:
+                raise LauncherArtifactError(
+                    "Launcher source changed during no-replace rename and "
+                    "the public mismatch could not be retired"
+                ) from retire_exc
+            raise LauncherArtifactError(
+                f"Launcher source changed during no-replace rename; "
+                f"preserved at {parent / evidence}"
+            )
     finally:
         os.close(source_fd)
 
@@ -662,6 +930,10 @@ def _rename_no_replace(source_dir_fd: int, source: str, destination_dir_fd: int,
 
 def _before_final_mutation(parent: Path) -> None:
     """Test seam immediately before an irreversible directory-fd mutation."""
+
+
+def _before_native_rename(parent: Path, source: str, destination: str) -> None:
+    """Test seam after source revalidation at the native rename boundary."""
 
 
 def _before_quarantine_delete(parent: Path) -> None:
@@ -856,11 +1128,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Create or roll back Kestrel user launch artifacts.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare = subparsers.add_parser("prepare")
-    prepare.add_argument("--kestrel-home", type=Path, required=True); prepare.add_argument("--user-home", type=Path, required=True)
-    prepare.add_argument("--manifest", type=Path, required=True); prepare.add_argument("--bin-dir", type=Path)
+    prepare.add_argument("--kestrel-home", type=Path, required=True)
+    prepare.add_argument("--user-home", type=Path, required=True)
+    prepare.add_argument("--manifest", type=Path, required=True)
+    prepare.add_argument("--bin-dir", type=Path)
     prepare.add_argument("--platform", choices=("darwin", "linux"))
     for command in ("commit", "rollback"):
-        action = subparsers.add_parser(command); action.add_argument("--manifest", type=Path, required=True)
+        action = subparsers.add_parser(command)
+        action.add_argument("--manifest", type=Path, required=True)
     return parser
 
 
@@ -870,11 +1145,15 @@ def run(argv: Sequence[str] | None = None) -> int:
         if args.command == "prepare":
             result = prepare_launchers(kestrel_home=args.kestrel_home, user_home=args.user_home,
                                        manifest_path=args.manifest, bin_dir=args.bin_dir, platform=args.platform)
-        elif args.command == "commit": result = commit_launchers(args.manifest)
-        else: result = rollback_launchers(args.manifest)
+        elif args.command == "commit":
+            result = commit_launchers(args.manifest)
+        else:
+            result = rollback_launchers(args.manifest)
     except LauncherArtifactError as exc:
-        sys.stderr.write(f"ERROR: {exc}\n"); return 1
-    sys.stdout.write(json.dumps(result, sort_keys=True) + "\n"); return 0
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 1
+    sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+    return 0
 
 
 def main() -> NoReturn:
