@@ -8,13 +8,14 @@ import secrets
 import sqlite3
 import stat
 import threading
+from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Generic, TypeVar, cast
 
-from ..file_lock import lock_exclusive, lock_shared, unlock
+from ..file_lock import lock_exclusive, unlock
 from .models import (
     MAX_QUERY_LIMIT,
     MAX_QUERY_OFFSET,
@@ -33,9 +34,17 @@ SCHEMA_VERSION = 5
 _APPLICATION_ID = 0x4B535452
 _GENERATION_HISTORY_LIMIT = 64
 _LOCK_SECRET_PREFIX = b"KESTREL-REPO-INDEX-LOCK-V1\n"
-_LOCK_MAX_BYTES = 4096
+_LOCK_MAX_BYTES = 16 * 1024 * 1024
+_LOCK_RECORD_MAX_BYTES = 1024
 _RECEIPT_MAX_BYTES = 4096
 _DIGEST_CHUNK_BYTES = 65_536
+_MAX_DATABASE_BYTES = 512 * 1024 * 1024
+_VERIFIED_CONTENT_CACHE_LIMIT = 256
+_VERIFIED_CONTENT_CACHE: OrderedDict[
+    tuple[str, str, str, _FileBinding, _FileBinding],
+    None,
+] = OrderedDict()
+_VERIFIED_CONTENT_CACHE_LOCK = threading.Lock()
 StoreRecordT = TypeVar("StoreRecordT")
 
 
@@ -164,6 +173,7 @@ class RepoIndexStore:
         self._lock_binding: _FileBinding | None = None
         self._lock_secret: bytes | None = None
         self._lock_authority: _LockAuthority | None = None
+        self._lock_uses_append_records = False
         self._active_lock_descriptor: int | None = None
         self._writes_allowed = True
         self._thread_lock = threading.RLock()
@@ -522,17 +532,27 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
+        path_prefixes: Sequence[str] = (),
     ) -> StoreQuerySnapshot[FileRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
+        parameters: list[object] = []
+        path_predicate = _path_scope_predicate(
+            "path",
+            path_prefixes,
+            parameters,
+        )
+        where = f"WHERE {path_predicate}" if path_predicate else ""
+        parameters.extend((bounded_limit + 1, bounded_offset))
         metadata, rows = self._select_records(
-            """
+            f"""
             SELECT id, path, digest, size, language, parser_version, is_test
             FROM files
+            {where}
             ORDER BY path, id
             LIMIT ? OFFSET ?
             """,
-            (bounded_limit + 1, bounded_offset),
+            tuple(parameters),
         )
         records = tuple(
             FileRecord(
@@ -562,17 +582,26 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
+        path_prefixes: Sequence[str] = (),
     ) -> StoreQuerySnapshot[SymbolRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
-        predicate = ""
+        predicates: list[str] = []
         parameters: list[object] = []
         if query is not None:
-            predicate = (
-                "WHERE instr(lower(s.name), lower(?)) > 0 "
-                "OR instr(lower(s.qualified_name), lower(?)) > 0"
+            predicates.append(
+                "(instr(lower(s.name), lower(?)) > 0 "
+                "OR instr(lower(s.qualified_name), lower(?)) > 0)"
             )
             parameters.extend((query, query))
+        path_predicate = _path_scope_predicate(
+            "f.path",
+            path_prefixes,
+            parameters,
+        )
+        if path_predicate:
+            predicates.append(path_predicate)
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
         parameters.extend((bounded_limit + 1, bounded_offset))
         metadata, rows = self._select_records(
             f"""
@@ -580,7 +609,7 @@ class RepoIndexStore:
                    s.line, s.column_number
             FROM symbols AS s
             JOIN files AS f ON f.id = s.file_id
-            {predicate}
+            {where}
             ORDER BY f.path, s.line, s.column_number, lower(s.name), s.name,
                      s.kind, lower(s.qualified_name), s.qualified_name, s.id
             LIMIT ? OFFSET ?
@@ -616,14 +645,23 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
+        path_prefixes: Sequence[str] = (),
     ) -> StoreQuerySnapshot[ImportRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
-        predicate = ""
+        predicates: list[str] = []
         parameters: list[object] = []
         if query is not None:
-            predicate = "WHERE instr(lower(i.module), lower(?)) > 0"
+            predicates.append("instr(lower(i.module), lower(?)) > 0")
             parameters.append(query)
+        path_predicate = _path_scope_predicate(
+            "f.path",
+            path_prefixes,
+            parameters,
+        )
+        if path_predicate:
+            predicates.append(path_predicate)
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
         parameters.extend((bounded_limit + 1, bounded_offset))
         metadata, rows = self._select_records(
             f"""
@@ -631,7 +669,7 @@ class RepoIndexStore:
                    i.line, i.column_number
             FROM imports AS i
             JOIN files AS f ON f.id = i.file_id
-            {predicate}
+            {where}
             ORDER BY f.path, i.line, i.column_number, lower(i.module), i.module,
                      lower(coalesce(i.imported_name, '')),
                      coalesce(i.imported_name, ''), i.id
@@ -667,21 +705,30 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
+        path_prefixes: Sequence[str] = (),
     ) -> StoreQuerySnapshot[ReferenceRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
-        predicate = ""
+        predicates: list[str] = []
         parameters: list[object] = []
         if name is not None:
-            predicate = "WHERE r.name = ? COLLATE NOCASE"
+            predicates.append("r.name = ? COLLATE NOCASE")
             parameters.append(name)
+        path_predicate = _path_scope_predicate(
+            "f.path",
+            path_prefixes,
+            parameters,
+        )
+        if path_predicate:
+            predicates.append(path_predicate)
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
         parameters.extend((bounded_limit + 1, bounded_offset))
         metadata, rows = self._select_records(
             f"""
             SELECT r.id, f.path, f.digest, r.name, r.line, r.column_number
             FROM lexical_references AS r
             JOIN files AS f ON f.id = r.file_id
-            {predicate}
+            {where}
             ORDER BY f.path, r.line, r.column_number, lower(r.name), r.name, r.id
             LIMIT ? OFFSET ?
             """,
@@ -714,23 +761,39 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
+        path_prefixes: Sequence[str] = (),
     ) -> StoreQuerySnapshot[TestRelationshipRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
+        parameters: list[object] = [symbol_name]
+        predicates = ["lower(s.name) = lower(?)"]
+        symbol_scope = _path_scope_predicate(
+            "sf.path",
+            path_prefixes,
+            parameters,
+        )
+        test_scope = _path_scope_predicate(
+            "tf.path",
+            path_prefixes,
+            parameters,
+        )
+        if symbol_scope:
+            predicates.extend((symbol_scope, test_scope))
+        parameters.extend((bounded_limit + 1, bounded_offset))
         metadata, rows = self._select_records(
-            """
+            f"""
             SELECT tr.id, s.name AS symbol_name, sf.path AS symbol_path,
                    tf.path AS test_path, tr.relationship, tr.evidence_line
             FROM test_relationships AS tr
             JOIN symbols AS s ON s.id = tr.symbol_id
             JOIN files AS sf ON sf.id = s.file_id
             JOIN files AS tf ON tf.id = tr.test_file_id
-            WHERE lower(s.name) = lower(?)
+            WHERE {' AND '.join(predicates)}
             ORDER BY tf.path, sf.path, s.line, tr.evidence_line,
                      lower(s.name), s.name, tr.id
             LIMIT ? OFFSET ?
             """,
-            (symbol_name, bounded_limit + 1, bounded_offset),
+            tuple(parameters),
         )
         records = tuple(
             TestRelationshipRecord(
@@ -1108,16 +1171,13 @@ class RepoIndexStore:
                     or observed_lock.inode != self._lock_binding.inode
                 ):
                     raise RepositoryIndexError("repository index lock identity changed")
-                binary_handle = os.fdopen(
-                    lock_descriptor,
-                    "r+b" if allow_create else "rb",
-                    closefd=False,
-                )
+                binary_handle = os.fdopen(lock_descriptor, "r+b", closefd=False)
                 lock_handle = cast(IO[str], binary_handle)
-                if allow_create:
-                    lock_exclusive(lock_handle)
-                else:
-                    lock_shared(lock_handle)
+                # An authenticated publication may need its final high-water
+                # write completed during create=False recovery. The lock file
+                # must already exist, but admission is always exclusive so the
+                # reconciliation cannot race another reader or writer.
+                lock_exclusive(lock_handle)
                 lock_acquired = True
                 locked_info = os.fstat(lock_descriptor)
                 self._require_safe_private_file(
@@ -1170,7 +1230,7 @@ class RepoIndexStore:
             return (
                 self._open_relative(
                     name,
-                    os.O_RDONLY | _no_follow_flag(),
+                    os.O_RDWR | _no_follow_flag(),
                     parent_descriptor=parent_descriptor,
                 ),
                 False,
@@ -1219,16 +1279,75 @@ class RepoIndexStore:
         if len(payload) != int(info.st_size) or not payload.startswith(_LOCK_SECRET_PREFIX):
             raise RepositoryIndexError("repository index lock authorization is invalid")
         encoded = payload[len(_LOCK_SECRET_PREFIX) :]
-        if len(encoded) == 65 and encoded.endswith(b"\n"):
+        complete = encoded
+        if not complete.endswith(b"\n"):
+            boundary = complete.rfind(b"\n")
+            if boundary < 0:
+                raise RepositoryIndexError(
+                    "repository index lock authorization is invalid"
+                )
+            # An interrupted append may leave one incomplete tail. Earlier
+            # fsync'd records remain authoritative.
+            complete = complete[: boundary + 1]
+        lines = complete.splitlines()
+        if lines and len(lines[0]) == 64:
             try:
-                secret = bytes.fromhex(encoded[:-1].decode("ascii"))
+                secret = bytes.fromhex(lines[0].decode("ascii"))
             except (UnicodeDecodeError, ValueError) as exc:
                 raise RepositoryIndexError(
                     "repository index lock authorization is invalid"
                 ) from exc
             if len(secret) != 32:
                 raise RepositoryIndexError("repository index lock authorization is invalid")
-            return secret, None
+            authority: _LockAuthority | None = None
+            for encoded_record in lines[1:]:
+                if not encoded_record:
+                    continue
+                if len(encoded_record) > _LOCK_RECORD_MAX_BYTES:
+                    raise RepositoryIndexError(
+                        "repository index lock authorization is invalid"
+                    )
+                try:
+                    record = json.loads(encoded_record)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RepositoryIndexError(
+                        "repository index lock authorization is invalid"
+                    ) from exc
+                if (
+                    not isinstance(record, dict)
+                    or set(record) != {"authority", "version"}
+                    or record["version"] != 3
+                ):
+                    raise RepositoryIndexError(
+                        "repository index lock authorization is invalid"
+                    )
+                observed = self._parse_lock_authority(
+                    record["authority"],
+                    secret=secret,
+                )
+                if observed is None:
+                    raise RepositoryIndexError(
+                        "repository index lock authority is invalid"
+                    )
+                if authority is not None:
+                    if observed.lineage_id != authority.lineage_id:
+                        raise RepositoryIndexError(
+                            "repository index lock authority lineage changed"
+                        )
+                    if observed.sequence < authority.sequence:
+                        raise RepositoryIndexError(
+                            "repository index lock authority sequence regressed"
+                        )
+                    if (
+                        observed.sequence == authority.sequence
+                        and observed != authority
+                    ):
+                        raise RepositoryIndexError(
+                            "repository index lock authority changed at one sequence"
+                        )
+                authority = observed
+            self._lock_uses_append_records = True
+            return secret, authority
         try:
             raw = json.loads(encoded)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1247,6 +1366,7 @@ class RepoIndexStore:
         if len(secret) != 32:
             raise RepositoryIndexError("repository index lock authorization is invalid")
         authority = self._parse_lock_authority(raw["authority"], secret=secret)
+        self._lock_uses_append_records = False
         return secret, authority
 
     def _parse_lock_authority(
@@ -1328,32 +1448,59 @@ class RepoIndexStore:
             label="repository index lock",
             expected_mode=0o600,
         )
-        raw_authority: dict[str, object] | None = None
-        if authority is not None:
-            raw_authority = {
-                "authorization_tag": authority.authorization_tag,
-                "content_digest": authority.content_digest,
-                "generation_id": authority.generation_id,
-                "lineage_id": authority.lineage_id,
-                "sequence": authority.sequence,
-            }
-        payload = _LOCK_SECRET_PREFIX + (
+        info = os.fstat(descriptor)
+        if authority is None:
+            if info.st_size != 0:
+                raise RepositoryIndexError(
+                    "repository index lock initialization would overwrite authority"
+                )
+            payload = _LOCK_SECRET_PREFIX + secret.hex().encode("ascii") + b"\n"
+            _write_all(descriptor, payload)
+            self._lock_uses_append_records = True
+            os.fsync(descriptor)
+            return
+        raw_authority = {
+            "authorization_tag": authority.authorization_tag,
+            "content_digest": authority.content_digest,
+            "generation_id": authority.generation_id,
+            "lineage_id": authority.lineage_id,
+            "sequence": authority.sequence,
+        }
+        record = (
             json.dumps(
                 {
                     "authority": raw_authority,
-                    "secret": secret.hex(),
-                    "version": 2,
+                    "version": 3,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
             + "\n"
         ).encode("utf-8")
-        if len(payload) > _LOCK_MAX_BYTES:
-            raise RepositoryIndexError("repository index lock authority exceeds its bounded size")
-        os.ftruncate(descriptor, 0)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        _write_all(descriptor, payload)
+        if len(record) > _LOCK_RECORD_MAX_BYTES:
+            raise RepositoryIndexError(
+                "repository index lock authority record exceeds its bounded size"
+            )
+        if not self._lock_uses_append_records:
+            # One-time migration for unreleased v2 sidecars. New v3 updates are
+            # append-only and never truncate a committed high-water record.
+            payload = _LOCK_SECRET_PREFIX + secret.hex().encode("ascii") + b"\n" + record
+            if len(payload) > _LOCK_MAX_BYTES:
+                raise RepositoryIndexError(
+                    "repository index lock authority exceeds its bounded size"
+                )
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _write_all(descriptor, payload)
+            self._lock_uses_append_records = True
+            os.fsync(descriptor)
+            return
+        if info.st_size + len(record) > _LOCK_MAX_BYTES:
+            raise RepositoryIndexError(
+                "repository index lock authority exceeds its bounded size"
+            )
+        os.lseek(descriptor, 0, os.SEEK_END)
+        _write_all(descriptor, record)
         os.fsync(descriptor)
 
     def _persist_lock_authority(self, receipt: _GenerationReceipt) -> None:
@@ -1473,6 +1620,10 @@ class RepoIndexStore:
             if not stat.S_ISREG(before.st_mode):
                 raise RepositoryIndexError("repository index database must be a regular file")
             observed = _file_binding(before)
+            if observed.size > _MAX_DATABASE_BYTES:
+                raise RepositoryIndexError(
+                    "repository index database exceeds its bounded size"
+                )
             chunks: list[bytes] = []
             remaining = observed.size
             while remaining:
@@ -1818,10 +1969,14 @@ class RepoIndexStore:
             raise RepositoryIndexError(
                 "repository index content receipt does not match its checkpoint"
             )
-        self._validate_lock_high_water(
-            generation=generation,
-            receipt=receipt,
-        )
+        authority = self._lock_authority
+        if authority is not None and (
+            generation.sequence < authority.sequence
+            or generation.lineage_id != authority.lineage_id
+        ):
+            raise RepositoryIndexError(
+                "repository index rollback is below the durable lock high-water mark"
+            )
         if (
             receipt.canonical_device,
             receipt.canonical_inode,
@@ -1849,6 +2004,36 @@ class RepoIndexStore:
         )
         if not hmac.compare_digest(receipt.authorization_tag, expected_tag):
             raise RepositoryIndexError("repository index content receipt authorization is invalid")
+        cache_key = _verified_content_cache_key(
+            self.path,
+            generation_id=generation.generation_id,
+            content_digest=receipt.content_digest,
+            canonical_binding=generation.binding,
+            snapshot_binding=snapshot_binding,
+        )
+        if not _verified_content_cache_contains(cache_key):
+            canonical_digest = self._digest_relative_file(
+                self.path.name,
+                expected_binding=generation.binding,
+                parent_descriptor=parent_descriptor,
+            )
+            snapshot_digest = self._digest_relative_file(
+                self._generation_filename(generation.generation_id),
+                expected_binding=snapshot_binding,
+                parent_descriptor=parent_descriptor,
+            )
+            if (
+                canonical_digest != receipt.content_digest
+                or snapshot_digest != receipt.content_digest
+            ):
+                raise RepositoryIndexError(
+                    "repository index content digest does not match its authenticated receipt"
+                )
+            _verified_content_cache_add(cache_key)
+        self._validate_lock_high_water(
+            generation=generation,
+            receipt=receipt,
+        )
         verified = self._verified_content
         if (
             verified is not None
@@ -1858,20 +2043,6 @@ class RepoIndexStore:
             and verified.snapshot_binding == snapshot_binding
         ):
             return
-        canonical_digest = self._digest_relative_file(
-            self.path.name,
-            expected_binding=generation.binding,
-            parent_descriptor=parent_descriptor,
-        )
-        snapshot_digest = self._digest_relative_file(
-            self._generation_filename(generation.generation_id),
-            expected_binding=snapshot_binding,
-            parent_descriptor=parent_descriptor,
-        )
-        if canonical_digest != receipt.content_digest or snapshot_digest != receipt.content_digest:
-            raise RepositoryIndexError(
-                "repository index content digest does not match its authenticated receipt"
-            )
         self._verified_content = _VerifiedGenerationContent(
             generation_id=generation.generation_id,
             content_digest=receipt.content_digest,
@@ -1896,9 +2067,22 @@ class RepoIndexStore:
                 "repository index rollback is below the durable lock high-water mark"
             )
         if generation.sequence > authority.sequence:
-            raise RepositoryIndexError(
-                "repository index publication exceeds durable lock authority"
-            )
+            if (
+                generation.sequence == authority.sequence + 1
+                and generation.lineage_id == authority.lineage_id
+                and generation.previous_generation_id == authority.generation_id
+                and receipt.previous_generation_id == authority.generation_id
+            ):
+                self._persist_lock_authority(receipt)
+                authority = self._lock_authority
+                if authority is None:
+                    raise RepositoryIndexError(
+                        "repository index publication recovery did not persist authority"
+                    )
+            else:
+                raise RepositoryIndexError(
+                    "repository index publication exceeds durable lock authority"
+                )
         if (
             generation.generation_id != authority.generation_id
             or receipt.content_digest != authority.content_digest
@@ -2464,6 +2648,15 @@ class RepoIndexStore:
                 os.fsync(parent_descriptor)
             self._verify_parent_descriptor(parent_descriptor)
             self._persist_lock_authority(receipt)
+            _verified_content_cache_add(
+                _verified_content_cache_key(
+                    self.path,
+                    generation_id=generation_id,
+                    content_digest=receipt.content_digest,
+                    canonical_binding=published_binding,
+                    snapshot_binding=published_snapshot_binding,
+                )
+            )
             self._verified_content = _VerifiedGenerationContent(
                 generation_id=generation_id,
                 content_digest=receipt.content_digest,
@@ -2836,6 +3029,10 @@ class RepoIndexStore:
                     operation="write",
                 )
                 serialized = connection.serialize()
+                if len(serialized) > _MAX_DATABASE_BYTES:
+                    raise RepositoryIndexError(
+                        "repository index database exceeds its bounded size"
+                    )
                 if database_binding is None or current_generation is None or serialized != payload:
                     append_previous = (
                         self._read_generation_state(
@@ -2857,10 +3054,15 @@ class RepoIndexStore:
                             connection,
                             append_previous,
                         )
+                    published_payload = connection.serialize()
+                    if len(published_payload) > _MAX_DATABASE_BYTES:
+                        raise RepositoryIndexError(
+                            "repository index database exceeds its bounded size"
+                        )
                     published_binding = self._publish_database(
                         connection,
                         parent_descriptor,
-                        payload=connection.serialize(),
+                        payload=published_payload,
                         expected_binding=database_binding,
                         generation_id=generation_id,
                         sequence=sequence,
@@ -2879,6 +3081,49 @@ class RepoIndexStore:
                 connection.close()
 
 
+def _verified_content_cache_key(
+    path: Path,
+    *,
+    generation_id: str,
+    content_digest: str,
+    canonical_binding: _FileBinding,
+    snapshot_binding: _FileBinding,
+) -> tuple[str, str, str, _FileBinding, _FileBinding]:
+    return (
+        str(path),
+        generation_id,
+        content_digest,
+        canonical_binding,
+        snapshot_binding,
+    )
+
+
+def _verified_content_cache_contains(
+    key: tuple[str, str, str, _FileBinding, _FileBinding],
+) -> bool:
+    # Windows' st_ctime is creation time rather than change time. Re-hash
+    # there until a platform change-journal binding is available.
+    if os.name != "posix":
+        return False
+    with _VERIFIED_CONTENT_CACHE_LOCK:
+        if key not in _VERIFIED_CONTENT_CACHE:
+            return False
+        _VERIFIED_CONTENT_CACHE.move_to_end(key)
+        return True
+
+
+def _verified_content_cache_add(
+    key: tuple[str, str, str, _FileBinding, _FileBinding],
+) -> None:
+    if os.name != "posix":
+        return
+    with _VERIFIED_CONTENT_CACHE_LOCK:
+        _VERIFIED_CONTENT_CACHE[key] = None
+        _VERIFIED_CONTENT_CACHE.move_to_end(key)
+        while len(_VERIFIED_CONTENT_CACHE) > _VERIFIED_CONTENT_CACHE_LIMIT:
+            _VERIFIED_CONTENT_CACHE.popitem(last=False)
+
+
 def _optional_str(value: object) -> str | None:
     if value is None:
         return None
@@ -2895,6 +3140,25 @@ def _validated_query_offset(offset: int) -> int:
     if isinstance(offset, bool) or not 0 <= offset <= MAX_QUERY_OFFSET:
         raise ValueError(f"offset must be between 0 and {MAX_QUERY_OFFSET}")
     return offset
+
+
+def _path_scope_predicate(
+    column: str,
+    prefixes: Sequence[str],
+    parameters: list[object],
+) -> str:
+    if not prefixes:
+        return ""
+    clauses: list[str] = []
+    for prefix in prefixes:
+        escaped = (
+            prefix.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        clauses.append(f"({column} = ? OR {column} LIKE ? ESCAPE '\\')")
+        parameters.extend((prefix, f"{escaped}/%"))
+    return f"({' OR '.join(clauses)})"
 
 
 def _query_page(

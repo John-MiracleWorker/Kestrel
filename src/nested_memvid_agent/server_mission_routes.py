@@ -9,6 +9,7 @@ from .mission_control import (
     inspect_git_worktree,
     inspect_index_without_mutation,
     inspect_provider_readiness,
+    validated_mission_plan,
 )
 from .server_capability_routes import _catalog
 from .server_models import MissionPreflightRequest
@@ -52,6 +53,11 @@ def register_mission_routes(
                 runs=runs,
                 routing_ledger=routing_ledger,
                 routing_config=routing_config,
+                mission_plan=(
+                    None
+                    if request.mission_plan is None
+                    else [task.model_dump() for task in request.mission_plan]
+                ),
             )
         except (PermissionError, ValueError) as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
@@ -67,6 +73,7 @@ def evaluate_mission_preflight(
     runs: Any,
     routing_ledger: Any,
     routing_config: Any,
+    mission_plan: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the same live preflight projection for inspection and admission."""
 
@@ -88,6 +95,7 @@ def evaluate_mission_preflight(
         template_id=template_id,
     )
     capability_catalog = _catalog(state=state, runs=runs)
+    tasks = validated_mission_plan(template_id, mission_plan)
     launch_binding = build_mission_launch_binding(
         project=project,
         objective=objective,
@@ -103,6 +111,7 @@ def evaluate_mission_preflight(
             provider=provider,
             capability_catalog=capability_catalog,
         ),
+        mission_plan=tasks,
     )
     return build_mission_preflight(
         project=project,
@@ -112,5 +121,6 @@ def evaluate_mission_preflight(
         index=index,
         provider=provider,
         capability_catalog=capability_catalog,
+        mission_plan=tasks,
         launch_binding=launch_binding,
     )

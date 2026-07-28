@@ -31,12 +31,23 @@ class RepositoryChangedDuringIndexingError(RepositoryIndexError):
 class IndexLimits:
     max_file_bytes: int = 1_000_000
     max_files: int = 20_000
+    max_scan_entries: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_file_bytes <= 0:
             raise ValueError("max_file_bytes must be positive")
         if self.max_files <= 0:
             raise ValueError("max_files must be positive")
+        if self.max_scan_entries is not None and self.max_scan_entries <= 0:
+            raise ValueError("max_scan_entries must be positive when provided")
+
+    @property
+    def scan_entry_budget(self) -> int:
+        """Bound discovery even when most repository entries are not indexable."""
+
+        if self.max_scan_entries is not None:
+            return self.max_scan_entries
+        return max(self.max_files + 1, self.max_files * 8)
 
 
 @dataclass(frozen=True)

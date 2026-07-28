@@ -23,6 +23,8 @@ class ToolContext:
     session_id: str = "default"
     run_id: str | None = None
     project_id: str | None = None
+    project_revision: int | None = None
+    project_baseline_index_digest: str | None = None
     allowed_paths: tuple[str, ...] = (".",)
     execution_origin: str = "standalone"
     approval_handler: ApprovalHandler | None = None

@@ -5,11 +5,12 @@ import hmac
 import json
 import os
 import signal
+import stat
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Thread
 from time import monotonic
 from typing import Any, Literal, cast
@@ -50,6 +51,10 @@ MISSION_TEMPLATE_IDS = frozenset(
 _MUTATING_TEMPLATES = frozenset(
     {"fix_failing_test", "implement_feature", "safe_refactor", "documentation"}
 )
+_MAX_GIT_PREFLIGHT_OUTPUT_BYTES = 8 * 1024 * 1024
+_MAX_GIT_PREFLIGHT_UNTRACKED_BYTES = 64 * 1024 * 1024
+_MAX_GIT_PREFLIGHT_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
+_MAX_GIT_PREFLIGHT_UNTRACKED_FILES = 10_000
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,9 @@ class GitInspection:
     branch: str
     state: WorkingTreeState
     summary: str
+    head_sha: str | None = None
+    tree_sha: str | None = None
+    worktree_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,7 @@ def build_mission_preflight(
     index: IndexInspection,
     provider: ProviderInspection,
     capability_catalog: Sequence[Mapping[str, object]],
+    mission_plan: Sequence[Mapping[str, Any]] | None = None,
     launch_binding: Mapping[str, Any] | None = None,
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
@@ -111,7 +120,7 @@ def build_mission_preflight(
     if project.archived_at is not None:
         raise ValueError("cannot preflight an archived project")
 
-    tasks = _plan_for(template_id)
+    tasks = validated_mission_plan(template_id, mission_plan)
     required_tools = sorted(
         {
             str(tool)
@@ -346,6 +355,9 @@ def build_mission_preflight(
         "working_tree": {
             "state": git.state,
             "summary": git.summary,
+            "head_sha": git.head_sha,
+            "tree_sha": git.tree_sha,
+            "digest": git.worktree_digest,
         },
         "route_policy": provider.route_policy,
         "budget": {
@@ -388,6 +400,7 @@ def build_mission_launch_binding(
     model_targets: Sequence[Any],
     route_policies: Sequence[Any],
     preflight_digest: str,
+    mission_plan: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Bind Mission launch to the live project, provider, and routing revisions."""
 
@@ -469,6 +482,7 @@ def build_mission_launch_binding(
         ),
         "inventory_digest": inventory_digest,
         "preflight_digest": preflight_digest,
+        "plan_digest": _payload_digest({"tasks": list(mission_plan)}),
     }
     payload["binding_digest"] = _payload_digest(payload)
     return payload
@@ -503,6 +517,9 @@ def build_mission_preflight_digest(
                 "branch": git.branch,
                 "state": git.state,
                 "summary": git.summary,
+                "head_sha": git.head_sha,
+                "tree_sha": git.tree_sha,
+                "worktree_digest": git.worktree_digest,
             },
             "index": {
                 "freshness": index.freshness,
@@ -556,35 +573,86 @@ def mission_plan_scope_matches(
     provided: Sequence[Mapping[str, Any]],
     expected: Sequence[Mapping[str, Any]],
 ) -> bool:
-    """Allow prose edits while keeping the preflighted graph, tools, and risk exact."""
+    """Require the launched plan to exactly match the newly bound preflight plan."""
 
     if len(provided) != len(expected):
         return False
-    structural_fields = ("task_id", "dependencies", "required_tools", "risk")
     try:
-        provided_scope = [
-            {field: item[field] for field in structural_fields}
-            for item in provided
-        ]
-        expected_scope = [
-            {field: item[field] for field in structural_fields}
-            for item in expected
-        ]
         return json.dumps(
-            provided_scope,
+            list(provided),
             ensure_ascii=True,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
         ) == json.dumps(
-            expected_scope,
+            list(expected),
             ensure_ascii=True,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
         )
-    except (KeyError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return False
+
+
+def validated_mission_plan(
+    template_id: str,
+    proposed: Sequence[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Accept bounded prose edits while preserving the server-authored task structure."""
+
+    expected = _plan_for(template_id)
+    if proposed is None:
+        return expected
+    if len(proposed) != len(expected):
+        raise ValueError("mission plan cannot add or remove preflight tasks")
+    structural_fields = ("task_id", "dependencies", "required_tools", "risk")
+    prose_fields = ("title", "rationale", "acceptance_criteria")
+    normalized: list[dict[str, Any]] = []
+    for index, (candidate, template) in enumerate(
+        zip(proposed, expected, strict=True),
+    ):
+        if set(candidate) != set(template):
+            raise ValueError(
+                f"mission task {index + 1} fields do not match the template"
+            )
+        if any(candidate.get(field) != template[field] for field in structural_fields):
+            raise ValueError(
+                f"mission task {index + 1} cannot change dependencies, tools, or risk"
+            )
+        title = candidate.get("title")
+        rationale = candidate.get("rationale")
+        acceptance = candidate.get("acceptance_criteria")
+        if (
+            not isinstance(title, str)
+            or not title.strip()
+            or len(title) > 512
+            or not isinstance(rationale, str)
+            or not rationale.strip()
+            or len(rationale) > 4_096
+            or not isinstance(acceptance, list)
+            or not 1 <= len(acceptance) <= 32
+            or any(
+                not isinstance(item, str)
+                or not item.strip()
+                or len(item) > 4_096
+                for item in acceptance
+            )
+        ):
+            raise ValueError(
+                f"mission task {index + 1} has invalid title, rationale, or acceptance criteria"
+            )
+        normalized.append(
+            {
+                field: (
+                    list(candidate[field])
+                    if field in {"dependencies", "acceptance_criteria", "required_tools"}
+                    else candidate[field]
+                )
+                for field in (*structural_fields[:1], *prose_fields, *structural_fields[1:])
+            }
+        )
+    return normalized
 
 
 def inspect_git_worktree(
@@ -658,21 +726,108 @@ def inspect_git_worktree(
         )
         if tracked_return_code != 0:
             raise OSError(f"git status failed with status {tracked_return_code}")
-        untracked, untracked_return_code = _git_first_line(
+        untracked_output, untracked_return_code = _git_output_bytes(
             root,
             (
                 "ls-files",
                 "--others",
                 "--exclude-standard",
-                "--directory",
-                "--no-empty-directory",
+                "-z",
+                "--",
             ),
             deadline=deadline,
+            maximum_bytes=_MAX_GIT_PREFLIGHT_OUTPUT_BYTES,
         )
         if untracked_return_code != 0:
             raise OSError(
                 f"git untracked-file inspection failed with status {untracked_return_code}"
             )
+        head_sha, head_return_code = _git_first_line(
+            root,
+            ("rev-parse", "--verify", "HEAD"),
+            deadline=deadline,
+        )
+        if head_return_code == 0 and not _is_git_object_id(head_sha):
+            raise OSError(
+                f"git HEAD inspection failed with status {head_return_code}"
+            )
+        if head_return_code == 0:
+            tree_sha, tree_return_code = _git_first_line(
+                root,
+                ("rev-parse", "--verify", "HEAD^{tree}"),
+                deadline=deadline,
+            )
+            if tree_return_code != 0 or not _is_git_object_id(tree_sha):
+                raise OSError(
+                    f"git tree inspection failed with status {tree_return_code}"
+                )
+            tracked_diff, diff_return_code = _git_output_bytes(
+                root,
+                (
+                    "diff",
+                    "--binary",
+                    "--full-index",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD",
+                    "--",
+                ),
+                deadline=deadline,
+                maximum_bytes=_MAX_GIT_PREFLIGHT_OUTPUT_BYTES,
+            )
+            if diff_return_code != 0:
+                raise OSError(
+                    f"git worktree-diff inspection failed with status {diff_return_code}"
+                )
+        else:
+            head_sha = ""
+            tree_sha = ""
+            staged_diff, staged_return_code = _git_output_bytes(
+                root,
+                (
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--full-index",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--",
+                ),
+                deadline=deadline,
+                maximum_bytes=_MAX_GIT_PREFLIGHT_OUTPUT_BYTES,
+            )
+            unstaged_diff, unstaged_return_code = _git_output_bytes(
+                root,
+                (
+                    "diff",
+                    "--binary",
+                    "--full-index",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--",
+                ),
+                deadline=deadline,
+                maximum_bytes=_MAX_GIT_PREFLIGHT_OUTPUT_BYTES,
+            )
+            if staged_return_code != 0 or unstaged_return_code != 0:
+                raise OSError("git unborn-worktree inspection failed")
+            tracked_diff = staged_diff + b"\0kestrel-index-boundary\0" + unstaged_diff
+        untracked_manifest = _untracked_content_manifest(
+            root,
+            untracked_output,
+            deadline=deadline,
+        )
+        worktree_digest = _payload_digest(
+            {
+                "head_sha": head_sha,
+                "tree_sha": tree_sha,
+                "tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
+                "untracked": untracked_manifest,
+            }
+        )
     except TimeoutError:
         return GitInspection(
             branch="unknown",
@@ -689,18 +844,24 @@ def inspect_git_worktree(
     dirty_kinds = []
     if tracked:
         dirty_kinds.append("tracked changes")
-    if untracked:
+    if untracked_output:
         dirty_kinds.append("untracked files")
     if not dirty_kinds:
         return GitInspection(
             branch=branch,
             state="clean",
             summary="Working tree is clean.",
+            head_sha=head_sha or None,
+            tree_sha=tree_sha or None,
+            worktree_digest=worktree_digest,
         )
     return GitInspection(
         branch=branch,
         state="dirty",
         summary=f"{' and '.join(dirty_kinds).capitalize()} are present.",
+        head_sha=head_sha or None,
+        tree_sha=tree_sha or None,
+        worktree_digest=worktree_digest,
     )
 
 
@@ -1039,6 +1200,188 @@ def _git_first_line(
         redact_text(bytes(first_line).decode("utf-8", errors="replace").strip()),
         return_code,
     )
+
+
+def _git_output_bytes(
+    repository_root: Path,
+    arguments: tuple[str, ...],
+    *,
+    deadline: float,
+    maximum_bytes: int,
+) -> tuple[bytes, int]:
+    """Read one Git result with a hard time and memory envelope."""
+
+    if maximum_bytes <= 0:
+        raise ValueError("maximum_bytes must be positive")
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    environment = hardened_readonly_git_environment()
+    environment["LC_ALL"] = "C"
+    command = hardened_readonly_git_command(
+        ["-C", str(repository_root), *arguments],
+    )
+    process = subprocess.Popen(  # noqa: S603 - verified Git executable and structured argv
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=environment,
+        start_new_session=os.name != "nt",
+    )
+    stream = process.stdout
+    if stream is None:
+        _stop_process(process)
+        raise OSError("Git preflight stdout pipe was not created")
+    output = bytearray()
+    output_too_large = False
+    reader_error: list[OSError] = []
+
+    def drain_output() -> None:
+        nonlocal output_too_large
+        try:
+            while chunk := stream.read(64 * 1024):
+                capacity = maximum_bytes + 1 - len(output)
+                if capacity > 0:
+                    output.extend(chunk[:capacity])
+                if len(output) > maximum_bytes or len(chunk) > capacity:
+                    output_too_large = True
+                    _stop_process(process)
+                    return
+        except OSError as exc:
+            reader_error.append(exc)
+
+    reader = Thread(
+        target=drain_output,
+        name="kestrel-git-preflight-output-reader",
+        daemon=True,
+    )
+    reader.start()
+    reader.join(timeout=remaining)
+    if reader.is_alive():
+        _stop_process(process)
+        reader.join(timeout=0.25)
+        raise TimeoutError
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        _stop_process(process)
+        raise TimeoutError
+    try:
+        return_code = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        _stop_process(process)
+        raise TimeoutError from None
+    if reader_error:
+        raise OSError(f"Git preflight output could not be read: {reader_error[0]}")
+    if output_too_large:
+        raise OSError(
+            f"Git preflight output exceeded its {maximum_bytes}-byte envelope"
+        )
+    return bytes(output), return_code
+
+
+def _untracked_content_manifest(
+    repository_root: Path,
+    encoded_paths: bytes,
+    *,
+    deadline: float,
+) -> list[dict[str, object]]:
+    raw_paths = [item for item in encoded_paths.split(b"\0") if item]
+    if len(raw_paths) > _MAX_GIT_PREFLIGHT_UNTRACKED_FILES:
+        raise OSError(
+            "Git preflight found too many untracked files to bind safely"
+        )
+    manifest: list[dict[str, object]] = []
+    total_bytes = 0
+    for raw_path in sorted(set(raw_paths)):
+        if monotonic() > deadline:
+            raise TimeoutError
+        relative = os.fsdecode(raw_path)
+        pure_path = PurePosixPath(relative)
+        if (
+            not relative
+            or pure_path.is_absolute()
+            or any(part in {"", ".", ".."} for part in pure_path.parts)
+        ):
+            raise OSError("Git reported an unsafe untracked path")
+        candidate = repository_root.joinpath(*pure_path.parts)
+        try:
+            metadata = candidate.lstat()
+        except OSError as exc:
+            raise OSError("An untracked path changed during Git preflight") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            target = os.fsencode(os.readlink(candidate))
+            total_bytes += len(target)
+            if total_bytes > _MAX_GIT_PREFLIGHT_UNTRACKED_BYTES:
+                raise OSError(
+                    "Untracked content exceeds the Git preflight envelope"
+                )
+            manifest.append(
+                {
+                    "path": relative,
+                    "kind": "symlink",
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                    "size": len(target),
+                    "sha256": hashlib.sha256(target).hexdigest(),
+                }
+            )
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("Git reported an unsupported untracked path type")
+        if metadata.st_size > _MAX_GIT_PREFLIGHT_UNTRACKED_FILE_BYTES:
+            raise OSError(
+                "An untracked file exceeds the Git preflight per-file envelope"
+            )
+        total_bytes += metadata.st_size
+        if total_bytes > _MAX_GIT_PREFLIGHT_UNTRACKED_BYTES:
+            raise OSError("Untracked content exceeds the Git preflight envelope")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+                or opened.st_size != metadata.st_size
+                or opened.st_mtime_ns != metadata.st_mtime_ns
+            ):
+                raise OSError("An untracked file changed during Git preflight")
+            digest = hashlib.sha256()
+            read_bytes = 0
+            while chunk := os.read(descriptor, 64 * 1024):
+                if monotonic() > deadline:
+                    raise TimeoutError
+                read_bytes += len(chunk)
+                if read_bytes > _MAX_GIT_PREFLIGHT_UNTRACKED_FILE_BYTES:
+                    raise OSError(
+                        "An untracked file exceeded the Git preflight envelope"
+                    )
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or read_bytes != opened.st_size
+            ):
+                raise OSError("An untracked file changed during Git preflight")
+        finally:
+            os.close(descriptor)
+        manifest.append(
+            {
+                "path": relative,
+                "kind": "file",
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "size": metadata.st_size,
+                "sha256": digest.hexdigest(),
+            }
+        )
+    return manifest
+
+
+def _is_git_object_id(value: str) -> bool:
+    return len(value) in {40, 64} and all(character in "0123456789abcdef" for character in value)
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:

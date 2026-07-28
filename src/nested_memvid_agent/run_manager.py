@@ -1580,6 +1580,8 @@ class RunManager:
         self._reserve_primary_run(run_id)
         try:
             project_allowed_paths: tuple[str, ...] = (".",)
+            project_baseline_index_digest: str | None = None
+            effective_project_revision: int | None = None
             if project_id is not None:
                 project = self.state.get_project(project_id)
                 if project.archived_at is not None:
@@ -1594,6 +1596,8 @@ class RunManager:
                         base_url=self.config.base_url,
                     )
                 project_allowed_paths = project.allowed_paths
+                project_baseline_index_digest = project.baseline_index_digest
+                effective_project_revision = project.revision
             normalized_autonomy = (
                 autonomy_mode
                 if autonomy_mode in {"background", "manual", "autonomous"}
@@ -1603,6 +1607,8 @@ class RunManager:
                 self.config,
                 workspace=(workspace or self.config.workspace),
                 project_id=project_id,
+                project_revision=effective_project_revision,
+                project_baseline_index_digest=project_baseline_index_digest,
                 project_allowed_paths=project_allowed_paths,
                 provider=provider or self.config.provider,
                 model=model or self.config.model,
@@ -2283,6 +2289,10 @@ class RunManager:
                             session_id=session_id,
                             run_id=run_id,
                             project_id=agent.config.project_id,
+                            project_revision=agent.config.project_revision,
+                            project_baseline_index_digest=(
+                                agent.config.project_baseline_index_digest
+                            ),
                             allowed_paths=agent.config.project_allowed_paths,
                             execution_origin="manual",
                             approval_handler=self._approval_handler if run_id else None,
@@ -2300,6 +2310,10 @@ class RunManager:
                         session_id=session_id,
                         run_id=run_id,
                         project_id=agent.config.project_id,
+                        project_revision=agent.config.project_revision,
+                        project_baseline_index_digest=(
+                            agent.config.project_baseline_index_digest
+                        ),
                         allowed_paths=agent.config.project_allowed_paths,
                         execution_origin="manual",
                         approval_handler=self._approval_handler if run_id else None,
@@ -4063,6 +4077,10 @@ class RunManager:
                     session_id=session_id,
                     run_id=run_id,
                     project_id=agent.config.project_id,
+                    project_revision=agent.config.project_revision,
+                    project_baseline_index_digest=(
+                        agent.config.project_baseline_index_digest
+                    ),
                     allowed_paths=agent.config.project_allowed_paths,
                     execution_origin=execution_origin,
                     approved_tool_call_ids=frozenset({call.id}),
@@ -5340,15 +5358,21 @@ class RunManager:
                     RuntimeSettings.from_mapping(run.config_snapshot, base),
                 )
         project_allowed_paths: tuple[str, ...] = (".",)
+        project_baseline_index_digest: str | None = None
+        project_revision: int | None = None
         if run.project_id is not None:
             project = self.state.get_project(run.project_id)
             if project.archived_at is not None:
                 raise ValueError("project-bound run references an archived project")
             project_allowed_paths = project.allowed_paths
+            project_baseline_index_digest = project.baseline_index_digest
+            project_revision = project.revision
         return replace(
             base,
             workspace=Path(run.workspace),
             project_id=run.project_id,
+            project_revision=project_revision,
+            project_baseline_index_digest=project_baseline_index_digest,
             project_allowed_paths=project_allowed_paths,
             provider=run.provider,
             model=run.model,
@@ -5454,6 +5478,22 @@ class RunManager:
             return (
                 False,
                 f"Tool {spec.name} is blocked because the project scope changed.",
+            )
+        if (
+            (
+                active_config.project_revision is not None
+                and active_config.project_revision != project.revision
+            )
+            or (
+                active_config.project_baseline_index_digest is not None
+                and active_config.project_baseline_index_digest
+                != project.baseline_index_digest
+            )
+        ):
+            return (
+                False,
+                f"Tool {spec.name} is blocked because the project revision or "
+                "repository-index baseline changed.",
             )
         missing_project_keys = [
             key

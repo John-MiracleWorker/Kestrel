@@ -83,6 +83,9 @@ export type MissionPreflight = {
   working_tree: {
     state: "clean" | "dirty" | "unknown";
     summary: string;
+    head_sha?: string | null;
+    tree_sha?: string | null;
+    digest?: string | null;
   };
   route_policy: string;
   budget: {
@@ -117,6 +120,7 @@ export type MissionPreflight = {
     policy_revision: number | null;
     inventory_digest: string;
     preflight_digest: string;
+    plan_digest: string;
     binding_digest: string;
   };
   checks: MissionPreflightCheck[];

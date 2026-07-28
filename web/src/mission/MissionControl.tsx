@@ -182,29 +182,38 @@ export function MissionControl({
     setEditingPlan(false);
   }
 
-  async function inspectPlan() {
-    if (!selectedProject || !objective.trim()) return;
+  async function inspectPlan(candidatePlan?: MissionPlanTask[]): Promise<boolean> {
+    if (!selectedProject || !objective.trim()) return false;
     setPreflightPending(true);
     setLoadError(null);
     try {
+      const request: Record<string, unknown> = {
+        objective: objective.trim(),
+        template_id: selectedTemplateId
+      };
+      if (candidatePlan) request.mission_plan = candidatePlan;
       const projection = await postJson<MissionPreflight>(
         `/api/projects/${encodeURIComponent(selectedProject.project_id)}/mission/preflight`,
-        {
-          objective: objective.trim(),
-          template_id: selectedTemplateId
-        }
+        request
       );
       setPreflight(projection);
       setPlan(projection.tasks);
+      return true;
     } catch (error) {
       if (isAuthError(error)) {
         onAuthRequired();
-        return;
+        return false;
       }
       setLoadError(errorMessage(error));
+      return false;
     } finally {
       setPreflightPending(false);
     }
+  }
+
+  async function finishEditingPlan() {
+    if (preflightPending) return;
+    if (await inspectPlan(plan)) setEditingPlan(false);
   }
 
   async function launchMission() {
@@ -398,7 +407,17 @@ export function MissionControl({
             <div className="mission-section-rule">
               <h2 id="mission-plan-heading">Task plan</h2>
               {plan.length > 0 ? (
-                <button type="button" onClick={() => setEditingPlan((current) => !current)}>
+                <button
+                  type="button"
+                  disabled={preflightPending}
+                  onClick={() => {
+                    if (editingPlan) {
+                      void finishEditingPlan();
+                    } else {
+                      setEditingPlan(true);
+                    }
+                  }}
+                >
                   <Pencil size={13} /> {editingPlan ? "Finish editing" : "Edit plan"}
                 </button>
               ) : null}

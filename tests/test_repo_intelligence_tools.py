@@ -26,9 +26,11 @@ def _context(
     *,
     project_id: str | None = PROJECT_ID,
     allowed_paths: tuple[str, ...] = (".",),
+    baseline_index_digest: str | None = None,
+    project_revision: int = 1,
 ) -> ToolContext:
     memory = build_memory_system("memory", tmp_path / "memory")
-    return ToolContext(
+    context = ToolContext(
         memory=memory,
         config=AgentConfig(
             workspace=repository,
@@ -39,6 +41,17 @@ def _context(
         project_id=project_id,
         allowed_paths=allowed_paths,
     )
+    if baseline_index_digest is None and project_id is not None:
+        sidecar = repository / ".nest" / "repo-index" / f"{project_id}.sqlite"
+        if sidecar.is_file():
+            baseline_index_digest = RepositoryIndex(
+                project_id=project_id,
+                repository_root=repository,
+                create=False,
+            ).status().aggregate_digest
+    context.project_revision = project_revision
+    context.project_baseline_index_digest = baseline_index_digest
+    return context
 
 
 def test_repo_intelligence_requires_project_context_and_never_creates_missing_index(
@@ -164,3 +177,74 @@ def test_repo_intelligence_hides_stale_rows_and_context(tmp_path: Path) -> None:
     assert context_pack.data["authoritative"] is False
     assert context_pack.data["context"] == ""
     assert context_pack.data["evidence"] == []
+
+
+def test_allowed_path_filter_does_not_leak_forbidden_matches(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    (repository / "public").mkdir(parents=True)
+    (repository / "private").mkdir()
+    (repository / "public" / "api.py").write_text(
+        "class PublicApi: ...\n",
+        encoding="utf-8",
+    )
+    (repository / "private" / "payroll.py").write_text(
+        "class ConfidentialPayrollEngine: ...\n",
+        encoding="utf-8",
+    )
+    report = RepositoryIndex(
+        project_id=PROJECT_ID,
+        repository_root=repository,
+    ).rebuild()
+    registry = build_default_tools(("repo.symbols",))
+    context = _context(
+        tmp_path,
+        repository,
+        allowed_paths=("public",),
+        baseline_index_digest=report.aggregate_digest,
+    )
+
+    forbidden = registry.execute(
+        ToolCall(
+            name="repo.symbols",
+            arguments={"query": "ConfidentialPayrollEngine"},
+        ),
+        context,
+    )
+    absent = registry.execute(
+        ToolCall(name="repo.symbols", arguments={"query": "NameThatDoesNotExist"}),
+        context,
+    )
+
+    assert forbidden.success and absent.success
+    assert forbidden.data["records"] == absent.data["records"] == []
+    assert forbidden.data["truncated"] == absent.data["truncated"] is False
+    assert forbidden.data["next_offset"] == absent.data["next_offset"] is None
+
+
+def test_repo_tools_require_project_bound_baseline_digest(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    report = RepositoryIndex(
+        project_id=PROJECT_ID,
+        repository_root=repository,
+    ).rebuild()
+    registry = build_default_tools(("repo.symbols",))
+
+    missing = registry.execute(
+        ToolCall(name="repo.symbols", arguments={"query": "Widget"}),
+        _context(
+            tmp_path,
+            repository,
+            baseline_index_digest="",
+        ),
+    )
+    mismatched = registry.execute(
+        ToolCall(name="repo.symbols", arguments={"query": "Widget"}),
+        _context(
+            tmp_path,
+            repository,
+            baseline_index_digest=f"{report.aggregate_digest}-unbound",
+        ),
+    )
+
+    assert missing.error == "repo_index_rebuild_required"
+    assert mismatched.error == "repo_index_rebuild_required"

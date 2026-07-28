@@ -69,6 +69,19 @@ def test_mission_preflight_is_read_only_and_plan_becomes_project_bound_graph(
                 "Repository boundaries, entry points, and unknowns are cited."
             ],
         }
+        rebound_response = client.post(
+            "/api/projects/mission_project/mission/preflight",
+            headers=headers,
+            json={
+                "objective": preflight["objective"],
+                "template_id": preflight["template_id"],
+                "mission_plan": edited_tasks,
+            },
+        )
+        assert rebound_response.status_code == 200
+        rebound = rebound_response.json()
+        assert rebound["tasks"] == edited_tasks
+        assert rebound["launch_binding"] != preflight["launch_binding"]
 
         launched = client.post(
             "/api/runs",
@@ -78,9 +91,9 @@ def test_mission_preflight_is_read_only_and_plan_becomes_project_bound_graph(
                 "project_id": "mission_project",
                 "autonomy_mode": "manual",
                 "mission_plan": edited_tasks,
-                "project_revision": preflight["project_revision"],
-                "mission_template_id": preflight["template_id"],
-                "mission_binding": preflight["launch_binding"],
+                "project_revision": rebound["project_revision"],
+                "mission_template_id": rebound["template_id"],
+                "mission_binding": rebound["launch_binding"],
             },
         )
         assert launched.status_code == 200
@@ -114,9 +127,9 @@ def test_mission_preflight_is_read_only_and_plan_becomes_project_bound_graph(
                 "project_id": "mission_project",
                 "autonomy_mode": "manual",
                 "mission_plan": edited_tasks,
-                "project_revision": preflight["project_revision"],
-                "mission_template_id": preflight["template_id"],
-                "mission_binding": preflight["launch_binding"],
+                "project_revision": rebound["project_revision"],
+                "mission_template_id": rebound["template_id"],
+                "mission_binding": rebound["launch_binding"],
             },
         )
         assert stale_repository.status_code == 409

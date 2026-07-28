@@ -15,8 +15,10 @@ from nested_memvid_agent.mission_control import (
     IndexInspection,
     ProviderInspection,
     build_mission_preflight,
+    build_mission_preflight_digest,
     inspect_git_worktree,
     inspect_provider_readiness,
+    mission_plan_scope_matches,
 )
 from nested_memvid_agent.projects import ProjectRecord
 from nested_memvid_agent.routing.ledger_records import (
@@ -180,6 +182,73 @@ def test_git_inspection_detects_dirty_state_without_refreshing_index(tmp_path: P
         after.st_mtime_ns,
         after.st_size,
     )
+
+
+def test_clean_head_change_invalidates_mission_binding_without_index(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "main")
+    _git(repository, "config", "user.email", "kestrel@example.invalid")
+    _git(repository, "config", "user.name", "Kestrel Test")
+    (repository / "README.md").write_text("# One\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "one")
+    first = inspect_git_worktree(repository)
+    provider = ProviderInspection(
+        status="pass",
+        detail="Validated target ready.",
+        route_policy="balanced",
+        estimated_cost_usd=0.1,
+    )
+    missing_index = IndexInspection(
+        freshness="missing",
+        detail="No repository index.",
+    )
+    first_digest = build_mission_preflight_digest(
+        git=first,
+        index=missing_index,
+        provider=provider,
+        capability_catalog=[],
+    )
+
+    (repository / "README.md").write_text("# Two\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "two")
+    second = inspect_git_worktree(repository)
+    second_digest = build_mission_preflight_digest(
+        git=second,
+        index=missing_index,
+        provider=provider,
+        capability_catalog=[],
+    )
+
+    assert first.head_sha and second.head_sha
+    assert first.tree_sha and second.tree_sha
+    assert first.worktree_digest and second.worktree_digest
+    assert (first.head_sha, first.tree_sha) != (second.head_sha, second.tree_sha)
+    assert first_digest != second_digest
+
+
+def test_task_goal_or_acceptance_edit_requires_new_binding() -> None:
+    expected = [
+        {
+            "task_id": "inspect",
+            "title": "Inspect the failure",
+            "rationale": "Find the evidence-backed cause.",
+            "dependencies": [],
+            "acceptance_criteria": ["The cause is cited.", "The failing test is named."],
+            "required_tools": ["repo.context_pack"],
+            "risk": "low",
+        }
+    ]
+    changed_title = [{**expected[0], "title": "Do something unrelated"}]
+    weakened_proof = [{**expected[0], "acceptance_criteria": ["A patch exists."]}]
+
+    assert mission_plan_scope_matches(expected, expected)
+    assert not mission_plan_scope_matches(changed_title, expected)
+    assert not mission_plan_scope_matches(weakened_proof, expected)
 
 
 def test_git_inspection_fails_closed_when_status_command_fails(

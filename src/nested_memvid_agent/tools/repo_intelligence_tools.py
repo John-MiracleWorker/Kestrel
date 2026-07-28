@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
 import sqlite3
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..repo_index import RepositoryIndex, RepositoryIndexError
@@ -56,7 +57,12 @@ class RepoSymbolsTool(AgentTool):
             index = _existing_project_index(context)
             limit, offset = _pagination(arguments)
             query = _optional_query(arguments.get("query"))
-            result = index.symbols(query, limit=limit, offset=offset)
+            result = index.symbols(
+                query,
+                limit=limit,
+                offset=offset,
+                path_prefixes=_allowed_index_prefixes(context),
+            )
             rows = [
                 {
                     "name": record.name,
@@ -111,7 +117,12 @@ class RepoReferencesTool(AgentTool):
             name = _required_query(arguments.get("name"), field="name")
             index = _existing_project_index(context)
             limit, offset = _pagination(arguments)
-            result = index.references(name, limit=limit, offset=offset)
+            result = index.references(
+                name,
+                limit=limit,
+                offset=offset,
+                path_prefixes=_allowed_index_prefixes(context),
+            )
             rows = [
                 {
                     "name": record.name,
@@ -163,7 +174,12 @@ class RepoDependenciesTool(AgentTool):
             index = _existing_project_index(context)
             limit, offset = _pagination(arguments)
             query = _optional_query(arguments.get("query"))
-            result = index.imports(query, limit=limit, offset=offset)
+            result = index.imports(
+                query,
+                limit=limit,
+                offset=offset,
+                path_prefixes=_allowed_index_prefixes(context),
+            )
             rows = [
                 {
                     "relation": "import",
@@ -218,7 +234,12 @@ class RepoTestsForTool(AgentTool):
             symbol = _required_query(arguments.get("symbol"), field="symbol")
             index = _existing_project_index(context)
             limit, offset = _pagination(arguments)
-            result = index.tests_for(symbol, limit=limit, offset=offset)
+            result = index.tests_for(
+                symbol,
+                limit=limit,
+                offset=offset,
+                path_prefixes=_allowed_index_prefixes(context),
+            )
             rows = [
                 {
                     "symbol": record.symbol_name,
@@ -271,9 +292,22 @@ class RepoImpactTool(AgentTool):
             symbol = _required_query(arguments.get("symbol"), field="symbol")
             limit, _ = _pagination(arguments)
             index = _existing_project_index(context)
-            definitions = index.symbols(symbol, limit=limit)
-            references = index.references(symbol, limit=limit)
-            tests = index.tests_for(symbol, limit=limit)
+            path_prefixes = _allowed_index_prefixes(context)
+            definitions = index.symbols(
+                symbol,
+                limit=limit,
+                path_prefixes=path_prefixes,
+            )
+            references = index.references(
+                symbol,
+                limit=limit,
+                path_prefixes=path_prefixes,
+            )
+            tests = index.tests_for(
+                symbol,
+                limit=limit,
+                path_prefixes=path_prefixes,
+            )
             authoritative, digest, freshness = _combined_query_authority(
                 definitions,
                 references,
@@ -395,8 +429,17 @@ class RepoContextPackTool(AgentTool):
                 field="line_window",
             )
             index = _existing_project_index(context)
-            symbols = index.symbols(query, limit=_MAX_CONTEXT_EVIDENCE)
-            references = index.references(query, limit=_MAX_CONTEXT_EVIDENCE)
+            path_prefixes = _allowed_index_prefixes(context)
+            symbols = index.symbols(
+                query,
+                limit=_MAX_CONTEXT_EVIDENCE,
+                path_prefixes=path_prefixes,
+            )
+            references = index.references(
+                query,
+                limit=_MAX_CONTEXT_EVIDENCE,
+                path_prefixes=path_prefixes,
+            )
             authoritative, digest, freshness = _combined_query_authority(
                 symbols,
                 references,
@@ -528,17 +571,33 @@ def _existing_project_index(context: ToolContext) -> RepositoryIndex:
             "repo_index_untrusted",
             "The project repository-index sidecar has an unsafe owner or mode.",
         )
+    expected_digest = str(context.project_baseline_index_digest or "").strip()
+    if (
+        context.project_revision is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+    ):
+        raise _RepoToolFailure(
+            "repo_index_rebuild_required",
+            "The project has no current repository-index baseline binding.",
+        )
     try:
-        return RepositoryIndex(
+        index = RepositoryIndex(
             project_id=project_id,
             repository_root=root,
             create=False,
         )
+        status = index.status()
     except RepositoryIndexError as exc:
         raise _RepoToolFailure(
             "repo_index_rebuild_required",
             "The repository index requires an explicit rebuild before it can be queried.",
         ) from exc
+    if not hmac.compare_digest(status.aggregate_digest, expected_digest):
+        raise _RepoToolFailure(
+            "repo_index_rebuild_required",
+            "The repository index is not bound to the current project baseline.",
+        )
+    return index
 
 
 def _pagination(arguments: dict[str, Any]) -> tuple[int, int]:
@@ -612,6 +671,22 @@ def _record_path_allowed(context: ToolContext, relative: Path) -> bool:
         return True
     except (OSError, PermissionError, ValueError):
         return False
+
+
+def _allowed_index_prefixes(context: ToolContext) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for raw in context.allowed_paths:
+        value = str(raw).strip().strip("/")
+        if value in {"", "."}:
+            return ()
+        pure = PurePosixPath(value)
+        if pure.is_absolute() or ".." in pure.parts or "\\" in value:
+            raise _RepoToolFailure(
+                "project_context_invalid",
+                "The project allowed-path ceiling is invalid.",
+            )
+        normalized.add(pure.as_posix())
+    return tuple(sorted(normalized))
 
 
 def _query_execution(

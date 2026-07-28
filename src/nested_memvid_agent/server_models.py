@@ -68,6 +68,7 @@ class MissionLaunchBindingRequest(BaseModel):
     policy_revision: Annotated[int, Field(strict=True, ge=1)] | None = None
     inventory_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     preflight_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     binding_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -125,6 +126,10 @@ class MissionPreflightRequest(BaseModel):
         "security_review",
         "documentation",
     ]
+    mission_plan: list[MissionPlanTaskRequest] | None = Field(
+        default=None,
+        max_length=12,
+    )
 
 
 class ChannelIngestRequest(BaseModel):

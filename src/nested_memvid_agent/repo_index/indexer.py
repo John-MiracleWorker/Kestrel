@@ -5,10 +5,10 @@ import os
 import re
 import stat
 import subprocess
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TypeVar
 
 from .models import (
@@ -113,8 +113,12 @@ class RepositoryIndex:
         )
         self._parser_versions = {
             **PARSER_VERSIONS,
-            "scanner": "descriptor-bounded-stat-v2",
-            "scanner_limits": (f"files={self.limits.max_files};bytes={self.limits.max_file_bytes}"),
+            "scanner": "descriptor-bounded-stat-v3",
+            "scanner_limits": (
+                f"files={self.limits.max_files};"
+                f"bytes={self.limits.max_file_bytes};"
+                f"entries={self.limits.scan_entry_budget}"
+            ),
         }
         managed_directories = (
             (
@@ -167,6 +171,7 @@ class RepositoryIndex:
                 indexed = self._index_candidate(candidate, root_descriptor)
                 if indexed is None:
                     skipped += 1
+                    coverage_complete = False
                     continue
                 changed.append(indexed)
 
@@ -241,11 +246,17 @@ class RepositoryIndex:
         limit: int = DEFAULT_QUERY_LIMIT,
         offset: int = 0,
         include_stale_diagnostics: bool = False,
+        path_prefixes: Sequence[str] = (),
     ) -> IndexQueryResult[FileRecord]:
         bounded_limit = _validate_query_limit(limit)
         bounded_offset = _validate_query_offset(offset)
+        bounded_prefixes = _validate_path_prefixes(path_prefixes)
         return self._query(
-            lambda: self._store.files(limit=bounded_limit, offset=bounded_offset),
+            lambda: self._store.files(
+                limit=bounded_limit,
+                offset=bounded_offset,
+                path_prefixes=bounded_prefixes,
+            ),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -256,11 +267,18 @@ class RepositoryIndex:
         limit: int = DEFAULT_QUERY_LIMIT,
         offset: int = 0,
         include_stale_diagnostics: bool = False,
+        path_prefixes: Sequence[str] = (),
     ) -> IndexQueryResult[SymbolRecord]:
         bounded_limit = _validate_query_limit(limit)
         bounded_offset = _validate_query_offset(offset)
+        bounded_prefixes = _validate_path_prefixes(path_prefixes)
         return self._query(
-            lambda: self._store.symbols(query, limit=bounded_limit, offset=bounded_offset),
+            lambda: self._store.symbols(
+                query,
+                limit=bounded_limit,
+                offset=bounded_offset,
+                path_prefixes=bounded_prefixes,
+            ),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -271,11 +289,18 @@ class RepositoryIndex:
         limit: int = DEFAULT_QUERY_LIMIT,
         offset: int = 0,
         include_stale_diagnostics: bool = False,
+        path_prefixes: Sequence[str] = (),
     ) -> IndexQueryResult[ImportRecord]:
         bounded_limit = _validate_query_limit(limit)
         bounded_offset = _validate_query_offset(offset)
+        bounded_prefixes = _validate_path_prefixes(path_prefixes)
         return self._query(
-            lambda: self._store.imports(query, limit=bounded_limit, offset=bounded_offset),
+            lambda: self._store.imports(
+                query,
+                limit=bounded_limit,
+                offset=bounded_offset,
+                path_prefixes=bounded_prefixes,
+            ),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -286,11 +311,18 @@ class RepositoryIndex:
         limit: int = DEFAULT_QUERY_LIMIT,
         offset: int = 0,
         include_stale_diagnostics: bool = False,
+        path_prefixes: Sequence[str] = (),
     ) -> IndexQueryResult[ReferenceRecord]:
         bounded_limit = _validate_query_limit(limit)
         bounded_offset = _validate_query_offset(offset)
+        bounded_prefixes = _validate_path_prefixes(path_prefixes)
         return self._query(
-            lambda: self._store.references(name, limit=bounded_limit, offset=bounded_offset),
+            lambda: self._store.references(
+                name,
+                limit=bounded_limit,
+                offset=bounded_offset,
+                path_prefixes=bounded_prefixes,
+            ),
             include_stale_diagnostics=include_stale_diagnostics,
         )
 
@@ -301,14 +333,17 @@ class RepositoryIndex:
         limit: int = DEFAULT_QUERY_LIMIT,
         offset: int = 0,
         include_stale_diagnostics: bool = False,
+        path_prefixes: Sequence[str] = (),
     ) -> IndexQueryResult[TestRelationshipRecord]:
         bounded_limit = _validate_query_limit(limit)
         bounded_offset = _validate_query_offset(offset)
+        bounded_prefixes = _validate_path_prefixes(path_prefixes)
         return self._query(
             lambda: self._store.tests_for(
                 symbol_name,
                 limit=bounded_limit,
                 offset=bounded_offset,
+                path_prefixes=bounded_prefixes,
             ),
             include_stale_diagnostics=include_stale_diagnostics,
         )
@@ -513,66 +548,93 @@ def _scan_candidates_from_descriptor(
     *,
     root_descriptor: int,
 ) -> tuple[list[CandidateFile], int, bool]:
+    """Traverse from a pinned root without materializing whole directories.
+
+    Ordering only affects partial, non-authoritative snapshots. Complete
+    snapshots are sorted before fingerprinting, so filesystem enumeration order
+    cannot affect authoritative results.
+    """
+
     candidates: list[CandidateFile] = []
     skipped = 0
     coverage_complete = True
-    for current, directory_names, file_names, current_descriptor in os.fwalk(
-        ".",
-        topdown=True,
-        follow_symlinks=False,
-        dir_fd=root_descriptor,
-    ):
-        retained_directories: list[str] = []
-        for name in sorted(directory_names):
-            if name.casefold() in _IGNORED_DIRECTORIES:
-                continue
-            try:
-                info = os.stat(
-                    name,
-                    dir_fd=current_descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError:
-                coverage_complete = False
-                continue
-            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                retained_directories.append(name)
-        directory_names[:] = retained_directories
+    inspected_entries = 0
+    stop = False
 
-        for name in sorted(file_names):
-            relative_parent = Path() if current == "." else Path(current)
-            relative_path = (relative_parent / name).as_posix()
-            display_path = repository_root / relative_path
-            if _ignored_file(display_path):
-                skipped += 1
-                continue
-            try:
-                info = os.stat(
-                    name,
-                    dir_fd=current_descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError:
-                skipped += 1
-                coverage_complete = False
-                continue
-            candidate = _candidate_from_stat(
-                path=display_path,
-                relative_path=relative_path,
-                info=info,
-                limits=limits,
-                candidate_count=len(candidates),
-            )
-            if candidate is None:
-                skipped += 1
-                if (
-                    stat.S_ISREG(info.st_mode)
-                    and info.st_size <= limits.max_file_bytes
-                    and len(candidates) >= limits.max_files
-                ):
+    def visit(directory_descriptor: int, relative_parent: Path) -> None:
+        nonlocal coverage_complete, inspected_entries, skipped, stop
+        if stop:
+            return
+        try:
+            iterator = os.scandir(directory_descriptor)
+        except OSError:
+            coverage_complete = False
+            return
+        with iterator:
+            for entry in iterator:
+                inspected_entries += 1
+                if inspected_entries > limits.scan_entry_budget:
                     coverage_complete = False
-                continue
-            candidates.append(candidate)
+                    stop = True
+                    return
+                name = entry.name
+                relative_path = relative_parent / name
+                display_path = repository_root / relative_path
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    skipped += 1
+                    coverage_complete = False
+                    continue
+                if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                    if name.casefold() in _IGNORED_DIRECTORIES:
+                        continue
+                    flags = os.O_RDONLY
+                    if hasattr(os, "O_DIRECTORY"):
+                        flags |= os.O_DIRECTORY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    try:
+                        child_descriptor = os.open(
+                            name,
+                            flags,
+                            dir_fd=directory_descriptor,
+                        )
+                    except OSError:
+                        coverage_complete = False
+                        continue
+                    try:
+                        visit(child_descriptor, relative_path)
+                    finally:
+                        os.close(child_descriptor)
+                    if stop:
+                        return
+                    continue
+                if _ignored_file(display_path):
+                    skipped += 1
+                    continue
+                candidate = _candidate_from_stat(
+                    path=display_path,
+                    relative_path=relative_path.as_posix(),
+                    info=info,
+                    limits=limits,
+                    candidate_count=len(candidates),
+                )
+                if candidate is None:
+                    skipped += 1
+                    if stat.S_ISREG(info.st_mode):
+                        coverage_complete = False
+                    if len(candidates) >= limits.max_files:
+                        stop = True
+                        return
+                    continue
+                candidates.append(candidate)
+                if len(candidates) >= limits.max_files:
+                    coverage_complete = False
+                    stop = True
+                    return
+
+    visit(root_descriptor, Path())
     candidates.sort(key=lambda item: item.relative_path)
     return candidates, skipped, coverage_complete
 
@@ -581,58 +643,70 @@ def _scan_candidates_from_path(
     repository_root: Path,
     limits: IndexLimits,
 ) -> tuple[list[CandidateFile], int, bool]:
+    """Portable bounded traversal for platforms without directory descriptors."""
+
     candidates: list[CandidateFile] = []
     skipped = 0
     coverage_complete = True
-    for current, directory_names, file_names in os.walk(
-        repository_root,
-        topdown=True,
-        followlinks=False,
-    ):
-        current_path = Path(current)
-        retained_directories: list[str] = []
-        for name in sorted(directory_names):
-            candidate_directory = current_path / name
-            try:
-                info = os.lstat(candidate_directory)
-            except OSError:
-                coverage_complete = False
-                continue
-            if (
-                name.casefold() not in _IGNORED_DIRECTORIES
-                and stat.S_ISDIR(info.st_mode)
-                and not stat.S_ISLNK(info.st_mode)
-            ):
-                retained_directories.append(name)
-        directory_names[:] = retained_directories
-        for name in sorted(file_names):
-            path = current_path / name
-            if _ignored_file(path):
-                skipped += 1
-                continue
-            try:
-                info = os.lstat(path)
-            except OSError:
-                skipped += 1
-                coverage_complete = False
-                continue
-            candidate = _candidate_from_stat(
-                path=path,
-                relative_path=path.relative_to(repository_root).as_posix(),
-                info=info,
-                limits=limits,
-                candidate_count=len(candidates),
-            )
-            if candidate is None:
-                skipped += 1
-                if (
-                    stat.S_ISREG(info.st_mode)
-                    and info.st_size <= limits.max_file_bytes
-                    and len(candidates) >= limits.max_files
-                ):
+    inspected_entries = 0
+    stop = False
+
+    def visit(current_path: Path, relative_parent: Path) -> None:
+        nonlocal coverage_complete, inspected_entries, skipped, stop
+        if stop:
+            return
+        try:
+            iterator = os.scandir(current_path)
+        except OSError:
+            coverage_complete = False
+            return
+        with iterator:
+            for entry in iterator:
+                inspected_entries += 1
+                if inspected_entries > limits.scan_entry_budget:
                     coverage_complete = False
-                continue
-            candidates.append(candidate)
+                    stop = True
+                    return
+                name = entry.name
+                path = current_path / name
+                relative_path = relative_parent / name
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    skipped += 1
+                    coverage_complete = False
+                    continue
+                if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                    if name.casefold() not in _IGNORED_DIRECTORIES:
+                        visit(path, relative_path)
+                    if stop:
+                        return
+                    continue
+                if _ignored_file(path):
+                    skipped += 1
+                    continue
+                candidate = _candidate_from_stat(
+                    path=path,
+                    relative_path=relative_path.as_posix(),
+                    info=info,
+                    limits=limits,
+                    candidate_count=len(candidates),
+                )
+                if candidate is None:
+                    skipped += 1
+                    if stat.S_ISREG(info.st_mode):
+                        coverage_complete = False
+                    if len(candidates) >= limits.max_files:
+                        stop = True
+                        return
+                    continue
+                candidates.append(candidate)
+                if len(candidates) >= limits.max_files:
+                    coverage_complete = False
+                    stop = True
+                    return
+
+    visit(repository_root, Path())
     candidates.sort(key=lambda item: item.relative_path)
     return candidates, skipped, coverage_complete
 
@@ -848,3 +922,23 @@ def _validate_query_offset(offset: int) -> int:
     if isinstance(offset, bool) or not 0 <= offset <= MAX_QUERY_OFFSET:
         raise ValueError(f"offset must be between 0 and {MAX_QUERY_OFFSET}")
     return offset
+
+
+def _validate_path_prefixes(prefixes: Sequence[str]) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for raw in prefixes:
+        if not isinstance(raw, str):
+            raise ValueError("path prefixes must be strings")
+        value = raw.strip().strip("/")
+        if value in {"", "."}:
+            return ()
+        pure = PurePosixPath(value)
+        if (
+            pure.is_absolute()
+            or ".." in pure.parts
+            or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("path prefix is invalid")
+        normalized.add(pure.as_posix())
+    return tuple(sorted(normalized))

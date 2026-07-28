@@ -16,9 +16,6 @@ import nested_memvid_agent.repo_index.store as repo_store
 from nested_memvid_agent.file_lock import (
     lock_exclusive as real_lock_exclusive,
 )
-from nested_memvid_agent.file_lock import (
-    lock_shared as real_lock_shared,
-)
 from nested_memvid_agent.repo_index import (
     DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
@@ -101,9 +98,9 @@ def _convert_current_sidecar_to_v4(index: RepositoryIndex) -> None:
     lock_path = index.index_path.parent / f".{index.index_path.name}.lock"
     lock_payload = lock_path.read_bytes()
     encoded_state = lock_payload[len(repo_store._LOCK_SECRET_PREFIX) :]
-    state = json.loads(encoded_state)
+    secret_line = encoded_state.splitlines()[0]
     lock_path.write_bytes(
-        repo_store._LOCK_SECRET_PREFIX + str(state["secret"]).encode("ascii") + b"\n"
+        repo_store._LOCK_SECRET_PREFIX + secret_line + b"\n"
     )
     lock_path.chmod(0o600)
 
@@ -321,6 +318,10 @@ def test_schema_v1_sidecar_migrates_and_forces_digest_revalidation(tmp_path: Pat
         connection.execute("PRAGMA application_id = 0")
     for artifact in index.index_path.parent.glob(f".{index.index_path.name}.generation-*"):
         artifact.unlink()
+    # A real v1 sidecar predates the authenticated publication lock. Remove the
+    # current-format fixture lock instead of asking migration to overwrite its
+    # valid high-water authority with an unrelated legacy lineage.
+    (index.index_path.parent / f".{index.index_path.name}.lock").unlink()
 
     reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
     rebuilt = reopened.rebuild()
@@ -402,9 +403,13 @@ def test_scan_ignores_symlinks_private_build_vendor_binary_and_oversize(
         limits=IndexLimits(max_file_bytes=80),
     )
     report = index.rebuild()
-    paths = {record.path.as_posix() for record in index.files().records}
+    paths = {
+        record.path.as_posix()
+        for record in index.files(include_stale_diagnostics=True).records
+    }
 
-    assert index.status().freshness is Freshness.CURRENT
+    assert index.status().freshness is Freshness.STALE
+    assert index.status().coverage_complete is False
     assert "web/format.ts" in paths
     assert {
         ".nest/private/secret.py",
@@ -775,6 +780,200 @@ def test_max_files_truncation_never_reports_current_or_authoritative(
     assert result.records == ()
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"class OmittedBecauseLarge:\n    pass\n" + (b"#" * 256),
+        b"class OmittedBecauseBinary:\n\x00\xff\n",
+        b"class OmittedBecauseEncoding:\n\xff\xfe\n",
+    ],
+)
+def test_omitted_supported_source_marks_coverage_incomplete(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    """A skipped source file must never authorize a negative symbol answer."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "visible.py").write_text("class Visible: ...\n", encoding="utf-8")
+    (repository / "omitted.py").write_bytes(payload)
+    index = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        limits=IndexLimits(max_file_bytes=96),
+    )
+
+    index.rebuild()
+    status = index.status()
+    result = index.symbols("Omitted")
+
+    assert status.coverage_complete is False
+    assert status.freshness is Freshness.STALE
+    assert result.authoritative is False
+    assert result.records == ()
+
+
+def test_max_files_bounds_candidate_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A small file budget must not stat every entry in a large directory."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for index in range(500):
+        (repository / f"{index:04d}.py").write_text(
+            f"class Symbol{index}: ...\n",
+            encoding="utf-8",
+        )
+    inspected = 0
+    original = repo_indexer._candidate_from_stat
+
+    def counted_candidate(**kwargs: Any) -> Any:
+        nonlocal inspected
+        inspected += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(repo_indexer, "_candidate_from_stat", counted_candidate)
+    index = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        limits=IndexLimits(max_files=1),
+    )
+
+    index.rebuild()
+
+    # Rebuild fences the repository with two scans. Each scan may inspect only
+    # a bounded handful of entries before declaring partial coverage.
+    assert inspected <= 8
+    assert index.status().freshness is Freshness.STALE
+
+
+def test_authenticated_file_bindings_avoid_full_database_hash_per_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal fresh tool handles must not hash two complete sidecars per call."""
+    repository = _copy_fixture(tmp_path)
+    RepositoryIndex(project_id="project-1", repository_root=repository).rebuild()
+    digested: list[str] = []
+    original = repo_store.RepoIndexStore._digest_relative_file
+
+    def counted_digest(
+        self: repo_store.RepoIndexStore,
+        name: str,
+        **kwargs: Any,
+    ) -> str:
+        digested.append(name)
+        return original(self, name, **kwargs)
+
+    monkeypatch.setattr(
+        repo_store.RepoIndexStore,
+        "_digest_relative_file",
+        counted_digest,
+    )
+
+    first = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        create=False,
+    ).symbols("Widget")
+    second = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        create=False,
+    ).symbols("Widget")
+
+    assert first.authoritative and second.authoritative
+    assert digested == []
+
+
+def test_database_snapshot_read_rejects_oversized_sidecar_before_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    monkeypatch.setattr(repo_store, "_MAX_DATABASE_BYTES", 1)
+
+    with pytest.raises(RepositoryIndexError, match="bounded size"):
+        index._store._read_database_snapshot(  # noqa: SLF001 - integrity regression
+            None,
+            allow_missing=False,
+        )
+
+
+def test_interrupted_publication_recovers_authenticated_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash after canonical publish must not brick read or rebuild paths."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    changed = repository / "src" / "widget.py"
+    changed.write_text(
+        changed.read_text(encoding="utf-8").replace("def helper", "def normalize"),
+        encoding="utf-8",
+    )
+    original = repo_store.RepoIndexStore._persist_lock_authority
+
+    def interrupted(
+        self: repo_store.RepoIndexStore,
+        receipt: Any,
+    ) -> None:
+        del self, receipt
+        raise OSError("injected authority persistence interruption")
+
+    monkeypatch.setattr(
+        repo_store.RepoIndexStore,
+        "_persist_lock_authority",
+        interrupted,
+    )
+    with pytest.raises(OSError, match="injected"):
+        index.rebuild()
+    monkeypatch.setattr(
+        repo_store.RepoIndexStore,
+        "_persist_lock_authority",
+        original,
+    )
+
+    reopened = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        create=False,
+    )
+    assert reopened.status().freshness is Freshness.CURRENT
+    writable = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+    )
+    assert writable.rebuild().aggregate_digest == reopened.status().aggregate_digest
+
+
+def test_interrupted_lock_authority_append_preserves_last_committed_record(
+    tmp_path: Path,
+) -> None:
+    """A torn append must not erase the previous durable high-water record."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    report = index.rebuild()
+    lock_path = index.index_path.parent / f".{index.index_path.name}.lock"
+    with lock_path.open("ab") as handle:
+        handle.write(b'{"authority":{"generation_id":"torn')
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    reopened = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        create=False,
+    )
+
+    assert reopened.status().aggregate_digest == report.aggregate_digest
+    assert reopened.status().freshness is Freshness.CURRENT
+
+
 def test_query_fingerprint_fence_rejects_repository_mutation_during_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -790,10 +989,16 @@ def test_query_fingerprint_fence_rejects_repository_mutation_during_load(
         *,
         limit: int,
         offset: int = 0,
+        path_prefixes: tuple[str, ...] | None = None,
     ) -> Any:
         changed = repository / "src" / "widget.py"
         changed.write_text("class ChangedDuringQuery: ...\n", encoding="utf-8")
-        return original_symbols(query, limit=limit, offset=offset)
+        return original_symbols(
+            query,
+            limit=limit,
+            offset=offset,
+            path_prefixes=path_prefixes,
+        )
 
     monkeypatch.setattr(index._store, "symbols", mutate_then_load)
 
@@ -867,20 +1072,10 @@ def test_repository_index_uses_cross_platform_file_lock_abstraction(
         calls.append("exclusive")
         real_lock_exclusive(handle, blocking=blocking)
 
-    def tracked_shared(handle: Any, *, blocking: bool = True) -> None:
-        calls.append("shared")
-        real_lock_shared(handle, blocking=blocking)
-
     monkeypatch.setattr(
         repo_store,
         "lock_exclusive",
         tracked_exclusive,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        repo_store,
-        "lock_shared",
-        tracked_shared,
         raising=False,
     )
     repository = _copy_fixture(tmp_path)
@@ -893,7 +1088,6 @@ def test_repository_index_uses_cross_platform_file_lock_abstraction(
     )
 
     assert "exclusive" in calls
-    assert "shared" in calls
 
 
 def test_long_lived_instances_accept_lock_coordinated_generation_advances(
@@ -1065,6 +1259,7 @@ def test_query_metadata_and_rows_do_not_cross_a_publication_generation(
         *,
         limit: int,
         offset: int = 0,
+        path_prefixes: tuple[str, ...] | None = None,
     ) -> Any:
         changed = repository / "src" / "widget.py"
         changed.write_text(
@@ -1075,7 +1270,12 @@ def test_query_metadata_and_rows_do_not_cross_a_publication_generation(
             encoding="utf-8",
         )
         writer.rebuild()
-        return original_symbols(query, limit=limit, offset=offset)
+        return original_symbols(
+            query,
+            limit=limit,
+            offset=offset,
+            path_prefixes=path_prefixes,
+        )
 
     monkeypatch.setattr(reader._store, "symbols", publish_then_load)
 
@@ -1313,7 +1513,8 @@ def test_single_disallowed_control_byte_is_binary(
     report = index.rebuild()
 
     assert index.files().records == ()
-    assert index.status().freshness is Freshness.CURRENT
+    assert index.status().freshness is Freshness.STALE
+    assert index.status().coverage_complete is False
     assert report.skipped_files == 1
 
 

@@ -62,6 +62,7 @@ const preflight: MissionPreflight = {
     policy_revision: 1,
     inventory_digest: "c".repeat(64),
     preflight_digest: "e".repeat(64),
+    plan_digest: "f".repeat(64),
     binding_digest: "d".repeat(64)
   },
   checks: [
@@ -121,7 +122,18 @@ describe("MissionControl", () => {
         return jsonResponse({ items: [project], count: 1 });
       }
       if (path === `/api/projects/${project.project_id}/mission/preflight` && init?.method === "POST") {
-        return jsonResponse(preflight);
+        const request = JSON.parse(String(init.body)) as {
+          mission_plan?: MissionPreflight["tasks"];
+        };
+        return jsonResponse(request.mission_plan ? {
+          ...preflight,
+          tasks: request.mission_plan,
+          launch_binding: {
+            ...preflight.launch_binding,
+            plan_digest: "1".repeat(64),
+            binding_digest: "2".repeat(64)
+          }
+        } : preflight);
       }
       return jsonResponse({ detail: "not_found" }, 404);
     });
@@ -164,6 +176,9 @@ describe("MissionControl", () => {
     fireEvent.change(title, { target: { value: "Map the auth failure" } });
     expect(screen.getByRole("button", { name: "Finish editing plan" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Finish editing" }));
+    await waitFor(() => expect(
+      screen.getByRole("button", { name: "Run mission" })
+    ).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Run mission" }));
 
     await waitFor(() => expect(onLaunch).toHaveBeenCalledTimes(1));
@@ -172,6 +187,11 @@ describe("MissionControl", () => {
       `/api/projects/${project.project_id}/mission/preflight`,
       expect.objectContaining({ method: "POST" })
     );
+    const reboundCall = fetchMock.mock.calls.find(([_input, init]) => {
+      const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}"));
+      return Array.isArray(body.mission_plan);
+    });
+    expect(reboundCall).toBeDefined();
 
     const report = await axe.run(container);
     expect(report.violations).toEqual([]);

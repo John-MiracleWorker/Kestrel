@@ -108,6 +108,8 @@ class AgentConfig:
     layer_config_path: Path | None = None
     workspace: Path = Path(".")
     project_id: str | None = None
+    project_revision: int | None = None
+    project_baseline_index_digest: str | None = None
     project_allowed_paths: tuple[str, ...] = (".",)
     max_tool_rounds: int = 6
     context_budget_chars: int = 18_000

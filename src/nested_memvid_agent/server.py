@@ -144,6 +144,7 @@ def _create_app(
         from .mission_control import (
             mission_launch_binding_matches,
             mission_plan_scope_matches,
+            validated_mission_plan,
         )
         from .provider_probe import ProviderProbeService
         from .server_behavior_delta_routes import register_behavior_delta_routes
@@ -564,8 +565,25 @@ def _create_app(
                     status_code=400,
                     detail="Mission launch cannot override the preflighted provider or model",
                 )
+            proposed_mission_plan = [task.model_dump() for task in request.mission_plan]
             try:
                 project = state.get_project(request.project_id)
+                provided_binding = request.mission_binding.model_dump(by_alias=True)
+                if provided_binding["project_revision"] != project.revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="mission_preflight_binding_stale",
+                    )
+                try:
+                    validated_mission_plan(
+                        request.mission_template_id,
+                        proposed_mission_plan,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="mission_plan_scope_changed_since_preflight",
+                    ) from exc
                 live_preflight = evaluate_mission_preflight(
                     project=project,
                     objective=request.message,
@@ -575,12 +593,12 @@ def _create_app(
                     runs=runs,
                     routing_ledger=routing_ledger,
                     routing_config=routing_config,
+                    mission_plan=proposed_mission_plan,
                 )
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             except (PermissionError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            provided_binding = request.mission_binding.model_dump(by_alias=True)
             expected_binding = live_preflight["launch_binding"]
             if not mission_launch_binding_matches(
                 provided_binding,
