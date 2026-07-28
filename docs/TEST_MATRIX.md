@@ -105,6 +105,11 @@ OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memory --provide
 OLLAMA_API_KEY=... python scripts/run_golden_evals.py --backend memvid --provider ollama-cloud --model gpt-oss:120b --memory-dir /tmp/kestrel-live-golden-memvid --validation-container-image "$VALIDATION_IMAGE"
 ```
 
+CI also runs `scripts/run_determinism_evals.py` with seed `1729`, twenty isolated repeats, and a
+machine-readable flake receipt. Functional outcome signatures must be identical and every
+underlying run must pass; measured latency is retained as a separate gate rather than compared for
+byte equality.
+
 The procedural-promotion case uses the pinned image for real private-snapshot repair validation. No image means a truthful failed golden case, never a host-process fallback.
 
 The current golden set checks behavior such as:
@@ -147,4 +152,5 @@ artifact matrix. The identical checksummed wheel and hash-locked release require
 installed on Linux x86_64, macOS arm64 and x86_64, and native Windows x86_64 for Python 3.11,
 3.12, and 3.13. Each lane asserts its runner architecture, exercises the installed package outside
 the source checkout, asserts its
-`importlib.metadata` version, and performs a real Memvid v2 persistence/reopen integration.
+`importlib.metadata` version, performs a real Memvid v2 persistence/reopen integration, and on
+Windows runs the checksummed PowerShell diagnostic without allowing prerequisite mutation.

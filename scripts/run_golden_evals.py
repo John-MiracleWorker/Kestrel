@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess  # nosec B404 - fixed local git fixture commands only
@@ -68,6 +69,9 @@ _REQUIRED_CATEGORIES = (
     "repo_regression",
 )
 
+_ID_SEED: int | None = None
+_ID_COUNTER = 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -80,6 +84,16 @@ def main() -> int:
     )
     parser.add_argument("--model", default="mock")
     parser.add_argument("--workspace", type=Path, default=Path("."))
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Use stable case and tool identifiers for repeated determinism evaluation.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Also write the complete JSON report to this path.",
+    )
     parser.add_argument(
         "--validation-container-image",
         default=os.getenv("NEST_AGENT_VALIDATION_CONTAINER_IMAGE"),
@@ -99,6 +113,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.max_case_latency_ms is not None and args.max_case_latency_ms <= 0:
         parser.error("--max-case-latency-ms must be greater than 0")
+    if args.seed is not None and not 0 <= args.seed <= 4_294_967_295:
+        parser.error("--seed must be between 0 and 4294967295")
+    _configure_ids(args.seed)
 
     config = AgentConfig(
         backend=args.backend,
@@ -109,103 +126,114 @@ def main() -> int:
         log_dir=args.memory_dir.parent / "logs",
         validation_container_image=args.validation_container_image,
     )
-    eval_id = f"golden_{uuid4().hex}"
-    results = [
-        _run_case(
-            "remember_correction_across_sessions",
-            lambda: _eval_correction_persists(_case_config(config, eval_id, "correction"), eval_id),
-        ),
-        _run_case(
-            "retrieve_prior_failure",
-            lambda: _eval_prior_failure_context(
-                _case_config(config, eval_id, "prior_failure"), eval_id
+    eval_id = _eval_identifier(args.seed)
+    results = _sort_case_results(
+        [
+            _run_case(
+                "remember_correction_across_sessions",
+                lambda: _eval_correction_persists(
+                    _case_config(config, eval_id, "correction"), eval_id
+                ),
             ),
-        ),
-        _run_case(
-            "use_procedural_recipe_after_repeats",
-            lambda: _eval_procedural_promotion(_case_config(config, eval_id, "procedure"), eval_id),
-        ),
-        _run_case(
-            "refuse_path_escape",
-            lambda: _eval_path_escape(_case_config(config, eval_id, "path_escape")),
-        ),
-        _run_case(
-            "block_shell_without_enablement",
-            lambda: _eval_shell_block(_case_config(config, eval_id, "shell")),
-        ),
-        _run_case(
-            "verify_mv2_files", lambda: _eval_verify_memory(_case_config(config, eval_id, "verify"))
-        ),
-        _run_case(
-            "compile_context_under_budget",
-            lambda: _eval_context_budget(_case_config(config, eval_id, "context_budget"), eval_id),
-        ),
-        _run_case(
-            "summary_first_expand_raw_on_demand",
-            lambda: _eval_summary_first_expand_raw(
-                _case_config(config, eval_id, "summary_expand"), eval_id
+            _run_case(
+                "retrieve_prior_failure",
+                lambda: _eval_prior_failure_context(
+                    _case_config(config, eval_id, "prior_failure"), eval_id
+                ),
             ),
-        ),
-        _run_case(
-            "flag_conflicting_facts",
-            lambda: _eval_conflict_warning(_case_config(config, eval_id, "conflicts"), eval_id),
-        ),
-        _run_case(
-            "create_capsule_and_consolidate_validated_lessons",
-            lambda: _eval_task_capsule_consolidation(
-                _case_config(config, eval_id, "capsule"), eval_id
+            _run_case(
+                "use_procedural_recipe_after_repeats",
+                lambda: _eval_procedural_promotion(
+                    _case_config(config, eval_id, "procedure"), eval_id
+                ),
             ),
-        ),
-        _run_case(
-            "mv2_not_sqlite_or_vector_db_substrate",
-            lambda: _eval_mv2_substrate_contract(_case_config(config, eval_id, "substrate")),
-        ),
-        _run_case(
-            "avoid_policy_from_ordinary_event",
-            lambda: _eval_no_policy_from_event(
-                _case_config(config, eval_id, "ordinary_event"), eval_id
+            _run_case(
+                "refuse_path_escape",
+                lambda: _eval_path_escape(_case_config(config, eval_id, "path_escape")),
             ),
-        ),
-        _run_case(
-            "explain_memory_promotion_gates",
-            lambda: _eval_memory_promotion_gate_metadata(
-                _case_config(config, eval_id, "promotion_gates"), eval_id
+            _run_case(
+                "block_shell_without_enablement",
+                lambda: _eval_shell_block(_case_config(config, eval_id, "shell")),
             ),
-        ),
-        _run_case(
-            "map_repository", lambda: _eval_repo_map(_case_config(config, eval_id, "repo_map"))
-        ),
-        _run_case(
-            "apply_patch_and_run_tests",
-            lambda: _eval_patch_and_test(_case_config(config, eval_id, "patch_test")),
-        ),
-        _run_case(
-            "report_test_failure_honestly",
-            lambda: _eval_honest_test_failure(_case_config(config, eval_id, "test_failure")),
-        ),
-        _run_case(
-            "no_success_claim_without_evidence",
-            lambda: _eval_no_success_without_evidence(
-                _case_config(config, eval_id, "no_evidence"), eval_id
+            _run_case(
+                "verify_mv2_files",
+                lambda: _eval_verify_memory(_case_config(config, eval_id, "verify")),
             ),
-        ),
-        _run_case(
-            "tool_call_accuracy_search",
-            lambda: _eval_tool_call_accuracy(_case_config(config, eval_id, "tool_accuracy")),
-        ),
-        _run_case(
-            "approval_requires_exact_call",
-            lambda: _eval_approval_correctness(_case_config(config, eval_id, "approval_exact")),
-        ),
-        _run_case(
-            "durable_plan_completion",
-            lambda: _eval_plan_completion(_case_config(config, eval_id, "plan_completion")),
-        ),
-        _run_case(
-            "repo_regression_guard",
-            lambda: _eval_repo_regression_guard(_case_config(config, eval_id, "repo_regression")),
-        ),
-    ]
+            _run_case(
+                "compile_context_under_budget",
+                lambda: _eval_context_budget(
+                    _case_config(config, eval_id, "context_budget"), eval_id
+                ),
+            ),
+            _run_case(
+                "summary_first_expand_raw_on_demand",
+                lambda: _eval_summary_first_expand_raw(
+                    _case_config(config, eval_id, "summary_expand"), eval_id
+                ),
+            ),
+            _run_case(
+                "flag_conflicting_facts",
+                lambda: _eval_conflict_warning(_case_config(config, eval_id, "conflicts"), eval_id),
+            ),
+            _run_case(
+                "create_capsule_and_consolidate_validated_lessons",
+                lambda: _eval_task_capsule_consolidation(
+                    _case_config(config, eval_id, "capsule"), eval_id
+                ),
+            ),
+            _run_case(
+                "mv2_not_sqlite_or_vector_db_substrate",
+                lambda: _eval_mv2_substrate_contract(_case_config(config, eval_id, "substrate")),
+            ),
+            _run_case(
+                "avoid_policy_from_ordinary_event",
+                lambda: _eval_no_policy_from_event(
+                    _case_config(config, eval_id, "ordinary_event"), eval_id
+                ),
+            ),
+            _run_case(
+                "explain_memory_promotion_gates",
+                lambda: _eval_memory_promotion_gate_metadata(
+                    _case_config(config, eval_id, "promotion_gates"), eval_id
+                ),
+            ),
+            _run_case(
+                "map_repository", lambda: _eval_repo_map(_case_config(config, eval_id, "repo_map"))
+            ),
+            _run_case(
+                "apply_patch_and_run_tests",
+                lambda: _eval_patch_and_test(_case_config(config, eval_id, "patch_test")),
+            ),
+            _run_case(
+                "report_test_failure_honestly",
+                lambda: _eval_honest_test_failure(_case_config(config, eval_id, "test_failure")),
+            ),
+            _run_case(
+                "no_success_claim_without_evidence",
+                lambda: _eval_no_success_without_evidence(
+                    _case_config(config, eval_id, "no_evidence"), eval_id
+                ),
+            ),
+            _run_case(
+                "tool_call_accuracy_search",
+                lambda: _eval_tool_call_accuracy(_case_config(config, eval_id, "tool_accuracy")),
+            ),
+            _run_case(
+                "approval_requires_exact_call",
+                lambda: _eval_approval_correctness(_case_config(config, eval_id, "approval_exact")),
+            ),
+            _run_case(
+                "durable_plan_completion",
+                lambda: _eval_plan_completion(_case_config(config, eval_id, "plan_completion")),
+            ),
+            _run_case(
+                "repo_regression_guard",
+                lambda: _eval_repo_regression_guard(
+                    _case_config(config, eval_id, "repo_regression")
+                ),
+            ),
+        ]
+    )
     summary = _summary(results, max_case_latency_ms=args.max_case_latency_ms)
     functional_passed = summary["fail_count"] == 0
     latency_gate = dict(summary["acceptance"]["latency"])
@@ -216,6 +244,7 @@ def main() -> int:
             "backend": args.backend,
             "provider": args.provider,
             "model": args.model,
+            "seed": args.seed,
             "max_case_latency_ms": args.max_case_latency_ms,
         },
         "results": results,
@@ -227,14 +256,51 @@ def main() -> int:
         },
         "passed": passed,
     }
-    print(json.dumps(report, indent=2))
+    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output is not None:
+        _write_report(args.output, rendered)
+    print(rendered, end="")
     return _report_exit_code(report)
+
+
+def _eval_identifier(seed: int | None) -> str:
+    if seed is None:
+        return f"golden_{uuid4().hex}"
+    digest = hashlib.sha256(f"kestrel-golden-seed:{seed}".encode()).hexdigest()
+    return f"golden_seed_{digest[:24]}"
+
+
+def _configure_ids(seed: int | None) -> None:
+    global _ID_COUNTER, _ID_SEED
+    _ID_SEED = seed
+    _ID_COUNTER = 0
+
+
+def _new_id(label: str) -> str:
+    global _ID_COUNTER
+    if _ID_SEED is None:
+        return uuid4().hex
+    counter = _ID_COUNTER
+    _ID_COUNTER += 1
+    return hashlib.sha256(f"kestrel-golden-id:{_ID_SEED}:{counter}:{label}".encode()).hexdigest()
+
+
+def _write_report(path: Path, rendered: str) -> None:
+    path = path.expanduser().resolve(strict=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(rendered, encoding="utf-8")
+    temporary.replace(path)
 
 
 def _report_exit_code(report: dict[str, Any]) -> int:
     """Fail closed when the emitted aggregate is not an explicit pass."""
 
     return 0 if report.get("passed") is True else 1
+
+
+def _sort_case_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(results, key=lambda item: str(item.get("name", "")))
 
 
 def _aggregate_passed(summary: dict[str, Any]) -> bool:
@@ -450,7 +516,7 @@ def _run_claim_bound_validation(
     executions: list[tuple[str, Any]] = []
 
     def execute(name: str, arguments: dict[str, Any], suffix: str) -> Any:
-        call = ToolCall(name=name, arguments=arguments, id=f"golden_{suffix}_{uuid4().hex}")
+        call = ToolCall(name=name, arguments=arguments, id=f"golden_{suffix}_{_new_id(suffix)}")
         result = agent.tools.execute(
             call,
             _tool_context(
@@ -890,7 +956,7 @@ def _eval_memory_promotion_gate_metadata(
             arguments=stage_arguments,
             session_id=eval_id,
             run_id=eval_id,
-            call_id=f"golden_policy_stage_{uuid4().hex}",
+            call_id=f"golden_policy_stage_{_new_id('policy_stage')}",
         )
         proposal_id = str(stage.data.get("proposal_id") or "")
         next_action = str(stage.data.get("next_action") or "")
@@ -906,7 +972,7 @@ def _eval_memory_promotion_gate_metadata(
             arguments=promote_arguments,
             session_id=eval_id,
             run_id=eval_id,
-            call_id=f"golden_policy_promote_{uuid4().hex}",
+            call_id=f"golden_policy_promote_{_new_id('policy_promote')}",
         )
         proposal = agent.memory.get_record(
             MemoryLayer.EPISODIC,

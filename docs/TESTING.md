@@ -423,6 +423,23 @@ Memvid path:
 RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --provider mock --memory-dir /tmp/kestrel-memvid-golden --validation-container-image "$VALIDATION_IMAGE" --max-case-latency-ms 45000
 ```
 
+The dedicated determinism lane runs the credential-free everyday golden set twenty times with the
+same seed and isolated state roots. It sorts cases before comparison and excludes wall-clock
+latency from the equality signature while still requiring each configured latency gate to pass.
+The JSON receipt reports unique functional signatures, differing cases, determinism streak, and
+observed flake rate:
+
+```bash
+DETERMINISM_PARENT="$(mktemp -d)"
+python scripts/run_determinism_evals.py \
+  --repeats 20 \
+  --seed 1729 \
+  --run-root "$DETERMINISM_PARENT/runs" \
+  --output "$DETERMINISM_PARENT/report.json" \
+  --validation-container-image "$VALIDATION_IMAGE" \
+  --max-case-latency-ms 45000
+```
+
 The pinned image is part of the golden evidence: the procedural-promotion case exercises real no-network OCI repair validation and intentionally fails closed when the image is absent or mutable. The 45-second per-case ceiling is for credential-free mock-provider release jobs with the validation image already pulled; it leaves headroom for the OCI cold-start case while still catching hangs or severe regressions. Each Memvid golden case should use its own memory/log directory to avoid `.mv2` lock contention. Live-provider latency depends on model, network, and quota conditions, so measure a representative baseline and set an explicit environment-appropriate ceiling rather than reusing the mock threshold. Live golden evals support provider/model arguments, but their result is not a current certification claim unless it is captured in a fresh accepted receipt for the exact subject.
 
 ## Release Validation
@@ -431,6 +448,11 @@ Use `docs/RELEASE_CHECKLIST.md` before tagging or publishing a build. The checkl
 compile, metadata alignment, lint, typecheck, unit tests, golden evals, the deterministic
 end-to-end agent learning gate, web build/test, required
 credential-free Memvid/MCP integration, executable-skill OCI containment, and packaging/Docker smoke checks.
+The exact clean candidate must also pass `release-rehearsal.yml`. Its local-only script creates a
+new disposable Git repository with `refs/heads/rehearsal/*` and `refs/tags/rehearsal/*`, builds the
+real wheel/sdist without dependency downloads, verifies their identities, simulates immutable
+release and package-index publication, and proves exact replay is a no-op. It accepts no remote
+repository, registry, GitHub release, or package-index URL.
 
 ## Failure Handling
 

@@ -58,6 +58,19 @@ Kestrel reports its model state explicitly:
 
 `kestrel` is the everyday command. `nest-agent` remains the advanced operator and automation CLI, `nested-memvid` remains the compatibility CLI, and `nested-memvid-agent` remains the Python distribution name.
 
+On native Windows, download the checksummed `install.ps1` release asset and run its non-mutating
+doctor first:
+
+```powershell
+.\install.ps1 -Action Doctor
+.\install.ps1 -Action Bootstrap -Path Auto
+```
+
+`Bootstrap` prints reviewed next-step commands; it does not enable WSL2, install Docker Desktop,
+Python, Git, or Kestrel. The report distinguishes the native exact-wheel, x86_64 WSL2, and Docker
+Desktop paths. See the [deployment guide](docs/DEPLOYMENT.md#windows-diagnostic-and-bootstrap-plan)
+for checksum verification and path requirements.
+
 Prefer a checkout? Use the [source quick start](#quick-start-from-source). Need full runtime controls? See [advanced `nest-agent` operation](#advanced-nest-agent-operation).
 
 ---

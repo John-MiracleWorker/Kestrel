@@ -76,6 +76,40 @@ jobs:
           print(f"verified successful main CI run {successful[0].get('html_url', '')}")
           PY
 
+      - name: Require successful exact-SHA release rehearsal before build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rehearsal_runs="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/release-rehearsal.yml/runs" \
+            -f head_sha="$RELEASE_COMMIT_SHA" \
+            -f branch=main \
+            -f event=push \
+            -f status=completed \
+            -f per_page=100)"
+          REHEARSAL_RUNS_JSON="$rehearsal_runs" python - <<'PY'
+          import json
+          import os
+
+          expected_sha = os.environ["RELEASE_COMMIT_SHA"]
+          runs = json.loads(os.environ["REHEARSAL_RUNS_JSON"]).get("workflow_runs", [])
+          successful = [
+              run
+              for run in runs
+              if run.get("head_sha") == expected_sha
+              and run.get("head_branch") == "main"
+              and run.get("event") == "push"
+              and run.get("status") == "completed"
+              and run.get("conclusion") == "success"
+          ]
+          if not successful:
+              raise SystemExit(
+                  f"release commit {expected_sha} has no successful exact-SHA "
+                  "release rehearsal push run on main"
+              )
+          print(f"verified successful rehearsal {successful[0].get('html_url', '')}")
+          PY
+
       - name: Install pinned uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -350,11 +384,13 @@ jobs:
       - name: Stage version-pinned installer
         run: |
           cp install.sh dist/install.sh
+          cp install.ps1 dist/install.ps1
           python - <<'PY'
           import os
           from pathlib import Path
 
           path = Path("dist/install.sh")
+          powershell_path = Path("dist/install.ps1")
           text = path.read_text(encoding="utf-8")
           tag = os.environ["GITHUB_REF_NAME"]
           release_sha = os.environ["RELEASE_COMMIT_SHA"]
@@ -390,6 +426,13 @@ jobs:
                   raise SystemExit(f"installer release marker not found: {marker}")
               text = text.replace(marker, pinned, 1)
           path.write_text(text, encoding="utf-8")
+          powershell_text = powershell_path.read_text(encoding="utf-8")
+          powershell_version = f'[string] $Version = "{version}"'
+          if powershell_text.count(powershell_version) != 1:
+              raise SystemExit(
+                  "PowerShell bootstrap version does not match the release: "
+                  f"{powershell_version}"
+              )
           PY
       - name: Validate staged release installer plan
         run: |
@@ -599,7 +642,7 @@ jobs:
             sdists=(*.tar.gz)
             test "${#wheels[@]}" -eq 1
             test "${#sdists[@]}" -eq 1
-            sha256sum install.sh requirements-release.txt "${wheels[@]}" "${sdists[@]}" sbom.cdx.json > SHA256SUMS
+            sha256sum install.sh install.ps1 requirements-release.txt "${wheels[@]}" "${sdists[@]}" sbom.cdx.json > SHA256SUMS
           )
       - name: Verify complete release payload
         run: python scripts/verify_release_payload.py dist --expected-version "$GITHUB_REF_NAME"
@@ -674,6 +717,21 @@ jobs:
           python -m scripts.verify_exact_wheel_install dist
           --expected-version "${{ github.ref_name }}"
           --source-root .
+      - name: Validate the shipped PowerShell Windows diagnostic
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $reportText = powershell -NoProfile -ExecutionPolicy Bypass -File dist/install.ps1 -Action Doctor -Json
+          if ($LASTEXITCODE -ne 0) {
+            throw "PowerShell diagnostic exited $LASTEXITCODE"
+          }
+          $report = $reportText | ConvertFrom-Json
+          if ($report.schema -ne "kestrel.windows_bootstrap_report.v1") {
+            throw "PowerShell diagnostic returned the wrong schema"
+          }
+          if ($report.mutation_performed -ne $false -or $report.passed -ne $true) {
+            throw "PowerShell diagnostic did not prove a non-mutating supported path"
+          }
 
   publish:
     name: Publish exact payload and multi-architecture image

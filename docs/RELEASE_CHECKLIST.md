@@ -235,7 +235,12 @@ docker run --rm kestrel-agent:local nest-agent doctor --backend memvid --memory-
 ```
 
 The tag workflow first proves that the exact tag SHA already has a successful `main` push run of
-the complete CI workflow. It then builds the wheel once and installs that identical downloaded
+the complete CI workflow and a successful exact-SHA `release-rehearsal.yml` push run. The
+rehearsal has read-only repository permission and writes only to a new runner-local repository and
+package namespace named `kestrel-rehearsal-*`; it exposes no production repository, GHCR, GitHub
+Release, or PyPI target. Run it on the clean candidate before creating the immutable production
+tag. The tag workflow refuses to build or publish when that exact-SHA receipt is absent. It then
+builds the wheel once and installs that identical downloaded
 wheel plus its hash-locked dependency payload on Linux x86_64, Apple-silicon macOS,
 and native Windows x86_64 with Python 3.11, 3.12, and 3.13. The macOS
 lanes use `macos-latest` (arm64); Intel macOS was dropped in v0.4.8 because the
@@ -353,6 +358,10 @@ Do not tag the release if any of these are true:
 - Policy memory can be written from one ordinary event.
 - The source candidate has not passed repository CI, including the native Windows source lane.
 - The exact release tag SHA has no successful complete CI `push` run on `main`.
+- The exact release tag SHA has no successful `release-rehearsal.yml` `push` run on `main`, or the
+  production tag was created before that rehearsal completed.
+- The twenty-repeat everyday golden lane reports more than one functional signature, a streak
+  below twenty, an underlying failed run, or missing flake evidence.
 - The exact single built wheel and hash-locked dependency payload have not passed Linux x86_64
   and Apple-silicon macOS on every supported Python version (3.11 through 3.13),
   plus native Windows x86_64 on every supported Python version, with each runner architecture

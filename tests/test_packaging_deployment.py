@@ -513,7 +513,7 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "Validate staged release installer plan" in workflow
     assert "bash < dist/install.sh" in workflow
     assert "verify SHA256SUMS" in workflow
-    assert 'sha256sum install.sh requirements-release.txt "${wheels[@]}"' in workflow
+    assert 'sha256sum install.sh install.ps1 requirements-release.txt "${wheels[@]}"' in workflow
     assert '"repos/$GITHUB_REPOSITORY/immutable-releases"' in workflow
     assert 'test "$enabled" = "true"' in workflow
     assert 'gh release create "$GITHUB_REF_NAME"' in workflow

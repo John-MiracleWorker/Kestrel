@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+BOOTSTRAP = ROOT / "install.ps1"
+
+
+def _powershell() -> str | None:
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def test_windows_bootstrap_is_shipped_at_the_repository_root() -> None:
+    assert BOOTSTRAP.is_file()
+
+
+@pytest.mark.skipif(_powershell() is None, reason="PowerShell is not available")
+def test_windows_doctor_reports_supported_paths_without_mutation() -> None:
+    completed = subprocess.run(
+        [
+            str(_powershell()),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(BOOTSTRAP),
+            "-Action",
+            "Doctor",
+            "-Json",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    report = json.loads(completed.stdout)
+
+    assert report["schema"] == "kestrel.windows_bootstrap_report.v1"
+    assert report["mutation_performed"] is False
+    assert set(report["checks"]) == {"docker_desktop", "git", "python", "wsl2"}
+    assert set(report["paths"]) == {"docker_desktop", "native_wheel", "wsl2"}
+    assert report["bootstrap"]["commands"] == []
+    assert completed.returncode == (0 if report["passed"] else 1)
+
+
+@pytest.mark.skipif(_powershell() is None, reason="PowerShell is not available")
+def test_windows_bootstrap_only_prints_operator_executed_commands() -> None:
+    before = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    completed = subprocess.run(
+        [
+            str(_powershell()),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(BOOTSTRAP),
+            "-Action",
+            "Bootstrap",
+            "-Path",
+            "Auto",
+            "-Json",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    after = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    report = json.loads(completed.stdout)
+
+    assert report["mutation_performed"] is False
+    assert report["bootstrap"]["operator_execution_required"] is True
+    assert report["bootstrap"]["commands"]
+    assert before == after
+    assert completed.returncode == (0 if report["passed"] else 1)

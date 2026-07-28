@@ -11,6 +11,7 @@ from scripts.run_golden_evals import (
     _golden_case_workspace,
     _report_exit_code,
     _run_case,
+    _sort_case_results,
     _summary,
 )
 
@@ -26,6 +27,18 @@ def test_golden_eval_report_exits_nonzero_when_any_case_fails() -> None:
 
     assert report["passed"] is False
     assert _report_exit_code(report) == 1
+
+
+def test_seeded_golden_case_results_have_stable_name_order() -> None:
+    results = [
+        {"name": "zeta", "passed": True},
+        {"name": "alpha", "passed": True},
+    ]
+
+    assert [item["name"] for item in _sort_case_results(results)] == [
+        "alpha",
+        "zeta",
+    ]
 
 
 def test_golden_eval_report_exits_zero_only_for_explicit_pass() -> None:
@@ -142,9 +155,7 @@ def test_golden_case_workspace_is_portable_and_bounded_to_eval_root(tmp_path: Pa
     workspace.resolve().relative_to(config.memory_dir.parent.resolve())
     assert workspace == tmp_path / "golden" / "workspaces" / "case-memory-patch"
     assert workspace.is_dir()
-    assert "/private/tmp" not in Path("scripts/run_golden_evals.py").read_text(
-        encoding="utf-8"
-    )
+    assert "/private/tmp" not in Path("scripts/run_golden_evals.py").read_text(encoding="utf-8")
 
 
 def test_golden_case_errors_are_redacted() -> None:

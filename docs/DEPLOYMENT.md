@@ -22,9 +22,10 @@ and Intel macOS (the `cryptography` dependency no longer publishes Intel wheels)
 use the published container image for those platforms. The `v0.4.11`
 links in this guide become usable only after that workflow succeeds; this pre-publication
 checkout does not claim that a GitHub release or GHCR artifact already exists.
-Native Windows users should install the wheel instead of using Git Bash or the Windows
-`bash.exe` launcher. The exact downloaded wheel is release-gated on native Windows,
-Linux x86_64, and Apple-silicon macOS with Python 3.11, 3.12, and 3.13.
+Native Windows users should use the checksummed PowerShell diagnostic and exact wheel instead of
+Git Bash or the Windows `bash.exe` launcher. The diagnostic also reports whether an x86_64 WSL2
+distribution or Docker Desktop Linux engine is ready. The exact downloaded wheel is release-gated
+on native Windows, Linux x86_64, and Apple-silicon macOS with Python 3.11, 3.12, and 3.13.
 The matrix asserts `platform.machine()` in
 each lane so a hosted-runner architecture or label drift cannot silently reduce that
 coverage.
@@ -68,6 +69,38 @@ python -m pip install "nested-memvid-agent[memvid,server,mcp,keyring]==0.4.11"
 ```
 
 The package command is a publication target until the exact tag workflow completes.
+
+## Windows Diagnostic and Bootstrap Plan
+
+`install.ps1` is a diagnostic and plan generator, not an unattended prerequisite installer. The
+release workflow includes it in `SHA256SUMS`, validates it on native Windows for every supported
+Python version, and refuses publication when its embedded version differs from the release.
+Download the full release payload and verify it before running the script:
+
+```powershell
+gh release download v0.4.11 --repo John-MiracleWorker/Kestrel --dir kestrel-release-v0.4.11
+python scripts/verify_release_payload.py kestrel-release-v0.4.11 --expected-version v0.4.11
+Set-Location kestrel-release-v0.4.11
+.\install.ps1 -Action Doctor
+.\install.ps1 -Action Bootstrap -Path Auto
+```
+
+The report checks Git, Python 3.11-3.13, WSL2 distro version/architecture/guest prerequisites, and
+Docker Desktop engine reachability with bounded probes. `Bootstrap` only prints commands for the
+selected ready path and sets `mutation_performed` to false. The operator must review and execute
+those commands separately. It never invokes Windows Features, `wsl --install`, a package manager,
+Docker installation, Python installation, Git installation, `pip install`, `docker pull`, or the
+Bash installer itself.
+
+Supported choices are:
+
+- `NativeWheel`: a supported 64-bit Python interpreter installs the exact published wheel.
+- `WSL2`: an existing x86_64 WSL2 distribution with Git and Python runs the Bash installer inside
+  Linux, never through Git Bash.
+- `DockerDesktop`: an already-running Linux container engine uses the published Kestrel image.
+
+Missing prerequisites are reported with explicit remediation. The script exits nonzero when the
+requested path is not ready.
 
 For `v0.4.5` and later, download the complete payload and verify both its GitHub
 provenance and its internal identity before installing it:
