@@ -65,6 +65,15 @@ class ProcessSnapshot:
 
 
 @dataclass(frozen=True)
+class BoundListener:
+    """A TCP listener together with the exact local endpoint lsof reported."""
+
+    pid: int
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
 class ServiceStatus:
     state: ServiceState
     management: ServiceManagement
@@ -86,7 +95,7 @@ class ServiceControlError(RuntimeError):
 class ProcessInspector(Protocol):
     def process(self, pid: int) -> ProcessSnapshot | None: ...
 
-    def listener_pids(self, host: str, port: int) -> tuple[int, ...]: ...
+    def listeners(self, host: str, port: int) -> tuple[BoundListener, ...]: ...
 
     def group_has_live_members(self, pgid: int) -> bool: ...
 
@@ -167,7 +176,7 @@ class SystemProcessInspector:
             state=state,
         )
 
-    def listener_pids(self, host: str, port: int) -> tuple[int, ...]:
+    def listeners(self, host: str, port: int) -> tuple[BoundListener, ...]:
         if host != "127.0.0.1":
             raise ServiceControlError(
                 "Easy-launch listener inspection is restricted to loopback.",
@@ -181,7 +190,7 @@ class SystemProcessInspector:
                     "-nP",
                     f"-iTCP:{port}",
                     "-sTCP:LISTEN",
-                    "-t",
+                    "-Fpn",
                 ],
                 check=False,
                 capture_output=True,
@@ -199,19 +208,50 @@ class SystemProcessInspector:
                 code="port_inspection_failed",
                 recovery="Run `kestrel doctor` and inspect the listener manually.",
             )
-        pids: set[int] = set()
+        listeners: set[BoundListener] = set()
+        current_pid: int | None = None
         for line in result.stdout.splitlines():
-            value = line.strip()
-            if not value:
+            if not line:
                 continue
-            if not value.isdigit() or int(value) <= 0:
+            field, value = line[0], line[1:]
+            if field == "p":
+                if not value.isdigit() or int(value) <= 0:
+                    raise ServiceControlError(
+                        f"Received an invalid listener PID for port {port}.",
+                        code="port_inspection_failed",
+                        recovery="Run `kestrel doctor` and inspect the listener manually.",
+                    )
+                current_pid = int(value)
+                continue
+            if field != "n" or current_pid is None:
+                continue
+            endpoint = _parse_listener_endpoint(value)
+            if endpoint is None:
                 raise ServiceControlError(
-                    f"Received an invalid listener PID for port {port}.",
+                    f"Could not parse a listener endpoint for port {port}.",
                     code="port_inspection_failed",
                     recovery="Run `kestrel doctor` and inspect the listener manually.",
                 )
-            pids.add(int(value))
-        return tuple(sorted(pids))
+            endpoint_host, endpoint_port = endpoint
+            if endpoint_port != port:
+                raise ServiceControlError(
+                    f"Received an unexpected listener endpoint for port {port}.",
+                    code="port_inspection_failed",
+                    recovery="Run `kestrel doctor` and inspect the listener manually.",
+                )
+            listeners.add(
+                BoundListener(
+                    pid=current_pid,
+                    host=endpoint_host,
+                    port=endpoint_port,
+                )
+            )
+        return tuple(
+            sorted(
+                listeners,
+                key=lambda item: (item.pid, item.host, item.port),
+            )
+        )
 
     def group_has_live_members(self, pgid: int) -> bool:
         result = subprocess.run(
@@ -700,7 +740,7 @@ class ServiceController:
                 code="metadata_in_use",
                 recovery="Run `kestrel doctor` and verify process ownership before retrying.",
             )
-        if self.inspector.listener_pids(self.paths.host, self.paths.port):
+        if self.inspector.listeners(self.paths.host, self.paths.port):
             raise ServiceControlError(
                 "The Kestrel loopback port still has a listener.",
                 code="metadata_in_use",
@@ -827,7 +867,7 @@ class ServiceController:
             and self.inspector.group_has_live_members(metadata.pgid)
         ):
             return False
-        return not self.inspector.listener_pids(
+        return not self.inspector.listeners(
             self.paths.host,
             self.paths.port,
         )
@@ -1037,9 +1077,11 @@ class ServiceController:
         return (
             self.inspector.process(pid) is None
             and pid
-            not in self.inspector.listener_pids(
-                self.paths.host,
-                self.paths.port,
+            not in _listener_pids(
+                self.inspector.listeners(
+                    self.paths.host,
+                    self.paths.port,
+                )
             )
         )
 
@@ -1059,11 +1101,14 @@ class ServiceController:
             and self.inspector.group_has_live_members(metadata.pgid)
         ):
             return False
-        listeners = self.inspector.listener_pids(
+        listeners = self.inspector.listeners(
             self.paths.host,
             self.paths.port,
         )
-        return metadata.pid is None or metadata.pid not in listeners
+        return (
+            metadata.pid is None
+            or metadata.pid not in _listener_pids(listeners)
+        )
 
     def _stopped_status(self) -> ServiceStatus:
         return ServiceStatus(
@@ -1141,16 +1186,27 @@ class ServiceController:
                 pgid=metadata.pgid,
                 lifecycle_busy=lifecycle_busy,
             )
-        listeners = self.inspector.listener_pids(
+        listeners = self.inspector.listeners(
             self.paths.host,
             self.paths.port,
         )
+        if any(
+            not isinstance(listener, BoundListener)
+            or listener.host != self.paths.host
+            or listener.port != self.paths.port
+            for listener in listeners
+        ):
+            return self._conflict(
+                "The configured port is not bound exactly to the Kestrel "
+                "loopback endpoint.",
+                lifecycle_busy=lifecycle_busy,
+            )
         if len(listeners) > 1:
             return self._conflict(
                 "Multiple processes report ownership of the Kestrel loopback port.",
                 lifecycle_busy=lifecycle_busy,
             )
-        listener_pid = listeners[0] if listeners else None
+        listener_pid = listeners[0].pid if listeners else None
         if listener_pid is None:
             return self._status_without_listener(
                 metadata,
@@ -1535,15 +1591,15 @@ def _supervisor_identity_matches(
 
 
 def _command_option(command: tuple[str, ...], option: str) -> str | None:
+    values: list[str] = []
     for index, argument in enumerate(command):
         if argument == option:
             if index + 1 >= len(command):
                 return None
-            return command[index + 1]
-        prefix = f"{option}="
-        if argument.startswith(prefix):
-            return argument[len(prefix) :]
-    return None
+            values.append(command[index + 1])
+        elif argument.startswith(f"{option}="):
+            values.append(argument[len(option) + 1 :])
+    return values[0] if len(values) == 1 else None
 
 
 def _option_path_matches(
@@ -1624,7 +1680,40 @@ def _configured_path(
     candidate = Path(configured.strip()).expanduser()
     if not candidate.is_absolute():
         candidate = home / candidate
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(home)
+        except ValueError as exc:
+            raise ValueError(
+                "Relative Kestrel state and memory paths must be contained by "
+                "the Kestrel home"
+            ) from exc
+        return resolved
     return candidate.resolve()
+
+
+def _parse_listener_endpoint(value: str) -> tuple[str, int] | None:
+    endpoint = value.strip()
+    if endpoint.startswith("["):
+        closing = endpoint.find("]")
+        if closing < 1 or closing + 1 >= len(endpoint) or endpoint[closing + 1] != ":":
+            return None
+        host = endpoint[1:closing]
+        port_text = endpoint[closing + 2 :]
+    else:
+        if ":" not in endpoint:
+            return None
+        host, port_text = endpoint.rsplit(":", 1)
+    if not host or not port_text.isdigit():
+        return None
+    port = int(port_text)
+    if not 1 <= port <= 65_535:
+        return None
+    return host, port
+
+
+def _listener_pids(listeners: tuple[BoundListener, ...]) -> tuple[int, ...]:
+    return tuple(sorted({listener.pid for listener in listeners}))
 
 
 def _current_uid() -> int:

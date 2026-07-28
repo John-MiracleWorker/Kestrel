@@ -19,6 +19,7 @@ from nested_memvid_agent.private_artifacts import (
 )
 from nested_memvid_agent.server_client import ServerProbe
 from nested_memvid_agent.service_control import (
+    BoundListener,
     ProcessSnapshot,
     ServiceControlError,
     ServiceController,
@@ -36,12 +37,12 @@ class FakeInspector:
         self,
         *,
         processes: dict[int, ProcessSnapshot] | None = None,
-        listeners: tuple[int, ...] = (),
+        listeners: tuple[BoundListener, ...] = (),
         live_groups: frozenset[int] = frozenset(),
         bindable: bool = True,
     ) -> None:
         self.processes = processes or {}
-        self.listeners = listeners
+        self.bound_listeners = listeners
         self.live_groups = live_groups
         self.bindable = bindable
         self.signals: list[tuple[str, int, int]] = []
@@ -49,10 +50,10 @@ class FakeInspector:
     def process(self, pid: int) -> ProcessSnapshot | None:
         return self.processes.get(pid)
 
-    def listener_pids(self, host: str, port: int) -> tuple[int, ...]:
+    def listeners(self, host: str, port: int) -> tuple[BoundListener, ...]:
         assert host == "127.0.0.1"
         assert port > 0
-        return self.listeners
+        return self.bound_listeners
 
     def group_has_live_members(self, pgid: int) -> bool:
         return pgid in self.live_groups
@@ -176,6 +177,10 @@ def _managed_metadata(paths: Any, *, server_pid: int = 201, supervisor_pid: int 
     write_private_text(paths.pgid_path, f"{server_pid}\n")
 
 
+def _listener(paths: Any, pid: int) -> BoundListener:
+    return BoundListener(pid=pid, host=paths.host, port=paths.port)
+
+
 def test_home_resolution_uses_the_documented_precedence(tmp_path: Path) -> None:
     explicit = _installation(tmp_path / "explicit")
     configured = _installation(tmp_path / "configured")
@@ -278,6 +283,156 @@ def test_service_paths_are_canonical_loopback_paths(tmp_path: Path) -> None:
     assert paths.lifecycle_lock_path == home.resolve() / ".nest" / "server.lifecycle.lock"
 
 
+def test_service_paths_allow_only_relative_state_and_memory_paths_contained_by_home(
+    tmp_path: Path,
+) -> None:
+    home = _installation(tmp_path / "home")
+
+    paths = resolve_service_paths(
+        home,
+        environ={
+            "NEST_AGENT_STATE_PATH": ".nest/alternate/agent.db",
+            "NEST_AGENT_MEMORY_DIR": ".nest/alternate/memory",
+        },
+    )
+
+    assert paths.state_path == home.resolve() / ".nest" / "alternate" / "agent.db"
+    assert paths.memory_dir == home.resolve() / ".nest" / "alternate" / "memory"
+
+
+@pytest.mark.parametrize(
+    ("setting", "configured"),
+    [
+        ("NEST_AGENT_STATE_PATH", "../outside/agent.db"),
+        ("NEST_AGENT_MEMORY_DIR", "../../outside/memory"),
+    ],
+)
+def test_service_paths_reject_relative_state_and_memory_escapes(
+    tmp_path: Path,
+    setting: str,
+    configured: str,
+) -> None:
+    home = _installation(tmp_path / "home")
+
+    with pytest.raises(ValueError, match="contained"):
+        resolve_service_paths(home, environ={setting: configured})
+
+
+def test_status_rejects_port_only_and_non_loopback_listener_records(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    for listener in (
+        BoundListener(pid=server.pid, host="*", port=paths.port),
+        BoundListener(pid=server.pid, host="0.0.0.0", port=paths.port),
+        BoundListener(pid=server.pid, host="::1", port=paths.port),
+        BoundListener(pid=server.pid, host=paths.host, port=paths.port + 1),
+    ):
+        status = ServiceController(
+            paths,
+            inspector=FakeInspector(
+                processes={server.pid: server},
+                listeners=(listener,),
+                bindable=False,
+            ),
+            client=FakeClient(ServerProbe(True, True, False)),
+        ).status()
+
+        assert status.state == ServiceState.CONFLICT
+        assert status.management == ServiceManagement.NONE
+
+
+def test_status_rejects_port_only_listener_pids_without_an_endpoint(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    status = ServiceController(
+        paths,
+        inspector=FakeInspector(
+            processes={server.pid: server},
+            listeners=(server.pid,),  # type: ignore[arg-type]
+            bindable=False,
+        ),
+        client=FakeClient(ServerProbe(True, True, False)),
+    ).status()
+
+    assert status.state == ServiceState.CONFLICT
+    assert status.management == ServiceManagement.NONE
+
+
+@pytest.mark.parametrize(
+    "extra_option",
+    [
+        ("--backend", "not-memvid"),
+        ("--memory-dir", ".nest/other-memory"),
+        ("--state-path", ".nest/other-state.db"),
+        ("--host", "0.0.0.0"),
+        ("--port", "18766"),
+    ],
+)
+def test_status_rejects_duplicate_server_identity_options(
+    tmp_path: Path,
+    extra_option: tuple[str, str],
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    command = (*server.command, *extra_option)
+    conflicting = replace(server, command=command)
+
+    status = ServiceController(
+        paths,
+        inspector=FakeInspector(
+            processes={conflicting.pid: conflicting},
+            listeners=(_listener(paths, conflicting.pid),),
+            bindable=False,
+        ),
+        client=FakeClient(ServerProbe(True, True, False)),
+    ).status()
+
+    assert status.state == ServiceState.CONFLICT
+
+
+@pytest.mark.parametrize(
+    "extra_option",
+    [
+        ("--pid-file", ".nest/other-server.pid"),
+        ("--supervisor-pid-file", ".nest/other-supervisor.pid"),
+        ("--process-group-file", ".nest/other-server.pgid"),
+        ("--log-file", ".nest/other-server.log"),
+    ],
+)
+def test_status_rejects_duplicate_supervisor_identity_options(
+    tmp_path: Path,
+    extra_option: tuple[str, str],
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    supervisor = _supervisor_snapshot(paths, server)
+    _managed_metadata(paths)
+    separator = supervisor.command.index("--")
+    command = (
+        *supervisor.command[:separator],
+        *extra_option,
+        *supervisor.command[separator:],
+    )
+    conflicting = replace(supervisor, command=command)
+
+    status = ServiceController(
+        paths,
+        inspector=FakeInspector(
+            processes={server.pid: server, conflicting.pid: conflicting},
+            listeners=(_listener(paths, server.pid),),
+            live_groups=frozenset({server.pgid}),
+            bindable=False,
+        ),
+        client=FakeClient(ServerProbe(True, True, False)),
+    ).status()
+
+    assert status.state == ServiceState.CONFLICT
+
+
 def test_status_recognizes_a_verified_managed_service(tmp_path: Path) -> None:
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
     server = _server_snapshot(paths)
@@ -288,7 +443,7 @@ def test_status_recognizes_a_verified_managed_service(tmp_path: Path) -> None:
         paths,
         inspector=FakeInspector(
             processes={server.pid: server, supervisor.pid: supervisor},
-            listeners=(server.pid,),
+            listeners=(_listener(paths, server.pid),),
             live_groups=frozenset({server.pgid}),
             bindable=False,
         ),
@@ -314,7 +469,7 @@ def test_status_recognizes_a_verified_external_service_without_adopting_it(
         paths,
         inspector=FakeInspector(
             processes={server.pid: server},
-            listeners=(server.pid,),
+            listeners=(_listener(paths, server.pid),),
             live_groups=frozenset({server.pgid}),
             bindable=False,
         ),
@@ -342,7 +497,7 @@ def test_status_treats_authenticated_service_as_running_but_locked(
         paths,
         inspector=FakeInspector(
             processes={server.pid: server, supervisor.pid: supervisor},
-            listeners=(server.pid,),
+            listeners=(_listener(paths, server.pid),),
             live_groups=frozenset({server.pgid}),
             bindable=False,
         ),
@@ -459,7 +614,7 @@ def test_status_refuses_reused_or_mismatched_server_pids(
         paths,
         inspector=FakeInspector(
             processes={server.pid: server},
-            listeners=(server.pid,),
+            listeners=(_listener(paths, server.pid),),
             bindable=False,
         ),
         client=FakeClient(ServerProbe(True, True, False)),
@@ -487,7 +642,7 @@ def test_status_refuses_a_healthy_api_with_unverified_listener_identity(
         paths,
         inspector=FakeInspector(
             processes={unknown.pid: unknown},
-            listeners=(unknown.pid,),
+            listeners=(_listener(paths, unknown.pid),),
             bindable=False,
         ),
         client=FakeClient(ServerProbe(True, True, False)),
@@ -555,7 +710,7 @@ def test_start_reuses_running_managed_and_external_services(
             _managed_metadata(paths)
         inspector = FakeInspector(
             processes=processes,
-            listeners=(server.pid,),
+            listeners=(_listener(paths, server.pid),),
             live_groups=frozenset({server.pgid}),
             bindable=False,
         )
@@ -593,7 +748,7 @@ def test_start_launches_the_existing_supervisor_with_safe_absolute_arguments(
             server.pid: server,
             supervisor.pid: supervisor,
         }
-        inspector.listeners = (server.pid,)
+        inspector.bound_listeners = (_listener(paths, server.pid),)
         inspector.live_groups = frozenset({server.pgid})
         inspector.bindable = False
         return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
@@ -644,7 +799,7 @@ def test_concurrent_start_calls_serialize_to_one_supervisor(
             server.pid: server,
             supervisor.pid: supervisor,
         }
-        inspector.listeners = (server.pid,)
+        inspector.bound_listeners = (_listener(paths, server.pid),)
         inspector.live_groups = frozenset({server.pgid})
         inspector.bindable = False
         return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
@@ -685,7 +840,7 @@ def test_start_removes_only_proven_stale_metadata_before_launch(
             server.pid: server,
             supervisor.pid: supervisor,
         }
-        inspector.listeners = (server.pid,)
+        inspector.bound_listeners = (_listener(paths, server.pid),)
         inspector.live_groups = frozenset({server.pgid})
         inspector.bindable = False
         return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
@@ -717,7 +872,7 @@ def test_start_refuses_unknown_listener_without_launching(
         paths,
         inspector=FakeInspector(
             processes={unknown.pid: unknown},
-            listeners=(unknown.pid,),
+            listeners=(_listener(paths, unknown.pid),),
             bindable=False,
         ),
         client=FakeClient(ServerProbe(True, True, False)),
@@ -800,7 +955,7 @@ def test_stop_terminates_only_a_verified_managed_process_group(
     _managed_metadata(paths)
     inspector = FakeInspector(
         processes={server.pid: server, supervisor.pid: supervisor},
-        listeners=(server.pid,),
+        listeners=(_listener(paths, server.pid),),
         live_groups=frozenset({server.pgid}),
         bindable=False,
     )
@@ -812,7 +967,7 @@ def test_stop_terminates_only_a_verified_managed_process_group(
             signal.SIGTERM,
         )
         inspector.processes.clear()
-        inspector.listeners = ()
+        inspector.bound_listeners = ()
         inspector.live_groups = frozenset()
         inspector.bindable = True
 
@@ -838,7 +993,7 @@ def test_stop_terminates_only_the_exact_verified_external_pid(
     server = _server_snapshot(paths)
     inspector = FakeInspector(
         processes={server.pid: server},
-        listeners=(server.pid,),
+        listeners=(_listener(paths, server.pid),),
         live_groups=frozenset({server.pgid}),
         bindable=False,
     )
@@ -850,7 +1005,7 @@ def test_stop_terminates_only_the_exact_verified_external_pid(
             signal.SIGTERM,
         )
         inspector.processes.clear()
-        inspector.listeners = ()
+        inspector.bound_listeners = ()
         inspector.live_groups = frozenset()
         inspector.bindable = True
 
@@ -871,7 +1026,7 @@ def test_stop_reverifies_identity_before_hard_kill(tmp_path: Path) -> None:
     server = _server_snapshot(paths)
     inspector = FakeInspector(
         processes={server.pid: server},
-        listeners=(server.pid,),
+        listeners=(_listener(paths, server.pid),),
         live_groups=frozenset({server.pgid}),
         bindable=False,
     )
@@ -921,7 +1076,7 @@ def test_stop_escalates_only_a_still_verified_signal_target(
         _managed_metadata(paths)
     inspector = FakeInspector(
         processes=processes,
-        listeners=(server.pid,),
+        listeners=(_listener(paths, server.pid),),
         live_groups=frozenset({server.pgid}),
         bindable=False,
     )
@@ -931,7 +1086,7 @@ def test_stop_escalates_only_a_still_verified_signal_target(
         if signal_number != signal.SIGKILL:
             return
         inspector.processes.clear()
-        inspector.listeners = ()
+        inspector.bound_listeners = ()
         inspector.live_groups = frozenset()
         inspector.bindable = True
 
