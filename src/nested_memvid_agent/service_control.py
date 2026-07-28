@@ -308,17 +308,24 @@ class SystemProcessInspector:
         return False
 
     def port_is_bindable(self, host: str, port: int) -> bool:
+        # A wildcard listener can coexist with this exact-host probe on Darwin
+        # when both sockets use SO_REUSEADDR. Inspect before binding so that
+        # case is still occupied, then inspect again while the probe owns its
+        # bind so a listener that raced the first inspection fails closed.
+        if self.listeners(host, port):
+            return False
         candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             # Match the server's listener semantics so recently closed client
             # connections in TIME_WAIT do not masquerade as a live listener.
             candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            candidate.bind((host, port))
-        except OSError:
-            return False
+            try:
+                candidate.bind((host, port))
+            except OSError:
+                return False
+            return not self.listeners(host, port)
         finally:
             candidate.close()
-        return True
 
     def _process_cwd(self, pid: int) -> Path:
         proc_cwd = Path("/proc") / str(pid) / "cwd"

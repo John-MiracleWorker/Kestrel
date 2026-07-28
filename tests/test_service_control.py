@@ -1590,6 +1590,10 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
                         time.sleep(0.05)
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("lsof") is None,
+    reason="requires POSIX listener inspection with lsof",
+)
 def test_system_port_bindability_ignores_closed_connection_residue() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -1601,7 +1605,76 @@ def test_system_port_bindability_ignores_closed_connection_residue() -> None:
                 connection.shutdown(socket.SHUT_WR)
                 assert client.recv(1) == b""
 
+    assert SystemProcessInspector().listeners("127.0.0.1", port) == ()
     assert SystemProcessInspector().port_is_bindable("127.0.0.1", port) is True
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("lsof") is None,
+    reason="requires POSIX listener inspection with lsof",
+)
+@pytest.mark.parametrize("listener_host", ["127.0.0.1", "0.0.0.0"])
+def test_system_port_bindability_rejects_active_ipv4_listeners(
+    listener_host: str,
+) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((listener_host, 0))
+        port = listener.getsockname()[1]
+        listener.listen()
+
+        assert SystemProcessInspector().listeners("127.0.0.1", port)
+        assert (
+            SystemProcessInspector().port_is_bindable("127.0.0.1", port) is False
+        )
+
+
+@pytest.mark.skipif(
+    os.name == "nt"
+    or shutil.which("lsof") is None
+    or not socket.has_ipv6,
+    reason="requires dual-stack IPv6 listener inspection with lsof",
+)
+def test_system_port_bindability_rejects_active_ipv6_wildcard_listener() -> None:
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
+        try:
+            listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("::", 0))
+        except OSError as exc:
+            pytest.skip(f"dual-stack IPv6 wildcard listener is unavailable: {exc}")
+        port = listener.getsockname()[1]
+        listener.listen()
+
+        assert SystemProcessInspector().listeners("127.0.0.1", port)
+        assert (
+            SystemProcessInspector().port_is_bindable("127.0.0.1", port) is False
+        )
+
+
+def test_system_port_bindability_rechecks_listener_after_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspector = SystemProcessInspector()
+    inspections: list[int] = []
+    raced_listener: BoundListener | None = None
+
+    def listeners(host: str, port: int) -> tuple[BoundListener, ...]:
+        assert host == "127.0.0.1"
+        inspections.append(port)
+        if len(inspections) == 1:
+            return ()
+        assert raced_listener is not None
+        return (raced_listener,)
+
+    monkeypatch.setattr(inspector, "listeners", listeners)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        available_port = reservation.getsockname()[1]
+    raced_listener = BoundListener(os.getpid(), "0.0.0.0", available_port)
+
+    assert inspector.port_is_bindable("127.0.0.1", available_port) is False
+    assert inspections == [available_port, available_port]
 
 
 @pytest.mark.parametrize(

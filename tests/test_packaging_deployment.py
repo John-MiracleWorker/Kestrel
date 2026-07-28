@@ -421,7 +421,11 @@ def test_readme_leads_with_the_everyday_kestrel_launch_contract() -> None:
     assert "Demo uses deterministic responses; no live model connected." in readme
     assert "Ready" in readme[install_index:why_index]
     assert "`kestrel` is the everyday command" in readme
-    assert "`nested-memvid-agent`" in readme
+    assert "`nested-memvid` remains the compatibility CLI" in readme
+    assert "`nested-memvid-agent` remains the Python distribution" in readme
+    assert "existing safe writable directory already on `PATH`" in readme
+    assert "`~/.local/bin`" in readme
+    assert "prints the exact `export PATH=...` step" in readme
     assert "kestrel open" in source_quick_start
     assert "nest-agent server" not in source_quick_start
     assert advanced_index > connect_index

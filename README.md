@@ -48,7 +48,7 @@ That explicit opt-in installs Kestrel, starts one verified loopback-only service
 kestrel open
 ```
 
-The installer places the `kestrel` launcher on your command path and, on macOS, creates `Kestrel.app` in `~/Applications`. Either entry point works from any directory. `kestrel status`, `kestrel chat`, `kestrel doctor`, and `kestrel stop` provide the same small everyday surface without requiring the operator to reconstruct server arguments.
+The installer installs a `kestrel` command shim in an existing safe writable directory already on `PATH` when one is available. Otherwise, it uses `~/.local/bin` and prints the exact `export PATH=...` step for the current shell. On macOS, it also creates `Kestrel.app` in `~/Applications`. Once the command directory is on `PATH`, either entry point works from any directory. `kestrel status`, `kestrel chat`, `kestrel doctor`, and `kestrel stop` provide the same small everyday surface without requiring the operator to reconstruct server arguments.
 
 Kestrel reports its model state explicitly:
 
@@ -56,7 +56,7 @@ Kestrel reports its model state explicitly:
 - **Model not connected** — a non-mock provider is configured but has not completed a successful response in this server process.
 - **Ready** — the configured non-mock provider has completed a successful response in the current server process.
 
-`kestrel` is the everyday command. `nest-agent` remains the advanced operator and automation CLI, and the Python distribution remains `nested-memvid-agent` for compatibility.
+`kestrel` is the everyday command. `nest-agent` remains the advanced operator and automation CLI, `nested-memvid` remains the compatibility CLI, and `nested-memvid-agent` remains the Python distribution name.
 
 Prefer a checkout? Use the [source quick start](#quick-start-from-source). Need full runtime controls? See [advanced `nest-agent` operation](#advanced-nest-agent-operation).
 
