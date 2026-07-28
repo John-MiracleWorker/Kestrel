@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .routine_limits import (
     MAX_ROUTINE_INTERVAL_SECONDS,
@@ -129,6 +129,18 @@ class ProjectUpdateRequest(BaseModel):
     build_recipes: list[ProjectRecipeRequest] | None = None
     capability_ceiling: list[str] | None = None
     baseline_index_digest: str | None = Field(default=None, max_length=512)
+
+    @field_validator(
+        "repository_path",
+        "test_recipes",
+        "build_recipes",
+        mode="before",
+    )
+    @classmethod
+    def reject_null_structural_updates(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("structural project fields cannot be null")
+        return value
 
 
 class ProjectImportRequest(BaseModel):

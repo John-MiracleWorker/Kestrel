@@ -121,6 +121,8 @@ def normalize_project_fields(
 
 
 def canonical_repository_path(value: str | Path) -> Path:
+    if not isinstance(value, (str, Path)):
+        raise ValueError("repository_path must be a string or Path")
     requested = Path(value)
     if not requested.is_absolute():
         raise ValueError("repository_path must be absolute")
@@ -160,7 +162,7 @@ def canonical_repository_path(value: str | Path) -> Path:
 
 
 def normalize_allowed_paths(values: Sequence[str]) -> tuple[str, ...]:
-    if isinstance(values, (str, bytes)):
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise ValueError("allowed_paths must be a sequence of relative paths")
     if not values:
         raise ValueError("allowed_paths must contain at least one relative path")
@@ -189,7 +191,7 @@ def normalize_recipes(
     *,
     field_name: str,
 ) -> tuple[dict[str, str], ...]:
-    if isinstance(values, (str, bytes)):
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise ValueError(f"{field_name} must be a sequence")
     if len(values) > _MAX_RECIPES:
         raise ValueError(f"{field_name} must contain at most {_MAX_RECIPES} recipes")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from nested_memvid_agent.config import AgentConfig
@@ -140,6 +141,94 @@ def test_project_api_rejects_extra_fields_unknown_capabilities(
     assert extra.status_code == 422
     assert unknown.status_code == 400
     assert "active capability" in unknown.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("repository_path", "test_recipes", "build_recipes"),
+)
+def test_project_api_rejects_null_structural_updates(
+    tmp_path: Path,
+    monkeypatch: object,
+    field: str,
+) -> None:
+    token = "project-api-null-token-c645"
+    monkeypatch.setenv("KESTREL_PROJECT_NULL_TOKEN", token)  # type: ignore[attr-defined]
+    headers = {"X-Kestrel-API-Key": token}
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    with TestClient(create_app(_config(tmp_path, token_env="KESTREL_PROJECT_NULL_TOKEN"))) as client:
+        created = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "project_id": "project_null_api",
+                "display_name": "Null API",
+                "repository_path": str(repository.resolve()),
+            },
+        )
+        assert created.status_code == 201
+
+        rejected = client.put(
+            "/api/projects/project_null_api",
+            headers=headers,
+            json={"expected_revision": 1, field: None},
+        )
+
+    assert rejected.status_code == 422
+
+
+def test_project_api_preserves_explicit_clearing_for_nullable_metadata(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    token = "project-api-clear-token-a756"
+    monkeypatch.setenv("KESTREL_PROJECT_CLEAR_TOKEN", token)  # type: ignore[attr-defined]
+    headers = {"X-Kestrel-API-Key": token}
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    with TestClient(create_app(_config(tmp_path, token_env="KESTREL_PROJECT_CLEAR_TOKEN"))) as client:
+        created = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "project_id": "project_clear_api",
+                "display_name": "Clear API",
+                "repository_path": str(repository.resolve()),
+                "remote": "git@github.com:example/repository.git",
+                "cost_budget": 5.0,
+                "provider_policy": {"preset": "local_only"},
+                "baseline_index_digest": "sha256:baseline",
+                "test_recipes": [{"name": "unit", "command": "pytest -q"}],
+                "build_recipes": [{"name": "build", "command": "python -m build"}],
+            },
+        )
+        assert created.status_code == 201
+
+        cleared = client.put(
+            "/api/projects/project_clear_api",
+            headers=headers,
+            json={
+                "expected_revision": 1,
+                "remote": None,
+                "cost_budget": None,
+                "provider_policy": None,
+                "baseline_index_digest": None,
+                "test_recipes": [],
+                "build_recipes": [],
+            },
+        )
+
+    assert cleared.status_code == 200
+    payload = cleared.json()
+    assert payload["remote"] is None
+    assert payload["cost_budget"] is None
+    assert payload["provider_policy"] == {}
+    assert payload["baseline_index_digest"] is None
+    assert payload["test_recipes"] == []
+    assert payload["build_recipes"] == []
 
 
 def _config(tmp_path: Path, *, token_env: str) -> AgentConfig:

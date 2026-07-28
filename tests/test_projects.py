@@ -72,6 +72,33 @@ def test_project_profiles_are_isolated_and_revision_fenced(tmp_path: Path) -> No
     assert stale.value.current == updated
 
 
+@pytest.mark.parametrize(
+    "field",
+    ("repository_path", "test_recipes", "build_recipes"),
+)
+def test_project_state_rejects_null_structural_updates_without_type_errors(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    project = state.create_project(
+        project_id=f"project_null_{field}",
+        display_name="Null defense",
+        repository_path=repository,
+        active_capability_keys=ACTIVE_CAPABILITIES,
+    )
+
+    with pytest.raises(ValueError, match=field):
+        state.update_project(
+            project.project_id,
+            expected_revision=project.revision,
+            active_capability_keys=ACTIVE_CAPABILITIES,
+            **{field: None},
+        )
+
+
 def test_project_repository_and_capability_boundaries_fail_closed(
     tmp_path: Path,
 ) -> None:
