@@ -3905,9 +3905,18 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
     assert result.success
     assert result.data["commit_gate"]["commit_allowed"] is True
     assert result.data["commit_gate"]["approval_required_before_commit"] is True
+    assert result.data["diff_preview"]["format"] == "unified"
+    assert result.data["diff_preview"]["bound_diff_digest"] == result.data["diff_digest"]
+    assert result.data["diff_preview"]["redacted"] is True
+    assert result.data["diff_preview"]["authoritative"] is False
+    assert "--- a/README.md" in result.data["diff_preview"]["content"]
+    assert "+++ b/README.md" in result.data["diff_preview"]["content"]
+    assert "+patched" in result.data["diff_preview"]["content"]
     review_path = tmp_path / ".nest" / "repair_reviews" / f"{result.data['review_id']}.json"
     assert review_path.exists()
-    assert json.loads(review_path.read_text())["diff_hash"] == result.data["diff_hash"]
+    stored_review = json.loads(review_path.read_text())
+    assert stored_review["diff_hash"] == result.data["diff_hash"]
+    assert stored_review["diff_preview"] == result.data["diff_preview"]
 
 
 def test_git_commit_blocks_repair_branch_without_reviewer_gate(tmp_path: Path) -> None:

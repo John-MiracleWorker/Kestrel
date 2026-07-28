@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getJson, postJson } from "../api";
+import { RepairReviewPanel } from "../repair/RepairReviewPanel";
 import { activityItemsForEvents, deriveThreadTitle } from "../runActivity";
 import type { Approval, Run, TaskGraph, TraceEvent } from "../types";
 import type {
@@ -95,6 +96,7 @@ type MissionControlProps = {
   onOpenHistory: () => void;
   onOpenAdvanced: () => void;
   onOpenDiagnostics: () => void;
+  onPrepareTool: (name: string, args: Record<string, unknown>) => void;
   onAuthRequired: () => void;
 };
 
@@ -109,6 +111,7 @@ export function MissionControl({
   onOpenHistory,
   onOpenAdvanced,
   onOpenDiagnostics,
+  onPrepareTool,
   onAuthRequired
 }: MissionControlProps) {
   const [projects, setProjects] = useState<ProjectProfile[]>([]);
@@ -420,6 +423,10 @@ export function MissionControl({
               approvals={approvals}
               activity={activity}
               taskGraph={taskGraph}
+            />
+            <RepairReviewPanel
+              tasks={taskGraph?.tasks ?? []}
+              onPrepareTool={onPrepareTool}
             />
           </section>
         </div>

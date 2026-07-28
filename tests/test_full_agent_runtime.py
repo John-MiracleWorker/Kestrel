@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -4781,6 +4782,14 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
         "changed_manifest": [{"path": "src/calculator.py", "secret": "drop-me"}],
     }
     never_persist = "NEVER_PERSIST_REPAIR_COMMAND_OUTPUT"
+    preview_content = (
+        "diff --git a/src/calculator.py b/src/calculator.py\n"
+        "--- a/src/calculator.py\n"
+        "+++ b/src/calculator.py\n"
+        "@@ -1 +1 @@\n"
+        "-return a - b\n"
+        "+return a + b\n"
+    )
     prompts: list[str] = []
 
     class ScriptedRepairAgent:
@@ -4840,6 +4849,18 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
                         "bad\nfilename.py",
                     ],
                     "summary": never_persist,
+                    "diff_preview": {
+                        "format": "unified",
+                        "content": preview_content,
+                        "sha256": hashlib.sha256(preview_content.encode("utf-8")).hexdigest(),
+                        "bound_diff_digest": diff_digest,
+                        "redacted": True,
+                        "authoritative": False,
+                        "truncated": False,
+                        "included_files": ["src/calculator.py"],
+                        "omitted_files": 0,
+                        "unsafe_extra": never_persist,
+                    },
                     "commit_gate": {
                         "commit_allowed": True,
                         "approval_required_before_commit": True,
@@ -4907,6 +4928,17 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
     assert review_artifact["changed_files_truncated"] is True
     assert len(review_artifact["changed_files"]) == 128
     assert "../escape.py" not in review_artifact["changed_files"]
+    assert review_artifact["diff_preview"] == {
+        "format": "unified",
+        "content": preview_content,
+        "sha256": hashlib.sha256(preview_content.encode("utf-8")).hexdigest(),
+        "bound_diff_digest": diff_digest,
+        "redacted": True,
+        "authoritative": False,
+        "truncated": False,
+        "included_files": ["src/calculator.py"],
+        "omitted_files": 0,
+    }
     commit_artifact = dict((persisted["Commit reviewed repair"].result or {})["repair_artifact"])
     assert commit_artifact == {
         "schema_version": 1,

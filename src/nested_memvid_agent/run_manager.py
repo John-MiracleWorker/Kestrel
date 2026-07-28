@@ -84,6 +84,7 @@ _REPAIR_ARTIFACT_SCHEMA_VERSION = 1
 _MAX_REPAIR_DEPENDENCY_ARTIFACTS = 16
 _MAX_REPAIR_CHANGED_FILES = 128
 _MAX_REPAIR_PATH_CHARS = 512
+_MAX_REPAIR_DIFF_PREVIEW_CHARS = 80_000
 _REPAIR_VALIDATION_ID_RE = re.compile(r"repair_validation_[0-9a-f]{24}")
 _REPAIR_REVIEW_ID_RE = re.compile(r"repair_review_[0-9a-f]{24}")
 _REPAIR_ROLLBACK_ID_RE = re.compile(r"repair_rollback_[0-9a-f]{24}")
@@ -6557,6 +6558,11 @@ def _project_repair_tool_artifact(
         if _sha256_digest(data.get("diff_digest")) != snapshot["diff_digest"]:
             return None
         changed_files, truncated = _repair_changed_files(data.get("changed_files"))
+        diff_preview = _repair_diff_preview_projection(
+            data.get("diff_preview"),
+            expected_diff_digest=snapshot["diff_digest"],
+            allowed_files=set(changed_files),
+        )
         commit_gate = data.get("commit_gate")
         artifact.update(
             {
@@ -6576,6 +6582,8 @@ def _project_repair_tool_artifact(
                 },
             }
         )
+        if diff_preview is not None:
+            artifact["diff_preview"] = diff_preview
         return artifact
 
     if tool_name == "git.commit":
@@ -6765,6 +6773,56 @@ def _repair_changed_files(value: Any) -> tuple[list[str], bool]:
         safe_paths.add(candidate)
     ordered = sorted(safe_paths)
     return ordered[:_MAX_REPAIR_CHANGED_FILES], len(ordered) > _MAX_REPAIR_CHANGED_FILES
+
+
+def _repair_diff_preview_projection(
+    value: Any,
+    *,
+    expected_diff_digest: str,
+    allowed_files: set[str],
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    content = value.get("content")
+    if (
+        value.get("format") != "unified"
+        or not isinstance(content, str)
+        or len(content) > _MAX_REPAIR_DIFF_PREVIEW_CHARS
+        or "\x00" in content
+        or any(
+            ord(character) < 32 and character not in {"\n", "\r", "\t"}
+            for character in content
+        )
+        or str(redact_secrets(content)) != content
+        or value.get("bound_diff_digest") != expected_diff_digest
+        or value.get("redacted") is not True
+        or value.get("authoritative") is not False
+    ):
+        return None
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if value.get("sha256") != content_sha256:
+        return None
+    included_files, included_truncated = _repair_changed_files(value.get("included_files"))
+    if included_truncated or not set(included_files).issubset(allowed_files):
+        return None
+    omitted_files = value.get("omitted_files")
+    if (
+        isinstance(omitted_files, bool)
+        or not isinstance(omitted_files, int)
+        or not 0 <= omitted_files <= 10_000
+    ):
+        return None
+    return {
+        "format": "unified",
+        "content": content,
+        "sha256": content_sha256,
+        "bound_diff_digest": expected_diff_digest,
+        "redacted": True,
+        "authoritative": False,
+        "truncated": value.get("truncated") is True,
+        "included_files": included_files,
+        "omitted_files": omitted_files,
+    }
 
 
 def _bounded_artifact_text(value: Any, *, max_chars: int) -> str | None:

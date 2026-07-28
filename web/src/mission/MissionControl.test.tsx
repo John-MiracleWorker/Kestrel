@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import axe from "axe-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Run, TaskGraph } from "../types";
 import { MissionControl } from "./MissionControl";
 import type { MissionLaunch, MissionPreflight, ProjectProfile } from "./types";
 
@@ -122,6 +123,7 @@ describe("MissionControl", () => {
         onOpenHistory={() => undefined}
         onOpenAdvanced={() => undefined}
         onOpenDiagnostics={() => undefined}
+        onPrepareTool={() => undefined}
         onAuthRequired={() => undefined}
       />
     );
@@ -185,6 +187,7 @@ describe("MissionControl", () => {
         onOpenHistory={() => undefined}
         onOpenAdvanced={() => undefined}
         onOpenDiagnostics={() => undefined}
+        onPrepareTool={() => undefined}
         onAuthRequired={() => undefined}
       />
     );
@@ -197,6 +200,128 @@ describe("MissionControl", () => {
 
     expect(await screen.findByText("Connect and validate a provider target.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
+  });
+
+  it("keeps completed repair proof and gated acceptance in the mission timeline", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") return jsonResponse({ items: [project], count: 1 });
+      return jsonResponse({ detail: path }, 404);
+    }));
+    const onPrepareTool = vi.fn();
+    const run: Run = {
+      run_id: "run_reviewed",
+      project_id: project.project_id,
+      status: "completed",
+      message: "Fix authentication",
+      session_id: "session_reviewed",
+      workspace: project.repository_path,
+      model: "local",
+      assistant_message: "Validated candidate ready.",
+      tool_count: 4,
+      context_chars: 1000,
+      stop_reason: "complete",
+      created_at: "2026-07-27T12:00:00Z",
+      updated_at: "2026-07-27T12:05:00Z"
+    };
+    const digest = "d".repeat(64);
+    const reviewId = `repair_review_${"a".repeat(24)}`;
+    const validationId = `repair_validation_${"b".repeat(24)}`;
+    const preview = [
+      "diff --git a/src/auth.py b/src/auth.py",
+      "--- a/src/auth.py",
+      "+++ b/src/auth.py",
+      "@@ -1 +1 @@",
+      "-return False",
+      "+return True"
+    ].join("\n");
+    const taskGraph: TaskGraph = {
+      tasks: [
+        {
+          task_id: "validate",
+          title: "Validate repair",
+          goal: "Run tests",
+          profile: "worker",
+          status: "completed",
+          approved: true,
+          required_tools: ["repair.validate"],
+          acceptance_criteria: ["Authentication regression passes"],
+          result: {
+            repair_artifact: {
+              tool: "repair.validate",
+              validation_id: validationId,
+              repair_snapshot: {
+                branch: "kestrel/worker/run-review/repair",
+                head_sha: "1".repeat(40),
+                diff_digest: digest
+              }
+            }
+          }
+        },
+        {
+          task_id: "review",
+          title: "Review repair",
+          goal: "Bind evidence",
+          profile: "reviewer",
+          status: "completed",
+          approved: true,
+          required_tools: ["repair.review"],
+          acceptance_criteria: ["Signed review remains current"],
+          result: {
+            repair_artifact: {
+              tool: "repair.review",
+              validation_id: validationId,
+              review_id: reviewId,
+              repair_snapshot: {
+                branch: "kestrel/worker/run-review/repair",
+                head_sha: "1".repeat(40),
+                diff_digest: digest
+              },
+              changed_files: ["src/auth.py"],
+              diff_preview: {
+                content: preview,
+                omitted_files: 0,
+                truncated: false
+              },
+              commit_gate: {
+                commit_allowed: true,
+                approval_required_before_commit: true
+              }
+            }
+          }
+        }
+      ],
+      ready_tasks: [],
+      approval_blocked_tasks: [],
+      subagents: []
+    };
+
+    render(
+      <MissionControl
+        runs={[run]}
+        activeRun={run}
+        taskGraph={taskGraph}
+        approvals={[]}
+        events={[]}
+        onLaunch={async () => undefined}
+        onOpenRun={() => undefined}
+        onOpenHistory={() => undefined}
+        onOpenAdvanced={() => undefined}
+        onOpenDiagnostics={() => undefined}
+        onPrepareTool={onPrepareTool}
+        onAuthRequired={() => undefined}
+      />
+    );
+
+    expect(await screen.findByRole("option", { name: "Kestrel" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Repair Patch Review")).toBeInTheDocument();
+    expect(screen.getByText("Authentication regression passes")).toBeInTheDocument();
+    expect(screen.getByText(/\+return True/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Prepare exact-call git.commit request" }));
+    expect(onPrepareTool).toHaveBeenCalledWith(
+      "git.commit",
+      expect.objectContaining({ repair_review_id: reviewId })
+    );
   });
 });
 

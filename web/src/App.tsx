@@ -43,6 +43,7 @@ import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
 import { MissionControl } from "./mission/MissionControl";
 import type { MissionLaunch } from "./mission/types";
+import { RepairReviewPanel } from "./repair/RepairReviewPanel";
 import { RoutingCenter } from "./routing/RoutingCenter";
 import {
   activityItemsForEvents,
@@ -1995,6 +1996,12 @@ export function App() {
           onOpenHistory={() => routeToSection("chat")}
           onOpenAdvanced={() => routeToSection("advanced")}
           onOpenDiagnostics={() => jumpToAdvanced("observability")}
+          onPrepareTool={(name, args) => {
+            setToolName(name);
+            setToolArgs(JSON.stringify(args, null, 2));
+            setPreparedToolPreview({ name, args });
+            jumpToAdvanced("tools");
+          }}
           onAuthRequired={() => {
             setAuthPromptOpen(true);
             setApiTokenDraft(getApiToken());
@@ -2396,7 +2403,7 @@ export function App() {
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("step")}>Step</button>
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("run")}>Run Until Idle</button>
             </div>
-            <RepairPatchReview
+            <RepairReviewPanel
               tasks={taskGraph?.tasks ?? []}
               onPrepareTool={(name, args) => {
                 setToolName(name);
@@ -4710,130 +4717,6 @@ function ExactCallApprovalPreview({ preview }: { preview: PreparedToolPreview })
       <JsonBlock value={preview.args} maxHeight="180px" />
     </section>
   );
-}
-
-function RepairPatchReview({
-  tasks,
-  onPrepareTool
-}: {
-  tasks: TaskNode[];
-  onPrepareTool: (name: string, args: Record<string, unknown>) => void;
-}) {
-  const repairTasks = tasks.filter((task) =>
-    (task.required_tools ?? []).some((tool) => tool.startsWith("repair.") || tool === "git.commit")
-  );
-  if (repairTasks.length === 0) return null;
-
-  const validationTask = repairTasks.find((task) => taskUsesTool(task, "repair.validate") || taskUsesTool(task, "repair.orchestrate_validate"));
-  const reviewTask = repairTasks.find((task) => taskUsesTool(task, "repair.review"));
-  const rollbackTask = repairTasks.find((task) => taskUsesTool(task, "repair.rollback"));
-
-  const validationResult = validationTask?.result ?? null;
-  const validationArtifact = readRecord(validationResult?.repair_artifact);
-  const validation = readRecord(validationResult?.validation);
-  const validationSnapshot = readRecord(validationArtifact?.repair_snapshot);
-  const validationId = String(validationArtifact?.validation_id ?? validation?.validation_id ?? "pending");
-  const explicitValidationSuccess = validation?.success;
-  const validationSuccess = explicitValidationSuccess === true || (
-    explicitValidationSuccess === undefined
-    && validationTask?.status === "completed"
-    && ["repair.validate", "repair.orchestrate_validate"].includes(String(validationArtifact?.tool ?? ""))
-    && validationId !== "pending"
-  );
-  const validationFailed = explicitValidationSuccess === false;
-  const validationLabel = validationSuccess
-    ? "Validation passed"
-    : validationFailed
-      ? "Validation failed"
-      : "Validation pending";
-  const validationCommand = formatCommand(validation?.command);
-  const validationEvidence = validationCommand || (validationId !== "pending" ? validationId : validationTask?.title ?? "pending");
-
-  const reviewResult = reviewTask?.result ?? null;
-  const reviewArtifact = readRecord(reviewResult?.repair_artifact);
-  const reviewSnapshot = readRecord(reviewArtifact?.repair_snapshot);
-  const reviewId = String(reviewArtifact?.review_id ?? reviewResult?.review_id ?? "pending");
-  const diffHash = String(reviewSnapshot?.diff_digest ?? reviewResult?.diff_hash ?? "pending");
-  const reviewBranch = String(reviewSnapshot?.branch ?? "pending");
-  const reviewHead = String(reviewSnapshot?.head_sha ?? "pending");
-  const changedFiles = asStringArray(reviewArtifact?.changed_files ?? reviewResult?.changed_files);
-  const commitGate = readRecord(reviewArtifact?.commit_gate ?? reviewResult?.commit_gate);
-  const commitApprovalRequired = commitGate?.approval_required_before_commit === true;
-
-  const rollbackResult = rollbackTask?.result ?? null;
-  const rollbackId = String(rollbackResult?.rollback_id ?? "pending");
-  const restoredFiles = asStringArray(rollbackResult?.restored_files);
-  const artifactPath = String(rollbackResult?.artifact_path ?? ".nest/repair_rollbacks");
-  const hasReviewArtifact = reviewId !== "pending";
-  const prepareCommit = () => {
-    onPrepareTool("git.commit", {
-      message: `repair: commit reviewed changes for ${reviewId}`,
-      repair_review_id: reviewId
-    });
-  };
-  const prepareRollback = () => {
-    onPrepareTool("repair.rollback", {
-      reason: `Rollback reviewed repair ${reviewId}`,
-      review_id: reviewId,
-      expected_current_diff_digest: diffHash
-    });
-  };
-
-  return (
-    <section aria-label="Repair Patch Review" className="run-detail repair-review-panel">
-      <div className="run-title">
-        <h3>Repair Patch Review</h3>
-        <StatusBadge value={reviewTask?.status ?? validationTask?.status ?? "pending"} />
-      </div>
-      <p className="muted">Validation, reviewer gate, and rollback evidence for the selected repair DAG.</p>
-      <div className="list compact-list">
-        {validationTask && (
-          <div className="data-row">
-            <strong>{validationLabel}</strong>
-            <InlineMeta items={[validationTask.status, validationTask.risk, validationTask.scheduler_reason]} />
-            <p>{`${validationSuccess || validationFailed ? validationLabel : "Validation state"}: ${validationEvidence}`}</p>
-            {Boolean(validationSnapshot?.diff_digest) && <p>{`Candidate digest ${String(validationSnapshot?.diff_digest)}`}</p>}
-          </div>
-        )}
-        {reviewTask && (
-          <div className="data-row">
-            <strong>Review gate</strong>
-            <InlineMeta items={[reviewTask.status, reviewTask.profile, commitApprovalRequired ? "exact-call commit approval" : "commit gate pending"]} />
-            <p>{`Review gate: ${reviewId} · ${commitApprovalRequired ? "commit approval required" : "commit gate pending"}`}</p>
-            <p>{`Diff ${diffHash} · ${changedFiles.length ? changedFiles.join(", ") : "no changed files recorded"}`}</p>
-            {reviewBranch !== "pending" && <p>{`Candidate ${reviewBranch} @ ${reviewHead}`}</p>}
-            <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareCommit}>
-              Prepare exact-call git.commit request
-            </button>
-          </div>
-        )}
-        {rollbackTask && (
-          <div className="data-row">
-            <strong>Rollback state</strong>
-            <InlineMeta items={[rollbackTask.status, rollbackTask.risk, rollbackTask.approved ? "approved" : "approval required"]} />
-            <p>{`Rollback state: ${rollbackTask.status} · ${rollbackId}`}</p>
-            <p>{`Restores ${restoredFiles.length ? restoredFiles.join(", ") : "recorded repair files"} and preserves ${artifactPath}`}</p>
-            <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareRollback}>
-              Prepare exact-call repair.rollback request
-            </button>
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
-
-function taskUsesTool(task: TaskNode, toolName: string): boolean {
-  return (task.required_tools ?? []).includes(toolName);
-}
-
-function readRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-}
-
-function formatCommand(value: unknown): string {
-  if (Array.isArray(value)) return value.map((part) => String(part)).filter(Boolean).join(" ");
-  return typeof value === "string" ? value : "";
 }
 
 function TaskList({ title, tasks, onApprove }: { title: string; tasks: TaskNode[]; onApprove: (task: TaskNode) => void }) {

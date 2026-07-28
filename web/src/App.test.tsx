@@ -936,6 +936,24 @@ describe("App", () => {
               review_id: reviewId,
               repair_snapshot: repairSnapshot,
               changed_files: ["src/calculator.py"],
+              diff_preview: {
+                format: "unified",
+                content: [
+                  "diff --git a/src/calculator.py b/src/calculator.py",
+                  "--- a/src/calculator.py",
+                  "+++ b/src/calculator.py",
+                  "@@ -1 +1 @@",
+                  "-  return a - b",
+                  "+  return a + b"
+                ].join("\n"),
+                sha256: "f".repeat(64),
+                bound_diff_digest: repairSnapshot.diff_digest,
+                redacted: true,
+                authoritative: false,
+                truncated: false,
+                included_files: ["src/calculator.py"],
+                omitted_files: 0
+              },
               commit_gate: { commit_allowed: true, approval_required_before_commit: true }
             }
           }
@@ -973,6 +991,11 @@ describe("App", () => {
     expect(within(panel).getByText(`Review gate: ${reviewId} · commit approval required`)).toBeInTheDocument();
     expect(within(panel).getByText(`Diff ${repairSnapshot.diff_digest} · src/calculator.py`)).toBeInTheDocument();
     expect(within(panel).getByText(`Candidate ${repairSnapshot.branch} @ ${repairSnapshot.head_sha}`)).toBeInTheDocument();
+    expect(within(panel).getByRole("heading", { name: "Unified diff preview" })).toBeInTheDocument();
+    expect(within(panel).getByText(/\+\s+return a \+ b/)).toBeInTheDocument();
+    expect(within(panel).getByText(/redacted advisory preview/i)).toBeInTheDocument();
+    fireEvent.click(within(panel).getByRole("button", { name: "Split" }));
+    expect(within(panel).getByRole("heading", { name: "Split diff preview" })).toBeInTheDocument();
     expect(within(panel).getByText("Rollback state: ready · rollback_abc123")).toBeInTheDocument();
     expect(within(panel).getByText("Restores src/calculator.py and preserves .nest/repair_rollbacks/rollback_abc123.json")).toBeInTheDocument();
   });
