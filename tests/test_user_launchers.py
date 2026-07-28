@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -311,13 +312,10 @@ def test_commit_removes_backups_and_manifest_but_keeps_new_artifacts(
         platform="linux",
         environ={"PATH": str(bin_dir)},
     )
-    payload = json.loads(manifest.read_text(encoding="utf-8"))
-    backup_dir = Path(payload["backup_dir"])
-
     module.commit_launchers(manifest)
 
     assert (bin_dir / "kestrel").is_file()
-    assert not backup_dir.exists()
+    assert not list(bin_dir.glob(".kestrel-backup-*"))
     assert not manifest.exists()
 
 
@@ -357,3 +355,351 @@ def test_prepare_rolls_back_if_app_install_fails_after_shim_install(
     assert not (bin_dir / "kestrel").exists()
     assert not (user_home / "Applications" / "Kestrel.app").exists()
     assert not manifest.exists()
+
+
+def test_generated_launchers_use_fixed_bash_and_forward_exit_status(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    executable = home / ".venv" / "bin" / "kestrel"
+    executable.write_text("#!/bin/bash\nexit 37\n", encoding="utf-8")
+    executable.chmod(0o755)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+
+    module.prepare_launchers(
+        kestrel_home=home, user_home=user_home, manifest_path=manifest,
+        bin_dir=bin_dir, platform="darwin", environ={"PATH": str(bin_dir)},
+        which=lambda _name: None,
+    )
+
+    shim = bin_dir / "kestrel"
+    app_executable = user_home / "Applications" / "Kestrel.app" / "Contents" / "MacOS" / "Kestrel"
+    assert shim.read_text(encoding="utf-8").splitlines()[0] == "#!/bin/bash"
+    assert app_executable.read_text(encoding="utf-8").splitlines()[0] == "#!/bin/bash"
+    assert subprocess.run([str(shim)], check=False).returncode == 37
+
+
+def test_staging_and_backup_are_per_artifact_target_parent_and_replace_is_dirfd_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    replacements: list[tuple[object, object]] = []
+    original_replace = module.os.replace
+
+    def record_replace(src: object, dst: object, **kwargs: object) -> None:
+        replacements.append((kwargs.get("src_dir_fd"), kwargs.get("dst_dir_fd")))
+        original_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(module.os, "replace", record_replace)
+    module.prepare_launchers(
+        kestrel_home=home, user_home=user_home, manifest_path=manifest,
+        bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)},
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    artifact = payload["artifacts"][0]
+    assert Path(artifact["staged"]).parent == bin_dir
+    assert Path(artifact["backup"]).parent == bin_dir
+    assert any(left is not None and left == right for left, right in replacements)
+
+
+def test_tampered_manifest_cannot_delete_marker_containing_arbitrary_file(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    module.prepare_launchers(
+        kestrel_home=home, user_home=user_home, manifest_path=manifest,
+        bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)},
+    )
+    victim = tmp_path / "victim"
+    victim.write_text("# KESTREL_MANAGED_COMMAND_SHIM_V1\ndo not delete\n", encoding="utf-8")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["artifacts"][0]["target"] = str(victim)
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    manifest.chmod(0o600)
+
+    with pytest.raises(module.LauncherArtifactError, match="schema|manifest"):
+        module.commit_launchers(manifest)
+    assert victim.exists()
+    assert victim.read_text(encoding="utf-8").endswith("do not delete\n")
+
+
+def test_final_mutation_parent_replacement_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    raced = False
+
+    def race(parent: Path) -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        moved = parent.with_name("bin-original")
+        parent.rename(moved)
+        parent.symlink_to(tmp_path / "attacker", target_is_directory=True)
+
+    monkeypatch.setattr(module, "_before_final_mutation", race)
+    with pytest.raises(module.LauncherArtifactError, match="changed"):
+        module.prepare_launchers(
+            kestrel_home=home, user_home=user_home, manifest_path=manifest,
+            bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)},
+        )
+    assert not (tmp_path / "attacker" / "kestrel").exists()
+
+
+def test_var_compatibility_is_lexical_and_user_symlink_is_still_rejected(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    # macOS exposes this test directory through both /var and /private/var.
+    assert str(tmp_path).startswith("/private/var/")
+    var_alias = Path("/var") / tmp_path.relative_to("/private/var")
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    alias_home = Path("/var") / user_home.relative_to("/private/var")
+    assert module._canonical_path(alias_home) == user_home
+    selected = module.select_bin_directory(
+        explicit=Path("/var") / (user_home / "bin").relative_to("/private/var"),
+        user_home=alias_home, environ={"PATH": ""},
+    )
+    assert selected == user_home / "bin"
+    linked = tmp_path / "linked-user"
+    linked.symlink_to(user_home, target_is_directory=True)
+    with pytest.raises(module.LauncherArtifactError, match="symbolic links"):
+        module.select_bin_directory(explicit=user_home / "other", user_home=linked, environ={"PATH": ""})
+
+
+def test_bin_directory_rejects_regular_file_and_external_temp_target(tmp_path: Path) -> None:
+    module = _module()
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    not_a_directory = user_home / "not-bin"
+    not_a_directory.write_text("no", encoding="utf-8")
+    with pytest.raises(module.LauncherArtifactError, match="not a directory"):
+        module.select_bin_directory(explicit=not_a_directory, user_home=user_home, environ={"PATH": ""})
+    with pytest.raises(module.LauncherArtifactError, match="temporary"):
+        module.select_bin_directory(explicit=tmp_path / "external-bin", user_home=user_home, environ={"PATH": ""})
+    with pytest.raises(module.LauncherArtifactError, match="not owned"):
+        module.select_bin_directory(explicit=user_home / "wrong-owner", user_home=user_home,
+                                    environ={"PATH": ""}, current_uid=os.getuid() + 1)
+
+
+def test_app_collision_and_static_recovery_never_accept_or_embed_a_secret(tmp_path: Path) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    collision = user_home / "Applications" / "Kestrel.app" / "Contents" / "Resources"
+    collision.mkdir(parents=True)
+    (collision / module.APP_MARKER_FILENAME).write_text(f"prefix {module.APP_MARKER} suffix\n", encoding="utf-8")
+    manifest = home / ".nest" / "transactions" / "collision.json"
+    with pytest.raises(module.LauncherArtifactError, match="unrelated"):
+        module.prepare_launchers(kestrel_home=home, user_home=user_home, manifest_path=manifest,
+                                 bin_dir=user_home / "bin", platform="darwin",
+                                 environ={"PATH": "", "OPENAI_API_KEY": "do-not-embed"}, which=lambda _name: None)
+
+    # A fresh app has only static recovery text; environment secrets must not leak into it.
+    shutil.rmtree(user_home / "Applications" / "Kestrel.app")
+    module.prepare_launchers(kestrel_home=home, user_home=user_home, manifest_path=manifest,
+                             bin_dir=user_home / "bin", platform="darwin",
+                             environ={"PATH": "", "OPENAI_API_KEY": "do-not-embed"}, which=lambda _name: None)
+    app_text = "\n".join(path.read_text(encoding="utf-8", errors="ignore")
+                         for path in (user_home / "Applications" / "Kestrel.app").rglob("*") if path.is_file())
+    assert "do-not-embed" not in app_text
+
+
+def test_codesign_reports_verified_and_refuses_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    calls: list[list[str]] = []
+
+    def success(args: list[str], **_kwargs: object) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(module.subprocess, "run", success)
+    assert module._codesign_app(tmp_path / "Kestrel.app", which=lambda _name: "/usr/bin/codesign") == "verified"
+    assert calls[0][1:5] == ["--force", "--deep", "--sign", "-"]
+    assert calls[1][1:4] == ["--verify", "--deep", "--strict"]
+
+    def failure(*_args: object, **_kwargs: object) -> None:
+        raise subprocess.CalledProcessError(1, "codesign")
+
+    monkeypatch.setattr(module.subprocess, "run", failure)
+    with pytest.raises(module.LauncherArtifactError, match="signing verification"):
+        module._codesign_app(tmp_path / "Kestrel.app", which=lambda _name: "/usr/bin/codesign")
+
+
+def test_commit_removes_real_same_parent_backup_after_replacement(tmp_path: Path) -> None:
+    module = _module()
+    first_home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    first_manifest = first_home / ".nest" / "transactions" / "first.json"
+    module.prepare_launchers(kestrel_home=first_home, user_home=user_home, manifest_path=first_manifest,
+                             bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)})
+    module.commit_launchers(first_manifest)
+    replacement_home = _kestrel_home(tmp_path / "replacement")
+    second_manifest = first_home / ".nest" / "transactions" / "second.json"
+    module.prepare_launchers(kestrel_home=replacement_home, user_home=user_home, manifest_path=second_manifest,
+                             bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)})
+    payload = json.loads(second_manifest.read_text(encoding="utf-8"))
+    backup = Path(payload["artifacts"][0]["backup"])
+    assert backup.is_file() and backup.parent == bin_dir
+    module.commit_launchers(second_manifest)
+    assert not backup.exists()
+    assert not list(bin_dir.glob(".kestrel-backup-*"))
+
+
+def _interrupted_replacement(module: ModuleType, tmp_path: Path) -> tuple[dict[str, Any], Path, Path, Path]:
+    original_home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    initial_manifest = original_home / ".nest" / "transactions" / "initial.json"
+    module.prepare_launchers(kestrel_home=original_home, user_home=user_home, manifest_path=initial_manifest,
+                             bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)})
+    module.commit_launchers(initial_manifest)
+    replacement_home = _kestrel_home(tmp_path / "replacement")
+    manifest = original_home / ".nest" / "transactions" / "interrupted.json"
+    transaction_id = "a" * 32
+    artifacts = module._derived_artifacts(bin_dir, user_home, "linux", transaction_id)
+    artifact = artifacts[0]
+    artifact["had_previous"] = True
+    module._write_staged_shim(artifact, module._shim_text(replacement_home), uid=os.getuid())
+    payload: dict[str, Any] = {
+        "schema": module.MANIFEST_SCHEMA, "transaction_id": transaction_id,
+        "kestrel_home": str(replacement_home), "user_home": str(user_home),
+        "platform": "linux", "bin_dir": str(bin_dir), "artifacts": artifacts,
+        "codesign": "not_applicable",
+    }
+    module._write_manifest(manifest, payload)
+    return payload, manifest, bin_dir / "kestrel", replacement_home
+
+
+@pytest.mark.parametrize("boundary", ["initial", "after_backup", "after_install"])
+def test_rollback_recovers_each_crash_boundary_without_losing_predecessor(
+    tmp_path: Path, boundary: str,
+) -> None:
+    module = _module()
+    payload, manifest, target, _replacement_home = _interrupted_replacement(module, tmp_path)
+    old_bytes = target.read_bytes()
+    artifact = payload["artifacts"][0]
+    staged, backup = Path(artifact["staged"]), Path(artifact["backup"])
+    if boundary in {"after_backup", "after_install"}:
+        os.replace(target, backup)
+    if boundary == "after_install":
+        # The backup status reached disk, but the post-install manifest update did not.
+        artifact["backed_up"] = True
+        module._write_manifest(manifest, payload)
+        os.replace(staged, target)
+
+    module.rollback_launchers(manifest)
+
+    assert target.read_bytes() == old_bytes
+    assert not staged.exists()
+    assert not backup.exists()
+    assert not manifest.exists()
+
+
+def test_commit_refuses_initial_crash_manifest_without_mutating_artifacts(tmp_path: Path) -> None:
+    module = _module()
+    payload, manifest, target, _replacement_home = _interrupted_replacement(module, tmp_path)
+    old_bytes = target.read_bytes()
+    stage = Path(payload["artifacts"][0]["staged"])
+    with pytest.raises(module.LauncherArtifactError, match="incomplete"):
+        module.commit_launchers(manifest)
+    assert target.read_bytes() == old_bytes
+    assert stage.exists()
+    assert manifest.exists()
+
+
+def _replace_quarantine_with_marker(parent: Path) -> None:
+    quarantines = list(parent.glob(".kestrel-quarantine-*"))
+    assert len(quarantines) == 1
+    quarantine = quarantines[0]
+    quarantine.rename(quarantine.with_name(quarantine.name + ".preserved"))
+    quarantine.write_text("attacker marker must survive", encoding="utf-8")
+
+
+def test_final_delete_race_preserves_swapped_shim_and_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    module.prepare_launchers(kestrel_home=home, user_home=user_home, manifest_path=manifest,
+                             bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)})
+    monkeypatch.setattr(module, "_before_quarantine_delete", _replace_quarantine_with_marker)
+    with pytest.raises(module.LauncherArtifactError, match="quarantined"):
+        module.rollback_launchers(manifest)
+    attacker = next(bin_dir.glob(".kestrel-quarantine-*"))
+    assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
+    assert list(bin_dir.glob("*.preserved"))
+
+
+def test_final_delete_race_preserves_swapped_backup_and_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module()
+    first = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    initial = first / ".nest" / "transactions" / "initial.json"
+    module.prepare_launchers(kestrel_home=first, user_home=user_home, manifest_path=initial,
+                             bin_dir=bin_dir, platform="darwin", environ={"PATH": str(bin_dir)}, which=lambda _name: None)
+    module.commit_launchers(initial)
+    replacement = _kestrel_home(tmp_path / "replacement")
+    manifest = first / ".nest" / "transactions" / "replacement.json"
+    module.prepare_launchers(kestrel_home=replacement, user_home=user_home, manifest_path=manifest,
+                             bin_dir=bin_dir, platform="darwin", environ={"PATH": str(bin_dir)}, which=lambda _name: None)
+    app_parent = user_home / "Applications"
+
+    def race_only_app(parent: Path) -> None:
+        if parent == app_parent:
+            _replace_quarantine_with_marker(parent)
+
+    monkeypatch.setattr(module, "_before_quarantine_delete", race_only_app)
+    with pytest.raises(module.LauncherArtifactError, match="quarantined"):
+        module.commit_launchers(manifest)
+    attacker = next(app_parent.glob(".kestrel-quarantine-*"))
+    assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
+    assert list(app_parent.glob("*.preserved"))
+
+
+def test_final_delete_race_preserves_swapped_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    module.prepare_launchers(kestrel_home=home, user_home=user_home, manifest_path=manifest,
+                             bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)})
+    monkeypatch.setattr(module, "_before_quarantine_delete", _replace_quarantine_with_marker)
+    with pytest.raises(module.LauncherArtifactError, match="quarantined"):
+        module.commit_launchers(manifest)
+    attacker = next(manifest.parent.glob(".kestrel-quarantine-*"))
+    assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
+    assert list(manifest.parent.glob("*.preserved"))
