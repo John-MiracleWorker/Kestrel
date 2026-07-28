@@ -71,7 +71,7 @@ def test_build_records_identity_content_and_multilanguage_relationships(tmp_path
     assert status.project_id == "project-1"
     assert status.repository_root == repository.resolve()
     assert status.aggregate_digest == report.aggregate_digest
-    assert status.schema_version == 3
+    assert status.schema_version == 4
     assert status.parser_versions["python"] == "ast-v1"
     assert status.git_head is None
     assert status.git_tree is None
@@ -270,7 +270,7 @@ def test_schema_v1_sidecar_migrates_and_forces_digest_revalidation(tmp_path: Pat
     reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
     rebuilt = reopened.rebuild()
 
-    assert reopened.status().schema_version == 3
+    assert reopened.status().schema_version == 4
     assert rebuilt.changed_files == 10
     assert rebuilt.reused_files == 0
 
@@ -403,6 +403,39 @@ def test_sidecar_file_replacement_is_rejected_on_next_open(tmp_path: Path) -> No
         index.status()
 
 
+def test_durable_generation_manifest_rejects_replacement_after_restart(
+    tmp_path: Path,
+) -> None:
+    """A copied atomic image must not become trusted merely by reopening the store."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    replacement = tmp_path / "replacement.sqlite"
+    shutil.copy2(index.index_path, replacement)
+    os.replace(replacement, index.index_path)
+
+    with pytest.raises(RepositoryIndexError, match="database identity"):
+        RepositoryIndex(project_id="project-1", repository_root=repository)
+
+
+def test_generation_identifier_cannot_escape_the_sidecar_parent(tmp_path: Path) -> None:
+    """Generation-ledger text must never become an unchecked relative path."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        connection.execute(
+            """
+            UPDATE index_generations
+            SET generation_id = '../../outside'
+            WHERE sequence = (SELECT MAX(sequence) FROM index_generations)
+            """
+        )
+
+    with pytest.raises(RepositoryIndexError, match="generation identifier"):
+        index.status()
+
+
 def test_reopening_an_unchanged_index_preserves_the_bound_database_inode(
     tmp_path: Path,
 ) -> None:
@@ -416,6 +449,35 @@ def test_reopening_an_unchanged_index_preserves_the_bound_database_inode(
 
     assert first.index_path.stat().st_ino == inode_before
     assert first.status().project_id == "project-1"
+
+
+def test_long_lived_instances_accept_lock_coordinated_generation_advances(
+    tmp_path: Path,
+) -> None:
+    """A valid atomic generation advance must not strand another live store."""
+    repository = _copy_fixture(tmp_path)
+    first = RepositoryIndex(project_id="project-1", repository_root=repository)
+    first.rebuild()
+    second = RepositoryIndex(project_id="project-1", repository_root=repository)
+
+    changed = repository / "src" / "widget.py"
+    changed.write_text(
+        changed.read_text(encoding="utf-8").replace("def helper", "def normalize"),
+        encoding="utf-8",
+    )
+    first.rebuild()
+
+    assert second.status().freshness is Freshness.CURRENT
+    assert [record.name for record in second.symbols("normalize").records] == ["normalize"]
+
+    changed.write_text(
+        changed.read_text(encoding="utf-8").replace("def normalize", "def canonicalize"),
+        encoding="utf-8",
+    )
+    second.rebuild()
+
+    assert first.status().freshness is Freshness.CURRENT
+    assert [record.name for record in first.symbols("canonicalize").records] == ["canonicalize"]
 
 
 def test_wrapped_sqlite_connect_aba_is_rejected_before_returning_data(
@@ -434,11 +496,23 @@ def test_wrapped_sqlite_connect_aba_is_rejected_before_returning_data(
             "UPDATE index_metadata SET aggregate_digest = 'decoy' WHERE singleton = 1"
         )
 
-    def aba_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
-        assert str(database) == ":memory:"
+    def aba_connect(
+        database: str | Path,
+        timeout: float = 5.0,
+        *,
+        uri: bool = False,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+    ) -> sqlite3.Connection:
+        assert uri is True
+        assert "immutable=1" in str(database)
         os.replace(index.index_path, parked)
         os.replace(decoy, index.index_path)
-        connection = real_connect(database, timeout=timeout)
+        connection = real_connect(
+            database,
+            timeout=timeout,
+            uri=uri,
+            factory=factory,
+        )
         os.replace(index.index_path, decoy)
         os.replace(parked, index.index_path)
         return connection
@@ -450,6 +524,78 @@ def test_wrapped_sqlite_connect_aba_is_rejected_before_returning_data(
 
     with pytest.raises(RepositoryIndexError, match="changed during read"):
         index.symbols()
+
+
+def test_bounded_query_opens_a_pinned_immutable_generation_without_copying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A limit-one read must not deserialize the full sidecar into memory."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    real_connect = sqlite3.connect
+    opened: list[tuple[str, bool]] = []
+
+    def tracking_connect(
+        database: str | Path,
+        timeout: float = 5.0,
+        *,
+        uri: bool = False,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+    ) -> sqlite3.Connection:
+        opened.append((str(database), uri))
+        return real_connect(database, timeout=timeout, uri=uri, factory=factory)
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.repo_index.store.sqlite3.connect",
+        tracking_connect,
+    )
+
+    result = index.symbols(limit=1)
+
+    assert len(result.records) == 1
+    assert opened
+    assert all(database != ":memory:" for database, _uri in opened)
+    assert all(uri and "immutable=1" in database for database, uri in opened)
+
+
+def test_query_metadata_and_rows_do_not_cross_a_publication_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publishing between freshness capture and row load must fail authority closed."""
+    repository = _copy_fixture(tmp_path)
+    reader = RepositoryIndex(project_id="project-1", repository_root=repository)
+    reader.rebuild()
+    writer = RepositoryIndex(project_id="project-1", repository_root=repository)
+    original_symbols = reader._store.symbols
+
+    def publish_then_load(
+        query: str | None = None,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> Any:
+        changed = repository / "src" / "widget.py"
+        changed.write_text(
+            changed.read_text(encoding="utf-8").replace(
+                "def helper",
+                "def generation_safe",
+            ),
+            encoding="utf-8",
+        )
+        writer.rebuild()
+        return original_symbols(query, limit=limit, offset=offset)
+
+    monkeypatch.setattr(reader._store, "symbols", publish_then_load)
+
+    result = reader.symbols(
+        "generation_safe",
+        include_stale_diagnostics=True,
+    )
+
+    assert result.authoritative is False
+    assert result.index_digest == writer.status().aggregate_digest
+    assert [record.name for record in result.records] == ["generation_safe"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode contract")
@@ -719,11 +865,18 @@ def test_connection_closes_when_serialize_setup_fails(
         def serialize(self, *args: Any, **kwargs: Any) -> bytes:
             raise sqlite3.OperationalError("injected serialize failure")
 
-    def tracking_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
+    def tracking_connect(
+        database: str | Path,
+        timeout: float = 5.0,
+        *,
+        uri: bool = False,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+    ) -> sqlite3.Connection:
         connection = real_connect(
             database,
             timeout=timeout,
             factory=FailingSerializeConnection,
+            uri=uri,
         )
         opened.append(connection)
         return connection
@@ -755,11 +908,18 @@ def test_connection_closes_when_pragma_setup_fails(
                 raise sqlite3.OperationalError("injected PRAGMA failure")
             return super().execute(sql, parameters)
 
-    def failing_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
+    def failing_connect(
+        database: str | Path,
+        timeout: float = 5.0,
+        *,
+        uri: bool = False,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+    ) -> sqlite3.Connection:
         connection = real_connect(
             database,
             timeout=timeout,
             factory=FailingPragmaConnection,
+            uri=uri,
         )
         opened.append(connection)
         return connection
@@ -790,8 +950,19 @@ def test_routine_queries_do_not_run_full_database_integrity_checks(
             statements.append(sql)
             return super().execute(sql, parameters)
 
-    def tracking_connect(database: str | Path, timeout: float = 5.0) -> sqlite3.Connection:
-        return real_connect(database, timeout=timeout, factory=TrackingConnection)
+    def tracking_connect(
+        database: str | Path,
+        timeout: float = 5.0,
+        *,
+        uri: bool = False,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+    ) -> sqlite3.Connection:
+        return real_connect(
+            database,
+            timeout=timeout,
+            factory=TrackingConnection,
+            uri=uri,
+        )
 
     monkeypatch.setattr(
         "nested_memvid_agent.repo_index.store.sqlite3.connect",

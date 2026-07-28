@@ -34,7 +34,13 @@ from .models import (
     TestRelationshipRecord,
 )
 from .parsers import PARSER_VERSIONS, language_for_path, parse_file, parser_version
-from .store import SCHEMA_VERSION, RepoIndexStore, StoreQueryPage
+from .store import (
+    SCHEMA_VERSION,
+    RepoIndexStore,
+    StoredMetadata,
+    StoreQueryPage,
+    StoreQuerySnapshot,
+)
 
 _VALID_PROJECT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _GIT_OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{40,64}\Z")
@@ -189,8 +195,8 @@ class RepositoryIndex:
 
     def status(self) -> IndexStatus:
         with self._root_descriptor() as (root_descriptor, observed_root):
-            self._store.assert_root_identity(observed_root)
             metadata = self._store.metadata()
+            self._assert_metadata_root(metadata, observed_root)
             observed = self._snapshot(root_descriptor)
             freshness = (
                 Freshness.CURRENT
@@ -293,25 +299,48 @@ class RepositoryIndex:
 
     def _query(
         self,
-        load: Callable[[], StoreQueryPage[ResultT]],
+        load: Callable[[], StoreQuerySnapshot[ResultT]],
         *,
         include_stale_diagnostics: bool,
     ) -> IndexQueryResult[ResultT]:
-        status = self.status()
-        authoritative = status.freshness is Freshness.CURRENT
+        with self._root_descriptor() as (root_descriptor, observed_root):
+            observed = self._snapshot(root_descriptor)
+            snapshot = load()
+            metadata = snapshot.metadata
+            self._assert_metadata_root(metadata, observed_root)
+        freshness = (
+            Freshness.CURRENT
+            if metadata.freshness_fingerprint
+            and metadata.freshness_fingerprint == observed.fingerprint
+            and metadata.parser_versions == self._parser_versions
+            else Freshness.STALE
+        )
+        authoritative = freshness is Freshness.CURRENT
         page = (
-            load()
+            snapshot.page
             if authoritative or include_stale_diagnostics
             else StoreQueryPage(records=(), truncated=False, next_offset=None)
         )
         return IndexQueryResult(
             records=page.records,
-            freshness=status.freshness,
+            freshness=freshness,
             authoritative=authoritative,
-            index_digest=status.aggregate_digest,
+            index_digest=metadata.aggregate_digest,
             truncated=page.truncated,
             next_offset=page.next_offset,
         )
+
+    @staticmethod
+    def _assert_metadata_root(
+        metadata: StoredMetadata,
+        observed: RootIdentity,
+    ) -> None:
+        if metadata.root_path != str(observed.path):
+            raise RepositoryRootMismatchError("repository root path does not match indexed root")
+        if metadata.root_device != observed.device or metadata.root_inode != observed.inode:
+            raise RepositoryRootMismatchError(
+                "repository root identity does not match indexed root"
+            )
 
     def _snapshot(self, root_descriptor: int | None) -> RepositorySnapshot:
         candidates, skipped = _scan_candidates(

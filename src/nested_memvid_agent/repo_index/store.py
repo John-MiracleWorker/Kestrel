@@ -26,7 +26,7 @@ from .models import (
     TestRelationshipRecord,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _APPLICATION_ID = 0x4B535452
 StoreRecordT = TypeVar("StoreRecordT")
 
@@ -83,10 +83,23 @@ class _DirectorySnapshot:
 
 
 @dataclass(frozen=True)
+class _GenerationState:
+    generation_id: str
+    sequence: int
+    binding: _FileBinding
+
+
+@dataclass(frozen=True)
 class StoreQueryPage(Generic[StoreRecordT]):
     records: tuple[StoreRecordT, ...]
     truncated: bool
     next_offset: int | None
+
+
+@dataclass(frozen=True)
+class StoreQuerySnapshot(Generic[StoreRecordT]):
+    metadata: StoredMetadata
+    page: StoreQueryPage[StoreRecordT]
 
 
 class RepoIndexStore:
@@ -101,7 +114,7 @@ class RepoIndexStore:
         self._managed_directories = managed_directories
         self._custom_parent = custom_parent
         self._parent_bindings: tuple[_PathBinding, ...] = ()
-        self._database_binding: _FileBinding | None = None
+        self._generation: _GenerationState | None = None
         self._lock_binding: _FileBinding | None = None
         self._thread_lock = threading.RLock()
 
@@ -115,15 +128,19 @@ class RepoIndexStore:
         self._prepare_sidecar_parent()
         with self._connection(write=True, integrity_check=True) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, 2, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
                 raise RepositoryIndexError(f"unsupported repository index schema version {version}")
             if version == 0:
                 self._create_schema(connection)
             elif version == 1:
                 self._migrate_schema_v1(connection)
                 self._migrate_schema_v2(connection)
+                self._migrate_schema_v3(connection)
             elif version == 2:
                 self._migrate_schema_v2(connection)
+                self._migrate_schema_v3(connection)
+            elif version == 3:
+                self._migrate_schema_v3(connection)
             application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
             if application_id != _APPLICATION_ID:
                 raise RepositoryIndexError("repository index database identity marker is invalid")
@@ -152,7 +169,13 @@ class RepoIndexStore:
 
     def metadata(self) -> StoredMetadata:
         with self._connection() as connection:
-            row = connection.execute("SELECT * FROM index_metadata WHERE singleton = 1").fetchone()
+            return self._metadata_from_connection(connection)
+
+    def _metadata_from_connection(
+        self,
+        connection: sqlite3.Connection,
+    ) -> StoredMetadata:
+        row = connection.execute("SELECT * FROM index_metadata WHERE singleton = 1").fetchone()
         if row is None:
             raise RepositoryIndexError("repository index metadata is missing")
         raw_versions = json.loads(str(row["parser_versions_json"]))
@@ -332,19 +355,23 @@ class RepoIndexStore:
                 ),
             )
 
-    def files(self, *, limit: int, offset: int = 0) -> StoreQueryPage[FileRecord]:
+    def files(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> StoreQuerySnapshot[FileRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, path, digest, size, language, parser_version, is_test
-                FROM files
-                ORDER BY path, id
-                LIMIT ? OFFSET ?
-                """,
-                (bounded_limit + 1, bounded_offset),
-            ).fetchall()
+        metadata, rows = self._select_records(
+            """
+            SELECT id, path, digest, size, language, parser_version, is_test
+            FROM files
+            ORDER BY path, id
+            LIMIT ? OFFSET ?
+            """,
+            (bounded_limit + 1, bounded_offset),
+        )
         records = tuple(
             FileRecord(
                 id=int(row["id"]),
@@ -357,7 +384,15 @@ class RepoIndexStore:
             )
             for row in rows[:bounded_limit]
         )
-        return _query_page(records, row_count=len(rows), limit=bounded_limit, offset=bounded_offset)
+        return StoreQuerySnapshot(
+            metadata=metadata,
+            page=_query_page(
+                records,
+                row_count=len(rows),
+                limit=bounded_limit,
+                offset=bounded_offset,
+            ),
+        )
 
     def symbols(
         self,
@@ -365,7 +400,7 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
-    ) -> StoreQueryPage[SymbolRecord]:
+    ) -> StoreQuerySnapshot[SymbolRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
         predicate = ""
@@ -377,7 +412,7 @@ class RepoIndexStore:
             )
             parameters.extend((query, query))
         parameters.extend((bounded_limit + 1, bounded_offset))
-        rows = self._select_records(
+        metadata, rows = self._select_records(
             f"""
             SELECT s.id, f.path, f.digest, s.name, s.qualified_name, s.kind,
                    s.line, s.column_number
@@ -403,7 +438,15 @@ class RepoIndexStore:
             )
             for row in rows[:bounded_limit]
         )
-        return _query_page(records, row_count=len(rows), limit=bounded_limit, offset=bounded_offset)
+        return StoreQuerySnapshot(
+            metadata=metadata,
+            page=_query_page(
+                records,
+                row_count=len(rows),
+                limit=bounded_limit,
+                offset=bounded_offset,
+            ),
+        )
 
     def imports(
         self,
@@ -411,7 +454,7 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
-    ) -> StoreQueryPage[ImportRecord]:
+    ) -> StoreQuerySnapshot[ImportRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
         predicate = ""
@@ -420,7 +463,7 @@ class RepoIndexStore:
             predicate = "WHERE instr(lower(i.module), lower(?)) > 0"
             parameters.append(query)
         parameters.extend((bounded_limit + 1, bounded_offset))
-        rows = self._select_records(
+        metadata, rows = self._select_records(
             f"""
             SELECT i.id, f.path, f.digest, i.module, i.imported_name,
                    i.line, i.column_number
@@ -446,7 +489,15 @@ class RepoIndexStore:
             )
             for row in rows[:bounded_limit]
         )
-        return _query_page(records, row_count=len(rows), limit=bounded_limit, offset=bounded_offset)
+        return StoreQuerySnapshot(
+            metadata=metadata,
+            page=_query_page(
+                records,
+                row_count=len(rows),
+                limit=bounded_limit,
+                offset=bounded_offset,
+            ),
+        )
 
     def references(
         self,
@@ -454,7 +505,7 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
-    ) -> StoreQueryPage[ReferenceRecord]:
+    ) -> StoreQuerySnapshot[ReferenceRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
         predicate = ""
@@ -463,7 +514,7 @@ class RepoIndexStore:
             predicate = "WHERE r.name = ? COLLATE NOCASE"
             parameters.append(name)
         parameters.extend((bounded_limit + 1, bounded_offset))
-        rows = self._select_records(
+        metadata, rows = self._select_records(
             f"""
             SELECT r.id, f.path, f.digest, r.name, r.line, r.column_number
             FROM lexical_references AS r
@@ -485,7 +536,15 @@ class RepoIndexStore:
             )
             for row in rows[:bounded_limit]
         )
-        return _query_page(records, row_count=len(rows), limit=bounded_limit, offset=bounded_offset)
+        return StoreQuerySnapshot(
+            metadata=metadata,
+            page=_query_page(
+                records,
+                row_count=len(rows),
+                limit=bounded_limit,
+                offset=bounded_offset,
+            ),
+        )
 
     def tests_for(
         self,
@@ -493,25 +552,24 @@ class RepoIndexStore:
         *,
         limit: int,
         offset: int = 0,
-    ) -> StoreQueryPage[TestRelationshipRecord]:
+    ) -> StoreQuerySnapshot[TestRelationshipRecord]:
         bounded_limit = _validated_query_limit(limit)
         bounded_offset = _validated_query_offset(offset)
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT tr.id, s.name AS symbol_name, sf.path AS symbol_path,
-                       tf.path AS test_path, tr.relationship, tr.evidence_line
-                FROM test_relationships AS tr
-                JOIN symbols AS s ON s.id = tr.symbol_id
-                JOIN files AS sf ON sf.id = s.file_id
-                JOIN files AS tf ON tf.id = tr.test_file_id
-                WHERE lower(s.name) = lower(?)
-                ORDER BY tf.path, sf.path, s.line, tr.evidence_line,
-                         lower(s.name), s.name, tr.id
-                LIMIT ? OFFSET ?
-                """,
-                (symbol_name, bounded_limit + 1, bounded_offset),
-            ).fetchall()
+        metadata, rows = self._select_records(
+            """
+            SELECT tr.id, s.name AS symbol_name, sf.path AS symbol_path,
+                   tf.path AS test_path, tr.relationship, tr.evidence_line
+            FROM test_relationships AS tr
+            JOIN symbols AS s ON s.id = tr.symbol_id
+            JOIN files AS sf ON sf.id = s.file_id
+            JOIN files AS tf ON tf.id = tr.test_file_id
+            WHERE lower(s.name) = lower(?)
+            ORDER BY tf.path, sf.path, s.line, tr.evidence_line,
+                     lower(s.name), s.name, tr.id
+            LIMIT ? OFFSET ?
+            """,
+            (symbol_name, bounded_limit + 1, bounded_offset),
+        )
         records = tuple(
             TestRelationshipRecord(
                 id=int(row["id"]),
@@ -523,11 +581,25 @@ class RepoIndexStore:
             )
             for row in rows[:bounded_limit]
         )
-        return _query_page(records, row_count=len(rows), limit=bounded_limit, offset=bounded_offset)
+        return StoreQuerySnapshot(
+            metadata=metadata,
+            page=_query_page(
+                records,
+                row_count=len(rows),
+                limit=bounded_limit,
+                offset=bounded_offset,
+            ),
+        )
 
-    def _select_records(self, statement: str, parameters: tuple[object, ...]) -> list[sqlite3.Row]:
+    def _select_records(
+        self,
+        statement: str,
+        parameters: tuple[object, ...],
+    ) -> tuple[StoredMetadata, list[sqlite3.Row]]:
         with self._connection() as connection:
-            return connection.execute(statement, parameters).fetchall()
+            metadata = self._metadata_from_connection(connection)
+            rows = connection.execute(statement, parameters).fetchall()
+        return metadata, rows
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
@@ -596,6 +668,16 @@ class RepoIndexStore:
                 UNIQUE(symbol_id, test_file_id, relationship)
             );
 
+            CREATE TABLE index_generations (
+                sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
+                generation_id TEXT NOT NULL UNIQUE,
+                previous_generation_id TEXT,
+                CHECK (
+                    (sequence = 1 AND previous_generation_id IS NULL)
+                    OR (sequence > 1 AND previous_generation_id IS NOT NULL)
+                )
+            );
+
             CREATE INDEX symbols_name_idx ON symbols(name);
             CREATE INDEX imports_module_idx ON imports(module);
             CREATE INDEX references_name_nocase_idx
@@ -620,6 +702,23 @@ class RepoIndexStore:
             """
             CREATE INDEX IF NOT EXISTS references_name_nocase_idx
             ON lexical_references(name COLLATE NOCASE)
+            """
+        )
+        connection.execute("PRAGMA user_version = 3")
+        connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+
+    def _migrate_schema_v3(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS index_generations (
+                sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
+                generation_id TEXT NOT NULL UNIQUE,
+                previous_generation_id TEXT,
+                CHECK (
+                    (sequence = 1 AND previous_generation_id IS NULL)
+                    OR (sequence > 1 AND previous_generation_id IS NOT NULL)
+                )
+            )
             """
         )
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -837,10 +936,6 @@ class RepoIndexStore:
             if not stat.S_ISREG(before.st_mode):
                 raise RepositoryIndexError("repository index database must be a regular file")
             observed = _file_binding(before)
-            if self._database_binding is None:
-                self._database_binding = observed
-            elif observed != self._database_binding:
-                raise RepositoryIndexError("repository index database identity changed")
             chunks: list[bytes] = []
             remaining = observed.size
             while remaining:
@@ -877,16 +972,216 @@ class RepoIndexStore:
         if observed != database_binding:
             raise RepositoryIndexError(f"repository index database changed during {operation}")
 
+    def _open_database_descriptor(
+        self,
+        parent_descriptor: int | None,
+    ) -> tuple[int, _FileBinding]:
+        try:
+            descriptor = self._open_relative(
+                self.path.name,
+                os.O_RDONLY | _no_follow_flag(),
+                parent_descriptor=parent_descriptor,
+            )
+        except OSError as exc:
+            raise RepositoryIndexError(
+                "repository index database is missing or inaccessible"
+            ) from exc
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            raise RepositoryIndexError("repository index database must be a regular file")
+        return descriptor, _file_binding(info)
+
+    def _connect_pinned_read(self, descriptor: int) -> sqlite3.Connection:
+        if os.name == "posix" and Path("/dev/fd").is_dir():
+            database_uri = f"file:/dev/fd/{descriptor}?mode=ro&immutable=1"
+        else:
+            database_uri = f"{self.path.as_uri()}?mode=ro&immutable=1"
+        return sqlite3.connect(database_uri, timeout=5.0, uri=True)
+
+    def _read_generation_state(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        binding: _FileBinding,
+        allow_missing: bool,
+    ) -> _GenerationState | None:
+        try:
+            row = connection.execute(
+                """
+                SELECT sequence, generation_id
+                FROM index_generations
+                ORDER BY sequence DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if allow_missing and "no such table" in str(exc).casefold():
+                return None
+            raise RepositoryIndexError("repository index generation ledger is missing") from exc
+        if row is None:
+            if allow_missing:
+                return None
+            raise RepositoryIndexError("repository index generation ledger is empty")
+        generation_id = str(row["generation_id"])
+        if not _valid_generation_id(generation_id):
+            raise RepositoryIndexError("repository index generation identifier is invalid")
+        return _GenerationState(
+            generation_id=generation_id,
+            sequence=int(row["sequence"]),
+            binding=binding,
+        )
+
+    def _validate_and_bind_generation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        binding: _FileBinding,
+        parent_descriptor: int | None,
+        allow_legacy: bool,
+    ) -> _GenerationState | None:
+        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if not allow_legacy and (application_id != _APPLICATION_ID or version != SCHEMA_VERSION):
+            raise RepositoryIndexError("repository index database identity marker is invalid")
+        observed = self._read_generation_state(
+            connection,
+            binding=binding,
+            allow_missing=allow_legacy,
+        )
+        expected = self._generation
+        if observed is None:
+            if expected is not None:
+                raise RepositoryIndexError("repository index database identity changed")
+            return None
+        self._validate_generation_manifest(
+            observed,
+            parent_descriptor=parent_descriptor,
+            allow_missing=(allow_legacy and version < SCHEMA_VERSION and self._generation is None),
+        )
+        if expected is None:
+            self._generation = observed
+            return observed
+        if binding == expected.binding:
+            if (
+                observed.generation_id != expected.generation_id
+                or observed.sequence != expected.sequence
+            ):
+                raise RepositoryIndexError("repository index generation changed in place")
+            return expected
+        if binding.device == expected.binding.device and binding.inode == expected.binding.inode:
+            raise RepositoryIndexError("repository index generation changed in place")
+        self._validate_generation_lineage(
+            connection,
+            expected=expected,
+            observed=observed,
+        )
+        self._generation = observed
+        return observed
+
+    def _validate_generation_manifest(
+        self,
+        generation: _GenerationState,
+        *,
+        parent_descriptor: int | None,
+        allow_missing: bool,
+    ) -> None:
+        manifest_binding = self._relative_file_binding(
+            self._generation_filename(generation.generation_id),
+            parent_descriptor=parent_descriptor,
+            allow_missing=allow_missing,
+        )
+        if manifest_binding is None and allow_missing:
+            return
+        if manifest_binding != generation.binding:
+            raise RepositoryIndexError(
+                "repository index database identity changed: generation manifest mismatch"
+            )
+
+    def _generation_filename(self, generation_id: str) -> str:
+        if not _valid_generation_id(generation_id):
+            raise RepositoryIndexError("repository index generation identifier is invalid")
+        return f".{self.path.name}.generation-{generation_id}"
+
+    def _validate_generation_lineage(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        expected: _GenerationState,
+        observed: _GenerationState,
+    ) -> None:
+        if observed.sequence <= expected.sequence:
+            raise RepositoryIndexError("repository index database identity changed")
+        rows = connection.execute(
+            """
+            SELECT sequence, generation_id, previous_generation_id
+            FROM index_generations
+            WHERE sequence BETWEEN ? AND ?
+            ORDER BY sequence
+            """,
+            (expected.sequence, observed.sequence),
+        ).fetchall()
+        if len(rows) != observed.sequence - expected.sequence + 1:
+            raise RepositoryIndexError("repository index generation lineage is incomplete")
+        previous_id: str | None = None
+        for position, row in enumerate(rows):
+            sequence = int(row["sequence"])
+            generation_id = str(row["generation_id"])
+            previous_generation_id = _optional_str(row["previous_generation_id"])
+            if not _valid_generation_id(generation_id) or (
+                previous_generation_id is not None
+                and not _valid_generation_id(previous_generation_id)
+            ):
+                raise RepositoryIndexError(
+                    "repository index generation lineage identifier is invalid"
+                )
+            if sequence != expected.sequence + position:
+                raise RepositoryIndexError("repository index generation lineage is not contiguous")
+            if position == 0:
+                if generation_id != expected.generation_id:
+                    raise RepositoryIndexError("repository index database identity changed")
+            elif previous_generation_id != previous_id:
+                raise RepositoryIndexError("repository index generation lineage is invalid")
+            previous_id = generation_id
+        if previous_id != observed.generation_id:
+            raise RepositoryIndexError("repository index generation lineage does not reach current")
+
+    def _append_generation(
+        self,
+        connection: sqlite3.Connection,
+        previous: _GenerationState | None,
+    ) -> tuple[str, int]:
+        generation_id = secrets.token_hex(16)
+        sequence = 1 if previous is None else previous.sequence + 1
+        connection.execute(
+            """
+            INSERT INTO index_generations (
+                sequence, generation_id, previous_generation_id
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                sequence,
+                generation_id,
+                None if previous is None else previous.generation_id,
+            ),
+        )
+        return generation_id, sequence
+
     def _publish_database(
         self,
         parent_descriptor: int | None,
         *,
         payload: bytes,
         expected_binding: _FileBinding | None,
-    ) -> None:
+        generation_id: str,
+        previous_generation_id: str | None,
+    ) -> _FileBinding:
         temporary_name = f".{self.path.name}.{secrets.token_hex(12)}.tmp"
+        generation_name = self._generation_filename(generation_id)
+        link_name = f".{self.path.name}.{secrets.token_hex(12)}.link"
         temporary_descriptor: int | None = None
-        published = False
+        generation_staged = False
+        canonical_published = False
         try:
             temporary_descriptor = self._open_relative(
                 temporary_name,
@@ -926,12 +1221,39 @@ class RepoIndexStore:
             )
             if current != expected_binding:
                 raise RepositoryIndexError("repository index database changed during write")
+            if (
+                self._relative_file_binding(
+                    generation_name,
+                    parent_descriptor=parent_descriptor,
+                    allow_missing=True,
+                )
+                is not None
+            ):
+                raise RepositoryIndexError("repository index generation manifest already exists")
             self._replace_relative(
                 temporary_name,
+                generation_name,
+                parent_descriptor=parent_descriptor,
+            )
+            generation_staged = True
+            self._link_relative(
+                generation_name,
+                link_name,
+                parent_descriptor=parent_descriptor,
+            )
+            current = self._relative_file_binding(
+                self.path.name,
+                parent_descriptor=parent_descriptor,
+                allow_missing=expected_binding is None,
+            )
+            if current != expected_binding:
+                raise RepositoryIndexError("repository index database changed during write")
+            self._replace_relative(
+                link_name,
                 self.path.name,
                 parent_descriptor=parent_descriptor,
             )
-            published = True
+            canonical_published = True
             published_binding = self._relative_file_binding(
                 self.path.name,
                 parent_descriptor=parent_descriptor,
@@ -943,16 +1265,41 @@ class RepoIndexStore:
                 or published_binding.inode != temporary_binding.inode
             ):
                 raise RepositoryIndexError("repository index database changed during publication")
-            self._database_binding = published_binding
+            manifest_binding = self._relative_file_binding(
+                generation_name,
+                parent_descriptor=parent_descriptor,
+                allow_missing=False,
+            )
+            if manifest_binding != published_binding:
+                raise RepositoryIndexError(
+                    "repository index generation manifest publication failed"
+                )
             if parent_descriptor is not None:
                 os.fsync(parent_descriptor)
             self._verify_parent_descriptor(parent_descriptor)
+            if previous_generation_id is not None:
+                self._unlink_relative(
+                    self._generation_filename(previous_generation_id),
+                    parent_descriptor=parent_descriptor,
+                )
+                if parent_descriptor is not None:
+                    os.fsync(parent_descriptor)
+            return published_binding
         finally:
             if temporary_descriptor is not None:
                 os.close(temporary_descriptor)
-            if not published:
+            if not generation_staged:
                 self._unlink_relative(
                     temporary_name,
+                    parent_descriptor=parent_descriptor,
+                )
+            self._unlink_relative(
+                link_name,
+                parent_descriptor=parent_descriptor,
+            )
+            if generation_staged and not canonical_published:
+                self._unlink_relative(
+                    generation_name,
                     parent_descriptor=parent_descriptor,
                 )
 
@@ -1008,6 +1355,28 @@ class RepoIndexStore:
             return
         os.replace(self.path.parent / source, self.path.parent / destination)
 
+    def _link_relative(
+        self,
+        source: str,
+        destination: str,
+        *,
+        parent_descriptor: int | None,
+    ) -> None:
+        if parent_descriptor is not None:
+            os.link(
+                source,
+                destination,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            return
+        os.link(
+            self.path.parent / source,
+            self.path.parent / destination,
+            follow_symlinks=False,
+        )
+
     def _unlink_relative(self, name: str, *, parent_descriptor: int | None) -> None:
         try:
             if parent_descriptor is not None:
@@ -1018,17 +1387,58 @@ class RepoIndexStore:
             pass
 
     @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        with self._locked_parent() as parent_descriptor:
+            parent_snapshot = self._directory_snapshot(parent_descriptor)
+            descriptor, database_binding = self._open_database_descriptor(parent_descriptor)
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect_pinned_read(descriptor)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA foreign_keys = ON")
+                self._verify_snapshot_unchanged(
+                    parent_descriptor,
+                    parent_snapshot=parent_snapshot,
+                    database_binding=database_binding,
+                    operation="read",
+                )
+                self._validate_and_bind_generation(
+                    connection,
+                    binding=database_binding,
+                    parent_descriptor=parent_descriptor,
+                    allow_legacy=False,
+                )
+                yield connection
+                self._verify_snapshot_unchanged(
+                    parent_descriptor,
+                    parent_snapshot=parent_snapshot,
+                    database_binding=database_binding,
+                    operation="read",
+                )
+                if _file_binding(os.fstat(descriptor)) != database_binding:
+                    raise RepositoryIndexError("repository index database changed during read")
+            finally:
+                if connection is not None:
+                    connection.close()
+                os.close(descriptor)
+
+    @contextmanager
     def _connection(
         self,
         *,
         write: bool = False,
         integrity_check: bool = False,
     ) -> Iterator[sqlite3.Connection]:
+        if not write:
+            with self._read_connection() as connection:
+                yield connection
+            return
         with self._locked_parent() as parent_descriptor:
             parent_snapshot = self._directory_snapshot(parent_descriptor)
             payload, database_binding = self._read_database_snapshot(
                 parent_descriptor,
-                allow_missing=write and self._database_binding is None,
+                allow_missing=self._generation is None,
             )
             connection = sqlite3.connect(":memory:", timeout=5.0)
             try:
@@ -1042,6 +1452,16 @@ class RepoIndexStore:
                     connection.deserialize(payload)
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA foreign_keys = ON")
+                current_generation = (
+                    self._validate_and_bind_generation(
+                        connection,
+                        binding=database_binding,
+                        parent_descriptor=parent_descriptor,
+                        allow_legacy=integrity_check,
+                    )
+                    if database_binding is not None
+                    else None
+                )
                 if integrity_check:
                     quick_check = connection.execute("PRAGMA quick_check").fetchone()
                     if quick_check is None or str(quick_check[0]) != "ok":
@@ -1054,16 +1474,29 @@ class RepoIndexStore:
                     parent_descriptor,
                     parent_snapshot=parent_snapshot,
                     database_binding=database_binding,
-                    operation="write" if write else "read",
+                    operation="write",
                 )
-                if write:
-                    serialized = connection.serialize()
-                    if database_binding is None or serialized != payload:
-                        self._publish_database(
-                            parent_descriptor,
-                            payload=serialized,
-                            expected_binding=database_binding,
+                serialized = connection.serialize()
+                if database_binding is None or current_generation is None or serialized != payload:
+                    with connection:
+                        generation_id, sequence = self._append_generation(
+                            connection,
+                            current_generation,
                         )
+                    published_binding = self._publish_database(
+                        parent_descriptor,
+                        payload=connection.serialize(),
+                        expected_binding=database_binding,
+                        generation_id=generation_id,
+                        previous_generation_id=(
+                            None if current_generation is None else current_generation.generation_id
+                        ),
+                    )
+                    self._generation = _GenerationState(
+                        generation_id=generation_id,
+                        sequence=sequence,
+                        binding=published_binding,
+                    )
             finally:
                 connection.close()
 
@@ -1113,6 +1546,10 @@ def _file_binding(info: os.stat_result) -> _FileBinding:
 
 def _no_follow_flag() -> int:
     return int(getattr(os, "O_NOFOLLOW", 0))
+
+
+def _valid_generation_id(value: str) -> bool:
+    return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
 def _absolute_components(path: Path) -> tuple[Path, ...]:
