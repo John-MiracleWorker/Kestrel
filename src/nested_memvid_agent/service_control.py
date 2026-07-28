@@ -20,7 +20,6 @@ from .file_lock import lock_exclusive, unlock
 from .platform_primitives import required_signal, signal_process_group
 from .private_artifacts import (
     create_private_empty_file,
-    ensure_private_directory,
     ensure_owner_only_directory,
     open_private_file_descriptor,
 )
