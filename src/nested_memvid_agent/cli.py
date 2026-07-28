@@ -8,6 +8,7 @@ import platform
 import sqlite3
 import subprocess  # nosec B404
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from importlib import metadata as importlib_metadata
@@ -1667,13 +1668,17 @@ def _doctor_memory(memory: object, *, dry_run: bool) -> dict[str, Any]:
     return report
 
 
-def _doctor_runtime(config: AgentConfig) -> dict[str, Any]:
+def _doctor_runtime(
+    config: AgentConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     memory_dir_exists = config.memory_dir.exists()
     report: dict[str, Any] = {
         "python": _doctor_python(),
         "package": _doctor_package(),
         "optional_extras": _doctor_optional_extras(),
-        "provider": _doctor_provider(config),
+        "provider": _doctor_provider(config, environ=environ),
         "workspace": _doctor_workspace(config),
         "tool_config": _doctor_tool_config(config),
         "validation_container": _doctor_validation_container(config),
@@ -1740,11 +1745,17 @@ def _doctor_optional_module(module_name: str) -> dict[str, Any]:
     return report
 
 
-def _doctor_provider(config: AgentConfig) -> dict[str, Any]:
+def _doctor_provider(
+    config: AgentConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     key_env = config.api_key_env
     if key_env is None and config.provider == "openai":
         key_env = "OPENAI_API_KEY"
-    api_key_present = bool(key_env and _env_has_value(key_env))
+    api_key_present = bool(
+        key_env and _env_has_value(key_env, environ=environ)
+    )
     needs_key = config.provider == "openai"
     needs_base_url = config.provider == "openai-compatible"
     return {
@@ -1910,10 +1921,15 @@ def _section_ok(value: dict[str, Any]) -> bool:
     return True
 
 
-def _env_has_value(name: str) -> bool:
+def _env_has_value(
+    name: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
     import os
 
-    return bool(os.getenv(name, "").strip())
+    environment = os.environ if environ is None else environ
+    return bool(environment.get(name, "").strip())
 
 
 def _build_run_manager(

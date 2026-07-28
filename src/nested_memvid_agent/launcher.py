@@ -551,7 +551,7 @@ def _default_offline_doctor(
         log_dir=paths.log_path.parent,
         workspace=paths.home,
     )
-    return _doctor_runtime(config)
+    return _doctor_runtime(config, environ=environ)
 
 
 def _default_application(

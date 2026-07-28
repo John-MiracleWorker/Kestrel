@@ -9,7 +9,6 @@ from typing import Any
 
 import pytest
 
-from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.launcher import (
     LauncherApplication,
     _default_application,
@@ -637,26 +636,34 @@ def test_default_offline_doctor_uses_only_the_injected_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("NEST_AGENT_PROVIDER", "host-provider")
-    monkeypatch.setenv("NEST_AGENT_API_KEY_ENV", "HOST_PROVIDER_SECRET")
-    environment = {
-        "NEST_AGENT_PROVIDER": "injected-provider",
-        "NEST_AGENT_API_KEY_ENV": "INJECTED_PROVIDER_SECRET",
+    monkeypatch.setenv("HOST_ONLY_PROVIDER_SECRET", "host-only-secret-value")
+    monkeypatch.delenv("INJECTED_ONLY_PROVIDER_SECRET", raising=False)
+    injected_environment = {
+        "NEST_AGENT_PROVIDER": "openai",
+        "NEST_AGENT_API_KEY_ENV": "INJECTED_ONLY_PROVIDER_SECRET",
+        "INJECTED_ONLY_PROVIDER_SECRET": "injected-only-secret-value",
     }
-    observed: dict[str, AgentConfig] = {}
+    host_only_environment = {
+        "NEST_AGENT_PROVIDER": "openai",
+        "NEST_AGENT_API_KEY_ENV": "HOST_ONLY_PROVIDER_SECRET",
+    }
 
-    def doctor_runtime(config: AgentConfig) -> dict[str, object]:
-        observed["config"] = config
-        return {"ok": True}
-
-    monkeypatch.setattr(
-        "nested_memvid_agent.cli._doctor_runtime",
-        doctor_runtime,
+    injected_app = _default_application(
+        _paths(tmp_path / "injected"),
+        environ=injected_environment,
     )
-    app = _default_application(_paths(tmp_path), environ=environment)
+    host_only_app = _default_application(
+        _paths(tmp_path / "host-only"),
+        environ=host_only_environment,
+    )
 
-    assert app.offline_doctor(app.paths) == {"ok": True}
-    assert observed["config"].provider == "injected-provider"
-    assert observed["config"].api_key_env == "INJECTED_PROVIDER_SECRET"
+    injected_report = injected_app.offline_doctor(injected_app.paths)
+    host_only_report = host_only_app.offline_doctor(host_only_app.paths)
+
+    assert injected_report["provider"]["provider"] == "openai"
+    assert injected_report["provider"]["api_key_present"] is True
+    assert host_only_report["provider"]["provider"] == "openai"
+    assert host_only_report["provider"]["api_key_present"] is False
 
 
 def test_run_passes_the_exact_injected_environment_to_the_default_factory(
