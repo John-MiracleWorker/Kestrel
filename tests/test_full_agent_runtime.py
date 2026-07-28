@@ -4848,7 +4848,8 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
                         "../escape.py",
                         "bad\nfilename.py",
                     ],
-                    "summary": never_persist,
+                    "summary": "Targeted repair with bounded validation evidence.",
+                    "risks": ["No known compatibility risk in the reviewed scope."],
                     "diff_preview": {
                         "format": "unified",
                         "content": preview_content,
@@ -4913,6 +4914,7 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
         "schema_version": 1,
         "tool": "repair.orchestrate_validate",
         "validation_id": validation_id,
+        "success": True,
         "repair_snapshot": {
             "branch": branch,
             "head_sha": head_sha,
@@ -4924,6 +4926,10 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
     )
     assert review_artifact["review_id"] == review_id
     assert review_artifact["validation_id"] == validation_id
+    assert review_artifact["summary"] == "Targeted repair with bounded validation evidence."
+    assert review_artifact["risks"] == [
+        "No known compatibility risk in the reviewed scope."
+    ]
     assert review_artifact["repair_snapshot"] == validation_artifact["repair_snapshot"]
     assert review_artifact["changed_files_truncated"] is True
     assert len(review_artifact["changed_files"]) == 128

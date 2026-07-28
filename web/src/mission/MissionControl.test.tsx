@@ -375,8 +375,10 @@ describe("MissionControl", () => {
           acceptance_criteria: ["Authentication regression passes"],
           result: {
             repair_artifact: {
+              schema_version: 1,
               tool: "repair.validate",
               validation_id: validationId,
+              success: true,
               repair_snapshot: {
                 branch: "kestrel/worker/run-review/repair",
                 head_sha: "1".repeat(40),
@@ -396,6 +398,7 @@ describe("MissionControl", () => {
           acceptance_criteria: ["Signed review remains current"],
           result: {
             repair_artifact: {
+              schema_version: 1,
               tool: "repair.review",
               validation_id: validationId,
               review_id: reviewId,
@@ -448,6 +451,11 @@ describe("MissionControl", () => {
     expect(screen.getByLabelText("Repair Patch Review")).toBeInTheDocument();
     expect(screen.getByText("Authentication regression passes")).toBeInTheDocument();
     expect(screen.getByText(/\+return True/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Prepare exact-call patch export" }));
+    expect(onPrepareTool).toHaveBeenCalledWith("git.export_patch", {
+      repair_review_id: reviewId,
+      expected_current_diff_digest: digest
+    });
     fireEvent.click(screen.getByRole("button", { name: "Prepare exact-call git.commit request" }));
     expect(onPrepareTool).toHaveBeenCalledWith(
       "git.commit",

@@ -2421,6 +2421,7 @@ export function App() {
             </div>
             <RepairReviewPanel
               tasks={taskGraph?.tasks ?? []}
+              allowedPaths={[]}
               onPrepareTool={(name, args) => {
                 setToolName(name);
                 setToolArgs(JSON.stringify(args, null, 2));

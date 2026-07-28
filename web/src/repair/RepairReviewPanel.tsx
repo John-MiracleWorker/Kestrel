@@ -4,9 +4,11 @@ import type { TaskNode } from "../types";
 
 export function RepairReviewPanel({
   tasks,
+  allowedPaths,
   onPrepareTool
 }: {
   tasks: TaskNode[];
+  allowedPaths: string[];
   onPrepareTool: (name: string, args: Record<string, unknown>) => void;
 }) {
   const [diffMode, setDiffMode] = useState<"unified" | "split">("unified");
@@ -21,37 +23,52 @@ export function RepairReviewPanel({
   const reviewTask = repairTasks.find((task) => taskUsesTool(task, "repair.review"));
   const rollbackTask = repairTasks.find((task) => taskUsesTool(task, "repair.rollback"));
 
-  const validationResult = validationTask?.result ?? null;
-  const validationArtifact = readRecord(validationResult?.repair_artifact);
-  const validation = readRecord(validationResult?.validation);
-  const validationSnapshot = readRecord(validationArtifact?.repair_snapshot);
-  const validationId = String(validationArtifact?.validation_id ?? validation?.validation_id ?? "pending");
-  const explicitValidationSuccess = validation?.success;
-  const validationSuccess = explicitValidationSuccess === true || (
-    explicitValidationSuccess === undefined
-    && validationTask?.status === "completed"
-    && ["repair.validate", "repair.orchestrate_validate"].includes(String(validationArtifact?.tool ?? ""))
-    && validationId !== "pending"
+  const validationArtifact = projectedRepairArtifact(
+    validationTask?.result?.repair_artifact,
+    ["repair.validate", "repair.orchestrate_validate"]
   );
-  const validationFailed = explicitValidationSuccess === false;
+  const validationSnapshot = projectedRepairSnapshot(validationArtifact?.repair_snapshot);
+  const validationId = validIdentifier(
+    validationArtifact?.validation_id,
+    /^repair_validation_[0-9a-f]{24}$/
+  ) ?? "pending";
+  const validationSuccess = validationTask?.status === "completed"
+    && validationArtifact !== null
+    && validationSnapshot !== null
+    && validationId !== "pending"
+    && validationArtifact.success === true;
+  const validationFailed = validationTask?.status === "failed"
+    || validationArtifact?.success === false;
   const validationLabel = validationSuccess
     ? "Validation passed"
     : validationFailed
       ? "Validation failed"
       : "Validation pending";
-  const validationCommand = formatCommand(validation?.command);
-  const validationEvidence = validationCommand
-    || (validationId !== "pending" ? validationId : validationTask?.title ?? "pending");
+  const validationEvidence = validationId !== "pending"
+    ? validationId
+    : validationTask?.title ?? "pending";
 
-  const reviewResult = reviewTask?.result ?? null;
-  const reviewArtifact = readRecord(reviewResult?.repair_artifact);
-  const reviewSnapshot = readRecord(reviewArtifact?.repair_snapshot);
-  const reviewId = String(reviewArtifact?.review_id ?? reviewResult?.review_id ?? "pending");
-  const diffHash = String(reviewSnapshot?.diff_digest ?? reviewResult?.diff_hash ?? "pending");
+  const reviewArtifact = projectedRepairArtifact(
+    reviewTask?.result?.repair_artifact,
+    ["repair.review"]
+  );
+  const reviewSnapshot = projectedRepairSnapshot(reviewArtifact?.repair_snapshot);
+  const reviewId = validIdentifier(
+    reviewArtifact?.review_id,
+    /^repair_review_[0-9a-f]{24}$/
+  ) ?? "pending";
+  const reviewValidationId = validIdentifier(
+    reviewArtifact?.validation_id,
+    /^repair_validation_[0-9a-f]{24}$/
+  );
+  const diffHash = validIdentifier(
+    reviewSnapshot?.diff_digest,
+    /^[0-9a-f]{64}$/
+  ) ?? "pending";
   const reviewBranch = String(reviewSnapshot?.branch ?? "pending");
   const reviewHead = String(reviewSnapshot?.head_sha ?? "pending");
-  const changedFiles = asStringArray(reviewArtifact?.changed_files ?? reviewResult?.changed_files);
-  const diffPreview = readRecord(reviewArtifact?.diff_preview ?? reviewResult?.diff_preview);
+  const changedFiles = asStringArray(reviewArtifact?.changed_files);
+  const diffPreview = readRecord(reviewArtifact?.diff_preview);
   const diffPreviewBound = diffPreview?.bound_diff_digest === diffHash
     && diffPreview?.redacted === true
     && diffPreview?.authoritative === false;
@@ -62,15 +79,24 @@ export function RepairReviewPanel({
   const diffOmittedFiles = typeof diffPreview?.omitted_files === "number"
     ? diffPreview.omitted_files
     : 0;
-  const hasReviewArtifact = reviewId !== "pending";
-  const commitGate = readRecord(reviewArtifact?.commit_gate ?? reviewResult?.commit_gate);
+  const commitGate = readRecord(reviewArtifact?.commit_gate);
   const commitApprovalRequired = commitGate?.approval_required_before_commit === true;
+  const hasReviewArtifact = reviewTask?.status === "completed"
+    && reviewArtifact !== null
+    && reviewSnapshot !== null
+    && reviewId !== "pending"
+    && reviewValidationId === validationId
+    && validationSuccess
+    && validationSnapshot?.branch === reviewSnapshot.branch
+    && validationSnapshot?.head_sha === reviewSnapshot.head_sha
+    && validationSnapshot?.diff_digest === reviewSnapshot.diff_digest;
   const commitAllowed = hasReviewArtifact
     && reviewTask?.status === "completed"
     && commitApprovalRequired
-    && commitGate?.commit_allowed !== false;
-  const reviewSummary = String(reviewArtifact?.summary ?? reviewResult?.summary ?? "").trim();
-  const riskNotes = asStringArray(reviewArtifact?.risks ?? reviewResult?.risks);
+    && commitGate?.commit_allowed === true;
+  const exportDestinationAllowed = projectArtifactDestinationAllowed(allowedPaths);
+  const reviewSummary = String(reviewArtifact?.summary ?? "").trim();
+  const riskNotes = asStringArray(reviewArtifact?.risks);
 
   const rollbackResult = rollbackTask?.result ?? null;
   const rollbackId = String(rollbackResult?.rollback_id ?? "pending");
@@ -88,7 +114,8 @@ export function RepairReviewPanel({
   };
   const prepareExport = () => {
     onPrepareTool("git.export_patch", {
-      staged: false
+      repair_review_id: reviewId,
+      expected_current_diff_digest: diffHash
     });
   };
   const prepareRollback = () => {
@@ -208,7 +235,15 @@ export function RepairReviewPanel({
               <p className="muted">Inline diff preview unavailable; changed-file and digest gates remain recorded.</p>
             )}
             <div className="page-actions">
-              <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareExport}>
+              <button
+                type="button"
+                className="btn subtle"
+                disabled={!commitAllowed || !exportDestinationAllowed}
+                title={exportDestinationAllowed
+                  ? "The backend revalidates the signed review before writing."
+                  : "Project allowed paths exclude .kestrel/improvements."}
+                onClick={prepareExport}
+              >
                 Prepare exact-call patch export
               </button>
               <button type="button" className="btn subtle" disabled={!commitAllowed} onClick={prepareCommit}>
@@ -243,11 +278,6 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function formatCommand(value: unknown): string {
-  if (Array.isArray(value)) return value.map((part) => String(part)).filter(Boolean).join(" ");
-  return typeof value === "string" ? value : "";
-}
-
 function diffLineClass(line: string): string {
   if (line.startsWith("diff --git") || line.startsWith("index ") || line.startsWith("@@")) return "diff-meta";
   if (line.startsWith("--- ") || line.startsWith("+++ ")) return "diff-file";
@@ -275,4 +305,38 @@ function asStringArray(value: unknown): string[] {
 
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function projectedRepairArtifact(
+  value: unknown,
+  expectedTools: string[]
+): Record<string, unknown> | null {
+  const artifact = readRecord(value);
+  return artifact?.schema_version === 1
+    && expectedTools.includes(String(artifact.tool ?? ""))
+    ? artifact
+    : null;
+}
+
+function projectedRepairSnapshot(value: unknown): Record<string, string> | null {
+  const snapshot = readRecord(value);
+  const branch = typeof snapshot?.branch === "string" ? snapshot.branch : "";
+  const head = validIdentifier(snapshot?.head_sha, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
+  const digest = validIdentifier(snapshot?.diff_digest, /^[0-9a-f]{64}$/);
+  return branch && head && digest
+    ? { branch, head_sha: head, diff_digest: digest }
+    : null;
+}
+
+function validIdentifier(value: unknown, pattern: RegExp): string | null {
+  return typeof value === "string" && pattern.test(value) ? value : null;
+}
+
+function projectArtifactDestinationAllowed(allowedPaths: string[]): boolean {
+  return allowedPaths.some((path) => {
+    const normalized = path.replaceAll("\\", "/").replace(/^\.\/|\/$/g, "");
+    return normalized === "" || normalized === "."
+      || normalized === ".kestrel"
+      || normalized.startsWith(".kestrel/improvements");
+  });
 }

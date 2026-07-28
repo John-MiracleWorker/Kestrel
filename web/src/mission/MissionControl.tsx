@@ -472,6 +472,7 @@ export function MissionControl({
             />
             <RepairReviewPanel
               tasks={taskGraph?.tasks ?? []}
+              allowedPaths={selectedProject?.allowed_paths ?? []}
               onPrepareTool={onPrepareTool}
             />
           </section>

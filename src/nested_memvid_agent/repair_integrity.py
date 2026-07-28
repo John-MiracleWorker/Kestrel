@@ -1362,6 +1362,7 @@ def _is_private_repair_path(path: str) -> bool:
         ".nest/repair_rollback_journals/",
         ".nest/repair_rollback_quarantine/",
         ".nest/repair_indexes/",
+        ".kestrel/improvements/",
     )
     return path in exact or path.startswith(prefixes)
 

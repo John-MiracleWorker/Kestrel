@@ -501,12 +501,16 @@ def _open_workspace_regular_file(
 
 
 def _atomic_workspace_write(workspace: Path, path: Path, text: str) -> None:
+    _atomic_workspace_write_bytes(workspace, path, text.encode("utf-8"))
+
+
+def _atomic_workspace_write_bytes(workspace: Path, path: Path, content: bytes) -> None:
     root = workspace.resolve()
     relative = path.relative_to(root)
     if not relative.name or relative == Path("."):
         raise ValueError("A file path is required.")
     if sys.platform == "win32":
-        _atomic_workspace_write_portable(root, relative, text)
+        _atomic_workspace_write_bytes_portable(root, relative, content)
         return
 
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
@@ -537,8 +541,8 @@ def _atomic_workspace_write(workspace: Path, path: Path, text: str) -> None:
             dir_fd=parent_fd,
         )
         try:
-            with os.fdopen(file_fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
+            with os.fdopen(file_fd, "wb") as handle:
+                handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
         except BaseException:
@@ -563,6 +567,14 @@ def _atomic_workspace_write(workspace: Path, path: Path, text: str) -> None:
 
 
 def _atomic_workspace_write_portable(root: Path, relative: Path, text: str) -> None:
+    _atomic_workspace_write_bytes_portable(root, relative, text.encode("utf-8"))
+
+
+def _atomic_workspace_write_bytes_portable(
+    root: Path,
+    relative: Path,
+    content: bytes,
+) -> None:
     parent = root
     for component in relative.parts[:-1]:
         parent /= component
@@ -572,8 +584,8 @@ def _atomic_workspace_write_portable(root: Path, relative: Path, text: str) -> N
     target = parent / relative.name
     temporary = parent / f".kestrel-write-{uuid4().hex}"
     try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            handle.write(text)
+        with temporary.open("xb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)

@@ -805,14 +805,13 @@ def test_git_diff_show_and_export_never_surface_or_persist_registered_secret(
     assert shown.success is True
     assert explicit_vault.success is False
     assert explicit_vault.error == "invalid_path"
-    assert exported.success is True
-    assert artifact.exists()
+    assert exported.success is False
+    assert exported.error == "repair_review_required"
+    assert not artifact.exists()
     for payload in (diff.content, shown.content, explicit_vault.content, exported.content):
         assert sentinel not in payload
-    assert sentinel not in artifact.read_text(encoding="utf-8")
     assert "<redacted>" in diff.content
     assert "<redacted>" in shown.content
-    assert "<redacted>" in artifact.read_text(encoding="utf-8")
     assert sentinel in vault.read_text(encoding="utf-8")
 
 
@@ -868,15 +867,13 @@ def test_git_diff_and_export_ignore_windows_autocrlf_config_drift_without_leakin
 
     artifact = tmp_path / ".kestrel" / "improvements" / "crlf-secret" / "diff.patch"
     assert diff.success is True
-    assert exported.success is True
-    assert artifact.exists()
+    assert exported.success is False
+    assert exported.error == "repair_review_required"
+    assert not artifact.exists()
     assert sentinel not in diff.content
     assert sentinel not in exported.content
-    assert sentinel not in artifact.read_text(encoding="utf-8")
     assert "config/runtime-state.json" not in diff.content
-    assert "config/runtime-state.json" not in artifact.read_text(encoding="utf-8")
     assert "<redacted>" in diff.content
-    assert "<redacted>" in artifact.read_text(encoding="utf-8")
     assert sentinel in vault.read_text(encoding="utf-8")
 
     vault.write_bytes(vault.read_bytes().replace(b'"purpose": "test"', b'"purpose": "changed"'))
@@ -894,7 +891,7 @@ def test_git_diff_and_export_ignore_windows_autocrlf_config_drift_without_leakin
     assert blocked_diff.success is False
     assert blocked_diff.error == "git_diff_path_blocked"
     assert blocked_export.success is False
-    assert blocked_export.error == "git_export_path_blocked"
+    assert blocked_export.error == "repair_review_required"
     assert sentinel not in blocked_diff.content
     assert sentinel not in blocked_export.content
     assert not (
@@ -941,10 +938,10 @@ def test_git_diff_and_export_preserve_intentionally_staged_crlf_only_change(
 
     artifact = tmp_path / ".kestrel" / "improvements" / "staged-crlf" / "diff.patch"
     assert diff.success is True
-    assert exported.success is True
+    assert exported.success is False
+    assert exported.error == "unsupported_patch_mode"
     assert "line-endings.txt" in diff.content
-    assert artifact.exists()
-    assert "line-endings.txt" in artifact.read_text(encoding="utf-8")
+    assert not artifact.exists()
 
 
 def test_git_reads_fail_before_deleted_or_historical_custom_vault_can_leak(
@@ -1005,7 +1002,7 @@ def test_git_reads_fail_before_deleted_or_historical_custom_vault_can_leak(
     assert status.success is False
     assert status.error == "git_status_path_blocked"
     assert exported.success is False
-    assert exported.error == "git_export_path_blocked"
+    assert exported.error == "unsupported_patch_mode"
     artifact = (
         tmp_path
         / ".kestrel"
@@ -1087,7 +1084,7 @@ def test_git_diff_and_export_revalidate_paths_from_exact_rendered_patch(
     assert diff.success is False
     assert diff.error == "git_diff_path_blocked"
     assert exported.success is False
-    assert exported.error == "git_export_path_blocked"
+    assert exported.error == "repair_review_required"
     assert sentinel not in diff.content
     assert sentinel not in exported.content
     assert not (
@@ -1158,7 +1155,8 @@ def test_git_reads_disable_repository_configured_diff_processes(
 
     assert diff.success is True
     assert shown.success is True
-    assert exported.success is True
+    assert exported.success is False
+    assert exported.error == "repair_review_required"
     assert not marker.exists()
     artifact = (
         tmp_path
@@ -1167,10 +1165,9 @@ def test_git_reads_disable_repository_configured_diff_processes(
         / f"{driver_kind}-driver"
         / "diff.patch"
     )
-    assert artifact.exists()
+    assert not artifact.exists()
     for payload in (diff.content, shown.content, exported.content):
         assert sentinel not in payload
-    assert sentinel not in artifact.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="test uses an executable POSIX helper")

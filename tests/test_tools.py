@@ -9,13 +9,14 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Any, Literal, cast
 
 import pytest
 from pytest import MonkeyPatch
 
 import nested_memvid_agent.tools.command_tools as command_tools
+import nested_memvid_agent.tools.git_tools as git_tools
 import nested_memvid_agent.tools.process_tools as process_tools
 import nested_memvid_agent.tools.repair_tools as repair_tools
 from nested_memvid_agent.config import AgentConfig
@@ -3730,6 +3731,28 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     assert review.data["commit_gate"]["approval_required_before_commit"] is True
     assert (tmp_path / ".nest" / "repair_reviews" / f"{review.data['review_id']}.json").exists()
 
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "path": ".kestrel/improvements/calculator/diff.patch",
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_e2e",
+    )
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+    assert exported.success, exported.content
+    assert exported.data["exact_reviewed_candidate"] is True
+    assert exported.data["repair_review_id"] == review.data["review_id"]
+    exported_patch = (
+        tmp_path / ".kestrel" / "improvements" / "calculator" / "diff.patch"
+    ).read_text(encoding="utf-8")
+    assert "-    return a - b" in exported_patch
+    assert "+    return a + b" in exported_patch
+
     commit_call = ToolCall(
         name="git.commit",
         arguments={
@@ -3771,6 +3794,336 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
         text=True,
     )
     assert status.stdout.strip() == ""
+
+
+def test_reviewed_patch_export_captures_staged_unstaged_deleted_and_untracked_bytes(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "staged.txt").write_bytes(b"staged before\n")
+    (tmp_path / "unstaged.txt").write_bytes(b"unstaged before\n")
+    (tmp_path / "deleted.txt").write_bytes(b"delete me\n")
+    subprocess.run(
+        ["git", "add", "staged.txt", "unstaged.txt", "deleted.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate fixture"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-complete-candidate"},
+        id="prepare_complete_export",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+
+    (tmp_path / "staged.txt").write_bytes(b"staged after\n")
+    subprocess.run(
+        ["git", "add", "staged.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "unstaged.txt").write_bytes(b"unstaged after\n")
+    (tmp_path / "deleted.txt").unlink()
+    (tmp_path / "new.txt").write_bytes(b"new untracked text\n")
+    (tmp_path / "blob.bin").write_bytes(b"\x00reviewed\xffbinary\n")
+
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_complete_export",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={
+            "validation_id": validation_id,
+            "summary": "Complete candidate export review.",
+        },
+        id="review_complete_export",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success, review.content
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_complete_candidate",
+    )
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+    assert exported.success, exported.content
+    patch_path = tmp_path / str(exported.data["path"])
+    patch_bytes = patch_path.read_bytes()
+    for expected_path in (
+        b"staged.txt",
+        b"unstaged.txt",
+        b"deleted.txt",
+        b"new.txt",
+        b"blob.bin",
+    ):
+        assert expected_path in patch_bytes
+    assert b"GIT binary patch" in patch_bytes
+
+    application = tmp_path.parent / f"{tmp_path.name}-patch-application"
+    subprocess.run(
+        ["git", "clone", "--no-hardlinks", str(tmp_path), str(application)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--detach", base_sha],
+        cwd=application,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "apply", "--binary", str(patch_path)],
+        cwd=application,
+        check=True,
+        capture_output=True,
+    )
+    assert (application / "staged.txt").read_bytes() == b"staged after\n"
+    assert (application / "unstaged.txt").read_bytes() == b"unstaged after\n"
+    assert not (application / "deleted.txt").exists()
+    assert (application / "new.txt").read_bytes() == b"new untracked text\n"
+    assert (application / "blob.bin").read_bytes() == b"\x00reviewed\xffbinary\n"
+
+
+def test_exact_patch_renderer_enforces_disk_backed_output_cap(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "large.bin").write_bytes(b"x" * (128 * 1024))
+    subprocess.run(
+        ["git", "add", "large.bin"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "large output fixture"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(ValueError, match="exceeds 1024 bytes"):
+        git_tools._run_bounded_git_output(
+            tmp_path,
+            ["show", "HEAD:large.bin"],
+            environment=git_tools._sanitized_git_environment(None),
+            deadline=monotonic() + 5.0,
+            maximum_stdout_bytes=1024,
+            maximum_stderr_bytes=1024,
+        )
+
+
+def test_reviewed_patch_export_rejects_post_review_drift(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-drift"},
+        id="prepare_export_drift",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+    (tmp_path / "README.md").write_text("reviewed\n", encoding="utf-8")
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_export_drift",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation_id": validation_id},
+        id="review_export_drift",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success
+    (tmp_path / "README.md").write_text("changed after review\n", encoding="utf-8")
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_drifted_candidate",
+    )
+
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+
+    assert exported.success is False
+    assert exported.error == "repair_review_stale"
+    assert not (tmp_path / ".kestrel").exists()
+
+
+def test_reviewed_patch_export_respects_project_artifact_scope(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    source = source_dir / "module.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "src/module.py"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add scoped source"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-scoped"},
+        id="prepare_scoped_export",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_scoped_export",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation_id": validation_id},
+        id="review_scoped_export",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_scoped_candidate",
+    )
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(allow_file_write=True),
+        workspace=tmp_path,
+        allowed_paths=("src",),
+        approved_tool_call_ids=frozenset({export_call.id}),
+        approved_tool_call_arguments={export_call.id: export_call.arguments},
+    )
+
+    exported = registry.execute(export_call, context)
+
+    assert exported.success is False
+    assert exported.error == "git_export_path_blocked"
+    assert not (tmp_path / ".kestrel").exists()
+
+
+def test_reviewed_patch_export_refuses_to_persist_registered_secret(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _init_git_repo(tmp_path)
+    secret = "opaque-reviewed-export-secret-123456"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-sensitive"},
+        id="prepare_sensitive_export",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+    (tmp_path / "README.md").write_text(
+        f"accidental token: {secret}\n",
+        encoding="utf-8",
+    )
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_sensitive_export",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation_id": validation_id},
+        id="review_sensitive_export",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_sensitive_candidate",
+    )
+
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+
+    assert exported.success is False
+    assert exported.error == "git_export_sensitive_content"
+    assert secret not in exported.content
+    assert not (tmp_path / ".kestrel").exists()
 
 
 def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_path: Path) -> None:
@@ -4172,100 +4525,34 @@ def test_git_create_local_branch_is_local_only_and_approval_gated(
     assert all("push" not in command for command in calls)
 
 
-def test_git_export_patch_writes_local_improvement_patch(
-    tmp_path: Path, monkeypatch: MonkeyPatch
-) -> None:
+def test_git_export_patch_requires_a_current_review_binding(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
-    patch_text = "diff --git a/a.txt b/a.txt\n+hello\n"
     call = ToolCall(
         name="git.export_patch",
         arguments={"path": ".kestrel/improvements/demo/diff.patch"},
         id="export_patch",
     )
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[Any]:
-        del kwargs
-        if "config" in command and "--get-regexp" in command:
-            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
-        if command[-7:] == [
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--ignore-cr-at-eol",
-            "--numstat",
-            "-z",
-        ]:
-            return subprocess.CompletedProcess(command, 0, stdout=b"1\t0\ta.txt\0", stderr=b"")
-        raise AssertionError(f"unexpected direct Git command: {command}")
-
-    def fake_supervised(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del kwargs
-        assert command[-4:] == [
-            "diff",
-            "--ignore-cr-at-eol",
-            "--no-ext-diff",
-            "--no-textconv",
-        ]
-        return subprocess.CompletedProcess(command, 0, stdout=patch_text, stderr="")
-
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools._run_subprocess", fake_supervised)
     result = registry.execute(call, _approved_context(memory, tmp_path, call))
 
-    assert result.success
-    assert result.data["path"] == ".kestrel/improvements/demo/diff.patch"
-    assert (
-        tmp_path / ".kestrel" / "improvements" / "demo" / "diff.patch"
-    ).read_text() == patch_text
+    assert result.success is False
+    assert result.error == "repair_review_required"
+    assert not (tmp_path / ".kestrel" / "improvements" / "demo" / "diff.patch").exists()
 
 
 def test_git_export_patch_default_destination_respects_project_allowed_paths(
     tmp_path: Path,
-    monkeypatch: MonkeyPatch,
 ) -> None:
     (tmp_path / "src").mkdir()
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
-    patch_text = "diff --git a/src/a.txt b/src/a.txt\n+hello\n"
     call = ToolCall(
         name="git.export_patch",
         arguments={},
         id="export_default_scoped_patch",
     )
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[Any]:
-        del kwargs
-        if "config" in command and "--get-regexp" in command:
-            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
-        if command[-7:] == [
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--ignore-cr-at-eol",
-            "--numstat",
-            "-z",
-        ]:
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout=b"1\t0\tsrc/a.txt\0",
-                stderr=b"",
-            )
-        raise AssertionError(f"unexpected direct Git command: {command}")
-
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
-    monkeypatch.setattr(
-        "nested_memvid_agent.tools.git_tools._run_subprocess",
-        lambda command, **_kwargs: subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=patch_text,
-            stderr="",
-        ),
-    )
     context = ToolContext(
         memory=memory,
         config=AgentConfig(allow_file_write=True),
@@ -4278,7 +4565,7 @@ def test_git_export_patch_default_destination_respects_project_allowed_paths(
     result = registry.execute(call, context)
 
     assert result.success is False
-    assert result.error == "git_export_path_blocked"
+    assert result.error == "repair_review_required"
     assert not (tmp_path / ".kestrel").exists()
 
 

@@ -6653,6 +6653,7 @@ def _project_repair_tool_artifact(
             return None
         artifact["validation_id"] = validation_id
         artifact["repair_snapshot"] = snapshot
+        artifact["success"] = validation.get("success") is True
         return artifact
 
     if tool_name == "repair.review":
@@ -6690,6 +6691,20 @@ def _project_repair_tool_artifact(
                 },
             }
         )
+        safe_summary = redact_secrets(str(data.get("summary", "")).strip())
+        if isinstance(safe_summary, str) and safe_summary:
+            artifact["summary"] = safe_summary[:4_096]
+        raw_risks = data.get("risks")
+        if isinstance(raw_risks, list):
+            safe_risks = redact_secrets(
+                [str(item).strip()[:2_048] for item in raw_risks[:32]]
+            )
+            if isinstance(safe_risks, list):
+                artifact["risks"] = [
+                    item
+                    for item in safe_risks
+                    if isinstance(item, str) and item
+                ]
         if diff_preview is not None:
             artifact["diff_preview"] = diff_preview
         return artifact
