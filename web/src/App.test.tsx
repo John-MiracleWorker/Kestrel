@@ -135,6 +135,7 @@ let routineRunNowAmbiguousStatuses: number[];
 let routineRunNowAccepted: Map<string, RoutineOccurrence>;
 let routineRunNowInitialStatus: string;
 let setupReadinessPayload: SetupReadinessReport;
+let setupReadinessFailure: { detail: string; status?: number; reject?: boolean } | null;
 let runtimeProviderName: string;
 let runtimeModelName: string;
 
@@ -366,6 +367,7 @@ describe("App", () => {
     routineRunNowAccepted = new Map();
     routineRunNowInitialStatus = "completed";
     setupReadinessPayload = readinessFixture();
+    setupReadinessFailure = null;
     runtimeProviderName = "mock";
     runtimeModelName = "mock";
     vi.stubGlobal("fetch", vi.fn(fetchMock));
@@ -2260,6 +2262,63 @@ describe("App", () => {
     );
   });
 
+  it.each([
+    ["a setup 5xx response", { detail: "Setup readiness is temporarily unavailable.", status: 503 }],
+    ["a rejected setup request", { detail: "Setup readiness request failed.", reject: true }]
+  ])("does not claim Ready after %s", async (_case, failure) => {
+    approvals = [];
+    setupReadinessFailure = failure;
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Checking setup");
+    });
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Ready");
+    expect(
+      screen.getByText(/could not verify setup readiness/i)
+    ).toBeInTheDocument();
+    expect(
+      within(container.querySelector(".simple-conv-head") as HTMLElement).getByRole(
+        "button",
+        { name: /refresh/i }
+      )
+    ).toBeInTheDocument();
+  });
+
+  it.each(["absent", "unknown"])(
+    "does not claim Ready when experience_mode is %s",
+    async (modeCase) => {
+      approvals = [];
+      const readiness = readinessFixture({
+        next_action: "Review setup before starting a live task."
+      });
+      if (modeCase === "absent") {
+        const { experience_mode: _experienceMode, ...withoutExperienceMode } = readiness;
+        setupReadinessPayload = withoutExperienceMode as SetupReadinessReport;
+      } else {
+        setupReadinessPayload = {
+          ...readiness,
+          experience_mode: "future_mode"
+        } as unknown as SetupReadinessReport;
+      }
+      const { container } = render(<App />);
+
+      await screen.findByRole("heading", { name: "Ask Kestrel" });
+      await waitFor(() => {
+        expect(container.querySelector(".status-pill")).toHaveTextContent("Needs setup");
+      });
+      expect(container.querySelector(".status-pill")).not.toHaveTextContent("Ready");
+      expect(screen.getByText("Review setup before starting a live task.")).toBeInTheDocument();
+      expect(
+        within(container.querySelector(".simple-conv-head") as HTMLElement).getByRole(
+          "button",
+          { name: /^setup$/i }
+        )
+      ).toBeInTheDocument();
+    }
+  );
+
   it("keeps non-provider setup failures above the experience mode", async () => {
     approvals = [];
     setupReadinessPayload = readinessFixture({
@@ -2505,6 +2564,15 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
   const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
   const url = new URL(raw, "http://kestrel.test");
   const path = `${url.pathname}${url.search}`;
+  if (path === "/api/product/setup" && setupReadinessFailure?.reject) {
+    throw new Error(setupReadinessFailure.detail);
+  }
+  if (path === "/api/product/setup" && setupReadinessFailure) {
+    return jsonResponse(
+      { detail: setupReadinessFailure.detail },
+      setupReadinessFailure.status ?? 503
+    );
+  }
   if (path === "/api/runs" && init?.method === "POST") {
     const body = JSON.parse(String(init.body ?? "{}"));
     const run: Run = {

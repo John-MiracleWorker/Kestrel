@@ -5107,16 +5107,31 @@ function simpleChatStatus(
       action: "model-settings"
     };
   }
+  if (setupReadiness?.experience_mode === "connected" && setupReadiness.ready) {
+    return {
+      label: "Ready",
+      detail: activeRun ? "Kestrel is ready for the next message." : "Start a chat to begin."
+    };
+  }
+  if (!setupReadiness) {
+    return {
+      label: "Checking setup",
+      detail: "Kestrel could not verify setup readiness. Refresh before relying on this connection."
+    };
+  }
   return {
-    label: "Ready",
-    detail: activeRun ? "Kestrel is ready for the next message." : "Start a chat to begin."
+    label: "Needs setup",
+    detail:
+      setupReadiness.next_action ||
+      "Kestrel received an unrecognized setup state. Review setup before relying on this connection.",
+    action: "setup"
   };
 }
 
 function firstNonProviderSetupIssue(
   setupReadiness: SetupReadinessReport | null
 ) {
-  if (!setupReadiness) return null;
+  if (!setupReadiness || !Array.isArray(setupReadiness.checks)) return null;
   return setupReadiness.checks.find(
     (check) =>
       check.status !== "pass" &&
