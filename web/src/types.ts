@@ -1,5 +1,6 @@
 export type Run = {
   run_id: string;
+  project_id?: string | null;
   status: string;
   message: string;
   session_id: string;

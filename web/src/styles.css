@@ -3920,6 +3920,34 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
   margin: -28px 0 24px;
 }
 
+.advanced-surface-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -18px 0 28px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--rule-strong);
+}
+
+.advanced-surface-nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  color: var(--ink-soft);
+  border: 1px solid var(--rule-strong);
+  border-radius: 5px;
+  background: rgba(28, 27, 27, .82);
+  font: 600 12px/1 var(--sans);
+  cursor: pointer;
+}
+
+.advanced-surface-nav button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 @media (max-width: 1180px) {
   .stitch-command-deck {
     grid-template-columns: 1fr;

@@ -201,6 +201,12 @@ function installRoutineHistoryPollTimers() {
   };
 }
 
+function openAdvancedWorkspace(name: "Routines" | "Routing" | "Settings") {
+  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  const workspaceNav = screen.getByRole("navigation", { name: "Advanced workspaces" });
+  fireEvent.click(within(workspaceNav).getByRole("button", { name }));
+}
+
 describe("App", () => {
   beforeEach(() => {
     runs = [otherRun, secondRun, baseRun];
@@ -394,7 +400,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /new chat/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
     expect(screen.getByText("Safe Auto")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /routing/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /workbench/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /advanced/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /chats/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /details/i })).toBeInTheDocument();
@@ -411,11 +417,27 @@ describe("App", () => {
     expect(results.violations).toEqual([]);
   });
 
+  it("opens the task-first Workbench with a durable project selector", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+
+    expect(await screen.findByRole("heading", { name: "What should Kestrel accomplish?" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Kestrel" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
+    expect(
+      screen.getByText(
+        "No run will start until you inspect the route, permissions, validation, and rollback projection."
+      )
+    ).toBeInTheDocument();
+  });
+
   it("opens the Adaptive Flock Routing Center from primary navigation", async () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /routing/i }));
+    openAdvancedWorkspace("Routing");
 
     expect(await screen.findByRole("heading", { name: "Adaptive Flock Routing" })).toBeInTheDocument();
     expect((await screen.findAllByText("Local server")).length).toBeGreaterThan(0);
@@ -569,7 +591,7 @@ describe("App", () => {
     const { container } = render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     const workbench = await screen.findByRole("region", { name: "Routine Workbench" });
     expect(within(workbench).getByRole("heading", { name: "Routine Workbench." })).toBeInTheDocument();
@@ -598,7 +620,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     expect(await screen.findByText("Proactive dispatch is disabled.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run Morning review now" })).toBeDisabled();
@@ -611,7 +633,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     expect(await screen.findByText("routine_status_unavailable")).toBeInTheDocument();
     expect(screen.getAllByText("Morning review").length).toBeGreaterThan(0);
@@ -624,7 +646,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     await waitFor(() => {
@@ -673,7 +695,7 @@ describe("App", () => {
 
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     const acceptedResult = await waitFor(() => {
@@ -737,7 +759,7 @@ describe("App", () => {
 
     render(<App />);
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     await screen.findByText("run_routine_1");
     await waitFor(() => expect(timers.count()).toBe(1));
     const staleSelectionPoll = timers.takeNext();
@@ -756,7 +778,7 @@ describe("App", () => {
     await screen.findByText("run_routine_1");
     await waitFor(() => expect(timers.count()).toBe(1));
     const staleUnmountPoll = timers.takeNext();
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
     await screen.findByRole("heading", { name: "Ask Kestrel" });
     const callsAfterUnmount = fetchSpy.mock.calls.length;
     await act(async () => {
@@ -773,7 +795,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     expect(await screen.findByText(/No response was received for Morning review/)).toBeInTheDocument();
@@ -782,9 +804,9 @@ describe("App", () => {
     const stored = JSON.parse(String(sessionStorage.getItem(storageKey)));
     expect(stored.expectedRevision).toBe(3);
 
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Retry Morning review now" }));
 
     await waitFor(() => {
@@ -807,7 +829,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     expect(await screen.findByText(/server returned 500 before confirming the outcome/i)).toBeInTheDocument();
@@ -1364,7 +1386,7 @@ describe("App", () => {
     expect(workspace).not.toBeNull();
     workspace!.scrollTop = 420;
 
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     await screen.findByRole("region", { name: "Routine Workbench" });
     expect(workspace!.scrollTop).toBe(0);
@@ -1729,7 +1751,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
     fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "codex-cli" } });
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4" } });
@@ -1793,7 +1815,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
 
     const card = await screen.findByRole("group", { name: /telegram setup/i });
@@ -1883,7 +1905,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
 
     expect(within(center).getAllByText(/Blocked by:/).some((item) => item.parentElement?.textContent?.includes("allow shell"))).toBe(true);
@@ -1972,7 +1994,7 @@ describe("App", () => {
     expect(within(await screen.findByLabelText("MCP tool")).queryByRole("option", { name: /read_file/ })).not.toBeInTheDocument();
     expect(within(screen.getByLabelText("Skill")).queryByRole("option", { name: "writer" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("switch", { name: "Enable Filesystem MCP" }));
     await within(center).findByRole("switch", { name: "Disable Filesystem MCP" });
@@ -2050,7 +2072,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("switch", { name: "Enable Shell run" }));
 
@@ -2068,7 +2090,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("button", { name: "Reauthorize" }));
 
@@ -2086,7 +2108,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("switch", { name: "Disable Memory search" }));
 
@@ -2099,7 +2121,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
     fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "ollama-cloud" } });
 
@@ -2115,7 +2137,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
 
     expect(screen.getByRole("option", { name: /LM Studio/i })).toBeInTheDocument();
@@ -2172,7 +2194,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
 
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "deepseek-v4-pro" } });
@@ -3110,6 +3132,32 @@ function payloadFor(path: string): unknown {
   }
   if (path === "/api/product/setup") {
     return setupReadinessPayload;
+  }
+  if (path === "/api/projects") {
+    return {
+      items: [
+        {
+          project_id: "project_kestrel",
+          display_name: "Kestrel",
+          repository_path: "/tmp/kestrel",
+          remote: null,
+          default_branch: "main",
+          allowed_paths: ["."],
+          provider_policy: {},
+          cost_budget: 1.5,
+          privacy_class: "local_required",
+          test_recipes: [{ name: "pytest", command: "pytest -q" }],
+          build_recipes: [],
+          capability_ceiling: ["file.read"],
+          baseline_index_digest: null,
+          archived_at: null,
+          revision: 1,
+          created_at: "2026-05-16T00:00:00Z",
+          updated_at: "2026-05-16T00:00:00Z"
+        }
+      ],
+      count: 1
+    };
   }
   if (path === "/api/runtime/config") {
     return {

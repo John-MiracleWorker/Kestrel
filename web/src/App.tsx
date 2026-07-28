@@ -41,6 +41,8 @@ import remarkGfm from "remark-gfm";
 import { ApiAuthError, ApiResponseError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
+import { MissionControl } from "./mission/MissionControl";
+import type { MissionLaunch } from "./mission/types";
 import { RoutingCenter } from "./routing/RoutingCenter";
 import {
   activityItemsForEvents,
@@ -105,7 +107,7 @@ type ProviderOption = {
   requiresKey?: boolean;
 };
 
-type AppSection = "chat" | "routines" | "routing" | "advanced" | "settings";
+type AppSection = "mission" | "chat" | "routines" | "routing" | "advanced" | "settings";
 
 type SimpleChatStatus = {
   label: string;
@@ -264,6 +266,7 @@ const emptyCapabilitySnapshot: CapabilitySnapshot = {
 };
 const capabilityKindOrder: CapabilityKind[] = ["mcp_server", "tool", "skill"];
 const HASH_ROUTING_ENABLED = typeof navigator === "undefined" || !navigator.userAgent.toLowerCase().includes("jsdom");
+const DEFAULT_APP_SECTION: AppSection = HASH_ROUTING_ENABLED ? "mission" : "chat";
 const runEventTypes = [
   "run.queued",
   "run.started",
@@ -424,7 +427,7 @@ export function App() {
   const [localThreads, setLocalThreads] = useState<ThreadSummary[]>([]);
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
-  const activeSectionRef = useRef<AppSection>("chat");
+  const activeSectionRef = useRef<AppSection>(DEFAULT_APP_SECTION);
   const threadRunsRef = useRef<Run[]>([]);
   const topbarRef = useRef<HTMLElement | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
@@ -434,7 +437,7 @@ export function App() {
   const memoryBackendHydratedRef = useRef(false);
   const setupDraftHydratedRef = useRef(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [activeSection, setActiveSection] = useState<AppSection>("chat");
+  const [activeSection, setActiveSection] = useState<AppSection>(DEFAULT_APP_SECTION);
 
   const [message, setMessage] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -1203,41 +1206,69 @@ export function App() {
   async function submitRun(event: FormEvent) {
     event.preventDefault();
     await guarded(async () => {
-      if (!message.trim() || !runtime) return;
-      followTranscriptRef.current = true;
-      const targetSessionId = sessionId.trim() || activeSessionIdRef.current || createThreadId();
-      const payload: Record<string, unknown> = {
-        message,
-        session_id: targetSessionId,
-        autonomy_mode: submissionAutonomyMode(autonomyMode)
-      };
-      if (workspace.trim()) payload.workspace = workspace.trim();
-      const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
-      const runtimeModel = String((runtime as RuntimeConfig | null)?.provider?.model ?? "");
-      if (provider.trim() && provider.trim() !== runtimeProvider) payload.provider = provider.trim();
-      if (model.trim() && model.trim() !== runtimeModel) payload.model = model.trim();
-      const run = await postJson<Run>("/api/runs", payload);
-      setMessage("");
-      selectSessionId(run.session_id);
-      selectRunId(run.run_id);
-      setThreadRuns((rows) => [...rows.filter((row) => row.run_id !== run.run_id), run]);
-      setLocalThreads((threads) => [
-        {
-          session_id: run.session_id,
-          title: deriveThreadTitle(run.message),
-          latest_message: run.message,
-          latest_status: run.status,
-          latest_run_id: run.run_id,
-          run_count: Math.max(1, (threads.find((thread) => thread.session_id === run.session_id)?.run_count ?? 0) + 1),
-          updated_at: run.updated_at,
-          is_local: true
-        },
-        ...threads.filter((thread) => thread.session_id !== run.session_id)
-      ]);
-      await refreshSummary();
-      await refreshThreadRuns(run.session_id);
-      await refreshRunDetails(run.run_id);
+      await enqueueRun({
+        objective: message,
+        sessionId: sessionId.trim() || activeSessionIdRef.current || createThreadId(),
+        workspace: workspace.trim() || null
+      });
     }, "Run queued.");
+  }
+
+  async function launchMission(mission: MissionLaunch) {
+    await enqueueRun({
+      objective: mission.objective,
+      sessionId: createThreadId(),
+      workspace: mission.project.repository_path,
+      projectId: mission.project.project_id
+    });
+    setNotice("Mission queued.");
+  }
+
+  async function enqueueRun({
+    objective,
+    sessionId: targetSessionId,
+    workspace: targetWorkspace,
+    projectId
+  }: {
+    objective: string;
+    sessionId: string;
+    workspace: string | null;
+    projectId?: string;
+  }) {
+    if (!objective.trim() || !runtime) return;
+    followTranscriptRef.current = true;
+    const payload: Record<string, unknown> = {
+      message: objective.trim(),
+      session_id: targetSessionId,
+      autonomy_mode: submissionAutonomyMode(autonomyMode)
+    };
+    if (targetWorkspace) payload.workspace = targetWorkspace;
+    if (projectId) payload.project_id = projectId;
+    const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
+    const runtimeModel = String((runtime as RuntimeConfig | null)?.provider?.model ?? "");
+    if (provider.trim() && provider.trim() !== runtimeProvider) payload.provider = provider.trim();
+    if (model.trim() && model.trim() !== runtimeModel) payload.model = model.trim();
+    const run = await postJson<Run>("/api/runs", payload);
+    setMessage("");
+    selectSessionId(run.session_id);
+    selectRunId(run.run_id);
+    setThreadRuns((rows) => [...rows.filter((row) => row.run_id !== run.run_id), run]);
+    setLocalThreads((threads) => [
+      {
+        session_id: run.session_id,
+        title: deriveThreadTitle(run.message),
+        latest_message: run.message,
+        latest_status: run.status,
+        latest_run_id: run.run_id,
+        run_count: Math.max(1, (threads.find((thread) => thread.session_id === run.session_id)?.run_count ?? 0) + 1),
+        updated_at: run.updated_at,
+        is_local: true
+      },
+      ...threads.filter((thread) => thread.session_id !== run.session_id)
+    ]);
+    await refreshSummary();
+    await refreshThreadRuns(run.session_id);
+    await refreshRunDetails(run.run_id);
   }
 
   function createNewThread() {
@@ -1889,10 +1920,8 @@ export function App() {
             </span>
           </a>
           <nav className="primary-nav" aria-label="Primary">
-            <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => routeToSection("chat")}>Chat</button>
-            <button type="button" className={activeSection === "routines" ? "active" : ""} onClick={() => routeToSection("routines")}>Routines</button>
-            <button type="button" className={activeSection === "routing" ? "active" : ""} onClick={() => routeToSection("routing")}>Routing</button>
-            <button type="button" className={activeSection === "settings" ? "active" : ""} onClick={() => routeToSection("settings")}>Settings</button>
+            <button type="button" className={activeSection === "mission" ? "active" : ""} onClick={() => routeToSection("mission")}>Workbench</button>
+            <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => routeToSection("chat")}>History</button>
             <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => routeToSection("advanced")}>Advanced</button>
           </nav>
           <div className="topbar-meta">
@@ -1948,6 +1977,25 @@ export function App() {
             </Panel>
           </section>
         </main>
+      ) : activeSection === "mission" ? (
+        <MissionControl
+          runs={runs}
+          activeRun={activeRun}
+          taskGraph={taskGraph}
+          approvals={approvals}
+          events={activeRunEvents}
+          onLaunch={launchMission}
+          onOpenRun={(run) => {
+            void selectRun(run.run_id);
+          }}
+          onOpenHistory={() => routeToSection("chat")}
+          onOpenAdvanced={() => routeToSection("advanced")}
+          onOpenDiagnostics={() => jumpToAdvanced("observability")}
+          onAuthRequired={() => {
+            setAuthPromptOpen(true);
+            setApiTokenDraft(getApiToken());
+          }}
+        />
       ) : (
       <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`} data-active-section={activeSection}>
       <a className="skip-link" href="#workspace">Skip to workspace</a>
@@ -2152,6 +2200,17 @@ export function App() {
                 </button>
               </div>
             </header>
+            <nav className="advanced-surface-nav" aria-label="Advanced workspaces">
+              <button type="button" onClick={() => routeToSection("routines")}>
+                <CalendarClock size={15} /> Routines
+              </button>
+              <button type="button" onClick={() => routeToSection("routing")}>
+                <Route size={15} /> Routing
+              </button>
+              <button type="button" onClick={() => routeToSection("settings")}>
+                <Settings size={15} /> Settings
+              </button>
+            </nav>
             {error && <ActionError message={error} onDismiss={() => setError(null)} />}
             <section className="stitch-command-deck advanced-overview" aria-label="Advanced overview">
               <div className="stitch-hero-card">
@@ -5203,7 +5262,8 @@ function createThreadId(): string {
 
 function sectionFromHash(hash: string): AppSection | null {
   const normalized = hash.replace(/^#/, "").toLowerCase();
-  return normalized === "chat" ||
+  return normalized === "mission" ||
+    normalized === "chat" ||
     normalized === "routines" ||
     normalized === "routing" ||
     normalized === "advanced" ||
