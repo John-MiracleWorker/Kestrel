@@ -121,6 +121,8 @@ def test_setup_readiness_reports_first_run_prerequisites(tmp_path: Path) -> None
     )
 
     assert report.schema == "kestrel.setup_readiness.v1"
+    assert report.experience_mode.value == "demo"
+    assert report.to_dict()["experience_mode"] == "demo"
     assert report.fail_count == 0
     assert report.ready is True
     checks = {check.check_id: check for check in report.checks}
@@ -129,6 +131,111 @@ def test_setup_readiness_reports_first_run_prerequisites(tmp_path: Path) -> None
     assert checks["api_auth"].status == SetupReadinessStatus.WARN
     assert checks["proactive_routines"].status == SetupReadinessStatus.PASS
     assert checks["validation_container"].status == SetupReadinessStatus.PASS
+
+
+def test_setup_readiness_distinguishes_demo_disconnected_and_connected_modes(
+    tmp_path: Path,
+) -> None:
+    mock = AgentConfig(provider="mock", model="mock", workspace=tmp_path)
+    missing_credential = AgentConfig(
+        provider="openai",
+        model="gpt-test",
+        api_key_env="MISSING_KESTREL_MODE_TEST_KEY",
+        workspace=tmp_path,
+    )
+    unvalidated = AgentConfig(
+        provider="openai-compatible",
+        model="local-model",
+        base_url="http://127.0.0.1:1234/v1",
+        workspace=tmp_path,
+    )
+
+    global_provider_health_registry.reset()
+    try:
+        assert build_setup_readiness_report(mock).experience_mode.value == "demo"
+        missing_report = build_setup_readiness_report(missing_credential)
+        assert missing_report.experience_mode.value == "model_not_connected"
+        assert missing_report.ready is False
+        assert (
+            build_setup_readiness_report(unvalidated).experience_mode.value
+            == "model_not_connected"
+        )
+
+        global_provider_health_registry.record_failure(
+            provider_health_id(unvalidated),
+            failure_class="endpoint_unreachable",
+            retryable=False,
+            failure_threshold=3,
+        )
+        assert (
+            build_setup_readiness_report(unvalidated).experience_mode.value
+            == "model_not_connected"
+        )
+
+        global_provider_health_registry.record_success(
+            provider_health_id(unvalidated)
+        )
+        connected = build_setup_readiness_report(unvalidated)
+        assert connected.experience_mode.value == "connected"
+        assert connected.to_dict()["experience_mode"] == "connected"
+    finally:
+        global_provider_health_registry.reset()
+
+
+def test_setup_readiness_next_action_prioritizes_non_provider_failures(
+    tmp_path: Path,
+) -> None:
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="openai",
+            model="gpt-test",
+            api_key_env="MISSING_KESTREL_ACTION_TEST_KEY",
+            workspace=tmp_path / "missing-workspace",
+        )
+    )
+
+    assert report.experience_mode.value == "model_not_connected"
+    assert report.next_action.startswith("Create the workspace")
+
+
+def test_setup_readiness_gives_mode_specific_next_actions(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    monkeypatch.setenv("KESTREL_READINESS_API_TOKEN", "configured-for-test")
+    shared = {
+        "workspace": tmp_path,
+        "memory_dir": memory_dir,
+        "state_path": state_dir / "agent.db",
+        "log_dir": logs_dir,
+        "enable_worker_isolation": True,
+        "require_api_auth": True,
+        "api_auth_token_env": "KESTREL_READINESS_API_TOKEN",
+    }
+
+    demo = build_setup_readiness_report(
+        AgentConfig(provider="mock", model="mock", **shared)
+    )
+    disconnected = build_setup_readiness_report(
+        AgentConfig(
+            provider="openai-compatible",
+            model="local-model",
+            base_url="http://127.0.0.1:1234/v1",
+            **shared,
+        )
+    )
+
+    assert demo.next_action.startswith("Demo is ready.")
+    assert "`kestrel chat`" in demo.next_action
+    assert disconnected.experience_mode.value == "model_not_connected"
+    assert "live provider smoke request" in disconnected.next_action
 
 
 def test_setup_readiness_requires_pinned_oci_image_for_arbitrary_code_tools(
