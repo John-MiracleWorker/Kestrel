@@ -655,9 +655,21 @@ def test_final_delete_race_preserves_swapped_shim_and_quarantine(
     monkeypatch.setattr(module, "_before_quarantine_delete", _replace_quarantine_with_marker)
     with pytest.raises(module.LauncherArtifactError, match="quarantined"):
         module.rollback_launchers(manifest)
-    attacker = next(bin_dir.glob(".kestrel-quarantine-*"))
+    quarantines = list(bin_dir.glob(".kestrel-quarantine-*"))
+    attacker = next(
+        path
+        for path in quarantines
+        if path.is_file()
+        and path.read_text(encoding="utf-8") == "attacker marker must survive"
+    )
     assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
-    assert list(bin_dir.glob("*.preserved"))
+    preserved = next(
+        path
+        for path in quarantines
+        if path.name.endswith(".preserved")
+    )
+    assert preserved.is_file()
+    assert module.SHIM_MARKER in preserved.read_text(encoding="utf-8")
 
 
 def test_final_delete_race_preserves_swapped_backup_and_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -683,9 +695,23 @@ def test_final_delete_race_preserves_swapped_backup_and_app(tmp_path: Path, monk
     monkeypatch.setattr(module, "_before_quarantine_delete", race_only_app)
     with pytest.raises(module.LauncherArtifactError, match="quarantined"):
         module.commit_launchers(manifest)
-    attacker = next(app_parent.glob(".kestrel-quarantine-*"))
+    quarantines = list(app_parent.glob(".kestrel-quarantine-*"))
+    attacker = next(
+        path
+        for path in quarantines
+        if path.is_file()
+        and path.read_text(encoding="utf-8") == "attacker marker must survive"
+    )
     assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
-    assert list(app_parent.glob("*.preserved"))
+    preserved = next(
+        path
+        for path in quarantines
+        if path.name.endswith(".preserved")
+    )
+    assert preserved.is_dir()
+    assert (
+        preserved / "Contents" / "Resources" / module.APP_MARKER_FILENAME
+    ).read_text(encoding="utf-8") == f"{module.APP_MARKER}\n"
 
 
 def test_final_delete_race_preserves_swapped_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -700,6 +726,21 @@ def test_final_delete_race_preserves_swapped_manifest(tmp_path: Path, monkeypatc
     monkeypatch.setattr(module, "_before_quarantine_delete", _replace_quarantine_with_marker)
     with pytest.raises(module.LauncherArtifactError, match="quarantined"):
         module.commit_launchers(manifest)
-    attacker = next(manifest.parent.glob(".kestrel-quarantine-*"))
+    quarantines = list(manifest.parent.glob(".kestrel-quarantine-*"))
+    attacker = next(
+        path
+        for path in quarantines
+        if path.is_file()
+        and path.read_text(encoding="utf-8") == "attacker marker must survive"
+    )
     assert attacker.read_text(encoding="utf-8") == "attacker marker must survive"
-    assert list(manifest.parent.glob("*.preserved"))
+    preserved = next(
+        path
+        for path in quarantines
+        if path.name.endswith(".preserved")
+    )
+    assert preserved.is_file()
+    assert (
+        json.loads(preserved.read_text(encoding="utf-8"))["schema"]
+        == module.MANIFEST_SCHEMA
+    )
