@@ -267,6 +267,78 @@ def test_plan_fallback_does_not_create_the_fallback_directory(tmp_path: Path) ->
     assert not (user_home / ".local").exists()
 
 
+def test_plan_baseline_proves_no_public_mutation_without_manifest(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    first_manifest = home / ".nest" / "transactions" / "first.json"
+    module.prepare_launchers(
+        kestrel_home=home,
+        user_home=user_home,
+        manifest_path=first_manifest,
+        bin_dir=bin_dir,
+        platform="linux",
+        environ={"PATH": str(bin_dir)},
+    )
+    module.commit_launchers(first_manifest)
+    plan = module.plan_launchers(
+        kestrel_home=home,
+        user_home=user_home,
+        bin_dir=bin_dir,
+        platform="linux",
+        environ={"PATH": str(bin_dir)},
+    )
+
+    assert module.verify_plan_unchanged(json.dumps(plan)) == {"unchanged": True}
+
+    replacement_home = _kestrel_home(tmp_path / "replacement")
+    replacement_manifest = home / ".nest" / "transactions" / "replacement.json"
+    module.prepare_launchers(
+        kestrel_home=replacement_home,
+        user_home=user_home,
+        manifest_path=replacement_manifest,
+        bin_dir=bin_dir,
+        platform="linux",
+        environ={"PATH": str(bin_dir)},
+    )
+    replacement_manifest.unlink()
+    with pytest.raises(module.LauncherArtifactError, match="identity changed"):
+        module.verify_plan_unchanged(json.dumps(plan))
+
+
+def test_prepare_persists_manifest_before_any_public_launcher_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+
+    def fail_manifest(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated durable manifest failure")
+
+    monkeypatch.setattr(module, "_write_manifest", fail_manifest)
+    with pytest.raises(OSError, match="durable manifest"):
+        module.prepare_launchers(
+            kestrel_home=home,
+            user_home=user_home,
+            manifest_path=manifest,
+            bin_dir=bin_dir,
+            platform="linux",
+            environ={"PATH": str(bin_dir)},
+        )
+
+    assert not (bin_dir / "kestrel").exists()
+    assert not manifest.exists()
+
+
 def test_prepare_refuses_unrelated_existing_shim_before_mutation(
     tmp_path: Path,
 ) -> None:

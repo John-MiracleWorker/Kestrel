@@ -9,6 +9,7 @@ DEFAULT_WHEEL_URL=""
 DEFAULT_CHECKSUMS_URL=""
 DEFAULT_RELEASE_SHA=""
 DEFAULT_RELEASE_VERSION=""
+DEFAULT_LAUNCHER_HELPER_SHA256="51faef62d2c240a59e83769ca6dc837093cca3e36ec2a7c38472c19ed5badd98"
 DEFAULT_PORT="8765"
 DEFAULT_START_SERVER="0"
 DEFAULT_OPEN_BROWSER="0"
@@ -51,6 +52,8 @@ STARTED_SERVER_PGID=""
 SERVER_LAUNCH_ATTEMPTED=0
 RELEASE_USER_LAUNCHERS_PREPARED=0
 RELEASE_USER_LAUNCHER_MANIFEST=""
+RELEASE_USER_LAUNCHER_MANAGER=""
+RELEASE_USER_LAUNCHER_PLAN=""
 INSTALLED_KESTREL_SHIM=""
 INSTALLED_KESTREL_BIN_DIR=""
 INSTALLED_KESTREL_BIN_ON_PATH=1
@@ -240,6 +243,9 @@ start_release_install_transaction() {
   RELEASE_STATE_PATH="$KESTREL_STATE_PATH"
   RELEASE_STATE_PREVIOUS_PATH="${KESTREL_STATE_PATH}.release-previous"
   RELEASE_USER_LAUNCHER_MANIFEST="${KESTREL_HOME}/.nest/user-launchers.install.json"
+  RELEASE_USER_LAUNCHERS_PREPARED=0
+  RELEASE_USER_LAUNCHER_MANAGER=""
+  RELEASE_USER_LAUNCHER_PLAN=""
   trap 'release_install_exit_trap "$?"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -259,45 +265,87 @@ prepare_release_venv_replacement() {
   RELEASE_VENV_NEW_STARTED=1
 }
 
+launcher_helper_source_url() {
+  local repository="${KESTREL_REPO%.git}"
+  local prefix="https://github.com/"
+  [[ "$repository" == "${prefix}"* ]] || return 1
+  local relative="${repository#"$prefix"}"
+  local owner="${relative%%/*}"
+  local name="${relative#*/}"
+  [[ -n "$owner" && -n "$name" && "$name" != */* ]] || return 1
+  [[ "$owner" =~ ^[A-Za-z0-9_.-]+$ && "$name" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+    return 1
+  local revision="${DEFAULT_RELEASE_SHA:-${KESTREL_REF:-}}"
+  [[ -n "$revision" && "$revision" != *..* ]] || return 1
+  [[ "$revision" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+  printf 'https://raw.githubusercontent.com/%s/%s/%s/scripts/manage_user_launchers.py\n' \
+    "$owner" "$name" "$revision"
+}
+
+run_verified_in_memory_launcher_plan() {
+  local helper_url
+  if ! helper_url="$(launcher_helper_source_url)"; then
+    log "ERROR: cannot derive the checksum-bound launcher helper URL from ${KESTREL_REPO}."
+    return 1
+  fi
+  [[ "$DEFAULT_LAUNCHER_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+    log "ERROR: installer launcher-helper checksum is invalid."
+    return 1
+  }
+  command -v curl >/dev/null 2>&1 || {
+    log "ERROR: curl is required for checksum-bound stdin launcher planning."
+    return 1
+  }
+  log "+ fetch and verify in-memory launcher planner ${helper_url}" >&2
+  curl --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' "$helper_url" |
+    "$PYTHON_BIN" -c '
+import hashlib
+import sys
+
+expected, source_url, *arguments = sys.argv[1:]
+source = sys.stdin.buffer.read()
+actual = hashlib.sha256(source).hexdigest()
+if actual != expected:
+    sys.stderr.write(
+        f"ERROR: launcher helper checksum mismatch: expected {expected}, got {actual}\n"
+    )
+    raise SystemExit(1)
+namespace = {
+    "__name__": "kestrel_verified_in_memory_launcher_planner",
+    "__file__": source_url,
+}
+exec(compile(source, source_url, "exec"), namespace)
+runner = namespace.get("run")
+if not callable(runner):
+    sys.stderr.write("ERROR: verified launcher helper has no callable planner\n")
+    raise SystemExit(1)
+raise SystemExit(runner(["plan", *arguments]))
+' "$DEFAULT_LAUNCHER_HELPER_SHA256" "$helper_url" "$@"
+}
+
 prepare_user_launchers() {
   local requested_bin_dir="${KESTREL_BIN_DIR:-}"
   local launcher_manager="${KESTREL_HOME}/scripts/manage_user_launchers.py"
-  if [[ -L "$launcher_manager" ]]; then
-    die "Installed checkout has an unsafe Kestrel user-launcher manager: ${launcher_manager}"
-  fi
-  if [[ ! -f "$launcher_manager" ]] && is_true "${KESTREL_DRY_RUN:-}"; then
+  local local_helper_available=1
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    # A dry run must use the helper belonging to this installer, not a
+    # potentially older helper in the target checkout.
+    local_helper_available=0
     local installer_source="${BASH_SOURCE[0]:-}"
     if [[ -n "$installer_source" && "$installer_source" != "/dev/stdin" ]]; then
       local source_launcher_manager
       source_launcher_manager="$(dirname "$installer_source")/scripts/manage_user_launchers.py"
       if [[ ! -L "$source_launcher_manager" && -f "$source_launcher_manager" ]]; then
         launcher_manager="$source_launcher_manager"
+        local_helper_available=1
       fi
     fi
-  fi
-  if [[ -L "$launcher_manager" || ! -f "$launcher_manager" ]]; then
-    if is_true "${KESTREL_DRY_RUN:-}"; then
-      # A curl-to-stdin or detached staged installer has no adjacent helper
-      # before its printed checkout step runs. Do not invent a target in that
-      # case: the real install will run the same selection and collision code
-      # inside the verified transactional helper after checkout.
-      INSTALLED_KESTREL_SHIM=""
-      INSTALLED_KESTREL_BIN_DIR=""
-      INSTALLED_KESTREL_BIN_ON_PATH=1
-      log "DRY RUN: launcher target selection is deferred until the verified non-mutating helper is available; no launcher path or collision result is being claimed."
-      return 0
-    fi
+  elif [[ -L "$launcher_manager" || ! -f "$launcher_manager" ]]; then
     die "Kestrel user-launcher planning helper is unavailable or unsafe: ${launcher_manager}"
   fi
 
-  local launcher_action="prepare"
-  if is_true "${KESTREL_DRY_RUN:-}"; then
-    launcher_action="plan"
-  fi
-  local launcher_command=(
-    "$PYTHON_BIN"
-    "$launcher_manager"
-    "$launcher_action"
+  local launcher_arguments=(
     --kestrel-home
     "$KESTREL_HOME"
     --user-home
@@ -309,38 +357,39 @@ prepare_user_launchers() {
     --memory-dir
     "${KESTREL_HOME}/.nest/memory"
   )
-  if [[ "$launcher_action" == "prepare" ]]; then
-    launcher_command+=(--manifest "$RELEASE_USER_LAUNCHER_MANIFEST")
-  fi
   if [[ -n "$requested_bin_dir" ]]; then
-    launcher_command+=(--bin-dir "$requested_bin_dir")
+    launcher_arguments+=(--bin-dir "$requested_bin_dir")
   fi
 
-  log "+ $(quote_cmd "${launcher_command[@]}")"
-  local launcher_result
-  if ! launcher_result="$("${launcher_command[@]}")"; then
-    die "Unable to ${launcher_action} the Kestrel user launchers."
+  local launcher_plan
+  if [[ "$local_helper_available" -eq 1 ]]; then
+    local plan_command=(
+      "$PYTHON_BIN" "$launcher_manager" plan "${launcher_arguments[@]}"
+    )
+    log "+ $(quote_cmd "${plan_command[@]}")"
+    if ! launcher_plan="$("${plan_command[@]}")"; then
+      die "Unable to plan the Kestrel user launchers."
+    fi
+  elif ! launcher_plan="$(
+    run_verified_in_memory_launcher_plan "${launcher_arguments[@]}"
+  )"; then
+    die "Unable to run the verified in-memory Kestrel launcher plan."
   fi
-  if [[ "$launcher_action" == "prepare" ]]; then
-    # The helper has atomically installed the artifacts and persisted
-    # everything required for rollback before returning success. Set this flag
-    # before parsing display metadata so any later failure still restores it.
-    RELEASE_USER_LAUNCHERS_PREPARED=1
-  fi
+
   if ! INSTALLED_KESTREL_SHIM="$(
     "$PYTHON_BIN" -c \
       'import json, sys; print(json.loads(sys.argv[1])["shim_path"])' \
-      "$launcher_result"
+      "$launcher_plan"
   )"; then
-    die "Kestrel user-launcher metadata was invalid after installation."
+    die "Kestrel user-launcher plan metadata was invalid."
   fi
   INSTALLED_KESTREL_BIN_DIR="$(dirname "$INSTALLED_KESTREL_SHIM")"
   if ! INSTALLED_KESTREL_BIN_ON_PATH="$(
     "$PYTHON_BIN" -c \
       'import json, sys; print("1" if json.loads(sys.argv[1])["bin_on_path"] else "0")' \
-      "$launcher_result"
+      "$launcher_plan"
   )"; then
-    die "Kestrel user-launcher PATH metadata was invalid after installation."
+    die "Kestrel user-launcher PATH plan metadata was invalid."
   fi
   if is_true "${KESTREL_DRY_RUN:-}"; then
     log "DRY RUN: would install the Kestrel command shim at ${INSTALLED_KESTREL_SHIM}"
@@ -348,7 +397,7 @@ prepare_user_launchers() {
     if ! planned_app="$(
       "$PYTHON_BIN" -c \
         'import json, sys; print(json.loads(sys.argv[1])["app_path"] or "")' \
-        "$launcher_result"
+        "$launcher_plan"
     )"; then
       die "Kestrel app-launcher metadata was invalid during planning."
     fi
@@ -356,6 +405,34 @@ prepare_user_launchers() {
       log "DRY RUN: would install the Kestrel app launcher at ${planned_app}"
     fi
     return 0
+  fi
+
+  RELEASE_USER_LAUNCHER_MANAGER="$launcher_manager"
+  RELEASE_USER_LAUNCHER_PLAN="$launcher_plan"
+  # Claim rollback responsibility before the first mutating helper call. The
+  # helper persists its manifest before any public launcher rename; if a
+  # signal lands earlier, rollback verifies this exact baseline stayed put.
+  RELEASE_USER_LAUNCHERS_PREPARED=1
+  local prepare_command=(
+    "$PYTHON_BIN" "$launcher_manager" prepare
+    "${launcher_arguments[@]}"
+    --manifest "$RELEASE_USER_LAUNCHER_MANIFEST"
+  )
+  log "+ $(quote_cmd "${prepare_command[@]}")"
+  local launcher_result
+  if ! launcher_result="$("${prepare_command[@]}")"; then
+    die "Unable to prepare the Kestrel user launchers."
+  fi
+  if ! "$PYTHON_BIN" -c '
+import json
+import sys
+
+planned = json.loads(sys.argv[1])
+prepared = json.loads(sys.argv[2])
+keys = ("shim_path", "app_path", "bin_on_path")
+raise SystemExit(0 if all(planned[key] == prepared[key] for key in keys) else 1)
+' "$launcher_plan" "$launcher_result"; then
+    die "Prepared Kestrel launcher targets differ from the approved plan."
   fi
   log "Prepared Kestrel command shim at ${INSTALLED_KESTREL_SHIM}"
 }
@@ -373,18 +450,40 @@ commit_user_launchers() {
     return 1
   fi
   RELEASE_USER_LAUNCHERS_PREPARED=0
+  RELEASE_USER_LAUNCHER_MANAGER=""
+  RELEASE_USER_LAUNCHER_PLAN=""
   log "Committed Kestrel user launchers."
 }
 
 rollback_user_launchers() {
   [[ "$RELEASE_USER_LAUNCHERS_PREPARED" -eq 1 ]] || return 0
-  if [[ ! -f "$RELEASE_USER_LAUNCHER_MANIFEST" || -L "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
+  if [[ -L "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
     log "ERROR: Kestrel user-launcher rollback metadata is missing or unsafe: ${RELEASE_USER_LAUNCHER_MANIFEST}"
     return 1
   fi
-  local launcher_manager="${KESTREL_HOME}/scripts/manage_user_launchers.py"
+  local launcher_manager="${RELEASE_USER_LAUNCHER_MANAGER:-${KESTREL_HOME}/scripts/manage_user_launchers.py}"
   if [[ -L "$launcher_manager" || ! -f "$launcher_manager" ]]; then
     log "ERROR: Kestrel user-launcher manager is missing or unsafe: ${launcher_manager}"
+    return 1
+  fi
+  if [[ ! -e "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
+    if [[ -z "$RELEASE_USER_LAUNCHER_PLAN" ]]; then
+      log "ERROR: Kestrel launcher manifest and pre-mutation plan are both missing."
+      return 1
+    fi
+    log "+ verify no public launcher mutation occurred before durable metadata"
+    if ! "$PYTHON_BIN" "$launcher_manager" verify-plan \
+      --plan-json "$RELEASE_USER_LAUNCHER_PLAN" >/dev/null; then
+      return 1
+    fi
+    RELEASE_USER_LAUNCHERS_PREPARED=0
+    RELEASE_USER_LAUNCHER_MANAGER=""
+    RELEASE_USER_LAUNCHER_PLAN=""
+    log "Verified that no public Kestrel launcher mutation requires rollback."
+    return 0
+  fi
+  if [[ ! -f "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
+    log "ERROR: Kestrel user-launcher rollback metadata is unsafe: ${RELEASE_USER_LAUNCHER_MANIFEST}"
     return 1
   fi
   log "+ $(quote_cmd "$PYTHON_BIN" "$launcher_manager" rollback --manifest "$RELEASE_USER_LAUNCHER_MANIFEST")"
@@ -393,6 +492,8 @@ rollback_user_launchers() {
     return 1
   fi
   RELEASE_USER_LAUNCHERS_PREPARED=0
+  RELEASE_USER_LAUNCHER_MANAGER=""
+  RELEASE_USER_LAUNCHER_PLAN=""
   log "Rolled back Kestrel user launchers."
 }
 

@@ -136,14 +136,6 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
         uid=uid,
         create_directories=True,
     )
-    for artifact in artifacts:
-        target = Path(artifact["target"])
-        if artifact["had_previous"]:
-            previous = _managed_artifact_identity(
-                target, kind=artifact["kind"],
-            )
-            artifact["previous_device"] = previous.st_dev
-            artifact["previous_inode"] = previous.st_ino
     codesign_status = "not_applicable"
     shim = artifacts[0]
     profile = _runtime_profile(
@@ -233,9 +225,16 @@ def _resolve_launcher_artifacts(
         selected_bin, user, platform, transaction_id,
     )
     for artifact in artifacts:
+        target = Path(artifact["target"])
         artifact["had_previous"] = _preflight_artifact(
-            Path(artifact["target"]), kind=artifact["kind"],
+            target, kind=artifact["kind"],
         )
+        if artifact["had_previous"]:
+            previous = _managed_artifact_identity(
+                target, kind=artifact["kind"],
+            )
+            artifact["previous_device"] = previous.st_dev
+            artifact["previous_inode"] = previous.st_ino
     return selected_bin, artifacts
 
 
@@ -256,7 +255,85 @@ def _launcher_result(
         "manifest_path": str(manifest) if manifest is not None else None,
         "bin_on_path": str(selected_bin) in path_entries,
         "codesign": codesign,
+        "baseline": [
+            {
+                "kind": artifact["kind"],
+                "target": artifact["target"],
+                "existed": artifact["had_previous"],
+                "device": artifact["previous_device"],
+                "inode": artifact["previous_inode"],
+            }
+            for artifact in artifacts
+        ],
     }
+
+
+def verify_plan_unchanged(plan_json: str) -> dict[str, Any]:
+    """Prove the helper made no public launcher mutation without a manifest."""
+    try:
+        plan = json.loads(plan_json)
+    except json.JSONDecodeError as exc:
+        raise LauncherArtifactError("Launcher plan is invalid") from exc
+    if not isinstance(plan, dict):
+        raise LauncherArtifactError("Launcher plan has an unknown schema")
+    baseline = plan.get("baseline")
+    if not isinstance(baseline, list) or not 1 <= len(baseline) <= 2:
+        raise LauncherArtifactError("Launcher plan has an invalid baseline")
+    for entry in baseline:
+        if not isinstance(entry, dict) or set(entry) != {
+            "kind", "target", "existed", "device", "inode",
+        }:
+            raise LauncherArtifactError(
+                "Launcher plan has invalid baseline metadata"
+            )
+        kind = entry["kind"]
+        target_raw = entry["target"]
+        existed = entry["existed"]
+        device = entry["device"]
+        inode = entry["inode"]
+        if (
+            kind not in {"shim", "app"}
+            or not isinstance(target_raw, str)
+            or not isinstance(existed, bool)
+            or not isinstance(device, int)
+            or isinstance(device, bool)
+            or not isinstance(inode, int)
+            or isinstance(inode, bool)
+            or device < 0
+            or inode < 0
+        ):
+            raise LauncherArtifactError(
+                "Launcher plan has invalid baseline values"
+            )
+        target = _canonical_path(Path(target_raw))
+        if str(target) != target_raw or not target.is_absolute():
+            raise LauncherArtifactError(
+                "Launcher plan baseline path is not canonical"
+            )
+        if _path_has_symlink(target):
+            raise LauncherArtifactError(
+                f"Public launcher path changed without recoverable metadata: {target}"
+            )
+        if existed:
+            if device <= 0 or inode <= 0:
+                raise LauncherArtifactError(
+                    "Launcher plan is missing predecessor identity"
+                )
+            try:
+                current = _managed_artifact_identity(target, kind=kind)
+            except (OSError, LauncherArtifactError) as exc:
+                raise LauncherArtifactError(
+                    f"Public launcher changed without recoverable metadata: {target}"
+                ) from exc
+            if (current.st_dev, current.st_ino) != (device, inode):
+                raise LauncherArtifactError(
+                    f"Public launcher identity changed without recoverable metadata: {target}"
+                )
+        elif target.exists() or target.is_symlink():
+            raise LauncherArtifactError(
+                f"Public launcher appeared without recoverable metadata: {target}"
+            )
+    return {"unchanged": True}
 
 
 def commit_launchers(manifest_path: str | Path) -> dict[str, Any]:
@@ -1405,6 +1482,8 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("--memory-dir", type=Path)
     prepare = subparsers.choices["prepare"]
     prepare.add_argument("--manifest", type=Path, required=True)
+    verify_plan = subparsers.add_parser("verify-plan")
+    verify_plan.add_argument("--plan-json", required=True)
     for command in ("commit", "rollback"):
         action = subparsers.add_parser(command)
         action.add_argument("--manifest", type=Path, required=True)
@@ -1437,8 +1516,10 @@ def run(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "commit":
             result = commit_launchers(args.manifest)
-        else:
+        elif args.command == "rollback":
             result = rollback_launchers(args.manifest)
+        else:
+            result = verify_plan_unchanged(args.plan_json)
     except LauncherArtifactError as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
         return 1
