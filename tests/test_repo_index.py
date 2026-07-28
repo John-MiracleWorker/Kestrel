@@ -11,11 +11,20 @@ from typing import Any
 
 import pytest
 
+import nested_memvid_agent.repo_index.indexer as repo_indexer
+import nested_memvid_agent.repo_index.store as repo_store
+from nested_memvid_agent.file_lock import (
+    lock_exclusive as real_lock_exclusive,
+)
+from nested_memvid_agent.file_lock import (
+    lock_shared as real_lock_shared,
+)
 from nested_memvid_agent.repo_index import (
     DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
     Freshness,
     IndexLimits,
+    RepositoryChangedDuringIndexingError,
     RepositoryIndex,
     RepositoryIndexError,
     RepositoryRootMismatchError,
@@ -54,6 +63,49 @@ def _git(repository: Path, *arguments: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def test_dotted_project_id_matches_project_profile_contract(tmp_path: Path) -> None:
+    repository = _copy_fixture(tmp_path)
+
+    index = RepositoryIndex(
+        project_id="project.tools",
+        repository_root=repository,
+    )
+    index.rebuild()
+
+    assert index.status().project_id == "project.tools"
+    assert index.index_path.name == "project.tools.sqlite"
+
+
+def _convert_current_sidecar_to_v4(index: RepositoryIndex) -> None:
+    with sqlite3.connect(index.index_path) as connection:
+        generation_id = str(
+            connection.execute(
+                """
+                SELECT generation_id
+                FROM index_generation_checkpoint
+                WHERE singleton = 1
+                """
+            ).fetchone()[0]
+        )
+        connection.execute("DROP TABLE index_generation_checkpoint")
+        connection.execute("PRAGMA user_version = 4")
+    generation_path = index.index_path.parent / (
+        f".{index.index_path.name}.generation-{generation_id}"
+    )
+    receipt_path = generation_path.with_name(f"{generation_path.name}.receipt")
+    generation_path.unlink()
+    receipt_path.unlink()
+    os.link(index.index_path, generation_path)
+    lock_path = index.index_path.parent / f".{index.index_path.name}.lock"
+    lock_payload = lock_path.read_bytes()
+    encoded_state = lock_payload[len(repo_store._LOCK_SECRET_PREFIX) :]
+    state = json.loads(encoded_state)
+    lock_path.write_bytes(
+        repo_store._LOCK_SECRET_PREFIX + str(state["secret"]).encode("ascii") + b"\n"
+    )
+    lock_path.chmod(0o600)
 
 
 def test_build_records_identity_content_and_multilanguage_relationships(tmp_path: Path) -> None:
@@ -237,16 +289,15 @@ def test_queries_label_stale_evidence_and_require_explicit_diagnostics(tmp_path:
     }
 
 
-def test_parser_version_change_marks_stale_and_forces_reparse(tmp_path: Path) -> None:
+def test_parser_version_change_marks_stale_and_forces_reparse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Treating rows from an obsolete parser as current must fail this test."""
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     index.rebuild()
-    with sqlite3.connect(index.index_path) as connection:
-        connection.execute(
-            "UPDATE index_metadata SET parser_versions_json = ? WHERE singleton = 1",
-            ('{"python":"ast-obsolete"}',),
-        )
+    monkeypatch.setitem(repo_indexer.PARSER_VERSIONS, "python", "ast-v2")
 
     reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
     assert reopened.status().freshness is Freshness.STALE
@@ -353,6 +404,8 @@ def test_scan_ignores_symlinks_private_build_vendor_binary_and_oversize(
     report = index.rebuild()
     paths = {record.path.as_posix() for record in index.files().records}
 
+    assert index.status().freshness is Freshness.CURRENT
+    assert "web/format.ts" in paths
     assert {
         ".nest/private/secret.py",
         "node_modules/package/vendor.ts",
@@ -450,9 +503,7 @@ def test_schema_v4_with_durable_generation_migrates_to_checkpoint(tmp_path: Path
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     index.rebuild()
-    with sqlite3.connect(index.index_path) as connection:
-        connection.execute("DROP TABLE index_generation_checkpoint")
-        connection.execute("PRAGMA user_version = 4")
+    _convert_current_sidecar_to_v4(index)
 
     reopened = RepositoryIndex(project_id="project-1", repository_root=repository)
 
@@ -502,6 +553,130 @@ def test_generation_identifier_cannot_escape_the_sidecar_parent(tmp_path: Path) 
         index.status()
 
 
+def test_generation_snapshot_is_not_a_mutable_alias_of_the_canonical_sidecar(
+    tmp_path: Path,
+) -> None:
+    """The durable generation image must not share the canonical SQLite inode."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        generation_id = str(
+            connection.execute(
+                """
+                SELECT generation_id
+                FROM index_generation_checkpoint
+                WHERE singleton = 1
+                """
+            ).fetchone()[0]
+        )
+    snapshot = index.index_path.parent / (f".{index.index_path.name}.generation-{generation_id}")
+
+    canonical_stat = index.index_path.stat()
+    snapshot_stat = snapshot.stat()
+
+    assert (canonical_stat.st_dev, canonical_stat.st_ino) != (
+        snapshot_stat.st_dev,
+        snapshot_stat.st_ino,
+    )
+
+
+def test_same_inode_metadata_tampering_fails_content_authentication_after_restart(
+    tmp_path: Path,
+) -> None:
+    """A forged aggregate digest must not regain authority after reopening."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    canonical_inode = index.index_path.stat().st_ino
+    with sqlite3.connect(index.index_path) as connection:
+        connection.execute(
+            """
+            UPDATE index_metadata
+            SET aggregate_digest = 'forged-authoritative-digest'
+            WHERE singleton = 1
+            """
+        )
+    assert index.index_path.stat().st_ino == canonical_inode
+
+    with pytest.raises(RepositoryIndexError, match="content"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            create=False,
+        )
+
+
+def test_forged_semantic_row_cannot_be_returned_as_authoritative_after_restart(
+    tmp_path: Path,
+) -> None:
+    """Checkpoint authentication must cover semantic repository-index content."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        connection.execute(
+            """
+            UPDATE symbols
+            SET name = 'forged_authority', qualified_name = 'forged_authority'
+            WHERE id = (SELECT MIN(id) FROM symbols)
+            """
+        )
+
+    with pytest.raises(RepositoryIndexError, match="content"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            create=False,
+        )
+
+
+def test_fresh_process_rejects_sidecar_rollback_below_lock_high_water(
+    tmp_path: Path,
+) -> None:
+    """Restoring an older valid generation must not roll back durable authority."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        generation_id = str(
+            connection.execute(
+                """
+                SELECT generation_id
+                FROM index_generation_checkpoint
+                WHERE singleton = 1
+                """
+            ).fetchone()[0]
+        )
+    generation_name = f".{index.index_path.name}.generation-{generation_id}"
+    snapshot = index.index_path.parent / generation_name
+    receipt = snapshot.with_name(f"{snapshot.name}.receipt")
+    old_canonical = tmp_path / "old-canonical.sqlite"
+    old_snapshot = tmp_path / "old-snapshot.sqlite"
+    old_receipt = tmp_path / "old-receipt.json"
+    shutil.copy2(index.index_path, old_canonical)
+    shutil.copy2(snapshot, old_snapshot)
+    shutil.copy2(receipt, old_receipt)
+
+    changed = repository / "src" / "widget.py"
+    changed.write_text(
+        changed.read_text(encoding="utf-8").replace("def helper", "def normalize"),
+        encoding="utf-8",
+    )
+    index.rebuild()
+
+    shutil.copy2(old_canonical, index.index_path)
+    shutil.copy2(old_snapshot, snapshot)
+    shutil.copy2(old_receipt, receipt)
+
+    with pytest.raises(RepositoryIndexError, match="rollback"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            create=False,
+        )
+
+
 def test_reopening_an_unchanged_index_preserves_the_bound_database_inode(
     tmp_path: Path,
 ) -> None:
@@ -541,9 +716,7 @@ def test_create_false_opens_only_an_existing_current_sidecar(tmp_path: Path) -> 
     )
     assert opened.status().freshness is Freshness.CURRENT
 
-    with sqlite3.connect(built.index_path) as connection:
-        connection.execute("DROP TABLE index_generation_checkpoint")
-        connection.execute("PRAGMA user_version = 4")
+    _convert_current_sidecar_to_v4(built)
     with pytest.raises(RepositoryIndexError, match="creation and migration are disabled"):
         RepositoryIndex(
             project_id="project-1",
@@ -559,6 +732,168 @@ def test_create_false_opens_only_an_existing_current_sidecar(tmp_path: Path) -> 
             """
         ).fetchone()
     assert checkpoint is None
+
+
+def test_create_false_instance_cannot_rebuild_or_publish(tmp_path: Path) -> None:
+    """A query-only index handle must reject every write path."""
+    repository = _copy_fixture(tmp_path)
+    built = RepositoryIndex(project_id="project-1", repository_root=repository)
+    built.rebuild()
+    opened = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        create=False,
+    )
+    before = built.index_path.read_bytes()
+
+    with pytest.raises(RepositoryIndexError, match="read-only"):
+        opened.rebuild()
+
+    assert built.index_path.read_bytes() == before
+
+
+def test_max_files_truncation_never_reports_current_or_authoritative(
+    tmp_path: Path,
+) -> None:
+    """A coverage-limited index must not authorize an empty navigation result."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "a.py").write_text("class Indexed: ...\n", encoding="utf-8")
+    (repository / "b.py").write_text("class Omitted: ...\n", encoding="utf-8")
+    index = RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        limits=IndexLimits(max_files=1),
+    )
+    index.rebuild()
+
+    status = index.status()
+    result = index.symbols("Omitted")
+
+    assert status.freshness is Freshness.STALE
+    assert result.authoritative is False
+    assert result.records == ()
+
+
+def test_query_fingerprint_fence_rejects_repository_mutation_during_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rows loaded across a repository mutation must never be labeled current."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    original_symbols = index._store.symbols
+
+    def mutate_then_load(
+        query: str | None = None,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> Any:
+        changed = repository / "src" / "widget.py"
+        changed.write_text("class ChangedDuringQuery: ...\n", encoding="utf-8")
+        return original_symbols(query, limit=limit, offset=offset)
+
+    monkeypatch.setattr(index._store, "symbols", mutate_then_load)
+
+    with pytest.raises(RepositoryChangedDuringIndexingError, match="query"):
+        index.symbols("Widget", include_stale_diagnostics=True)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX hard-link contract")
+def test_lock_hardlink_is_rejected_before_linked_victim_is_modified(tmp_path: Path) -> None:
+    """Lock initialization must not chmod or write through an existing hard link."""
+    repository = _copy_fixture(tmp_path)
+    index_path = tmp_path / "index.sqlite"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"")
+    victim.chmod(0o600)
+    lock_path = tmp_path / ".index.sqlite.lock"
+    os.link(victim, lock_path)
+
+    with pytest.raises(RepositoryIndexError, match="lock.*link"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            index_path=index_path,
+        )
+
+    assert victim.read_bytes() == b""
+    assert victim.stat().st_mode & 0o777 == 0o600
+    assert not index_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX hard-link contract")
+def test_content_receipt_hardlink_is_rejected(tmp_path: Path) -> None:
+    """A linked receipt must not be trusted as immutable generation authority."""
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    with sqlite3.connect(index.index_path) as connection:
+        generation_id = str(
+            connection.execute(
+                """
+                SELECT generation_id
+                FROM index_generation_checkpoint
+                WHERE singleton = 1
+                """
+            ).fetchone()[0]
+        )
+    receipt = index.index_path.parent / (
+        f".{index.index_path.name}.generation-{generation_id}.receipt"
+    )
+    victim = tmp_path / "receipt-victim"
+    shutil.copy2(receipt, victim)
+    receipt.unlink()
+    os.link(victim, receipt)
+
+    with pytest.raises(RepositoryIndexError, match="receipt.*link"):
+        RepositoryIndex(
+            project_id="project-1",
+            repository_root=repository,
+            create=False,
+        )
+
+
+def test_repository_index_uses_cross_platform_file_lock_abstraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Creation and read paths must route through the Windows-capable lock API."""
+    calls: list[str] = []
+
+    def tracked_exclusive(handle: Any, *, blocking: bool = True) -> None:
+        calls.append("exclusive")
+        real_lock_exclusive(handle, blocking=blocking)
+
+    def tracked_shared(handle: Any, *, blocking: bool = True) -> None:
+        calls.append("shared")
+        real_lock_shared(handle, blocking=blocking)
+
+    monkeypatch.setattr(
+        repo_store,
+        "lock_exclusive",
+        tracked_exclusive,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        repo_store,
+        "lock_shared",
+        tracked_shared,
+        raising=False,
+    )
+    repository = _copy_fixture(tmp_path)
+    index = RepositoryIndex(project_id="project-1", repository_root=repository)
+    index.rebuild()
+    RepositoryIndex(
+        project_id="project-1",
+        repository_root=repository,
+        create=False,
+    )
+
+    assert "exclusive" in calls
+    assert "shared" in calls
 
 
 def test_long_lived_instances_accept_lock_coordinated_generation_advances(
@@ -744,14 +1079,11 @@ def test_query_metadata_and_rows_do_not_cross_a_publication_generation(
 
     monkeypatch.setattr(reader._store, "symbols", publish_then_load)
 
-    result = reader.symbols(
-        "generation_safe",
-        include_stale_diagnostics=True,
-    )
-
-    assert result.authoritative is False
-    assert result.index_digest == writer.status().aggregate_digest
-    assert [record.name for record in result.records] == ["generation_safe"]
+    with pytest.raises(RepositoryChangedDuringIndexingError, match="query"):
+        reader.symbols(
+            "generation_safe",
+            include_stale_diagnostics=True,
+        )
 
 
 def test_compacted_checkpoint_advances_a_reader_older_than_retained_history(
@@ -981,6 +1313,7 @@ def test_single_disallowed_control_byte_is_binary(
     report = index.rebuild()
 
     assert index.files().records == ()
+    assert index.status().freshness is Freshness.CURRENT
     assert report.skipped_files == 1
 
 

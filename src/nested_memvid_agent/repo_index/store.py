@@ -10,10 +10,11 @@ import stat
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import IO, Generic, TypeVar, cast
 
+from ..file_lock import lock_exclusive, lock_shared, unlock
 from .models import (
     MAX_QUERY_LIMIT,
     MAX_QUERY_OFFSET,
@@ -32,6 +33,9 @@ SCHEMA_VERSION = 5
 _APPLICATION_ID = 0x4B535452
 _GENERATION_HISTORY_LIMIT = 64
 _LOCK_SECRET_PREFIX = b"KESTREL-REPO-INDEX-LOCK-V1\n"
+_LOCK_MAX_BYTES = 4096
+_RECEIPT_MAX_BYTES = 4096
+_DIGEST_CHUNK_BYTES = 65_536
 StoreRecordT = TypeVar("StoreRecordT")
 
 
@@ -43,6 +47,7 @@ class StoredMetadata:
     root_inode: int
     aggregate_digest: str
     freshness_fingerprint: str
+    coverage_complete: bool
     indexed_at: str
     parser_versions: dict[str, str]
     git_head: str | None
@@ -97,6 +102,39 @@ class _GenerationState:
 
 
 @dataclass(frozen=True)
+class _GenerationReceipt:
+    generation_id: str
+    sequence: int
+    lineage_id: str
+    previous_generation_id: str | None
+    content_digest: str
+    canonical_device: int
+    canonical_inode: int
+    canonical_size: int
+    snapshot_device: int
+    snapshot_inode: int
+    snapshot_size: int
+    authorization_tag: str
+
+
+@dataclass(frozen=True)
+class _VerifiedGenerationContent:
+    generation_id: str
+    content_digest: str
+    canonical_binding: _FileBinding
+    snapshot_binding: _FileBinding
+
+
+@dataclass(frozen=True)
+class _LockAuthority:
+    generation_id: str
+    sequence: int
+    lineage_id: str
+    content_digest: str
+    authorization_tag: str
+
+
+@dataclass(frozen=True)
 class StoreQueryPage(Generic[StoreRecordT]):
     records: tuple[StoreRecordT, ...]
     truncated: bool
@@ -122,8 +160,12 @@ class RepoIndexStore:
         self._custom_parent = custom_parent
         self._parent_bindings: tuple[_PathBinding, ...] = ()
         self._generation: _GenerationState | None = None
+        self._verified_content: _VerifiedGenerationContent | None = None
         self._lock_binding: _FileBinding | None = None
         self._lock_secret: bytes | None = None
+        self._lock_authority: _LockAuthority | None = None
+        self._active_lock_descriptor: int | None = None
+        self._writes_allowed = True
         self._thread_lock = threading.RLock()
 
     def initialize(
@@ -134,6 +176,7 @@ class RepoIndexStore:
         parser_versions: dict[str, str],
         allow_migration: bool = True,
     ) -> None:
+        self._writes_allowed = allow_migration
         self._prepare_sidecar_parent(allow_create=allow_migration)
         if self._initialize_current_read_only(
             project_id=project_id,
@@ -176,8 +219,8 @@ class RepoIndexStore:
                     INSERT INTO index_metadata (
                         singleton, project_id, root_path, root_device, root_inode,
                         aggregate_digest, freshness_fingerprint, indexed_at,
-                        parser_versions_json, git_head, git_tree
-                    ) VALUES (1, ?, ?, ?, ?, '', '', '', ?, NULL, NULL)
+                        coverage_complete, parser_versions_json, git_head, git_tree
+                    ) VALUES (1, ?, ?, ?, ?, '', '', '', 0, ?, NULL, NULL)
                     """,
                     (
                         project_id,
@@ -303,6 +346,7 @@ class RepoIndexStore:
             root_inode=int(row["root_inode"]),
             aggregate_digest=str(row["aggregate_digest"]),
             freshness_fingerprint=str(row["freshness_fingerprint"]),
+            coverage_complete=bool(row["coverage_complete"]),
             indexed_at=str(row["indexed_at"]),
             parser_versions={str(key): str(value) for key, value in raw_versions.items()},
             git_head=_optional_str(row["git_head"]),
@@ -349,6 +393,7 @@ class RepoIndexStore:
         deleted_paths: Sequence[str],
         aggregate_digest: str,
         freshness_fingerprint: str,
+        coverage_complete: bool,
         indexed_at: str,
         parser_versions: dict[str, str],
         git_head: str | None,
@@ -454,6 +499,7 @@ class RepoIndexStore:
                 UPDATE index_metadata
                 SET aggregate_digest = ?,
                     freshness_fingerprint = ?,
+                    coverage_complete = ?,
                     indexed_at = ?,
                     parser_versions_json = ?,
                     git_head = ?,
@@ -463,6 +509,7 @@ class RepoIndexStore:
                 (
                     aggregate_digest,
                     freshness_fingerprint,
+                    int(coverage_complete),
                     indexed_at,
                     json.dumps(parser_versions, sort_keys=True, separators=(",", ":")),
                     git_head,
@@ -728,6 +775,9 @@ class RepoIndexStore:
                 aggregate_digest TEXT NOT NULL,
                 freshness_fingerprint TEXT NOT NULL,
                 indexed_at TEXT NOT NULL,
+                coverage_complete INTEGER NOT NULL CHECK (
+                    coverage_complete IN (0, 1)
+                ),
                 parser_versions_json TEXT NOT NULL,
                 git_head TEXT,
                 git_tree TEXT
@@ -812,6 +862,17 @@ class RepoIndexStore:
         connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
 
     def _migrate_schema_v4(self, connection: sqlite3.Connection) -> None:
+        metadata_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(index_metadata)")
+        }
+        if "coverage_complete" not in metadata_columns:
+            connection.execute(
+                """
+                ALTER TABLE index_metadata
+                ADD COLUMN coverage_complete INTEGER NOT NULL DEFAULT 0
+                CHECK (coverage_complete IN (0, 1))
+                """
+            )
         connection.execute(
             """
             CREATE TABLE index_generation_checkpoint (
@@ -1002,29 +1063,44 @@ class RepoIndexStore:
             self._verify_parent_bindings()
             parent_descriptor = self._open_parent_descriptor()
             lock_descriptor: int | None = None
+            lock_handle: IO[str] | None = None
+            lock_acquired = False
             try:
                 try:
-                    lock_descriptor = self._open_relative(
-                        f".{self.path.name}.lock",
-                        (
-                            os.O_RDWR | os.O_CREAT | _no_follow_flag()
-                            if allow_create
-                            else os.O_RDONLY | _no_follow_flag()
-                        ),
-                        mode=0o600,
-                        parent_descriptor=parent_descriptor,
+                    lock_descriptor, created = self._open_lock_descriptor(
+                        parent_descriptor,
+                        allow_create=allow_create,
                     )
                 except OSError as exc:
                     raise RepositoryIndexError(
                         "repository index lock is missing or inaccessible"
                     ) from exc
                 lock_info = os.fstat(lock_descriptor)
-                if not stat.S_ISREG(lock_info.st_mode):
-                    raise RepositoryIndexError("repository index lock must be a regular file")
-                if os.name == "posix" and allow_create:
+                self._require_safe_private_file(
+                    lock_info,
+                    label="repository index lock",
+                    expected_mode=None if created else 0o600,
+                )
+                if os.name == "posix" and created:
                     os.fchmod(lock_descriptor, 0o600)
                     lock_info = os.fstat(lock_descriptor)
+                self._require_safe_private_file(
+                    lock_info,
+                    label="repository index lock",
+                    expected_mode=0o600,
+                )
                 observed_lock = _file_binding(lock_info)
+                path_lock = self._relative_file_binding(
+                    f".{self.path.name}.lock",
+                    parent_descriptor=parent_descriptor,
+                    allow_missing=False,
+                )
+                if (
+                    path_lock is None
+                    or path_lock.device != observed_lock.device
+                    or path_lock.inode != observed_lock.inode
+                ):
+                    raise RepositoryIndexError("repository index lock identity changed")
                 if self._lock_binding is None:
                     self._lock_binding = observed_lock
                 elif (
@@ -1032,14 +1108,35 @@ class RepoIndexStore:
                     or observed_lock.inode != self._lock_binding.inode
                 ):
                     raise RepositoryIndexError("repository index lock identity changed")
-                if os.name == "posix":
-                    import fcntl
-
-                    fcntl.flock(
-                        lock_descriptor,
-                        fcntl.LOCK_EX if allow_create else fcntl.LOCK_SH,
-                    )
-                observed_secret = self._load_or_create_lock_secret(
+                binary_handle = os.fdopen(
+                    lock_descriptor,
+                    "r+b" if allow_create else "rb",
+                    closefd=False,
+                )
+                lock_handle = cast(IO[str], binary_handle)
+                if allow_create:
+                    lock_exclusive(lock_handle)
+                else:
+                    lock_shared(lock_handle)
+                lock_acquired = True
+                locked_info = os.fstat(lock_descriptor)
+                self._require_safe_private_file(
+                    locked_info,
+                    label="repository index lock",
+                    expected_mode=0o600,
+                )
+                locked_path = self._relative_file_binding(
+                    f".{self.path.name}.lock",
+                    parent_descriptor=parent_descriptor,
+                    allow_missing=False,
+                )
+                if (
+                    locked_path is None
+                    or locked_path.device != int(locked_info.st_dev)
+                    or locked_path.inode != int(locked_info.st_ino)
+                ):
+                    raise RepositoryIndexError("repository index lock identity changed")
+                observed_secret, observed_authority = self._load_or_create_lock_state(
                     lock_descriptor,
                     allow_create=allow_create,
                 )
@@ -1047,50 +1144,263 @@ class RepoIndexStore:
                     self._lock_secret = observed_secret
                 elif not hmac.compare_digest(self._lock_secret, observed_secret):
                     raise RepositoryIndexError("repository index lock authorization changed")
+                self._lock_authority = observed_authority
+                self._active_lock_descriptor = lock_descriptor
                 self._verify_parent_descriptor(parent_descriptor)
                 yield parent_descriptor
             finally:
+                self._active_lock_descriptor = None
                 if lock_descriptor is not None:
-                    if os.name == "posix":
-                        import fcntl
-
-                        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                    if lock_handle is not None and lock_acquired:
+                        unlock(lock_handle)
+                    if lock_handle is not None:
+                        lock_handle.close()
                     os.close(lock_descriptor)
                 if parent_descriptor is not None:
                     os.close(parent_descriptor)
 
-    def _load_or_create_lock_secret(
+    def _open_lock_descriptor(
+        self,
+        parent_descriptor: int | None,
+        *,
+        allow_create: bool,
+    ) -> tuple[int, bool]:
+        name = f".{self.path.name}.lock"
+        if not allow_create:
+            return (
+                self._open_relative(
+                    name,
+                    os.O_RDONLY | _no_follow_flag(),
+                    parent_descriptor=parent_descriptor,
+                ),
+                False,
+            )
+        try:
+            return (
+                self._open_relative(
+                    name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _no_follow_flag(),
+                    mode=0o600,
+                    parent_descriptor=parent_descriptor,
+                ),
+                True,
+            )
+        except FileExistsError:
+            return (
+                self._open_relative(
+                    name,
+                    os.O_RDWR | _no_follow_flag(),
+                    parent_descriptor=parent_descriptor,
+                ),
+                False,
+            )
+
+    def _load_or_create_lock_state(
         self,
         descriptor: int,
         *,
         allow_create: bool,
-    ) -> bytes:
+    ) -> tuple[bytes, _LockAuthority | None]:
         info = os.fstat(descriptor)
         if info.st_size == 0:
             if not allow_create:
                 raise RepositoryIndexError("repository index lock authorization is missing")
             secret = secrets.token_bytes(32)
-            payload = _LOCK_SECRET_PREFIX + secret.hex().encode("ascii") + b"\n"
-            os.ftruncate(descriptor, 0)
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            _write_all(descriptor, payload)
-            os.fsync(descriptor)
-            return secret
-        if info.st_size > 256:
+            self._write_lock_state(
+                descriptor,
+                secret=secret,
+                authority=None,
+            )
+            return secret, None
+        if info.st_size > _LOCK_MAX_BYTES:
             raise RepositoryIndexError("repository index lock authorization is invalid")
         os.lseek(descriptor, 0, os.SEEK_SET)
         payload = os.read(descriptor, int(info.st_size))
-        expected_size = len(_LOCK_SECRET_PREFIX) + 65
-        if len(payload) != expected_size or not payload.startswith(_LOCK_SECRET_PREFIX):
+        if len(payload) != int(info.st_size) or not payload.startswith(_LOCK_SECRET_PREFIX):
             raise RepositoryIndexError("repository index lock authorization is invalid")
-        encoded = payload[len(_LOCK_SECRET_PREFIX) : -1]
+        encoded = payload[len(_LOCK_SECRET_PREFIX) :]
+        if len(encoded) == 65 and encoded.endswith(b"\n"):
+            try:
+                secret = bytes.fromhex(encoded[:-1].decode("ascii"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise RepositoryIndexError(
+                    "repository index lock authorization is invalid"
+                ) from exc
+            if len(secret) != 32:
+                raise RepositoryIndexError("repository index lock authorization is invalid")
+            return secret, None
         try:
-            secret = bytes.fromhex(encoded.decode("ascii"))
-        except (UnicodeDecodeError, ValueError) as exc:
+            raw = json.loads(encoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RepositoryIndexError("repository index lock authorization is invalid") from exc
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"authority", "secret", "version"}
+            or raw["version"] != 2
+            or not isinstance(raw["secret"], str)
+        ):
+            raise RepositoryIndexError("repository index lock authorization is invalid")
+        try:
+            secret = bytes.fromhex(raw["secret"])
+        except ValueError as exc:
             raise RepositoryIndexError("repository index lock authorization is invalid") from exc
         if len(secret) != 32:
             raise RepositoryIndexError("repository index lock authorization is invalid")
-        return secret
+        authority = self._parse_lock_authority(raw["authority"], secret=secret)
+        return secret, authority
+
+    def _parse_lock_authority(
+        self,
+        raw: object,
+        *,
+        secret: bytes,
+    ) -> _LockAuthority | None:
+        if raw is None:
+            return None
+        if (
+            not isinstance(raw, dict)
+            or set(raw)
+            != {
+                "authorization_tag",
+                "content_digest",
+                "generation_id",
+                "lineage_id",
+                "sequence",
+            }
+            or type(raw["sequence"]) is not int
+            or any(
+                not isinstance(raw[key], str)
+                for key in (
+                    "authorization_tag",
+                    "content_digest",
+                    "generation_id",
+                    "lineage_id",
+                )
+            )
+        ):
+            raise RepositoryIndexError("repository index lock authority is invalid")
+        authority = _LockAuthority(
+            generation_id=raw["generation_id"],
+            sequence=raw["sequence"],
+            lineage_id=raw["lineage_id"],
+            content_digest=raw["content_digest"],
+            authorization_tag=raw["authorization_tag"],
+        )
+        if (
+            authority.sequence <= 0
+            or not _valid_generation_id(authority.generation_id)
+            or not _valid_generation_id(authority.lineage_id)
+            or not _valid_content_digest(authority.content_digest)
+            or not _valid_authorization_tag(authority.authorization_tag)
+        ):
+            raise RepositoryIndexError("repository index lock authority is invalid")
+        expected = self._lock_authority_tag(secret, authority=authority)
+        if not hmac.compare_digest(authority.authorization_tag, expected):
+            raise RepositoryIndexError("repository index lock authority authorization is invalid")
+        return authority
+
+    def _lock_authority_tag(
+        self,
+        secret: bytes,
+        *,
+        authority: _LockAuthority,
+    ) -> str:
+        payload = "\0".join(
+            (
+                "kestrel-repo-index-lock-authority-v1",
+                authority.lineage_id,
+                str(authority.sequence),
+                authority.generation_id,
+                authority.content_digest,
+            )
+        ).encode("utf-8")
+        return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+    def _write_lock_state(
+        self,
+        descriptor: int,
+        *,
+        secret: bytes,
+        authority: _LockAuthority | None,
+    ) -> None:
+        self._require_safe_private_file(
+            os.fstat(descriptor),
+            label="repository index lock",
+            expected_mode=0o600,
+        )
+        raw_authority: dict[str, object] | None = None
+        if authority is not None:
+            raw_authority = {
+                "authorization_tag": authority.authorization_tag,
+                "content_digest": authority.content_digest,
+                "generation_id": authority.generation_id,
+                "lineage_id": authority.lineage_id,
+                "sequence": authority.sequence,
+            }
+        payload = _LOCK_SECRET_PREFIX + (
+            json.dumps(
+                {
+                    "authority": raw_authority,
+                    "secret": secret.hex(),
+                    "version": 2,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        if len(payload) > _LOCK_MAX_BYTES:
+            raise RepositoryIndexError("repository index lock authority exceeds its bounded size")
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+
+    def _persist_lock_authority(self, receipt: _GenerationReceipt) -> None:
+        descriptor = self._active_lock_descriptor
+        secret = self._lock_secret
+        if descriptor is None or secret is None:
+            raise RepositoryIndexError(
+                "repository index lock authority is unavailable during publication"
+            )
+        unsigned = _LockAuthority(
+            generation_id=receipt.generation_id,
+            sequence=receipt.sequence,
+            lineage_id=receipt.lineage_id,
+            content_digest=receipt.content_digest,
+            authorization_tag="",
+        )
+        authority = replace(
+            unsigned,
+            authorization_tag=self._lock_authority_tag(
+                secret,
+                authority=unsigned,
+            ),
+        )
+        self._write_lock_state(
+            descriptor,
+            secret=secret,
+            authority=authority,
+        )
+        self._lock_authority = authority
+
+    def _require_safe_private_file(
+        self,
+        info: os.stat_result,
+        *,
+        label: str,
+        expected_mode: int | None,
+    ) -> None:
+        if not stat.S_ISREG(info.st_mode):
+            raise RepositoryIndexError(f"{label} must be a regular file")
+        if int(info.st_nlink) != 1:
+            raise RepositoryIndexError(f"{label} must not be a hard link")
+        if os.name != "posix":
+            return
+        if int(info.st_uid) != os.getuid():
+            raise RepositoryIndexError(f"{label} has an unsafe owner")
+        if expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode:
+            raise RepositoryIndexError(f"{label} has unsafe permissions")
 
     def _open_parent_descriptor(self) -> int | None:
         if not hasattr(os, "O_DIRECTORY"):
@@ -1364,10 +1674,10 @@ class RepoIndexStore:
         )
         if observed is None:
             raise RepositoryIndexError("repository index generation checkpoint is empty")
-        self._validate_generation_manifest(
+        self._validate_generation_content(
+            connection,
             observed,
             parent_descriptor=parent_descriptor,
-            allow_missing=False,
         )
         self._bind_observed_generation(connection, observed=observed)
         return observed
@@ -1415,11 +1725,15 @@ class RepoIndexStore:
                 connection,
                 binding=binding,
             )
-            self._validate_generation_manifest(
+            self._validate_legacy_generation_manifest(
                 observed,
                 parent_descriptor=parent_descriptor,
                 allow_missing=False,
             )
+            if self._lock_authority is not None:
+                raise RepositoryIndexError(
+                    "legacy repository index downgrade conflicts with durable lock authority"
+                )
             self._bind_observed_generation(connection, observed=observed)
             return observed
         if version not in {0, 1, 2, 3}:
@@ -1470,7 +1784,130 @@ class RepoIndexStore:
         )
         self._generation = observed
 
-    def _validate_generation_manifest(
+    def _validate_generation_content(
+        self,
+        connection: sqlite3.Connection,
+        generation: _GenerationState,
+        *,
+        parent_descriptor: int | None,
+    ) -> None:
+        snapshot_binding = self._relative_file_binding(
+            self._generation_filename(generation.generation_id),
+            parent_descriptor=parent_descriptor,
+            allow_missing=False,
+        )
+        if snapshot_binding is None:
+            raise RepositoryIndexError("repository index immutable generation content is missing")
+        if (
+            snapshot_binding.device == generation.binding.device
+            and snapshot_binding.inode == generation.binding.inode
+        ):
+            raise RepositoryIndexError(
+                "repository index immutable generation content is a mutable alias"
+            )
+        receipt = self._read_generation_receipt(
+            generation.generation_id,
+            parent_descriptor=parent_descriptor,
+        )
+        if (
+            receipt.generation_id != generation.generation_id
+            or receipt.sequence != generation.sequence
+            or receipt.lineage_id != generation.lineage_id
+            or receipt.previous_generation_id != generation.previous_generation_id
+        ):
+            raise RepositoryIndexError(
+                "repository index content receipt does not match its checkpoint"
+            )
+        self._validate_lock_high_water(
+            generation=generation,
+            receipt=receipt,
+        )
+        if (
+            receipt.canonical_device,
+            receipt.canonical_inode,
+            receipt.canonical_size,
+        ) != (
+            generation.binding.device,
+            generation.binding.inode,
+            generation.binding.size,
+        ) or (
+            receipt.snapshot_device,
+            receipt.snapshot_inode,
+            receipt.snapshot_size,
+        ) != (
+            snapshot_binding.device,
+            snapshot_binding.inode,
+            snapshot_binding.size,
+        ):
+            raise RepositoryIndexError(
+                "repository index database identity changed: "
+                "content binding does not match its receipt"
+            )
+        expected_tag = self._content_authorization_tag(
+            connection,
+            receipt=receipt,
+        )
+        if not hmac.compare_digest(receipt.authorization_tag, expected_tag):
+            raise RepositoryIndexError("repository index content receipt authorization is invalid")
+        verified = self._verified_content
+        if (
+            verified is not None
+            and verified.generation_id == generation.generation_id
+            and verified.content_digest == receipt.content_digest
+            and verified.canonical_binding == generation.binding
+            and verified.snapshot_binding == snapshot_binding
+        ):
+            return
+        canonical_digest = self._digest_relative_file(
+            self.path.name,
+            expected_binding=generation.binding,
+            parent_descriptor=parent_descriptor,
+        )
+        snapshot_digest = self._digest_relative_file(
+            self._generation_filename(generation.generation_id),
+            expected_binding=snapshot_binding,
+            parent_descriptor=parent_descriptor,
+        )
+        if canonical_digest != receipt.content_digest or snapshot_digest != receipt.content_digest:
+            raise RepositoryIndexError(
+                "repository index content digest does not match its authenticated receipt"
+            )
+        self._verified_content = _VerifiedGenerationContent(
+            generation_id=generation.generation_id,
+            content_digest=receipt.content_digest,
+            canonical_binding=generation.binding,
+            snapshot_binding=snapshot_binding,
+        )
+
+    def _validate_lock_high_water(
+        self,
+        *,
+        generation: _GenerationState,
+        receipt: _GenerationReceipt,
+    ) -> None:
+        authority = self._lock_authority
+        if authority is None:
+            raise RepositoryIndexError("repository index rollback authority is missing")
+        if (
+            generation.sequence < authority.sequence
+            or generation.lineage_id != authority.lineage_id
+        ):
+            raise RepositoryIndexError(
+                "repository index rollback is below the durable lock high-water mark"
+            )
+        if generation.sequence > authority.sequence:
+            raise RepositoryIndexError(
+                "repository index publication exceeds durable lock authority"
+            )
+        if (
+            generation.generation_id != authority.generation_id
+            or receipt.content_digest != authority.content_digest
+        ):
+            raise RepositoryIndexError(
+                "repository index rollback authority does not match current content"
+            )
+
+    def _validate_legacy_generation_manifest(
         self,
         generation: _GenerationState,
         *,
@@ -1489,10 +1926,108 @@ class RepoIndexStore:
                 "repository index database identity changed: generation manifest mismatch"
             )
 
+    def _read_generation_receipt(
+        self,
+        generation_id: str,
+        *,
+        parent_descriptor: int | None,
+    ) -> _GenerationReceipt:
+        payload = self._read_relative_payload(
+            self._generation_receipt_filename(generation_id),
+            max_bytes=_RECEIPT_MAX_BYTES,
+            parent_descriptor=parent_descriptor,
+        )
+        try:
+            raw = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RepositoryIndexError("repository index content receipt is invalid") from exc
+        expected_keys = {
+            "authorization_tag",
+            "canonical_device",
+            "canonical_inode",
+            "canonical_size",
+            "content_digest",
+            "generation_id",
+            "lineage_id",
+            "previous_generation_id",
+            "sequence",
+            "snapshot_device",
+            "snapshot_inode",
+            "snapshot_size",
+            "version",
+        }
+        if not isinstance(raw, dict) or set(raw) != expected_keys:
+            raise RepositoryIndexError("repository index content receipt is invalid")
+        if raw["version"] != 1:
+            raise RepositoryIndexError("repository index content receipt version is invalid")
+        string_keys = (
+            "authorization_tag",
+            "content_digest",
+            "generation_id",
+            "lineage_id",
+        )
+        integer_keys = (
+            "canonical_device",
+            "canonical_inode",
+            "canonical_size",
+            "sequence",
+            "snapshot_device",
+            "snapshot_inode",
+            "snapshot_size",
+        )
+        if any(not isinstance(raw[key], str) for key in string_keys) or any(
+            type(raw[key]) is not int for key in integer_keys
+        ):
+            raise RepositoryIndexError("repository index content receipt is invalid")
+        previous_generation_id = raw["previous_generation_id"]
+        if previous_generation_id is not None and not isinstance(
+            previous_generation_id,
+            str,
+        ):
+            raise RepositoryIndexError("repository index content receipt is invalid")
+        receipt = _GenerationReceipt(
+            generation_id=raw["generation_id"],
+            sequence=raw["sequence"],
+            lineage_id=raw["lineage_id"],
+            previous_generation_id=previous_generation_id,
+            content_digest=raw["content_digest"],
+            canonical_device=raw["canonical_device"],
+            canonical_inode=raw["canonical_inode"],
+            canonical_size=raw["canonical_size"],
+            snapshot_device=raw["snapshot_device"],
+            snapshot_inode=raw["snapshot_inode"],
+            snapshot_size=raw["snapshot_size"],
+            authorization_tag=raw["authorization_tag"],
+        )
+        if (
+            not _valid_generation_id(receipt.generation_id)
+            or not _valid_generation_id(receipt.lineage_id)
+            or (
+                receipt.previous_generation_id is not None
+                and not _valid_generation_id(receipt.previous_generation_id)
+            )
+            or not _valid_authorization_tag(receipt.authorization_tag)
+            or not _valid_content_digest(receipt.content_digest)
+            or receipt.sequence <= 0
+            or min(
+                receipt.canonical_device,
+                receipt.canonical_inode,
+                receipt.snapshot_device,
+                receipt.snapshot_inode,
+            )
+            < 0
+            or min(receipt.canonical_size, receipt.snapshot_size) <= 0
+        ):
+            raise RepositoryIndexError("repository index content receipt is invalid")
+        return receipt
+
     def _generation_filename(self, generation_id: str) -> str:
         if not _valid_generation_id(generation_id):
             raise RepositoryIndexError("repository index generation identifier is invalid")
         return f".{self.path.name}.generation-{generation_id}"
+
+    def _generation_receipt_filename(self, generation_id: str) -> str:
+        return f"{self._generation_filename(generation_id)}.receipt"
 
     def _validate_generation_lineage(
         self,
@@ -1633,6 +2168,46 @@ class RepoIndexStore:
         ).encode("utf-8")
         return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
+    def _content_authorization_tag(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        receipt: _GenerationReceipt,
+    ) -> str:
+        secret = self._lock_secret
+        if secret is None:
+            raise RepositoryIndexError("repository index lock authorization is unavailable")
+        row = connection.execute(
+            """
+            SELECT project_id, root_path, root_device, root_inode
+            FROM index_metadata
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        if row is None:
+            raise RepositoryIndexError("repository index metadata is missing")
+        payload = "\0".join(
+            (
+                "kestrel-repo-index-content-v1",
+                str(row["project_id"]),
+                str(row["root_path"]),
+                str(int(row["root_device"])),
+                str(int(row["root_inode"])),
+                receipt.lineage_id,
+                str(receipt.sequence),
+                receipt.generation_id,
+                receipt.previous_generation_id or "",
+                receipt.content_digest,
+                str(receipt.canonical_device),
+                str(receipt.canonical_inode),
+                str(receipt.canonical_size),
+                str(receipt.snapshot_device),
+                str(receipt.snapshot_inode),
+                str(receipt.snapshot_size),
+            )
+        ).encode("utf-8")
+        return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
     def _table_exists(self, connection: sqlite3.Connection, table: str) -> bool:
         return (
             connection.execute(
@@ -1734,51 +2309,25 @@ class RepoIndexStore:
 
     def _publish_database(
         self,
+        connection: sqlite3.Connection,
         parent_descriptor: int | None,
         *,
         payload: bytes,
         expected_binding: _FileBinding | None,
         generation_id: str,
+        sequence: int,
+        lineage_id: str,
         previous_generation_id: str | None,
     ) -> _FileBinding:
-        temporary_name = f".{self.path.name}.{secrets.token_hex(12)}.tmp"
+        snapshot_temporary_name = f".{self.path.name}.{secrets.token_hex(12)}.snapshot"
+        canonical_temporary_name = f".{self.path.name}.{secrets.token_hex(12)}.canonical"
+        receipt_temporary_name = f".{self.path.name}.{secrets.token_hex(12)}.receipt"
         generation_name = self._generation_filename(generation_id)
-        link_name = f".{self.path.name}.{secrets.token_hex(12)}.link"
-        temporary_descriptor: int | None = None
+        receipt_name = self._generation_receipt_filename(generation_id)
         generation_staged = False
+        receipt_staged = False
         canonical_published = False
         try:
-            temporary_descriptor = self._open_relative(
-                temporary_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _no_follow_flag(),
-                mode=0o600,
-                parent_descriptor=parent_descriptor,
-            )
-            if os.name == "posix":
-                os.fchmod(temporary_descriptor, 0o600)
-            temporary_binding = _file_binding(os.fstat(temporary_descriptor))
-            view = memoryview(payload)
-            written = 0
-            while written < len(view):
-                count = os.write(temporary_descriptor, view[written:])
-                if count == 0:
-                    raise RepositoryIndexError("repository index snapshot write made no progress")
-                written += count
-            os.fsync(temporary_descriptor)
-            os.close(temporary_descriptor)
-            temporary_descriptor = None
-
-            staged_binding = self._relative_file_binding(
-                temporary_name,
-                parent_descriptor=parent_descriptor,
-                allow_missing=False,
-            )
-            if (
-                staged_binding is None
-                or staged_binding.device != temporary_binding.device
-                or staged_binding.inode != temporary_binding.inode
-            ):
-                raise RepositoryIndexError("repository index snapshot changed before publication")
             current = self._relative_file_binding(
                 self.path.name,
                 parent_descriptor=parent_descriptor,
@@ -1793,17 +2342,63 @@ class RepoIndexStore:
                     allow_missing=True,
                 )
                 is not None
+                or self._relative_file_binding(
+                    receipt_name,
+                    parent_descriptor=parent_descriptor,
+                    allow_missing=True,
+                )
+                is not None
             ):
                 raise RepositoryIndexError("repository index generation manifest already exists")
-            self._replace_relative(
-                temporary_name,
-                generation_name,
+            snapshot_binding = self._write_staged_file(
+                snapshot_temporary_name,
+                payload,
+                mode=0o400,
                 parent_descriptor=parent_descriptor,
             )
-            generation_staged = True
-            self._link_relative(
-                generation_name,
-                link_name,
+            canonical_temporary_binding = self._write_staged_file(
+                canonical_temporary_name,
+                payload,
+                mode=0o600,
+                parent_descriptor=parent_descriptor,
+            )
+            if (
+                snapshot_binding.device == canonical_temporary_binding.device
+                and snapshot_binding.inode == canonical_temporary_binding.inode
+            ):
+                raise RepositoryIndexError(
+                    "repository index immutable generation content is a mutable alias"
+                )
+            unsigned_receipt = _GenerationReceipt(
+                generation_id=generation_id,
+                sequence=sequence,
+                lineage_id=lineage_id,
+                previous_generation_id=previous_generation_id,
+                content_digest=hashlib.sha256(payload).hexdigest(),
+                canonical_device=canonical_temporary_binding.device,
+                canonical_inode=canonical_temporary_binding.inode,
+                canonical_size=canonical_temporary_binding.size,
+                snapshot_device=snapshot_binding.device,
+                snapshot_inode=snapshot_binding.inode,
+                snapshot_size=snapshot_binding.size,
+                authorization_tag="",
+            )
+            receipt = replace(
+                unsigned_receipt,
+                authorization_tag=self._content_authorization_tag(
+                    connection,
+                    receipt=unsigned_receipt,
+                ),
+            )
+            receipt_payload = self._generation_receipt_payload(receipt)
+            if len(receipt_payload) > _RECEIPT_MAX_BYTES:
+                raise RepositoryIndexError(
+                    "repository index content receipt exceeds its bounded size"
+                )
+            self._write_staged_file(
+                receipt_temporary_name,
+                receipt_payload,
+                mode=0o400,
                 parent_descriptor=parent_descriptor,
             )
             current = self._relative_file_binding(
@@ -1814,7 +2409,37 @@ class RepoIndexStore:
             if current != expected_binding:
                 raise RepositoryIndexError("repository index database changed during write")
             self._replace_relative(
-                link_name,
+                snapshot_temporary_name,
+                generation_name,
+                parent_descriptor=parent_descriptor,
+            )
+            generation_staged = True
+            self._replace_relative(
+                receipt_temporary_name,
+                receipt_name,
+                parent_descriptor=parent_descriptor,
+            )
+            receipt_staged = True
+            published_snapshot_binding = self._relative_file_binding(
+                generation_name,
+                parent_descriptor=parent_descriptor,
+                allow_missing=False,
+            )
+            if published_snapshot_binding is None or _content_binding(
+                published_snapshot_binding
+            ) != _content_binding(snapshot_binding):
+                raise RepositoryIndexError(
+                    "repository index immutable generation publication failed"
+                )
+            current = self._relative_file_binding(
+                self.path.name,
+                parent_descriptor=parent_descriptor,
+                allow_missing=expected_binding is None,
+            )
+            if current != expected_binding:
+                raise RepositoryIndexError("repository index database changed during write")
+            self._replace_relative(
+                canonical_temporary_name,
                 self.path.name,
                 parent_descriptor=parent_descriptor,
             )
@@ -1824,42 +2449,50 @@ class RepoIndexStore:
                 parent_descriptor=parent_descriptor,
                 allow_missing=False,
             )
-            if (
-                published_binding is None
-                or published_binding.device != temporary_binding.device
-                or published_binding.inode != temporary_binding.inode
+            if published_binding is None or _content_binding(published_binding) != _content_binding(
+                canonical_temporary_binding
             ):
                 raise RepositoryIndexError("repository index database changed during publication")
-            manifest_binding = self._relative_file_binding(
-                generation_name,
-                parent_descriptor=parent_descriptor,
-                allow_missing=False,
-            )
-            if manifest_binding != published_binding:
+            if (
+                published_snapshot_binding.device == published_binding.device
+                and published_snapshot_binding.inode == published_binding.inode
+            ):
                 raise RepositoryIndexError(
-                    "repository index generation manifest publication failed"
+                    "repository index immutable generation content is a mutable alias"
                 )
             if parent_descriptor is not None:
                 os.fsync(parent_descriptor)
             self._verify_parent_descriptor(parent_descriptor)
+            self._persist_lock_authority(receipt)
+            self._verified_content = _VerifiedGenerationContent(
+                generation_id=generation_id,
+                content_digest=receipt.content_digest,
+                canonical_binding=published_binding,
+                snapshot_binding=published_snapshot_binding,
+            )
             if previous_generation_id is not None:
                 self._unlink_relative(
                     self._generation_filename(previous_generation_id),
+                    parent_descriptor=parent_descriptor,
+                )
+                self._unlink_relative(
+                    self._generation_receipt_filename(previous_generation_id),
                     parent_descriptor=parent_descriptor,
                 )
                 if parent_descriptor is not None:
                     os.fsync(parent_descriptor)
             return published_binding
         finally:
-            if temporary_descriptor is not None:
-                os.close(temporary_descriptor)
-            if not generation_staged:
-                self._unlink_relative(
-                    temporary_name,
-                    parent_descriptor=parent_descriptor,
-                )
             self._unlink_relative(
-                link_name,
+                snapshot_temporary_name,
+                parent_descriptor=parent_descriptor,
+            )
+            self._unlink_relative(
+                canonical_temporary_name,
+                parent_descriptor=parent_descriptor,
+            )
+            self._unlink_relative(
+                receipt_temporary_name,
                 parent_descriptor=parent_descriptor,
             )
             if generation_staged and not canonical_published:
@@ -1867,6 +2500,187 @@ class RepoIndexStore:
                     generation_name,
                     parent_descriptor=parent_descriptor,
                 )
+            if receipt_staged and not canonical_published:
+                self._unlink_relative(
+                    receipt_name,
+                    parent_descriptor=parent_descriptor,
+                )
+
+    def _generation_receipt_payload(self, receipt: _GenerationReceipt) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "authorization_tag": receipt.authorization_tag,
+                    "canonical_device": receipt.canonical_device,
+                    "canonical_inode": receipt.canonical_inode,
+                    "canonical_size": receipt.canonical_size,
+                    "content_digest": receipt.content_digest,
+                    "generation_id": receipt.generation_id,
+                    "lineage_id": receipt.lineage_id,
+                    "previous_generation_id": receipt.previous_generation_id,
+                    "sequence": receipt.sequence,
+                    "snapshot_device": receipt.snapshot_device,
+                    "snapshot_inode": receipt.snapshot_inode,
+                    "snapshot_size": receipt.snapshot_size,
+                    "version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    def _write_staged_file(
+        self,
+        name: str,
+        payload: bytes,
+        *,
+        mode: int,
+        parent_descriptor: int | None,
+    ) -> _FileBinding:
+        descriptor: int | None = None
+        try:
+            descriptor = self._open_relative(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _no_follow_flag(),
+                mode=mode,
+                parent_descriptor=parent_descriptor,
+            )
+            opened_info = os.fstat(descriptor)
+            self._require_safe_private_file(
+                opened_info,
+                label="repository index staged private file",
+                expected_mode=None,
+            )
+            if os.name == "posix":
+                os.fchmod(descriptor, mode)
+            opened_info = os.fstat(descriptor)
+            self._require_safe_private_file(
+                opened_info,
+                label="repository index staged private file",
+                expected_mode=mode,
+            )
+            path_binding = self._relative_file_binding(
+                name,
+                parent_descriptor=parent_descriptor,
+                allow_missing=False,
+            )
+            if (
+                path_binding is None
+                or path_binding.device != int(opened_info.st_dev)
+                or path_binding.inode != int(opened_info.st_ino)
+            ):
+                raise RepositoryIndexError("repository index staged private file identity changed")
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            return _file_binding(os.fstat(descriptor))
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _read_relative_payload(
+        self,
+        name: str,
+        *,
+        max_bytes: int,
+        parent_descriptor: int | None,
+    ) -> bytes:
+        try:
+            descriptor = self._open_relative(
+                name,
+                os.O_RDONLY | _no_follow_flag(),
+                parent_descriptor=parent_descriptor,
+            )
+        except OSError as exc:
+            raise RepositoryIndexError(
+                "repository index content receipt is missing or inaccessible"
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            self._require_safe_private_file(
+                before,
+                label="repository index content receipt",
+                expected_mode=0o400,
+            )
+            if before.st_size <= 0 or before.st_size > max_bytes:
+                raise RepositoryIndexError("repository index content receipt is invalid")
+            path_binding = self._relative_file_binding(
+                name,
+                parent_descriptor=parent_descriptor,
+                allow_missing=False,
+            )
+            if (
+                path_binding is None
+                or path_binding.device != int(before.st_dev)
+                or path_binding.inode != int(before.st_ino)
+            ):
+                raise RepositoryIndexError("repository index content receipt identity changed")
+            remaining = int(before.st_size)
+            chunks: list[bytes] = []
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, _DIGEST_CHUNK_BYTES))
+                if not chunk:
+                    raise RepositoryIndexError(
+                        "repository index content receipt changed while being read"
+                    )
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if _file_binding(os.fstat(descriptor)) != _file_binding(before):
+                raise RepositoryIndexError(
+                    "repository index content receipt changed while being read"
+                )
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+    def _digest_relative_file(
+        self,
+        name: str,
+        *,
+        expected_binding: _FileBinding,
+        parent_descriptor: int | None,
+    ) -> str:
+        try:
+            descriptor = self._open_relative(
+                name,
+                os.O_RDONLY | _no_follow_flag(),
+                parent_descriptor=parent_descriptor,
+            )
+        except OSError as exc:
+            raise RepositoryIndexError(
+                "repository index generation content is missing or inaccessible"
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            label = (
+                "repository index database"
+                if name == self.path.name
+                else "repository index immutable generation content"
+            )
+            self._require_safe_private_file(
+                before,
+                label=label,
+                expected_mode=0o600 if name == self.path.name else 0o400,
+            )
+            if _file_binding(before) != expected_binding or before.st_size <= 0:
+                raise RepositoryIndexError("repository index generation content binding changed")
+            digest = hashlib.sha256()
+            remaining = int(before.st_size)
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, _DIGEST_CHUNK_BYTES))
+                if not chunk:
+                    raise RepositoryIndexError(
+                        "repository index generation content changed while being verified"
+                    )
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if _file_binding(os.fstat(descriptor)) != expected_binding:
+                raise RepositoryIndexError(
+                    "repository index generation content changed while being verified"
+                )
+            return digest.hexdigest()
+        finally:
+            os.close(descriptor)
 
     def _relative_file_binding(
         self,
@@ -1919,28 +2733,6 @@ class RepoIndexStore:
             )
             return
         os.replace(self.path.parent / source, self.path.parent / destination)
-
-    def _link_relative(
-        self,
-        source: str,
-        destination: str,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
-        if parent_descriptor is not None:
-            os.link(
-                source,
-                destination,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            return
-        os.link(
-            self.path.parent / source,
-            self.path.parent / destination,
-            follow_symlinks=False,
-        )
 
     def _unlink_relative(self, name: str, *, parent_descriptor: int | None) -> None:
         try:
@@ -1998,6 +2790,10 @@ class RepoIndexStore:
             with self._read_connection() as connection:
                 yield connection
             return
+        if not self._writes_allowed:
+            raise RepositoryIndexError(
+                "repository index was opened read-only and cannot publish changes"
+            )
         with self._locked_parent() as parent_descriptor:
             parent_snapshot = self._directory_snapshot(parent_descriptor)
             payload, database_binding = self._read_database_snapshot(
@@ -2062,10 +2858,13 @@ class RepoIndexStore:
                             append_previous,
                         )
                     published_binding = self._publish_database(
+                        connection,
                         parent_descriptor,
                         payload=connection.serialize(),
                         expected_binding=database_binding,
                         generation_id=generation_id,
+                        sequence=sequence,
+                        lineage_id=lineage_id,
                         previous_generation_id=previous_generation_id,
                     )
                     self._generation = _GenerationState(
@@ -2133,6 +2932,14 @@ def _valid_generation_id(value: str) -> bool:
 
 def _valid_authorization_tag(value: str) -> bool:
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _valid_content_digest(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _content_binding(binding: _FileBinding) -> tuple[int, int, int]:
+    return binding.device, binding.inode, binding.size
 
 
 def _generation_history_limit() -> int:

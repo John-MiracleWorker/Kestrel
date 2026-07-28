@@ -42,7 +42,7 @@ from .store import (
     StoreQuerySnapshot,
 )
 
-_VALID_PROJECT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_VALID_PROJECT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _GIT_OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{40,64}\Z")
 _IGNORED_DIRECTORIES = {
     ".git",
@@ -92,9 +92,11 @@ class RepositoryIndex:
     ) -> None:
         if _VALID_PROJECT_ID.fullmatch(project_id) is None:
             raise ValueError(
-                "project_id must contain only letters, digits, underscores, and hyphens"
+                "project_id must start with a letter or digit and contain only "
+                "letters, digits, dots, underscores, and hyphens"
             )
         self.project_id = project_id
+        self._read_only = not create
         self.limits = limits or IndexLimits()
         self.repository_root = _canonical_root(repository_root)
         default_index_path = index_path is None
@@ -135,6 +137,10 @@ class RepositoryIndex:
         )
 
     def rebuild(self) -> BuildReport:
+        if self._read_only:
+            raise RepositoryIndexError(
+                "repository index was opened read-only and cannot be rebuilt"
+            )
         with self._root_descriptor() as (root_descriptor, root_identity):
             self._store.assert_root_identity(root_identity)
             before = self._snapshot(root_descriptor)
@@ -143,6 +149,7 @@ class RepositoryIndex:
             changed: list[IndexedCandidate] = []
             reused_digests: dict[str, str] = {}
             skipped = before.skipped_files
+            coverage_complete = before.coverage_complete
 
             for candidate in before.candidates:
                 previous = stored.get(candidate.relative_path)
@@ -169,7 +176,10 @@ class RepositoryIndex:
             aggregate_digest = _aggregate_digest(current_digests)
 
             after = self._snapshot(root_descriptor)
-            if after.fingerprint != before.fingerprint:
+            if (
+                after.fingerprint != before.fingerprint
+                or after.coverage_complete != before.coverage_complete
+            ):
                 raise RepositoryChangedDuringIndexingError(
                     "repository changed while the index snapshot was being built"
                 )
@@ -179,6 +189,7 @@ class RepositoryIndex:
                 deleted_paths=deleted,
                 aggregate_digest=aggregate_digest,
                 freshness_fingerprint=after.fingerprint,
+                coverage_complete=coverage_complete and after.coverage_complete,
                 indexed_at=datetime.now(UTC).isoformat(),
                 parser_versions=self._parser_versions,
                 git_head=after.git_head,
@@ -205,6 +216,8 @@ class RepositoryIndex:
                 if metadata.freshness_fingerprint
                 and metadata.freshness_fingerprint == observed.fingerprint
                 and metadata.parser_versions == self._parser_versions
+                and metadata.coverage_complete
+                and observed.coverage_complete
                 else Freshness.STALE
             )
             return IndexStatus(
@@ -219,6 +232,7 @@ class RepositoryIndex:
                 git_tree=metadata.git_tree,
                 indexed_fingerprint=metadata.freshness_fingerprint,
                 observed_fingerprint=observed.fingerprint,
+                coverage_complete=(metadata.coverage_complete and observed.coverage_complete),
             )
 
     def files(
@@ -306,15 +320,26 @@ class RepositoryIndex:
         include_stale_diagnostics: bool,
     ) -> IndexQueryResult[ResultT]:
         with self._root_descriptor() as (root_descriptor, observed_root):
-            observed = self._snapshot(root_descriptor)
+            observed_before = self._snapshot(root_descriptor)
             snapshot = load()
             metadata = snapshot.metadata
             self._assert_metadata_root(metadata, observed_root)
+            observed_after = self._snapshot(root_descriptor)
+            if (
+                observed_after.fingerprint != observed_before.fingerprint
+                or observed_after.coverage_complete != observed_before.coverage_complete
+            ):
+                raise RepositoryChangedDuringIndexingError(
+                    "repository changed during repository index query"
+                )
+            observed = observed_after
         freshness = (
             Freshness.CURRENT
             if metadata.freshness_fingerprint
             and metadata.freshness_fingerprint == observed.fingerprint
             and metadata.parser_versions == self._parser_versions
+            and metadata.coverage_complete
+            and observed.coverage_complete
             else Freshness.STALE
         )
         authoritative = freshness is Freshness.CURRENT
@@ -345,7 +370,7 @@ class RepositoryIndex:
             )
 
     def _snapshot(self, root_descriptor: int | None) -> RepositorySnapshot:
-        candidates, skipped = _scan_candidates(
+        candidates, skipped, coverage_complete = _scan_candidates(
             self.repository_root,
             self.limits,
             root_descriptor=root_descriptor,
@@ -358,6 +383,7 @@ class RepositoryIndex:
             git_head=git_head,
             git_tree=git_tree,
             skipped_files=skipped,
+            coverage_complete=coverage_complete,
         )
 
     def _observed_root_identity(self) -> RootIdentity:
@@ -471,7 +497,7 @@ def _scan_candidates(
     limits: IndexLimits,
     *,
     root_descriptor: int | None,
-) -> tuple[list[CandidateFile], int]:
+) -> tuple[list[CandidateFile], int, bool]:
     if root_descriptor is not None and hasattr(os, "fwalk"):
         return _scan_candidates_from_descriptor(
             repository_root,
@@ -486,9 +512,10 @@ def _scan_candidates_from_descriptor(
     limits: IndexLimits,
     *,
     root_descriptor: int,
-) -> tuple[list[CandidateFile], int]:
+) -> tuple[list[CandidateFile], int, bool]:
     candidates: list[CandidateFile] = []
     skipped = 0
+    coverage_complete = True
     for current, directory_names, file_names, current_descriptor in os.fwalk(
         ".",
         topdown=True,
@@ -506,6 +533,7 @@ def _scan_candidates_from_descriptor(
                     follow_symlinks=False,
                 )
             except OSError:
+                coverage_complete = False
                 continue
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                 retained_directories.append(name)
@@ -526,6 +554,7 @@ def _scan_candidates_from_descriptor(
                 )
             except OSError:
                 skipped += 1
+                coverage_complete = False
                 continue
             candidate = _candidate_from_stat(
                 path=display_path,
@@ -536,18 +565,25 @@ def _scan_candidates_from_descriptor(
             )
             if candidate is None:
                 skipped += 1
+                if (
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_size <= limits.max_file_bytes
+                    and len(candidates) >= limits.max_files
+                ):
+                    coverage_complete = False
                 continue
             candidates.append(candidate)
     candidates.sort(key=lambda item: item.relative_path)
-    return candidates, skipped
+    return candidates, skipped, coverage_complete
 
 
 def _scan_candidates_from_path(
     repository_root: Path,
     limits: IndexLimits,
-) -> tuple[list[CandidateFile], int]:
+) -> tuple[list[CandidateFile], int, bool]:
     candidates: list[CandidateFile] = []
     skipped = 0
+    coverage_complete = True
     for current, directory_names, file_names in os.walk(
         repository_root,
         topdown=True,
@@ -560,6 +596,7 @@ def _scan_candidates_from_path(
             try:
                 info = os.lstat(candidate_directory)
             except OSError:
+                coverage_complete = False
                 continue
             if (
                 name.casefold() not in _IGNORED_DIRECTORIES
@@ -577,6 +614,7 @@ def _scan_candidates_from_path(
                 info = os.lstat(path)
             except OSError:
                 skipped += 1
+                coverage_complete = False
                 continue
             candidate = _candidate_from_stat(
                 path=path,
@@ -587,10 +625,16 @@ def _scan_candidates_from_path(
             )
             if candidate is None:
                 skipped += 1
+                if (
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_size <= limits.max_file_bytes
+                    and len(candidates) >= limits.max_files
+                ):
+                    coverage_complete = False
                 continue
             candidates.append(candidate)
     candidates.sort(key=lambda item: item.relative_path)
-    return candidates, skipped
+    return candidates, skipped, coverage_complete
 
 
 def _candidate_from_stat(
@@ -640,8 +684,10 @@ def _read_stable_text(
             flags=flags,
             root_descriptor=root_descriptor,
         )
-    except OSError:
-        return None
+    except OSError as exc:
+        raise RepositoryChangedDuringIndexingError(
+            f"repository file could not be opened for indexing: {candidate.relative_path}"
+        ) from exc
     try:
         before = os.fstat(descriptor)
         if (

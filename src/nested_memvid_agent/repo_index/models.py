@@ -59,6 +59,7 @@ class IndexStatus:
     git_tree: str | None
     indexed_fingerprint: str
     observed_fingerprint: str
+    coverage_complete: bool
 
 
 @dataclass(frozen=True)
@@ -199,3 +200,4 @@ class RepositorySnapshot:
     git_head: str | None
     git_tree: str | None
     skipped_files: int = field(default=0)
+    coverage_complete: bool = field(default=True)
