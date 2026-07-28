@@ -157,3 +157,25 @@ Local tests and rendered browser evidence qualify this implementation branch,
 not a production release. Live provider calls, OCI repair validation, native
 Windows/WSL2 execution, GitHub mutation, hosted CI, package publication, and
 installation on a fresh external workstation require separate receipts.
+
+Final local evidence:
+
+- the complete Python suite passed across 2,478 collected tests, with expected
+  platform/integration skips and one upstream Starlette deprecation warning;
+- all 79 web tests passed across six files;
+- the production TypeScript/Vite build passed, with the existing non-blocking
+  warning that the primary JavaScript chunk exceeds 500 kB;
+- `ruff check .` and strict `mypy src` passed;
+- a disposable release-rehearsal v2 receipt passed: exact wheel/sdist identity,
+  exact replay of both finalized surfaces, and rejection of conflicting
+  post-finalization mutation were proven without touching production targets;
+- an actual 20-repeat golden invocation completed with one stable outcome
+  signature and zero observed flakes, but it was **not release-qualified**:
+  every repeat correctly failed the three validation-dependent cases because
+  Docker was not running and no digest-pinned OCI validation image was
+  preloaded. Kestrel did not fall back to host execution.
+
+The repository does not configure `ruff format` as a gate. A diagnostic
+repository-wide format check reports 214 existing files that would be
+reformatted; this branch does not mix a bulk formatting migration into the
+product change.
