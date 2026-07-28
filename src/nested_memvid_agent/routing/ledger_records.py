@@ -86,6 +86,13 @@ class RouteDecisionEntry:
     score: float
     predicted_success: float | None
     estimated_cost_usd: float | None
+    input_cost_per_million_usd: float | None
+    output_cost_per_million_usd: float | None
+    project_id: str | None
+    task_family: str
+    risk: str
+    required_capabilities: tuple[str, ...]
+    capability_key: str
     reason_codes: tuple[str, ...]
     candidate_snapshot: tuple[dict[str, Any], ...]
     actionable: bool
@@ -96,6 +103,7 @@ class RouteDecisionEntry:
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
+        payload["required_capabilities"] = list(self.required_capabilities)
         payload["reason_codes"] = list(self.reason_codes)
         payload["candidate_snapshot"] = [dict(item) for item in self.candidate_snapshot]
         return payload
@@ -133,3 +141,83 @@ class RouteOutcomeEntry:
         payload["outcome_labels"] = list(self.outcome_labels)
         payload["evidence_refs"] = list(self.evidence_refs)
         return payload
+
+
+@dataclass(frozen=True)
+class RoutingShadowDraft:
+    project_id: str | None
+    task_family: str
+    risk: str
+    capability_key: str
+    static_target_id: str
+    learned_target_id: str | None
+    actual_target_id: str | None
+    actual_provider: str
+    actual_model: str
+    evidence_count: int
+    target_example_count: int
+    cost_coverage: float
+    confidence: float
+    static_utility: float | None
+    learned_utility: float | None
+    utility_delta: float
+    estimated_savings_usd: float | None
+    activated: bool
+    abstention_reason: str | None
+    config_digest: str
+
+
+@dataclass(frozen=True)
+class RoutingShadowEntry:
+    shadow_id: str
+    decision_id: str
+    project_id: str | None
+    task_family: str
+    risk: str
+    capability_key: str
+    static_target_id: str
+    learned_target_id: str | None
+    actual_target_id: str | None
+    actual_provider: str
+    actual_model: str
+    evidence_count: int
+    target_example_count: int
+    cost_coverage: float
+    confidence: float
+    static_utility: float | None
+    learned_utility: float | None
+    utility_delta: float
+    estimated_savings_usd: float | None
+    route_regret_usd: float | None
+    activated: bool
+    abstention_reason: str | None
+    config_digest: str
+    created_at: str
+    resolved_at: str | None = None
+    actual_validation_passed: bool | None = None
+    actual_cost_usd: float | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TargetCalibrationEntry:
+    calibration_key: str
+    project_id: str | None
+    target_id: str
+    task_family: str
+    risk: str
+    capability_key: str
+    validation_rate: float
+    recent_failure_rate: float
+    provider_outage_rate: float
+    average_cost_usd: float | None
+    average_latency_seconds: float | None
+    cost_coverage: float
+    example_count: int
+    effective_sample_size: float
+    updated_at: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)

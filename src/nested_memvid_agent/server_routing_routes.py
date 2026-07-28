@@ -68,6 +68,8 @@ class ModelTargetRequest(BaseModel):
     latency_tier: int = Field(default=3, ge=1, le=5)
     operator_priority: int = Field(default=0, ge=-10, le=10)
     estimated_cost_usd: float | None = Field(default=None, ge=0)
+    input_cost_per_million_usd: float | None = Field(default=None, ge=0)
+    output_cost_per_million_usd: float | None = Field(default=None, ge=0)
     health: RoutingHealth = "unknown"
     recent_failure_rate: float = Field(default=0.0, ge=0, le=1)
     predicted_success: float | None = Field(default=None, ge=0, le=1)
@@ -101,7 +103,7 @@ class RoutePolicyRequest(BaseModel):
 class RoutingPreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str = Field(min_length=1, max_length=240)
+    run_id: str | None = Field(default=None, min_length=1, max_length=240)
     task_id: str = Field(min_length=1, max_length=240)
     policy_id: str | None = Field(default=None, min_length=1, max_length=240)
     direct_target_id: str | None = Field(default=None, min_length=1, max_length=240)
@@ -152,6 +154,7 @@ def register_routing_routes(
                 "enabled_model_targets": sum(1 for item in targets if item.target.enabled),
                 "policies": len(policies),
                 "enabled_policies": sum(1 for item in policies if item.enabled),
+                "calibrations": len(ledger.list_calibrations()),
             },
         }
 
@@ -243,6 +246,8 @@ def register_routing_routes(
                     latency_tier=request.latency_tier,
                     operator_priority=request.operator_priority,
                     estimated_cost_usd=request.estimated_cost_usd,
+                    input_cost_per_million_usd=request.input_cost_per_million_usd,
+                    output_cost_per_million_usd=request.output_cost_per_million_usd,
                     health=request.health,
                     recent_failure_rate=request.recent_failure_rate,
                     predicted_success=request.predicted_success,
@@ -398,7 +403,7 @@ def register_routing_routes(
     def preview_route(request: RoutingPreviewRequest) -> dict[str, object]:
         try:
             task = ledger.state.get_task_node(request.task_id)
-            if task.run_id != request.run_id:
+            if request.run_id is not None and task.run_id != request.run_id:
                 raise ValueError("preview task does not belong to run")
             policy_id = request.policy_id or runtime.policy_id
             policy_entry = ledger.get_policy(policy_id)
@@ -426,7 +431,7 @@ def register_routing_routes(
             )
             return {
                 "schema": "kestrel.adaptive_flock.preview.v1",
-                "run_id": request.run_id,
+                "run_id": task.run_id,
                 "task_id": request.task_id,
                 "task": {
                     "task_id": task.task_id,
@@ -464,6 +469,16 @@ def register_routing_routes(
             "outcomes": [
                 item.to_payload()
                 for item in ledger.list_outcomes(run_id=run_id, task_id=task_id)
+            ],
+            "shadows": [
+                item.to_payload()
+                for item in ledger.list_shadows(run_id=run_id, task_id=task_id)
+            ],
+            "calibrations": [
+                item.to_payload()
+                for item in ledger.list_calibrations(
+                    project_id=ledger.state.get_run(run_id).project_id
+                )
             ],
         }
 

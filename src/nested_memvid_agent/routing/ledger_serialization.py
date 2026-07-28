@@ -13,6 +13,8 @@ from .ledger_records import (
     RouteOutcomeEntry,
     RoutePolicyEntry,
     RoutingRevisionConflict,
+    RoutingShadowEntry,
+    TargetCalibrationEntry,
 )
 from .models import ModelTarget, ProviderProfile, RoutePolicy
 
@@ -149,6 +151,8 @@ def _target_values(
         target.latency_tier,
         target.operator_priority,
         target.estimated_cost_usd,
+        target.input_cost_per_million_usd,
+        target.output_cost_per_million_usd,
         target.health,
         target.recent_failure_rate,
         target.predicted_success,
@@ -202,6 +206,12 @@ def _target_entry_from_row(row: sqlite3.Row) -> ModelTargetEntry:
             latency_tier=int(row["latency_tier"]),
             operator_priority=int(row["operator_priority"]),
             estimated_cost_usd=_optional_float(row["estimated_cost_usd"]),
+            input_cost_per_million_usd=_optional_float(
+                row["input_cost_per_million_usd"]
+            ),
+            output_cost_per_million_usd=_optional_float(
+                row["output_cost_per_million_usd"]
+            ),
             health=str(row["health"]),  # type: ignore[arg-type]
             recent_failure_rate=float(row["recent_failure_rate"]),
             predicted_success=_optional_float(row["predicted_success"]),
@@ -247,6 +257,17 @@ def _decision_entry_from_row(row: sqlite3.Row) -> RouteDecisionEntry:
         score=float(row["score"]),
         predicted_success=_optional_float(row["predicted_success"]),
         estimated_cost_usd=_optional_float(row["estimated_cost_usd"]),
+        input_cost_per_million_usd=_optional_float(
+            row["input_cost_per_million_usd"]
+        ),
+        output_cost_per_million_usd=_optional_float(
+            row["output_cost_per_million_usd"]
+        ),
+        project_id=_optional_str(row["project_id"]),
+        task_family=str(row["task_family"]),
+        risk=str(row["risk"]),
+        required_capabilities=_json_tuple(row["required_capabilities_json"]),
+        capability_key=str(row["capability_key"]),
         reason_codes=_json_tuple(row["reason_codes_json"]),
         candidate_snapshot=tuple(dict(item) for item in candidates if isinstance(item, dict)),
         actionable=bool(row["actionable"]),
@@ -288,6 +309,61 @@ def _outcome_entry_from_row(row: sqlite3.Row) -> RouteOutcomeEntry:
     )
 
 
+def _shadow_entry_from_row(row: sqlite3.Row) -> RoutingShadowEntry:
+    actual_validation_raw = row["actual_validation_passed"]
+    return RoutingShadowEntry(
+        shadow_id=str(row["shadow_id"]),
+        decision_id=str(row["decision_id"]),
+        project_id=_optional_str(row["project_id"]),
+        task_family=str(row["task_family"]),
+        risk=str(row["risk"]),
+        capability_key=str(row["capability_key"]),
+        static_target_id=str(row["static_target_id"]),
+        learned_target_id=_optional_str(row["learned_target_id"]),
+        actual_target_id=_optional_str(row["actual_target_id"]),
+        actual_provider=str(row["actual_provider"]),
+        actual_model=str(row["actual_model"]),
+        evidence_count=int(row["evidence_count"]),
+        target_example_count=int(row["target_example_count"]),
+        cost_coverage=float(row["cost_coverage"]),
+        confidence=float(row["confidence"]),
+        static_utility=_optional_float(row["static_utility"]),
+        learned_utility=_optional_float(row["learned_utility"]),
+        utility_delta=float(row["utility_delta"]),
+        estimated_savings_usd=_optional_float(row["estimated_savings_usd"]),
+        route_regret_usd=_optional_float(row["route_regret_usd"]),
+        activated=bool(row["activated"]),
+        abstention_reason=_optional_str(row["abstention_reason"]),
+        config_digest=str(row["config_digest"]),
+        created_at=str(row["created_at"]),
+        resolved_at=_optional_str(row["resolved_at"]),
+        actual_validation_passed=(
+            None if actual_validation_raw is None else bool(actual_validation_raw)
+        ),
+        actual_cost_usd=_optional_float(row["actual_cost_usd"]),
+    )
+
+
+def _calibration_entry_from_row(row: sqlite3.Row) -> TargetCalibrationEntry:
+    return TargetCalibrationEntry(
+        calibration_key=str(row["calibration_key"]),
+        project_id=_optional_str(row["project_id"]),
+        target_id=str(row["target_id"]),
+        task_family=str(row["task_family"]),
+        risk=str(row["risk"]),
+        capability_key=str(row["capability_key"]),
+        validation_rate=float(row["validation_rate"]),
+        recent_failure_rate=float(row["recent_failure_rate"]),
+        provider_outage_rate=float(row["provider_outage_rate"]),
+        average_cost_usd=_optional_float(row["average_cost_usd"]),
+        average_latency_seconds=_optional_float(row["average_latency_seconds"]),
+        cost_coverage=float(row["cost_coverage"]),
+        example_count=int(row["example_count"]),
+        effective_sample_size=float(row["effective_sample_size"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
 def _bounded_candidate(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "target_id": str(payload.get("target_id", ""))[:256],
@@ -326,6 +402,13 @@ def _decision_request_identity(entry: RouteDecisionEntry) -> tuple[object, ...]:
         entry.score,
         entry.predicted_success,
         entry.estimated_cost_usd,
+        entry.input_cost_per_million_usd,
+        entry.output_cost_per_million_usd,
+        entry.project_id,
+        entry.task_family,
+        entry.risk,
+        _json(list(entry.required_capabilities)),
+        entry.capability_key,
         _json(list(entry.reason_codes)),
         _json(list(entry.candidate_snapshot)),
         1 if entry.actionable else 0,
@@ -358,6 +441,13 @@ def _decision_request_identity_values(values: tuple[object, ...]) -> tuple[objec
         values[21],
         values[22],
         values[23],
+        values[24],
+        values[25],
+        values[26],
+        values[27],
+        values[28],
+        values[29],
+        values[30],
     )
 
 

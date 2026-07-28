@@ -6,6 +6,15 @@ export type AdaptiveFlockRuntimeStatus = {
   enabled: boolean;
   mode: RoutingMode;
   policy_id: string;
+  learned?: {
+    min_examples: number;
+    min_target_examples: number;
+    confidence_threshold: number;
+    activation_margin: number;
+    cost_coverage_threshold: number;
+    decay_half_life_days: number;
+    activation_replay_verified: boolean;
+  };
 };
 
 export type RoutingStatus = {
@@ -19,6 +28,7 @@ export type RoutingStatus = {
     enabled_model_targets: number;
     policies: number;
     enabled_policies: number;
+    calibrations?: number;
   };
 };
 
@@ -73,6 +83,8 @@ export type ModelTarget = {
   latency_tier: number;
   operator_priority: number;
   estimated_cost_usd: number | null;
+  input_cost_per_million_usd: number | null;
+  output_cost_per_million_usd: number | null;
   health: RoutingHealth;
   recent_failure_rate: number;
   predicted_success: number | null;
@@ -103,6 +115,8 @@ export type ModelTargetDraft = {
   latency_tier: number;
   operator_priority: number;
   estimated_cost_usd: number | null;
+  input_cost_per_million_usd: number | null;
+  output_cost_per_million_usd: number | null;
   health: RoutingHealth;
   recent_failure_rate: number;
   predicted_success: number | null;
@@ -170,6 +184,79 @@ export type TaskRoutePreview = {
 export type RoutingRunReport = {
   run_id: string;
   task_id: string | null;
-  decisions: Array<Record<string, unknown>>;
-  outcomes: Array<Record<string, unknown>>;
+  decisions: RoutingDecisionRecord[];
+  outcomes: RoutingOutcomeRecord[];
+  shadows?: RoutingShadowRecord[];
+  calibrations?: TargetCalibrationRecord[];
+};
+
+export type RoutingDecisionRecord = {
+  decision_id: string;
+  task_id: string;
+  attempt: number;
+  status: string;
+  mode: RoutingMode;
+  selected_target_id: string;
+  selected_provider: string;
+  selected_model: string;
+  selection_kind: string;
+  actionable: boolean;
+  task_family: string;
+  risk: string;
+};
+
+export type RoutingOutcomeRecord = {
+  decision_id: string;
+  validation_passed: boolean;
+  execution_status: string;
+  failure_category: string | null;
+  latency_seconds: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  actual_cost_usd: number | null;
+  retry_count: number;
+  escalated: boolean;
+  outcome_labels: string[];
+};
+
+export type RoutingShadowRecord = {
+  shadow_id: string;
+  decision_id: string;
+  project_id: string | null;
+  task_family: string;
+  risk: string;
+  static_target_id: string;
+  learned_target_id: string | null;
+  actual_target_id: string | null;
+  actual_provider: string;
+  actual_model: string;
+  evidence_count: number;
+  target_example_count: number;
+  cost_coverage: number;
+  confidence: number;
+  utility_delta: number;
+  estimated_savings_usd: number | null;
+  route_regret_usd: number | null;
+  activated: boolean;
+  abstention_reason: string | null;
+  resolved_at: string | null;
+  actual_validation_passed: boolean | null;
+  actual_cost_usd: number | null;
+};
+
+export type TargetCalibrationRecord = {
+  calibration_key: string;
+  project_id: string | null;
+  target_id: string;
+  task_family: string;
+  risk: string;
+  validation_rate: number;
+  recent_failure_rate: number;
+  provider_outage_rate: number;
+  average_cost_usd: number | null;
+  average_latency_seconds: number | null;
+  cost_coverage: number;
+  example_count: number;
+  effective_sample_size: number;
+  updated_at: string;
 };

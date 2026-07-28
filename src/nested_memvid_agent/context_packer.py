@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from .context_frames import MV2ContextFrame, estimate_tokens, from_memory_record
-from .layers import LayeredMemorySystem
+from .layers import LayeredMemorySystem, memory_record_matches_project_scope
 from .models import MemoryHit, MemoryLayer, MemoryRecord, RetrievalQuery
 
 SUMMARY_FRAME_TYPES = frozenset({"section_summary", "task_summary", "session_summary", "skill_card", "trace_stub", "self_model"})
@@ -33,6 +33,7 @@ class ContextPackRequest:
     include_telemetry: bool = True
     k_per_layer: int = 8
     excluded_record_ids: frozenset[str] = frozenset()
+    project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ class ContextPacker:
                 layers=tuple(layers),
                 k_per_layer=request.k_per_layer,
                 objective=request.objective,
+                project_id=request.project_id,
             )
         )
         hits = [
@@ -159,7 +161,11 @@ class ContextPacker:
             if should_expand:
                 content = frame.content
             if expand_children:
-                expanded_content = self._content_with_child_frames(frame, content)
+                expanded_content = self._content_with_child_frames(
+                    frame,
+                    content,
+                    project_id=request.project_id,
+                )
                 if expanded_content != content:
                     content = expanded_content
                     should_expand = True
@@ -244,12 +250,18 @@ class ContextPacker:
         frame_rank = 3 if frame.frame_type in SUMMARY_FRAME_TYPES else 2 if frame.frame_type in CORRECTION_FRAME_TYPES else 1
         return (layer_rank, frame_rank, hit.score, frame.importance, frame.confidence)
 
-    def _content_with_child_frames(self, frame: MV2ContextFrame, base_content: str) -> str:
+    def _content_with_child_frames(
+        self,
+        frame: MV2ContextFrame,
+        base_content: str,
+        *,
+        project_id: str | None,
+    ) -> str:
         if not frame.child_ids:
             return base_content
         lines = [base_content.strip()]
         for child_id in frame.child_ids:
-            record = self._find_record_by_id(child_id)
+            record = self._find_record_by_id(child_id, project_id=project_id)
             if record is None:
                 continue
             if _is_retrieval_artifact(record):
@@ -260,11 +272,21 @@ class ContextPacker:
             lines.append(f"[expanded child {child_frame.id} / {child_frame.frame_type}]\n{record.content.strip()}")
         return "\n\n".join(line for line in lines if line)
 
-    def _find_record_by_id(self, lookup_id: str) -> MemoryRecord | None:
+    def _find_record_by_id(
+        self,
+        lookup_id: str,
+        *,
+        project_id: str | None,
+    ) -> MemoryRecord | None:
         record = self.memory.get_record(None, lookup_id, include_inactive=True)
-        if record is not None:
+        if record is not None and memory_record_matches_project_scope(
+            record,
+            project_id=project_id,
+        ):
             return record
-        for hit in self.memory.retrieve(RetrievalQuery(query=lookup_id, k_per_layer=5)):
+        for hit in self.memory.retrieve(
+            RetrievalQuery(query=lookup_id, k_per_layer=5, project_id=project_id)
+        ):
             metadata = hit.record.metadata
             if hit.record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id or hit.frame_id == lookup_id:
                 return hit.record

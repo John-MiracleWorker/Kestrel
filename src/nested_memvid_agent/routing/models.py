@@ -138,6 +138,8 @@ class ModelTarget:
     latency_tier: int = 3
     operator_priority: int = 0
     estimated_cost_usd: float | None = None
+    input_cost_per_million_usd: float | None = None
+    output_cost_per_million_usd: float | None = None
     health: TargetHealth = "unknown"
     recent_failure_rate: float = 0.0
     predicted_success: float | None = None
@@ -156,9 +158,14 @@ class ModelTarget:
             raise ValueError("recent_failure_rate must be between 0 and 1")
         if self.predicted_success is not None and not 0.0 <= self.predicted_success <= 1.0:
             raise ValueError("predicted_success must be between 0 and 1")
-        if self.estimated_cost_usd is not None:
-            if not math.isfinite(self.estimated_cost_usd) or self.estimated_cost_usd < 0:
-                raise ValueError("estimated_cost_usd must be a finite non-negative number")
+        for name in (
+            "estimated_cost_usd",
+            "input_cost_per_million_usd",
+            "output_cost_per_million_usd",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be a finite non-negative number")
 
     def to_public_payload(self) -> dict[str, Any]:
         payload = asdict(self)

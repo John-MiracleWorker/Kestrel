@@ -325,7 +325,7 @@ The “first useful hour” slice now joins previously separate runtime capabili
 
 This is not the whole roadmap. The next release sequence remains:
 
-1. **v0.6 — Adaptive Flock Learns:** provider usage/cost attribution, learned-router shadow integration, per-family calibration, route regret, evidence-gated constrained routing, and project-scoped learning.
+1. **v0.6 — Adaptive Flock Learns:** ✅ provider usage/cost attribution, durable learned-router shadow integration, per-project/family/risk/capability calibration, savings/regret evidence, failure-specific escalation, evidence-gated low/medium-risk constrained routing, project-scoped memory retrieval, and a readable comparison dashboard. Learned activation remains default-off until its explicit replay gate is verified.
 2. **v0.7 — Parallel Flock:** bounded graph amendments, isolated candidate fan-out/selection, contained browser validation, approval packets, private benchmarks, and GitHub PR/CI feedback.
 3. **Later ecosystem work:** dependency-locked extensions, portable containment, richer schedules, and idempotent external delivery after the engineering loop is mature.
 

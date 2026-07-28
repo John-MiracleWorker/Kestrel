@@ -4,7 +4,7 @@ import sqlite3
 
 from ..state_store import AgentStateStore, utc_now
 
-ROUTING_SCHEMA_VERSION = 1
+ROUTING_SCHEMA_VERSION = 2
 
 
 def ensure_routing_schema(state: AgentStateStore) -> None:
@@ -31,6 +31,9 @@ def ensure_routing_schema(state: AgentStateStore) -> None:
         if current < 1:
             _apply_routing_schema_v1(conn)
             current = 1
+        if current < 2:
+            _apply_routing_schema_v2(conn)
+            current = 2
         conn.execute(
             """
             INSERT INTO routing_schema_version (id, version, updated_at)
@@ -184,5 +187,104 @@ def _apply_routing_schema_v1(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_routing_decisions_task ON routing_decisions(task_id, attempt)",
         "CREATE INDEX IF NOT EXISTS idx_routing_decisions_subagent ON routing_decisions(subagent_id, attempt)",
         "CREATE INDEX IF NOT EXISTS idx_routing_outcomes_run ON routing_outcomes(run_id, created_at)",
+    ):
+        conn.execute(statement)
+
+
+def _apply_routing_schema_v2(conn: sqlite3.Connection) -> None:
+    """Add measured, project-scoped learned-routing state.
+
+    The migration is intentionally additive. Existing v1 decisions remain
+    readable with empty scope and pricing snapshots, so a routing ledger can be
+    upgraded without rewriting historical evidence.
+    """
+
+    for statement in (
+        "ALTER TABLE routing_model_targets ADD COLUMN input_cost_per_million_usd REAL",
+        "ALTER TABLE routing_model_targets ADD COLUMN output_cost_per_million_usd REAL",
+        "ALTER TABLE routing_decisions ADD COLUMN project_id TEXT",
+        "ALTER TABLE routing_decisions ADD COLUMN task_family TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE routing_decisions ADD COLUMN risk TEXT NOT NULL DEFAULT ''",
+        (
+            "ALTER TABLE routing_decisions ADD COLUMN "
+            "required_capabilities_json TEXT NOT NULL DEFAULT '[]'"
+        ),
+        "ALTER TABLE routing_decisions ADD COLUMN capability_key TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE routing_decisions ADD COLUMN input_cost_per_million_usd REAL",
+        "ALTER TABLE routing_decisions ADD COLUMN output_cost_per_million_usd REAL",
+    ):
+        conn.execute(statement)
+    conn.execute(
+        """
+        CREATE TABLE routing_shadow_evaluations (
+            shadow_id TEXT PRIMARY KEY,
+            decision_id TEXT NOT NULL UNIQUE,
+            project_id TEXT,
+            task_family TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            capability_key TEXT NOT NULL,
+            static_target_id TEXT NOT NULL,
+            learned_target_id TEXT,
+            actual_target_id TEXT,
+            actual_provider TEXT NOT NULL,
+            actual_model TEXT NOT NULL,
+            evidence_count INTEGER NOT NULL,
+            target_example_count INTEGER NOT NULL,
+            cost_coverage REAL NOT NULL,
+            confidence REAL NOT NULL,
+            static_utility REAL,
+            learned_utility REAL,
+            utility_delta REAL NOT NULL,
+            estimated_savings_usd REAL,
+            route_regret_usd REAL,
+            activated INTEGER NOT NULL,
+            abstention_reason TEXT,
+            config_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            actual_validation_passed INTEGER,
+            actual_cost_usd REAL,
+            FOREIGN KEY (decision_id) REFERENCES routing_decisions(decision_id),
+            FOREIGN KEY (static_target_id) REFERENCES routing_model_targets(target_id),
+            FOREIGN KEY (learned_target_id) REFERENCES routing_model_targets(target_id),
+            FOREIGN KEY (actual_target_id) REFERENCES routing_model_targets(target_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE routing_target_calibrations (
+            calibration_key TEXT PRIMARY KEY,
+            project_id TEXT,
+            target_id TEXT NOT NULL,
+            task_family TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            capability_key TEXT NOT NULL,
+            validation_rate REAL NOT NULL,
+            recent_failure_rate REAL NOT NULL,
+            provider_outage_rate REAL NOT NULL,
+            average_cost_usd REAL,
+            average_latency_seconds REAL,
+            cost_coverage REAL NOT NULL,
+            example_count INTEGER NOT NULL,
+            effective_sample_size REAL NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (target_id) REFERENCES routing_model_targets(target_id)
+        )
+        """
+    )
+    for statement in (
+        (
+            "CREATE INDEX idx_routing_decisions_learning_scope ON "
+            "routing_decisions(project_id, task_family, risk, capability_key, created_at)"
+        ),
+        (
+            "CREATE INDEX idx_routing_shadow_run ON "
+            "routing_shadow_evaluations(decision_id, created_at)"
+        ),
+        (
+            "CREATE INDEX idx_routing_calibration_scope ON "
+            "routing_target_calibrations(project_id, task_family, risk, capability_key, target_id)"
+        ),
     ):
         conn.execute(statement)

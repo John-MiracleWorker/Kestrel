@@ -162,9 +162,10 @@ class RoutingRegistry:
                     task_family_affinities_json, max_context_tokens, supports_tools,
                     supports_json, supports_vision, supports_reasoning, supports_streaming,
                     quality_tier, latency_tier, operator_priority, estimated_cost_usd,
-                    health, recent_failure_rate, predicted_success, metadata_json,
-                    revision, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    input_cost_per_million_usd, output_cost_per_million_usd, health,
+                    recent_failure_rate, predicted_success, metadata_json, revision,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(target_id) DO UPDATE SET
                     provider_profile_id = excluded.provider_profile_id,
                     provider = excluded.provider,
@@ -185,6 +186,8 @@ class RoutingRegistry:
                     latency_tier = excluded.latency_tier,
                     operator_priority = excluded.operator_priority,
                     estimated_cost_usd = excluded.estimated_cost_usd,
+                    input_cost_per_million_usd = excluded.input_cost_per_million_usd,
+                    output_cost_per_million_usd = excluded.output_cost_per_million_usd,
                     health = excluded.health,
                     recent_failure_rate = excluded.recent_failure_rate,
                     predicted_success = excluded.predicted_success,
@@ -321,9 +324,10 @@ class RoutingRegistry:
                         task_family_affinities_json, max_context_tokens, supports_tools,
                         supports_json, supports_vision, supports_reasoning, supports_streaming,
                         quality_tier, latency_tier, operator_priority, estimated_cost_usd,
-                        health, recent_failure_rate, predicted_success, metadata_json,
-                        revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        input_cost_per_million_usd, output_cost_per_million_usd, health,
+                        recent_failure_rate, predicted_success, metadata_json, revision,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(target_id) DO UPDATE SET
                         provider_profile_id = excluded.provider_profile_id,
                         provider = excluded.provider,
@@ -344,6 +348,8 @@ class RoutingRegistry:
                         latency_tier = excluded.latency_tier,
                         operator_priority = excluded.operator_priority,
                         estimated_cost_usd = excluded.estimated_cost_usd,
+                        input_cost_per_million_usd = excluded.input_cost_per_million_usd,
+                        output_cost_per_million_usd = excluded.output_cost_per_million_usd,
                         health = excluded.health,
                         recent_failure_rate = excluded.recent_failure_rate,
                         predicted_success = excluded.predicted_success,

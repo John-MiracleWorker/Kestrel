@@ -260,3 +260,5 @@ class AgentTurnResult:
     run_id: str = ""
     error: dict[str, Any] | None = None
     proof_of_work: dict[str, Any] | None = None
+    provider_usage: dict[str, Any] | None = None
+    provider_attempts: tuple[dict[str, Any], ...] = ()

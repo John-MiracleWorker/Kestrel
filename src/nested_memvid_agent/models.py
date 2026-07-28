@@ -114,6 +114,7 @@ class RetrievalQuery:
     mode: str = "auto"
     min_relevancy: float = 0.0
     objective: str | None = None
+    project_id: str | None = None
     include_inactive: bool = False
     include_retrieval_artifacts: bool = False
 

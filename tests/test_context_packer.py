@@ -208,6 +208,107 @@ def test_packer_excludes_the_current_turn_frame_from_recalled_hits(tmp_path: Pat
     assert packed.telemetry["excluded"] == 1
 
 
+def test_packer_isolates_project_memory_and_keeps_global_self_separate(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(tmp_path)
+    _put(
+        memory,
+        "Project A fact",
+        "sharedtoken belongs to project A.",
+        MemoryLayer.SEMANTIC,
+        metadata={"project_id": "project-a"},
+    )
+    _put(
+        memory,
+        "Project B fact",
+        "sharedtoken belongs to project B.",
+        MemoryLayer.SEMANTIC,
+        metadata={"project_id": "project-b"},
+    )
+    _put(
+        memory,
+        "Global fact",
+        "sharedtoken is portable global knowledge.",
+        MemoryLayer.PROCEDURAL,
+        confidence=0.9,
+    )
+    _put(
+        memory,
+        "Global self",
+        "sharedtoken global user preference.",
+        MemoryLayer.SELF,
+    )
+    _put(
+        memory,
+        "Invalid scoped self",
+        "sharedtoken must never become project-owned self memory.",
+        MemoryLayer.SELF,
+        metadata={"project_id": "project-a"},
+    )
+
+    project_a = ContextPacker(memory).pack(
+        ContextPackRequest(
+            objective="sharedtoken",
+            query="sharedtoken",
+            project_id="project-a",
+        )
+    )
+    unbound = ContextPacker(memory).pack(
+        ContextPackRequest(objective="sharedtoken", query="sharedtoken")
+    )
+
+    project_titles = {item.frame.title for item in project_a.items}
+    unbound_titles = {item.frame.title for item in unbound.items}
+    assert "Project A fact" in project_titles
+    assert "Project B fact" not in project_titles
+    assert "Global fact" in project_titles
+    assert "Global self" in project_titles
+    assert "Invalid scoped self" not in project_titles
+    assert "Project A fact" not in unbound_titles
+    assert "Project B fact" not in unbound_titles
+
+
+def test_project_summary_cannot_expand_a_cross_project_child(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    _put(
+        memory,
+        "Project A summary",
+        "crosschild summary.",
+        MemoryLayer.EPISODIC,
+        frame_type="task_summary",
+        metadata={
+            "frame_id": "summary-a",
+            "child_ids": ["raw-b"],
+            "project_id": "project-a",
+        },
+    )
+    _put(
+        memory,
+        "Project B raw",
+        "secret-cross-project-child",
+        MemoryLayer.EPISODIC,
+        frame_type="raw_chunk",
+        metadata={
+            "frame_id": "raw-b",
+            "parent_ids": ["summary-a"],
+            "project_id": "project-b",
+        },
+    )
+
+    packed = ContextPacker(memory).pack(
+        ContextPackRequest(
+            objective="crosschild",
+            query="crosschild",
+            expand_raw=True,
+            project_id="project-a",
+        )
+    )
+
+    assert "Project A summary" in packed.prompt
+    assert "secret-cross-project-child" not in packed.prompt
+
+
 def _memory(tmp_path: Path) -> LayeredMemorySystem:
     return LayeredMemorySystem.from_backend_factory(
         tmp_path,

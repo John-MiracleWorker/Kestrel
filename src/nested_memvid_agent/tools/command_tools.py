@@ -635,6 +635,8 @@ class TestRunTool(AgentTool):
                     output_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
                     session_id=context.session_id,
                     run_id=context.run_id,
+                    project_id=context.project_id,
+                    project_revision=context.project_revision,
                     subject_record_id=str(arguments.get("subject_record_id") or "").strip() or None,
                 )
                 validation_evidence = _authenticated_validation_evidence_payload(
@@ -749,6 +751,8 @@ class LintRunTool(AgentTool):
                     output_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
                     session_id=context.session_id,
                     run_id=context.run_id,
+                    project_id=context.project_id,
+                    project_revision=context.project_revision,
                     subject_record_id=str(arguments.get("subject_record_id") or "").strip() or None,
                 )
                 validation_evidence = _authenticated_validation_evidence_payload(

@@ -14,7 +14,12 @@ from .learned_router import (
     replay_history,
     should_activate_learned_policy,
 )
-from .ledger import RoutingLedger, stable_decision_id, stable_outcome_id
+from .ledger import (
+    RoutingLedger,
+    capability_scope_key,
+    stable_decision_id,
+    stable_outcome_id,
+)
 from .ledger_records import (
     ModelTargetEntry,
     ProviderProfileEntry,
@@ -22,6 +27,9 @@ from .ledger_records import (
     RouteOutcomeEntry,
     RoutePolicyEntry,
     RoutingRevisionConflict,
+    RoutingShadowDraft,
+    RoutingShadowEntry,
+    TargetCalibrationEntry,
 )
 from .models import (
     AgentTaskContract,
@@ -85,16 +93,20 @@ __all__ = [
     "RoutingLedger",
     "RoutingMode",
     "RoutingRevisionConflict",
+    "RoutingShadowDraft",
+    "RoutingShadowEntry",
     "RoutingUnavailableError",
     "RunManagerBuild",
     "ShadowEvaluation",
     "TaskLike",
+    "TargetCalibrationEntry",
     "WorkerArtifact",
     "WorkerCredentials",
     "WorkerLifecycleState",
     "WorkerState",
     "build_route_examples",
     "build_run_manager",
+    "capability_scope_key",
     "compile_task_contract",
     "evaluate_shadow",
     "replay_history",

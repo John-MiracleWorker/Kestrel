@@ -117,6 +117,15 @@ def test_routing_preview_explains_task_without_executing_model(tmp_path: Path) -
         assert payload["decision"]["selected_target_id"] == "local-scout"
         assert payload["decision"]["mode"] == "shadow"
         assert payload["decision"]["actionable"] is False
+        omitted_run = client.post(
+            "/api/routing/preview",
+            json={
+                "task_id": "task-preview-success",
+                "local_required": True,
+            },
+        )
+        assert omitted_run.status_code == 200
+        assert omitted_run.json()["run_id"] == "run-preview-success"
         assert state.get_task_node("task-preview-success").status == "queued"
         assert build.routing_ledger.list_decisions(run_id="run-preview-success") == []
     finally:

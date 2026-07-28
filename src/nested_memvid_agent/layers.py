@@ -535,6 +535,8 @@ class LayeredMemorySystem:
         output_sha256: str,
         session_id: str,
         run_id: str | None,
+        project_id: str | None = None,
+        project_revision: int | None = None,
         signed_artifact_source: str | None = None,
         signed_artifact_locator: str | None = None,
         subject_record_id: str | None = None,
@@ -563,6 +565,11 @@ class LayeredMemorySystem:
         )
         if normalized_subject_id and subject_record is None:
             raise ValueError("Runtime validation subject record is missing or inactive.")
+        if subject_record is not None and not memory_record_matches_project_scope(
+            subject_record,
+            project_id=project_id,
+        ):
+            raise ValueError("Runtime validation subject is outside the project scope.")
         receipt_id = f"validation_receipt_{sha256(secrets.token_bytes(32)).hexdigest()[:24]}"
         payload: dict[str, object] = {
             "schema": _RUNTIME_VALIDATION_RECEIPT_SCHEMA,
@@ -574,6 +581,8 @@ class LayeredMemorySystem:
             "output_sha256": output_sha256.strip(),
             "session_id": session_id,
             "run_id": run_id,
+            "project_id": project_id,
+            "project_revision": project_revision,
             "signed_artifact_source": artifact_source or None,
             "signed_artifact_locator": artifact_locator or None,
             "stable_learning_eligible": subject_record is not None,
@@ -603,7 +612,16 @@ class LayeredMemorySystem:
                 "evidence_bucket": normalized_bucket,
                 "signed_artifact_source": artifact_source or None,
                 "signed_artifact_locator": artifact_locator or None,
+                **(
+                    {
+                        "project_id": project_id,
+                        "project_revision": project_revision,
+                    }
+                    if project_id is not None
+                    else {}
+                ),
             },
+            tags={"project_id": project_id} if project_id is not None else {},
             evidence=[
                 EvidenceRef(
                     source=f"tool://{normalized_tool}",
@@ -1037,7 +1055,16 @@ class LayeredMemorySystem:
                 min_relevancy=query.min_relevancy,
                 include_inactive=True,
             )
-            return _best_hits_by_record_id(direct_hits)
+            return _best_hits_by_record_id(
+                [
+                    hit
+                    for hit in direct_hits
+                    if memory_record_matches_project_scope(
+                        hit.record,
+                        project_id=query.project_id,
+                    )
+                ]
+            )
 
         eligible_by_id: dict[str, MemoryHit] = {}
         cursor: str | None = None
@@ -1065,7 +1092,13 @@ class LayeredMemorySystem:
             for hit in page.hits:
                 if (
                     not query.include_retrieval_artifacts and _is_retrieval_artifact(hit.record)
-                ) or (not query.include_inactive and memory_record_is_expired(hit.record, now=now)):
+                ) or (
+                    not query.include_inactive
+                    and memory_record_is_expired(hit.record, now=now)
+                ) or not memory_record_matches_project_scope(
+                    hit.record,
+                    project_id=query.project_id,
+                ):
                     continue
                 existing = eligible_by_id.get(hit.record.id)
                 if existing is None or hit.score > existing.score:
@@ -1664,6 +1697,21 @@ def _is_retrieval_artifact(record: MemoryRecord) -> bool:
             "tool://memory.search/",
         )
     )
+
+
+def memory_record_matches_project_scope(
+    record: MemoryRecord,
+    *,
+    project_id: str | None,
+) -> bool:
+    """Allow global memory plus records bound to the caller's exact project."""
+
+    record_project = str(record.metadata.get("project_id") or "").strip() or None
+    if record.layer in {MemoryLayer.SELF, MemoryLayer.POLICY}:
+        return record_project is None
+    if record_project is None:
+        return True
+    return project_id is not None and record_project == project_id
 
 
 def memory_record_is_expired(

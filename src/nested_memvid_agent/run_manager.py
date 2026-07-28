@@ -3480,6 +3480,8 @@ class RunManager:
                     "context_chars": result.context_chars,
                     "tool_count": len(combined_result.tool_executions),
                     "memory_writes": list(result.memory_writes),
+                    "provider_usage": result.provider_usage,
+                    "provider_attempts": [dict(item) for item in result.provider_attempts],
                     "acceptance_validation": validation,
                     "worker_isolation": worker_isolation,
                 }
@@ -4426,6 +4428,8 @@ class RunManager:
                     "context_chars": result.context_chars,
                     "tool_count": len(result.tool_executions),
                     "memory_writes": list(result.memory_writes),
+                    "provider_usage": result.provider_usage,
+                    "provider_attempts": [dict(item) for item in result.provider_attempts],
                     "acceptance_validation": validation,
                     "worker_isolation": worker_isolation,
                     "approval_continuation": self._approval_continuation_for_task(
@@ -4462,6 +4466,10 @@ class RunManager:
             completed_result: dict[str, Any] = {
                 "assistant_message": result.assistant_message,
                 "stop_reason": result.stop_reason,
+                "context_chars": result.context_chars,
+                "tool_count": len(result.tool_executions),
+                "provider_usage": result.provider_usage,
+                "provider_attempts": [dict(item) for item in result.provider_attempts],
                 "acceptance_validation": validation,
                 "worker_isolation": worker_isolation,
             }
@@ -4730,6 +4738,8 @@ class RunManager:
                 "context_chars": result.context_chars,
                 "tool_count": len(result.tool_executions),
                 "memory_writes": list(result.memory_writes),
+                "provider_usage": result.provider_usage,
+                "provider_attempts": [dict(item) for item in result.provider_attempts],
                 "acceptance_validation": validation,
                 "worker_isolation": worker_isolation,
             }
@@ -6406,6 +6416,8 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
         "proof_of_work": result.proof_of_work,
+        "provider_usage": result.provider_usage,
+        "provider_attempts": [dict(item) for item in result.provider_attempts],
     }
 
 
