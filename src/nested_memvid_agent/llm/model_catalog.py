@@ -7,10 +7,11 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..config import AgentConfig
 from ..security_boundary import REDACTED, redact_text
@@ -73,6 +74,7 @@ SecretResolver = Callable[[str | None], str | None]
 MAX_MODEL_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_MODEL_CATALOG_ENTRIES = 2048
 MAX_MODEL_ID_CHARS = 512
+_HTTP_READ_CHUNK_BYTES = 16 * 1024
 _SENSITIVE_QUERY_VALUE = re.compile(
     r"([?&](?:api[_-]?key|key|token|access[_-]?token)=)[^&\s]+",
     flags=re.IGNORECASE,
@@ -93,6 +95,9 @@ class ProviderModelCatalog:
     api_key_env: str | None = None
     api_key_configured: bool = False
     fetched_at: str | None = None
+    catalog_complete: bool = False
+    catalog_truncated: bool = False
+    reported_model_count: int | None = None
     declared_capabilities: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
@@ -101,6 +106,9 @@ class ProviderModelCatalog:
             "provider": self.provider,
             "models": list(self.models),
             "source": self.source,
+            "catalog_complete": self.catalog_complete,
+            "catalog_truncated": self.catalog_truncated,
+            "reported_model_count": self.reported_model_count,
             "declared_capabilities": {
                 model: list(capabilities)
                 for model, capabilities in sorted(self.declared_capabilities.items())
@@ -128,6 +136,9 @@ class ProviderModelCatalog:
             "api_key_configured": self.api_key_configured,
             "fetched_at": self.fetched_at,
             "catalog_digest": self.digest,
+            "catalog_complete": self.catalog_complete,
+            "catalog_truncated": self.catalog_truncated,
+            "reported_model_count": self.reported_model_count,
             "declared_capabilities": {
                 model: list(capabilities)
                 for model, capabilities in sorted(self.declared_capabilities.items())
@@ -330,6 +341,9 @@ def _catalog(
 ) -> ProviderModelCatalog:
     unique_models = _unique(_model_ids(payload))
     declared_capabilities = _model_capability_declarations(payload)
+    catalog_complete, catalog_truncated, reported_model_count = _catalog_completeness(
+        payload
+    )
     if not unique_models:
         return ProviderModelCatalog(
             provider=provider,
@@ -354,6 +368,9 @@ def _catalog(
         api_key_env=api_key_env,
         api_key_configured=_api_key_configured_for_env(api_key_env, secret_resolver=secret_resolver),
         fetched_at=datetime.now(UTC).isoformat(),
+        catalog_complete=catalog_complete,
+        catalog_truncated=catalog_truncated,
+        reported_model_count=reported_model_count,
         declared_capabilities={
             model: declared_capabilities[model]
             for model in unique_models
@@ -369,7 +386,9 @@ def _fetch_json(
     api_key: str | None,
     headers: dict[str, str] | None = None,
     use_bearer: bool = True,
+    monotonic_clock: Callable[[], float] = monotonic,
 ) -> Any:
+    deadline = monotonic_clock() + timeout_seconds
     safe_url = validate_provider_http_url(url)
     request_headers = {"Accept": "application/json", **(headers or {})}
     if api_key and use_bearer:
@@ -377,10 +396,27 @@ def _fetch_json(
     request = Request(safe_url, headers=request_headers)
     try:
         # The URL is restricted to HTTP(S) with a host immediately above.
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
-            raw_body = response.read(MAX_MODEL_CATALOG_BYTES + 1)
+        with urlopen(
+            request,
+            timeout=_remaining_http_seconds(deadline, monotonic_clock),
+        ) as response:  # nosec B310
+            raw_body = read_bounded_http_body(
+                response,
+                max_bytes=MAX_MODEL_CATALOG_BYTES,
+                deadline=deadline,
+                monotonic_clock=monotonic_clock,
+            )
     except HTTPError as exc:
-        detail = exc.read(241).decode("utf-8", errors="replace")
+        try:
+            detail_bytes = read_bounded_http_body(
+                exc,
+                max_bytes=240,
+                deadline=deadline,
+                monotonic_clock=monotonic_clock,
+            )
+            detail = detail_bytes.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - error-body diagnostics are best effort
+            detail = "response detail unavailable"
         raise RuntimeError(
             f"model list failed with HTTP {exc.code}: "
             f"{_safe_catalog_error(detail, secret=api_key)[:240]}"
@@ -390,10 +426,104 @@ def _fetch_json(
         raise RuntimeError(
             f"model list request failed: {_safe_catalog_error(str(reason), secret=api_key)}"
         ) from exc
-    if len(raw_body) > MAX_MODEL_CATALOG_BYTES:
-        raise ValueError("model catalog response exceeded the byte limit")
     body = raw_body.decode("utf-8")
     return json.loads(body)
+
+
+class _RejectRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def urlopen(request: Request, timeout: float) -> Any:
+    """Open one validated provider request without following redirects."""
+
+    opener = build_opener(_RejectRedirectHandler())
+    return opener.open(request, timeout=timeout)  # nosec B310
+
+
+def read_bounded_http_body(
+    response: Any,
+    *,
+    max_bytes: int,
+    deadline: float,
+    monotonic_clock: Callable[[], float] = monotonic,
+) -> bytes:
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    chunks: list[bytes] = []
+    total = 0
+    reader = getattr(response, "read1", None)
+    read_chunk_bytes = _HTTP_READ_CHUNK_BYTES
+    if not callable(reader):
+        response_fp = getattr(response, "fp", None)
+        reader = getattr(response_fp, "read1", None)
+    if not callable(reader):
+        reader = getattr(response, "read", None)
+        # A generic read(n) may wait for all n bytes while a peer slow-drips.
+        # Reading one byte keeps the monotonic check authoritative even for a
+        # non-standard response wrapper without read1().
+        read_chunk_bytes = 1
+    if not callable(reader):
+        raise ValueError("provider response is not readable")
+    while True:
+        remaining = _remaining_http_seconds(deadline, monotonic_clock)
+        _set_response_socket_timeout(response, remaining)
+        raw_chunk = reader(min(read_chunk_bytes, max_bytes + 1 - total))
+        if monotonic_clock() >= deadline:
+            raise TimeoutError("provider response deadline exceeded")
+        if not isinstance(raw_chunk, bytes):
+            raise ValueError("provider response reader returned non-bytes content")
+        if not raw_chunk:
+            break
+        chunks.append(raw_chunk)
+        total += len(raw_chunk)
+        if total > max_bytes:
+            raise ValueError("provider response exceeded the byte limit")
+    return b"".join(chunks)
+
+
+def _remaining_http_seconds(
+    deadline: float,
+    monotonic_clock: Callable[[], float],
+) -> float:
+    remaining = deadline - monotonic_clock()
+    if remaining <= 0:
+        raise TimeoutError("provider response deadline exceeded")
+    return max(0.001, remaining)
+
+
+def _set_response_socket_timeout(response: Any, timeout_seconds: float) -> None:
+    candidates = [response]
+    seen: set[int] = set()
+    while candidates and len(seen) < 12:
+        candidate = candidates.pop(0)
+        if candidate is None:
+            continue
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        socket = getattr(candidate, "_sock", None)
+        setter = getattr(socket, "settimeout", None)
+        if callable(setter):
+            setter(timeout_seconds)
+            return
+        candidates.extend(
+            [
+                getattr(candidate, "fp", None),
+                getattr(candidate, "raw", None),
+            ]
+        )
 
 
 def _model_ids(payload: Any) -> tuple[str, ...]:
@@ -416,6 +546,74 @@ def _model_ids(payload: Any) -> tuple[str, ...]:
         if model_id is not None:
             ids.append(model_id)
     return tuple(ids)
+
+
+def _catalog_completeness(payload: Any) -> tuple[bool, bool, int | None]:
+    if not isinstance(payload, dict):
+        return False, True, None
+    rows: list[Any] = []
+    for key in ("data", "models"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            rows.extend(value)
+    reported_model_count = _reported_model_count(payload)
+    continuation_values: list[Any] = [
+        payload.get("next"),
+        payload.get("next_page"),
+        payload.get("nextPageToken"),
+        payload.get("next_cursor"),
+    ]
+    pagination = payload.get("pagination")
+    if isinstance(pagination, dict):
+        continuation_values.extend(
+            [
+                pagination.get("next"),
+                pagination.get("next_page"),
+                pagination.get("next_cursor"),
+            ]
+        )
+    links = payload.get("links")
+    if isinstance(links, dict):
+        continuation_values.append(links.get("next"))
+    has_continuation = payload.get("has_more") is True or any(
+        value is not None and value is not False and value != ""
+        for value in continuation_values
+    )
+    parsed_row_count = len(_model_ids(payload))
+    bounded_row_count = min(len(rows), MAX_MODEL_CATALOG_ENTRIES)
+    truncated = (
+        len(rows) > MAX_MODEL_CATALOG_ENTRIES
+        or parsed_row_count != bounded_row_count
+        or has_continuation
+        or (
+            reported_model_count is not None
+            and reported_model_count != len(rows)
+        )
+    )
+    return not truncated, truncated, reported_model_count
+
+
+def _reported_model_count(payload: dict[Any, Any]) -> int | None:
+    candidates: list[Any] = [
+        payload.get("total"),
+        payload.get("total_count"),
+        payload.get("totalCount"),
+    ]
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        candidates.extend(
+            [meta.get("total"), meta.get("total_count"), meta.get("totalCount")]
+        )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.isdecimal():
+            candidate = int(candidate)
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and candidate >= 0
+        ):
+            return candidate
+    return None
 
 
 def _model_capability_declarations(payload: Any) -> dict[str, tuple[str, ...]]:

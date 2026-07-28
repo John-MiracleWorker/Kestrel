@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from typing import Any
 
 import pytest
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.model_catalog import (
-    MAX_MODEL_CATALOG_BYTES,
     MAX_MODEL_ID_CHARS,
     ProviderModelCatalog,
     _fetch_json,
@@ -17,6 +19,11 @@ from nested_memvid_agent.provider_probe import (
     CapabilityEvidence,
     ModelProbeObservation,
     ProviderProbeService,
+    _post_bytes,
+    _valid_generation,
+    _valid_stream,
+    _valid_structured_output,
+    _valid_tool_call,
     routing_constraint_presets,
 )
 from nested_memvid_agent.routing.models import ProviderProfile
@@ -42,6 +49,7 @@ def test_probe_service_combines_catalog_declarations_with_observed_evidence() ->
         ok=True,
         fetchable=True,
         fetched_at="2026-07-28T12:00:00+00:00",
+        catalog_complete=True,
         declared_capabilities={"qwen-coder": ("vision",)},
     )
 
@@ -133,6 +141,7 @@ def test_probe_backend_failure_is_redacted_and_keeps_capabilities_unknown() -> N
         ok=True,
         fetchable=True,
         fetched_at="2026-07-28T12:00:00+00:00",
+        catalog_complete=True,
     )
 
     class Backend:
@@ -230,8 +239,7 @@ def test_catalog_response_body_is_bounded(monkeypatch: pytest.MonkeyPatch) -> No
         def __exit__(self, *_args: object) -> None:
             return None
 
-        def read(self, limit: int) -> bytes:
-            assert limit == MAX_MODEL_CATALOG_BYTES + 1
+        def read1(self, limit: int) -> bytes:
             return b"x" * limit
 
     monkeypatch.setattr(
@@ -270,3 +278,261 @@ def test_live_catalog_drops_unbounded_or_control_character_model_ids(
     )
 
     assert catalog.models == ("valid/model:1",)
+    assert catalog.catalog_complete is False
+    assert catalog.catalog_truncated is True
+
+
+def test_catalog_marks_paginated_or_capped_inventory_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_fetch_json(_url: str, **_kwargs: Any) -> Any:
+        return {
+            "data": [{"id": f"model-{index}"} for index in range(2049)],
+            "has_more": True,
+            "total": 3000,
+        }
+
+    monkeypatch.setattr("nested_memvid_agent.llm.model_catalog._fetch_json", fake_fetch_json)
+    catalog = model_catalog_for_provider(
+        AgentConfig(
+            provider="openai-compatible",
+            model="model-0",
+            base_url="http://127.0.0.1:1234/v1",
+        ),
+        "openai-compatible",
+    )
+
+    assert len(catalog.models) == 2048
+    assert catalog.catalog_complete is False
+    assert catalog.catalog_truncated is True
+    assert catalog.reported_model_count == 3000
+    assert catalog.to_public_dict()["catalog_complete"] is False
+
+
+def test_capability_validators_require_exact_meaningful_evidence() -> None:
+    assert _valid_generation({"choices": [{"message": {"content": " OK "}}]}) is True
+    assert _valid_generation({"choices": [{"message": {"content": "  "}}]}) is False
+    assert _valid_generation({"choices": [{"message": {"content": None}}]}) is False
+
+    valid_sse = (
+        b'data: {"choices":[{"delta":{"content":"O"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    assert _valid_stream(valid_sse) is True
+    assert _valid_stream(b'data: {"error":{"message":"denied"}}\n\n') is False
+    assert _valid_stream(b"data: [DONE]\n\n") is False
+    assert _valid_stream(b"data: not-json\n\n") is False
+
+    assert (
+        _valid_structured_output(
+            {"choices": [{"message": {"content": '{"ok": true}'}}]}
+        )
+        is True
+    )
+    assert (
+        _valid_structured_output(
+            {"choices": [{"message": {"content": '{"different": true}'}}]}
+        )
+        is False
+    )
+
+    valid_tool = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "kestrel_probe",
+                                "arguments": '{"value":"ok"}',
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    assert _valid_tool_call(valid_tool) is True
+    wrong_name = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "other_tool",
+                                "arguments": '{"value":"ok"}',
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    assert _valid_tool_call(wrong_name) is False
+    invalid_arguments = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "kestrel_probe",
+                                "arguments": '{"value":"wrong"}',
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    assert _valid_tool_call(invalid_arguments) is False
+
+
+class _AdvancingClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class _SlowDripResponse:
+    def __init__(self, clock: _AdvancingClock) -> None:
+        self.clock = clock
+
+    def __enter__(self) -> _SlowDripResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read1(self, _limit: int) -> bytes:
+        self.clock.value += 0.4
+        return b"x"
+
+
+def test_catalog_read_enforces_monotonic_deadline_during_slow_drip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _AdvancingClock()
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.model_catalog.urlopen",
+        lambda _request, timeout: _SlowDripResponse(clock),
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        _fetch_json(
+            "http://127.0.0.1:1234/v1/models",
+            timeout_seconds=1,
+            api_key=None,
+            monotonic_clock=clock,
+        )
+
+
+def test_probe_read_enforces_monotonic_deadline_during_slow_drip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _AdvancingClock()
+    monkeypatch.setattr(
+        "nested_memvid_agent.provider_probe.urlopen",
+        lambda _request, timeout: _SlowDripResponse(clock),
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        _post_bytes(
+            "http://127.0.0.1:1234/v1/chat/completions",
+            {"model": "local"},
+            timeout_seconds=1,
+            secret=None,
+            monotonic_clock=clock,
+        )
+
+
+@contextmanager
+def _serve(handler: type[BaseHTTPRequestHandler]) -> Any:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_catalog_redirect_never_forwards_authorization_cross_host() -> None:
+    captured_authorization: list[str | None] = []
+
+    class CaptureHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            captured_authorization.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"data":[{"id":"stolen"}]}')
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+    with _serve(CaptureHandler) as capture_url:
+        cross_host_url = capture_url.replace("127.0.0.1", "localhost")
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", f"{cross_host_url}/models")
+                self.end_headers()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return None
+
+        with _serve(RedirectHandler) as redirect_url:
+            with pytest.raises(RuntimeError, match="HTTP 302") as raised:
+                _fetch_json(
+                    f"{redirect_url}/models",
+                    timeout_seconds=1,
+                    api_key="redirect-secret-value",
+                )
+
+    assert captured_authorization == []
+    assert "redirect-secret-value" not in str(raised.value)
+
+
+def test_probe_redirect_never_forwards_authorization_cross_host() -> None:
+    captured_authorization: list[str | None] = []
+
+    class CaptureHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            captured_authorization.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"choices":[{"message":{"content":"stolen"}}]}')
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+    with _serve(CaptureHandler) as capture_url:
+        cross_host_url = capture_url.replace("127.0.0.1", "localhost")
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                self.send_response(307)
+                self.send_header("Location", f"{cross_host_url}/chat/completions")
+                self.end_headers()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return None
+
+        with _serve(RedirectHandler) as redirect_url:
+            with pytest.raises(RuntimeError, match="HTTP 307") as raised:
+                _post_bytes(
+                    f"{redirect_url}/chat/completions",
+                    {"model": "local"},
+                    timeout_seconds=1,
+                    secret="redirect-secret-value",
+                )
+
+    assert captured_authorization == []
+    assert "redirect-secret-value" not in str(raised.value)

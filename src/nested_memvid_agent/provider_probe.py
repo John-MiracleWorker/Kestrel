@@ -9,10 +9,16 @@ from time import monotonic
 from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .config import AgentConfig
-from .llm.model_catalog import DEFAULT_BASE_URLS, ProviderModelCatalog, model_catalog_for_provider
+from .llm.model_catalog import (
+    DEFAULT_BASE_URLS,
+    ProviderModelCatalog,
+    model_catalog_for_provider,
+    read_bounded_http_body,
+    urlopen,
+)
 from .llm.provider_urls import normalize_ollama_openai_base_url, validate_provider_http_url
 from .routing.models import ProviderProfile
 from .security_boundary import REDACTED, redact_text
@@ -185,6 +191,9 @@ class ProviderDiscoveryResult:
     catalog_source: str
     catalog_digest: str
     catalog_fetched_at: str | None
+    catalog_complete: bool
+    catalog_truncated: bool
+    reported_model_count: int | None
     probed_at: str
     catalog_models: tuple[str, ...]
     models: tuple[DiscoveredModelProbe, ...]
@@ -199,6 +208,9 @@ class ProviderDiscoveryResult:
             "catalog_source": self.catalog_source,
             "catalog_digest": self.catalog_digest,
             "catalog_fetched_at": self.catalog_fetched_at,
+            "catalog_complete": self.catalog_complete,
+            "catalog_truncated": self.catalog_truncated,
+            "reported_model_count": self.reported_model_count,
             "probed_at": self.probed_at,
             "catalog_model_count": len(self.catalog_models),
             "probed_model_count": len(self.models),
@@ -359,6 +371,9 @@ class ProviderProbeService:
                 catalog_source=catalog.source,
                 catalog_digest=catalog.digest,
                 catalog_fetched_at=catalog.fetched_at,
+                catalog_complete=False,
+                catalog_truncated=catalog.catalog_truncated,
+                reported_model_count=catalog.reported_model_count,
                 probed_at=now,
                 catalog_models=(),
                 models=(),
@@ -438,6 +453,9 @@ class ProviderProbeService:
             catalog_source=catalog.source,
             catalog_digest=catalog.digest,
             catalog_fetched_at=catalog.fetched_at,
+            catalog_complete=catalog.catalog_complete,
+            catalog_truncated=catalog.catalog_truncated,
+            reported_model_count=catalog.reported_model_count,
             probed_at=now,
             catalog_models=catalog.models,
             models=tuple(discovered),
@@ -613,8 +631,9 @@ class BoundedOpenAICompatibleProbeBackend:
             response = _post_json(
                 endpoint,
                 payload,
-                timeout_seconds=_remaining_seconds(deadline, self._monotonic),
                 secret=secret,
+                deadline=deadline,
+                monotonic_clock=self._monotonic,
             )
             if not validator(response):
                 raise ValueError("provider response did not satisfy the bounded probe")
@@ -639,8 +658,9 @@ class BoundedOpenAICompatibleProbeBackend:
             response = _post_bytes(
                 endpoint,
                 payload,
-                timeout_seconds=_remaining_seconds(deadline, self._monotonic),
                 secret=secret,
+                deadline=deadline,
+                monotonic_clock=self._monotonic,
             )
             if not validator(response):
                 raise ValueError("provider stream did not satisfy the bounded probe")
@@ -677,10 +697,19 @@ def _post_json(
     url: str,
     payload: Mapping[str, object],
     *,
-    timeout_seconds: float,
+    timeout_seconds: float | None = None,
     secret: str | None,
+    deadline: float | None = None,
+    monotonic_clock: Callable[[], float] = monotonic,
 ) -> Mapping[str, Any]:
-    body = _post_bytes(url, payload, timeout_seconds=timeout_seconds, secret=secret)
+    body = _post_bytes(
+        url,
+        payload,
+        timeout_seconds=timeout_seconds,
+        secret=secret,
+        deadline=deadline,
+        monotonic_clock=monotonic_clock,
+    )
     parsed = json.loads(body.decode("utf-8"))
     if not isinstance(parsed, dict):
         raise ValueError("provider probe response must be a JSON object")
@@ -691,9 +720,16 @@ def _post_bytes(
     url: str,
     payload: Mapping[str, object],
     *,
-    timeout_seconds: float,
+    timeout_seconds: float | None = None,
     secret: str | None,
+    deadline: float | None = None,
+    monotonic_clock: Callable[[], float] = monotonic,
 ) -> bytes:
+    active_deadline = _active_deadline(
+        timeout_seconds=timeout_seconds,
+        deadline=deadline,
+        monotonic_clock=monotonic_clock,
+    )
     safe_url = validate_provider_http_url(url)
     headers = {
         "Accept": "application/json, text/event-stream",
@@ -709,10 +745,27 @@ def _post_bytes(
     )
     try:
         # URL schemes and hosts are validated immediately above.
-        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
-            body = bytes(response.read(MAX_PROBE_RESPONSE_BYTES + 1))
+        with urlopen(
+            request,
+            timeout=_remaining_seconds(active_deadline, monotonic_clock),
+        ) as response:  # nosec B310
+            body = read_bounded_http_body(
+                response,
+                max_bytes=MAX_PROBE_RESPONSE_BYTES,
+                deadline=active_deadline,
+                monotonic_clock=monotonic_clock,
+            )
     except HTTPError as exc:
-        detail = exc.read(241).decode("utf-8", errors="replace")
+        try:
+            detail_bytes = read_bounded_http_body(
+                exc,
+                max_bytes=240,
+                deadline=active_deadline,
+                monotonic_clock=monotonic_clock,
+            )
+            detail = detail_bytes.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - error-body diagnostics are best effort
+            detail = "response detail unavailable"
         raise RuntimeError(
             f"provider probe failed with HTTP {exc.code}: "
             f"{_safe_error(detail, secrets=(secret,))}"
@@ -722,13 +775,15 @@ def _post_bytes(
         raise RuntimeError(
             f"provider probe request failed: {_safe_error(str(reason), secrets=(secret,))}"
         ) from exc
-    if len(body) > MAX_PROBE_RESPONSE_BYTES:
-        raise ValueError("provider probe response exceeded the byte limit")
     return body
 
 
 def _valid_generation(payload: Mapping[str, Any]) -> bool:
-    return _response_message(payload) is not None
+    message = _response_message(payload)
+    if message is None:
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and bool(content.strip())
 
 
 def _valid_structured_output(payload: Mapping[str, Any]) -> bool:
@@ -739,7 +794,7 @@ def _valid_structured_output(payload: Mapping[str, Any]) -> bool:
     if not isinstance(content, str):
         return False
     try:
-        return isinstance(json.loads(content), dict)
+        return bool(json.loads(content) == {"ok": True})
     except json.JSONDecodeError:
         return False
 
@@ -749,11 +804,74 @@ def _valid_tool_call(payload: Mapping[str, Any]) -> bool:
     if message is None:
         return False
     calls = message.get("tool_calls")
-    return isinstance(calls, list) and bool(calls)
+    if not isinstance(calls, list):
+        return False
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict) or function.get("name") != "kestrel_probe":
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                continue
+        if arguments == {"value": "ok"}:
+            return True
+    return False
 
 
 def _valid_stream(payload: bytes) -> bool:
-    return b"data:" in payload and payload.strip() not in {b"data: [DONE]", b"[DONE]"}
+    observed_content = False
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith(b"event:") and b"error" in line.lower():
+            return False
+        if not line.startswith(b"data:"):
+            continue
+        raw_data = line.removeprefix(b"data:").strip()
+        if raw_data == b"[DONE]":
+            continue
+        try:
+            event = json.loads(raw_data)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(event, dict) or event.get("error") is not None:
+            return False
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                observed_content = True
+    return observed_content
+
+
+def _active_deadline(
+    *,
+    timeout_seconds: float | None,
+    deadline: float | None,
+    monotonic_clock: Callable[[], float],
+) -> float:
+    if deadline is None:
+        if timeout_seconds is None or timeout_seconds <= 0:
+            raise ValueError("a positive provider probe timeout is required")
+        return monotonic_clock() + timeout_seconds
+    if timeout_seconds is None:
+        return deadline
+    if timeout_seconds <= 0:
+        raise ValueError("provider probe timeout must be positive")
+    return min(deadline, monotonic_clock() + timeout_seconds)
 
 
 def _response_message(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:

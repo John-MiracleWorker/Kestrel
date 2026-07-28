@@ -141,6 +141,7 @@ def _create_app(
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
+        from .provider_probe import ProviderProbeService
         from .server_behavior_delta_routes import register_behavior_delta_routes
         from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
@@ -486,6 +487,9 @@ def _create_app(
         ledger=routing_ledger,
         runtime=routing_config,
         http_exception=HTTPException,
+        provider_probe_service=ProviderProbeService(
+            secret_resolver=secret_broker.resolve,
+        ),
     )
     register_routine_routes(
         app,

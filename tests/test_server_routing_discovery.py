@@ -15,8 +15,10 @@ from nested_memvid_agent.provider_probe import (
     ModelProbeObservation,
     ProviderProbeService,
 )
+from nested_memvid_agent.routing.ledger import RoutingLedger
 from nested_memvid_agent.routing.models import ProviderProfile
 from nested_memvid_agent.routing.runtime import AdaptiveFlockRuntimeConfig, build_run_manager
+from nested_memvid_agent.server import create_app
 from nested_memvid_agent.server_routing_routes import register_routing_routes
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
@@ -27,6 +29,7 @@ def _routing_app(
     *,
     models: list[str],
     catalog_ok: bool = True,
+    catalog_complete: list[bool] | None = None,
 ) -> tuple[Any, Any, ProviderProbeService]:
     fastapi = pytest.importorskip("fastapi")
     testclient = pytest.importorskip("fastapi.testclient")
@@ -52,6 +55,9 @@ def _routing_app(
             fetchable=True,
             error=None if catalog_ok else "catalog unavailable",
             fetched_at="2026-07-28T12:00:00+00:00",
+            catalog_complete=(
+                catalog_complete[0] if catalog_complete is not None else True
+            ),
         )
 
     class Backend:
@@ -142,7 +148,7 @@ def test_discovery_creates_disabled_unconfirmed_target_drafts(tmp_path: Path) ->
 
         stored = build.routing_ledger.get_provider_profile("local")
         assert stored is not None
-        assert stored.revision == 3
+        assert stored.revision == 2
         assert stored.profile.metadata["discovery"]["status"] == "complete"
         assert stored.profile.metadata["discovery"]["catalog_digest"] == payload["catalog_digest"]
         assert build.routing_ledger.list_model_targets(enabled_only=True) == []
@@ -186,7 +192,7 @@ def test_removed_discovery_model_is_staled_and_excluded(tmp_path: Path) -> None:
             "/api/routing/discovery",
             json={
                 "provider_profile_id": "local",
-                "expected_profile_revision": 3,
+                "expected_profile_revision": 2,
                 "probe_capabilities": False,
             },
         )
@@ -288,3 +294,217 @@ def test_manual_capability_claim_is_stored_as_operator_supplied(tmp_path: Path) 
     finally:
         assert build.runs.shutdown(timeout_seconds=1.0)
         assert build.runs.mcp.shutdown()
+
+
+def test_operator_confirmation_preserves_discovery_provenance_when_omitted(
+    tmp_path: Path,
+) -> None:
+    client, build, _service = _routing_app(tmp_path, models=["qwen-coder"])
+    try:
+        _create_profile(client)
+        discovered = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": "local",
+                "expected_profile_revision": 1,
+                "probe_capabilities": False,
+            },
+        )
+        assert discovered.status_code == 200
+        draft = discovered.json()["targets"][0]
+
+        confirmed = client.post(
+            "/api/routing/targets",
+            json={
+                "target_id": draft["target_id"],
+                "provider_profile_id": "local",
+                "provider": "openai-compatible",
+                "model": "qwen-coder",
+                "enabled": True,
+                "locality": "local",
+                "trust_class": "operator_confirmed",
+                "expected_revision": draft["revision"],
+            },
+        )
+
+        assert confirmed.status_code == 200
+        assert confirmed.json()["metadata"]["discovery"]["managed"] is True
+        assert confirmed.json()["enabled"] is True
+    finally:
+        assert build.runs.shutdown(timeout_seconds=1.0)
+        assert build.runs.mcp.shutdown()
+
+
+def test_incomplete_catalog_never_stales_a_missing_target(tmp_path: Path) -> None:
+    models = ["qwen-coder"]
+    complete = [True]
+    client, build, _service = _routing_app(
+        tmp_path,
+        models=models,
+        catalog_complete=complete,
+    )
+    try:
+        _create_profile(client)
+        first = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": "local",
+                "expected_profile_revision": 1,
+                "probe_capabilities": False,
+            },
+        )
+        assert first.status_code == 200
+        target_id = first.json()["targets"][0]["target_id"]
+        target = build.routing_ledger.get_model_target(target_id)
+        assert target is not None
+        build.routing_ledger.put_model_target(
+            target.target.__class__(
+                **{
+                    **target.target.__dict__,
+                    "enabled": True,
+                    "trust_class": "operator_confirmed",
+                    "health": "healthy",
+                }
+            ),
+            expected_revision=target.revision,
+        )
+
+        models.clear()
+        complete[0] = False
+        refresh = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": "local",
+                "expected_profile_revision": 2,
+                "probe_capabilities": False,
+            },
+        )
+
+        assert refresh.status_code == 200
+        assert refresh.json()["catalog_complete"] is False
+        assert refresh.json()["stale_target_ids"] == []
+        preserved = build.routing_ledger.get_model_target(target_id)
+        assert preserved is not None
+        assert preserved.target.enabled is True
+        assert preserved.target.health == "healthy"
+    finally:
+        assert build.runs.shutdown(timeout_seconds=1.0)
+        assert build.runs.mcp.shutdown()
+
+
+def test_inventory_apply_rolls_back_atomically_on_injected_crash_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.routing.ledger_registry as ledger_registry
+
+    models = ["qwen-coder"]
+    client, build, _service = _routing_app(tmp_path, models=models)
+    try:
+        _create_profile(client)
+
+        def crash() -> None:
+            raise RuntimeError("injected inventory crash")
+
+        monkeypatch.setattr(ledger_registry, "_before_inventory_commit", crash)
+        with pytest.raises(RuntimeError, match="injected inventory crash"):
+            client.post(
+                "/api/routing/discovery",
+                json={
+                    "provider_profile_id": "local",
+                    "expected_profile_revision": 1,
+                    "probe_capabilities": False,
+                },
+            )
+
+        restarted = RoutingLedger(build.routing_ledger.state)
+        profile = restarted.get_provider_profile("local")
+        assert profile is not None
+        assert profile.revision == 1
+        assert "discovery" not in profile.profile.metadata
+        assert restarted.list_model_targets() == []
+
+        monkeypatch.setattr(ledger_registry, "_before_inventory_commit", lambda: None)
+        retry = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": "local",
+                "expected_profile_revision": 1,
+                "probe_capabilities": False,
+            },
+        )
+        assert retry.status_code == 200
+        assert retry.json()["provider_profile_revision"] == 2
+        assert len(restarted.list_model_targets()) == 1
+    finally:
+        assert build.runs.shutdown(timeout_seconds=1.0)
+        assert build.runs.mcp.shutdown()
+
+
+def test_create_app_discovery_resolves_broker_secret_without_exposing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    testclient = pytest.importorskip("fastapi.testclient")
+    raw_secret = "broker-only-provider-secret"
+    observed_api_keys: list[str | None] = []
+
+    def fake_fetch_json(_url: str, **kwargs: Any) -> Any:
+        observed_api_keys.append(kwargs.get("api_key"))
+        return {"data": [{"id": "private-local-model"}]}
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.llm.model_catalog._fetch_json",
+        fake_fetch_json,
+    )
+    config = AgentConfig(
+        provider="mock",
+        model="mock",
+        state_path=tmp_path / "state" / "agent.db",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        workspace=tmp_path,
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        secret_store_path=tmp_path / "secrets" / "vault.json",
+        require_api_auth=False,
+    )
+
+    with testclient.TestClient(create_app(config)) as client:
+        stored = client.post(
+            "/api/secrets",
+            json={
+                "id": "provider-key",
+                "name": "Provider key",
+                "purpose": "routing discovery",
+                "value": raw_secret,
+            },
+        )
+        assert stored.status_code == 200
+        assert raw_secret not in stored.text
+
+        profile = client.post(
+            "/api/routing/providers",
+            json={
+                "profile_id": "private-local",
+                "display_name": "Private local",
+                "adapter": "openai-compatible",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "secret_ref": "secret://provider-key",
+                "locality": "local",
+            },
+        )
+        assert profile.status_code == 200
+        discovery = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": "private-local",
+                "expected_profile_revision": 1,
+                "probe_capabilities": False,
+            },
+        )
+
+    assert discovery.status_code == 200
+    assert observed_api_keys == [raw_secret]
+    assert raw_secret not in discovery.text
+    assert "provider-key" not in discovery.text

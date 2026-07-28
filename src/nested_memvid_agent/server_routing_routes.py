@@ -204,7 +204,23 @@ def register_routing_routes(
     @app.post("/api/routing/targets")  # type: ignore[untyped-decorator]
     def put_model_target(request: ModelTargetRequest) -> dict[str, Any]:
         try:
-            metadata = _operator_capability_metadata(request)
+            current = ledger.get_model_target(request.target_id)
+            base_metadata = request.metadata
+            if (
+                current is not None
+                and request.expected_revision is not None
+                and "metadata" not in request.model_fields_set
+            ):
+                base_metadata = current.target.metadata
+            if current is not None and _is_discovery_managed(current):
+                base_metadata = {
+                    **base_metadata,
+                    "discovery": current.target.metadata["discovery"],
+                }
+            metadata = _operator_capability_metadata(
+                request,
+                base_metadata=base_metadata,
+            )
             entry = ledger.put_model_target(
                 ModelTarget(
                     target_id=request.target_id,
@@ -304,33 +320,28 @@ def register_routing_routes(
                 ),
             )
         try:
-            applying_profile = ledger.put_provider_profile(
+            (
+                target_updates,
+                visible_target_count,
+                stale_target_ids,
+                created_count,
+            ) = _plan_discovered_targets(
+                ledger,
+                profile=current_profile.profile,
+                discovery=discovery,
+            )
+            updated_profile, applied_targets = ledger.apply_provider_inventory(
                 replace(
                     current_profile.profile,
                     metadata=_provider_discovery_metadata(
                         current_profile.profile,
                         discovery,
-                        status="applying",
                     ),
                 ),
-                expected_revision=current_profile.revision,
+                expected_profile_revision=current_profile.revision,
+                target_updates=target_updates,
             )
-            targets, stale_target_ids, created_count = _persist_discovered_targets(
-                ledger,
-                profile=applying_profile.profile,
-                discovery=discovery,
-            )
-            updated_profile = ledger.put_provider_profile(
-                replace(
-                    applying_profile.profile,
-                    metadata=_provider_discovery_metadata(
-                        applying_profile.profile,
-                        discovery,
-                        status="complete",
-                    ),
-                ),
-                expected_revision=applying_profile.revision,
-            )
+            targets = applied_targets[:visible_target_count]
         except RoutingRevisionConflict as exc:
             raise http_exception(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
@@ -457,12 +468,12 @@ def register_routing_routes(
         }
 
 
-def _persist_discovered_targets(
+def _plan_discovered_targets(
     ledger: RoutingLedger,
     *,
     profile: ProviderProfile,
     discovery: ProviderDiscoveryResult,
-) -> tuple[list[ModelTargetEntry], list[str], int]:
+) -> tuple[tuple[tuple[ModelTarget, int], ...], int, list[str], int]:
     entries = [
         entry
         for entry in ledger.list_model_targets()
@@ -473,14 +484,14 @@ def _persist_discovered_targets(
         for entry in entries
         if _is_discovery_managed(entry)
     }
-    persisted: list[ModelTargetEntry] = []
+    updates: list[tuple[ModelTarget, int]] = []
     created_count = 0
     for model_probe in discovery.models:
         existing = managed_by_model.get(model_probe.model)
         metadata = _target_discovery_metadata(discovery, model_probe, stale=False)
         if existing is None:
             target = _new_discovered_target(profile, model_probe, metadata=metadata)
-            persisted.append(ledger.put_model_target(target))
+            updates.append((target, 0))
             created_count += 1
             continue
         target = existing.target
@@ -501,40 +512,51 @@ def _persist_discovered_targets(
                 supports_streaming="streaming" in supported,
                 health="healthy" if _generation_observed(model_probe) else "unknown",
             )
-        persisted.append(
-            ledger.put_model_target(updated, expected_revision=existing.revision)
-        )
+        updates.append((updated, existing.revision))
 
     available_models = set(discovery.catalog_models)
     stale_target_ids: list[str] = []
-    for entry in entries:
-        if not _is_discovery_managed(entry) or entry.target.model in available_models:
-            continue
-        previous = entry.target.metadata.get("discovery")
-        previous_metadata = previous if isinstance(previous, dict) else {}
-        stale_metadata = {
-            **previous_metadata,
-            "schema": "kestrel.routing.target_discovery_evidence.v1",
-            "managed": True,
-            "stale": True,
-            "stale_at": discovery.probed_at,
-            "catalog_digest": discovery.catalog_digest,
-            "catalog_fetched_at": discovery.catalog_fetched_at,
-        }
-        updated = replace(
-            entry.target,
-            enabled=False,
-            health="unavailable",
-            metadata={**entry.target.metadata, "discovery": stale_metadata},
-        )
-        ledger.put_model_target(updated, expected_revision=entry.revision)
-        stale_target_ids.append(entry.target.target_id)
+    if discovery.catalog_complete:
+        for entry in entries:
+            if (
+                not _is_discovery_managed(entry)
+                or entry.target.model in available_models
+            ):
+                continue
+            previous = entry.target.metadata.get("discovery")
+            previous_metadata = previous if isinstance(previous, dict) else {}
+            stale_metadata = {
+                **previous_metadata,
+                "schema": "kestrel.routing.target_discovery_evidence.v1",
+                "managed": True,
+                "stale": True,
+                "stale_at": discovery.probed_at,
+                "catalog_digest": discovery.catalog_digest,
+                "catalog_fetched_at": discovery.catalog_fetched_at,
+            }
+            updated = replace(
+                entry.target,
+                enabled=False,
+                health="unavailable",
+                metadata={**entry.target.metadata, "discovery": stale_metadata},
+            )
+            updates.append((updated, entry.revision))
+            stale_target_ids.append(entry.target.target_id)
 
-    return persisted, sorted(stale_target_ids), created_count
+    return (
+        tuple(updates),
+        len(discovery.models),
+        sorted(stale_target_ids),
+        created_count,
+    )
 
 
-def _operator_capability_metadata(request: ModelTargetRequest) -> dict[str, Any]:
-    metadata = dict(request.metadata)
+def _operator_capability_metadata(
+    request: ModelTargetRequest,
+    *,
+    base_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = dict(request.metadata if base_metadata is None else base_metadata)
     evidence_payload = metadata.get("capability_evidence")
     evidence = dict(evidence_payload) if isinstance(evidence_payload, dict) else {}
     fields = (
@@ -559,17 +581,18 @@ def _operator_capability_metadata(request: ModelTargetRequest) -> dict[str, Any]
 def _provider_discovery_metadata(
     profile: ProviderProfile,
     discovery: ProviderDiscoveryResult,
-    *,
-    status: Literal["applying", "complete"],
 ) -> dict[str, Any]:
     return {
         **profile.metadata,
         "discovery": {
             "schema": "kestrel.routing.provider_catalog_evidence.v1",
-            "status": status,
+            "status": "complete",
             "catalog_digest": discovery.catalog_digest,
             "catalog_source": discovery.catalog_source,
             "catalog_fetched_at": discovery.catalog_fetched_at,
+            "catalog_complete": discovery.catalog_complete,
+            "catalog_truncated": discovery.catalog_truncated,
+            "reported_model_count": discovery.reported_model_count,
             "refreshed_at": discovery.probed_at,
             "catalog_model_count": len(discovery.catalog_models),
             "probed_model_count": len(discovery.models),
@@ -621,6 +644,8 @@ def _target_discovery_metadata(
         "stale": stale,
         "catalog_digest": discovery.catalog_digest,
         "catalog_fetched_at": discovery.catalog_fetched_at,
+        "catalog_complete": discovery.catalog_complete,
+        "catalog_truncated": discovery.catalog_truncated,
         "observed_at": discovery.probed_at,
         "model_identity": model_probe.model_identity,
         "identity_provenance": model_probe.identity_provenance,
@@ -657,7 +682,15 @@ def _generation_observed(model_probe: DiscoveredModelProbe) -> bool:
 
 def _is_discovery_managed(entry: ModelTargetEntry) -> bool:
     discovery = entry.target.metadata.get("discovery")
-    return isinstance(discovery, dict) and discovery.get("managed") is True
+    return (
+        isinstance(discovery, dict)
+        and discovery.get("managed") is True
+        and entry.target.target_id
+        == _draft_target_id(
+            entry.target.provider_profile_id,
+            entry.target.model,
+        )
+    )
 
 
 def _draft_target_id(profile_id: str, model: str) -> str:
