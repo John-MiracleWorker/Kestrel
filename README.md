@@ -33,6 +33,35 @@ Kestrel is currently designed for **one trusted user running one local or privat
 
 ---
 
+## Install and Open Kestrel
+
+Once the matching `v0.4.11` tag and exact-tag assets have been published, the everyday install-and-open path is:
+
+```bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.11/install.sh \
+  | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+```
+
+That explicit opt-in installs Kestrel, starts one verified loopback-only service, and opens the local Workbench. Returning users can launch or safely reuse that same service with:
+
+```bash
+kestrel open
+```
+
+The installer places the `kestrel` launcher on your command path and, on macOS, creates `Kestrel.app` in `~/Applications`. Either entry point works from any directory. `kestrel status`, `kestrel chat`, `kestrel doctor`, and `kestrel stop` provide the same small everyday surface without requiring the operator to reconstruct server arguments.
+
+Kestrel reports its model state explicitly:
+
+- **Demo** — `Demo uses deterministic responses; no live model connected.` No model credential is required.
+- **Model not connected** — a non-mock provider is configured but has not completed a successful response in this server process.
+- **Ready** — the configured non-mock provider has completed a successful response in the current server process.
+
+`kestrel` is the everyday command. `nest-agent` remains the advanced operator and automation CLI, and the Python distribution remains `nested-memvid-agent` for compatibility.
+
+Prefer a checkout? Use the [source quick start](#quick-start-from-source). Need full runtime controls? See [advanced `nest-agent` operation](#advanced-nest-agent-operation).
+
+---
+
 ## Why Kestrel Exists
 
 Most agents look impressive during the first task. The harder problems arrive later:
@@ -186,38 +215,13 @@ npm ci --prefix web
 npm run build --prefix web
 ```
 
-### Initialize Memory and Verify the Runtime
+### Open Kestrel
 
 ```bash
-nest-agent init --backend memvid --memory-dir .nest/memory
-
-nest-agent doctor \
-  --backend memvid \
-  --memory-dir .nest/memory \
-  --provider mock
-
-nest-agent chat \
-  --backend memvid \
-  --memory-dir .nest/memory \
-  --provider mock \
-  --message "hello"
+kestrel open
 ```
 
-The `mock` provider is deterministic and requires no credentials. It is intended for health checks, tests, and evaluation—not normal engineering work.
-
-### Start the Workbench
-
-```bash
-nest-agent server \
-  --backend memvid \
-  --memory-dir .nest/memory \
-  --provider mock \
-  --model mock \
-  --host 127.0.0.1 \
-  --port 8765
-```
-
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765).
+This initializes the local runtime as needed, starts it in deterministic Demo mode, and opens the Workbench. Run `kestrel chat "hello"` for the same authoritative server-backed conversation from the terminal.
 
 ---
 
@@ -278,7 +282,46 @@ nest-agent product provider-certification \
 
 ---
 
-## Published Release Installation
+## Advanced `nest-agent` Operation
+
+The `kestrel` facade is the recommended launch path. Use `nest-agent` when you need to select memory, provider, model, or server options directly.
+
+### Initialize Memory and Verify the Runtime
+
+```bash
+nest-agent init --backend memvid --memory-dir .nest/memory
+
+nest-agent doctor \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --provider mock
+
+nest-agent chat \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --provider mock \
+  --message "hello"
+```
+
+The `mock` provider is deterministic and requires no credentials. It is intended for health checks, tests, and evaluation—not normal engineering work.
+
+### Start the Server Directly
+
+```bash
+nest-agent server \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --provider mock \
+  --model mock \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765).
+
+---
+
+## Advanced Installer Controls
 
 The repository contains `v0.4.11` release metadata, but release commands should only be used after the matching Git tag and exact-tag artifacts have been published.
 
@@ -297,8 +340,6 @@ curl -fsSL \
   https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.11/install.sh \
   | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
-
-The product is named **Kestrel**, the CLI is `nest-agent`, and the Python distribution remains `nested-memvid-agent` for compatibility.
 
 ---
 

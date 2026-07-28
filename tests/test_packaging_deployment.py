@@ -399,6 +399,34 @@ def test_one_shot_docs_match_safe_opt_in_server_defaults() -> None:
         assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh" in document
 
 
+def test_readme_leads_with_the_everyday_kestrel_launch_contract() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    expected_release_command = (
+        "curl -fsSL "
+        "https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.11/install.sh \\\n"
+        "  | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash"
+    )
+
+    install_index = readme.index("## Install and Open Kestrel")
+    why_index = readme.index("## Why Kestrel Exists")
+    source_index = readme.index("## Quick Start From Source")
+    connect_index = readme.index("## Connect a Real Model")
+    advanced_index = readme.index("## Advanced `nest-agent` Operation")
+    source_quick_start = readme[source_index:connect_index]
+
+    assert expected_release_command in readme
+    assert install_index < why_index
+    assert "kestrel open" in readme[install_index:why_index]
+    assert "from any directory" in readme[install_index:why_index]
+    assert "Demo uses deterministic responses; no live model connected." in readme
+    assert "Ready" in readme[install_index:why_index]
+    assert "`kestrel` is the everyday command" in readme
+    assert "`nested-memvid-agent`" in readme
+    assert "kestrel open" in source_quick_start
+    assert "nest-agent server" not in source_quick_start
+    assert advanced_index > connect_index
+
+
 def test_readme_behavior_delta_validation_fails_on_regression() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
