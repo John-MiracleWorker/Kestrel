@@ -18,6 +18,8 @@ Kestrel is a **memory-native AI engineering agent runtime** for developers who w
 It combines:
 
 - a conversational CLI and local web workbench;
+- task-first Mission Control with local project profiles and repository preflight;
+- a rebuildable structural repository index with freshness-bound code intelligence;
 - structured, layered Memvid v2 memory;
 - durable runs, task graphs, approvals, and proactive routines;
 - built-in tools, MCP servers, skills, plugins, and channels;
@@ -498,6 +500,8 @@ When enabled, they require a preloaded, digest-pinned validation image and run w
 
 A repair commit requires a current review artifact tied to the successful validation result and current diff. Committing does not imply pushing, and protected branches are refused by default.
 
+Mission Control presents the bounded validation receipt, review summary, risk notes, rollback state, and redacted diff preview together. Patch export is not a snapshot of an arbitrary live `git diff`: it requires the signed review ID and exact candidate digest, revalidates the review, and renders the complete reviewed staged, unstaged, deleted, untracked, and binary candidate into a local `.kestrel/improvements` artifact.
+
 ---
 
 ## Proactive Routines Without a Safety Back Door
@@ -523,6 +527,8 @@ Cron expressions, named-timezone calendar rules, and automatic connector deliver
 
 The FastAPI-based workbench provides a single place to inspect and control the runtime:
 
+- task-first projects, objective templates, preflight, editable plans, and mission timelines;
+- repository index freshness and structural code evidence;
 - runs and live event streams;
 - plans, task nodes, subagents, and scheduler state;
 - pending and historical approvals;
@@ -637,8 +643,11 @@ Important unfinished areas include:
 
 - hosted and multi-user authorization;
 - tenant isolation and role-scoped permissions;
+- learned Adaptive Flock production routing with complete usage/cost attribution;
 - fully dynamic provider-written task graphs;
 - autonomous patch synthesis and worker-branch fan-out/merge;
+- contained browser/visual project validation;
+- project-aware GitHub PR/CI feedback;
 - production-soaked MCP network transports;
 - managed plugin dependency installation;
 - broader portable container-engine support;

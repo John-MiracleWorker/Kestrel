@@ -57,7 +57,7 @@ Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 19. Run rows retain serialized channel source provenance plus turn origin and transcript scope across queueing, recovery, and approval waits; legacy rows default to primary scope. Schema v19 adds durable hashed manual-routine idempotency claims and trigger provenance. Schema v18 gives approved side effects renewable execution claims and preserves the exact scheduler task/subagent binding until the pair reaches its continuation boundary. Schema v17 added revisioned routine definitions and occurrence rows with deterministic identities, UTC schedule instants, claim owner/generation/expiry fencing, request snapshots, run linkage, and terminal history.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 20. Schema v20 adds revisioned local project profiles and nullable run-to-project bindings; legacy runs remain valid with no project. Run rows retain serialized channel source provenance plus turn origin and transcript scope across queueing, recovery, and approval waits; legacy rows default to primary scope. Schema v19 adds durable hashed manual-routine idempotency claims and trigger provenance. Schema v18 gives approved side effects renewable execution claims and preserves the exact scheduler task/subagent binding until the pair reaches its continuation boundary. Schema v17 added revisioned routine definitions and occurrence rows with deterministic identities, UTC schedule instants, claim owner/generation/expiry fencing, request snapshots, run linkage, and terminal history.
 
 It stores:
 

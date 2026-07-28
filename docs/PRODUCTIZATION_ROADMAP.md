@@ -1,6 +1,6 @@
 # Kestrel Productization Roadmap
 
-Last updated: 2026-05-21
+Last updated: 2026-07-28
 
 This is the long-horizon full-product roadmap, including hosted/team capabilities. It is not the release gate for the supported single-user, single-node local/private profile; use `docs/PRODUCTION_OPERATIONS.md` and the latest dated readiness review for that decision.
 
@@ -275,7 +275,7 @@ Tasks:
 3. Create a demo repo fixture with known failure and expected repair. ✅ `examples/golden_repair_demo` seeds a deterministic failing test plus expected fix patch.
 4. Finish branch/worktree isolated repair run as the default for code modification. ✅ Repair/code-modification scheduler tasks now default to git worktree isolation when the workspace supports worktrees.
 5. Persist a coherent repair workspace across the full repair DAG instead of creating a separate worker worktree per isolated task. ✅ Repair DAG tasks now reuse one coherent git worktree for the run.
-6. Add patch review UI with validation and rollback state.
+6. Add patch review UI with validation and rollback state. ✅ Mission Control renders strict projected validation/review evidence, redacted unified/split diff, risk, rollback, and exact-call local commit/export actions.
 7. Add support bundle export. ✅ `nest-agent product support-bundle` and `POST /api/product/support-bundle` now generate redacted local diagnostic archives.
 8. Add provider certification reporting. ✅ `nest-agent product provider-certification` and `GET /api/product/provider-certification` now expose redacted per-provider status and live-validation commands.
 9. Add durable per-tool, MCP-server, and skill controls. ✅ The Settings Capability Center and revisioned capability API expose configured/effective state, blockers, default-off dynamic capabilities, and change history for the local single-owner profile.
@@ -312,39 +312,24 @@ Tasks:
 4. Billing/limits if commercialized.
 5. Production monitoring and incident playbooks.
 
-## First implementation slice
+## Current integrated slice — Everyday Kestrel v0.5
 
-The first implementation slice is deliberately low-risk:
+The “first useful hour” slice now joins previously separate runtime capabilities:
 
-> Add a product-readiness checklist/report that makes alpha-to-product gaps visible from CLI/API/UI without changing runtime behavior.
+- task-first Mission Control with local project selection, objective templates, preflight, editable acceptance plan, and one run timeline;
+- schema-v20 local project profiles that narrow repository paths, capability ceiling, budget, provider policy, and validation recipes;
+- a digest-keyed, rebuildable structural repository index with freshness-bound intelligence tools;
+- bounded local/OpenAI-compatible provider discovery, evidence-tagged probes, disabled target drafts, stale-model handling, and constraining presets;
+- strict review projections with exact reviewed-candidate patch export and local commit preparation;
+- repeat-run determinism reporting, Windows doctor/bootstrap diagnostics, and disposable release rehearsal.
 
-Why first:
+This is not the whole roadmap. The next release sequence remains:
 
-- It turns this roadmap into an operational dashboard.
-- It gives every future implementation pass a visible target.
-- It is read-only and safe.
-- It avoids pretending the product is done while surfacing real progress.
+1. **v0.6 — Adaptive Flock Learns:** provider usage/cost attribution, learned-router shadow integration, per-family calibration, route regret, evidence-gated constrained routing, and project-scoped learning.
+2. **v0.7 — Parallel Flock:** bounded graph amendments, isolated candidate fan-out/selection, contained browser validation, approval packets, private benchmarks, and GitHub PR/CI feedback.
+3. **Later ecosystem work:** dependency-locked extensions, portable containment, richer schedules, and idempotent external delivery after the engineering loop is mature.
 
-Initial checklist categories:
-
-- local product stability
-- golden repair workflow
-- safe autonomous learning
-- production auth/workspaces
-- sandboxed extensibility
-- provider certification
-- product UX/onboarding
-- operations/release engineering
-- channels/ingress
-- metrics/proof
-
-The report should classify each category as:
-
-- `ready`
-- `partial`
-- `missing`
-
-and include evidence, remaining work, and recommended next action.
+The dated implementation review records exact local evidence and limitations; it is not release publication or live-provider certification.
 
 ## Product definition of done
 
