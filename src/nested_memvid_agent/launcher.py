@@ -4,14 +4,16 @@ import argparse
 import json
 import os
 import sys
+import time
 import webbrowser
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NoReturn, TextIO
 from uuid import uuid4
 
 from .config import AgentConfig
+from .security_boundary import redact_text
 from .server_client import (
     KestrelServerClient,
     ServerClientError,
@@ -122,6 +124,13 @@ class LauncherApplication:
     stdout: TextIO
     stderr: TextIO
     session_id_factory: Callable[[], str]
+    environ: Mapping[str, str] = field(
+        default_factory=lambda: os.environ,
+        repr=False,
+        compare=False,
+    )
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
 
     def execute(self, args: argparse.Namespace) -> int:
         try:
@@ -195,7 +204,10 @@ class LauncherApplication:
             opened = bool(self.browser_open(status.url))
         except Exception as exc:  # noqa: BLE001 - opener failure must preserve service
             opened = False
-            self.stderr.write(f"Browser opener failed: {type(exc).__name__}: {exc}\n")
+            detail = redact_text(str(exc), environ=self.environ)
+            self.stderr.write(
+                f"Browser opener failed: {type(exc).__name__}: {detail}\n"
+            )
         if opened:
             self.stdout.write(f"Opened Kestrel Workbench at {status.url}\n")
         else:
@@ -267,19 +279,19 @@ class LauncherApplication:
             run = self.client.wait_for_run(
                 run_id,
                 timeout_seconds=wait_timeout,
+                clock=self.clock,
+                sleep=self.sleep,
             )
         except ServerClientError as exc:
             if exc.code != "run_timeout":
                 raise
-            self.stdout.write(
-                f"Run {run_id} is still active; it was not cancelled. "
-                f"Inspect it at {self.paths.url}\n"
-            )
+            self._print_durable_wait_result(run_id, json_output=json_output)
             return 1
         except KeyboardInterrupt:
-            self.stdout.write(
-                f"\nRun {run_id} may still be active; it was not cancelled. "
-                f"Inspect it at {self.paths.url}\n"
+            self._print_durable_wait_result(
+                run_id,
+                json_output=json_output,
+                interrupted=True,
             )
             return 130
         if json_output:
@@ -308,6 +320,34 @@ class LauncherApplication:
             )
             self.stdout.write(f"{detail}\nRun: {run_id}\n")
         return 1
+
+    def _print_durable_wait_result(
+        self,
+        run_id: str,
+        *,
+        json_output: bool,
+        interrupted: bool = False,
+    ) -> None:
+        if json_output:
+            self.stdout.write(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "status": "active",
+                        "durable": True,
+                        "cancelled": False,
+                        "workbench_url": self.paths.url,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            return
+        prefix = "\n" if interrupted else ""
+        self.stdout.write(
+            f"{prefix}Run {run_id} may still be active; it was not cancelled. "
+            f"Inspect it at {self.paths.url}\n"
+        )
 
     def _doctor(self, *, json_output: bool) -> int:
         status = self.controller.status()
@@ -506,8 +546,13 @@ def _default_application(
     *,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
+    environ: Mapping[str, str] | None = None,
+    client_factory: Callable[..., KestrelServerClient] = KestrelServerClient,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> LauncherApplication:
-    client = KestrelServerClient(paths.url)
+    environment = os.environ if environ is None else environ
+    client = client_factory(paths.url, environ=environment)
     controller = ServiceController(paths, client=client)
     return LauncherApplication(
         paths=paths,
@@ -519,6 +564,9 @@ def _default_application(
         stdout=stdout,
         stderr=stderr,
         session_id_factory=lambda: f"kestrel-cli-{uuid4().hex}",
+        environ=environment,
+        clock=clock,
+        sleep=sleep,
     )
 
 
@@ -528,8 +576,14 @@ def run(
     environ: Mapping[str, str] | None = None,
     cwd: Path | None = None,
     application_factory: Callable[[ServicePaths], LauncherApplication] | None = None,
+    client_factory: Callable[..., KestrelServerClient] = KestrelServerClient,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
     environment = os.environ if environ is None else environ
     try:
         home = resolve_kestrel_home(
@@ -551,7 +605,13 @@ def run(
     application = (
         application_factory(paths)
         if application_factory is not None
-        else _default_application(paths)
+        else _default_application(
+            paths,
+            environ=environment,
+            client_factory=client_factory,
+            clock=clock,
+            sleep=sleep,
+        )
     )
     return application.execute(args)
 

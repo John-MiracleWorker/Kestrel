@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +11,15 @@ import pytest
 
 from nested_memvid_agent.launcher import (
     LauncherApplication,
+    _default_application,
     build_parser,
+    run,
 )
-from nested_memvid_agent.server_client import ServerClientError, ServerProbe
+from nested_memvid_agent.server_client import (
+    KestrelServerClient,
+    ServerClientError,
+    ServerProbe,
+)
 from nested_memvid_agent.service_control import (
     ServiceManagement,
     ServicePaths,
@@ -79,8 +86,8 @@ class FakeClient:
         self.created_payloads.append(payload)
         return {"run_id": f"run_{len(self.created_payloads)}", "status": "queued"}
 
-    def wait_for_run(self, run_id: str, **_kwargs: object) -> dict[str, Any]:
-        self.calls.append(("wait", run_id))
+    def wait_for_run(self, run_id: str, **kwargs: object) -> dict[str, Any]:
+        self.calls.append(("wait", {"run_id": run_id, **kwargs}))
         if not self.runs:
             return {
                 "run_id": run_id,
@@ -137,6 +144,9 @@ def _application(
     browser_open: Any | None = None,
     offline_doctor: Any | None = None,
     input_fn: Any | None = None,
+    environ: Mapping[str, str] | None = None,
+    clock: Any | None = None,
+    sleep: Any | None = None,
 ) -> tuple[LauncherApplication, io.StringIO, io.StringIO]:
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -150,6 +160,9 @@ def _application(
         stdout=stdout,
         stderr=stderr,
         session_id_factory=lambda: "session-fixed",
+        environ={} if environ is None else environ,
+        clock=clock or (lambda: 0.0),
+        sleep=sleep or (lambda _seconds: None),
     )
     return app, stdout, stderr
 
@@ -362,6 +375,26 @@ def test_open_no_browser_and_opener_failure_keep_service_available(
     assert "could not open" in failed_err.getvalue().lower()
 
 
+def test_open_redacts_browser_opener_exception_with_injected_environment(
+    tmp_path: Path,
+) -> None:
+    token = "opaque-browser-token-value"
+
+    def browser_open(_url: str) -> bool:
+        raise RuntimeError(f"browser rejected token {token}")
+
+    app, stdout, stderr = _application(
+        tmp_path,
+        browser_open=browser_open,
+        environ={"CUSTOM_BROWSER_TOKEN": token},
+    )
+
+    assert app.execute(build_parser().parse_args(["open"])) == 0
+    assert "<redacted>" in stderr.getvalue()
+    assert token not in stderr.getvalue()
+    assert "http://127.0.0.1:18765/" in stdout.getvalue()
+
+
 def test_one_shot_chat_uses_only_the_server_run_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -426,12 +459,18 @@ def test_chat_json_blocked_timeout_and_interruption_are_durable(
     timed, timed_out, _ = _application(tmp_path, client=timeout_client)
     assert (
         timed.execute(
-            build_parser().parse_args(["chat", "--message", "slow"])
+            build_parser().parse_args(["chat", "--message", "slow", "--json"])
         )
         == 1
     )
-    assert "run_1" in timed_out.getvalue()
-    assert "http://127.0.0.1:18765/" in timed_out.getvalue()
+    timeout_payload = json.loads(timed_out.getvalue())
+    assert timeout_payload == {
+        "run_id": "run_1",
+        "status": "active",
+        "durable": True,
+        "cancelled": False,
+        "workbench_url": "http://127.0.0.1:18765/",
+    }
     assert not any("cancel" in str(call) for call in timeout_client.calls)
 
     interrupted_client = FakeClient(runs=[KeyboardInterrupt()])
@@ -441,11 +480,20 @@ def test_chat_json_blocked_timeout_and_interruption_are_durable(
     )
     assert (
         interrupted.execute(
-            build_parser().parse_args(["chat", "--message", "interrupt"])
+            build_parser().parse_args(
+                ["chat", "--message", "interrupt", "--json"]
+            )
         )
         == 130
     )
-    assert "run_1" in interrupted_out.getvalue()
+    interrupted_payload = json.loads(interrupted_out.getvalue())
+    assert interrupted_payload == {
+        "run_id": "run_1",
+        "status": "active",
+        "durable": True,
+        "cancelled": False,
+        "workbench_url": "http://127.0.0.1:18765/",
+    }
     assert not any("cancel" in str(call) for call in interrupted_client.calls)
 
 
@@ -471,6 +519,107 @@ def test_interactive_chat_reuses_one_session_id(tmp_path: Path) -> None:
         "session-fixed",
     ]
     assert stdout.getvalue().count("mock response") == 2
+
+
+def test_chat_wait_uses_the_application_clock_and_sleep(tmp_path: Path) -> None:
+    client = FakeClient()
+
+    def clock() -> float:
+        return 5.0
+
+    def sleep(_seconds: float) -> None:
+        return None
+
+    app, _stdout, _stderr = _application(
+        tmp_path,
+        client=client,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    assert app.execute(build_parser().parse_args(["chat", "--message", "hello"])) == 0
+
+    wait = next(payload for call, payload in client.calls if call == "wait")
+    assert wait["clock"] is clock
+    assert wait["sleep"] is sleep
+
+
+def test_default_application_uses_injected_environment_for_shared_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "opaque-injected-launch-token"
+    environment = {
+        "NEST_AGENT_API_AUTH_TOKEN_ENV": "INJECTED_KESTREL_TOKEN",
+        "INJECTED_KESTREL_TOKEN": token,
+    }
+    monkeypatch.setenv("NEST_AGENT_API_TOKEN", "host-secret-must-not-be-used")
+    observed: dict[str, object] = {}
+
+    def client_factory(
+        base_url: str,
+        *,
+        environ: Mapping[str, str],
+    ) -> KestrelServerClient:
+        observed["environ"] = environ
+        return KestrelServerClient(base_url, environ=environ)
+
+    def clock() -> float:
+        return 0.0
+
+    def sleep(_seconds: float) -> None:
+        return None
+
+    app = _default_application(
+        _paths(tmp_path),
+        client_factory=client_factory,
+        environ=environment,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    assert observed["environ"] is environment
+    assert app.client is app.controller.client
+    assert app.client._token() == token
+    assert app.environ is environment
+    assert app.clock is clock
+    assert app.sleep is sleep
+
+
+def test_run_passes_the_exact_injected_environment_to_the_default_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "installed-kestrel"
+    (home / "scripts").mkdir(parents=True)
+    (home / "scripts" / "installer-server-supervisor.sh").touch()
+    (home / ".venv" / "bin").mkdir(parents=True)
+    (home / ".venv" / "bin" / "nest-agent").touch()
+    environment = {"NEST_AGENT_API_TOKEN": "opaque-run-token"}
+    observed: dict[str, object] = {}
+
+    class Application:
+        def execute(self, _args: object) -> int:
+            return 0
+
+    def default_factory(_paths: ServicePaths, **kwargs: object) -> Application:
+        observed.update(kwargs)
+        return Application()
+
+    monkeypatch.setattr(
+        "nested_memvid_agent.launcher._default_application",
+        default_factory,
+    )
+
+    assert run(["--home", str(home), "status"], environ=environment) == 0
+    assert observed["environ"] is environment
+
+
+def test_run_returns_argparse_usage_error_without_raising_system_exit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert run(["not-a-kestrel-command"]) == 2
+    assert "usage: kestrel" in capsys.readouterr().err
 
 
 def test_doctor_routes_running_stopped_and_conflict_without_owner_collision(
