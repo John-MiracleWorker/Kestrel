@@ -30,6 +30,10 @@ def test_windows_doctor_source_binds_and_validates_each_supported_path() -> None
     assert "guest_python_supported" in source
     assert "guest_python_64_bit" in source
     assert "guest_pip" in source
+    assert "guest_bash" in source
+    assert "guest_curl" in source
+    assert '"--exec", "bash", "--version"' in source
+    assert '"--exec", "curl", "--version"' in source
     assert "distribution_architecture" in source
     assert '"context", "show"' in source
     assert "desktop-linux" in source
@@ -40,6 +44,8 @@ def test_windows_doctor_source_binds_and_validates_each_supported_path() -> None
     assert ".Architecture" in source
     assert "linux_engine" in source
     assert "local_desktop_context" in source
+    assert '"bash",' in source
+    assert '"curl"' in source
 
 
 def test_native_bootstrap_discloses_version_pinned_index_install_assurance() -> None:

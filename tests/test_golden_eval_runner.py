@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import scripts.run_golden_evals as golden_runner
@@ -193,6 +194,11 @@ def test_isolated_case_timeout_writes_machine_receipt(
             cleanup_attempted=True,
             cleanup_succeeded=True,
             termination_method="test_process_group",
+            stdout_total_bytes=0,
+            stderr_total_bytes=0,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            capture_limit_bytes=64 * 1024,
         )
 
     monkeypatch.setattr(golden_runner, "run_bounded_process", fake_bounded_process)  # type: ignore[attr-defined]
@@ -215,10 +221,17 @@ def test_isolated_case_timeout_writes_machine_receipt(
     assert result["passed"] is False
     assert result["error"] == "case exceeded monotonic deadline of 0.25 seconds"
     assert "--_case-name" in seen_command
-    receipt = receipt_path.read_text(encoding="utf-8")
-    assert '"status": "timed_out"' in receipt
-    assert '"deadline_clock": "monotonic"' in receipt
-    assert '"succeeded": true' in receipt
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "timed_out"
+    assert receipt["process"]["deadline_clock"] == "monotonic"
+    assert receipt["process"]["cleanup"]["succeeded"] is True
+    assert receipt["process"]["capture"] == {
+        "limit_bytes_per_stream": 65536,
+        "stderr_total_bytes": 0,
+        "stderr_truncated": False,
+        "stdout_total_bytes": 0,
+        "stdout_truncated": False,
+    }
 
 
 def test_honest_failure_fixture_isolated_from_caller_workspace_secrets(

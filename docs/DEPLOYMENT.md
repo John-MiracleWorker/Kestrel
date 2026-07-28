@@ -86,7 +86,7 @@ Set-Location kestrel-release-v0.4.11
 ```
 
 The report checks Git, one exact 64-bit Python 3.11-3.13 interpreter plus its pip, one named WSL2
-distribution's architecture/Python bitness/pip/Git through non-login probes, and one local
+distribution's architecture/Python bitness/pip/Git/Bash/curl through non-login probes, and one local
 `desktop-linux` Docker Desktop context's named-pipe endpoint/Linux engine/root/architecture. A
 successful sub-check is never combined with evidence from another interpreter, distribution, or
 Docker context. `Bootstrap` only prints commands for the selected ready path and sets
@@ -99,8 +99,8 @@ Supported choices are:
 - `NativeWheel`: one supported 64-bit Python interpreter with pip receives a version-pinned
   package-index command. This printed command is not hash-bound to a verified local wheel, and the
   JSON report says so explicitly.
-- `WSL2`: one named x86_64 WSL2 distribution with Git, 64-bit Python 3.11-3.13, and pip runs the
-  Bash installer inside Linux, never through Git Bash or a login-shell probe.
+- `WSL2`: one named x86_64 WSL2 distribution with Git, Bash, curl, 64-bit Python 3.11-3.13, and
+  pip runs the Bash installer inside Linux, never through Git Bash or a login-shell probe.
 - `DockerDesktop`: an already-running Linux container engine uses the published Kestrel image.
 
 Missing prerequisites are reported with explicit remediation. The script exits nonzero when the

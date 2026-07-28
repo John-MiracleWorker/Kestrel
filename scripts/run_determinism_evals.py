@@ -47,20 +47,14 @@ class GoldenRunnerError(RuntimeError):
 
 
 def _redact_json(value: Any) -> Any:
-    if isinstance(value, str):
-        return redact_secrets(value)
-    if isinstance(value, list):
-        return [_redact_json(item) for item in value]
-    if isinstance(value, dict):
-        return {redact_secrets(str(key)): _redact_json(item) for key, item in value.items()}
-    return value
+    return redact_secrets(value)
 
 
 def _excerpt(value: str, *, limit: int = 2_000) -> str:
     value = redact_secrets(value)
     if len(value) <= limit:
         return value
-    return value[:limit] + "...[truncated]"
+    return "[truncated]..." + value[-limit:]
 
 
 def _canonical_json(value: object) -> str:
@@ -475,6 +469,13 @@ def _subprocess_invoker(
                 "attempted": completed.cleanup_attempted,
                 "succeeded": completed.cleanup_succeeded,
                 "method": completed.termination_method,
+            },
+            "capture": {
+                "limit_bytes_per_stream": completed.capture_limit_bytes,
+                "stdout_total_bytes": completed.stdout_total_bytes,
+                "stdout_truncated": completed.stdout_truncated,
+                "stderr_total_bytes": completed.stderr_total_bytes,
+                "stderr_truncated": completed.stderr_truncated,
             },
             "stdout": _excerpt(completed.stdout),
             "stderr": _excerpt(completed.stderr),

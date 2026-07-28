@@ -8,14 +8,25 @@ from pathlib import Path
 
 import pytest
 
+import scripts.bounded_process as bounded_process
+from nested_memvid_agent.security_boundary import REDACTED
 from scripts.bounded_process import run_bounded_process
 from scripts.run_determinism_evals import (
     _deterministic_projection,
+    _excerpt,
     _subprocess_invoker,
     build_determinism_report,
     run_determinism,
 )
-from scripts.run_golden_evals import _eval_identifier
+from scripts.run_determinism_evals import (
+    _redact_json as redact_determinism_json,
+)
+from scripts.run_golden_evals import (
+    _eval_identifier,
+)
+from scripts.run_golden_evals import (
+    _redact_json as redact_golden_json,
+)
 
 TEST_CASES = {"alpha": "repo_regression", "beta": "repo_regression"}
 
@@ -278,6 +289,29 @@ def test_runner_redacts_complete_imported_and_final_reports(tmp_path: Path) -> N
     assert secret not in output.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("redactor", [redact_determinism_json, redact_golden_json])
+def test_report_redactors_apply_sensitive_key_rules_recursively(
+    redactor: object,
+) -> None:
+    assert callable(redactor)
+    payload = {
+        "safe": [
+            {
+                "api_key": "opaque-value-that-has-no-secret-shape",
+                "nested": {"client_secret": "another-opaque-value"},
+            }
+        ]
+    }
+
+    redacted = redactor(payload)
+
+    serialized = json.dumps(redacted)
+    assert "opaque-value-that-has-no-secret-shape" not in serialized
+    assert "another-opaque-value" not in serialized
+    assert redacted["safe"][0]["api_key"] == REDACTED  # type: ignore[index]
+    assert redacted["safe"][0]["nested"]["client_secret"] == REDACTED  # type: ignore[index]
+
+
 def test_forged_top_level_pass_cannot_override_failed_case() -> None:
     forged = _golden_report(first_passed=False)
     forged["passed"] = True
@@ -449,6 +483,152 @@ def test_bounded_process_quiesces_descendants_after_successful_leader_exit(
     assert late_marker.exists() is False
 
 
+def test_bounded_process_caps_each_stream_and_retains_useful_tail(tmp_path: Path) -> None:
+    program = tmp_path / "large-output.py"
+    stdout_tail = b"STDOUT-USEFUL-TAIL"
+    stderr_tail = b"STDERR-USEFUL-TAIL"
+    stdout_size = 3 * 1024 * 1024
+    stderr_size = 2 * 1024 * 1024
+    program.write_text(
+        "\n".join(
+            [
+                "import os",
+                f"os.write(1, b'x' * {stdout_size} + {stdout_tail!r})",
+                f"os.write(2, b'y' * {stderr_size} + {stderr_tail!r})",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = run_bounded_process(
+        [sys.executable, str(program)],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        timeout_seconds=5,
+        capture_limit_bytes=64 * 1024,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.endswith(stdout_tail.decode())
+    assert result.stderr.endswith(stderr_tail.decode())
+    assert len(result.stdout.encode()) <= 64 * 1024
+    assert len(result.stderr.encode()) <= 64 * 1024
+    assert result.stdout_total_bytes == stdout_size + len(stdout_tail)
+    assert result.stderr_total_bytes == stderr_size + len(stderr_tail)
+    assert result.stdout_truncated is True
+    assert result.stderr_truncated is True
+    assert result.capture_limit_bytes == 64 * 1024
+
+
+def test_iteration_excerpt_preserves_the_most_recent_bounded_output() -> None:
+    value = "old-prefix" + ("x" * 4_000) + "USEFUL-TAIL"
+
+    excerpt = _excerpt(value, limit=128)
+
+    assert excerpt.startswith("[truncated]...")
+    assert excerpt.endswith("USEFUL-TAIL")
+    assert "old-prefix" not in excerpt
+
+
+def test_windows_job_is_assigned_before_resume_and_quiesced_after_leader_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeStream:
+        def read(self, _size: int = -1) -> bytes:
+            return b""
+
+    class FakeProcess:
+        pid = 4242
+        returncode = 0
+        stdout = FakeStream()
+        stderr = FakeStream()
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self) -> int:
+            events.append("wait")
+            return 0
+
+        def kill(self) -> None:
+            events.append("parent-kill")
+
+    class FakeJob:
+        def assign(self, process_id: int) -> bool:
+            events.append(f"assign:{process_id}")
+            return True
+
+        def resume(self, process_id: int) -> bool:
+            events.append(f"resume:{process_id}")
+            return True
+
+        def terminate_and_wait(self, *, timeout_seconds: float) -> bool:
+            events.append(f"quiesce:{timeout_seconds}")
+            return True
+
+        def close(self) -> bool:
+            events.append("close")
+            return True
+
+    def fake_popen(*_args: object, **kwargs: object) -> FakeProcess:
+        events.append(f"launch:{kwargs['creationflags']}")
+        return FakeProcess()
+
+    monkeypatch.setattr(bounded_process.os, "name", "nt")
+    monkeypatch.setattr(bounded_process, "_create_windows_process_job", FakeJob)
+    monkeypatch.setattr(bounded_process.subprocess, "Popen", fake_popen)
+
+    result = run_bounded_process(
+        ["example.exe"],
+        cwd=tmp_path,
+        environment={},
+        timeout_seconds=5,
+    )
+
+    assert result.returncode == 0
+    assert result.cleanup_attempted is True
+    assert result.cleanup_succeeded is True
+    assert result.termination_method == "windows_job_object_quiesced"
+    assert int(events[0].partition(":")[2]) & 0x00000004
+    assert events[1:3] == ["assign:4242", "resume:4242"]
+    assert any(event.startswith("quiesce:") for event in events)
+    assert events[-1] == "close"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object integration assertion")
+def test_bounded_process_quiesces_windows_descendant_after_successful_leader_exit(
+    tmp_path: Path,
+) -> None:
+    late_marker = tmp_path / "windows-late-marker.txt"
+    program = tmp_path / "windows-leader.py"
+    descendant = (
+        "import pathlib,time;"
+        "time.sleep(1);"
+        f"pathlib.Path({str(late_marker)!r}).write_text('late', encoding='utf-8')"
+    )
+    program.write_text(
+        f"import subprocess,sys\nsubprocess.Popen([sys.executable, '-c', {descendant!r}])\n",
+        encoding="utf-8",
+    )
+
+    result = run_bounded_process(
+        [sys.executable, str(program)],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        timeout_seconds=5,
+    )
+
+    assert result.returncode == 0
+    assert result.cleanup_attempted is True
+    assert result.cleanup_succeeded is True
+    time.sleep(1.2)
+    assert late_marker.exists() is False
+
+
 def test_timeout_writes_atomic_redacted_iteration_and_aggregate_receipts(
     tmp_path: Path,
 ) -> None:
@@ -486,4 +666,13 @@ def test_timeout_writes_atomic_redacted_iteration_and_aggregate_receipts(
         assert receipt["status"] == "timed_out"
         assert receipt["cleanup"]["attempted"] is True
         assert receipt["cleanup"]["succeeded"] is True
+        assert receipt["capture"] == {
+            "limit_bytes_per_stream": 262144,
+            "stderr_total_bytes": len(
+                b"OPENAI_API_KEY=sk-proj-timeout-secret123\n"
+            ),
+            "stderr_truncated": False,
+            "stdout_total_bytes": 0,
+            "stdout_truncated": False,
+        }
         assert "sk-proj-timeout-secret123" not in receipt_path.read_text(encoding="utf-8")

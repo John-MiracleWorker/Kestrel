@@ -11,6 +11,7 @@ import re
 import subprocess  # nosec B404 - fixed local git and Python build commands
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,10 @@ from scripts.verify_release_payload import (  # noqa: E402
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _NAMESPACE_RE = re.compile(r"^kestrel-rehearsal-[a-z0-9][a-z0-9-]{4,79}$")
+_FINALIZED_IDENTITY_FIELDS = frozenset(
+    {"commit", "distribution", "namespace", "tag_ref", "version"}
+)
+_FINALIZED_SURFACES = frozenset({"release_assets", "package_index"})
 
 
 def _sha256(path: Path) -> str:
@@ -156,9 +161,24 @@ def _publish_exact(source: Path, target: Path) -> str:
     return "published"
 
 
-def _publish_finalized_exact(source: Path, target: Path, marker: Path) -> str:
+def _publish_finalized_exact(
+    source: Path,
+    target: Path,
+    marker: Path,
+    *,
+    expected_identity: Mapping[str, str],
+    surface: str,
+    surface_root: Path,
+    expected_surface_path: str,
+) -> str:
     """Verify an exact replay without permitting any finalized-state mutation."""
 
+    if set(expected_identity) != _FINALIZED_IDENTITY_FIELDS or any(
+        not isinstance(value, str) or not value for value in expected_identity.values()
+    ):
+        raise ValueError("expected finalized release identity is incomplete")
+    if surface not in _FINALIZED_SURFACES:
+        raise ValueError(f"unknown finalized release surface: {surface!r}")
     if marker.is_symlink() or not marker.is_file():
         raise ValueError("release is not finalized by a regular marker")
     if marker.stat().st_nlink != 1:
@@ -167,11 +187,51 @@ def _publish_finalized_exact(source: Path, target: Path, marker: Path) -> str:
         marker_payload = json.loads(marker.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError("release finalization marker is invalid") from exc
-    if not isinstance(marker_payload, dict) or marker_payload.get("state") != "finalized":
+    if (
+        not isinstance(marker_payload, dict)
+        or set(marker_payload) != {"state", "identity", "surfaces"}
+        or marker_payload.get("state") != "finalized"
+    ):
         raise ValueError("release finalization marker does not declare finalized state")
-    manifest = marker_payload.get("artifacts")
-    if not isinstance(manifest, dict):
-        raise ValueError("release finalization marker has no artifact manifest")
+    marker_identity = marker_payload.get("identity")
+    if not isinstance(marker_identity, dict) or marker_identity != dict(expected_identity):
+        raise ValueError("release finalization marker identity mismatch")
+    surfaces = marker_payload.get("surfaces")
+    if not isinstance(surfaces, dict) or set(surfaces) != _FINALIZED_SURFACES:
+        raise ValueError("release finalization marker surface set mismatch")
+    for surface_name, raw_surface in surfaces.items():
+        if (
+            not isinstance(raw_surface, dict)
+            or set(raw_surface) != {"path", "artifacts"}
+            or not isinstance(raw_surface.get("path"), str)
+            or not raw_surface["path"]
+            or not isinstance(raw_surface.get("artifacts"), dict)
+        ):
+            raise ValueError(
+                f"release finalization marker surface is invalid: {surface_name}"
+            )
+        artifacts = raw_surface["artifacts"]
+        if any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for name, digest in artifacts.items()
+        ):
+            raise ValueError(
+                f"release finalization marker artifact manifest is invalid: {surface_name}"
+            )
+    surface_record = surfaces[surface]
+    assert isinstance(surface_record, dict)
+    if surface_record.get("path") != expected_surface_path:
+        raise ValueError(f"release finalization marker surface path mismatch: {surface}")
+    if surface_root.is_symlink() or not surface_root.is_dir():
+        raise ValueError(f"finalized release surface root is unsafe: {surface}")
+    resolved_surface_root = surface_root.resolve(strict=True)
+    if target.parent.resolve(strict=True) != resolved_surface_root:
+        raise ValueError(f"finalized release target escapes declared surface: {surface}")
+    manifest = surface_record["artifacts"]
+    assert isinstance(manifest, dict)
     if source.is_symlink() or not source.is_file():
         raise ValueError(f"publication source is not a regular file: {source}")
     if target.is_symlink() or not target.is_file():
@@ -213,18 +273,24 @@ def _create_ref(repository: Path, ref: str, commit: str, *, cwd: Path) -> None:
 def _write_finalization_marker(
     marker: Path,
     *,
-    commit: str,
-    namespace: str,
-    tag_ref: str,
-    artifacts: list[Path],
+    identity: Mapping[str, str],
+    surfaces: Mapping[str, tuple[str, list[Path]]],
 ) -> None:
+    if set(identity) != _FINALIZED_IDENTITY_FIELDS:
+        raise ValueError("release finalization identity is incomplete")
+    if set(surfaces) != _FINALIZED_SURFACES:
+        raise ValueError("release finalization surfaces are incomplete")
     marker.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "state": "finalized",
-        "commit": commit,
-        "namespace": namespace,
-        "tag_ref": tag_ref,
-        "artifacts": {artifact.name: _sha256(artifact) for artifact in artifacts},
+        "identity": dict(identity),
+        "surfaces": {
+            name: {
+                "path": path,
+                "artifacts": {artifact.name: _sha256(artifact) for artifact in artifacts},
+            }
+            for name, (path, artifacts) in surfaces.items()
+        },
     }
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -395,18 +461,19 @@ def run_release_rehearsal(
     steps.extend(["distributions_built", "distribution_identity_verified"])
 
     release_root = sandbox_root / "release" / namespace
-    release_assets = release_root / "draft" / "assets"
-    release_assets.mkdir(parents=True)
+    release_draft = release_root / "draft"
+    draft_release_assets = release_draft / "assets"
+    draft_release_assets.mkdir(parents=True)
     steps.append("draft_created")
     upload_status = {
-        artifact.name: _publish_exact(artifact, release_assets / artifact.name)
+        artifact.name: _publish_exact(artifact, draft_release_assets / artifact.name)
         for artifact in artifacts
     }
     steps.append("exact_assets_uploaded")
 
     downloaded_root = sandbox_root / "downloaded"
     downloaded_root.mkdir()
-    for artifact in sorted(release_assets.iterdir(), key=lambda path: path.name):
+    for artifact in sorted(draft_release_assets.iterdir(), key=lambda path: path.name):
         _publish_exact(artifact, downloaded_root / artifact.name)
     _verify_exact_set(candidate_root, downloaded_root)
     steps.append("downloaded_assets_verified")
@@ -417,44 +484,96 @@ def run_release_rehearsal(
         for artifact in artifacts
     }
     steps.append("package_files_published")
+    release_final = release_root / "final"
+    release_draft.replace(release_final)
+    release_assets = release_final / "assets"
+    _verify_exact_set(candidate_root, release_assets)
+    steps.append("release_assets_finalized")
+
     mutation_probe = sandbox_root / "conflicting-post-finalization-probe"
     mutation_probe.write_bytes(b"kestrel-finalized-mutation-probe")
     finalization_marker = release_root / "FINALIZED.json"
+    identity = {
+        "commit": commit,
+        "distribution": distribution,
+        "namespace": namespace,
+        "tag_ref": tag_ref,
+        "version": version,
+    }
+    release_surface_path = release_assets.relative_to(sandbox_root).as_posix()
+    package_surface_path = package_root.relative_to(sandbox_root).as_posix()
     _write_finalization_marker(
         finalization_marker,
-        commit=commit,
-        namespace=namespace,
-        tag_ref=tag_ref,
-        artifacts=artifacts,
+        identity=identity,
+        surfaces={
+            "release_assets": (release_surface_path, list(release_assets.iterdir())),
+            "package_index": (package_surface_path, list(package_root.iterdir())),
+        },
     )
     steps.append("release_marked_immutable")
-    replay_status = {
-        artifact.name: _publish_finalized_exact(
-            artifact,
-            package_root / artifact.name,
-            finalization_marker,
-        )
-        for artifact in artifacts
+    replay_status: dict[str, dict[str, str]] = {
+        "release_assets": {
+            artifact.name: _publish_finalized_exact(
+                artifact,
+                release_assets / artifact.name,
+                finalization_marker,
+                expected_identity=identity,
+                surface="release_assets",
+                surface_root=release_assets,
+                expected_surface_path=release_surface_path,
+            )
+            for artifact in artifacts
+        },
+        "package_index": {
+            artifact.name: _publish_finalized_exact(
+                artifact,
+                package_root / artifact.name,
+                finalization_marker,
+                expected_identity=identity,
+                surface="package_index",
+                surface_root=package_root,
+                expected_surface_path=package_surface_path,
+            )
+            for artifact in artifacts
+        },
     }
-    if set(replay_status.values()) != {"already_exact"}:
+    if any(
+        set(surface_status.values()) != {"already_exact"}
+        for surface_status in replay_status.values()
+    ):
         raise ValueError(f"rehearsal replay was not an exact no-op: {replay_status}")
+    _verify_exact_set(candidate_root, release_assets)
     _verify_exact_set(candidate_root, package_root)
-    steps.append("exact_replay_verified")
-    conflicting_target = package_root / artifacts[0].name
-    before_conflict = _sha256(conflicting_target)
-    try:
-        _publish_finalized_exact(
-            mutation_probe,
-            conflicting_target,
-            finalization_marker,
-        )
-    except ValueError as exc:
-        if "finalized release refuses mutation" not in str(exc):
-            raise
-    else:
-        raise ValueError("finalized rehearsal unexpectedly permitted conflicting mutation")
-    if _sha256(conflicting_target) != before_conflict:
-        raise ValueError("finalized rehearsal mutation probe changed published bytes")
+    steps.append("both_finalized_surfaces_replayed_exactly")
+    conflict_rejections: dict[str, bool] = {}
+    for surface, surface_root, surface_path in (
+        ("release_assets", release_assets, release_surface_path),
+        ("package_index", package_root, package_surface_path),
+    ):
+        conflicting_target = surface_root / artifacts[0].name
+        before_conflict = _sha256(conflicting_target)
+        try:
+            _publish_finalized_exact(
+                mutation_probe,
+                conflicting_target,
+                finalization_marker,
+                expected_identity=identity,
+                surface=surface,
+                surface_root=surface_root,
+                expected_surface_path=surface_path,
+            )
+        except ValueError as exc:
+            if "finalized release refuses mutation" not in str(exc):
+                raise
+            conflict_rejections[surface] = True
+        else:
+            raise ValueError(
+                f"finalized rehearsal unexpectedly permitted {surface} mutation"
+            )
+        if _sha256(conflicting_target) != before_conflict:
+            raise ValueError(
+                f"finalized rehearsal mutation probe changed {surface} bytes"
+            )
     steps.append("conflicting_post_finalization_mutation_rejected")
 
     artifact_reports = [
@@ -463,12 +582,13 @@ def run_release_rehearsal(
             "sha256": _sha256(artifact),
             "release_upload": upload_status[artifact.name],
             "package_publish": package_status[artifact.name],
-            "replay": replay_status[artifact.name],
+            "release_replay": replay_status["release_assets"][artifact.name],
+            "package_replay": replay_status["package_index"][artifact.name],
         }
         for artifact in artifacts
     ]
     return {
-        "schema": "kestrel.release_rehearsal_report.v1",
+        "schema": "kestrel.release_rehearsal_report.v2",
         "source": {
             "commit": commit,
             "distribution": distribution,
@@ -483,7 +603,12 @@ def run_release_rehearsal(
         "artifacts": artifact_reports,
         "finalization": {
             "marker": finalization_marker.relative_to(sandbox_root).as_posix(),
-            "conflicting_mutation_rejected": True,
+            "identity": identity,
+            "surfaces": {
+                "release_assets": release_surface_path,
+                "package_index": package_surface_path,
+            },
+            "conflicting_mutation_rejected": conflict_rejections,
         },
         "steps": steps,
         "production_targets_blocked": True,

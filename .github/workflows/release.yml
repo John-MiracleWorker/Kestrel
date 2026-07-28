@@ -80,6 +80,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_run="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
           rehearsal_runs="$(gh api --method GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/release-rehearsal.yml/runs" \
             -f head_sha="$RELEASE_COMMIT_SHA" \
@@ -87,11 +89,19 @@ jobs:
             -f event=push \
             -f status=completed \
             -f per_page=100)"
-          REHEARSAL_RUNS_JSON="$rehearsal_runs" python - <<'PY'
+          RELEASE_RUN_JSON="$release_run" REHEARSAL_RUNS_JSON="$rehearsal_runs" python - <<'PY'
+          from datetime import datetime
           import json
           import os
 
+          def timestamp(value):
+              if not isinstance(value, str):
+                  raise SystemExit("release ordering evidence has no timestamp")
+              return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
           expected_sha = os.environ["RELEASE_COMMIT_SHA"]
+          release_run = json.loads(os.environ["RELEASE_RUN_JSON"])
+          release_created_at = timestamp(release_run.get("created_at"))
           runs = json.loads(os.environ["REHEARSAL_RUNS_JSON"]).get("workflow_runs", [])
           successful = [
               run
@@ -101,11 +111,13 @@ jobs:
               and run.get("event") == "push"
               and run.get("status") == "completed"
               and run.get("conclusion") == "success"
+              and timestamp(run.get("updated_at")) < release_created_at
           ]
           if not successful:
               raise SystemExit(
                   f"release commit {expected_sha} has no successful exact-SHA "
-                  "release rehearsal push run on main"
+                  "release rehearsal push run on main that completed before the "
+                  "release workflow was created"
               )
           print(f"verified successful rehearsal {successful[0].get('html_url', '')}")
           PY

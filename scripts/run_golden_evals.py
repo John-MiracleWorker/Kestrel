@@ -270,13 +270,7 @@ def _golden_case_functions(
 
 
 def _redact_json(value: Any) -> Any:
-    if isinstance(value, str):
-        return redact_secrets(value)
-    if isinstance(value, list):
-        return [_redact_json(item) for item in value]
-    if isinstance(value, dict):
-        return {redact_secrets(str(key)): _redact_json(item) for key, item in value.items()}
-    return value
+    return redact_secrets(value)
 
 
 def _case_failure_result(
@@ -357,6 +351,13 @@ def _run_isolated_case(
             "attempted": process.cleanup_attempted,
             "succeeded": process.cleanup_succeeded,
             "method": process.termination_method,
+        },
+        "capture": {
+            "limit_bytes_per_stream": process.capture_limit_bytes,
+            "stdout_total_bytes": process.stdout_total_bytes,
+            "stdout_truncated": process.stdout_truncated,
+            "stderr_total_bytes": process.stderr_total_bytes,
+            "stderr_truncated": process.stderr_truncated,
         },
         "stdout": process.stdout,
         "stderr": process.stderr,

@@ -263,6 +263,8 @@ else {
     $wslPython = $null
     $wslPip = $null
     $wslGit = $null
+    $wslBash = $null
+    $wslCurl = $null
     if ($null -ne $wslDistribution) {
         $wslArchitecture = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
             "--distribution", $wslDistribution, "--exec", "uname", "-m"
@@ -277,6 +279,12 @@ else {
         $wslGit = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
             "--distribution", $wslDistribution, "--exec", "sh", "-c",
             "command -v git >/dev/null && git --version"
+        )
+        $wslBash = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
+            "--distribution", $wslDistribution, "--exec", "bash", "--version"
+        )
+        $wslCurl = Invoke-BoundedProbe -Executable $wslExecutable -Arguments @(
+            "--distribution", $wslDistribution, "--exec", "curl", "--version"
         )
     }
     $hasVersionTwo = $null -ne $wslDistribution
@@ -302,17 +310,21 @@ else {
     $guestPython64Bit = $guestPythonSupported -and $guestPythonMatch.Groups[2].Value -eq "64"
     $guestPip = $null -ne $wslPip -and $wslPip.exit_code -eq 0 -and $wslPip.stdout -match '^pip\s+[0-9]'
     $guestGit = $null -ne $wslGit -and $wslGit.exit_code -eq 0 -and $wslGit.stdout -match '^git version '
+    $guestBash = $null -ne $wslBash -and $wslBash.exit_code -eq 0 -and $wslBash.stdout -match '^GNU bash, version '
+    $guestCurl = $null -ne $wslCurl -and $wslCurl.exit_code -eq 0 -and $wslCurl.stdout -match '^curl [0-9]'
     $wslReady = (
         $hasVersionTwo -and
         $hasSupportedArchitecture -and
         $guestPythonSupported -and
         $guestPython64Bit -and
         $guestPip -and
-        $guestGit
+        $guestGit -and
+        $guestBash -and
+        $guestCurl
     )
     if ($wslReady) {
         $checks.wsl2 = New-Check -Status "ready" `
-            -Evidence "distribution=$wslDistribution; distribution_architecture=$distributionArchitecture; guest_python_supported=$guestPythonSupported; guest_python_64_bit=$guestPython64Bit; guest_pip=$guestPip; guest_git=$guestGit" `
+            -Evidence "distribution=$wslDistribution; distribution_architecture=$distributionArchitecture; guest_python_supported=$guestPythonSupported; guest_python_64_bit=$guestPython64Bit; guest_pip=$guestPip; guest_git=$guestGit; guest_bash=$guestBash; guest_curl=$guestCurl" `
             -Remediation ""
         $checks.wsl2["target"] = $wslDistribution
     }
@@ -325,12 +337,14 @@ else {
             "guest_python_64_bit=$guestPython64Bit",
             "guest_pip=$guestPip",
             "guest_git=$guestGit",
+            "guest_bash=$guestBash",
+            "guest_curl=$guestCurl",
             $wslList.stderr,
             $wslQuiet.stderr
         ) -join "; "
         $checks.wsl2 = New-Check -Status "incomplete" `
             -Evidence $wslEvidence `
-            -Remediation "Configure one x86_64 WSL2 distribution with git, 64-bit Python 3.11-3.13, and pip; this script will not enable or install them."
+            -Remediation "Configure one x86_64 WSL2 distribution with git, bash, curl, 64-bit Python 3.11-3.13, and pip; this script will not enable or install them."
         $checks.wsl2["target"] = $wslDistribution
     }
 }
@@ -421,7 +435,9 @@ $paths = [ordered] @{
             "x86_64 Linux distribution",
             "git",
             "64-bit Python 3.11-3.13",
-            "pip"
+            "pip",
+            "bash",
+            "curl"
         )
         trust_boundary = "The existing Bash installer runs inside WSL2, not Git Bash."
         install_assurance = "release_script_transport"

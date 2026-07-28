@@ -426,7 +426,11 @@ RUN_MEMVID_INTEGRATION=1 python scripts/run_golden_evals.py --backend memvid --p
 The dedicated determinism lane runs the credential-free everyday golden set twenty times with the
 same seed and isolated state roots. Every case and every aggregate iteration runs in a separately
 terminable process tree behind a monotonic deadline. Timeout/hang receipts are written atomically
-and record descendant cleanup. The aggregate rejects a nonzero runner exit even if a report file
+and record descendant cleanup. Windows processes are assigned to a kill-on-close Job Object before
+their suspended leader is resumed, so a normally exiting leader cannot orphan untracked
+descendants. Stdout and stderr are continuously drained into bounded tails; receipts expose the
+capture limit, total byte counts, and truncation state without retaining unbounded output. The
+aggregate rejects a nonzero runner exit even if a report file
 claims success, validates the exact golden schema and expected 21-case set, and derives acceptance
 from case/evidence fields rather than the top-level `passed` claim. It recursively redacts imported
 and final machine reports. It sorts cases before comparison and excludes wall-clock latency from
