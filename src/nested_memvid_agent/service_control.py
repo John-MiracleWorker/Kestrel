@@ -848,29 +848,30 @@ class ServiceController:
                 code="service_conflict",
                 recovery="Run `kestrel doctor`; no process was signalled.",
             )
-        expected = self.inspector.process(status.pid)
+        external_pid = status.pid
+        expected = self.inspector.process(external_pid)
         if expected is None or not _server_identity_matches(
             expected,
             self.paths,
             managed=False,
         ):
-            raise _identity_changed(status.pid)
+            raise _identity_changed(external_pid)
         try:
             self.signaler.signal_pid(
-                status.pid,
+                external_pid,
                 required_signal("SIGTERM"),
             )
         except ProcessLookupError:
             pass
         if _wait_until(
-            lambda: self._external_absent(status.pid),
+            lambda: self._external_absent(external_pid),
             timeout_seconds=grace_timeout,
             poll_interval=poll_interval,
             clock=clock,
             sleep=sleep,
         ):
             return
-        current = self.inspector.process(status.pid)
+        current = self.inspector.process(external_pid)
         if (
             current is None
             or not _same_process_identity(expected, current)
@@ -880,16 +881,16 @@ class ServiceController:
                 managed=False,
             )
         ):
-            raise _identity_changed(status.pid)
+            raise _identity_changed(external_pid)
         try:
             self.signaler.signal_pid(
-                status.pid,
+                external_pid,
                 required_signal("SIGKILL"),
             )
         except ProcessLookupError:
             pass
         if not _wait_until(
-            lambda: self._external_absent(status.pid),
+            lambda: self._external_absent(external_pid),
             timeout_seconds=kill_timeout,
             poll_interval=poll_interval,
             clock=clock,
@@ -1228,6 +1229,7 @@ class ServiceController:
                 pgid=metadata.pgid,
                 lifecycle_busy=lifecycle_busy,
             )
+        assert supervisor is not None
         detail = (
             "Verified managed Kestrel service is running; API access is locked."
             if probe.locked
