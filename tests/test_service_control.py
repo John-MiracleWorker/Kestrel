@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,9 +20,12 @@ from nested_memvid_agent.private_artifacts import (
 from nested_memvid_agent.server_client import ServerProbe
 from nested_memvid_agent.service_control import (
     ProcessSnapshot,
+    ServiceControlError,
     ServiceController,
     ServiceManagement,
     ServiceState,
+    SystemProcessInspector,
+    SystemProcessSignaler,
     resolve_kestrel_home,
     resolve_service_paths,
 )
@@ -63,6 +71,25 @@ class FakeClient:
     def probe(self) -> ServerProbe:
         self.probe_count += 1
         return self._probe
+
+
+class FakeSignaler:
+    def __init__(
+        self,
+        callback: Any | None = None,
+    ) -> None:
+        self.callback = callback
+        self.calls: list[tuple[str, int, int]] = []
+
+    def signal_pid(self, pid: int, signal_number: int) -> None:
+        self.calls.append(("pid", pid, signal_number))
+        if self.callback is not None:
+            self.callback("pid", pid, signal_number)
+
+    def signal_group(self, pgid: int, signal_number: int) -> None:
+        self.calls.append(("group", pgid, signal_number))
+        if self.callback is not None:
+            self.callback("group", pgid, signal_number)
 
 
 def _installation(home: Path, *, with_venv: bool = True) -> Path:
@@ -510,3 +537,448 @@ def test_status_reports_lifecycle_lock_contention_without_waiting(
     assert status.state == ServiceState.STOPPED
     assert status.lifecycle_busy is True
     assert "lifecycle" in status.detail.lower()
+
+
+def test_start_reuses_running_managed_and_external_services(
+    tmp_path: Path,
+) -> None:
+    for name, managed in (("managed", True), ("external", False)):
+        paths = resolve_service_paths(
+            _installation(tmp_path / name),
+            port=18765 if managed else 18766,
+        )
+        server = _server_snapshot(paths)
+        processes = {server.pid: server}
+        if managed:
+            supervisor = _supervisor_snapshot(paths, server)
+            processes[supervisor.pid] = supervisor
+            _managed_metadata(paths)
+        inspector = FakeInspector(
+            processes=processes,
+            listeners=(server.pid,),
+            live_groups=frozenset({server.pgid}),
+            bindable=False,
+        )
+
+        status = ServiceController(
+            paths,
+            inspector=inspector,
+            client=FakeClient(ServerProbe(True, True, False)),
+            popen=lambda *_args, **_kwargs: pytest.fail(
+                "healthy service must not relaunch"
+            ),
+        ).start()
+
+        assert status.state == ServiceState.RUNNING
+        assert status.management == (
+            ServiceManagement.MANAGED
+            if managed
+            else ServiceManagement.EXTERNAL
+        )
+
+
+def test_start_launches_the_existing_supervisor_with_safe_absolute_arguments(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    inspector = FakeInspector()
+    launches: list[tuple[list[str], dict[str, object]]] = []
+
+    def launch(command: list[str], **kwargs: object) -> object:
+        launches.append((command, kwargs))
+        server = _server_snapshot(paths)
+        supervisor = _supervisor_snapshot(paths, server)
+        _managed_metadata(paths)
+        inspector.processes = {
+            server.pid: server,
+            supervisor.pid: supervisor,
+        }
+        inspector.listeners = (server.pid,)
+        inspector.live_groups = frozenset({server.pgid})
+        inspector.bindable = False
+        return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
+
+    status = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        popen=launch,
+    ).start()
+
+    assert status.state == ServiceState.RUNNING
+    assert status.management == ServiceManagement.MANAGED
+    assert len(launches) == 1
+    command, kwargs = launches[0]
+    assert command[:2] == ["bash", str(paths.supervisor_script)]
+    assert command[command.index("--") + 1 :] == list(
+        _server_snapshot(paths).command
+    )
+    assert kwargs["cwd"] == paths.home
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["shell"] is False
+
+
+def test_concurrent_start_calls_serialize_to_one_supervisor(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    inspector = FakeInspector()
+    entered = threading.Event()
+    release = threading.Event()
+    launch_count = 0
+    launch_guard = threading.Lock()
+
+    def launch(_command: list[str], **_kwargs: object) -> object:
+        nonlocal launch_count
+        with launch_guard:
+            launch_count += 1
+        entered.set()
+        assert release.wait(timeout=2)
+        server = _server_snapshot(paths)
+        supervisor = _supervisor_snapshot(paths, server)
+        _managed_metadata(paths)
+        inspector.processes = {
+            server.pid: server,
+            supervisor.pid: supervisor,
+        }
+        inspector.listeners = (server.pid,)
+        inspector.live_groups = frozenset({server.pgid})
+        inspector.bindable = False
+        return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
+
+    controller = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        popen=launch,
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(controller.start)
+        assert entered.wait(timeout=2)
+        second = pool.submit(controller.start)
+        release.set()
+        statuses = (first.result(timeout=3), second.result(timeout=3))
+
+    assert launch_count == 1
+    assert all(status.state == ServiceState.RUNNING for status in statuses)
+    assert statuses[0].pid == statuses[1].pid
+
+
+def test_start_removes_only_proven_stale_metadata_before_launch(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    _managed_metadata(paths, server_pid=701, supervisor_pid=700)
+    inspector = FakeInspector()
+
+    def launch(_command: list[str], **_kwargs: object) -> object:
+        assert not paths.pid_path.exists()
+        assert not paths.supervisor_pid_path.exists()
+        assert not paths.pgid_path.exists()
+        server = _server_snapshot(paths)
+        supervisor = _supervisor_snapshot(paths, server)
+        _managed_metadata(paths)
+        inspector.processes = {
+            server.pid: server,
+            supervisor.pid: supervisor,
+        }
+        inspector.listeners = (server.pid,)
+        inspector.live_groups = frozenset({server.pgid})
+        inspector.bindable = False
+        return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
+
+    status = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        popen=launch,
+    ).start()
+
+    assert status.state == ServiceState.RUNNING
+    assert paths.pid_path.read_text(encoding="utf-8").strip() == "201"
+
+
+def test_start_refuses_unknown_listener_without_launching(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    unknown = ProcessSnapshot(
+        pid=909,
+        uid=os.getuid(),
+        cwd=tmp_path,
+        command=("python", "-m", "http.server", "18765"),
+        pgid=909,
+        state="S",
+    )
+    controller = ServiceController(
+        paths,
+        inspector=FakeInspector(
+            processes={unknown.pid: unknown},
+            listeners=(unknown.pid,),
+            bindable=False,
+        ),
+        client=FakeClient(ServerProbe(True, True, False)),
+        popen=lambda *_args, **_kwargs: pytest.fail(
+            "conflict must not launch"
+        ),
+    )
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        controller.start()
+
+    assert exc_info.value.code == "service_conflict"
+
+
+def test_startup_timeout_cleans_up_only_its_verified_supervisor(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    inspector = FakeInspector()
+    now = [0.0]
+
+    def launch(_command: list[str], **_kwargs: object) -> object:
+        server = _server_snapshot(paths)
+        supervisor = _supervisor_snapshot(paths, server)
+        write_private_text(paths.supervisor_pid_path, f"{supervisor.pid}\n")
+        inspector.processes = {supervisor.pid: supervisor}
+        return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
+
+    def on_signal(kind: str, identifier: int, signal_number: int) -> None:
+        assert kind == "pid"
+        assert identifier == 200
+        assert signal_number == signal.SIGTERM
+        inspector.processes.clear()
+
+    signaler = FakeSignaler(on_signal)
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    controller = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(False, False, False, "offline")),
+        popen=launch,
+        signaler=signaler,
+    )
+    with pytest.raises(ServiceControlError) as exc_info:
+        controller.start(
+            readiness_timeout=0.5,
+            poll_interval=0.25,
+            clock=lambda: now[0],
+            sleep=sleep,
+        )
+
+    assert exc_info.value.code == "startup_failed"
+    assert signaler.calls == [("pid", 200, signal.SIGTERM)]
+    assert not paths.supervisor_pid_path.exists()
+
+
+def test_stop_is_idempotent_when_already_stopped(tmp_path: Path) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    signaler = FakeSignaler()
+    status = ServiceController(
+        paths,
+        inspector=FakeInspector(),
+        client=FakeClient(ServerProbe(False, False, False, "offline")),
+        signaler=signaler,
+    ).stop()
+
+    assert status.state == ServiceState.STOPPED
+    assert signaler.calls == []
+
+
+def test_stop_terminates_only_a_verified_managed_process_group(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    supervisor = _supervisor_snapshot(paths, server)
+    _managed_metadata(paths)
+    inspector = FakeInspector(
+        processes={server.pid: server, supervisor.pid: supervisor},
+        listeners=(server.pid,),
+        live_groups=frozenset({server.pgid}),
+        bindable=False,
+    )
+
+    def on_signal(kind: str, identifier: int, signal_number: int) -> None:
+        assert (kind, identifier, signal_number) == (
+            "group",
+            server.pgid,
+            signal.SIGTERM,
+        )
+        inspector.processes.clear()
+        inspector.listeners = ()
+        inspector.live_groups = frozenset()
+        inspector.bindable = True
+
+    signaler = FakeSignaler(on_signal)
+    status = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        signaler=signaler,
+    ).stop()
+
+    assert status.state == ServiceState.STOPPED
+    assert signaler.calls == [("group", server.pgid, signal.SIGTERM)]
+    assert not paths.pid_path.exists()
+    assert not paths.supervisor_pid_path.exists()
+    assert not paths.pgid_path.exists()
+
+
+def test_stop_terminates_only_the_exact_verified_external_pid(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    inspector = FakeInspector(
+        processes={server.pid: server},
+        listeners=(server.pid,),
+        live_groups=frozenset({server.pgid}),
+        bindable=False,
+    )
+
+    def on_signal(kind: str, identifier: int, signal_number: int) -> None:
+        assert (kind, identifier, signal_number) == (
+            "pid",
+            server.pid,
+            signal.SIGTERM,
+        )
+        inspector.processes.clear()
+        inspector.listeners = ()
+        inspector.live_groups = frozenset()
+        inspector.bindable = True
+
+    signaler = FakeSignaler(on_signal)
+    status = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        signaler=signaler,
+    ).stop()
+
+    assert status.state == ServiceState.STOPPED
+    assert signaler.calls == [("pid", server.pid, signal.SIGTERM)]
+
+
+def test_stop_reverifies_identity_before_hard_kill(tmp_path: Path) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    inspector = FakeInspector(
+        processes={server.pid: server},
+        listeners=(server.pid,),
+        live_groups=frozenset({server.pgid}),
+        bindable=False,
+    )
+    now = [0.0]
+
+    def on_signal(kind: str, identifier: int, signal_number: int) -> None:
+        if signal_number == signal.SIGTERM:
+            inspector.processes[server.pid] = replace(
+                server,
+                command=("python", "-m", "http.server", "18765"),
+            )
+
+    signaler = FakeSignaler(on_signal)
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        ServiceController(
+            paths,
+            inspector=inspector,
+            client=FakeClient(ServerProbe(True, True, False)),
+            signaler=signaler,
+        ).stop(
+            grace_timeout=0.5,
+            kill_timeout=0.5,
+            poll_interval=0.25,
+            clock=lambda: now[0],
+            sleep=sleep,
+        )
+
+    assert exc_info.value.code == "identity_changed"
+    assert signaler.calls == [("pid", server.pid, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_stop_escalates_only_a_still_verified_signal_target(
+    tmp_path: Path,
+    managed: bool,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths)
+    processes = {server.pid: server}
+    if managed:
+        supervisor = _supervisor_snapshot(paths, server)
+        processes[supervisor.pid] = supervisor
+        _managed_metadata(paths)
+    inspector = FakeInspector(
+        processes=processes,
+        listeners=(server.pid,),
+        live_groups=frozenset({server.pgid}),
+        bindable=False,
+    )
+    now = [0.0]
+
+    def on_signal(kind: str, identifier: int, signal_number: int) -> None:
+        if signal_number != signal.SIGKILL:
+            return
+        inspector.processes.clear()
+        inspector.listeners = ()
+        inspector.live_groups = frozenset()
+        inspector.bindable = True
+
+    signaler = FakeSignaler(on_signal)
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    status = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        signaler=signaler,
+    ).stop(
+        grace_timeout=0.5,
+        kill_timeout=0.5,
+        poll_interval=0.25,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+
+    target_kind = "group" if managed else "pid"
+    assert status.state == ServiceState.STOPPED
+    assert signaler.calls == [
+        (target_kind, server.pgid if managed else server.pid, signal.SIGTERM),
+        (target_kind, server.pgid if managed else server.pid, signal.SIGKILL),
+    ]
+
+
+def test_system_process_inspector_and_signaler_touch_only_test_owned_process(
+    tmp_path: Path,
+) -> None:
+    process = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        cwd=tmp_path,
+        start_new_session=True,
+    )
+    try:
+        snapshot = SystemProcessInspector().process(process.pid)
+        assert snapshot is not None
+        assert snapshot.pid == process.pid
+        assert snapshot.uid == os.getuid()
+        assert snapshot.cwd == tmp_path.resolve()
+
+        SystemProcessSignaler().signal_pid(process.pid, signal.SIGTERM)
+        assert process.wait(timeout=3) == -signal.SIGTERM
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=3)

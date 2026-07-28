@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import math
 import os
 import shlex
 import socket
 import stat
 import subprocess
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
 from .file_lock import lock_exclusive, unlock
+from .platform_primitives import required_signal, signal_process_group
+from .private_artifacts import (
+    create_private_empty_file,
+    ensure_private_directory,
+    open_private_file_descriptor,
+)
 from .server_client import KestrelServerClient, ServerProbe
 
 
@@ -86,6 +95,20 @@ class ProcessInspector(Protocol):
 
 class ProbeClient(Protocol):
     def probe(self) -> ServerProbe: ...
+
+
+class ProcessSignaler(Protocol):
+    def signal_pid(self, pid: int, signal_number: int) -> None: ...
+
+    def signal_group(self, pgid: int, signal_number: int) -> None: ...
+
+
+class SystemProcessSignaler:
+    def signal_pid(self, pid: int, signal_number: int) -> None:
+        os.kill(pid, signal_number)
+
+    def signal_group(self, pgid: int, signal_number: int) -> None:
+        signal_process_group(pgid, signal_number)
 
 
 class SystemProcessInspector:
@@ -342,10 +365,14 @@ class ServiceController:
         *,
         inspector: ProcessInspector | None = None,
         client: ProbeClient | None = None,
+        signaler: ProcessSignaler | None = None,
+        popen: Callable[..., object] = subprocess.Popen,
     ) -> None:
         self.paths = paths
         self.inspector = inspector or SystemProcessInspector()
         self.client = client or KestrelServerClient(paths.url)
+        self.signaler = signaler or SystemProcessSignaler()
+        self.popen = popen
 
     def status(self) -> ServiceStatus:
         try:
@@ -378,6 +405,675 @@ class ServiceController:
                     "Run `kestrel doctor` and inspect the listener manually."
                 ),
             )
+
+    def start(
+        self,
+        *,
+        readiness_timeout: float = 15.0,
+        lifecycle_lock_timeout: float = 5.0,
+        poll_interval: float = 0.1,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> ServiceStatus:
+        readiness = _bounded_seconds(
+            "readiness timeout",
+            readiness_timeout,
+            allow_zero=True,
+        )
+        interval = _bounded_seconds(
+            "poll interval",
+            poll_interval,
+            allow_zero=False,
+        )
+        with _exclusive_lifecycle_lock(
+            self.paths.lifecycle_lock_path,
+            timeout_seconds=lifecycle_lock_timeout,
+            poll_interval=interval,
+            clock=clock,
+            sleep=sleep,
+        ):
+            current = self._locked_status()
+            if current.state == ServiceState.RUNNING:
+                return current
+            if current.state == ServiceState.CONFLICT:
+                raise _status_conflict(current)
+            if current.state == ServiceState.STARTING:
+                return self._wait_for_running(
+                    timeout_seconds=readiness,
+                    poll_interval=interval,
+                    clock=clock,
+                    sleep=sleep,
+                    existing_startup=True,
+                )
+            self._remove_proven_stale_metadata()
+            self._prepare_service_artifacts()
+            command = self._supervisor_command()
+            try:
+                launched = self.popen(
+                    command,
+                    cwd=self.paths.home,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                    shell=False,
+                )
+            except OSError as exc:
+                raise ServiceControlError(
+                    f"Could not launch the Kestrel supervisor: {exc}",
+                    code="launch_failed",
+                    recovery=(
+                        f"Inspect {self.paths.log_path} and run `kestrel doctor`."
+                    ),
+                ) from exc
+            launched_pid = getattr(launched, "pid", None)
+            if not isinstance(launched_pid, int) or launched_pid <= 0:
+                raise ServiceControlError(
+                    "The Kestrel supervisor did not return a valid process ID.",
+                    code="launch_failed",
+                    recovery=(
+                        f"Inspect {self.paths.log_path} and run `kestrel doctor`."
+                    ),
+                )
+            try:
+                return self._wait_for_running(
+                    timeout_seconds=readiness,
+                    poll_interval=interval,
+                    clock=clock,
+                    sleep=sleep,
+                    existing_startup=False,
+                )
+            except ServiceControlError as startup_error:
+                cleanup_error = self._cleanup_failed_start(
+                    launched_pid,
+                    timeout_seconds=max(1.0, interval * 10),
+                    poll_interval=interval,
+                    clock=clock,
+                    sleep=sleep,
+                )
+                if cleanup_error is not None:
+                    raise cleanup_error from startup_error
+                raise ServiceControlError(
+                    f"Kestrel did not become ready: {startup_error}",
+                    code="startup_failed",
+                    recovery=(
+                        f"Inspect {self.paths.log_path}, then run `kestrel doctor`."
+                    ),
+                ) from startup_error
+
+    def stop(
+        self,
+        *,
+        grace_timeout: float = 5.0,
+        kill_timeout: float = 3.0,
+        lifecycle_lock_timeout: float = 5.0,
+        poll_interval: float = 0.1,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> ServiceStatus:
+        grace = _bounded_seconds(
+            "grace timeout",
+            grace_timeout,
+            allow_zero=True,
+        )
+        hard_kill = _bounded_seconds(
+            "kill timeout",
+            kill_timeout,
+            allow_zero=True,
+        )
+        interval = _bounded_seconds(
+            "poll interval",
+            poll_interval,
+            allow_zero=False,
+        )
+        with _exclusive_lifecycle_lock(
+            self.paths.lifecycle_lock_path,
+            timeout_seconds=lifecycle_lock_timeout,
+            poll_interval=interval,
+            clock=clock,
+            sleep=sleep,
+        ):
+            current = self._locked_status()
+            if current.state == ServiceState.CONFLICT:
+                raise _status_conflict(current)
+            if current.state == ServiceState.STOPPED:
+                self._remove_proven_stale_metadata()
+                return self._stopped_status()
+            if current.management == ServiceManagement.EXTERNAL:
+                self._stop_external(
+                    current,
+                    grace_timeout=grace,
+                    kill_timeout=hard_kill,
+                    poll_interval=interval,
+                    clock=clock,
+                    sleep=sleep,
+                )
+            elif current.management == ServiceManagement.MANAGED:
+                self._stop_managed(
+                    current,
+                    grace_timeout=grace,
+                    kill_timeout=hard_kill,
+                    poll_interval=interval,
+                    clock=clock,
+                    sleep=sleep,
+                )
+            else:
+                raise ServiceControlError(
+                    "Kestrel process ownership could not be verified for stop.",
+                    code="service_conflict",
+                    recovery="Run `kestrel doctor`; do not signal the process manually until ownership is proven.",
+                )
+            self._remove_proven_stale_metadata()
+            if not self.inspector.port_is_bindable(
+                self.paths.host,
+                self.paths.port,
+            ):
+                raise ServiceControlError(
+                    "The Kestrel process exited, but the loopback port is still occupied.",
+                    code="termination_incomplete",
+                    recovery="Run `kestrel doctor` and inspect the new listener; no further process was signalled.",
+                )
+            return self._stopped_status()
+
+    def _locked_status(self) -> ServiceStatus:
+        try:
+            return self._status_from_inspection(
+                self._metadata(),
+                lifecycle_busy=False,
+            )
+        except ServiceControlError:
+            raise
+        except OSError as exc:
+            raise ServiceControlError(
+                f"Service ownership inspection failed: {exc}",
+                code="process_inspection_failed",
+                recovery="Run `kestrel doctor` and inspect the loopback listener manually.",
+            ) from exc
+
+    def _wait_for_running(
+        self,
+        *,
+        timeout_seconds: float,
+        poll_interval: float,
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+        existing_startup: bool,
+    ) -> ServiceStatus:
+        deadline = clock() + timeout_seconds
+        while True:
+            status = self._locked_status()
+            if status.state == ServiceState.RUNNING:
+                return status
+            if status.state == ServiceState.CONFLICT:
+                raise _status_conflict(status)
+            remaining = deadline - clock()
+            if remaining <= 0:
+                qualifier = "existing " if existing_startup else ""
+                raise ServiceControlError(
+                    f"The {qualifier}Kestrel startup did not reach API readiness.",
+                    code="startup_timeout",
+                    recovery=(
+                        f"Inspect {self.paths.log_path} and run `kestrel doctor`."
+                    ),
+                )
+            sleep(min(poll_interval, remaining))
+
+    def _prepare_service_artifacts(self) -> None:
+        if not self.paths.supervisor_script.is_file():
+            raise ServiceControlError(
+                f"Kestrel supervisor script is missing: {self.paths.supervisor_script}",
+                code="installation_incomplete",
+                recovery="Repair or reinstall Kestrel before starting the service.",
+            )
+        if (
+            not self.paths.server_executable.is_file()
+            or not os.access(self.paths.server_executable, os.X_OK)
+        ):
+            raise ServiceControlError(
+                f"Kestrel server executable is unavailable: {self.paths.server_executable}",
+                code="installation_incomplete",
+                recovery="Repair or reinstall the Kestrel virtual environment.",
+            )
+        ensure_private_directory(self.paths.lifecycle_lock_path.parent)
+        ensure_private_directory(self.paths.memory_dir)
+        ensure_private_directory(self.paths.state_path.parent)
+        create_private_empty_file(self.paths.log_path)
+
+    def _supervisor_command(self) -> list[str]:
+        server_command = [
+            str(self.paths.server_executable),
+            "server",
+            "--backend",
+            "memvid",
+            "--memory-dir",
+            str(self.paths.memory_dir),
+            "--state-path",
+            str(self.paths.state_path),
+            "--provider",
+            "mock",
+            "--model",
+            "mock",
+            "--host",
+            self.paths.host,
+            "--port",
+            str(self.paths.port),
+        ]
+        return [
+            "bash",
+            str(self.paths.supervisor_script),
+            "--pid-file",
+            str(self.paths.pid_path),
+            "--supervisor-pid-file",
+            str(self.paths.supervisor_pid_path),
+            "--process-group-file",
+            str(self.paths.pgid_path),
+            "--log-file",
+            str(self.paths.log_path),
+            "--",
+            *server_command,
+        ]
+
+    def _remove_proven_stale_metadata(self) -> None:
+        metadata = self._metadata()
+        if metadata.pid is not None and self.inspector.process(metadata.pid) is not None:
+            raise ServiceControlError(
+                "Recorded Kestrel server PID is still live.",
+                code="metadata_in_use",
+                recovery="Run `kestrel doctor` and verify process ownership before retrying.",
+            )
+        if (
+            metadata.supervisor_pid is not None
+            and self.inspector.process(metadata.supervisor_pid) is not None
+        ):
+            raise ServiceControlError(
+                "Recorded Kestrel supervisor PID is still live.",
+                code="metadata_in_use",
+                recovery="Run `kestrel doctor` and verify process ownership before retrying.",
+            )
+        if (
+            metadata.pgid is not None
+            and self.inspector.group_has_live_members(metadata.pgid)
+        ):
+            raise ServiceControlError(
+                "Recorded Kestrel process group is still live.",
+                code="metadata_in_use",
+                recovery="Run `kestrel doctor` and verify process ownership before retrying.",
+            )
+        if self.inspector.listener_pids(self.paths.host, self.paths.port):
+            raise ServiceControlError(
+                "The Kestrel loopback port still has a listener.",
+                code="metadata_in_use",
+                recovery="Run `kestrel doctor` and verify listener ownership before retrying.",
+            )
+        for path, expected in (
+            (self.paths.pid_path, metadata.pid),
+            (self.paths.supervisor_pid_path, metadata.supervisor_pid),
+            (self.paths.pgid_path, metadata.pgid),
+        ):
+            if expected is not None:
+                _unlink_private_identifier(path, expected)
+
+    def _cleanup_failed_start(
+        self,
+        launched_pid: int,
+        *,
+        timeout_seconds: float,
+        poll_interval: float,
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+    ) -> ServiceControlError | None:
+        metadata = self._metadata()
+        if metadata.supervisor_pid is not None:
+            if metadata.supervisor_pid != launched_pid:
+                return ServiceControlError(
+                    "Startup cleanup could not prove supervisor ownership; evidence was preserved.",
+                    code="cleanup_indeterminate",
+                    recovery="Run `kestrel doctor` and inspect the recorded supervisor before taking action.",
+                )
+            supervisor = self.inspector.process(launched_pid)
+            if supervisor is not None and not _supervisor_identity_matches(
+                supervisor,
+                self.paths,
+            ):
+                return ServiceControlError(
+                    "Startup cleanup detected a changed supervisor identity; evidence was preserved.",
+                    code="cleanup_indeterminate",
+                    recovery="Run `kestrel doctor`; do not signal the reused PID.",
+                )
+        if (
+            metadata.pgid is not None
+            and self.inspector.group_has_live_members(metadata.pgid)
+        ):
+            server = (
+                self.inspector.process(metadata.pid)
+                if metadata.pid is not None
+                else None
+            )
+            if (
+                server is None
+                or not _server_identity_matches(
+                    server,
+                    self.paths,
+                    managed=True,
+                )
+                or server.pgid != metadata.pgid
+            ):
+                return ServiceControlError(
+                    "Startup cleanup could not verify the new server process group; evidence was preserved.",
+                    code="cleanup_indeterminate",
+                    recovery="Run `kestrel doctor`; do not signal the process group manually.",
+                )
+            try:
+                self.signaler.signal_group(
+                    metadata.pgid,
+                    required_signal("SIGTERM"),
+                )
+            except ProcessLookupError:
+                pass
+        else:
+            supervisor = self.inspector.process(launched_pid)
+            if supervisor is not None:
+                if not _supervisor_identity_matches(supervisor, self.paths):
+                    return ServiceControlError(
+                        "Startup cleanup detected a reused supervisor PID; evidence was preserved.",
+                        code="cleanup_indeterminate",
+                        recovery="Run `kestrel doctor`; do not signal the reused PID.",
+                    )
+                try:
+                    self.signaler.signal_pid(
+                        launched_pid,
+                        required_signal("SIGTERM"),
+                    )
+                except ProcessLookupError:
+                    pass
+        stopped = _wait_until(
+            lambda: self._startup_processes_absent(metadata, launched_pid),
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+            clock=clock,
+            sleep=sleep,
+        )
+        if not stopped:
+            return ServiceControlError(
+                "The verified startup process did not exit; lifecycle evidence was preserved.",
+                code="cleanup_indeterminate",
+                recovery="Run `kestrel doctor` and inspect the service log before taking action.",
+            )
+        try:
+            self._remove_proven_stale_metadata()
+        except ServiceControlError as exc:
+            return ServiceControlError(
+                f"Startup processes exited, but cleanup proof failed: {exc}",
+                code="cleanup_indeterminate",
+                recovery="Run `kestrel doctor`; lifecycle evidence was preserved.",
+            )
+        return None
+
+    def _startup_processes_absent(
+        self,
+        metadata: _ServiceMetadata,
+        launched_pid: int,
+    ) -> bool:
+        if self.inspector.process(launched_pid) is not None:
+            return False
+        if (
+            metadata.pid is not None
+            and self.inspector.process(metadata.pid) is not None
+        ):
+            return False
+        if (
+            metadata.pgid is not None
+            and self.inspector.group_has_live_members(metadata.pgid)
+        ):
+            return False
+        return not self.inspector.listener_pids(
+            self.paths.host,
+            self.paths.port,
+        )
+
+    def _stop_external(
+        self,
+        status: ServiceStatus,
+        *,
+        grace_timeout: float,
+        kill_timeout: float,
+        poll_interval: float,
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+    ) -> None:
+        if status.pid is None:
+            raise ServiceControlError(
+                "Verified external service has no process ID.",
+                code="service_conflict",
+                recovery="Run `kestrel doctor`; no process was signalled.",
+            )
+        expected = self.inspector.process(status.pid)
+        if expected is None or not _server_identity_matches(
+            expected,
+            self.paths,
+            managed=False,
+        ):
+            raise _identity_changed(status.pid)
+        try:
+            self.signaler.signal_pid(
+                status.pid,
+                required_signal("SIGTERM"),
+            )
+        except ProcessLookupError:
+            pass
+        if _wait_until(
+            lambda: self._external_absent(status.pid),
+            timeout_seconds=grace_timeout,
+            poll_interval=poll_interval,
+            clock=clock,
+            sleep=sleep,
+        ):
+            return
+        current = self.inspector.process(status.pid)
+        if (
+            current is None
+            or not _same_process_identity(expected, current)
+            or not _server_identity_matches(
+                current,
+                self.paths,
+                managed=False,
+            )
+        ):
+            raise _identity_changed(status.pid)
+        try:
+            self.signaler.signal_pid(
+                status.pid,
+                required_signal("SIGKILL"),
+            )
+        except ProcessLookupError:
+            pass
+        if not _wait_until(
+            lambda: self._external_absent(status.pid),
+            timeout_seconds=kill_timeout,
+            poll_interval=poll_interval,
+            clock=clock,
+            sleep=sleep,
+        ):
+            raise ServiceControlError(
+                "The verified external Kestrel process survived termination.",
+                code="termination_failed",
+                recovery="Run `kestrel doctor`; no other process was signalled.",
+            )
+
+    def _stop_managed(
+        self,
+        status: ServiceStatus,
+        *,
+        grace_timeout: float,
+        kill_timeout: float,
+        poll_interval: float,
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+    ) -> None:
+        metadata = self._metadata()
+        if (
+            metadata.pgid is not None
+            and metadata.pid is not None
+            and self.inspector.group_has_live_members(metadata.pgid)
+        ):
+            expected = self.inspector.process(metadata.pid)
+            if (
+                expected is None
+                or expected.pgid != metadata.pgid
+                or not _server_identity_matches(
+                    expected,
+                    self.paths,
+                    managed=True,
+                )
+            ):
+                raise _identity_changed(metadata.pid)
+            try:
+                self.signaler.signal_group(
+                    metadata.pgid,
+                    required_signal("SIGTERM"),
+                )
+            except ProcessLookupError:
+                pass
+            if _wait_until(
+                lambda: self._managed_absent(metadata),
+                timeout_seconds=grace_timeout,
+                poll_interval=poll_interval,
+                clock=clock,
+                sleep=sleep,
+            ):
+                return
+            current_metadata = self._metadata()
+            current = self.inspector.process(metadata.pid)
+            if (
+                current_metadata != metadata
+                or current is None
+                or not _same_process_identity(expected, current)
+                or current.pgid != metadata.pgid
+                or not _server_identity_matches(
+                    current,
+                    self.paths,
+                    managed=True,
+                )
+            ):
+                raise _identity_changed(metadata.pid)
+            try:
+                self.signaler.signal_group(
+                    metadata.pgid,
+                    required_signal("SIGKILL"),
+                )
+            except ProcessLookupError:
+                pass
+            if not _wait_until(
+                lambda: self._managed_absent(metadata),
+                timeout_seconds=kill_timeout,
+                poll_interval=poll_interval,
+                clock=clock,
+                sleep=sleep,
+            ):
+                raise ServiceControlError(
+                    "The verified Kestrel process group survived termination.",
+                    code="termination_failed",
+                    recovery="Run `kestrel doctor`; no unrelated process was signalled.",
+                )
+            return
+        supervisor_pid = metadata.supervisor_pid or status.supervisor_pid
+        if supervisor_pid is None:
+            raise ServiceControlError(
+                "Managed Kestrel startup has no verified signal target.",
+                code="service_conflict",
+                recovery="Run `kestrel doctor`; no process was signalled.",
+            )
+        expected_supervisor = self.inspector.process(supervisor_pid)
+        if expected_supervisor is None or not _supervisor_identity_matches(
+            expected_supervisor,
+            self.paths,
+        ):
+            raise _identity_changed(supervisor_pid)
+        try:
+            self.signaler.signal_pid(
+                supervisor_pid,
+                required_signal("SIGTERM"),
+            )
+        except ProcessLookupError:
+            pass
+        if _wait_until(
+            lambda: self.inspector.process(supervisor_pid) is None,
+            timeout_seconds=grace_timeout,
+            poll_interval=poll_interval,
+            clock=clock,
+            sleep=sleep,
+        ):
+            return
+        current = self.inspector.process(supervisor_pid)
+        if (
+            current is None
+            or not _same_process_identity(expected_supervisor, current)
+            or not _supervisor_identity_matches(current, self.paths)
+        ):
+            raise _identity_changed(supervisor_pid)
+        try:
+            self.signaler.signal_pid(
+                supervisor_pid,
+                required_signal("SIGKILL"),
+            )
+        except ProcessLookupError:
+            pass
+        if not _wait_until(
+            lambda: self.inspector.process(supervisor_pid) is None,
+            timeout_seconds=kill_timeout,
+            poll_interval=poll_interval,
+            clock=clock,
+            sleep=sleep,
+        ):
+            raise ServiceControlError(
+                "The verified Kestrel supervisor survived termination.",
+                code="termination_failed",
+                recovery="Run `kestrel doctor`; no unrelated process was signalled.",
+            )
+
+    def _external_absent(self, pid: int) -> bool:
+        return (
+            self.inspector.process(pid) is None
+            and pid
+            not in self.inspector.listener_pids(
+                self.paths.host,
+                self.paths.port,
+            )
+        )
+
+    def _managed_absent(self, metadata: _ServiceMetadata) -> bool:
+        if (
+            metadata.pid is not None
+            and self.inspector.process(metadata.pid) is not None
+        ):
+            return False
+        if (
+            metadata.supervisor_pid is not None
+            and self.inspector.process(metadata.supervisor_pid) is not None
+        ):
+            return False
+        if (
+            metadata.pgid is not None
+            and self.inspector.group_has_live_members(metadata.pgid)
+        ):
+            return False
+        listeners = self.inspector.listener_pids(
+            self.paths.host,
+            self.paths.port,
+        )
+        return metadata.pid is None or metadata.pid not in listeners
+
+    def _stopped_status(self) -> ServiceStatus:
+        return ServiceStatus(
+            state=ServiceState.STOPPED,
+            management=ServiceManagement.NONE,
+            url=self.paths.url,
+            pid=None,
+            supervisor_pid=None,
+            pgid=None,
+            detail="Kestrel is stopped.",
+        )
 
     def _metadata(self) -> _ServiceMetadata:
         return _ServiceMetadata(
@@ -932,6 +1628,137 @@ def _configured_path(
 def _current_uid() -> int:
     getuid = getattr(os, "getuid", None)
     return int(getuid()) if callable(getuid) else 0
+
+
+@contextmanager
+def _exclusive_lifecycle_lock(
+    path: Path,
+    *,
+    timeout_seconds: float,
+    poll_interval: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> Iterator[None]:
+    timeout = _bounded_seconds(
+        "lifecycle lock timeout",
+        timeout_seconds,
+        allow_zero=True,
+    )
+    try:
+        descriptor = open_private_file_descriptor(path)
+    except (OSError, ValueError) as exc:
+        raise ServiceControlError(
+            f"Cannot open the Kestrel lifecycle lock: {exc}",
+            code="unsafe_metadata",
+            recovery="Inspect the lifecycle lock path and run `kestrel doctor`.",
+        ) from exc
+    handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+    acquired = False
+    deadline = clock() + timeout
+    try:
+        while True:
+            try:
+                lock_exclusive(handle, blocking=False)
+                acquired = True
+                break
+            except BlockingIOError:
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise ServiceControlError(
+                        "Another Kestrel lifecycle command is still in progress.",
+                        code="lifecycle_busy",
+                        recovery="Wait for that start/open/stop command to finish, then retry.",
+                    ) from None
+                sleep(min(poll_interval, remaining))
+        yield
+    finally:
+        if acquired:
+            unlock(handle)
+        handle.close()
+
+
+def _unlink_private_identifier(path: Path, expected: int) -> None:
+    current = _read_private_identifier(path)
+    if current is None:
+        return
+    if current != expected:
+        raise ServiceControlError(
+            f"Lifecycle metadata changed before cleanup: {path}",
+            code="identity_changed",
+            recovery="Run `kestrel doctor`; the changed file was preserved.",
+        )
+    before = os.lstat(path)
+    _validate_private_metadata(before, path)
+    after = os.lstat(path)
+    _validate_private_metadata(after, path)
+    if not os.path.samestat(before, after):
+        raise ServiceControlError(
+            f"Lifecycle metadata changed before cleanup: {path}",
+            code="identity_changed",
+            recovery="Run `kestrel doctor`; the changed file was preserved.",
+        )
+    path.unlink()
+
+
+def _bounded_seconds(
+    name: str,
+    value: float,
+    *,
+    allow_zero: bool,
+) -> float:
+    seconds = float(value)
+    minimum_valid = seconds >= 0 if allow_zero else seconds > 0
+    if not math.isfinite(seconds) or not minimum_valid:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be a finite {qualifier} number")
+    return seconds
+
+
+def _wait_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout_seconds: float,
+    poll_interval: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    deadline = clock() + timeout_seconds
+    while True:
+        if predicate():
+            return True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        sleep(min(poll_interval, remaining))
+
+
+def _same_process_identity(
+    expected: ProcessSnapshot,
+    current: ProcessSnapshot,
+) -> bool:
+    return (
+        expected.pid == current.pid
+        and expected.uid == current.uid
+        and expected.cwd.resolve() == current.cwd.resolve()
+        and expected.command == current.command
+        and expected.pgid == current.pgid
+    )
+
+
+def _identity_changed(pid: int) -> ServiceControlError:
+    return ServiceControlError(
+        f"Process identity changed for PID {pid}; escalation was refused.",
+        code="identity_changed",
+        recovery="Run `kestrel doctor`; no reused or unverified process was signalled.",
+    )
+
+
+def _status_conflict(status: ServiceStatus) -> ServiceControlError:
+    return ServiceControlError(
+        status.detail,
+        code="service_conflict",
+        recovery="Resolve the ownership conflict with `kestrel doctor` before retrying.",
+    )
 
 
 def _with_lifecycle(detail: str, busy: bool) -> str:
