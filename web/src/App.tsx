@@ -107,6 +107,12 @@ type ProviderOption = {
 
 type AppSection = "chat" | "routines" | "routing" | "advanced" | "settings";
 
+type SimpleChatStatus = {
+  label: string;
+  detail: string;
+  action?: "setup" | "model-settings";
+};
+
 const RUN_EVENT_REFRESH_DEBOUNCE_MS = 250;
 
 const providerOptions: ProviderOption[] = [
@@ -1844,7 +1850,7 @@ export function App() {
   const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
   const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
-  const simpleStatus = authPromptOpen
+  const simpleStatus: SimpleChatStatus = authPromptOpen
     ? {
         label: "Locked",
         detail: "Enter the local API token before using this Kestrel."
@@ -1854,10 +1860,20 @@ export function App() {
           label: "Connecting",
           detail: "Loading the authoritative Kestrel runtime configuration."
         }
-    : simpleChatStatus(activeRun, pendingApprovalCount, setupReadiness);
+    : simpleChatStatus(
+        activeRun,
+        pendingApprovalCount,
+        setupReadiness,
+        providerDisplayName,
+        model
+      );
   const chatIntro = userDisplayName
     ? `Ready when you are, ${userDisplayName}.`
     : "Ready when you are.";
+  const chatStatusDetail =
+    activeRun || simpleStatus.label !== "Ready"
+      ? simpleStatus.detail
+      : chatIntro;
 
   return (
     <>
@@ -1974,14 +1990,19 @@ export function App() {
             <div className="conv-meta simple-meta">
               <span>{activeThread ? "Current chat" : "New chat"}</span>
               <span className="sep">·</span>
-              <span>{activeRun ? simpleStatus.detail : chatIntro}</span>
+              <span>{chatStatusDetail}</span>
             </div>
           </div>
           <div className="conv-tools simple-conv-tools">
             <StatusBadge value={simpleStatus.label} />
-            {setupReadiness && !setupReadiness.ready && (
+            {simpleStatus.action === "setup" && (
               <button type="button" onClick={() => setSetupOpen(true)}>
                 <Sparkles size={15} /> Setup
+              </button>
+            )}
+            {simpleStatus.action === "model-settings" && (
+              <button type="button" onClick={() => routeToSection("settings")}>
+                <Settings size={15} /> Open model settings
               </button>
             )}
             {activeRun && (
@@ -5033,8 +5054,10 @@ function extractProofOfWork(trace: RunTrace | null): Record<string, unknown> | n
 function simpleChatStatus(
   activeRun: Run | null,
   pendingApprovalCount: number,
-  setupReadiness: SetupReadinessReport | null
-): { label: string; detail: string } {
+  setupReadiness: SetupReadinessReport | null,
+  providerName: string,
+  modelName: string
+): SimpleChatStatus {
   if (pendingApprovalCount > 0) {
     return {
       label: "Needs approval",
@@ -5059,16 +5082,47 @@ function simpleChatStatus(
       detail: activeRun.error || "The last run failed."
     };
   }
-  if (setupReadiness && !setupReadiness.ready) {
+  const setupIssue = firstNonProviderSetupIssue(setupReadiness);
+  if (setupReadiness && !setupReadiness.ready && setupIssue) {
     return {
       label: "Needs setup",
-      detail: setupReadiness.next_action || "Finish setup before relying on this Kestrel."
+      detail:
+        setupReadiness.next_action ||
+        setupIssue.recovery ||
+        "Finish setup before relying on this Kestrel.",
+      action: "setup"
+    };
+  }
+  if (setupReadiness?.experience_mode === "demo") {
+    return {
+      label: "Demo",
+      detail: "Demo uses deterministic responses; no live model connected."
+    };
+  }
+  if (setupReadiness?.experience_mode === "model_not_connected") {
+    const providerModel = [providerName, modelName].filter(Boolean).join(" / ");
+    return {
+      label: "Model not connected",
+      detail: `${providerModel || "The configured provider and model"} has no verified live model connection. Open Settings to configure or test it.`,
+      action: "model-settings"
     };
   }
   return {
     label: "Ready",
     detail: activeRun ? "Kestrel is ready for the next message." : "Start a chat to begin."
   };
+}
+
+function firstNonProviderSetupIssue(
+  setupReadiness: SetupReadinessReport | null
+) {
+  if (!setupReadiness) return null;
+  return setupReadiness.checks.find(
+    (check) =>
+      check.status !== "pass" &&
+      check.check_id !== "provider_configuration" &&
+      check.check_id !== "provider_operational"
+  ) ?? null;
 }
 
 function simpleThreadStatus(status: string): string {

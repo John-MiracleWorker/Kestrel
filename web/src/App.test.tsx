@@ -14,6 +14,7 @@ import type {
   Run,
   SecretRef,
   Session,
+  SetupReadinessReport,
   Skill,
   TaskGraph,
   Tool,
@@ -133,6 +134,40 @@ let routineRunNowAmbiguousFailures: number;
 let routineRunNowAmbiguousStatuses: number[];
 let routineRunNowAccepted: Map<string, RoutineOccurrence>;
 let routineRunNowInitialStatus: string;
+let setupReadinessPayload: SetupReadinessReport;
+let runtimeProviderName: string;
+let runtimeModelName: string;
+
+function readinessFixture(
+  overrides: Partial<SetupReadinessReport> = {}
+): SetupReadinessReport {
+  return {
+    schema: "kestrel.setup_readiness.v1",
+    ready: true,
+    experience_mode: "demo",
+    pass_count: 2,
+    warn_count: 0,
+    fail_count: 0,
+    next_action: "Demo is ready. Connect a live model in Settings when you want provider-backed responses.",
+    checks: [
+      {
+        check_id: "provider_configuration",
+        title: "Provider configuration",
+        status: "pass",
+        detail: "Mock provider is selected.",
+        recovery: "Choose a live provider in Settings when needed."
+      },
+      {
+        check_id: "provider_operational",
+        title: "Provider operational health",
+        status: "pass",
+        detail: "Deterministic Demo responses are available.",
+        recovery: "Connect a live provider for model-backed responses."
+      }
+    ],
+    ...overrides
+  };
+}
 
 function installRoutineHistoryPollTimers() {
   const nativeSetTimeout = window.setTimeout.bind(window);
@@ -330,6 +365,9 @@ describe("App", () => {
     routineRunNowAmbiguousStatuses = [];
     routineRunNowAccepted = new Map();
     routineRunNowInitialStatus = "completed";
+    setupReadinessPayload = readinessFixture();
+    runtimeProviderName = "mock";
+    runtimeModelName = "mock";
     vi.stubGlobal("fetch", vi.fn(fetchMock));
     vi.stubGlobal("EventSource", MockEventSource);
   });
@@ -1500,6 +1538,7 @@ describe("App", () => {
 
     await screen.findAllByText("Inspect the repo");
     expect(await screen.findByLabelText("Kestrel is responding")).toHaveTextContent("Working");
+    expect(document.querySelector(".status-pill")).toHaveTextContent("Working");
   });
 
   it("hydrates thinking and tool use from the selected run trace", async () => {
@@ -1541,6 +1580,7 @@ describe("App", () => {
     render(<App />);
 
     expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
+    expect(document.querySelector(".status-pill")).toHaveTextContent("Needs approval");
     const approvalCard = screen.getByRole("group", { name: /approval for shell.run/i });
     expect(within(approvalCard).getByText("shell.run")).toBeInTheDocument();
     expect(within(approvalCard).getByText("High risk")).toBeInTheDocument();
@@ -2139,6 +2179,173 @@ describe("App", () => {
     expect(await screen.findByDisplayValue("grok-4.3")).toBeInTheDocument();
   });
 
+  it("labels deterministic mock responses as Demo instead of a live model", async () => {
+    approvals = [];
+    runs = [];
+    sessions = [];
+    sessionRuns = {};
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Demo");
+    });
+    expect(
+      screen.getByText(/deterministic responses; no live model connected/i)
+    ).toBeInTheDocument();
+  });
+
+  it("shows provider and model recovery when a live model is not connected", async () => {
+    approvals = [];
+    runtimeProviderName = "openai";
+    runtimeModelName = "gpt-5.5";
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      experience_mode: "model_not_connected",
+      pass_count: 0,
+      warn_count: 1,
+      fail_count: 1,
+      next_action: "Open Settings and verify the OpenAI credential.",
+      checks: [
+        {
+          check_id: "provider_configuration",
+          title: "Provider configuration",
+          status: "fail",
+          detail: "The configured OpenAI credential is missing.",
+          recovery: "Store the credential in Settings."
+        },
+        {
+          check_id: "provider_operational",
+          title: "Provider operational health",
+          status: "warn",
+          detail: "No successful request is recorded for this server process.",
+          recovery: "Send a live request after fixing provider configuration."
+        }
+      ]
+    });
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent(
+        "Model not connected"
+      );
+    });
+    expect(screen.getByText(/OpenAI.*gpt-5\.5/i)).toBeInTheDocument();
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Needs setup");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /open model settings/i })
+    );
+    expect(await screen.findByRole("heading", { name: /settings/i })).toBeInTheDocument();
+  });
+
+  it("shows Ready only for a connected non-mock model", async () => {
+    approvals = [];
+    runtimeProviderName = "openai";
+    runtimeModelName = "gpt-5.5";
+    setupReadinessPayload = readinessFixture({
+      experience_mode: "connected",
+      next_action: "Start a provider-backed run."
+    });
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Ready");
+    });
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Demo");
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent(
+      "Model not connected"
+    );
+  });
+
+  it("keeps non-provider setup failures above the experience mode", async () => {
+    approvals = [];
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      fail_count: 1,
+      next_action: "Create or select the workspace Kestrel should use.",
+      checks: [
+        ...readinessFixture().checks,
+        {
+          check_id: "workspace",
+          title: "Workspace",
+          status: "fail",
+          detail: "The configured workspace does not exist.",
+          recovery: "Create or select a workspace."
+        }
+      ]
+    });
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Needs setup");
+    });
+    expect(screen.getByText("Create or select the workspace Kestrel should use.")).toBeInTheDocument();
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Demo");
+  });
+
+  it("keeps connecting above the experience mode until the API loads", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    let releaseHealth: ((response: Response) => void) | null = null;
+    fetchSpy.mockImplementationOnce(
+      () => new Promise<Response>((resolve) => {
+        releaseHealth = resolve;
+      })
+    );
+    const { container } = render(<App />);
+
+    expect(container.querySelector(".status-pill")).toHaveTextContent("Connecting");
+    await act(async () => {
+      releaseHealth?.(jsonResponse({ ok: true }));
+    });
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+  });
+
+  it("keeps a failed run above a disconnected model state", async () => {
+    approvals = [];
+    runtimeProviderName = "openai";
+    runtimeModelName = "gpt-5.5";
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      experience_mode: "model_not_connected",
+      fail_count: 1,
+      checks: [
+        {
+          check_id: "provider_configuration",
+          title: "Provider configuration",
+          status: "fail",
+          detail: "The provider is not configured.",
+          recovery: "Open Settings."
+        }
+      ]
+    });
+    const failedRun = {
+      ...otherRun,
+      status: "failed",
+      error: "The last provider-backed run failed."
+    };
+    runs = [failedRun, secondRun, baseRun];
+    sessionRuns.session_2 = [failedRun];
+    sessions = [
+      {
+        ...sessions[0],
+        latest_run_id: failedRun.run_id,
+        latest_status: failedRun.status
+      },
+      sessions[1]
+    ];
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Needs attention");
+    });
+    expect(screen.getByText("The last provider-backed run failed.")).toBeInTheDocument();
+  });
+
   it("renders behavior delta review panel from the ledger API", async () => {
     render(<App />);
 
@@ -2158,6 +2365,36 @@ describe("App", () => {
   it("runs the setup wizard and saves onboarding to Soul memory", async () => {
     const fetchSpy = vi.mocked(fetch);
     onboardingProfile = null;
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      pass_count: 5,
+      warn_count: 2,
+      fail_count: 1,
+      next_action: "Fix failing setup checks before starting the golden local workflow.",
+      checks: [
+        {
+          check_id: "provider_configuration",
+          title: "Provider configuration",
+          status: "pass",
+          detail: "Mock provider is selected, so deterministic first-run smoke tests can run without credentials.",
+          recovery: "Choose a live provider later and rerun setup readiness before claiming provider support."
+        },
+        {
+          check_id: "workspace",
+          title: "Workspace",
+          status: "fail",
+          detail: "Workspace `/tmp/missing` does not exist.",
+          recovery: "Create the workspace or pass `--workspace` pointing at the repo/project Kestrel should operate on."
+        },
+        {
+          check_id: "memory_storage",
+          title: "Memory storage",
+          status: "warn",
+          detail: "Memory directory is not present yet. Path: `/tmp/memory`.",
+          recovery: "Run `nest-agent init` or start a local run so Kestrel can initialize memory layers."
+        }
+      ]
+    });
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Meet your Kestrel" })).toBeInTheDocument();
@@ -2781,7 +3018,12 @@ function payloadFor(path: string): unknown {
         display_name: "Soul",
         description: "A local-first, memory-native engineering agent runtime."
       },
-      provider: { provider: "mock", model: "mock", api_key_env: null, api_key_configured: false },
+      provider: {
+        provider: runtimeProviderName,
+        model: runtimeModelName,
+        api_key_env: null,
+        api_key_configured: runtimeProviderName !== "mock"
+      },
       config: { allow_self_modification: false, allow_web: false },
       memory_layers: [{ layer: "self", mv2_file: "self.mv2" }],
       tools: [],
@@ -2799,44 +3041,19 @@ function payloadFor(path: string): unknown {
     };
   }
   if (path === "/api/product/setup") {
-    return {
-      schema: "kestrel.setup_readiness.v1",
-      ready: false,
-      pass_count: 5,
-      warn_count: 2,
-      fail_count: 1,
-      next_action: "Fix failing setup checks before starting the golden local workflow.",
-      checks: [
-        {
-          check_id: "provider_configuration",
-          title: "Provider configuration",
-          status: "pass",
-          detail: "Mock provider is selected, so deterministic first-run smoke tests can run without credentials.",
-          recovery: "Choose a live provider later and rerun setup readiness before claiming provider support."
-        },
-        {
-          check_id: "workspace",
-          title: "Workspace",
-          status: "fail",
-          detail: "Workspace `/tmp/missing` does not exist.",
-          recovery: "Create the workspace or pass `--workspace` pointing at the repo/project Kestrel should operate on."
-        },
-        {
-          check_id: "memory_storage",
-          title: "Memory storage",
-          status: "warn",
-          detail: "Memory directory is not present yet. Path: `/tmp/memory`.",
-          recovery: "Run `nest-agent init` or start a local run so Kestrel can initialize memory layers."
-        }
-      ]
-    };
+    return setupReadinessPayload;
   }
   if (path === "/api/runtime/config") {
     return {
       name: "Kestrel",
       version: "0.1.0",
       schema_version: 9,
-      provider: { name: "mock", model: "mock", api_key_env: null, api_key_configured: false },
+      provider: {
+        name: runtimeProviderName,
+        model: runtimeModelName,
+        api_key_env: null,
+        api_key_configured: runtimeProviderName !== "mock"
+      },
       feature_flags: {
         enable_autonomous_scheduler: false,
         require_approval_for_high_risk_tools: true,
@@ -2848,8 +3065,8 @@ function payloadFor(path: string): unknown {
       paths: { workspace: "/tmp/kestrel", memory_dir: "/tmp/memory" },
       settings: {
         runtime: {
-          provider: "mock",
-          model: "mock",
+          provider: runtimeProviderName,
+          model: runtimeModelName,
           backend: "memory",
           memory_dir: "/tmp/memory",
           workspace: "/tmp/kestrel",

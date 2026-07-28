@@ -565,6 +565,11 @@ export type SelfOnboardingSaveResult = {
 
 export type SetupReadinessStatus = "pass" | "warn" | "fail";
 
+export type SetupExperienceMode =
+  | "demo"
+  | "model_not_connected"
+  | "connected";
+
 export type SetupReadinessCheck = {
   check_id: string;
   title: string;
@@ -576,6 +581,7 @@ export type SetupReadinessCheck = {
 export type SetupReadinessReport = {
   schema: string;
   ready: boolean;
+  experience_mode: SetupExperienceMode;
   pass_count: number;
   warn_count: number;
   fail_count: number;
