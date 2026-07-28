@@ -52,19 +52,30 @@ export function RepairReviewPanel({
   const reviewHead = String(reviewSnapshot?.head_sha ?? "pending");
   const changedFiles = asStringArray(reviewArtifact?.changed_files ?? reviewResult?.changed_files);
   const diffPreview = readRecord(reviewArtifact?.diff_preview ?? reviewResult?.diff_preview);
-  const diffContent = typeof diffPreview?.content === "string" ? diffPreview.content : "";
+  const diffPreviewBound = diffPreview?.bound_diff_digest === diffHash
+    && diffPreview?.redacted === true
+    && diffPreview?.authoritative === false;
+  const diffContent = diffPreviewBound && typeof diffPreview?.content === "string"
+    ? diffPreview.content
+    : "";
   const diffTruncated = diffPreview?.truncated === true;
   const diffOmittedFiles = typeof diffPreview?.omitted_files === "number"
     ? diffPreview.omitted_files
     : 0;
+  const hasReviewArtifact = reviewId !== "pending";
   const commitGate = readRecord(reviewArtifact?.commit_gate ?? reviewResult?.commit_gate);
   const commitApprovalRequired = commitGate?.approval_required_before_commit === true;
+  const commitAllowed = hasReviewArtifact
+    && reviewTask?.status === "completed"
+    && commitApprovalRequired
+    && commitGate?.commit_allowed !== false;
+  const reviewSummary = String(reviewArtifact?.summary ?? reviewResult?.summary ?? "").trim();
+  const riskNotes = asStringArray(reviewArtifact?.risks ?? reviewResult?.risks);
 
   const rollbackResult = rollbackTask?.result ?? null;
   const rollbackId = String(rollbackResult?.rollback_id ?? "pending");
   const restoredFiles = asStringArray(rollbackResult?.restored_files);
   const artifactPath = String(rollbackResult?.artifact_path ?? ".nest/repair_rollbacks");
-  const hasReviewArtifact = reviewId !== "pending";
   const criteria = uniqueStrings(
     repairTasks.flatMap((task) => task.acceptance_criteria ?? [])
   );
@@ -132,6 +143,15 @@ export function RepairReviewPanel({
             <p>{`Review gate: ${reviewId} · ${commitApprovalRequired ? "commit approval required" : "commit gate pending"}`}</p>
             <p>{`Diff ${diffHash} · ${changedFiles.length ? changedFiles.join(", ") : "no changed files recorded"}`}</p>
             {reviewBranch !== "pending" && <p>{`Candidate ${reviewBranch} @ ${reviewHead}`}</p>}
+            {reviewSummary && <p>{reviewSummary}</p>}
+            {riskNotes.length > 0 && (
+              <div className="repair-risk-notes">
+                <strong>Known risks</strong>
+                <ul>
+                  {riskNotes.map((risk) => <li key={risk}>{risk}</li>)}
+                </ul>
+              </div>
+            )}
             {diffContent ? (
               <section className="repair-diff" aria-label="Repair diff preview">
                 <header>
@@ -191,7 +211,7 @@ export function RepairReviewPanel({
               <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareExport}>
                 Prepare exact-call patch export
               </button>
-              <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareCommit}>
+              <button type="button" className="btn subtle" disabled={!commitAllowed} onClick={prepareCommit}>
                 Prepare exact-call git.commit request
               </button>
             </div>

@@ -3879,7 +3879,27 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
         capture_output=True,
         text=True,
     )
+    (tmp_path / "removed.txt").write_text("remove me\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "removed.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "test fixture"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "removed.txt").unlink()
     (tmp_path / "README.md").write_text("patched\n")
+    (tmp_path / "new_module.py").write_text(
+        "def newly_added() -> bool:\n    return True\n",
+        encoding="utf-8",
+    )
     subprocess.run(
         ["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True
     )
@@ -3912,6 +3932,11 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
     assert "--- a/README.md" in result.data["diff_preview"]["content"]
     assert "+++ b/README.md" in result.data["diff_preview"]["content"]
     assert "+patched" in result.data["diff_preview"]["content"]
+    assert "+++ b/new_module.py" in result.data["diff_preview"]["content"]
+    assert "+def newly_added() -> bool:" in result.data["diff_preview"]["content"]
+    assert "--- a/removed.txt" in result.data["diff_preview"]["content"]
+    assert "+++ /dev/null" in result.data["diff_preview"]["content"]
+    assert "-remove me" in result.data["diff_preview"]["content"]
     review_path = tmp_path / ".nest" / "repair_reviews" / f"{result.data['review_id']}.json"
     assert review_path.exists()
     stored_review = json.loads(review_path.read_text())
@@ -4194,6 +4219,67 @@ def test_git_export_patch_writes_local_improvement_patch(
     assert (
         tmp_path / ".kestrel" / "improvements" / "demo" / "diff.patch"
     ).read_text() == patch_text
+
+
+def test_git_export_patch_default_destination_respects_project_allowed_paths(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    (tmp_path / "src").mkdir()
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    patch_text = "diff --git a/src/a.txt b/src/a.txt\n+hello\n"
+    call = ToolCall(
+        name="git.export_patch",
+        arguments={},
+        id="export_default_scoped_patch",
+    )
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[Any]:
+        del kwargs
+        if "config" in command and "--get-regexp" in command:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+        if command[-7:] == [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--ignore-cr-at-eol",
+            "--numstat",
+            "-z",
+        ]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=b"1\t0\tsrc/a.txt\0",
+                stderr=b"",
+            )
+        raise AssertionError(f"unexpected direct Git command: {command}")
+
+    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "nested_memvid_agent.tools.git_tools._run_subprocess",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=patch_text,
+            stderr="",
+        ),
+    )
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(allow_file_write=True),
+        workspace=tmp_path,
+        allowed_paths=("src",),
+        approved_tool_call_ids=frozenset({call.id}),
+        approved_tool_call_arguments={call.id: call.arguments},
+    )
+
+    result = registry.execute(call, context)
+
+    assert result.success is False
+    assert result.error == "git_export_path_blocked"
+    assert not (tmp_path / ".kestrel").exists()
 
 
 def test_git_commit_refuses_protected_branches(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

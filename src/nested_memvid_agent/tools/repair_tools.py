@@ -1317,13 +1317,15 @@ def _repair_diff_preview(workspace: Path, snapshot: dict[str, Any]) -> dict[str,
 
     The signed repair fingerprint and commit-time revalidation remain the
     authority. This preview is intentionally labelled advisory because source
-    text is redacted and may be truncated. Only bounded, regular tracked files
-    are admitted to the Git renderer; unusual or oversized paths remain visible
-    in ``changed_files`` but are omitted from inline content.
+    text is redacted and may be truncated. Bounded tracked, deleted, and
+    untracked files are admitted through an isolated temporary Git index;
+    unusual or oversized paths remain visible in ``changed_files`` but are
+    omitted from inline content.
     """
 
     changed = _safe_preview_paths(snapshot.get("changed_files"))
     tracked = set(_safe_preview_paths(snapshot.get("tracked_files")))
+    untracked = set(_safe_preview_paths(snapshot.get("untracked_files")))
     manifest = {
         str(item.get("path")): item
         for item in snapshot.get("changed_manifest", [])
@@ -1337,8 +1339,7 @@ def _repair_diff_preview(workspace: Path, snapshot: dict[str, Any]) -> dict[str,
         size = int(entry.get("size", 0)) if isinstance(entry.get("size", 0), int) else 0
         encoded_size = len(os.fsencode(path)) + 1
         if (
-            path not in tracked
-            or entry.get("type") == "deleted"
+            path not in tracked | untracked
             or size < 0
             or len(selected) >= _MAX_REPAIR_DIFF_PREVIEW_FILES
             or selected_path_bytes + encoded_size > _MAX_REPAIR_DIFF_PREVIEW_PATH_BYTES
@@ -1354,7 +1355,11 @@ def _repair_diff_preview(workspace: Path, snapshot: dict[str, Any]) -> dict[str,
     unavailable_reason: str | None = None
     if selected:
         try:
-            raw, output_truncated = _capture_bounded_repair_diff(workspace, selected)
+            raw, output_truncated = _capture_bounded_repair_diff(
+                workspace,
+                selected,
+                untracked_paths=[path for path in selected if path in untracked],
+            )
             content = redact_text(raw.decode("utf-8", errors="replace"))
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             unavailable_reason = redact_text(str(exc))[:500]
@@ -1399,31 +1404,107 @@ def _safe_preview_paths(value: object) -> list[str]:
     return sorted(set(paths))
 
 
-def _capture_bounded_repair_diff(workspace: Path, paths: list[str]) -> tuple[bytes, bool]:
-    command = _hardened_git_command(
-        [
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "HEAD",
-            "--",
-            *paths,
-        ],
-        workspace=workspace,
-    )
+def _capture_bounded_repair_diff(
+    workspace: Path,
+    paths: list[str],
+    *,
+    untracked_paths: list[str],
+) -> tuple[bytes, bool]:
+    deadline = time.monotonic() + _REPAIR_DIFF_PREVIEW_TIMEOUT_SECONDS
+    environment = _sanitized_git_environment(None)
+    with tempfile.TemporaryDirectory(prefix="kestrel-review-index-") as temporary:
+        environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
+        _run_preview_index_command(
+            workspace,
+            ["read-tree", "HEAD"],
+            environment=environment,
+            deadline=deadline,
+        )
+        if untracked_paths:
+            _run_preview_index_command(
+                workspace,
+                ["add", "--intent-to-add", "--", *untracked_paths],
+                environment=environment,
+                deadline=deadline,
+            )
+        command = _hardened_git_command(
+            [
+                "diff",
+                "--binary",
+                "--ita-visible-in-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "HEAD",
+                "--",
+                *paths,
+            ],
+            workspace=workspace,
+        )
+        return _capture_preview_command(
+            workspace,
+            command,
+            environment=environment,
+            deadline=deadline,
+        )
+
+
+def _run_preview_index_command(
+    workspace: Path,
+    arguments: list[str],
+    *,
+    environment: dict[str, str],
+    deadline: float,
+) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(arguments, _REPAIR_DIFF_PREVIEW_TIMEOUT_SECONDS)
+    command = _hardened_git_command(arguments, workspace=workspace)
+    with tempfile.TemporaryFile() as stderr_file:
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed Git and structured argv
+                command,
+                cwd=workspace,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                check=False,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            raise
+        stderr_size = os.fstat(stderr_file.fileno()).st_size
+        stderr_file.seek(0)
+        stderr = stderr_file.read(16_000)
+    if completed.returncode != 0:
+        suffix = " (truncated)" if stderr_size > len(stderr) else ""
+        raise RuntimeError(
+            redact_text(
+                "Unable to prepare repair diff preview: "
+                + stderr.decode("utf-8", errors="replace")
+                + suffix
+            )
+        )
+
+
+def _capture_preview_command(
+    workspace: Path,
+    command: list[str],
+    *,
+    environment: dict[str, str],
+    deadline: float,
+) -> tuple[bytes, bool]:
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         process = subprocess.Popen(  # noqa: S603 - fixed Git executable and structured argv
             command,
             cwd=workspace,
-            env=_sanitized_git_environment(None),
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
             start_new_session=os.name != "nt",
         )
-        deadline = time.monotonic() + _REPAIR_DIFF_PREVIEW_TIMEOUT_SECONDS
         truncated = False
         while process.poll() is None:
             if time.monotonic() >= deadline:

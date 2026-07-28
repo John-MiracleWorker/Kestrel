@@ -32,7 +32,11 @@ from .process_tools import (
     _SubprocessToolOutcomeIndeterminate,
     _SubprocessToolTimeout,
 )
-from .workspace_tools import _assert_workspace_path_allowed, _safe_path
+from .workspace_tools import (
+    _assert_workspace_path_allowed,
+    _atomic_workspace_write,
+    _safe_path,
+)
 
 
 def _safe_branch_name(name: str) -> bool:
@@ -601,8 +605,23 @@ class GitExportPatchTool(AgentTool):
                     Path(".kestrel") / "improvements" / f"improvement_{patch_id}" / "diff.patch"
                 )
                 patch_path = context.workspace.resolve() / relpath
-            patch_path.parent.mkdir(parents=True, exist_ok=True)
-            patch_path.write_text(patch, encoding="utf-8")
+            try:
+                _assert_workspace_path_allowed(
+                    context,
+                    patch_path,
+                    requested_path=relpath.as_posix(),
+                )
+            except (OSError, RuntimeError, ValueError):
+                return self._result(
+                    call,
+                    success=False,
+                    content=(
+                        "The patch destination is outside the project allowed paths; "
+                        "nothing was written."
+                    ),
+                    error="git_export_path_blocked",
+                )
+            _atomic_workspace_write(context.workspace, patch_path, patch)
             return self._result(
                 call,
                 success=True,
