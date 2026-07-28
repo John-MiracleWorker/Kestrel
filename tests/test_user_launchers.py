@@ -319,7 +319,20 @@ def test_prepare_persists_manifest_before_any_public_launcher_mutation(
     user_home = tmp_path / "user"
     user_home.mkdir()
     bin_dir = user_home / "bin"
-    manifest = home / ".nest" / "transactions" / "launchers.json"
+    initial_manifest = home / ".nest" / "initial-transactions" / "initial.json"
+    module.prepare_launchers(
+        kestrel_home=home,
+        user_home=user_home,
+        manifest_path=initial_manifest,
+        bin_dir=bin_dir,
+        platform="linux",
+        environ={"PATH": str(bin_dir)},
+    )
+    module.commit_launchers(initial_manifest)
+    shim = bin_dir / "kestrel"
+    predecessor = shim.read_bytes()
+    replacement_home = _kestrel_home(tmp_path / "replacement")
+    manifest = home / ".nest" / "failed-transaction" / "replacement.json"
 
     def fail_manifest(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated durable manifest failure")
@@ -327,7 +340,7 @@ def test_prepare_persists_manifest_before_any_public_launcher_mutation(
     monkeypatch.setattr(module, "_write_manifest", fail_manifest)
     with pytest.raises(OSError, match="durable manifest"):
         module.prepare_launchers(
-            kestrel_home=home,
+            kestrel_home=replacement_home,
             user_home=user_home,
             manifest_path=manifest,
             bin_dir=bin_dir,
@@ -335,8 +348,16 @@ def test_prepare_persists_manifest_before_any_public_launcher_mutation(
             environ={"PATH": str(bin_dir)},
         )
 
-    assert not (bin_dir / "kestrel").exists()
+    assert shim.read_bytes() == predecessor
     assert not manifest.exists()
+    assert not list(bin_dir.glob(".kestrel-stage-*"))
+    assert not list(bin_dir.glob(".kestrel-backup-*"))
+    assert not list(bin_dir.glob("*.tombstone"))
+    assert list(manifest.parent.iterdir()) == []
+    for retired in bin_dir.glob(".kestrel-quarantine-*"):
+        assert retired.is_file()
+        assert retired.stat().st_size == 0
+        assert retired.stat().st_mode & 0o777 == 0
 
 
 def test_prepare_refuses_unrelated_existing_shim_before_mutation(

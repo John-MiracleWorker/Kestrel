@@ -9,7 +9,7 @@ DEFAULT_WHEEL_URL=""
 DEFAULT_CHECKSUMS_URL=""
 DEFAULT_RELEASE_SHA=""
 DEFAULT_RELEASE_VERSION=""
-DEFAULT_LAUNCHER_HELPER_SHA256="51faef62d2c240a59e83769ca6dc837093cca3e36ec2a7c38472c19ed5badd98"
+DEFAULT_LAUNCHER_HELPER_SHA256="9d1188c64e985660aa6dfdc9e27947701938e2844cd621f9276556f54c26e303"
 DEFAULT_PORT="8765"
 DEFAULT_START_SERVER="0"
 DEFAULT_OPEN_BROWSER="0"
@@ -297,9 +297,9 @@ run_verified_in_memory_launcher_plan() {
     return 1
   }
   log "+ fetch and verify in-memory launcher planner ${helper_url}" >&2
-  curl --fail --silent --show-error --location --retry 3 \
+  curl --disable --fail --silent --show-error --location --retry 3 \
     --proto '=https' --proto-redir '=https' "$helper_url" |
-    "$PYTHON_BIN" -c '
+    "$PYTHON_BIN" -I -c '
 import hashlib
 import sys
 
