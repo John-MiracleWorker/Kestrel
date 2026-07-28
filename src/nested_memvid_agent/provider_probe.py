@@ -15,10 +15,10 @@ from .config import AgentConfig
 from .llm.model_catalog import (
     DEFAULT_BASE_URLS,
     BoundedHTTPStatusError,
+    BoundedHTTPTransportError,
     ProviderModelCatalog,
     model_catalog_for_provider,
     request_bytes_with_deadline,
-    urlopen,
 )
 from .llm.provider_urls import normalize_ollama_openai_base_url, validate_provider_http_url
 from .routing.models import ProviderProfile
@@ -744,13 +744,17 @@ def _post_bytes(
             error_max_bytes=240,
             deadline=active_deadline,
             monotonic_clock=monotonic_clock,
-            open_request=urlopen,
         )
     except BoundedHTTPStatusError as exc:
         detail = exc.detail.decode("utf-8", errors="replace")
         raise RuntimeError(
             f"provider probe failed with HTTP {exc.status_code}: "
             f"{_safe_error(detail, secrets=(secret,))}"
+        ) from exc
+    except BoundedHTTPTransportError as exc:
+        raise RuntimeError(
+            "provider probe request failed: "
+            f"{_safe_error(exc.detail, secrets=(secret,))}"
         ) from exc
     except URLError as exc:
         reason = getattr(exc, "reason", exc)

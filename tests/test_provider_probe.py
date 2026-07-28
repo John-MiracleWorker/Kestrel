@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from time import monotonic, sleep
 from typing import Any
 
@@ -12,6 +11,7 @@ import pytest
 
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.model_catalog import (
+    MAX_MODEL_CATALOG_BYTES,
     MAX_MODEL_ID_CHARS,
     ProviderModelCatalog,
     _fetch_json,
@@ -233,28 +233,28 @@ def test_live_catalog_preserves_explicit_provider_capability_declarations(
     )
 
 
-def test_catalog_response_body_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Response:
-        def __enter__(self) -> Response:
-            return self
+def test_catalog_response_body_is_bounded() -> None:
+    class OversizedBodyHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            body = b"x" * (MAX_MODEL_CATALOG_BYTES + 1)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except OSError:
+                return
 
-        def __exit__(self, *_args: object) -> None:
+        def log_message(self, _format: str, *_args: object) -> None:
             return None
 
-        def read1(self, limit: int) -> bytes:
-            return b"x" * limit
-
-    monkeypatch.setattr(
-        "nested_memvid_agent.llm.model_catalog.urlopen",
-        lambda _request, timeout: Response(),
-    )
-
-    with pytest.raises(ValueError, match="byte limit"):
-        _fetch_json(
-            "http://127.0.0.1:1234/v1/models",
-            timeout_seconds=1,
-            api_key=None,
-        )
+    with _serve(OversizedBodyHandler) as base_url:
+        with pytest.raises(ValueError, match="byte limit"):
+            _fetch_json(
+                f"{base_url}/models",
+                timeout_seconds=2,
+                api_key=None,
+            )
 
 
 def test_live_catalog_drops_unbounded_or_control_character_model_ids(
@@ -391,64 +391,58 @@ def test_capability_validators_require_exact_meaningful_evidence() -> None:
     assert _valid_tool_call(invalid_arguments) is False
 
 
-class _AdvancingClock:
-    def __init__(self) -> None:
-        self.value = 0.0
+def _slow_body_handler(*, stop: Event) -> type[BaseHTTPRequestHandler]:
+    class SlowBodyHandler(BaseHTTPRequestHandler):
+        def _respond(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                while not stop.wait(timeout=0.01):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+            except OSError:
+                return
 
-    def __call__(self) -> float:
-        return self.value
+        def do_GET(self) -> None:  # noqa: N802
+            self._respond()
 
+        def do_POST(self) -> None:  # noqa: N802
+            self._respond()
 
-class _SlowDripResponse:
-    def __init__(self, clock: _AdvancingClock) -> None:
-        self.clock = clock
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
 
-    def __enter__(self) -> _SlowDripResponse:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        return None
-
-    def read1(self, _limit: int) -> bytes:
-        self.clock.value += 0.4
-        return b"x"
-
-
-def test_catalog_read_enforces_monotonic_deadline_during_slow_drip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = _AdvancingClock()
-    monkeypatch.setattr(
-        "nested_memvid_agent.llm.model_catalog.urlopen",
-        lambda _request, timeout: _SlowDripResponse(clock),
-    )
-
-    with pytest.raises(TimeoutError, match="deadline"):
-        _fetch_json(
-            "http://127.0.0.1:1234/v1/models",
-            timeout_seconds=1,
-            api_key=None,
-            monotonic_clock=clock,
-        )
+    return SlowBodyHandler
 
 
-def test_probe_read_enforces_monotonic_deadline_during_slow_drip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = _AdvancingClock()
-    monkeypatch.setattr(
-        "nested_memvid_agent.provider_probe.urlopen",
-        lambda _request, timeout: _SlowDripResponse(clock),
-    )
+def test_catalog_read_enforces_monotonic_deadline_during_slow_drip() -> None:
+    stop = Event()
+    try:
+        with _serve(_slow_body_handler(stop=stop)) as base_url:
+            with pytest.raises(TimeoutError, match="deadline"):
+                _fetch_json(
+                    f"{base_url}/models",
+                    timeout_seconds=0.25,
+                    api_key=None,
+                )
+    finally:
+        stop.set()
 
-    with pytest.raises(TimeoutError, match="deadline"):
-        _post_bytes(
-            "http://127.0.0.1:1234/v1/chat/completions",
-            {"model": "local"},
-            timeout_seconds=1,
-            secret=None,
-            monotonic_clock=clock,
-        )
+
+def test_probe_read_enforces_monotonic_deadline_during_slow_drip() -> None:
+    stop = Event()
+    try:
+        with _serve(_slow_body_handler(stop=stop)) as base_url:
+            with pytest.raises(TimeoutError, match="deadline"):
+                _post_bytes(
+                    f"{base_url}/chat/completions",
+                    {"model": "local"},
+                    timeout_seconds=0.25,
+                    secret=None,
+                )
+    finally:
+        stop.set()
 
 
 @contextmanager
@@ -489,6 +483,57 @@ class _SlowHeaderHandler(BaseHTTPRequestHandler):
         return None
 
 
+def _saturating_slow_header_handler(
+    *,
+    stop: Event,
+    started: Event,
+) -> type[BaseHTTPRequestHandler]:
+    class SaturatingSlowHeaderHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/healthy":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"recovered":true}')
+                return
+            started.set()
+            try:
+                self.connection.sendall(b"HTTP/1.1 200 OK\r\nX-Kestrel-Slow: ")
+                while not stop.wait(timeout=0.01):
+                    self.connection.sendall(b"x")
+            except OSError:
+                return
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+    return SaturatingSlowHeaderHandler
+
+
+def test_slow_header_timeouts_release_transport_capacity_for_recovery() -> None:
+    stop = Event()
+    started = Event()
+    handler = _saturating_slow_header_handler(stop=stop, started=started)
+    try:
+        with _serve(handler) as base_url:
+            for _index in range(9):
+                with pytest.raises(TimeoutError, match="deadline"):
+                    _fetch_json(
+                        f"{base_url}/slow",
+                        timeout_seconds=0.1,
+                        api_key=None,
+                    )
+
+            assert started.wait(timeout=0.5)
+            assert _fetch_json(
+                f"{base_url}/healthy",
+                timeout_seconds=1.0,
+                api_key=None,
+            ) == {"recovered": True}
+    finally:
+        stop.set()
+
+
 def test_catalog_wall_deadline_covers_slow_response_headers() -> None:
     with _serve(_SlowHeaderHandler) as base_url:
         started = monotonic()
@@ -516,88 +561,6 @@ def test_probe_wall_deadline_covers_slow_response_headers() -> None:
         elapsed = monotonic() - started
 
     assert elapsed < 0.75
-
-
-def test_provider_wall_deadline_bounds_stuck_transport_workers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    release = Event()
-    drained = Event()
-    lock = Lock()
-    active = 0
-    maximum_active = 0
-
-    def blocked_open(_request: object, _timeout: float) -> Any:
-        nonlocal active, maximum_active
-        with lock:
-            active += 1
-            maximum_active = max(maximum_active, active)
-        try:
-            release.wait(timeout=2)
-        finally:
-            with lock:
-                active -= 1
-                if active == 0:
-                    drained.set()
-        raise TimeoutError("blocked transport released")
-
-    monkeypatch.setattr(
-        "nested_memvid_agent.llm.model_catalog.urlopen",
-        blocked_open,
-    )
-
-    def fetch() -> None:
-        with pytest.raises(TimeoutError, match="deadline"):
-            _fetch_json(
-                "http://127.0.0.1:1234/v1/models",
-                timeout_seconds=0.3,
-                api_key=None,
-            )
-
-    try:
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            futures = [pool.submit(fetch) for _index in range(12)]
-            for future in futures:
-                future.result(timeout=1)
-    finally:
-        release.set()
-
-    assert maximum_active <= 8
-    assert drained.wait(timeout=1)
-
-
-class _BlockingBodyResponse:
-    def __init__(self) -> None:
-        self.read_started = Event()
-        self.closed = Event()
-
-    def read1(self, _limit: int) -> bytes:
-        self.read_started.set()
-        self.closed.wait(timeout=2)
-        return b""
-
-    def close(self) -> None:
-        self.closed.set()
-
-
-def test_provider_wall_deadline_cancels_an_active_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    response = _BlockingBodyResponse()
-    monkeypatch.setattr(
-        "nested_memvid_agent.llm.model_catalog.urlopen",
-        lambda _request, _timeout: response,
-    )
-
-    with pytest.raises(TimeoutError, match="deadline"):
-        _fetch_json(
-            "http://127.0.0.1:1234/v1/models",
-            timeout_seconds=0.1,
-            api_key=None,
-        )
-
-    assert response.read_started.wait(timeout=0.2)
-    assert response.closed.wait(timeout=0.2)
 
 
 def test_catalog_redirect_never_forwards_authorization_cross_host() -> None:

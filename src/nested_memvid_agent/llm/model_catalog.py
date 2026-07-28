@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
+import subprocess  # nosec B404
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from queue import Empty, Queue
-from threading import BoundedSemaphore, Event, Lock, Thread
+from pathlib import Path
+from threading import BoundedSemaphore
 from time import monotonic
 from typing import Any
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.parse import urljoin
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import Request
 
 from ..config import AgentConfig
 from ..security_boundary import REDACTED, redact_text
@@ -76,9 +79,12 @@ SecretResolver = Callable[[str | None], str | None]
 MAX_MODEL_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_MODEL_CATALOG_ENTRIES = 2048
 MAX_MODEL_ID_CHARS = 512
-_HTTP_READ_CHUNK_BYTES = 16 * 1024
 MAX_CONCURRENT_PROVIDER_HTTP_EXCHANGES = 8
 _PROVIDER_HTTP_WORKER_SLOTS = BoundedSemaphore(MAX_CONCURRENT_PROVIDER_HTTP_EXCHANGES)
+_PROVIDER_HTTP_REQUEST_SCHEMA = "kestrel.provider_http_request.v1"
+_PROVIDER_HTTP_RESPONSE_SCHEMA = "kestrel.provider_http_response.v1"
+_PROVIDER_HTTP_WORKER = Path(__file__).with_name("provider_http_worker.py")
+_PROVIDER_HTTP_TERMINATION_GRACE_SECONDS = 1.0
 _SENSITIVE_QUERY_VALUE = re.compile(
     r"([?&](?:api[_-]?key|key|token|access[_-]?token)=)[^&\s]+",
     flags=re.IGNORECASE,
@@ -405,13 +411,17 @@ def _fetch_json(
             error_max_bytes=240,
             deadline=deadline,
             monotonic_clock=monotonic_clock,
-            open_request=urlopen,
         )
     except BoundedHTTPStatusError as exc:
         detail = exc.detail.decode("utf-8", errors="replace")
         raise RuntimeError(
             f"model list failed with HTTP {exc.status_code}: "
             f"{_safe_catalog_error(detail, secret=api_key)[:240]}"
+        ) from exc
+    except BoundedHTTPTransportError as exc:
+        raise RuntimeError(
+            "model list request failed: "
+            f"{_safe_catalog_error(exc.detail, secret=api_key)[:240]}"
         ) from exc
     except URLError as exc:
         reason = getattr(exc, "reason", exc)
@@ -422,27 +432,6 @@ def _fetch_json(
     return json.loads(body)
 
 
-class _RejectRedirectHandler(HTTPRedirectHandler):
-    def redirect_request(
-        self,
-        req: Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> None:
-        del req, fp, code, msg, headers, newurl
-        return None
-
-
-def urlopen(request: Request, timeout: float) -> Any:
-    """Open one validated provider request without following redirects."""
-
-    opener = build_opener(_RejectRedirectHandler())
-    return opener.open(request, timeout=timeout)  # nosec B310
-
-
 class BoundedHTTPStatusError(RuntimeError):
     def __init__(self, status_code: int, detail: bytes) -> None:
         self.status_code = status_code
@@ -450,10 +439,11 @@ class BoundedHTTPStatusError(RuntimeError):
         super().__init__(f"provider returned HTTP {status_code}")
 
 
-@dataclass(frozen=True)
-class _HTTPWorkerResult:
-    body: bytes | None = None
-    error: Exception | None = None
+class BoundedHTTPTransportError(RuntimeError):
+    def __init__(self, error_type: str, detail: str) -> None:
+        self.error_type = error_type
+        self.detail = detail
+        super().__init__(f"isolated provider transport failed: {error_type}")
 
 
 def request_bytes_with_deadline(
@@ -463,159 +453,61 @@ def request_bytes_with_deadline(
     error_max_bytes: int,
     deadline: float,
     monotonic_clock: Callable[[], float] = monotonic,
-    open_request: Callable[[Request, float], Any],
 ) -> bytes:
-    """Run a complete HTTP exchange behind one absolute caller wall deadline.
+    """Run one provider exchange in an isolated process with a hard deadline.
 
-    Socket timeouts alone are inactivity timers: DNS, connect, response
-    headers, and a slow-drip body can each consume a fresh timeout. The daemon
-    worker keeps those blocking operations off the caller, while cancellation
-    closes any response that has become available and prevents a late response
-    from being consumed after the deadline.
+    Request data, including authorization, crosses only the worker's stdin
+    pipe. On expiry the parent force-terminates and reaps the worker before its
+    capacity slot is released, so DNS, connect, header, and body ownership
+    cannot outlive the caller.
     """
 
     if max_bytes < 1 or error_max_bytes < 1:
         raise ValueError("HTTP response byte limits must be positive")
     remaining = _remaining_http_seconds(deadline, monotonic_clock)
-    cancelled = Event()
-    response_lock = Lock()
-    active_response: list[Any] = []
-    outcome: Queue[_HTTPWorkerResult] = Queue(maxsize=1)
-
-    def publish(result: _HTTPWorkerResult) -> None:
-        if not cancelled.is_set():
-            outcome.put_nowait(result)
-
-    def register_response(response: Any) -> bool:
-        with response_lock:
-            if cancelled.is_set():
-                return False
-            active_response.append(response)
-            return True
-
-    def clear_response(response: Any) -> None:
-        with response_lock:
-            if active_response and active_response[0] is response:
-                active_response.clear()
-
-    def read_response(response: Any, *, byte_limit: int) -> bytes:
-        if not register_response(response):
-            _close_http_response(response)
-            raise TimeoutError("provider response deadline exceeded")
-        try:
-            return read_bounded_http_body(
-                response,
-                max_bytes=byte_limit,
-                deadline=deadline,
-                monotonic_clock=monotonic_clock,
-            )
-        finally:
-            clear_response(response)
-            _close_http_response(response)
-
-    def exchange() -> None:
-        try:
-            try:
-                # The caller validates the URL before constructing the request.
-                response = open_request(
-                    request,
-                    _remaining_http_seconds(deadline, monotonic_clock),
-                )
-                publish(_HTTPWorkerResult(body=read_response(response, byte_limit=max_bytes)))
-            except HTTPError as exc:
-                try:
-                    detail = read_response(exc, byte_limit=error_max_bytes)
-                except Exception:  # noqa: BLE001 - status diagnostics are best effort
-                    detail = b"response detail unavailable"
-                publish(
-                    _HTTPWorkerResult(
-                        error=BoundedHTTPStatusError(int(exc.code), detail),
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - propagated across worker boundary
-                publish(_HTTPWorkerResult(error=exc))
-        finally:
-            _PROVIDER_HTTP_WORKER_SLOTS.release()
-
+    encoded_request = _encode_provider_http_request(
+        request,
+        timeout_seconds=remaining,
+        max_bytes=max_bytes,
+        error_max_bytes=error_max_bytes,
+    )
+    remaining = _remaining_http_seconds(deadline, monotonic_clock)
     if not _PROVIDER_HTTP_WORKER_SLOTS.acquire(timeout=remaining):
         raise TimeoutError("provider response deadline exceeded")
+    process: subprocess.Popen[bytes] | None = None
     try:
-        remaining = _remaining_http_seconds(deadline, monotonic_clock)
-        worker = Thread(
-            target=exchange,
-            name="kestrel-provider-http-deadline",
-            daemon=True,
+        _remaining_http_seconds(deadline, monotonic_clock)
+        process = subprocess.Popen(  # noqa: S603  # nosec B603
+            _provider_http_worker_command(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            env=_provider_http_worker_environment(),
         )
-        worker.start()
-    except Exception:
-        _PROVIDER_HTTP_WORKER_SLOTS.release()
-        raise
-    try:
-        result = outcome.get(timeout=remaining)
-    except Empty as exc:
-        cancelled.set()
-        with response_lock:
-            response = active_response[0] if active_response else None
-        _close_http_response(response)
-        raise TimeoutError("provider response deadline exceeded") from exc
-    if monotonic_clock() >= deadline:
-        cancelled.set()
-        raise TimeoutError("provider response deadline exceeded")
-    if result.error is not None:
-        raise result.error
-    if result.body is None:
-        raise RuntimeError("provider HTTP worker returned no result")
-    return result.body
-
-
-def _close_http_response(response: Any) -> None:
-    close = getattr(response, "close", None)
-    if callable(close):
         try:
-            close()
-        except Exception:  # noqa: BLE001 - cancellation cleanup is best effort
-            pass
-
-
-def read_bounded_http_body(
-    response: Any,
-    *,
-    max_bytes: int,
-    deadline: float,
-    monotonic_clock: Callable[[], float] = monotonic,
-) -> bytes:
-    if max_bytes < 1:
-        raise ValueError("max_bytes must be positive")
-    chunks: list[bytes] = []
-    total = 0
-    reader = getattr(response, "read1", None)
-    read_chunk_bytes = _HTTP_READ_CHUNK_BYTES
-    if not callable(reader):
-        response_fp = getattr(response, "fp", None)
-        reader = getattr(response_fp, "read1", None)
-    if not callable(reader):
-        reader = getattr(response, "read", None)
-        # A generic read(n) may wait for all n bytes while a peer slow-drips.
-        # Reading one byte keeps the monotonic check authoritative even for a
-        # non-standard response wrapper without read1().
-        read_chunk_bytes = 1
-    if not callable(reader):
-        raise ValueError("provider response is not readable")
-    while True:
-        remaining = _remaining_http_seconds(deadline, monotonic_clock)
-        _set_response_socket_timeout(response, remaining)
-        raw_chunk = reader(min(read_chunk_bytes, max_bytes + 1 - total))
-        if monotonic_clock() >= deadline:
-            raise TimeoutError("provider response deadline exceeded")
-        if not isinstance(raw_chunk, bytes):
-            raise ValueError("provider response reader returned non-bytes content")
-        if not raw_chunk:
-            break
-        chunks.append(raw_chunk)
-        total += len(raw_chunk)
-        if total > max_bytes:
-            raise ValueError("provider response exceeded the byte limit")
-    return b"".join(chunks)
+            stdout, _stderr = process.communicate(
+                input=encoded_request,
+                timeout=_remaining_http_seconds(deadline, monotonic_clock),
+            )
+        except subprocess.TimeoutExpired as exc:
+            _kill_and_reap_provider_worker(process)
+            process = None
+            raise TimeoutError("provider response deadline exceeded") from exc
+        if process.returncode != 0:
+            raise BoundedHTTPTransportError(
+                "WorkerExitError",
+                "isolated provider transport exited without a result",
+            )
+        return _decode_provider_http_response(
+            stdout,
+            max_bytes=max_bytes,
+            error_max_bytes=error_max_bytes,
+        )
+    finally:
+        if process is not None and process.poll() is None:
+            _kill_and_reap_provider_worker(process)
+        _PROVIDER_HTTP_WORKER_SLOTS.release()
 
 
 def _remaining_http_seconds(
@@ -628,28 +520,146 @@ def _remaining_http_seconds(
     return max(0.001, remaining)
 
 
-def _set_response_socket_timeout(response: Any, timeout_seconds: float) -> None:
-    candidates = [response]
-    seen: set[int] = set()
-    while candidates and len(seen) < 12:
-        candidate = candidates.pop(0)
-        if candidate is None:
-            continue
-        identity = id(candidate)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        socket = getattr(candidate, "_sock", None)
-        setter = getattr(socket, "settimeout", None)
-        if callable(setter):
-            setter(timeout_seconds)
-            return
-        candidates.extend(
-            [
-                getattr(candidate, "fp", None),
-                getattr(candidate, "raw", None),
-            ]
+def _encode_provider_http_request(
+    request: Request,
+    *,
+    timeout_seconds: float,
+    max_bytes: int,
+    error_max_bytes: int,
+) -> bytes:
+    data = request.data
+    if data is not None and not isinstance(data, bytes):
+        raise ValueError("provider request body must be bytes")
+    payload = {
+        "schema": _PROVIDER_HTTP_REQUEST_SCHEMA,
+        "url": request.full_url,
+        "method": request.get_method(),
+        "headers": [[name, value] for name, value in request.header_items()],
+        "body_base64": base64.b64encode(data).decode("ascii") if data is not None else None,
+        "timeout_seconds": timeout_seconds,
+        "max_bytes": max_bytes,
+        "error_max_bytes": error_max_bytes,
+    }
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def _provider_http_worker_command() -> list[str]:
+    interpreter = Path(sys.executable).resolve(strict=True)
+    worker = _PROVIDER_HTTP_WORKER.resolve(strict=True)
+    module_parent = Path(__file__).resolve(strict=True).parent
+    if not worker.is_file() or worker.parent != module_parent:
+        raise RuntimeError("isolated provider transport worker is unavailable")
+    return [str(interpreter), "-I", str(worker)]
+
+
+def _provider_http_worker_environment() -> dict[str, str]:
+    allowed = (
+        "COMSPEC",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    )
+    return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
+def _kill_and_reap_provider_worker(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.communicate(timeout=_PROVIDER_HTTP_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("isolated provider transport could not be reaped") from exc
+
+
+def _decode_provider_http_response(
+    raw_response: bytes,
+    *,
+    max_bytes: int,
+    error_max_bytes: int,
+) -> bytes:
+    try:
+        payload = json.loads(raw_response.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BoundedHTTPTransportError(
+            "ProtocolError",
+            "isolated provider transport returned an invalid result",
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != _PROVIDER_HTTP_RESPONSE_SCHEMA
+    ):
+        raise BoundedHTTPTransportError(
+            "ProtocolError",
+            "isolated provider transport returned an invalid result",
         )
+    kind = payload.get("kind")
+    if kind == "ok":
+        return _decode_provider_http_body(payload.get("body_base64"), max_bytes=max_bytes)
+    if kind == "http_error":
+        status_code = payload.get("status_code")
+        if isinstance(status_code, bool) or not isinstance(status_code, int):
+            raise BoundedHTTPTransportError(
+                "ProtocolError",
+                "isolated provider transport returned an invalid HTTP status",
+            )
+        detail = _decode_provider_http_body(
+            payload.get("body_base64"),
+            max_bytes=error_max_bytes,
+        )
+        raise BoundedHTTPStatusError(status_code, detail)
+    if kind == "url_error":
+        raise URLError(_provider_http_error_detail(payload))
+    if kind == "timeout":
+        raise TimeoutError("provider response deadline exceeded")
+    if kind == "value_error":
+        raise ValueError(_provider_http_error_detail(payload))
+    raise BoundedHTTPTransportError(
+        str(payload.get("error_type") or "ProtocolError"),
+        _provider_http_error_detail(payload),
+    )
+
+
+def _decode_provider_http_body(value: object, *, max_bytes: int) -> bytes:
+    if not isinstance(value, str):
+        raise BoundedHTTPTransportError(
+            "ProtocolError",
+            "isolated provider transport returned an invalid body",
+        )
+    try:
+        body = base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise BoundedHTTPTransportError(
+            "ProtocolError",
+            "isolated provider transport returned an invalid body",
+        ) from exc
+    if len(body) > max_bytes:
+        raise BoundedHTTPTransportError(
+            "ProtocolError",
+            "isolated provider transport exceeded its response limit",
+        )
+    return body
+
+
+def _provider_http_error_detail(payload: dict[str, object]) -> str:
+    detail = payload.get("detail")
+    if not isinstance(detail, str):
+        return "isolated provider transport failed"
+    return detail[:1024]
 
 
 def _model_ids(payload: Any) -> tuple[str, ...]:
