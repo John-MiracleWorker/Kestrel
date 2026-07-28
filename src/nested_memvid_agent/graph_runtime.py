@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from .agent import NestedMV2Agent, ProgressHandler, StreamHandler
 from .config import AgentConfig
 from .diagnosis import classify_failure
+from .engineering.graph_amendments import GraphAmendmentService
 from .runtime_models import (
     AgentTurnResult,
     ChatMessage,
@@ -62,6 +63,7 @@ class GraphRuntimeServices:
     scheduler_outcome: Callable[[dict[str, Any]], tuple[str, str]]
     reconcile_root_task: Callable[[str, str, str, bool], TaskNodeRecord | None]
     is_cancelled: Callable[[str], bool]
+    graph_amendments: GraphAmendmentService
 
 
 class PlannerNode:
@@ -130,10 +132,24 @@ class PlannerNode:
                         "FinalizerNode",
                     ],
                     "execution_model": "single_chat_turn_then_optional_task_scheduler",
-                    "can_revise_plan": False,
+                    "can_revise_plan": True,
                     "can_revise_semantic_plan": semantic_plan.get("source")
                     == "provider_structured",
-                    "can_rewrite_task_dag": False,
+                    "can_rewrite_task_dag": True,
+                    "graph_amendments": {
+                        "mode": "bounded_durable_operator_governed",
+                        "operations": [
+                            "add_task",
+                            "split_task",
+                            "replace_dependency",
+                            "cancel_task",
+                            "request_evidence",
+                        ],
+                        "max_nodes": services.graph_amendments.max_nodes,
+                        "risk_permission_cost_scope_expansion_requires_approval": True,
+                        "cycle_validation": True,
+                        "digest_bound_decisions": True,
+                    },
                     "provider_plan_status": provider_plan_status,
                     "semantic_plan_source": semantic_plan.get("source"),
                     "approval_pause_resume": True,
@@ -146,7 +162,8 @@ class PlannerNode:
                     ),
                     "worker_assignment": "optional_scheduler_task_nodes",
                     "limitations": [
-                        "The provider may refine the semantic plan but cannot rewrite task dependencies, risk, tools, or approvals.",
+                        "The provider may propose graph amendments but cannot apply them outside the bounded durable amendment validator.",
+                        "An amendment cannot make an unavailable tool available, and risk, permission, cost, or scope expansion requires an owner decision.",
                         "The primary executor remains one chat/tool turn before any optional scheduler work.",
                     ],
                 }
@@ -162,7 +179,8 @@ class PlannerNode:
                     "provider_plan_status": provider_plan_status
                     if root is not None
                     else "no_root_task",
-                    "can_rewrite_task_dag": False,
+                    "can_rewrite_task_dag": True,
+                    "graph_amendment_mode": "bounded_durable_operator_governed",
                 },
             )
             span.set_result(

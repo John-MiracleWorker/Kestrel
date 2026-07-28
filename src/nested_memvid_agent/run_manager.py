@@ -22,6 +22,24 @@ from .app_factory import build_agent
 from .capability_policy import CapabilityPolicy, parent_resource_digest, tool_spec_digest
 from .config import AgentConfig
 from .diagnosis import classify_failure
+from .engineering.approval_packets import (
+    ApprovalPacketCall,
+    ApprovalPacketService,
+)
+from .engineering.browser_validation import (
+    BrowserAssertion,
+    BrowserInteraction,
+    BrowserValidationRequest,
+    BrowserValidationService,
+)
+from .engineering.candidates import (
+    CandidateFanoutRecord,
+    CandidateFanoutService,
+    CandidateIsolation,
+)
+from .engineering.github_workflow import GitHubWorkflowService
+from .engineering.graph_amendments import GraphAmendmentRecord, GraphAmendmentService
+from .engineering.outcomes import OutcomeAnalyticsService
 from .event_bus import RunEventBus
 from .event_log import redact_secrets
 from .graph_runtime import (
@@ -75,7 +93,7 @@ from .tools.builtin import build_default_tools
 from .tools.process_tools import cancel_subprocesses_for_run
 from .tools.registry import RuntimeToolFence, ToolRegistry
 from .tracing import SpanRecorder
-from .worker_isolation import prepare_git_worktree
+from .worker_isolation import plan_git_worktree_isolation, prepare_git_worktree
 
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "skipped"}
@@ -144,6 +162,12 @@ class RunManager:
         try:
             self.plugins = plugins or PluginManager(config.plugins_dir, state)
             self.capabilities = CapabilityPolicy(state, lambda: self.config)
+            self.graph_amendments = GraphAmendmentService(state)
+            self.candidate_fanouts = CandidateFanoutService(state)
+            self.browser_validations = BrowserValidationService(state)
+            self.approval_packets = ApprovalPacketService(state)
+            self.outcomes = OutcomeAnalyticsService(state)
+            self.github_workflow = GitHubWorkflowService(state)
             self.mcp.capability_policy = self.capabilities
             self.skills.capability_policy = self.capabilities
             self._lock = Lock()
@@ -1816,6 +1840,225 @@ class RunManager:
             self.expire_pending_approvals()
         return self.state.list_approvals(status=status, expire=False)
 
+    def create_approval_packet(
+        self,
+        *,
+        packet_id: str,
+        run_id: str,
+        objective: str,
+        calls: tuple[dict[str, Any], ...],
+        checkpoint: str = "",
+        actor: str = "planner",
+    ) -> dict[str, Any]:
+        """Materialize display metadata and immutable bindings for exact calls."""
+
+        self._require_mutable_runtime("create_approval_packet")
+        run = self._require_run_accepts_work(run_id, operation="approval_packet")
+        registry = self.build_registry()
+        project = self.state.get_project(run.project_id) if run.project_id else None
+        packet_calls: list[ApprovalPacketCall] = []
+        for raw in calls:
+            if not isinstance(raw, dict):
+                raise ValueError("approval packet calls must be objects")
+            requested_name = str(raw.get("tool_name") or "")
+            canonical = registry.canonical_name(requested_name)
+            spec = registry.spec_for(canonical or requested_name)
+            if canonical is None or spec is None:
+                raise ValueError(f"approval packet contains an unknown tool: {requested_name}")
+            capability = self.capabilities.tool_decision(spec)
+            if not capability.effective_enabled:
+                raise PermissionError(
+                    f"approval packet tool is disabled: {canonical}"
+                )
+            if project is not None:
+                missing = [
+                    key
+                    for key in _project_capability_keys_for_tool(spec)
+                    if key not in project.capability_ceiling
+                ]
+                if missing:
+                    raise PermissionError(
+                        f"approval packet tool is outside the project ceiling: {canonical}"
+                    )
+            arguments = raw.get("arguments")
+            if not isinstance(arguments, dict):
+                raise ValueError("approval packet call arguments must be an object")
+            packet_calls.append(
+                ApprovalPacketCall(
+                    tool_call_id=str(raw.get("tool_call_id") or ""),
+                    tool_name=canonical,
+                    arguments=arguments,
+                    risk=spec.risk,
+                    capability_revision=capability.revision,
+                    resource_digest=self.tool_resource_digest(spec),
+                    reason=str(raw.get("reason") or ""),
+                    resource_scope=str(raw.get("resource_scope") or ""),
+                    expected_side_effect=str(
+                        raw.get("expected_side_effect") or ""
+                    ),
+                    rollback=str(raw.get("rollback") or ""),
+                )
+            )
+        packet = self.approval_packets.create(
+            packet_id=packet_id,
+            run_id=run_id,
+            objective=objective,
+            calls=tuple(packet_calls),
+            actor=actor,
+            checkpoint=checkpoint,
+        )
+        payload = packet.to_payload()
+        self.events.publish(run_id, "approval.packet_requested", payload)
+        return payload
+
+    def decide_approval_packet(
+        self,
+        packet_id: str,
+        *,
+        expected_packet_digest: str,
+        decisions: dict[str, bool],
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        self._require_mutable_runtime("decide_approval_packet")
+        packet = self.approval_packets.decide(
+            packet_id,
+            expected_packet_digest=expected_packet_digest,
+            decisions=decisions,
+            actor=actor,
+        )
+        payload = packet.to_payload()
+        self.events.publish(packet.run_id, "approval.packet_decided", payload)
+        return payload
+
+    def start_benchmark_replay(
+        self,
+        *,
+        replay_id: str,
+        case_id: str,
+        route_policy_id: str | None,
+        context_strategy: str,
+        baseline: str,
+        existing_run_id: str | None = None,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        """Launch or bind one private benchmark without changing live policy."""
+
+        self._require_mutable_runtime("start_benchmark_replay")
+        case = self.outcomes.get_benchmark(case_id)
+        if route_policy_id is not None:
+            coordinator = getattr(self, "routing_coordinator", None)
+            configured_policy_id = getattr(coordinator, "policy_id", None)
+            if configured_policy_id is not None and route_policy_id != configured_policy_id:
+                raise ValueError(
+                    "benchmark replay cannot silently change the live route policy; "
+                    "select the configured policy or provide an existing run"
+                )
+        if existing_run_id is None:
+            objective = str(case.fixture["objective"])
+            project = self.state.get_project(case.project_id)
+            run = self.create_run(
+                message=objective,
+                project_id=case.project_id,
+                workspace=Path(project.repository_path),
+                autonomy_mode="background",
+            )
+        else:
+            run = self.state.get_run(existing_run_id)
+        replay = self.outcomes.link_replay(
+            replay_id=replay_id,
+            case_id=case.case_id,
+            run_id=run.run_id,
+            route_policy_id=route_policy_id,
+            context_strategy=context_strategy,
+            baseline=baseline,
+            actor=actor,
+        )
+        payload = replay.to_payload()
+        self.events.publish(run.run_id, "benchmark.replay_linked", payload)
+        return payload
+
+    def prepare_github_change_request(
+        self,
+        *,
+        request_id: str,
+        run_id: str,
+        review_id: str,
+        title: str,
+        base_branch: str,
+        head_branch: str | None = None,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        self._require_mutable_runtime("prepare_github_change_request")
+        request = self.github_workflow.prepare(
+            request_id=request_id,
+            run_id=run_id,
+            review_id=review_id,
+            title=title,
+            base_branch=base_branch,
+            head_branch=head_branch,
+            actor=actor,
+        )
+        payload = request.to_payload()
+        self.events.publish(run_id, "github.change_request_prepared", payload)
+        return payload
+
+    def recover_github_feedback(
+        self,
+        request_id: str,
+        *,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        """Launch one bounded recovery run from persisted failing PR evidence."""
+
+        self._require_mutable_runtime("recover_github_feedback")
+        request = self.github_workflow.get(request_id)
+        if request.recovery_run_id is not None:
+            return request.to_payload()
+        if request.status not in {"ci_failed", "changes_requested"}:
+            raise ValueError("GitHub change request has no actionable failure")
+        original = self.state.get_run(request.run_id)
+        if request.project_id is None:
+            raise ValueError("GitHub recovery requires a project-bound run")
+        project = self.state.get_project(request.project_id)
+        latest = request.feedback[-1] if request.feedback else None
+        evidence = latest.to_payload() if latest is not None else {}
+        message = (
+            f"Recover GitHub pull request #{request.external_number or 'unknown'} "
+            f"for {request.title}. Preserve the reviewed objective and address only "
+            f"the recorded {request.status} evidence. Source run: {original.run_id}. "
+            f"Feedback snapshot: {json.dumps(evidence, sort_keys=True)[:12_000]}"
+        )
+        recovery = self.create_run(
+            message=message,
+            project_id=request.project_id,
+            workspace=Path(project.repository_path),
+            autonomy_mode="background",
+        )
+        updated = self.github_workflow.bind_recovery_run(
+            request.request_id,
+            recovery_run_id=recovery.run_id,
+        )
+        payload = updated.to_payload()
+        payload["recovery_actor"] = actor
+        self.events.publish(
+            request.run_id,
+            "github.recovery_run_created",
+            {
+                "request_id": request.request_id,
+                "recovery_run_id": recovery.run_id,
+                "source_run_id": request.run_id,
+            },
+        )
+        self.events.publish(
+            recovery.run_id,
+            "github.recovery_run_linked",
+            {
+                "request_id": request.request_id,
+                "source_run_id": request.run_id,
+            },
+        )
+        return payload
+
     def expire_pending_approvals(self) -> list[dict[str, Any]]:
         """Expire and terminally reconcile exact-call approvals without a UI read."""
 
@@ -2162,6 +2405,10 @@ class RunManager:
                     )
             except KeyError:
                 pass
+        revoked += self.approval_packets.invalidate_tools(
+            tool_names,
+            reason=reason,
+        )
         return revoked
 
     def tool_resource_digest(self, spec: ToolSpec) -> str:
@@ -2553,6 +2800,9 @@ class RunManager:
             if "failed" in executed_statuses:
                 stop_reason = "task_failed"
                 break
+            if "recovery_approval_required" in executed_statuses:
+                stop_reason = "graph_amendment_approval_required"
+                break
             if step["blocked"]:
                 stop_reason = "tool_approval_required"
                 break
@@ -2779,6 +3029,247 @@ class RunManager:
                 payload["scheduler"] = scheduler
             return payload
 
+    def preview_candidate_fanout(
+        self,
+        *,
+        fanout_id: str,
+        run_id: str,
+        source_task_id: str,
+        candidate_count: int,
+        estimated_budget_delta_usd: float,
+    ) -> dict[str, Any]:
+        """Build a read-only, exact plan for isolated parallel candidates."""
+
+        if (
+            isinstance(candidate_count, bool)
+            or not isinstance(candidate_count, int)
+            or not 2 <= candidate_count <= 8
+        ):
+            raise ValueError("candidate_count must be between two and eight")
+        run = self._require_run_accepts_work(run_id, operation="candidate_fanout_preview")
+        source = self.state.get_task_node(source_task_id)
+        if source.run_id != run_id:
+            raise ValueError("source task does not belong to the candidate run")
+        config = self._config_for_run(run)
+        worktree_root = config.worker_worktree_dir
+        if not worktree_root.is_absolute():
+            worktree_root = Path(run.workspace) / worktree_root
+        isolations: list[CandidateIsolation] = []
+        for index in range(candidate_count):
+            suffix = hashlib.sha256(
+                f"{fanout_id}:{run_id}:{source_task_id}:{index}".encode()
+            ).hexdigest()[:20]
+            candidate_id = f"candidate_{suffix}"
+            task_id = f"task_candidate_{suffix}"
+            planned = plan_git_worktree_isolation(
+                worktree_root=worktree_root,
+                branch_prefix=config.worker_branch_prefix,
+                run_id=run_id,
+                worker_id=candidate_id,
+            )
+            isolations.append(
+                CandidateIsolation(
+                    candidate_id=candidate_id,
+                    task_id=task_id,
+                    workspace=planned.workspace,
+                    branch=planned.branch,
+                )
+            )
+        return self.candidate_fanouts.preview(
+            fanout_id=fanout_id,
+            run_id=run_id,
+            source_task_id=source_task_id,
+            task_contract_digest=self.candidate_fanouts.task_contract_digest(
+                source_task_id
+            ),
+            candidates=tuple(isolations),
+            estimated_budget_delta_usd=estimated_budget_delta_usd,
+        )
+
+    def create_candidate_fanout(
+        self,
+        *,
+        fanout_id: str,
+        plan: dict[str, Any],
+        approved_plan_digest: str,
+        actor: str = "owner",
+        start: bool = True,
+    ) -> dict[str, Any]:
+        """Materialize approved worktrees/tasks and optionally launch them in parallel."""
+
+        self._require_mutable_runtime("create_candidate_fanout")
+        validated = self.candidate_fanouts.validate_approved_plan(
+            fanout_id=fanout_id,
+            plan=plan,
+            approved_plan_digest=approved_plan_digest,
+        )
+        run_id = str(validated["run_id"])
+        run = self._require_run_accepts_work(run_id, operation="candidate_fanout")
+        config = self._config_for_run(run)
+        raw_candidates = validated.get("candidates")
+        if not isinstance(raw_candidates, list):
+            raise ValueError("candidate fanout plan has no candidate list")
+        prepared: list[dict[str, str]] = []
+        for raw in raw_candidates:
+            if not isinstance(raw, dict):
+                raise ValueError("candidate fanout isolation is invalid")
+            candidate_id = str(raw.get("candidate_id") or "")
+            isolation = prepare_git_worktree(
+                workspace=Path(run.workspace),
+                worktree_root=(
+                    config.worker_worktree_dir
+                    if config.worker_worktree_dir.is_absolute()
+                    else Path(run.workspace) / config.worker_worktree_dir
+                ),
+                branch_prefix=config.worker_branch_prefix,
+                run_id=run_id,
+                worker_id=candidate_id,
+            )
+            if (
+                str(isolation.workspace) != str(raw.get("workspace"))
+                or isolation.branch != str(raw.get("branch"))
+            ):
+                raise ValueError(
+                    "prepared candidate isolation does not match the approved plan"
+                )
+            prepared.append(isolation.to_payload())
+        fanout = self.candidate_fanouts.create_fanout(
+            fanout_id=fanout_id,
+            plan=plan,
+            approved_plan_digest=approved_plan_digest,
+            actor=actor,
+            materialize_tasks=True,
+        )
+        self.events.publish(run_id, "candidate.fanout.created", fanout.to_payload())
+        launches: list[dict[str, Any]] = []
+        if start:
+            source = self.state.get_task_node(fanout.source_task_id)
+            for candidate in fanout.candidates:
+                try:
+                    launch = self.create_subagent(
+                        run_id=run_id,
+                        profile=source.profile,
+                        goal=source.goal,
+                        task_id=candidate.task_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retain every candidate receipt
+                    launch = {
+                        "candidate_id": candidate.candidate_id,
+                        "task_id": candidate.task_id,
+                        "status": "launch_failed",
+                        "error": str(redact_secrets(f"{type(exc).__name__}: {exc}")),
+                    }
+                else:
+                    launch["candidate_id"] = candidate.candidate_id
+                launches.append(launch)
+        return {
+            "fanout": self.candidate_fanouts.get_fanout(fanout_id).to_payload(),
+            "isolations": prepared,
+            "launches": launches,
+        }
+
+    def validate_browser_evidence(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        candidate_id: str | None,
+        expected_candidate_digest: str,
+        start_command: tuple[str, ...],
+        target_url: str,
+        assertions: tuple[dict[str, Any], ...],
+        interactions: tuple[dict[str, Any], ...],
+        allowed_domains: tuple[str, ...] = (),
+        network_fixtures: dict[str, dict[str, Any]] | None = None,
+        image: str | None = None,
+        timeout_seconds: float = 90.0,
+    ) -> dict[str, Any]:
+        """Capture candidate-bound rendered, interaction, and accessibility proof."""
+
+        self._require_mutable_runtime("validate_browser_evidence")
+        run = self._require_run_accepts_work(run_id, operation="browser_validation")
+        task = self.state.get_task_node(task_id)
+        if task.run_id != run_id:
+            raise ValueError("browser validation task does not belong to the run")
+        workspace = Path(run.workspace)
+        if candidate_id is not None:
+            candidate = next(
+                (
+                    item
+                    for fanout in self._candidate_fanouts_for_run(run_id)
+                    for item in fanout.candidates
+                    if item.candidate_id == candidate_id
+                    and item.task_id == task_id
+                ),
+                None,
+            )
+            if candidate is None:
+                raise ValueError("browser validation candidate binding is invalid")
+            workspace = Path(candidate.workspace)
+        config = self._config_for_run(run)
+        if not config.allow_browser_validation:
+            raise PermissionError(
+                "browser validation is disabled by allow_browser_validation"
+            )
+        selected_image = str(image or config.validation_container_image or "").strip()
+        record = self.browser_validations.validate(
+            BrowserValidationRequest(
+                run_id=run_id,
+                task_id=task_id,
+                candidate_id=candidate_id,
+                workspace=workspace,
+                image=selected_image,
+                start_command=start_command,
+                target_url=target_url,
+                assertions=tuple(
+                    BrowserAssertion(
+                        selector=str(item.get("selector") or ""),
+                        expectation=str(item.get("expectation") or ""),
+                        value=(
+                            None
+                            if item.get("value") is None
+                            else str(item.get("value"))
+                        ),
+                    )
+                    for item in assertions
+                ),
+                interactions=tuple(
+                    BrowserInteraction(
+                        action=str(item.get("action") or ""),
+                        selector=str(item.get("selector") or ""),
+                        value=(
+                            None
+                            if item.get("value") is None
+                            else str(item.get("value"))
+                        ),
+                    )
+                    for item in interactions
+                ),
+                allowed_domains=allowed_domains,
+                network_fixtures=network_fixtures or {},
+                timeout_seconds=timeout_seconds,
+            ),
+            expected_candidate_digest=expected_candidate_digest,
+        )
+        payload = record.to_payload()
+        self.events.publish(run_id, "browser.validation.completed", payload)
+        return payload
+
+    def _candidate_fanouts_for_run(self, run_id: str) -> list[CandidateFanoutRecord]:
+        with self.state._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT fanout_id FROM candidate_fanouts
+                WHERE run_id = ?
+                ORDER BY created_at ASC, fanout_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            self.candidate_fanouts.get_fanout(str(row["fanout_id"]))
+            for row in rows
+        ]
+
     def create_subagent(
         self, *, run_id: str, profile: str, goal: str, task_id: str | None = None
     ) -> dict[str, Any]:
@@ -2929,6 +3420,7 @@ class RunManager:
                 scheduler_outcome=_scheduler_run_outcome,
                 reconcile_root_task=self._reconcile_root_task,
                 is_cancelled=cancelled,
+                graph_amendments=self.graph_amendments,
             )
             try:
                 DurableOrchestrationRuntime(services).run_chat_turn(
@@ -4817,6 +5309,26 @@ class RunManager:
                 }.get(status, "subagent.completed"),
                 asdict(updated_subagent),
             )
+            if status == "failed":
+                amendment = self._propose_bounded_recovery(
+                    run_id=run.run_id,
+                    failed_task=updated_task,
+                    error=failure_reason or "task acceptance validation failed",
+                    diagnosis=dict(updated_task.diagnosis or {}),
+                )
+                if amendment is not None:
+                    return {
+                        "task_id": task.task_id,
+                        "subagent_id": subagent.subagent_id,
+                        "status": (
+                            "replanned"
+                            if amendment.status == "applied"
+                            else "recovery_approval_required"
+                        ),
+                        "failure_status": "failed",
+                        "error": failure_reason,
+                        "graph_amendment": amendment.to_payload(),
+                    }
             return {
                 "task_id": task.task_id,
                 "subagent_id": subagent.subagent_id,
@@ -4895,6 +5407,25 @@ class RunManager:
                     {"task_id": task.task_id, "source": "scheduler", **diagnosis},
                 )
                 self.events.publish(run.run_id, "subagent.failed", asdict(failed_subagent))
+                amendment = self._propose_bounded_recovery(
+                    run_id=run.run_id,
+                    failed_task=failed_task,
+                    error=error_text,
+                    diagnosis=diagnosis,
+                )
+                if amendment is not None:
+                    return {
+                        "task_id": task.task_id,
+                        "subagent_id": subagent.subagent_id,
+                        "status": (
+                            "replanned"
+                            if amendment.status == "applied"
+                            else "recovery_approval_required"
+                        ),
+                        "failure_status": "failed",
+                        "error": error_text,
+                        "graph_amendment": amendment.to_payload(),
+                    }
             return {
                 "task_id": task.task_id,
                 "subagent_id": subagent.subagent_id,
@@ -4906,6 +5437,58 @@ class RunManager:
         finally:
             if agent is not None:
                 self._close_agent_for_run(run.run_id, agent)
+
+    def _propose_bounded_recovery(
+        self,
+        *,
+        run_id: str,
+        failed_task: TaskNodeRecord,
+        error: str,
+        diagnosis: dict[str, Any],
+    ) -> GraphAmendmentRecord | None:
+        """Create one evidence-first retry without repeating a failed strategy."""
+
+        plan = dict(failed_task.plan or {})
+        if plan.get("disable_bounded_recovery") is True:
+            return None
+        try:
+            estimated = _bounded_recovery_budget(
+                plan.get("recovery_estimated_cost_usd", 0.01),
+                field="recovery_estimated_cost_usd",
+            )
+            preauthorized = _bounded_recovery_budget(
+                plan.get("preauthorized_recovery_budget_usd", 0.0),
+                field="preauthorized_recovery_budget_usd",
+            )
+            amendment = self.graph_amendments.propose_recovery(
+                run_id=run_id,
+                failed_task_id=failed_task.task_id,
+                error=error,
+                diagnosis=diagnosis,
+                actor="scheduler.RecoveryNode",
+                estimated_budget_delta_usd=estimated,
+                preauthorized_budget_usd=preauthorized,
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            self.events.publish(
+                run_id,
+                "graph.amendment.exhausted",
+                {
+                    "task_id": failed_task.task_id,
+                    "reason": str(redact_secrets(str(exc))),
+                },
+            )
+            return None
+        self.events.publish(
+            run_id,
+            (
+                "graph.amendment.applied"
+                if amendment.status == "applied"
+                else "graph.amendment.requested"
+            ),
+            amendment.to_payload(),
+        )
+        return amendment
 
     def _worker_config(
         self,
@@ -4928,8 +5511,15 @@ class RunManager:
         worktree_root = config.worker_worktree_dir
         if not worktree_root.is_absolute():
             worktree_root = run_workspace / worktree_root
+        candidate_isolation_id = (
+            str((task.plan or {}).get("candidate_isolation_worker_id") or "").strip()
+            if task is not None
+            else ""
+        )
         isolation_worker_id = (
-            "repair"
+            candidate_isolation_id
+            if candidate_isolation_id
+            else "repair"
             if task is not None and _task_requires_default_worker_isolation(task)
             else worker_id
         )
@@ -4953,9 +5543,18 @@ class RunManager:
         children = [task for task in tasks if task.parent_id == root.task_id]
         if not children:
             return
-        child_statuses = {task.status for task in children}
+        superseded_task_ids = {
+            str((task.plan or {}).get("replaces_task_id"))
+            for task in children
+            if str((task.plan or {}).get("replaces_task_id") or "").strip()
+        }
+        effective_children = [
+            task for task in children if task.task_id not in superseded_task_ids
+        ]
+        child_statuses = {task.status for task in effective_children}
         root_result = dict(root.result or {})
         root_result["child_statuses"] = sorted(child_statuses)
+        root_result["superseded_task_ids"] = sorted(superseded_task_ids)
         if any(status == "failed" for status in child_statuses):
             updated = self.state.update_task_node(root.task_id, status="failed", result=root_result)
             self.events.publish(run_id, "task.failed", _task_payload(updated))
@@ -5020,6 +5619,37 @@ class RunManager:
         stored_arguments = _approval_storage_arguments(raw_arguments)
         capability = self.capabilities.tool_decision(spec)
         resource_digest = self.tool_resource_digest(spec)
+        try:
+            packet_grant = self.approval_packets.consume_exact(
+                run_id=run_id,
+                tool_call_id=call.id,
+                tool_name=spec.name,
+                arguments=raw_arguments,
+                risk=spec.risk,
+                capability_revision=capability.revision,
+                resource_digest=resource_digest,
+            )
+        except ValueError:
+            # Packet identifiers and persisted arguments are intentionally
+            # stricter than arbitrary provider call IDs. Incompatible calls
+            # simply continue through the ordinary exact-call approval path.
+            packet_grant = None
+        if packet_grant is not None:
+            grant_payload = {
+                "runtime_exact_call_approved": True,
+                "packet_id": packet_grant.packet_id,
+                "packet_call_id": packet_grant.packet_call_id,
+                "call_digest": packet_grant.call_digest,
+                "capability_revision": packet_grant.capability_revision,
+                "resource_digest": packet_grant.resource_digest,
+            }
+            self.events.publish(run_id, "approval.packet_call_consumed", grant_payload)
+            return ToolExecution(
+                call=replace(call, name=spec.name, arguments=stored_arguments),
+                success=True,
+                content="Exact call authorized by the displayed approval packet.",
+                data=grant_payload,
+            )
         scheduler_continuation = getattr(
             self._execution_context,
             "scheduler_approval_context",
@@ -6587,9 +7217,23 @@ def _scheduler_run_outcome(scheduler: dict[str, Any]) -> tuple[str, str]:
         return "failed", stop_reason
     if stop_reason in {"scheduler_busy", "tasks_in_progress"}:
         return "running", stop_reason
-    if stop_reason in {"tool_approval_required", "task_approval_required", "cycle_limit_reached"}:
+    if stop_reason in {
+        "tool_approval_required",
+        "task_approval_required",
+        "graph_amendment_approval_required",
+        "cycle_limit_reached",
+    }:
         return "blocked", stop_reason
     return "completed", "scheduler_idle"
+
+
+def _bounded_recovery_budget(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    amount = float(value)
+    if not 0 <= amount <= 100_000:
+        raise ValueError(f"{field} must be between zero and 100000")
+    return amount
 
 
 def _repair_task_artifact(

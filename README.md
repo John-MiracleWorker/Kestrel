@@ -502,11 +502,18 @@ A repair commit requires a current review artifact tied to the successful valida
 
 Mission Control presents the bounded validation receipt, review summary, risk notes, rollback state, and redacted diff preview together. Patch export is not a snapshot of an arbitrary live `git diff`: it requires the signed review ID and exact candidate digest, revalidates the review, and renders the complete reviewed staged, unstaged, deleted, untracked, and binary candidate into a local `.kestrel/improvements` artifact.
 
+Contained browser proof is separately default-off. It requires
+`NEST_AGENT_ALLOW_BROWSER_VALIDATION=true`, a preloaded digest-pinned image
+containing `/opt/kestrel/browser-validate`, and exact-call approval for
+`browser.validate`; the API route enters that same approval path and has no
+direct-execution shortcut.
+
 ---
 
 ## Proactive Routines Without a Safety Back Door
 
-Kestrel can persist one-shot or fixed-interval UTC routines.
+Kestrel can persist one-shot, fixed-interval, or five-field cron routines in a
+named IANA timezone.
 
 Routines:
 
@@ -517,9 +524,15 @@ Routines:
 - use leased occurrences and overlap suppression;
 - bound how much work can be claimed per tick;
 - preserve exact-call approvals for dangerous tools; and
-- expose history and manual run-now controls in the workbench.
+- expose history and manual run-now controls in the workbench;
+- bind optional channel delivery to a durable destination-specific idempotency
+  key and receipt; and
+- leave ambiguous delivery in an explicit `uncertain` state until the owner
+  reconciles it.
 
-Cron expressions, named-timezone calendar rules, and automatic connector delivery are not yet part of the supported routine contract.
+UTC scanning handles daylight-saving gaps and repeated local instants
+deterministically. Kestrel does not claim that an arbitrary third-party channel
+provides exactly-once effects.
 
 ---
 
@@ -528,7 +541,9 @@ Cron expressions, named-timezone calendar rules, and automatic connector deliver
 The FastAPI-based workbench provides a single place to inspect and control the runtime:
 
 - task-first projects, objective templates, preflight, editable plans, and mission timelines;
-- repository index freshness and structural code evidence;
+- repository index freshness, intent-aware structural code evidence, and navigation benchmark state;
+- graph amendments, candidate comparison, browser evidence, and GitHub change requests;
+- outcome analytics and private benchmark replay;
 - runs and live event streams;
 - plans, task nodes, subagents, and scheduler state;
 - pending and historical approvals;

@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import stat
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -26,6 +27,91 @@ _MAX_CONTEXT_CHARS = 50_000
 _MAX_CONTEXT_FILE_BYTES = 1_000_000
 _MAX_CONTEXT_EVIDENCE = 24
 _VALID_PROJECT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_REPOSITORY_QUERY_TOKEN = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|[.:-])[A-Za-z0-9_]+)*"
+)
+_REPOSITORY_QUERY_STOPWORDS = frozenset(
+    {
+        "a",
+        "all",
+        "an",
+        "and",
+        "are",
+        "at",
+        "be",
+        "by",
+        "can",
+        "class",
+        "code",
+        "defined",
+        "definition",
+        "definitions",
+        "dependency",
+        "dependencies",
+        "does",
+        "exercise",
+        "exercises",
+        "file",
+        "files",
+        "find",
+        "for",
+        "from",
+        "function",
+        "get",
+        "give",
+        "implementation",
+        "implementations",
+        "import",
+        "imported",
+        "imports",
+        "in",
+        "is",
+        "it",
+        "locate",
+        "method",
+        "of",
+        "please",
+        "reference",
+        "referenced",
+        "references",
+        "show",
+        "source",
+        "symbol",
+        "test",
+        "tests",
+        "the",
+        "to",
+        "type",
+        "uses",
+        "using",
+        "what",
+        "where",
+        "which",
+        "who",
+    }
+)
+_DEFINITION_INTENT = frozenset(
+    {"class", "defined", "definition", "definitions", "function", "implementation", "type"}
+)
+_REFERENCE_INTENT = frozenset(
+    {"call", "calls", "reference", "referenced", "references", "use", "uses", "using"}
+)
+_IMPORT_INTENT = frozenset({"dependency", "dependencies", "import", "imported", "imports"})
+_TEST_INTENT = frozenset(
+    {"coverage", "exercise", "exercises", "spec", "specs", "test", "tested", "tests"}
+)
+
+
+@dataclass(frozen=True)
+class _ContextCandidate:
+    score: int
+    term_rank: int
+    path: Path
+    line: int
+    expected_digest: str | None
+    relation: str
+    label: str
+    query_term: str
 
 
 class _RepoToolFailure(RuntimeError):
@@ -430,54 +516,49 @@ class RepoContextPackTool(AgentTool):
             )
             index = _existing_project_index(context)
             path_prefixes = _allowed_index_prefixes(context)
-            symbols = index.symbols(
-                query,
-                limit=_MAX_CONTEXT_EVIDENCE,
+            query_terms = _repository_query_terms(query)
+            query_intent = {
+                token.casefold() for token in _REPOSITORY_QUERY_TOKEN.findall(query)
+            }
+            candidates, results = _context_candidates(
+                index,
+                context=context,
+                query_terms=query_terms,
+                query_intent=query_intent,
                 path_prefixes=path_prefixes,
             )
-            references = index.references(
-                query,
-                limit=_MAX_CONTEXT_EVIDENCE,
-                path_prefixes=path_prefixes,
-            )
-            authoritative, digest, freshness = _combined_query_authority(
-                symbols,
-                references,
-            )
-            candidates: list[tuple[Path, int, str, str]] = []
-            if authoritative:
-                candidates.extend(
-                    (record.path, record.line, record.file_digest, f"definition:{record.name}")
-                    for record in symbols.records
-                    if _record_path_allowed(context, record.path)
-                )
-                candidates.extend(
-                    (record.path, record.line, record.file_digest, f"reference:{record.name}")
-                    for record in references.records
-                    if _record_path_allowed(context, record.path)
-                )
+            authoritative, digest, freshness = _combined_query_authority(*results)
             evidence: list[dict[str, Any]] = []
             blocks: list[str] = []
             remaining = max_chars
             seen: set[tuple[str, int]] = set()
             read_drift = False
-            for path, line, file_digest, relation in candidates:
-                identity = (path.as_posix(), line)
+            ranked_candidates = _rank_context_candidates(candidates) if authoritative else []
+            candidate_locations = {
+                (candidate.path.as_posix(), candidate.line)
+                for candidate in ranked_candidates
+            }
+            for candidate in ranked_candidates:
+                identity = (candidate.path.as_posix(), candidate.line)
                 if identity in seen or len(evidence) >= _MAX_CONTEXT_EVIDENCE:
                     continue
                 seen.add(identity)
                 snippet, observed_digest = _verified_snippet(
                     context,
-                    path,
-                    line=line,
+                    candidate.path,
+                    line=candidate.line,
                     line_window=line_window,
                 )
-                if observed_digest != file_digest:
+                if not observed_digest or (
+                    candidate.expected_digest is not None
+                    and not hmac.compare_digest(observed_digest, candidate.expected_digest)
+                ):
                     read_drift = True
                     continue
                 block = (
-                    f"### {path.as_posix()}:{line} [{relation}]\n"
-                    f"file_sha256={file_digest}\n{snippet}"
+                    f"### {candidate.path.as_posix()}:{candidate.line} "
+                    f"[{candidate.relation}:{candidate.label}]\n"
+                    f"file_sha256={observed_digest}\n{snippet}"
                 )
                 if len(block) > remaining:
                     break
@@ -485,27 +566,37 @@ class RepoContextPackTool(AgentTool):
                 remaining -= len(block)
                 evidence.append(
                     {
-                        "path": path.as_posix(),
-                        "line": line,
-                        "relation": relation,
-                        "file_digest": file_digest,
+                        "path": candidate.path.as_posix(),
+                        "line": candidate.line,
+                        "relation": candidate.relation,
+                        "label": candidate.label,
+                        "query_term": candidate.query_term,
+                        "match_score": candidate.score,
+                        "file_digest": observed_digest,
                     }
                 )
+            if authoritative:
+                final_status = index.status()
+                if (
+                    final_status.freshness.value != "current"
+                    or not hmac.compare_digest(final_status.aggregate_digest, digest)
+                ):
+                    read_drift = True
             if read_drift:
                 authoritative = False
                 evidence = []
                 blocks = []
             payload = {
                 "query": query,
+                "query_terms": list(query_terms),
                 "context": "\n\n".join(blocks),
                 "evidence": evidence,
                 "freshness": freshness,
                 "authoritative": authoritative,
                 "index_digest": digest,
                 "truncated": (
-                    symbols.truncated
-                    or references.truncated
-                    or len(evidence) < len(seen)
+                    any(result.truncated for result in results)
+                    or len(evidence) < len(candidate_locations)
                     or read_drift
                 ),
                 "read_drift_detected": read_drift,
@@ -530,6 +621,179 @@ class RepoContextPackTool(AgentTool):
                 content=redact_text(str(exc)),
                 error="repo_index_query_failed",
             )
+
+
+def _repository_query_terms(query: str) -> tuple[str, ...]:
+    tokens = [
+        token.strip("._:-")
+        for token in _REPOSITORY_QUERY_TOKEN.findall(query)
+        if token.strip("._:-")
+    ]
+    selected: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        folded = token.casefold()
+        if folded in _REPOSITORY_QUERY_STOPWORDS or folded in seen:
+            continue
+        if len(token) == 1 and token != token.upper():
+            continue
+        selected.append(token)
+        seen.add(folded)
+        if len(selected) == 8:
+            break
+    if selected:
+        return tuple(selected)
+    for token in sorted(tokens, key=lambda value: (-len(value), value.casefold(), value)):
+        folded = token.casefold()
+        if folded not in seen:
+            return (token,)
+    return (query,)
+
+
+def _context_candidates(
+    index: RepositoryIndex,
+    *,
+    context: ToolContext,
+    query_terms: tuple[str, ...],
+    query_intent: set[str],
+    path_prefixes: tuple[str, ...],
+) -> tuple[list[_ContextCandidate], tuple[IndexQueryResult[Any], ...]]:
+    candidates: list[_ContextCandidate] = []
+    results: list[IndexQueryResult[Any]] = []
+    definition_bonus = 20 if query_intent & _DEFINITION_INTENT else 0
+    reference_bonus = 55 if query_intent & _REFERENCE_INTENT else 0
+    import_bonus = 70 if query_intent & _IMPORT_INTENT else 0
+    test_bonus = 70 if query_intent & _TEST_INTENT else 0
+
+    for term_rank, term in enumerate(query_terms):
+        symbols = index.symbols(
+            term,
+            limit=_MAX_CONTEXT_EVIDENCE,
+            path_prefixes=path_prefixes,
+        )
+        references = index.references(
+            term,
+            limit=_MAX_CONTEXT_EVIDENCE,
+            path_prefixes=path_prefixes,
+        )
+        imports = index.imports(
+            term,
+            limit=_MAX_CONTEXT_EVIDENCE,
+            path_prefixes=path_prefixes,
+        )
+        tests = index.tests_for(
+            term,
+            limit=_MAX_CONTEXT_EVIDENCE,
+            path_prefixes=path_prefixes,
+        )
+        results.extend((symbols, references, imports, tests))
+
+        candidates.extend(
+            _ContextCandidate(
+                score=_definition_match_score(
+                    term,
+                    name=record.name,
+                    qualified_name=record.qualified_name,
+                )
+                + definition_bonus,
+                term_rank=term_rank,
+                path=record.path,
+                line=record.line,
+                expected_digest=record.file_digest,
+                relation="definition",
+                label=record.qualified_name or record.name,
+                query_term=term,
+            )
+            for record in symbols.records
+            if _record_path_allowed(context, record.path)
+        )
+        candidates.extend(
+            _ContextCandidate(
+                score=85 + reference_bonus,
+                term_rank=term_rank,
+                path=record.path,
+                line=record.line,
+                expected_digest=record.file_digest,
+                relation="reference",
+                label=record.name,
+                query_term=term,
+            )
+            for record in references.records
+            if _record_path_allowed(context, record.path)
+        )
+        candidates.extend(
+            _ContextCandidate(
+                score=70 + import_bonus,
+                term_rank=term_rank,
+                path=record.path,
+                line=record.line,
+                expected_digest=record.file_digest,
+                relation="import",
+                label=record.imported_name or record.module,
+                query_term=term,
+            )
+            for record in imports.records
+            if _record_path_allowed(context, record.path)
+        )
+        candidates.extend(
+            _ContextCandidate(
+                score=90 + test_bonus,
+                term_rank=term_rank,
+                path=record.test_path,
+                line=record.evidence_line,
+                expected_digest=None,
+                relation="test",
+                label=record.symbol_name,
+                query_term=term,
+            )
+            for record in tests.records
+            if _record_path_allowed(context, record.symbol_path)
+            and _record_path_allowed(context, record.test_path)
+        )
+
+    return candidates, tuple(results)
+
+
+def _definition_match_score(term: str, *, name: str, qualified_name: str) -> int:
+    folded_term = term.casefold()
+    folded_name = name.casefold()
+    folded_qualified = qualified_name.casefold()
+    if folded_name == folded_term:
+        return 120
+    if folded_qualified == folded_term:
+        return 118
+    if folded_qualified.endswith((f".{folded_term}", f"::{folded_term}")):
+        return 115
+    if folded_name.startswith(folded_term) or folded_name.endswith(folded_term):
+        return 100
+    return 90
+
+
+def _rank_context_candidates(
+    candidates: list[_ContextCandidate],
+) -> list[_ContextCandidate]:
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: (
+            -candidate.score,
+            candidate.term_rank,
+            candidate.path.as_posix().casefold(),
+            candidate.path.as_posix(),
+            candidate.line,
+            candidate.relation,
+            candidate.label.casefold(),
+            candidate.label,
+        ),
+    )
+    selected: list[_ContextCandidate] = []
+    seen: set[tuple[str, int]] = set()
+    for candidate in ranked:
+        identity = (candidate.path.as_posix(), candidate.line)
+        if identity in seen:
+            continue
+        selected.append(candidate)
+        seen.add(identity)
+    return selected
 
 
 def _existing_project_index(context: ToolContext) -> RepositoryIndex:

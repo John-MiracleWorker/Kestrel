@@ -107,7 +107,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
         default=argparse.SUPPRESS,
         help=(
             "Preloaded immutable name@sha256:<64 hex> OCI image used by test.run, "
-            "lint.run, repair validation, and codex.exec; there is no host fallback."
+            "lint.run, repair/browser validation, and codex.exec; there is no host fallback."
         ),
     )
     parser.add_argument("--allow-plugin-install", action="store_true", default=argparse.SUPPRESS)
@@ -118,6 +118,11 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protected-branches", default=argparse.SUPPRESS)
     parser.add_argument("--allow-memory-import", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-executable-skills", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--allow-browser-validation",
+        action="store_true",
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--allow-mcp-network-endpoints", action="store_true", default=argparse.SUPPRESS
     )
@@ -1035,6 +1040,7 @@ _CONFIG_ARG_FIELDS = {
     "git_write_mode": "git_write_mode",
     "allow_memory_import": "allow_memory_import",
     "allow_executable_skills": "allow_executable_skills",
+    "allow_browser_validation": "allow_browser_validation",
     "allow_mcp_network_endpoints": "allow_mcp_network_endpoints",
     "allow_web": "allow_web",
     "allow_self_modification": "allow_self_modification",
@@ -1797,6 +1803,7 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "secret_backend": config.secret_backend,
         "allow_memory_import": config.allow_memory_import,
         "allow_executable_skills": config.allow_executable_skills,
+        "allow_browser_validation": config.allow_browser_validation,
         "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
         "allow_web": config.allow_web,
         "allow_self_modification": config.allow_self_modification,
@@ -1824,6 +1831,8 @@ def _doctor_validation_container(config: AgentConfig) -> dict[str, Any]:
         )
     if config.allow_codex_cli:
         required_by.append("codex.exec")
+    if config.allow_browser_validation:
+        required_by.append("browser.validate")
     required = bool(required_by)
     if not configured:
         detail = (

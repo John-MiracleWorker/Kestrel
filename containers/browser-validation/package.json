@@ -1,0 +1,13 @@
+{
+  "name": "@kestrel/browser-validation-image",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "axe-core": "4.12.1",
+    "playwright": "1.62.0"
+  }
+}

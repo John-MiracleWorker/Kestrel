@@ -113,6 +113,7 @@ def register_runtime_routes(
                 "allow_remote_mutation": config.allow_remote_mutation,
                 "allow_memory_import": config.allow_memory_import,
                 "allow_executable_skills": config.allow_executable_skills,
+                "allow_browser_validation": config.allow_browser_validation,
                 "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
                 "allow_web": config.allow_web,
                 "allow_self_modification": config.allow_self_modification,

@@ -39,19 +39,15 @@ def prepare_git_worktree(
     repo_root = Path(_git_output(workspace, "rev-parse", "--show-toplevel")).resolve()
     base_sha = _git_output(repo_root, "rev-parse", "--verify", "HEAD^{commit}")
     common_dir = _resolved_git_path(repo_root, "rev-parse", "--git-common-dir")
-    safe_run = _safe_ref_part(run_id)
-    safe_worker = _safe_ref_part(worker_id)
-    safe_prefix = "/".join(_safe_ref_part(part) for part in branch_prefix.split("/") if part)
-    branch = (
-        f"{safe_prefix}/{safe_run}/{safe_worker}"
-        if safe_prefix
-        else f"kestrel-worker/{safe_run}/{safe_worker}"
+    planned = plan_git_worktree_isolation(
+        worktree_root=worktree_root,
+        branch_prefix=branch_prefix,
+        run_id=run_id,
+        worker_id=worker_id,
     )
+    branch = planned.branch
+    target = planned.workspace
     _git_output(repo_root, "check-ref-format", "--branch", branch)
-    resolved_worktree_root = worktree_root.resolve()
-    target = (resolved_worktree_root / safe_run / safe_worker).resolve()
-    if resolved_worktree_root not in target.parents:
-        raise RuntimeError("worker worktree target escapes configured worktree root")
     target.parent.mkdir(parents=True, exist_ok=True)
     if (target / ".git").exists():
         return _verified_existing_worktree(
@@ -68,6 +64,35 @@ def prepare_git_worktree(
         expected_branch=branch,
         expected_common_dir=common_dir,
         worker_id=worker_id,
+    )
+
+
+def plan_git_worktree_isolation(
+    *,
+    worktree_root: Path,
+    branch_prefix: str,
+    run_id: str,
+    worker_id: str,
+) -> WorkerIsolation:
+    """Return the exact branch/worktree identity without creating it."""
+
+    safe_run = _safe_ref_part(run_id)
+    safe_worker = _safe_ref_part(worker_id)
+    safe_prefix = "/".join(_safe_ref_part(part) for part in branch_prefix.split("/") if part)
+    branch = (
+        f"{safe_prefix}/{safe_run}/{safe_worker}"
+        if safe_prefix
+        else f"kestrel-worker/{safe_run}/{safe_worker}"
+    )
+    resolved_worktree_root = worktree_root.resolve()
+    target = (resolved_worktree_root / safe_run / safe_worker).resolve()
+    if resolved_worktree_root not in target.parents:
+        raise RuntimeError("worker worktree target escapes configured worktree root")
+    return WorkerIsolation(
+        workspace=target,
+        branch=branch,
+        worker_id=worker_id,
+        mode="git-worktree-planned",
     )
 
 

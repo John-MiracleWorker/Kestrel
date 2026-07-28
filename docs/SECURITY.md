@@ -21,6 +21,7 @@ NEST_AGENT_PROTECTED_BRANCHES=main,master,release/*
 NEST_AGENT_SECRET_STORE_PATH=.nest/secrets/local_vault.json
 NEST_AGENT_ALLOW_MEMORY_IMPORT=false
 NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=false
+NEST_AGENT_ALLOW_BROWSER_VALIDATION=false
 NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS=false
 NEST_AGENT_ENABLE_AUTONOMOUS_SCHEDULER=false
 NEST_AGENT_MAX_SCHEDULER_TASKS=3
@@ -107,7 +108,37 @@ This control plane does not expand the supported deployment tier. Kestrel remain
 
 Self-improvement is local-first. Kestrel may write validated lessons to local `.mv2` memory, prepare local branches/worktrees, create patches, and run validation. `git.create_local_branch` and `git.export_patch` are approval-gated local-only primitives. Remote publishing is a separate lane: direct commits to protected branches, direct pushes to upstream `main`, force pushes, tag pushes, remote rewrites, repo setting edits, GitHub secrets, and workflow enablement are disabled by default. The default tool registry does not include `git.push`; `shell.run` is limited to minimal introspection commands and structurally blocks remote-publishing argv shapes such as `git push`, `git tag`, `git remote set-url`, `gh repo edit`, `gh secret set`, and `gh workflow enable`.
 
+The review-bound GitHub workflow accepts only a credential-free `github.com`
+origin and canonical HTTPS pull-request receipt URLs without user info, ports,
+queries, or fragments. Remote push/PR creation remains a critical exact-call
+tool behind both remote-mutation and Git-push enablement.
+
 Skill installation is a high-risk file-write action. Uploaded skill capsules are confined to the configured skills directory, validated by manifest shape, and still require approval before installation. Host `python` and `shell` skill runtimes fail closed. Executable skills are always forced to high risk, require exact approval plus `NEST_AGENT_ALLOW_EXECUTABLE_SKILLS=true` / `--allow-executable-skills`, and must declare a digest-pinned OCI image with canonical default-deny scopes. Immediately before launch Kestrel copies the bounded skill tree into an owner-private system-temporary snapshot and verifies its digest. Explicit workspace read grants are independently copied through descriptor-relative, no-follow traversal with hardlink, special-file, mount-crossing, depth, entry, per-file, and total-byte rejection; Docker binds only those private snapshots read-only. Workspace-root, `.git`, `.nest`, writable, network, and secret scopes fail closed. Docker execution has no host fallback, pins the verified local Unix/named-pipe endpoint for launch and cleanup, and enforces a read-only root, nonroot identity, dropped capabilities, no-new-privileges, PID/CPU/memory/ulimit/tmpfs limits, bounded UTF-8 input and output, and supervised timeout cleanup. A terminal result is not returned until I/O workers have stopped and repeated exact-name probes prove the container absent.
+
+Plugin manifests reject raw registered secrets before review or persistence.
+Dependency declarations remain inert metadata unless a reviewed runtime can
+materialize them; a complete lock can attest reviewed source but cannot claim
+runtime reproducibility while dependency management is unavailable.
+
+Browser validation uses that same no-host-fallback snapshot runner and is
+separately disabled unless `NEST_AGENT_ALLOW_BROWSER_VALIDATION=true`.
+`browser.validate` always remains high risk and exact-call approved, including
+requests originating from the API. The project server and Chromium run in the
+same networkless container; non-local requests are fulfilled only by bounded
+exact fixtures. Evidence is bound to the current repair digest and, for
+fan-out, the durable candidate workspace binding. Registered secrets are
+rejected from browser commands, selectors, assertion values, target URLs, and
+network fixtures before container execution. A container report cannot pass
+by omitting or substituting requested checks: every assertion and interaction
+must return an identity-matched boolean result under the bounded evidence
+schema. Engineering control-plane
+mutations (graph decisions, fan-out/evidence, browser requests, approval
+packets, private benchmarks, and GitHub recovery) also require owner API
+authentication to be configured; exact-call approval remains a separate
+requirement where applicable. Graph-amendment payloads, candidate results and
+review provenance, and approval-packet display fields reject registered secret
+material before hashing or durable persistence; their JSON contracts also
+reject non-finite values.
 
 Executable-skill writeback is intentionally unsupported until Kestrel has a quota-bounded staging area plus a reviewed, no-follow host-side commit protocol. The supported single-user threat model also trusts the owning host account and its local container socket; a same-user process that can replace or proxy that socket is outside this containment boundary.
 
@@ -115,7 +146,7 @@ Plugin installation is high risk: it fetches public GitHub repositories and mate
 
 Autonomous scheduling is disabled by default. When enabled, it is bounded by per-cycle task and cycle limits, and it stops at task approval or exact-call tool approval boundaries instead of silently crossing into high-risk work.
 
-Proactive routine polling is independently disabled by default. New routine definitions are always disabled. Polling and claim leases are limited to 1-3,600 seconds, each tick to 1-100 claims, fixed intervals to 60-31,536,000 seconds (one year), and misfire grace to 0-604,800 seconds (seven days). Create/update/enable/disable/delete API calls fail closed unless shared-token API authentication is configured, and routine mutation bodies use strict boolean and integer types rather than coercing strings or booleans. Definition fields reject registered raw secret values; use `secret://...` references only where a later tool explicitly resolves them. Owner mutations use revision compare-and-swap, deletion tombstones the ID, and each due occurrence is bound to its routine revision and UTC instant.
+Proactive routine polling is independently disabled by default. New routine definitions are always disabled. Polling and claim leases are limited to 1-3,600 seconds, each tick to 1-100 claims, fixed intervals to 60-31,536,000 seconds (one year), and misfire grace to 0-604,800 seconds (seven days). Create/update/enable/disable/delete API calls fail closed unless shared-token API authentication is configured, and routine mutation bodies use strict boolean and integer types rather than coercing strings or booleans. Definition fields reject registered raw secret values; use `secret://...` references only where a later tool explicitly resolves them. Provider delivery receipts are redacted recursively, and both automatic and operator-supplied receipts must be bounded finite JSON without raw registered secrets before persistence. Owner mutations use revision compare-and-swap, deletion tombstones the ID, and each due occurrence is bound to its routine revision and UTC instant.
 
 A routine occurrence uses a claim owner, lease generation, and expiry. The same SQLite transaction revalidates that claim and the live routine revision before inserting its deterministic internally scoped run. Disabling, revising, or deleting before admission fences the stale worker. Once a run is admitted, it follows normal run cancellation and approval semantics; a routine switch is not a universal process-kill primitive. An approval-blocked run counts as active for overlap suppression, and routine enablement never grants tool approval.
 

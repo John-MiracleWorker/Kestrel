@@ -312,24 +312,29 @@ Tasks:
 4. Billing/limits if commercialized.
 5. Production monitoring and incident playbooks.
 
-## Current integrated slice — Everyday Kestrel v0.5
+## Current integrated usefulness slice — v0.5 through v0.7
 
 The “first useful hour” slice now joins previously separate runtime capabilities:
 
 - task-first Mission Control with local project selection, objective templates, preflight, editable acceptance plan, and one run timeline;
-- schema-v20 local project profiles that narrow repository paths, capability ceiling, budget, provider policy, and validation recipes;
-- a digest-keyed, rebuildable structural repository index with freshness-bound intelligence tools;
+- schema-v21 local project profiles that narrow repository paths, capability ceiling, budget, provider policy, and validation recipes;
+- a digest-keyed, rebuildable structural repository index with freshness-bound, intent-aware
+  definition/reference/import/test context packs and a seven-language recall@5 CI gate;
 - bounded local/OpenAI-compatible provider discovery, evidence-tagged probes, disabled target drafts, stale-model handling, and constraining presets;
 - strict review projections with exact reviewed-candidate patch export and local commit preparation;
 - repeat-run determinism reporting, Windows doctor/bootstrap diagnostics, and disposable release rehearsal.
 
-This is not the whole roadmap. The next release sequence remains:
+The roadmap release sequence is now represented by integrated, default-safe local
+implementation slices:
 
 1. **v0.6 — Adaptive Flock Learns:** ✅ provider usage/cost attribution, durable learned-router shadow integration, per-project/family/risk/capability calibration, savings/regret evidence, failure-specific escalation, evidence-gated low/medium-risk constrained routing, project-scoped memory retrieval, and a readable comparison dashboard. Learned activation remains default-off until its explicit replay gate is verified.
-2. **v0.7 — Parallel Flock:** bounded graph amendments, isolated candidate fan-out/selection, contained browser validation, approval packets, private benchmarks, and GitHub PR/CI feedback.
-3. **Later ecosystem work:** dependency-locked extensions, portable containment, richer schedules, and idempotent external delivery after the engineering loop is mature.
+2. **v0.7 — Parallel Flock:** ✅ bounded durable graph amendments, isolated candidate fan-out and evidence-ranked selection, digest-bound OCI browser validation, per-call approval packets, private benchmarks/outcome analytics, and review-bound GitHub PR/CI feedback are wired through the API and Mission Control. Provider-authored graph changes and candidate generation remain bounded by the existing planner/worker integrations rather than receiving new authority.
+3. **Later ecosystem work:** ✅ extension manifests now carry reviewable dependency locks, compatibility constraints, signature/source provenance, authority deltas, and reproducible install receipts; proactive routines now support five-field cron in named timezones plus durable idempotent delivery and explicit reconciliation. Portable non-Docker containment and automatic third-party dependency installation remain separate hardening work.
 
-The dated implementation review records exact local evidence and limitations; it is not release publication or live-provider certification.
+These are implementation slices, not a `v0.5`, `v0.6`, or `v0.7`
+publication claim. The dated implementation reviews record exact local
+evidence and limitations; they are not release publication, hosted CI
+evidence, or live-provider certification.
 
 ## Product definition of done
 

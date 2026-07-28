@@ -12,6 +12,7 @@ from .routine_limits import (
 )
 
 _StrictRoutineRevision = Annotated[int, Field(strict=True, ge=1)]
+_StrictRoutineAttempt = Annotated[int, Field(strict=True, ge=0)]
 _StrictRoutineEnabled = Annotated[bool, Field(strict=True)]
 _StrictRoutineInterval = Annotated[
     int,
@@ -241,6 +242,260 @@ class ApprovalDecisionRequest(BaseModel):
     arguments: dict[str, Any] | None = None
 
 
+class GraphAmendmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    amendment_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    operation: Literal[
+        "add_task",
+        "split_task",
+        "replace_dependency",
+        "cancel_task",
+        "request_evidence",
+    ]
+    payload: dict[str, Any]
+    evidence_refs: list[
+        Annotated[str, Field(min_length=1, max_length=512)]
+    ] = Field(default_factory=list, max_length=64)
+
+
+class GraphAmendmentDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    approved: bool
+    expected_base_graph_digest: Annotated[
+        str,
+        Field(pattern=r"^[0-9a-f]{64}$"),
+    ]
+
+
+class CandidateFanoutPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    fanout_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    source_task_id: Annotated[str, Field(min_length=1, max_length=192)]
+    candidate_count: Annotated[int, Field(strict=True, ge=2, le=8)] = 2
+    estimated_budget_delta_usd: Annotated[
+        float,
+        Field(strict=True, ge=0, le=1_000_000),
+    ]
+
+
+class CandidateFanoutCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    fanout_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    plan: dict[str, Any]
+    approved_plan_digest: Annotated[
+        str,
+        Field(pattern=r"^[0-9a-f]{64}$"),
+    ]
+    start: bool = True
+
+
+class CandidateReviewEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    review_id: Annotated[str, Field(min_length=1, max_length=192)]
+    reviewer_id: Annotated[str, Field(min_length=1, max_length=192)]
+    evidence_ref: Annotated[str, Field(min_length=1, max_length=512)]
+
+
+class CandidateEvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    task_contract_digest: Annotated[
+        str,
+        Field(pattern=r"^[0-9a-f]{64}$"),
+    ]
+    validation_id: Annotated[str, Field(min_length=1, max_length=192)]
+    reviews: list[CandidateReviewEvidence] = Field(default_factory=list, max_length=8)
+    actual_cost_usd: Annotated[
+        float | None,
+        Field(strict=True, ge=0, le=1_000_000),
+    ] = None
+    latency_seconds: Annotated[
+        float | None,
+        Field(strict=True, ge=0, le=31_536_000),
+    ] = None
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrowserAssertionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    selector: Annotated[str, Field(min_length=1, max_length=1000)]
+    expectation: Literal["visible", "hidden", "text", "count", "attribute"]
+    value: Annotated[str | None, Field(max_length=2000)] = None
+
+
+class BrowserInteractionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    action: Literal["click", "fill", "check", "select", "press"]
+    selector: Annotated[str, Field(min_length=1, max_length=1000)]
+    value: Annotated[str | None, Field(max_length=2000)] = None
+
+
+class BrowserValidationAPIRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    task_id: Annotated[str, Field(min_length=1, max_length=192)]
+    candidate_id: Annotated[str | None, Field(max_length=192)] = None
+    expected_candidate_digest: Annotated[
+        str,
+        Field(pattern=r"^[0-9a-f]{64}$"),
+    ]
+    image: Annotated[str | None, Field(max_length=512)] = None
+    start_command: list[
+        Annotated[str, Field(min_length=1, max_length=4000)]
+    ] = Field(min_length=1, max_length=64)
+    target_url: Annotated[str, Field(min_length=1, max_length=2048)]
+    assertions: list[BrowserAssertionRequest] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+    interactions: list[BrowserInteractionRequest] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+    allowed_domains: list[
+        Annotated[str, Field(min_length=1, max_length=253)]
+    ] = Field(default_factory=list, max_length=32)
+    network_fixtures: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    timeout_seconds: Annotated[
+        float,
+        Field(strict=True, ge=5, le=600),
+    ] = 90.0
+
+
+class ApprovalPacketCallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    tool_call_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    tool_name: Annotated[str, Field(min_length=1, max_length=160)]
+    arguments: dict[str, Any]
+    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+    resource_scope: Annotated[str, Field(min_length=1, max_length=2000)]
+    expected_side_effect: Annotated[str, Field(min_length=1, max_length=2000)]
+    rollback: Annotated[str, Field(min_length=1, max_length=2000)]
+
+
+class ApprovalPacketCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    packet_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    objective: Annotated[str, Field(min_length=1, max_length=4000)]
+    checkpoint: Annotated[str, Field(max_length=1000)] = ""
+    calls: list[ApprovalPacketCallRequest] = Field(min_length=1, max_length=32)
+
+
+class ApprovalPacketDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_packet_digest: Annotated[
+        str,
+        Field(pattern=r"^[0-9a-f]{64}$"),
+    ]
+    decisions: dict[str, bool]
+
+
+class BenchmarkCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    case_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    project_id: Annotated[str, Field(min_length=1, max_length=192)]
+    name: Annotated[str, Field(min_length=1, max_length=256)]
+    task_family: Annotated[str, Field(min_length=1, max_length=160)]
+    risk: Literal["low", "medium", "high", "critical"] = "low"
+    fixture: dict[str, Any]
+    acceptance_criteria: list[
+        Annotated[str, Field(min_length=1, max_length=2000)]
+    ] = Field(min_length=1, max_length=64)
+
+
+class BenchmarkReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    replay_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    route_policy_id: Annotated[str | None, Field(max_length=192)] = None
+    context_strategy: Annotated[str, Field(min_length=1, max_length=160)] = "default"
+    baseline: Literal[
+        "live",
+        "static_policy",
+        "strongest_model_only",
+        "local_only",
+    ] = "live"
+    launch: bool = True
+    existing_run_id: Annotated[str | None, Field(max_length=192)] = None
+
+
+class GitHubChangeRequestPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=192,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ),
+    ]
+    review_id: Annotated[str, Field(min_length=1, max_length=192)]
+    title: Annotated[str, Field(min_length=1, max_length=256)]
+    base_branch: Annotated[str, Field(min_length=1, max_length=255)] = "main"
+    head_branch: Annotated[str | None, Field(max_length=255)] = None
+
+
 class MCPServerRequest(BaseModel):
     id: str
     name: str | None = None
@@ -286,6 +541,9 @@ class RoutineCreateRequest(BaseModel):
     schedule_kind: str = "interval"
     start_at: str
     interval_seconds: _StrictRoutineInterval | None = None
+    cron_expression: str | None = None
+    timezone: str = "UTC"
+    delivery: dict[str, Any] | None = None
     workspace: str | None = None
     provider: str | None = None
     model: str | None = None
@@ -300,6 +558,9 @@ class RoutineUpdateRequest(BaseModel):
     schedule_kind: str | None = None
     start_at: str | None = None
     interval_seconds: _StrictRoutineInterval | None = None
+    cron_expression: str | None = None
+    timezone: str | None = None
+    delivery: dict[str, Any] | None = None
     workspace: str | None = None
     provider: str | None = None
     model: str | None = None
@@ -317,6 +578,14 @@ class RoutineRunNowRequest(BaseModel):
 
     expected_revision: _StrictRoutineRevision
     idempotency_key: _RoutineIdempotencyKey
+
+
+class RoutineDeliveryReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_attempt_count: _StrictRoutineAttempt
+    resolution: Literal["retry", "delivered", "failed"]
+    receipt: dict[str, Any] | None = None
 
 
 class MemorySearchRequest(BaseModel):

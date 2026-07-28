@@ -151,6 +151,7 @@ def _create_app(
         from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
         from .server_diagnosis_routes import register_diagnosis_routes
+        from .server_engineering_routes import register_engineering_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_mission_routes import (
             evaluate_mission_preflight,
@@ -256,6 +257,7 @@ def _create_app(
         runs,
         claim_ttl_seconds=active_config.routine_claim_ttl_seconds,
         max_occurrences_per_tick=active_config.max_routines_per_tick,
+        delivery=channels,
     )
     routine_loop = (
         RoutineLoop(
@@ -530,6 +532,13 @@ def _create_app(
         runs=runs,
         routing_ledger=routing_ledger,
         routing_config=routing_config,
+        http_exception=HTTPException,
+    )
+    register_engineering_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        runs=runs,
         http_exception=HTTPException,
     )
     register_channel_routes(
@@ -945,6 +954,21 @@ def _create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (PluginError, FileExistsError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/{plugin_id}/review-update")  # type: ignore[untyped-decorator]
+    def review_plugin_update(
+        plugin_id: str, request: PluginUpdateRequest | None = None
+    ) -> dict[str, object]:
+        require_plugin_install_enabled()
+        try:
+            return plugins.review_update(
+                plugin_id,
+                ref=request.ref if request else None,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PluginError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.delete("/api/plugins/{plugin_id}")  # type: ignore[untyped-decorator]

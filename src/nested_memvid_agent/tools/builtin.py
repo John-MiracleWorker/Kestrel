@@ -60,6 +60,7 @@ from ..skill_validation import validate_skill_manifest
 from ..state_store import AgentStateStore
 from ..task_capsule import capsule_signal_staging_record, summarize_run_capsule
 from .base import AgentTool, ToolContext
+from .browser_tools import BrowserValidateTool
 from .command_tools import (
     CodexExecTool,
     LintRunTool,
@@ -86,6 +87,7 @@ from .git_tools import (
     GitShowTool,
     GitStatusTool,
 )
+from .github_tools import GitHubCreatePullRequestTool, GitHubSyncPullRequestTool
 from .registry import RuntimeToolFence, ToolRegistry
 from .repair_tools import (
     RepairApplyPatchTool,
@@ -2340,6 +2342,7 @@ def build_default_tools(
     register(RepairOrchestrateValidateTool())
     register(RepairReviewTool())
     register(RepairRollbackTool())
+    register(BrowserValidateTool())
     register(SelfInspectTool())
     register(SelfReflectTool())
     register(SelfRememberTool())
@@ -2379,6 +2382,8 @@ def build_default_tools(
     register(GitLogTool())
     register(GitShowTool())
     register(GitCommitTool())
+    register(GitHubCreatePullRequestTool())
+    register(GitHubSyncPullRequestTool())
     register(MemvidVerifyTool())
     register(MemvidDoctorTool())
     register(MemvidStatsTool())
@@ -2462,6 +2467,7 @@ def _self_snapshot(
             "protected_branches": list(config.protected_branches),
             "allow_memory_import": config.allow_memory_import,
             "allow_executable_skills": config.allow_executable_skills,
+            "allow_browser_validation": config.allow_browser_validation,
             "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
             "allow_web": config.allow_web,
             "allow_self_modification": config.allow_self_modification,

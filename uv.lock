@@ -1084,6 +1084,7 @@ anthropic = [
 dev = [
     { name = "bandit" },
     { name = "build" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "mypy" },
@@ -1140,6 +1141,7 @@ requires-dist = [
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.7" },
     { name = "build", marker = "extra == 'dev'", specifier = "==1.5.0" },
     { name = "click", marker = "extra == 'runtime'", specifier = ">=8.3.3" },
+    { name = "cryptography", marker = "extra == 'dev'", specifier = ">=48.0.1" },
     { name = "cryptography", marker = "extra == 'mcp'", specifier = ">=48.0.1" },
     { name = "cryptography", marker = "extra == 'runtime'", specifier = ">=48.0.1" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.110" },

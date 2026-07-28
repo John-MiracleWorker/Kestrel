@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import binascii
 import hashlib
 import json
 import re
 import subprocess  # nosec B404
 import tempfile
+from base64 import b64decode
 from dataclasses import dataclass
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -32,6 +35,7 @@ from .repair_integrity import (
     hardened_readonly_git_command,
     hardened_readonly_git_environment,
 )
+from .security_boundary import redact_secrets
 from .skill_validation import validate_skill_manifest
 from .state_store import AgentStateStore
 
@@ -41,6 +45,7 @@ PLUGIN_GENERATED_DIR = "generated"
 DEFAULT_PLUGIN_RISK = "medium"
 GIT_TIMEOUT_SECONDS = 60
 PLUGIN_DEPENDENCY_KINDS = ("python", "node", "system")
+PLUGIN_MANIFEST_SIGNATURE_SCHEMA = "kestrel.plugin.signature.v1"
 
 _GITHUB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -79,6 +84,9 @@ class PluginManifest:
     permissions: tuple[str, ...]
     requires_env: tuple[str, ...]
     dependencies: dict[str, list[str]]
+    dependency_lock: dict[str, list[dict[str, str]]]
+    compatibility: dict[str, str]
+    signature: dict[str, str] | None
     isolation: dict[str, Any]
     skills: tuple[dict[str, Any], ...]
     mcp_servers: tuple[dict[str, Any], ...]
@@ -97,6 +105,9 @@ class PluginManifest:
             "permissions": list(self.permissions),
             "requires_env": list(self.requires_env),
             "dependencies": self.dependencies,
+            "dependency_lock": self.dependency_lock,
+            "compatibility": self.compatibility,
+            "signature": self.signature,
             "isolation": self.isolation,
             "skills": list(self.skills),
             "mcp_servers": list(self.mcp_servers),
@@ -186,6 +197,46 @@ class PluginManager:
                 risk_report=risk_report,
             )
 
+    def review_update(
+        self,
+        plugin_id: str,
+        *,
+        ref: str | None = None,
+    ) -> dict[str, Any]:
+        current = self.state.get_plugin(plugin_id)
+        parsed_source = parse_github_plugin_source(str(current["source_url"]))
+        normalized_ref = _normalize_ref(ref or current.get("source_ref"))
+        tmp_parent = self.root / ".tmp"
+        tmp_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="plugin-update-review-",
+            dir=tmp_parent,
+        ) as tmp_name:
+            repo_path = Path(tmp_name) / "repo"
+            commit_sha = self.fetcher.fetch(parsed_source, repo_path, normalized_ref)
+            manifest = load_plugin_manifest(repo_path)
+            if manifest.id != plugin_id:
+                raise PluginError(
+                    "Plugin manifest id changed during update: "
+                    f"expected {plugin_id}, got {manifest.id}"
+                )
+            risk_report = _risk_report(
+                manifest,
+                source=parsed_source.display_url,
+                commit_sha=commit_sha,
+                source_dir=repo_path,
+                prior_manifest=dict(current["manifest"]),
+            )
+            payload = _review_payload(
+                manifest,
+                source=parsed_source.display_url,
+                ref=normalized_ref,
+                commit_sha=commit_sha,
+                risk_report=risk_report,
+            )
+            payload["current_commit_sha"] = current["commit_sha"]
+            return payload
+
     def install(
         self,
         source: str,
@@ -218,12 +269,32 @@ class PluginManager:
                 plugin_dir = _safe_plugin_dir(self.root, initial_manifest.id)
                 if path_exists(plugin_dir) and not overwrite:
                     raise FileExistsError(f"Plugin already installed: {initial_manifest.id}")
+                current: dict[str, Any] | None = None
+                if overwrite:
+                    try:
+                        current = self.state.get_plugin(initial_manifest.id)
+                    except KeyError:
+                        current = None
                 risk_report = _risk_report(
                     initial_manifest,
                     source=parsed_source.display_url,
                     commit_sha=commit_sha,
                     source_dir=staged_source,
+                    prior_manifest=(
+                        dict(current["manifest"]) if current is not None else None
+                    ),
                 )
+                authority_delta = dict(risk_report["authority_delta"])
+                if (
+                    current is not None
+                    and bool(current["enabled"])
+                    and bool(authority_delta["expands_authority"])
+                ):
+                    added = ", ".join(str(item) for item in authority_delta["added"])
+                    raise PluginError(
+                        "Plugin update expands authority while enabled; disable and "
+                        f"review the update first: {added}"
+                    )
                 _ensure_plugin_enable_allowed(
                     initial_manifest,
                     risk_report,
@@ -256,6 +327,9 @@ class PluginManager:
                     source=parsed_source.display_url,
                     commit_sha=commit_sha,
                     source_dir=staged_source,
+                    prior_manifest=(
+                        dict(current["manifest"]) if current is not None else None
+                    ),
                 )
                 if staged_risk_report != risk_report:
                     raise PluginError("Plugin source changed during staged validation.")
@@ -743,12 +817,22 @@ def load_plugin_manifest(repo_root: Path) -> PluginManifest:
         raw = json.loads(read_regular_text(kestrel_manifest))
         if not isinstance(raw, dict):
             raise PluginError("kestrel.plugin.json must contain a JSON object.")
+        if redact_secrets(raw) != raw:
+            raise PluginError(
+                "Plugin manifests must use secret references or environment names, "
+                "not raw secret material."
+            )
         return _normalize_kestrel_manifest(raw, repo_root)
 
     for filename in ("plugin.yaml", "plugin.yml"):
         hermes_manifest = repo_root / filename
         if hermes_manifest.exists():
             raw = _load_yaml_manifest(hermes_manifest)
+            if redact_secrets(raw) != raw:
+                raise PluginError(
+                    "Plugin manifests must use secret references or environment names, "
+                    "not raw secret material."
+                )
             return _normalize_hermes_manifest(raw, repo_root)
     raise PluginError("Plugin repo must include kestrel.plugin.json or plugin.yaml.")
 
@@ -763,6 +847,9 @@ def _normalize_kestrel_manifest(raw: dict[str, Any], repo_root: Path) -> PluginM
     permissions = _string_tuple(raw.get("permissions", []), "permissions")
     requires_env = _env_tuple(raw.get("requires_env", []))
     dependencies = _dependency_map(raw.get("dependencies", {}))
+    dependency_lock = _dependency_lock(raw.get("dependency_lock", {}))
+    compatibility = _compatibility(raw.get("compatibility", {}))
+    signature = _manifest_signature(raw.get("signature"))
     isolation = _isolation(raw.get("isolation", {}))
     warnings: list[str] = []
     skills = tuple(_normalize_skill(plugin_id, item, repo_root, risk) for item in _dict_list(raw.get("skills", []), "skills"))
@@ -782,6 +869,9 @@ def _normalize_kestrel_manifest(raw: dict[str, Any], repo_root: Path) -> PluginM
         permissions=permissions,
         requires_env=requires_env,
         dependencies=dependencies,
+        dependency_lock=dependency_lock,
+        compatibility=compatibility,
+        signature=signature,
         isolation=isolation,
         skills=skills,
         mcp_servers=mcp_servers,
@@ -823,6 +913,9 @@ def _normalize_hermes_manifest(raw: dict[str, Any], repo_root: Path) -> PluginMa
         permissions=_string_tuple(raw.get("permissions", []), "permissions"),
         requires_env=_env_tuple(raw.get("requires_env", [])),
         dependencies=_dependency_map(raw.get("dependencies", {})),
+        dependency_lock=_dependency_lock(raw.get("dependency_lock", {})),
+        compatibility=_compatibility(raw.get("compatibility", {})),
+        signature=_manifest_signature(raw.get("signature")),
         isolation=_isolation(raw.get("isolation", {})),
         skills=skills,
         mcp_servers=mcp_servers,
@@ -1091,23 +1184,73 @@ def _risk_report(
     source: str,
     commit_sha: str,
     source_dir: Path,
+    prior_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    dependency_review = _dependency_review(manifest.dependencies)
+    tree_sha256 = _tree_sha256(source_dir)
+    dependency_review = _dependency_review(
+        manifest.dependencies,
+        manifest.dependency_lock,
+    )
     isolation_review = _isolation_review(manifest.isolation)
-    enable_blockers = _enable_blockers(dependency_review, isolation_review)
+    compatibility_review = _compatibility_review(manifest.compatibility)
+    provenance_review = _provenance_review(
+        manifest,
+        commit_sha=commit_sha,
+        tree_sha256=tree_sha256,
+    )
+    authority_delta = _authority_delta(
+        manifest,
+        prior_manifest=prior_manifest,
+    )
+    enable_blockers = _enable_blockers(
+        dependency_review,
+        isolation_review,
+        compatibility_review,
+        provenance_review,
+    )
+    install_receipt = {
+        "schema": "kestrel.plugin.install-receipt.v1",
+        "source_url": source,
+        "commit_sha": commit_sha,
+        "tree_sha256": tree_sha256,
+        "manifest_sha256": provenance_review["manifest_sha256"],
+        "dependency_lock_sha256": dependency_review["lock_digest"],
+        "compatibility": compatibility_review,
+        "provenance": provenance_review,
+        "authority_digest": authority_delta["authority_digest"],
+        "source_reproducible": bool(
+            provenance_review["verified"]
+            and compatibility_review["compatible"]
+            and dependency_review["lock_complete"]
+        ),
+        "runtime_reproducible": bool(
+            provenance_review["verified"]
+            and compatibility_review["compatible"]
+            and dependency_review["lock_complete"]
+            and (
+                not dependency_review["requires_install"]
+                or dependency_review["managed"]
+            )
+        ),
+    }
+    install_receipt["reproducible"] = install_receipt["runtime_reproducible"]
     return {
         "risk": manifest.risk,
         "permissions": list(manifest.permissions),
         "requires_env": list(manifest.requires_env),
         "dependency_review": dependency_review,
         "isolation_review": isolation_review,
+        "compatibility_review": compatibility_review,
+        "provenance_review": provenance_review,
+        "authority_delta": authority_delta,
+        "install_receipt": install_receipt,
         "enable_blockers": enable_blockers,
         "warnings": list(manifest.warnings),
         "unsupported_features": list(manifest.unsupported_features),
         "source_url": source,
         "commit_sha": commit_sha,
         "approval_policy": "approval_by_default",
-        "tree_sha256": _tree_sha256(source_dir),
+        "tree_sha256": tree_sha256,
     }
 
 
@@ -1128,6 +1271,10 @@ def _review_payload(
         "risk_report": risk_report,
         "dependency_review": risk_report["dependency_review"],
         "isolation_review": risk_report["isolation_review"],
+        "compatibility_review": risk_report["compatibility_review"],
+        "provenance_review": risk_report["provenance_review"],
+        "authority_delta": risk_report["authority_delta"],
+        "install_receipt": risk_report["install_receipt"],
         "enable_blockers": risk_report["enable_blockers"],
         "warnings": list(manifest.warnings),
         "unsupported_features": list(manifest.unsupported_features),
@@ -1147,13 +1294,204 @@ def _ensure_plugin_enable_allowed_from_row(row: dict[str, Any]) -> None:
         raise PluginError(f"Plugin enable blocked: {row['id']}: {', '.join(blockers)}")
 
 
-def _dependency_review(dependencies: dict[str, list[str]]) -> dict[str, Any]:
+def _provenance_review(
+    manifest: PluginManifest,
+    *,
+    commit_sha: str,
+    tree_sha256: str | None,
+) -> dict[str, Any]:
+    message = _canonical_manifest_bytes(manifest.raw)
+    manifest_sha256 = hashlib.sha256(message).hexdigest()
+    signature = manifest.signature
+    if signature is None:
+        source_pinned = bool(
+            re.fullmatch(r"[0-9a-fA-F]{40}", commit_sha)
+            and tree_sha256
+            and re.fullmatch(r"[0-9a-f]{64}", tree_sha256)
+        )
+        return {
+            "status": "source_pinned" if source_pinned else "unverified",
+            "verified": source_pinned,
+            "signature_verified": False,
+            "algorithm": None,
+            "key_id": None,
+            "manifest_sha256": manifest_sha256,
+            "commit_pinned": source_pinned,
+            "tree_attested": bool(tree_sha256),
+        }
+    try:
+        public_key_bytes = b64decode(signature["public_key"], validate=True)
+        signature_bytes = b64decode(signature["signature"], validate=True)
+        if len(public_key_bytes) != 32 or len(signature_bytes) != 64:
+            raise ValueError("invalid Ed25519 key or signature length")
+    except (binascii.Error, KeyError, ValueError) as exc:
+        raise PluginError("Plugin manifest signature verification failed.") from exc
+    try:
+        ed25519 = import_module(
+            "cryptography.hazmat.primitives.asymmetric.ed25519"
+        )
+    except ImportError as exc:
+        raise PluginError(
+            "Plugin manifest signature verification requires cryptography."
+        ) from exc
+    try:
+        ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes).verify(
+            signature_bytes,
+            message,
+        )
+    except Exception as exc:
+        raise PluginError("Plugin manifest signature verification failed.") from exc
+    return {
+        "status": "verified",
+        "verified": True,
+        "signature_verified": True,
+        "algorithm": "ed25519",
+        "key_id": signature.get("key_id"),
+        "manifest_sha256": manifest_sha256,
+        "commit_pinned": bool(re.fullmatch(r"[0-9a-fA-F]{40}", commit_sha)),
+        "tree_attested": bool(tree_sha256),
+    }
+
+
+def _canonical_manifest_bytes(raw: dict[str, Any]) -> bytes:
+    unsigned = dict(raw)
+    unsigned.pop("signature", None)
+    return json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _compatibility_review(compatibility: dict[str, str]) -> dict[str, Any]:
+    try:
+        current_version = version("nested-memvid-agent")
+    except PackageNotFoundError:
+        current_version = "0.4.11"
+    kestrel_spec = compatibility.get("kestrel", "*")
+    compatible = _version_matches(current_version, kestrel_spec)
+    return {
+        "current_kestrel": current_version,
+        "required_kestrel": kestrel_spec,
+        "compatible": compatible,
+        "status": "compatible" if compatible else "incompatible",
+    }
+
+
+def _authority_delta(
+    manifest: PluginManifest,
+    *,
+    prior_manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    current = _authority_set(manifest.to_state_payload())
+    prior = _authority_set(prior_manifest) if prior_manifest is not None else set()
+    added = sorted(current - prior)
+    removed = sorted(prior - current)
+    authority_payload = json.dumps(
+        sorted(current),
+        separators=(",", ":"),
+    ).encode("utf-8")
+    initial_install = prior_manifest is None
+    return {
+        "initial_install": initial_install,
+        "added": added,
+        "removed": removed,
+        "unchanged_count": len(current & prior),
+        "expands_authority": bool(added) and not initial_install,
+        "authority_digest": hashlib.sha256(authority_payload).hexdigest(),
+    }
+
+
+def _authority_set(manifest: dict[str, Any] | None) -> set[str]:
+    if manifest is None:
+        return set()
+    authority = {"plugin"}
+    for permission in manifest.get("permissions", []):
+        authority.add(f"permission:{permission}")
+    for env_name in manifest.get("requires_env", []):
+        authority.add(f"secret-env:{env_name}")
+    dependencies = manifest.get("dependencies", {})
+    if isinstance(dependencies, dict):
+        for kind in PLUGIN_DEPENDENCY_KINDS:
+            for dependency in dependencies.get(kind, []):
+                authority.add(f"dependency:{kind}:{dependency}")
+    isolation = manifest.get("isolation", {})
+    if isinstance(isolation, dict):
+        authority.add(
+            "isolation:"
+            f"{isolation.get('mode', 'shared')}:"
+            f"{bool(isolation.get('required', False))}"
+        )
+    for raw_skill in manifest.get("skills", []):
+        if not isinstance(raw_skill, dict):
+            continue
+        skill_id = str(raw_skill.get("namespaced_id") or raw_skill.get("id") or "")
+        if skill_id:
+            authority.add(f"skill:{skill_id}")
+        skill_manifest = raw_skill.get("manifest", {})
+        if isinstance(skill_manifest, dict):
+            for capability in skill_manifest.get("capabilities", []):
+                authority.add(f"skill-capability:{skill_id}:{capability}")
+    for raw_server in manifest.get("mcp_servers", []):
+        if not isinstance(raw_server, dict):
+            continue
+        server_id = str(raw_server.get("namespaced_id") or raw_server.get("id") or "")
+        if server_id:
+            authority.add(f"mcp:{server_id}")
+        config = raw_server.get("config", {})
+        if not isinstance(config, dict):
+            continue
+        command = str(config.get("command") or "")
+        if command:
+            authority.add(f"mcp-launch:{server_id}:{Path(command).name}")
+        for tool in config.get("tools", []):
+            if not isinstance(tool, dict):
+                continue
+            tool_name = str(tool.get("remote_name") or tool.get("name") or "")
+            authority.add(f"mcp-tool:{server_id}:{tool_name}")
+            for capability in tool.get("capabilities", []):
+                authority.add(
+                    f"mcp-tool-capability:{server_id}:{tool_name}:{capability}"
+                )
+    return authority
+
+
+def _dependency_review(
+    dependencies: dict[str, list[str]],
+    dependency_lock: dict[str, list[dict[str, str]]],
+) -> dict[str, Any]:
     declared = {kind: list(dependencies.get(kind, [])) for kind in PLUGIN_DEPENDENCY_KINDS}
+    locked = {
+        kind: [dict(item) for item in dependency_lock.get(kind, [])]
+        for kind in PLUGIN_DEPENDENCY_KINDS
+    }
     requires_install = any(declared[kind] for kind in PLUGIN_DEPENDENCY_KINDS)
+    missing_from_lock: dict[str, list[str]] = {}
+    extra_in_lock: dict[str, list[str]] = {}
+    for kind in PLUGIN_DEPENDENCY_KINDS:
+        declared_names = {_dependency_name(item, kind=kind) for item in declared[kind]}
+        locked_names = {item["name"] for item in locked[kind]}
+        missing = sorted(declared_names - locked_names)
+        extra = sorted(locked_names - declared_names)
+        if missing:
+            missing_from_lock[kind] = missing
+        if extra:
+            extra_in_lock[kind] = extra
+    lock_payload = json.dumps(
+        locked,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    lock_complete = not missing_from_lock and not extra_in_lock
     return {
         "declared": declared,
+        "locked": locked,
         "requires_install": requires_install,
         "managed": False,
+        "lock_complete": lock_complete,
+        "missing_from_lock": missing_from_lock,
+        "extra_in_lock": extra_in_lock,
+        "lock_digest": hashlib.sha256(lock_payload).hexdigest(),
         "status": "unmanaged" if requires_install else "none",
     }
 
@@ -1164,12 +1502,21 @@ def _isolation_review(isolation: dict[str, Any]) -> dict[str, Any]:
     return {"mode": mode, "required": required, "available": mode == "shared" or not required}
 
 
-def _enable_blockers(dependency_review: dict[str, Any], isolation_review: dict[str, Any]) -> list[str]:
+def _enable_blockers(
+    dependency_review: dict[str, Any],
+    isolation_review: dict[str, Any],
+    compatibility_review: dict[str, Any],
+    provenance_review: dict[str, Any],
+) -> list[str]:
     blockers: list[str] = []
     if dependency_review["requires_install"] and not dependency_review["managed"]:
         blockers.append("plugin_dependencies_unmanaged")
     if isolation_review["required"] and not isolation_review["available"]:
         blockers.append("plugin_isolation_unavailable")
+    if not compatibility_review["compatible"]:
+        blockers.append("plugin_kestrel_version_incompatible")
+    if not provenance_review["verified"]:
+        blockers.append("plugin_source_unverified")
     return blockers
 
 
@@ -1275,6 +1622,217 @@ def _dependency_map(value: object) -> dict[str, list[str]]:
             raise PluginError(f"Plugin dependencies.{kind} must be a list of strings.")
         dependencies[kind] = [item.strip() for item in raw_items if item.strip()]
     return dependencies
+
+
+def _dependency_lock(value: object) -> dict[str, list[dict[str, str]]]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise PluginError("Plugin dependency_lock must be an object.")
+    unknown = sorted(
+        str(key) for key in value if str(key) not in PLUGIN_DEPENDENCY_KINDS
+    )
+    if unknown:
+        raise PluginError(
+            f"Unsupported plugin dependency lock kinds: {', '.join(unknown)}"
+        )
+    normalized: dict[str, list[dict[str, str]]] = {
+        kind: [] for kind in PLUGIN_DEPENDENCY_KINDS
+    }
+    for kind in PLUGIN_DEPENDENCY_KINDS:
+        raw_items = value.get(kind, [])
+        if raw_items is None:
+            raw_items = []
+        if not isinstance(raw_items, list):
+            raise PluginError(f"Plugin dependency_lock.{kind} must be a list.")
+        seen: set[str] = set()
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise PluginError(
+                    f"Plugin dependency_lock.{kind} entries must be objects."
+                )
+            unknown_fields = sorted(
+                str(key)
+                for key in raw_item
+                if str(key) not in {"name", "version", "sha256"}
+            )
+            if unknown_fields:
+                raise PluginError(
+                    f"Plugin dependency_lock.{kind} has unsupported fields: "
+                    + ", ".join(unknown_fields)
+                )
+            name = str(raw_item.get("name") or "").strip()
+            locked_version = str(raw_item.get("version") or "").strip()
+            sha256 = str(raw_item.get("sha256") or "").strip().lower()
+            if not re.fullmatch(r"[A-Za-z0-9@][A-Za-z0-9@._/+:-]{0,199}", name):
+                raise PluginError(
+                    f"Plugin dependency_lock.{kind} contains an invalid name."
+                )
+            if (
+                not locked_version
+                or len(locked_version) > 128
+                or any(char.isspace() for char in locked_version)
+            ):
+                raise PluginError(
+                    f"Plugin dependency_lock.{kind} contains an invalid version."
+                )
+            if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                raise PluginError(
+                    f"Plugin dependency_lock.{kind} sha256 must be 64 hex characters."
+                )
+            if name in seen:
+                raise PluginError(
+                    f"Plugin dependency_lock.{kind} contains duplicate name {name}."
+                )
+            seen.add(name)
+            normalized[kind].append(
+                {"name": name, "version": locked_version, "sha256": sha256}
+            )
+        normalized[kind].sort(key=lambda item: item["name"].casefold())
+    return normalized
+
+
+def _dependency_name(value: str, *, kind: str) -> str:
+    stripped = value.strip()
+    if kind == "node" and stripped.startswith("@") and "/" in stripped:
+        package_end = stripped.find("@", stripped.find("/") + 1)
+        return stripped if package_end < 0 else stripped[:package_end]
+    name = re.split(r"\s|[<>=!~@]", stripped, maxsplit=1)[0].strip()
+    if not name:
+        raise PluginError(f"Plugin dependency declaration has no package name: {value}")
+    return name
+
+
+def _compatibility(value: object) -> dict[str, str]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise PluginError("Plugin compatibility must be an object.")
+    unknown = sorted(str(key) for key in value if str(key) != "kestrel")
+    if unknown:
+        raise PluginError(
+            f"Unsupported plugin compatibility targets: {', '.join(unknown)}"
+        )
+    kestrel = str(value.get("kestrel", "*")).strip() or "*"
+    if len(kestrel) > 128:
+        raise PluginError("Plugin compatibility.kestrel is too long.")
+    try:
+        _version_matches("0.4.11", kestrel)
+    except ValueError as exc:
+        raise PluginError("Plugin compatibility.kestrel is invalid.") from exc
+    return {"kestrel": kestrel}
+
+
+def _manifest_signature(value: object) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PluginError("Plugin signature must be an object.")
+    allowed = {"schema", "algorithm", "key_id", "public_key", "signature"}
+    unknown = sorted(str(key) for key in value if str(key) not in allowed)
+    if unknown:
+        raise PluginError(
+            f"Plugin signature has unsupported fields: {', '.join(unknown)}"
+        )
+    schema = str(value.get("schema") or "").strip()
+    algorithm = str(value.get("algorithm") or "").strip().lower()
+    public_key = str(value.get("public_key") or "").strip()
+    signature = str(value.get("signature") or "").strip()
+    key_id = str(value.get("key_id") or "").strip()
+    if schema != PLUGIN_MANIFEST_SIGNATURE_SCHEMA:
+        raise PluginError(
+            f"Plugin signature schema must be {PLUGIN_MANIFEST_SIGNATURE_SCHEMA}."
+        )
+    if algorithm != "ed25519":
+        raise PluginError("Plugin signature algorithm must be ed25519.")
+    if not public_key or not signature:
+        raise PluginError("Plugin signature public_key and signature are required.")
+    normalized = {
+        "schema": schema,
+        "algorithm": algorithm,
+        "public_key": public_key,
+        "signature": signature,
+    }
+    if key_id:
+        normalized["key_id"] = key_id
+    return normalized
+
+
+def _version_matches(current: str, raw_spec: str) -> bool:
+    spec = raw_spec.strip()
+    if spec in {"", "*"}:
+        return True
+    current_version = _version_tuple(current)
+    for raw_clause in spec.split(","):
+        clause = raw_clause.strip()
+        if not clause:
+            raise ValueError("empty version clause")
+        if clause.startswith("^"):
+            lower = _version_tuple(clause[1:])
+            upper = _caret_upper_bound(lower)
+            if not (current_version >= lower and current_version < upper):
+                return False
+            continue
+        if clause.startswith("~="):
+            lower = _version_tuple(clause[2:])
+            parts = _version_components(clause[2:])
+            upper = (
+                (lower[0] + 1, 0, 0)
+                if len(parts) == 1
+                else (lower[0], lower[1] + 1, 0)
+            )
+            if not (current_version >= lower and current_version < upper):
+                return False
+            continue
+        wildcard = re.fullmatch(r"v?(\d+(?:\.\d+){0,2})\.\*", clause)
+        if wildcard:
+            prefix = tuple(int(part) for part in wildcard.group(1).split("."))
+            if current_version[: len(prefix)] != prefix:
+                return False
+            continue
+        match = re.fullmatch(
+            r"(>=|<=|==|!=|>|<)?(v?\d+(?:\.\d+){0,2})",
+            clause,
+        )
+        if not match:
+            raise ValueError(f"invalid version clause: {clause}")
+        operator = match.group(1) or "=="
+        target = _version_tuple(match.group(2))
+        comparisons = {
+            ">=": current_version >= target,
+            "<=": current_version <= target,
+            "==": current_version == target,
+            "!=": current_version != target,
+            ">": current_version > target,
+            "<": current_version < target,
+        }
+        if not comparisons[operator]:
+            return False
+    return True
+
+
+def _version_components(value: str) -> tuple[int, ...]:
+    match = re.fullmatch(r"v?(\d+(?:\.\d+){0,2})", value.strip())
+    if not match:
+        raise ValueError(f"invalid version: {value}")
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.match(r"^v?(\d+(?:\.\d+){0,2})", value.strip())
+    if not match:
+        raise ValueError(f"invalid version: {value}")
+    parts = [int(part) for part in match.group(1).split(".")]
+    padded = (parts + [0, 0])[:3]
+    return padded[0], padded[1], padded[2]
+
+
+def _caret_upper_bound(lower: tuple[int, int, int]) -> tuple[int, int, int]:
+    if lower[0] > 0:
+        return (lower[0] + 1, 0, 0)
+    if lower[1] > 0:
+        return (0, lower[1] + 1, 0)
+    return (0, 0, lower[2] + 1)
 
 
 def _isolation(value: object) -> dict[str, Any]:

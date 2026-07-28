@@ -179,6 +179,66 @@ class ChannelManager:
         )
         return {"ok": delivery.sent, "channel_id": channel.id, "method": "sendMessage", "delivery": delivery.to_public_dict()}
 
+    def deliver_routine_result(
+        self,
+        *,
+        channel_id: str,
+        conversation_id: str,
+        text: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        channel = self.channels.get(channel_id)
+        if channel is None:
+            return {
+                "ok": False,
+                "channel_id": channel_id,
+                "method": "routineResult",
+                "delivery": {
+                    "sent": False,
+                    "dry_run": True,
+                    "blocked_reason": "unknown_channel",
+                    "error": None,
+                    "status_code": None,
+                },
+            }
+        if not channel.enabled:
+            return {
+                "ok": False,
+                "channel_id": channel.id,
+                "method": "routineResult",
+                "delivery": {
+                    "sent": False,
+                    "dry_run": True,
+                    "blocked_reason": "channel_disabled",
+                    "error": None,
+                    "status_code": None,
+                },
+            }
+        channel = self._with_resolved_secrets(channel)
+        adapter = self._adapter_for(channel.provider)
+        dry_run, blocked_reason = self._delivery_gate(channel, requested=True)
+        outbound = ChannelOutboundMessage(
+            channel=channel.provider,
+            channel_id=channel.id,
+            conversation_id=conversation_id,
+            text=text,
+            metadata={"idempotency_key": idempotency_key},
+        )
+        delivery = adapter.deliver(
+            channel,
+            outbound,
+            dry_run=dry_run,
+            timeout_seconds=self.config.channel_send_timeout_seconds,
+            blocked_reason=blocked_reason,
+        )
+        return {
+            "ok": delivery.sent,
+            "channel_id": channel.id,
+            "method": "routineResult",
+            "idempotency_key": idempotency_key,
+            "delivery": delivery.to_public_dict(),
+        }
+
     def handle_payload(
         self,
         *,

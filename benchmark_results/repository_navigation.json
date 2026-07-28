@@ -1,0 +1,213 @@
+{
+  "case_count": 11,
+  "cases": [
+    {
+      "authoritative_evidence": true,
+      "case_id": "python_definition",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "src/widget.py"
+      ],
+      "language": "python",
+      "precision_at_5": 0.2,
+      "query": "Where is the Widget class defined?",
+      "ranked_paths_at_5": [
+        "src/widget.py",
+        "apple/Widget.swift",
+        "cmd/widget.go",
+        "crates/widget.rs",
+        "jvm/Widget.java"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "typescript_definition",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "web/widget.ts"
+      ],
+      "language": "typescript",
+      "precision_at_5": 1.0,
+      "query": "Locate the WebWidget implementation.",
+      "ranked_paths_at_5": [
+        "web/widget.ts"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "go_definition",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "cmd/widget.go"
+      ],
+      "language": "go",
+      "precision_at_5": 1.0,
+      "query": "Find the BuildWidget function.",
+      "ranked_paths_at_5": [
+        "cmd/widget.go"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "rust_definition",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "crates/widget.rs"
+      ],
+      "language": "rust",
+      "precision_at_5": 1.0,
+      "query": "Where is the RustWidget type defined?",
+      "ranked_paths_at_5": [
+        "crates/widget.rs"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "java_definition",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "jvm/Widget.java"
+      ],
+      "language": "java",
+      "precision_at_5": 1.0,
+      "query": "Show the JavaWidget class definition.",
+      "ranked_paths_at_5": [
+        "jvm/Widget.java"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "kotlin_definition",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "jvm/Widget.kt"
+      ],
+      "language": "kotlin",
+      "precision_at_5": 1.0,
+      "query": "Locate the KotlinWidget implementation.",
+      "ranked_paths_at_5": [
+        "jvm/Widget.kt"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "swift_definition",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "apple/Widget.swift"
+      ],
+      "language": "swift",
+      "precision_at_5": 1.0,
+      "query": "Where is the SwiftWidget type defined?",
+      "ranked_paths_at_5": [
+        "apple/Widget.swift"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "test_ownership",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "tests/widget_checks.py"
+      ],
+      "language": "python",
+      "precision_at_5": 0.2,
+      "query": "Which tests exercise Widget?",
+      "ranked_paths_at_5": [
+        "tests/widget_checks.py",
+        "src/widget.py",
+        "apple/Widget.swift",
+        "cmd/widget.go",
+        "crates/widget.rs"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "typescript_import",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "web/widget.ts"
+      ],
+      "language": "typescript",
+      "precision_at_5": 0.3333333333333333,
+      "query": "Where is format imported?",
+      "ranked_paths_at_5": [
+        "web/widget.ts",
+        "crates/widget.rs",
+        "web/format.ts"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "swift_import",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "apple/Widget.swift"
+      ],
+      "language": "swift",
+      "precision_at_5": 1.0,
+      "query": "Where is Foundation imported?",
+      "ranked_paths_at_5": [
+        "apple/Widget.swift"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "authoritative_evidence": true,
+      "case_id": "cross_file_reference",
+      "deterministic_replay": true,
+      "expected_paths": [
+        "src/widget.py",
+        "tests/widget_checks.py"
+      ],
+      "language": "python",
+      "precision_at_5": 0.6666666666666666,
+      "query": "Where does helper get referenced?",
+      "ranked_paths_at_5": [
+        "README.md",
+        "src/widget.py",
+        "tests/widget_checks.py"
+      ],
+      "recall_at_5": 1.0,
+      "reciprocal_rank": 0.5
+    }
+  ],
+  "deterministic_replay": true,
+  "languages": [
+    "go",
+    "java",
+    "kotlin",
+    "python",
+    "rust",
+    "swift",
+    "typescript"
+  ],
+  "metrics": {
+    "authoritative_evidence_coverage": 1.0,
+    "mean_reciprocal_rank": 0.9545454545454546,
+    "precision_at_5": 0.7636363636363637,
+    "recall_at_5": 1.0
+  },
+  "minimum_recall_at_5": 0.7,
+  "passed": true,
+  "schema": "kestrel.repository_navigation_benchmark.v1"
+}

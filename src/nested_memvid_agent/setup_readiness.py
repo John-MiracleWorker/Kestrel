@@ -357,6 +357,7 @@ def _permission_gate_check(config: AgentConfig) -> SetupReadinessCheck:
             ("git_commit", config.allow_git_commit),
             ("git_push", config.allow_git_push),
             ("remote_mutation", config.allow_remote_mutation),
+            ("browser_validation", config.allow_browser_validation),
             ("policy_writes", config.allow_policy_writes),
         )
         if enabled
@@ -399,6 +400,8 @@ def _validation_container_check(config: AgentConfig) -> SetupReadinessCheck:
         )
     if config.allow_codex_cli:
         enabled_tools.append("codex.exec")
+    if config.allow_browser_validation:
+        enabled_tools.append("browser.validate")
     if not enabled_tools:
         return SetupReadinessCheck(
             "validation_container",

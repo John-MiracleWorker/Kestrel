@@ -2054,23 +2054,26 @@ def test_shell_run_file_commands_cannot_escape_or_read_sensitive_paths(
     assert result.error == "path_not_allowed"
 
 
-def test_remote_publishing_config_is_disabled_by_default_and_env_gated(
+def test_remote_publishing_and_browser_validation_are_default_off_and_env_gated(
     monkeypatch: MonkeyPatch,
 ) -> None:
     default_config = AgentConfig()
     assert default_config.allow_git_push is False
     assert default_config.allow_remote_mutation is False
+    assert default_config.allow_browser_validation is False
     assert default_config.git_write_mode == "local_branch"
     assert default_config.protected_branches == ("main", "master", "release/*")
 
     monkeypatch.setenv("NEST_AGENT_ALLOW_GIT_PUSH", "1")
     monkeypatch.setenv("NEST_AGENT_ALLOW_REMOTE_MUTATION", "true")
+    monkeypatch.setenv("NEST_AGENT_ALLOW_BROWSER_VALIDATION", "true")
     monkeypatch.setenv("NEST_AGENT_GIT_WRITE_MODE", "fork_pr")
     monkeypatch.setenv("NEST_AGENT_PROTECTED_BRANCHES", "main,stable/*")
 
     env_config = AgentConfig.from_env()
     assert env_config.allow_git_push is True
     assert env_config.allow_remote_mutation is True
+    assert env_config.allow_browser_validation is True
     assert env_config.git_write_mode == "fork_pr"
     assert env_config.protected_branches == ("main", "stable/*")
 

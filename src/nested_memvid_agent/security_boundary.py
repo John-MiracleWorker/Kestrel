@@ -261,12 +261,16 @@ def redact_secrets(value: Any, *, environ: Mapping[str, str] | None = None) -> A
     """Recursively remove raw credential material from an untrusted payload."""
 
     if isinstance(value, dict):
-        return {
-            redact_text(key, environ=environ) if isinstance(key, str) else key: REDACTED
-            if _should_redact_secret_item(str(key), item)
-            else redact_secrets(item, environ=environ)
-            for key, item in value.items()
-        }
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            safe_key = redact_text(key, environ=environ) if isinstance(key, str) else key
+            if _should_redact_secret_item(str(key), item):
+                redacted[safe_key] = REDACTED
+            elif _is_safe_secret_env_descriptor(str(key), item):
+                redacted[safe_key] = _redact_public_metadata(item, environ=environ)
+            else:
+                redacted[safe_key] = redact_secrets(item, environ=environ)
+        return redacted
     if isinstance(value, list):
         return [redact_secrets(item, environ=environ) for item in value]
     if isinstance(value, tuple):
@@ -465,6 +469,35 @@ def _safe_secret_metadata_value(suffix: str, value: Any) -> bool:
     # Secret-like file, id, name, and path keys are not safe merely because
     # they end in a metadata-looking suffix.
     return False
+
+
+def _is_safe_secret_env_descriptor(key: str, value: Any) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    suffix = _secret_metadata_suffix(normalized)
+    return suffix == "_env" and _safe_secret_metadata_value(suffix, value)
+
+
+def _redact_public_metadata(
+    value: Any,
+    *,
+    environ: Mapping[str, str] | None,
+) -> Any:
+    """Redact registered values without reclassifying descriptor field names."""
+
+    if isinstance(value, Mapping):
+        return {
+            redact_text(key, environ=environ) if isinstance(key, str) else key: (
+                _redact_public_metadata(item, environ=environ)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_public_metadata(item, environ=environ) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_public_metadata(item, environ=environ) for item in value)
+    if isinstance(value, str):
+        return redact_text(value, environ=environ)
+    return value
 
 
 def _is_secret_ref(value: str) -> bool:

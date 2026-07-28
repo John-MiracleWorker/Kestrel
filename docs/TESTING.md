@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last updated: 2026-07-19
+Last updated: 2026-07-28
 
 Kestrel's fast test path is deterministic: it uses `InMemoryBackend` plus the mock LLM provider. Memvid, MCP, provider, executable-skill container, and platform integrations stay behind explicit environment flags.
 
@@ -19,10 +19,13 @@ npm ci --prefix web
 Run these for normal development:
 
 ```bash
-python -m compileall -q src tests scripts
+python -m compileall -q benchmarks src tests scripts
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 make golden
 python benchmarks/real_agent_learning_benchmark.py --output benchmark_results/agent_learning_gate.json
+python benchmarks/repository_navigation_benchmark.py \
+  --minimum-recall-at-5 0.70 \
+  --output benchmark_results/repository_navigation.json
 PYTHONPATH=src python -m nested_memvid_agent.cli chat --backend memory --provider mock --message "hello"
 ```
 
@@ -44,6 +47,14 @@ persist provenance-linked `FailureEpisode` and `LessonCard` records. Its second 
 that exact lesson as untrusted user-role evidence and improve from control failure to treatment
 success. Any missing evidence, validation metadata, exact-call approval, transfer, or expected
 outcome exits nonzero. Real-provider learning remains a separate optional evaluation below.
+
+The repository-navigation gate builds the production digest-keyed index over a
+seven-language fixture and sends natural-language definition, reference,
+import, and test-ownership questions through `repo.context_pack`. It fails
+unless recall@5 is at least `0.70`, every case returns current digest-bound
+path/line evidence, and an immediate replay is identical. It is intentionally
+a deterministic structural-navigation gate, not a claim about embeddings or
+large-repository semantic relevance.
 
 The proactive-routine slice has a smaller deterministic safety gate for scheduler changes:
 
@@ -80,7 +91,7 @@ The repair cases cover signed/tamper-evident receipts, redacted validation outpu
 ## Lint, Types, and Web
 
 ```bash
-python -m ruff check scripts src tests
+python -m ruff check benchmarks scripts src tests
 python -m mypy src
 npm run test --prefix web
 npm run build --prefix web

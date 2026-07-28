@@ -1141,6 +1141,7 @@ def test_doctor_subcommand_uses_env_config(
     monkeypatch.setenv("NEST_AGENT_MODEL", "env-model")
     monkeypatch.setenv("NEST_AGENT_BASE_URL", "http://127.0.0.1:11434/v1")
     monkeypatch.setenv("NEST_AGENT_ALLOW_SHELL", "true")
+    monkeypatch.setenv("NEST_AGENT_ALLOW_BROWSER_VALIDATION", "true")
     monkeypatch.setenv("NEST_AGENT_VALIDATION_CONTAINER_IMAGE", PINNED_VALIDATION_IMAGE)
     monkeypatch.setenv("NEST_AGENT_CONTEXT_BUDGET_CHARS", "12345")
     monkeypatch.setattr(sys, "argv", ["nest-agent", "doctor"])
@@ -1154,9 +1155,11 @@ def test_doctor_subcommand_uses_env_config(
     assert payload["provider"]["model"] == "env-model"
     assert payload["provider"]["base_url_configured"] is True
     assert payload["tool_config"]["allow_shell"] is True
+    assert payload["tool_config"]["allow_browser_validation"] is True
     assert payload["tool_config"]["context_budget_chars"] == 12345
     assert payload["validation_container"]["image"] == PINNED_VALIDATION_IMAGE
     assert payload["validation_container"]["digest_pinned"] is True
+    assert "browser.validate" in payload["validation_container"]["required_by_config_gates"]
 
 
 def test_doctor_flags_override_env_config(

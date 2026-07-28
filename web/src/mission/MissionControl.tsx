@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getJson, postJson } from "../api";
+import { EngineeringRunPanel } from "../engineering/EngineeringRunPanel";
 import { RepairReviewPanel } from "../repair/RepairReviewPanel";
 import { activityItemsForEvents, deriveThreadTitle } from "../runActivity";
 import type { Approval, Run, TaskGraph, TraceEvent } from "../types";
@@ -473,6 +474,13 @@ export function MissionControl({
             <RepairReviewPanel
               tasks={taskGraph?.tasks ?? []}
               allowedPaths={selectedProject?.allowed_paths ?? []}
+              onPrepareTool={onPrepareTool}
+            />
+            <EngineeringRunPanel
+              runId={activeRun?.run_id ?? null}
+              refreshToken={activeRun?.updated_at ?? ""}
+              tasks={taskGraph?.tasks ?? []}
+              defaultBranch={selectedProject?.default_branch ?? "main"}
               onPrepareTool={onPrepareTool}
             />
           </section>

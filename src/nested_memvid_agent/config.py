@@ -125,6 +125,7 @@ class AgentConfig:
     protected_branches: tuple[str, ...] = ("main", "master", "release/*")
     allow_memory_import: bool = False
     allow_executable_skills: bool = False
+    allow_browser_validation: bool = False
     allow_mcp_network_endpoints: bool = False
     allow_web: bool = False
     allow_self_modification: bool = False
@@ -336,6 +337,9 @@ class AgentConfig:
             ),
             allow_memory_import=environment.as_bool("NEST_AGENT_ALLOW_MEMORY_IMPORT"),
             allow_executable_skills=environment.as_bool("NEST_AGENT_ALLOW_EXECUTABLE_SKILLS"),
+            allow_browser_validation=environment.as_bool(
+                "NEST_AGENT_ALLOW_BROWSER_VALIDATION"
+            ),
             allow_mcp_network_endpoints=environment.as_bool("NEST_AGENT_ALLOW_MCP_NETWORK_ENDPOINTS"),
             allow_web=environment.as_bool("NEST_AGENT_ALLOW_WEB"),
             allow_self_modification=environment.as_bool("NEST_AGENT_ALLOW_SELF_MODIFICATION"),

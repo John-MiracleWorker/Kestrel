@@ -150,6 +150,53 @@ def test_repo_intelligence_returns_digest_bound_structural_evidence_with_path_ce
     assert any(row["relation"] == "test" for row in impact.data["records"])
 
 
+def test_context_pack_blends_natural_language_intent_and_structural_evidence(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    report = RepositoryIndex(project_id=PROJECT_ID, repository_root=repository).rebuild()
+    registry = build_default_tools(("repo.context_pack",))
+    context = _context(
+        tmp_path,
+        repository,
+        baseline_index_digest=report.aggregate_digest,
+    )
+
+    definition = registry.execute(
+        ToolCall(
+            name="repo.context_pack",
+            arguments={"query": "Where is the RustWidget type defined?"},
+        ),
+        context,
+    )
+    imported = registry.execute(
+        ToolCall(
+            name="repo.context_pack",
+            arguments={"query": "Where is format imported?"},
+        ),
+        context,
+    )
+    tests = registry.execute(
+        ToolCall(
+            name="repo.context_pack",
+            arguments={"query": "Which tests exercise Widget?"},
+        ),
+        context,
+    )
+
+    assert definition.success and definition.data["authoritative"] is True
+    assert definition.data["query_terms"] == ["RustWidget"]
+    assert definition.data["evidence"][0]["path"] == "crates/widget.rs"
+    assert definition.data["evidence"][0]["relation"] == "definition"
+    assert imported.success and imported.data["authoritative"] is True
+    assert imported.data["evidence"][0]["path"] == "web/widget.ts"
+    assert imported.data["evidence"][0]["relation"] == "import"
+    assert tests.success and tests.data["authoritative"] is True
+    assert tests.data["evidence"][0]["path"] == "tests/widget_checks.py"
+    assert tests.data["evidence"][0]["relation"] == "test"
+    assert all(item["file_digest"] for item in tests.data["evidence"])
+
+
 def test_repo_intelligence_hides_stale_rows_and_context(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     RepositoryIndex(project_id=PROJECT_ID, repository_root=repository).rebuild()

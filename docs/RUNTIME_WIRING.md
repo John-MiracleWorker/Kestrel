@@ -57,7 +57,7 @@ Soul/self routes expose the same non-secret runtime model as the CLI: `/api/self
 
 ## State Store
 
-`AgentStateStore` is SQLite control-plane storage, currently schema version 20. Schema v20 adds revisioned local project profiles and nullable run-to-project bindings; legacy runs remain valid with no project. Run rows retain serialized channel source provenance plus turn origin and transcript scope across queueing, recovery, and approval waits; legacy rows default to primary scope. Schema v19 adds durable hashed manual-routine idempotency claims and trigger provenance. Schema v18 gives approved side effects renewable execution claims and preserves the exact scheduler task/subagent binding until the pair reaches its continuation boundary. Schema v17 added revisioned routine definitions and occurrence rows with deterministic identities, UTC schedule instants, claim owner/generation/expiry fencing, request snapshots, run linkage, and terminal history.
+`AgentStateStore` is SQLite control-plane storage, currently schema version 21. Schema v21 adds named-timezone cron routine definitions and durable delivery receipts/reconciliation state. Schema v20 adds revisioned local project profiles and nullable run-to-project bindings; legacy runs remain valid with no project. Run rows retain serialized channel source provenance plus turn origin and transcript scope across queueing, recovery, and approval waits; legacy rows default to primary scope. Schema v19 adds durable hashed manual-routine idempotency claims and trigger provenance. Schema v18 gives approved side effects renewable execution claims and preserves the exact scheduler task/subagent binding until the pair reaches its continuation boundary. Schema v17 added revisioned routine definitions and occurrence rows with deterministic identities, UTC schedule instants, claim owner/generation/expiry fencing, request snapshots, run linkage, and terminal history.
 
 It stores:
 
@@ -72,6 +72,12 @@ It stores:
 - task nodes
 - subagent runs
 - trace spans
+- proactive routine definitions, leased occurrence history, and
+  destination-bound delivery/reconciliation receipts
+- local project records and nullable run-to-project bindings
+- independently versioned engineering ledgers for graph amendments, candidate
+  attempts/selections, browser evidence, approval packets, benchmarks, and
+  GitHub change requests
 
 Run records also persist the provider/model selected for the run so the local operator UI can launch and inspect runs without falling back to process-global provider assumptions.
 
@@ -162,7 +168,7 @@ The local-only git lane includes `git.create_local_branch` for approval-gated br
 
 `self.propose_change` is disabled unless `allow_self_modification` is enabled, still requires exact-call approval, and only records the requested self-change. Any actual code edit must use `repair.prepare`, `repair.apply_patch`, `repair.validate`, `repair.review`, and `git.commit`.
 
-`test.run`, `lint.run`, `repair.validate`, `repair.orchestrate_validate`, and read-only `codex.exec` never execute candidate code on the host. `NEST_AGENT_VALIDATION_CONTAINER_IMAGE` must name a preloaded digest-pinned OCI image containing the requested command and the project's validation dependencies. The runner copies the exact tracked-plus-untracked, non-ignored Git candidate into a bounded private snapshot, excludes `.git`, `.nest`, secrets, receipts, and the live workspace, and runs it with network disabled, a read-only source/root filesystem, nonroot identity, dropped capabilities, resource limits, and no host fallback. Kestrel uses `--pull=never`; operators must preload the exact `name@sha256:<64 hex>` reference. `nest-agent doctor` reports whether a configured reference has the required shape and whether enabled master gates require it, but defers local-image and dependency checks until execution. Validation receipts bind the isolation evidence. `codex.exec` also requires a Codex binary in the image; because this boundary exposes no credentials or network, remote-model delegation is unavailable. The separate `codex-cli` response provider remains a host-process surface and fails closed when same-account-readable secret or repair trust domains exist.
+`test.run`, `lint.run`, `repair.validate`, `repair.orchestrate_validate`, `browser.validate`, and read-only `codex.exec` never execute candidate code on the host. `NEST_AGENT_VALIDATION_CONTAINER_IMAGE` must name a preloaded digest-pinned OCI image containing the requested command and the project's validation dependencies. Browser proof additionally requires `NEST_AGENT_ALLOW_BROWSER_VALIDATION=true`; its API route enters the same exact-call approval path. The runner copies the exact tracked-plus-untracked, non-ignored Git candidate into a bounded private snapshot, excludes `.git`, `.nest`, secrets, receipts, and the live workspace, and runs it with network disabled, a read-only source/root filesystem, nonroot identity, dropped capabilities, resource limits, and no host fallback. Kestrel uses `--pull=never`; operators must preload the exact `name@sha256:<64 hex>` reference. `nest-agent doctor` reports whether a configured reference has the required shape and whether enabled master gates require it, but defers local-image and dependency checks until execution. Validation receipts bind the isolation evidence. `codex.exec` also requires a Codex binary in the image; because this boundary exposes no credentials or network, remote-model delegation is unavailable. The separate `codex-cli` response provider remains a host-process surface and fails closed when same-account-readable secret or repair trust domains exist.
 
 `web.search` and `web.fetch` are disabled unless `allow_web` is enabled. They are read-only context tools; `web.fetch` rejects private, local, link-local, multicast, reserved, and unspecified addresses and applies timeout/byte limits.
 

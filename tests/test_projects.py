@@ -318,7 +318,7 @@ def test_new_runs_may_bind_only_to_an_active_matching_project(
         )
 
 
-def test_schema_19_to_20_adds_projects_and_nullable_run_binding(
+def test_schema_19_migrates_projects_and_nullable_run_binding(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-v19.db"
@@ -346,7 +346,7 @@ def test_schema_19_to_20_adds_projects_and_nullable_run_binding(
             for row in connection.execute("PRAGMA table_info(runs)").fetchall()
         }
 
-    assert migrated.schema_version() == SCHEMA_VERSION == 20
-    assert reopened.schema_version() == 20
+    assert migrated.schema_version() == SCHEMA_VERSION == 21
+    assert reopened.schema_version() == SCHEMA_VERSION
     assert "project_id" in columns
     assert run.project_id is None
