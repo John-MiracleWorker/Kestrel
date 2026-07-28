@@ -22,7 +22,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypedDict
 from uuid import uuid4
 
 SHIM_MARKER = "KESTREL_MANAGED_COMMAND_SHIM_V1"
@@ -41,9 +41,16 @@ class LauncherArtifactError(RuntimeError):
     pass
 
 
+class RuntimeProfile(TypedDict):
+    port: int
+    state_path: Path
+    memory_dir: Path
+
+
 def select_bin_directory(*, explicit: str | Path | None, user_home: str | Path,
                          environ: Mapping[str, str] | None = None,
-                         current_uid: int | None = None) -> Path:
+                         current_uid: int | None = None,
+                         create: bool = True) -> Path:
     environment = os.environ if environ is None else environ
     uid = _current_uid() if current_uid is None else current_uid
     home = _validated_user_home(_canonical_path(Path(user_home)), uid=uid)
@@ -51,8 +58,9 @@ def select_bin_directory(*, explicit: str | Path | None, user_home: str | Path,
         requested = _canonical_path(Path(explicit))
         if not requested.is_absolute():
             raise LauncherArtifactError("KESTREL_BIN_DIR must be an absolute directory path")
-        _create_bin_directory(requested, user_home=home, uid=uid)
-        return _validate_bin_directory(requested, user_home=home, uid=uid)
+        return _select_bin_candidate(
+            requested, user_home=home, uid=uid, create=create,
+        )
     for raw_entry in environment.get("PATH", "").split(os.pathsep):
         candidate = _canonical_path(Path(raw_entry)) if raw_entry else None
         if candidate is None or not candidate.is_absolute() or not candidate.is_dir():
@@ -62,13 +70,54 @@ def select_bin_directory(*, explicit: str | Path | None, user_home: str | Path,
         except LauncherArtifactError:
             continue
     fallback = home / ".local" / "bin"
-    _create_bin_directory(fallback, user_home=home, uid=uid)
-    return _validate_bin_directory(fallback, user_home=home, uid=uid)
+    return _select_bin_candidate(
+        fallback, user_home=home, uid=uid, create=create,
+    )
+
+
+def plan_launchers(
+    *, kestrel_home: str | Path, user_home: str | Path,
+    bin_dir: str | Path | None = None, platform: str | None = None,
+    port: int | str = 8765, state_path: str | Path | None = None,
+    memory_dir: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Resolve the exact launcher targets and collisions without mutating disk."""
+    environment = os.environ if environ is None else environ
+    uid = _current_uid()
+    home = _validate_planned_kestrel_home(
+        _canonical_path(Path(kestrel_home)), uid=uid,
+    )
+    user = _validated_user_home(_canonical_path(Path(user_home)), uid=uid)
+    selected_platform = _validated_platform(platform)
+    selected_bin, artifacts = _resolve_launcher_artifacts(
+        user=user,
+        bin_dir=bin_dir,
+        platform=selected_platform,
+        transaction_id="0" * 32,
+        environment=environment,
+        uid=uid,
+        create_directories=False,
+    )
+    _runtime_profile(
+        home, port=port, state_path=state_path, memory_dir=memory_dir,
+    )
+    return _launcher_result(
+        artifacts=artifacts,
+        selected_bin=selected_bin,
+        platform=selected_platform,
+        environment=environment,
+        manifest=None,
+        codesign="not_applicable",
+    )
 
 
 def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
                       manifest_path: str | Path, bin_dir: str | Path | None = None,
                       platform: str | None = None,
+                      port: int | str = 8765,
+                      state_path: str | Path | None = None,
+                      memory_dir: str | Path | None = None,
                       environ: Mapping[str, str] | None = None,
                       which: Callable[[str], str | None] = shutil.which) -> dict[str, Any]:
     environment = os.environ if environ is None else environ
@@ -76,19 +125,19 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
     home = _validate_kestrel_home(_canonical_path(Path(kestrel_home)), uid=uid)
     user = _validated_user_home(_canonical_path(Path(user_home)), uid=uid)
     manifest = _prepare_manifest_path(_canonical_path(Path(manifest_path)), uid=uid)
-    selected_platform = (platform or sys.platform).lower()
-    if selected_platform not in {"darwin", "linux"}:
-        raise LauncherArtifactError(f"Unsupported launcher platform: {selected_platform}")
-    selected_bin = select_bin_directory(explicit=bin_dir, user_home=user,
-                                        environ=environment, current_uid=uid)
-    app_parent = user / "Applications"
-    if selected_platform == "darwin":
-        _create_user_artifact_directory(app_parent, user_home=user, uid=uid)
+    selected_platform = _validated_platform(platform)
     transaction_id = uuid4().hex
-    artifacts = _derived_artifacts(selected_bin, user, selected_platform, transaction_id)
+    selected_bin, artifacts = _resolve_launcher_artifacts(
+        user=user,
+        bin_dir=bin_dir,
+        platform=selected_platform,
+        transaction_id=transaction_id,
+        environment=environment,
+        uid=uid,
+        create_directories=True,
+    )
     for artifact in artifacts:
         target = Path(artifact["target"])
-        artifact["had_previous"] = _preflight_artifact(target, kind=artifact["kind"])
         if artifact["had_previous"]:
             previous = _managed_artifact_identity(
                 target, kind=artifact["kind"],
@@ -97,7 +146,20 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
             artifact["previous_inode"] = previous.st_ino
     codesign_status = "not_applicable"
     shim = artifacts[0]
-    _write_staged_shim(shim, _shim_text(home, transaction_id), uid=uid)
+    profile = _runtime_profile(
+        home, port=port, state_path=state_path, memory_dir=memory_dir,
+    )
+    _write_staged_shim(
+        shim,
+        _shim_text(
+            home,
+            transaction_id,
+            port=profile["port"],
+            state_path=profile["state_path"],
+            memory_dir=profile["memory_dir"],
+        ),
+        uid=uid,
+    )
     if selected_platform == "darwin":
         app = artifacts[1]
         _build_staged_app(app, shim_path=Path(shim["target"]),
@@ -131,12 +193,70 @@ def prepare_launchers(*, kestrel_home: str | Path, user_home: str | Path,
         raise LauncherArtifactError(f"Launcher installation failed and was rolled back: {exc}") from exc
     finally:
         _remove_staged_leftovers(payload)
-    path_entries = {str(_canonical_path(Path(entry))) for entry in environment.get("PATH", "").split(os.pathsep)
-                    if entry and Path(entry).is_absolute()}
-    return {"shim_path": str(Path(shim["target"])),
-            "app_path": str(Path(artifacts[1]["target"])) if selected_platform == "darwin" else None,
-            "manifest_path": str(manifest), "bin_on_path": str(selected_bin) in path_entries,
-            "codesign": codesign_status}
+    return _launcher_result(
+        artifacts=artifacts,
+        selected_bin=selected_bin,
+        platform=selected_platform,
+        environment=environment,
+        manifest=manifest,
+        codesign=codesign_status,
+    )
+
+
+def _validated_platform(platform: str | None) -> str:
+    selected = (platform or sys.platform).lower()
+    if selected not in {"darwin", "linux"}:
+        raise LauncherArtifactError(f"Unsupported launcher platform: {selected}")
+    return selected
+
+
+def _resolve_launcher_artifacts(
+    *, user: Path, bin_dir: str | Path | None, platform: str,
+    transaction_id: str, environment: Mapping[str, str], uid: int,
+    create_directories: bool,
+) -> tuple[Path, list[dict[str, Any]]]:
+    selected_bin = select_bin_directory(
+        explicit=bin_dir,
+        user_home=user,
+        environ=environment,
+        current_uid=uid,
+        create=create_directories,
+    )
+    if platform == "darwin":
+        _prepare_user_artifact_directory(
+            user / "Applications",
+            user_home=user,
+            uid=uid,
+            create=create_directories,
+        )
+    artifacts = _derived_artifacts(
+        selected_bin, user, platform, transaction_id,
+    )
+    for artifact in artifacts:
+        artifact["had_previous"] = _preflight_artifact(
+            Path(artifact["target"]), kind=artifact["kind"],
+        )
+    return selected_bin, artifacts
+
+
+def _launcher_result(
+    *, artifacts: list[dict[str, Any]], selected_bin: Path, platform: str,
+    environment: Mapping[str, str], manifest: Path | None, codesign: str,
+) -> dict[str, Any]:
+    path_entries = {
+        str(_canonical_path(Path(entry)))
+        for entry in environment.get("PATH", "").split(os.pathsep)
+        if entry and Path(entry).is_absolute()
+    }
+    return {
+        "shim_path": str(Path(artifacts[0]["target"])),
+        "app_path": (
+            str(Path(artifacts[1]["target"])) if platform == "darwin" else None
+        ),
+        "manifest_path": str(manifest) if manifest is not None else None,
+        "bin_on_path": str(selected_bin) in path_entries,
+        "codesign": codesign,
+    }
 
 
 def commit_launchers(manifest_path: str | Path) -> dict[str, Any]:
@@ -349,13 +469,91 @@ def _build_staged_app(
             )
 
 
-def _shim_text(kestrel_home: Path, transaction_id: str = "0" * 32) -> str:
+def _shim_text(
+    kestrel_home: Path,
+    transaction_id: str = "0" * 32,
+    *,
+    port: int | str = 8765,
+    state_path: str | Path | None = None,
+    memory_dir: str | Path | None = None,
+) -> str:
+    profile = _runtime_profile(
+        kestrel_home,
+        port=port,
+        state_path=state_path,
+        memory_dir=memory_dir,
+    )
     executable = kestrel_home / ".venv" / "bin" / "kestrel"
     return ("#!/bin/bash\n" f"# {SHIM_MARKER}\n"
             f"{TRANSACTION_MARKER_PREFIX}{transaction_id}\n"
             "set -euo pipefail\n"
             f"export KESTREL_HOME={shlex.quote(str(kestrel_home))}\n"
+            f"export KESTREL_PORT={profile['port']}\n"
+            "export NEST_AGENT_STATE_PATH="
+            f"{shlex.quote(str(profile['state_path']))}\n"
+            "export NEST_AGENT_MEMORY_DIR="
+            f"{shlex.quote(str(profile['memory_dir']))}\n"
             f"exec {shlex.quote(str(executable))} \"$@\"\n")
+
+
+def _runtime_profile(
+    kestrel_home: Path,
+    *,
+    port: int | str,
+    state_path: str | Path | None,
+    memory_dir: str | Path | None,
+) -> RuntimeProfile:
+    resolved_port = _validated_port(port)
+    resolved_state = _validated_profile_path(
+        state_path,
+        default=kestrel_home / ".nest" / "state" / "agent.db",
+        home=kestrel_home,
+        label="state",
+    )
+    resolved_memory = _validated_profile_path(
+        memory_dir,
+        default=kestrel_home / ".nest" / "memory",
+        home=kestrel_home,
+        label="memory",
+    )
+    return {
+        "port": resolved_port,
+        "state_path": resolved_state,
+        "memory_dir": resolved_memory,
+    }
+
+
+def _validated_port(value: int | str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise LauncherArtifactError("Kestrel launcher port must be an integer") from exc
+    if isinstance(value, bool) or not 1 <= port <= 65535:
+        raise LauncherArtifactError(
+            "Kestrel launcher port must be between 1 and 65535"
+        )
+    return port
+
+
+def _validated_profile_path(
+    configured: str | Path | None,
+    *,
+    default: Path,
+    home: Path,
+    label: str,
+) -> Path:
+    raw = default if configured is None else Path(configured)
+    candidate = raw if raw.is_absolute() else home / raw
+    candidate = _canonical_path(candidate)
+    if (
+        not candidate.is_absolute()
+        or _path_has_symlink(candidate)
+        or any(ord(character) < 32 for character in str(candidate))
+    ):
+        raise LauncherArtifactError(
+            f"Kestrel launcher {label} path is unsafe: {candidate}"
+        )
+    return candidate
 
 
 def _build_macos_app(
@@ -1026,6 +1224,23 @@ def _validate_kestrel_home(path: Path, *, uid: int) -> Path:
     return path
 
 
+def _validate_planned_kestrel_home(path: Path, *, uid: int) -> Path:
+    if not path.is_absolute() or _path_has_symlink(path):
+        raise LauncherArtifactError(
+            "Kestrel home must be absolute and must not use symbolic links"
+        )
+    if path.exists():
+        _validate_owned_directory(path, uid=uid)
+        return path
+    parent = _nearest_existing_parent(path)
+    _validate_owned_directory(parent, uid=uid)
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise LauncherArtifactError(
+            f"Cannot create the planned Kestrel home: {path}"
+        )
+    return path
+
+
 def _validated_user_home(path: Path, *, uid: int) -> Path:
     if not path.is_absolute() or _path_has_symlink(path):
         raise LauncherArtifactError("User home must be absolute and must not use symbolic links")
@@ -1034,40 +1249,65 @@ def _validated_user_home(path: Path, *, uid: int) -> Path:
 
 
 def _validate_bin_directory(path: Path, *, user_home: Path, uid: int) -> Path:
-    if not path.is_absolute() or _path_has_symlink(path):
-        raise LauncherArtifactError(f"Launcher bin directory must not use symbolic links: {path}")
-    parts = {part.lower() for part in path.parts}
-    if ".venv" in parts or "venv" in parts or any(part.endswith(".app") for part in parts):
-        raise LauncherArtifactError(f"Launcher bin directory is inside a transient runtime or app: {path}")
-    system_temp = _canonical_path(Path(tempfile.gettempdir()))
-    if _is_relative_to(path, system_temp) and not _is_relative_to(path, user_home):
-        raise LauncherArtifactError(f"Launcher bin directory is temporary: {path}")
+    _validate_bin_path_shape(path, user_home=user_home)
     _validate_owned_directory(path, uid=uid)
     if not os.access(path, os.W_OK | os.X_OK):
         raise LauncherArtifactError(f"Launcher bin directory is not user-writable: {path}")
     return path
 
 
-def _create_bin_directory(path: Path, *, user_home: Path, uid: int) -> None:
+def _validate_bin_path_shape(path: Path, *, user_home: Path) -> None:
+    if not path.is_absolute() or _path_has_symlink(path):
+        raise LauncherArtifactError(
+            f"Launcher bin directory must not use symbolic links: {path}"
+        )
+    parts = {part.lower() for part in path.parts}
+    if ".venv" in parts or "venv" in parts or any(part.endswith(".app") for part in parts):
+        raise LauncherArtifactError(f"Launcher bin directory is inside a transient runtime or app: {path}")
+    system_temp = _canonical_path(Path(tempfile.gettempdir()))
+    if _is_relative_to(path, system_temp) and not _is_relative_to(path, user_home):
+        raise LauncherArtifactError(f"Launcher bin directory is temporary: {path}")
+
+
+def _select_bin_candidate(
+    path: Path, *, user_home: Path, uid: int, create: bool,
+) -> Path:
     if path.exists():
         if not path.is_dir():
             raise LauncherArtifactError(f"Launcher bin directory is not a directory: {path}")
-        return
-    if not path.is_absolute() or _path_has_symlink(path):
-        raise LauncherArtifactError(f"Launcher bin directory must not use symbolic links: {path}")
-    if not _is_relative_to(path, user_home):
-        parent = _nearest_existing_parent(path)
-        _validate_owned_directory(parent, uid=uid)
-        if not os.access(parent, os.W_OK | os.X_OK):
-            raise LauncherArtifactError(f"Cannot create launcher bin directory: {path}")
-    path.mkdir(parents=True, mode=0o700)
+        return _validate_bin_directory(path, user_home=user_home, uid=uid)
+    _validate_bin_path_shape(path, user_home=user_home)
+    parent = _nearest_existing_parent(path)
+    _validate_owned_directory(parent, uid=uid)
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise LauncherArtifactError(f"Cannot create launcher bin directory: {path}")
+    if create:
+        path.mkdir(parents=True, mode=0o700)
+        return _validate_bin_directory(path, user_home=user_home, uid=uid)
+    return path
 
 
-def _create_user_artifact_directory(path: Path, *, user_home: Path, uid: int) -> None:
+def _prepare_user_artifact_directory(
+    path: Path, *, user_home: Path, uid: int, create: bool,
+) -> None:
     if not path.is_absolute() or not _is_relative_to(path, user_home) or _path_has_symlink(path):
         raise LauncherArtifactError(f"User launcher directory must remain safe inside the user home: {path}")
-    path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    _validate_owned_directory(path, uid=uid)
+    if path.exists():
+        _validate_owned_directory(path, uid=uid)
+        if not os.access(path, os.W_OK | os.X_OK):
+            raise LauncherArtifactError(
+                f"User launcher directory is not user-writable: {path}"
+            )
+        return
+    parent = _nearest_existing_parent(path)
+    _validate_owned_directory(parent, uid=uid)
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise LauncherArtifactError(
+            f"Cannot create user launcher directory: {path}"
+        )
+    if create:
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        _validate_owned_directory(path, uid=uid)
 
 
 def _prepare_manifest_path(path: Path, *, uid: int) -> Path:
@@ -1154,12 +1394,17 @@ def _current_uid() -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Create or roll back Kestrel user launch artifacts.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    prepare = subparsers.add_parser("prepare")
-    prepare.add_argument("--kestrel-home", type=Path, required=True)
-    prepare.add_argument("--user-home", type=Path, required=True)
+    for command in ("plan", "prepare"):
+        action = subparsers.add_parser(command)
+        action.add_argument("--kestrel-home", type=Path, required=True)
+        action.add_argument("--user-home", type=Path, required=True)
+        action.add_argument("--bin-dir", type=Path)
+        action.add_argument("--platform", choices=("darwin", "linux"))
+        action.add_argument("--port", default="8765")
+        action.add_argument("--state-path", type=Path)
+        action.add_argument("--memory-dir", type=Path)
+    prepare = subparsers.choices["prepare"]
     prepare.add_argument("--manifest", type=Path, required=True)
-    prepare.add_argument("--bin-dir", type=Path)
-    prepare.add_argument("--platform", choices=("darwin", "linux"))
     for command in ("commit", "rollback"):
         action = subparsers.add_parser(command)
         action.add_argument("--manifest", type=Path, required=True)
@@ -1169,9 +1414,27 @@ def build_parser() -> argparse.ArgumentParser:
 def run(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "prepare":
-            result = prepare_launchers(kestrel_home=args.kestrel_home, user_home=args.user_home,
-                                       manifest_path=args.manifest, bin_dir=args.bin_dir, platform=args.platform)
+        if args.command == "plan":
+            result = plan_launchers(
+                kestrel_home=args.kestrel_home,
+                user_home=args.user_home,
+                bin_dir=args.bin_dir,
+                platform=args.platform,
+                port=args.port,
+                state_path=args.state_path,
+                memory_dir=args.memory_dir,
+            )
+        elif args.command == "prepare":
+            result = prepare_launchers(
+                kestrel_home=args.kestrel_home,
+                user_home=args.user_home,
+                manifest_path=args.manifest,
+                bin_dir=args.bin_dir,
+                platform=args.platform,
+                port=args.port,
+                state_path=args.state_path,
+                memory_dir=args.memory_dir,
+            )
         elif args.command == "commit":
             result = commit_launchers(args.manifest)
         else:

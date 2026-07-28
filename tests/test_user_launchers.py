@@ -148,6 +148,125 @@ def test_prepare_creates_executable_managed_shim_that_forwards_exactly(
     )
 
 
+def test_prepare_persists_only_supported_runtime_profile_values(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    executable = home / ".venv" / "bin" / "kestrel"
+    executable.write_text(
+        "#!/bin/bash\n"
+        "printf '%s|%s|%s|%s\\n' "
+        '"$KESTREL_HOME" "$KESTREL_PORT" "$NEST_AGENT_STATE_PATH" '
+        '"$NEST_AGENT_MEMORY_DIR" > "$KESTREL_TEST_CAPTURE"\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    state_path = home / ".nest" / "custom-state" / "agent.db"
+    memory_dir = home / ".nest" / "custom-memory"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+
+    module.prepare_launchers(
+        kestrel_home=home,
+        user_home=user_home,
+        manifest_path=manifest,
+        bin_dir=bin_dir,
+        platform="linux",
+        port=19421,
+        state_path=state_path,
+        memory_dir=memory_dir,
+        environ={
+            "PATH": str(bin_dir),
+            "OPENAI_API_KEY": "secret-not-for-shim",
+            "KESTREL_SERVER_PID": "/secret/lifecycle/path",
+        },
+    )
+
+    shim = bin_dir / "kestrel"
+    text = shim.read_text(encoding="utf-8")
+    assert "export KESTREL_PORT=19421" in text
+    assert f"export NEST_AGENT_STATE_PATH={state_path}" in text
+    assert f"export NEST_AGENT_MEMORY_DIR={memory_dir}" in text
+    assert "secret-not-for-shim" not in text
+    assert "KESTREL_SERVER_PID" not in text
+
+    capture = tmp_path / "profile-capture.txt"
+    completed = subprocess.run(
+        [str(shim), "status"],
+        check=False,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "KESTREL_TEST_CAPTURE": str(capture),
+            "KESTREL_PORT": "9999",
+            "NEST_AGENT_STATE_PATH": "/caller/state.db",
+        },
+    )
+
+    assert completed.returncode == 0
+    assert capture.read_text(encoding="utf-8").strip() == (
+        f"{home.resolve()}|19421|{state_path}|{memory_dir}"
+    )
+
+
+def test_plan_is_non_mutating_and_uses_the_same_path_and_collision_rules(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    path_bin = user_home / "preferred-path-bin"
+    path_bin.mkdir()
+    intended_home = user_home / "future-kestrel-home"
+    before = sorted(path.relative_to(user_home) for path in user_home.rglob("*"))
+
+    result = module.plan_launchers(
+        kestrel_home=intended_home,
+        user_home=user_home,
+        platform="darwin",
+        environ={"PATH": str(path_bin)},
+    )
+
+    assert result["shim_path"] == str(path_bin / "kestrel")
+    assert result["app_path"] == str(user_home / "Applications" / "Kestrel.app")
+    assert result["bin_on_path"] is True
+    assert sorted(path.relative_to(user_home) for path in user_home.rglob("*")) == before
+    assert not (user_home / ".local").exists()
+    assert not (user_home / "Applications").exists()
+    assert not intended_home.exists()
+
+    unrelated = path_bin / "kestrel"
+    unrelated.write_text("#!/bin/sh\necho unrelated\n", encoding="utf-8")
+    original = unrelated.read_bytes()
+    with pytest.raises(module.LauncherArtifactError, match="unrelated"):
+        module.plan_launchers(
+            kestrel_home=intended_home,
+            user_home=user_home,
+            platform="linux",
+            environ={"PATH": str(path_bin)},
+        )
+    assert unrelated.read_bytes() == original
+
+
+def test_plan_fallback_does_not_create_the_fallback_directory(tmp_path: Path) -> None:
+    module = _module()
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+
+    result = module.plan_launchers(
+        kestrel_home=user_home / "future-kestrel-home",
+        user_home=user_home,
+        platform="linux",
+        environ={"PATH": str(tmp_path / "missing")},
+    )
+
+    assert result["shim_path"] == str(user_home / ".local" / "bin" / "kestrel")
+    assert result["bin_on_path"] is False
+    assert not (user_home / ".local").exists()
+
+
 def test_prepare_refuses_unrelated_existing_shim_before_mutation(
     tmp_path: Path,
 ) -> None:

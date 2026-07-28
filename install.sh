@@ -261,40 +261,57 @@ prepare_release_venv_replacement() {
 
 prepare_user_launchers() {
   local requested_bin_dir="${KESTREL_BIN_DIR:-}"
-  local planned_bin_dir="$requested_bin_dir"
-  if [[ -z "$planned_bin_dir" ]]; then
-    planned_bin_dir="${HOME}/.local/bin"
-  fi
-  INSTALLED_KESTREL_BIN_DIR="$planned_bin_dir"
-  INSTALLED_KESTREL_SHIM="${planned_bin_dir}/kestrel"
-  INSTALLED_KESTREL_BIN_ON_PATH=0
-  case ":${PATH:-}:" in
-    *":${planned_bin_dir}:"*) INSTALLED_KESTREL_BIN_ON_PATH=1 ;;
-  esac
-
-  if is_true "${KESTREL_DRY_RUN:-}"; then
-    log "DRY RUN: would install the Kestrel command shim at ${INSTALLED_KESTREL_SHIM}"
-    if [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]]; then
-      log "DRY RUN: would install the Kestrel app launcher at ${HOME}/Applications/Kestrel.app"
-    fi
-    return 0
-  fi
-
   local launcher_manager="${KESTREL_HOME}/scripts/manage_user_launchers.py"
+  if [[ -L "$launcher_manager" ]]; then
+    die "Installed checkout has an unsafe Kestrel user-launcher manager: ${launcher_manager}"
+  fi
+  if [[ ! -f "$launcher_manager" ]] && is_true "${KESTREL_DRY_RUN:-}"; then
+    local installer_source="${BASH_SOURCE[0]:-}"
+    if [[ -n "$installer_source" && "$installer_source" != "/dev/stdin" ]]; then
+      local source_launcher_manager
+      source_launcher_manager="$(dirname "$installer_source")/scripts/manage_user_launchers.py"
+      if [[ ! -L "$source_launcher_manager" && -f "$source_launcher_manager" ]]; then
+        launcher_manager="$source_launcher_manager"
+      fi
+    fi
+  fi
   if [[ -L "$launcher_manager" || ! -f "$launcher_manager" ]]; then
-    die "Installed checkout is missing the regular Kestrel user-launcher manager: ${launcher_manager}"
+    if is_true "${KESTREL_DRY_RUN:-}"; then
+      # A curl-to-stdin or detached staged installer has no adjacent helper
+      # before its printed checkout step runs. Do not invent a target in that
+      # case: the real install will run the same selection and collision code
+      # inside the verified transactional helper after checkout.
+      INSTALLED_KESTREL_SHIM=""
+      INSTALLED_KESTREL_BIN_DIR=""
+      INSTALLED_KESTREL_BIN_ON_PATH=1
+      log "DRY RUN: launcher target selection is deferred until the verified non-mutating helper is available; no launcher path or collision result is being claimed."
+      return 0
+    fi
+    die "Kestrel user-launcher planning helper is unavailable or unsafe: ${launcher_manager}"
+  fi
+
+  local launcher_action="prepare"
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    launcher_action="plan"
   fi
   local launcher_command=(
     "$PYTHON_BIN"
     "$launcher_manager"
-    prepare
+    "$launcher_action"
     --kestrel-home
     "$KESTREL_HOME"
     --user-home
     "$HOME"
-    --manifest
-    "$RELEASE_USER_LAUNCHER_MANIFEST"
+    --port
+    "$KESTREL_PORT"
+    --state-path
+    "$KESTREL_STATE_PATH"
+    --memory-dir
+    "${KESTREL_HOME}/.nest/memory"
   )
+  if [[ "$launcher_action" == "prepare" ]]; then
+    launcher_command+=(--manifest "$RELEASE_USER_LAUNCHER_MANIFEST")
+  fi
   if [[ -n "$requested_bin_dir" ]]; then
     launcher_command+=(--bin-dir "$requested_bin_dir")
   fi
@@ -302,12 +319,14 @@ prepare_user_launchers() {
   log "+ $(quote_cmd "${launcher_command[@]}")"
   local launcher_result
   if ! launcher_result="$("${launcher_command[@]}")"; then
-    die "Unable to prepare the Kestrel user launchers."
+    die "Unable to ${launcher_action} the Kestrel user launchers."
   fi
-  # The helper has atomically installed the artifacts and persisted everything
-  # required for rollback before returning success. Set this flag before
-  # parsing its display metadata so any later failure still restores them.
-  RELEASE_USER_LAUNCHERS_PREPARED=1
+  if [[ "$launcher_action" == "prepare" ]]; then
+    # The helper has atomically installed the artifacts and persisted
+    # everything required for rollback before returning success. Set this flag
+    # before parsing display metadata so any later failure still restores it.
+    RELEASE_USER_LAUNCHERS_PREPARED=1
+  fi
   if ! INSTALLED_KESTREL_SHIM="$(
     "$PYTHON_BIN" -c \
       'import json, sys; print(json.loads(sys.argv[1])["shim_path"])' \
@@ -322,6 +341,21 @@ prepare_user_launchers() {
       "$launcher_result"
   )"; then
     die "Kestrel user-launcher PATH metadata was invalid after installation."
+  fi
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    log "DRY RUN: would install the Kestrel command shim at ${INSTALLED_KESTREL_SHIM}"
+    local planned_app
+    if ! planned_app="$(
+      "$PYTHON_BIN" -c \
+        'import json, sys; print(json.loads(sys.argv[1])["app_path"] or "")' \
+        "$launcher_result"
+    )"; then
+      die "Kestrel app-launcher metadata was invalid during planning."
+    fi
+    if [[ -n "$planned_app" ]]; then
+      log "DRY RUN: would install the Kestrel app launcher at ${planned_app}"
+    fi
+    return 0
   fi
   log "Prepared Kestrel command shim at ${INSTALLED_KESTREL_SHIM}"
 }
@@ -2714,6 +2748,32 @@ Add the Kestrel command to this shell:
 EOF
   fi
 
+  local advanced_cli="${KESTREL_HOME}/.venv/bin/nest-agent"
+  local advanced_reference="${KESTREL_HOME}/README.md#advanced-nest-agent-operation"
+
+  if is_true "$KESTREL_START_SERVER" && ! uses_default_kestrel_lifecycle_paths; then
+    cat <<EOF
+
+Kestrel install complete.
+
+The local web workbench is running at:
+  $(server_url)
+
+This service uses custom lifecycle metadata, which the everyday kestrel
+status, stop, and open commands do not own:
+  server PID: ${KESTREL_SERVER_PID}
+  supervisor PID: ${KESTREL_SERVER_SUPERVISOR_PID}
+  process group: ${KESTREL_SERVER_PROCESS_GROUP}
+  server log: ${KESTREL_SERVER_LOG}
+
+Use the process supervisor and metadata policy that supplied those paths for
+lifecycle management. Kestrel's advanced operator reference is:
+  ${advanced_cli} --help
+  ${advanced_reference}
+EOF
+    return 0
+  fi
+
   if is_true "$KESTREL_START_SERVER"; then
     cat <<EOF
 
@@ -2728,6 +2788,10 @@ Useful commands:
   kestrel chat
   kestrel doctor
   kestrel stop
+
+Advanced operator reference:
+  ${advanced_cli} --help
+  ${advanced_reference}
 EOF
     return 0
   fi
@@ -2744,6 +2808,10 @@ Other useful commands:
   kestrel chat
   kestrel doctor
   kestrel stop
+
+Advanced operator reference:
+  ${advanced_cli} --help
+  ${advanced_reference}
 EOF
 }
 
