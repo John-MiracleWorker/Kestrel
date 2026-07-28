@@ -191,6 +191,7 @@ jobs:
               or configuration.get("required_repeats") != 20
               or configuration.get("case_timeout_seconds") != 60.0
               or configuration.get("iteration_timeout_seconds") != 1500.0
+              or configuration.get("max_case_latency_ms") != 45000.0
           ):
               raise SystemExit("determinism receipt configuration is not release-qualified")
           if (

@@ -119,6 +119,7 @@ def test_production_release_requires_exact_sha_reliability_receipts_before_build
     assert "kestrel-determinism-${RELEASE_COMMIT_SHA}" in workflow
     assert 'report.get("schema") != "kestrel.determinism_eval_report.v2"' in workflow
     assert 'configuration.get("source_commit") != expected_sha' in workflow
+    assert 'configuration.get("max_case_latency_ms") != 45000.0' in workflow
     assert 'summary.get("completed_repeats") != 20' in workflow
 
 

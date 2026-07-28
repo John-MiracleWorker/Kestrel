@@ -36,6 +36,7 @@ def _golden_report(
     first_passed: bool = True,
     result_order: tuple[str, ...] = ("beta", "alpha"),
     latency_offset: float = 0.0,
+    max_case_latency_ms: float | None = None,
 ) -> dict[str, object]:
     results = []
     for index, name in enumerate(result_order):
@@ -54,6 +55,24 @@ def _golden_report(
                 "executed_tools": ["repo.map"],
             }
         )
+    latency_ms_max = max(float(item["latency_ms"]) for item in results)
+    latency_passed = (
+        latency_ms_max <= max_case_latency_ms
+        if max_case_latency_ms is not None
+        else None
+    )
+    latency_acceptance = {
+        "measurement_status": "measured",
+        "gate_configured": max_case_latency_ms is not None,
+        "required": max_case_latency_ms is not None,
+        "threshold_max_case_latency_ms": max_case_latency_ms,
+        "latency_ms_max": latency_ms_max,
+        "passed": latency_passed,
+    }
+    functional_passed = all(bool(item["passed"]) for item in results)
+    report_passed = functional_passed and (
+        latency_passed is True if max_case_latency_ms is not None else True
+    )
     return {
         "schema": "kestrel.golden_eval_report.v2",
         "configuration": {
@@ -61,26 +80,19 @@ def _golden_report(
             "provider": "mock",
             "model": "mock",
             "seed": 1729,
-            "max_case_latency_ms": None,
+            "max_case_latency_ms": max_case_latency_ms,
         },
         "results": results,
         "summary": {
             "pass_count": sum(bool(item["passed"]) for item in results),
             "fail_count": sum(not bool(item["passed"]) for item in results),
-            "latency_ms_max": max(float(item["latency_ms"]) for item in results),
+            "latency_ms_max": latency_ms_max,
             "context_chars_max": 3,
             "tool_count_total": len(results),
             "cost_estimate_usd_total": None,
             "categories": {},
             "acceptance": {
-                "latency": {
-                    "measurement_status": "measured",
-                    "gate_configured": False,
-                    "required": False,
-                    "threshold_max_case_latency_ms": None,
-                    "latency_ms_max": max(float(item["latency_ms"]) for item in results),
-                    "passed": None,
-                },
+                "latency": dict(latency_acceptance),
                 "cost": {
                     "measurement_status": "unmeasured",
                     "gate_configured": False,
@@ -98,16 +110,9 @@ def _golden_report(
         "acceptance": {
             "functional": {
                 "required": True,
-                "passed": all(bool(item["passed"]) for item in results),
+                "passed": functional_passed,
             },
-            "latency": {
-                "measurement_status": "measured",
-                "gate_configured": False,
-                "required": False,
-                "threshold_max_case_latency_ms": None,
-                "latency_ms_max": max(float(item["latency_ms"]) for item in results),
-                "passed": None,
-            },
+            "latency": dict(latency_acceptance),
             "cost": {
                 "measurement_status": "unmeasured",
                 "gate_configured": False,
@@ -119,7 +124,7 @@ def _golden_report(
                 "residual": "fixture",
             },
         },
-        "passed": all(bool(item["passed"]) for item in results),
+        "passed": report_passed,
     }
 
 
@@ -192,6 +197,47 @@ def test_determinism_report_fails_when_one_repeat_changes_outcome() -> None:
     assert report["reference_projection"]["cases"][0]["name"] == "alpha"
 
 
+def test_determinism_report_binds_the_invoked_latency_gate() -> None:
+    reports = [
+        _golden_report(max_case_latency_ms=45_000.0),
+        _golden_report(max_case_latency_ms=45_000.0),
+    ]
+
+    report = build_determinism_report(
+        reports,
+        required_repeats=2,
+        seed=1729,
+        max_case_latency_ms=45_000.0,
+        expected_case_categories=TEST_CASES,
+    )
+
+    assert report["passed"] is True
+    assert report["configuration"]["max_case_latency_ms"] == 45_000.0
+
+
+def test_determinism_report_rejects_a_missing_or_different_latency_gate() -> None:
+    with pytest.raises(ValueError, match="latency gate"):
+        build_determinism_report(
+            [_golden_report(), _golden_report()],
+            required_repeats=2,
+            seed=1729,
+            max_case_latency_ms=45_000.0,
+            expected_case_categories=TEST_CASES,
+        )
+
+    with pytest.raises(ValueError, match="latency gate"):
+        build_determinism_report(
+            [
+                _golden_report(max_case_latency_ms=30_000.0),
+                _golden_report(max_case_latency_ms=30_000.0),
+            ],
+            required_repeats=2,
+            seed=1729,
+            max_case_latency_ms=45_000.0,
+            expected_case_categories=TEST_CASES,
+        )
+
+
 def test_runner_isolates_each_repeat_and_writes_report_on_failure(tmp_path: Path) -> None:
     seen_roots: list[Path] = []
 
@@ -256,6 +302,24 @@ def test_runner_redacts_iteration_errors_from_machine_report(tmp_path: Path) -> 
     )
 
     assert secret not in output.read_text(encoding="utf-8")
+
+
+def test_runner_failure_receipt_preserves_required_latency_gate(tmp_path: Path) -> None:
+    def fail(_iteration: int, _memory: Path, _seed: int) -> dict[str, object]:
+        raise RuntimeError("injected runner failure")
+
+    report = run_determinism(
+        repeats=2,
+        seed=1729,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=fail,
+        expected_case_categories=TEST_CASES,
+        max_case_latency_ms=45_000.0,
+    )
+
+    assert report["passed"] is False
+    assert report["configuration"]["max_case_latency_ms"] == 45_000.0
 
 
 def test_runner_redacts_complete_imported_and_final_reports(tmp_path: Path) -> None:

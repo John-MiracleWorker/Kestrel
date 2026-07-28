@@ -3845,6 +3845,8 @@ def test_reviewed_patch_export_captures_staged_unstaged_deleted_and_untracked_by
     (tmp_path / "deleted.txt").unlink()
     (tmp_path / "new.txt").write_bytes(b"new untracked text\n")
     (tmp_path / "blob.bin").write_bytes(b"\x00reviewed\xffbinary\n")
+    (tmp_path / "foo bar.txt").write_bytes(b"reviewed spaced path\n")
+    (tmp_path / "café.txt").write_bytes(b"reviewed unicode path\n")
 
     validation_id = _successful_repair_validation_id(
         registry,
@@ -3886,8 +3888,10 @@ def test_reviewed_patch_export_captures_staged_unstaged_deleted_and_untracked_by
         b"deleted.txt",
         b"new.txt",
         b"blob.bin",
+        b"foo bar.txt",
     ):
         assert expected_path in patch_bytes
+    assert b"caf" in patch_bytes
     assert b"GIT binary patch" in patch_bytes
 
     application = tmp_path.parent / f"{tmp_path.name}-patch-application"
@@ -3913,6 +3917,8 @@ def test_reviewed_patch_export_captures_staged_unstaged_deleted_and_untracked_by
     assert not (application / "deleted.txt").exists()
     assert (application / "new.txt").read_bytes() == b"new untracked text\n"
     assert (application / "blob.bin").read_bytes() == b"\x00reviewed\xffbinary\n"
+    assert (application / "foo bar.txt").read_bytes() == b"reviewed spaced path\n"
+    assert (application / "café.txt").read_bytes() == b"reviewed unicode path\n"
 
 
 def test_exact_patch_renderer_enforces_disk_backed_output_cap(
@@ -3942,6 +3948,92 @@ def test_exact_patch_renderer_enforces_disk_backed_output_cap(
             maximum_stdout_bytes=1024,
             maximum_stderr_bytes=1024,
         )
+
+
+@pytest.mark.parametrize(
+    ("assigns", "resumes", "expected_error"),
+    (
+        (False, False, "could not attach"),
+        (True, False, "could not resume"),
+    ),
+)
+def test_windows_exact_patch_setup_failure_reaps_suspended_git_leader(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    assigns: bool,
+    resumes: bool,
+    expected_error: str,
+) -> None:
+    events: list[str] = []
+
+    class FakeProcess:
+        pid = 4242
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("parent-kill")
+            self.returncode = 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            events.append(f"parent-wait:{timeout}")
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(["git"], timeout)
+            return self.returncode
+
+    class FakeJob:
+        def assign(self, process_id: int) -> bool:
+            events.append(f"assign:{process_id}")
+            return assigns
+
+        def resume(self, process_id: int) -> bool:
+            events.append(f"resume:{process_id}")
+            return resumes
+
+        def terminate_and_wait(self, *, timeout_seconds: float) -> bool:
+            events.append(f"terminate:{timeout_seconds}")
+            return False
+
+        def close(self) -> bool:
+            events.append("close")
+            return True
+
+    def fake_popen(*_args: object, **kwargs: object) -> FakeProcess:
+        events.append(f"launch:{kwargs['creationflags']}")
+        return FakeProcess()
+
+    monkeypatch.setattr(git_tools.sys, "platform", "win32")
+    monkeypatch.setattr(git_tools, "create_windows_process_job", FakeJob)
+    monkeypatch.setattr(
+        git_tools,
+        "_hardened_git_command",
+        lambda arguments, *, workspace: ["git", *arguments],
+    )
+    monkeypatch.setattr(git_tools.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        git_tools._run_bounded_git_output(
+            tmp_path,
+            ["status", "--porcelain"],
+            environment={},
+            deadline=monotonic() + 5.0,
+            maximum_stdout_bytes=1024,
+            maximum_stderr_bytes=1024,
+        )
+
+    assert int(events[0].partition(":")[2]) & 0x00000004
+    assert events[1] == "assign:4242"
+    if assigns:
+        assert events[2] == "resume:4242"
+        assert any(event.startswith("terminate:") for event in events)
+    else:
+        assert not any(event.startswith("resume:") for event in events)
+        assert not any(event.startswith("terminate:") for event in events)
+    assert "parent-kill" in events
+    assert any(event.startswith("parent-wait:") for event in events)
+    assert events[-1] == "close"
 
 
 def test_reviewed_patch_export_rejects_post_review_drift(

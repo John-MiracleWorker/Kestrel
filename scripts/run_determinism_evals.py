@@ -134,6 +134,7 @@ def build_determinism_report(
     *,
     required_repeats: int,
     seed: int,
+    max_case_latency_ms: float | None = None,
     expected_case_categories: Mapping[str, str] = GOLDEN_CASE_CATEGORIES,
     source_commit: str | None = None,
     case_timeout_seconds: float | None = None,
@@ -141,9 +142,19 @@ def build_determinism_report(
 ) -> dict[str, object]:
     if required_repeats < 2:
         raise ValueError("determinism evaluation requires at least two repeats")
+    if max_case_latency_ms is not None and max_case_latency_ms <= 0:
+        raise ValueError("determinism latency gate must be greater than zero")
     derived_passes: list[bool] = []
     projections: list[dict[str, object]] = []
     for report in reports:
+        configuration = report.get("configuration")
+        if (
+            not isinstance(configuration, dict)
+            or configuration.get("max_case_latency_ms") != max_case_latency_ms
+        ):
+            raise ValueError(
+                "golden report latency gate does not match the determinism invocation"
+            )
         derived_passes.append(
             validate_golden_report(
                 report,
@@ -192,6 +203,7 @@ def build_determinism_report(
                     "source_commit": source_commit,
                     "case_timeout_seconds": case_timeout_seconds,
                     "iteration_timeout_seconds": iteration_timeout_seconds,
+                    "max_case_latency_ms": max_case_latency_ms,
                 },
                 "summary": summary,
                 "differing_cases": _differing_cases(projections),
@@ -232,6 +244,7 @@ def _failure_report(
     seed: int,
     error: str,
     expected_case_categories: Mapping[str, str],
+    max_case_latency_ms: float | None,
 ) -> dict[str, object]:
     results: list[dict[str, object]] = [
         {
@@ -260,11 +273,11 @@ def _failure_report(
     }
     latency = {
         "measurement_status": "measured",
-        "gate_configured": False,
-        "required": False,
-        "threshold_max_case_latency_ms": None,
+        "gate_configured": max_case_latency_ms is not None,
+        "required": max_case_latency_ms is not None,
+        "threshold_max_case_latency_ms": max_case_latency_ms,
         "latency_ms_max": 0.0,
-        "passed": None,
+        "passed": True if max_case_latency_ms is not None else None,
     }
     return {
         "schema": GOLDEN_REPORT_SCHEMA,
@@ -273,7 +286,7 @@ def _failure_report(
             "provider": "mock",
             "model": "mock",
             "seed": seed,
-            "max_case_latency_ms": None,
+            "max_case_latency_ms": max_case_latency_ms,
         },
         "results": results,
         "summary": {
@@ -332,6 +345,7 @@ def run_determinism(
     invoke: IterationRunner,
     expected_case_categories: Mapping[str, str] = GOLDEN_CASE_CATEGORIES,
     source_commit: str | None = None,
+    max_case_latency_ms: float | None = None,
     case_timeout_seconds: float | None = None,
     iteration_timeout_seconds: float | None = None,
 ) -> dict[str, object]:
@@ -341,6 +355,8 @@ def run_determinism(
         raise ValueError(f"seed must be between 0 and {MAX_PYTHON_HASH_SEED}")
     if source_commit is not None and not _COMMIT_RE.fullmatch(source_commit):
         raise ValueError("source commit must be a 40-character lowercase hexadecimal SHA")
+    if max_case_latency_ms is not None and max_case_latency_ms <= 0:
+        raise ValueError("determinism latency gate must be greater than zero")
     run_root = run_root.expanduser().resolve(strict=False)
     if run_root.exists():
         raise ValueError(f"run root must not already exist: {run_root}")
@@ -376,6 +392,7 @@ def run_determinism(
                 seed=seed,
                 error=str(receipt["error"]),
                 expected_case_categories=expected_case_categories,
+                max_case_latency_ms=max_case_latency_ms,
             )
         except Exception as exc:  # noqa: BLE001 - preserve a fail-closed receipt
             receipt.update(
@@ -388,6 +405,7 @@ def run_determinism(
                 seed=seed,
                 error=str(receipt["error"]),
                 expected_case_categories=expected_case_categories,
+                max_case_latency_ms=max_case_latency_ms,
             )
         _write_json(repeat_root / "iteration-receipt.json", receipt)
         reports.append(report)
@@ -395,6 +413,7 @@ def run_determinism(
             reports,
             required_repeats=repeats,
             seed=seed,
+            max_case_latency_ms=max_case_latency_ms,
             expected_case_categories=expected_case_categories,
             source_commit=source_commit,
             case_timeout_seconds=case_timeout_seconds,
@@ -576,6 +595,7 @@ def main() -> int:
                 iteration_timeout_seconds=args.iteration_timeout_seconds,
             ),
             source_commit=args.source_commit,
+            max_case_latency_ms=args.max_case_latency_ms,
             case_timeout_seconds=args.case_timeout_seconds,
             iteration_timeout_seconds=args.iteration_timeout_seconds,
         )

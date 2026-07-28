@@ -646,22 +646,13 @@ class GitExportPatchTool(AgentTool):
                         ),
                         error="git_export_sensitive_content",
                     )
-                try:
-                    _validate_patch_paths(
-                        root,
-                        patch_text,
-                        context=context,
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    return self._result(
-                        call,
-                        success=False,
-                        content=(
-                            "The exact reviewed patch includes a protected workspace "
-                            "path; nothing was written."
-                        ),
-                        error="git_export_path_blocked",
-                    )
+                # This patch is rendered by Kestrel from the authenticated
+                # manifest above, rather than accepted as caller-controlled
+                # patch text. The manifest paths have already passed the
+                # project capability check and are re-read without symlink
+                # traversal by `_render_exact_reviewed_patch`. Re-parsing
+                # Git's human-oriented diff headers here is both redundant
+                # and incorrect for ordinary quoted Unicode or spaced paths.
 
                 final_check = _validate_repair_review_gate(
                     root,
@@ -1546,6 +1537,7 @@ def _run_bounded_git_output(
 
     command = _hardened_git_command(arguments, workspace=workspace)
     windows_job = create_windows_process_job() if sys.platform == "win32" else None
+    windows_job_assigned = False
     process: subprocess.Popen[bytes] | None = None
     failure: BaseException | None = None
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
@@ -1573,6 +1565,7 @@ def _run_bounded_git_output(
                     raise RuntimeError(
                         "Windows patch-export containment could not attach the Git process."
                     )
+                windows_job_assigned = True
                 if not windows_job.resume(process.pid):
                     raise RuntimeError(
                         "Windows patch-export containment could not resume the Git process."
@@ -1604,6 +1597,7 @@ def _run_bounded_git_output(
                 settled = _settle_git_process_tree(
                     process,
                     windows_job=windows_job,
+                    windows_job_assigned=windows_job_assigned,
                 )
                 if not settled and failure is None:
                     failure = RuntimeError(
@@ -1630,14 +1624,23 @@ def _settle_git_process_tree(
     process: subprocess.Popen[bytes],
     *,
     windows_job: Any,
+    windows_job_assigned: bool = False,
 ) -> bool:
     if windows_job is not None:
-        settled = windows_job.terminate_and_wait(timeout_seconds=2.0)
+        if not windows_job_assigned:
+            return _kill_git_parent_and_wait(process)
+        settled = bool(windows_job.terminate_and_wait(timeout_seconds=2.0))
         try:
             process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
-            return False
-        return bool(settled)
+            parent_settled = _kill_git_parent_and_wait(process)
+            return settled and parent_settled
+        if settled:
+            return True
+        # A failed Job Object proof must still reap the leader so assignment or
+        # resume failures cannot strand a suspended process.
+        _kill_git_parent_and_wait(process)
+        return False
     deadline = time.monotonic() + 2.0
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -1668,6 +1671,22 @@ def _settle_git_process_tree(
     except subprocess.TimeoutExpired:
         return False
     return True
+
+
+def _kill_git_parent_and_wait(process: subprocess.Popen[bytes]) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        return False
+    return process.poll() is not None
 
 
 def _git_alternate_object_path(path: Path) -> str:

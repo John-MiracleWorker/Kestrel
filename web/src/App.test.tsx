@@ -57,6 +57,68 @@ const otherRun: Run = {
   updated_at: "2026-05-16T00:05:01Z"
 };
 
+function projectedRepairAuthority(seed: string, reviewTitle: string) {
+  const validationId = `repair_validation_${seed.repeat(24)}`;
+  const reviewId = `repair_review_${seed.repeat(24)}`;
+  const snapshot = {
+    branch: `kestrel/worker/run-${seed}/repair`,
+    head_sha: seed.repeat(40),
+    diff_digest: seed.repeat(64)
+  };
+  return {
+    validationId,
+    reviewId,
+    snapshot,
+    tasks: [
+      {
+        task_id: `validate-${seed}`,
+        title: "Validate repair",
+        goal: "Validate exact repair candidate",
+        profile: "worker",
+        status: "completed",
+        approved: true,
+        required_tools: ["repair.validate"],
+        risk: "high",
+        attempt_count: 1,
+        result: {
+          repair_artifact: {
+            schema_version: 1,
+            tool: "repair.validate",
+            validation_id: validationId,
+            success: true,
+            repair_snapshot: snapshot
+          }
+        }
+      },
+      {
+        task_id: `review-${seed}`,
+        title: reviewTitle,
+        goal: "Create durable review artifact",
+        profile: "reviewer",
+        status: "completed",
+        approved: true,
+        required_tools: ["repair.review"],
+        risk: "medium",
+        attempt_count: 1,
+        result: {
+          repair_artifact: {
+            schema_version: 1,
+            tool: "repair.review",
+            validation_id: validationId,
+            review_id: reviewId,
+            repair_snapshot: snapshot,
+            changed_files: ["src/calculator.py"],
+            commit_gate: {
+              commit_allowed: true,
+              approval_required_before_commit: true
+            }
+          }
+        }
+      }
+    ]
+  };
+}
+
 const pendingApproval: Approval = {
   approval_id: "approval_1",
   run_id: "run_2",
@@ -914,6 +976,7 @@ describe("App", () => {
               schema_version: 1,
               tool: "repair.validate",
               validation_id: validationId,
+              success: true,
               repair_snapshot: repairSnapshot
             }
           }
@@ -1001,7 +1064,7 @@ describe("App", () => {
   });
 
   it("treats an explicit failed repair validation as authoritative over artifact fallback", async () => {
-    const validationId = "repair_validation_failed_aaaaaaaaaaaaaa";
+    const validationId = `repair_validation_${"f".repeat(24)}`;
     const repairRun: Run = {
       ...baseRun,
       run_id: "run_repairfailedvalidation",
@@ -1034,15 +1097,11 @@ describe("App", () => {
         risk: "high",
         attempt_count: 1,
         result: {
-          validation: {
-            success: false,
-            validation_id: validationId,
-            command: ["pytest", "-q"]
-          },
           repair_artifact: {
             schema_version: 1,
             tool: "repair.validate",
             validation_id: validationId,
+            success: false,
             repair_snapshot: {
               branch: "kestrel/worker/run-repair-failed/repair",
               head_sha: "2222222222222222222222222222222222222222",
@@ -1062,7 +1121,8 @@ describe("App", () => {
 
     const panel = await screen.findByLabelText("Repair Patch Review");
     expect(within(panel).getByText("Validation failed")).toBeInTheDocument();
-    expect(within(panel).getByText("Validation failed: pytest -q")).toBeInTheDocument();
+    expect(within(panel).getByText(`Validation failed: ${validationId}`)).toBeInTheDocument();
+    expect(within(panel).queryByText("pytest -q")).not.toBeInTheDocument();
     expect(within(panel).queryByText("Validation passed")).not.toBeInTheDocument();
   });
 
@@ -1090,6 +1150,7 @@ describe("App", () => {
     ];
     sessionRuns = { session_repair_actions: [repairRun] };
     approvals = [];
+    const actionAuthority = projectedRepairAuthority("3", "Review repair before commit");
     toolsPayload = [
       ...toolsPayload,
       { name: "git.commit", description: "Commit reviewed repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["git"], enabled: true, enablement_flag: null },
@@ -1097,23 +1158,7 @@ describe("App", () => {
     ];
     taskGraphs.run_repairactions = {
       tasks: [
-        {
-          task_id: "review",
-          title: "Review repair before commit",
-          goal: "Create durable review artifact",
-          profile: "reviewer",
-          status: "completed",
-          approved: true,
-          required_tools: ["repair.review"],
-          risk: "medium",
-          attempt_count: 1,
-          result: {
-            review_id: "review_action123",
-            diff_hash: "feedfacecafebeef",
-            changed_files: ["src/calculator.py"],
-            commit_gate: { approval_required_before_commit: true }
-          }
-        },
+        ...actionAuthority.tasks,
         {
           task_id: "rollback",
           title: "Rollback stale repair",
@@ -1146,21 +1191,26 @@ describe("App", () => {
     expect(screen.getByLabelText("Tool")).toHaveValue("git.commit");
     const toolArgsInput = screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement;
     const commitArgs = JSON.parse(toolArgsInput.value);
-    expect(commitArgs).toMatchObject({ repair_review_id: "review_action123" });
-    expect(String(commitArgs.message)).toContain("review_action123");
+    expect(commitArgs).toMatchObject({ repair_review_id: actionAuthority.reviewId });
+    expect(String(commitArgs.message)).toContain(actionAuthority.reviewId);
     let preview = screen.getByLabelText("Exact-call approval preview");
     expect(within(preview).getByText("Prepared exact-call request: git.commit")).toBeInTheDocument();
     expect(within(preview).getByText("Invoking this request will create or require approval before execution; it has not run yet.")).toBeInTheDocument();
     expect(within(preview).getByRole("link", { name: /review prepared request in tool form/i })).toHaveAttribute("href", "#tools");
-    expect(within(preview).getByText(/review_action123/)).toBeInTheDocument();
+    expect(within(preview).getByText(new RegExp(actionAuthority.reviewId))).toBeInTheDocument();
 
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));
     expect(screen.getByLabelText("Tool")).toHaveValue("repair.rollback");
     const rollbackArgs = JSON.parse(toolArgsInput.value);
-    expect(rollbackArgs).toMatchObject({ review_id: "review_action123", reason: "Rollback reviewed repair review_action123" });
+    expect(rollbackArgs).toMatchObject({
+      review_id: actionAuthority.reviewId,
+      reason: `Rollback reviewed repair ${actionAuthority.reviewId}`
+    });
     preview = screen.getByLabelText("Exact-call approval preview");
     expect(within(preview).getByText("Prepared exact-call request: repair.rollback")).toBeInTheDocument();
-    expect(within(preview).getByText(/Rollback reviewed repair review_action123/)).toBeInTheDocument();
+    expect(within(preview).getByText(
+      new RegExp(`Rollback reviewed repair ${actionAuthority.reviewId}`)
+    )).toBeInTheDocument();
     expect(fetchSpy.mock.calls.some(([path, init]) => String(path).includes("/api/tools/") && init?.method === "POST")).toBe(false);
   });
 
@@ -1192,30 +1242,13 @@ describe("App", () => {
     sessionRuns = { session_repair_approval: [repairRun] };
     runs = [repairRun];
     approvals = [];
+    const commitAuthority = projectedRepairAuthority("4", "Review repair before commit");
     toolsPayload = [
       ...toolsPayload,
       { name: "git.commit", description: "Commit reviewed repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["git"], enabled: true, enablement_flag: null }
     ];
     taskGraphs.run_repairapproval = {
-      tasks: [
-        {
-          task_id: "review",
-          title: "Review repair before commit",
-          goal: "Create durable review artifact",
-          profile: "reviewer",
-          status: "completed",
-          approved: true,
-          required_tools: ["repair.review"],
-          risk: "medium",
-          attempt_count: 1,
-          result: {
-            review_id: "review_approval123",
-            diff_hash: "feedfacecafebeef",
-            changed_files: ["src/calculator.py"],
-            commit_gate: { approval_required_before_commit: true }
-          }
-        }
-      ],
+      tasks: commitAuthority.tasks,
       ready_tasks: [],
       approval_blocked_tasks: [],
       subagents: []
@@ -1245,7 +1278,9 @@ describe("App", () => {
     const approvalCard = await screen.findByRole("group", { name: /approval for git.commit/i });
     expect(within(approvalCard).getByText("git.commit")).toBeInTheDocument();
     expect(within(approvalCard).getByText(/High risk/i)).toBeInTheDocument();
-    expect(within(approvalCard).getByText(/review_approval123/)).toBeInTheDocument();
+    expect(within(approvalCard).getByText(
+      new RegExp(commitAuthority.reviewId)
+    )).toBeInTheDocument();
     expect(within(approvalCard).getByText(new RegExp(String(preparedArgs.message)))).toBeInTheDocument();
   });
 
@@ -1277,29 +1312,14 @@ describe("App", () => {
     sessionRuns = { session_rollback_approval: [repairRun] };
     runs = [repairRun];
     approvals = [];
+    const rollbackAuthority = projectedRepairAuthority("5", "Review repair before rollback");
     toolsPayload = [
       ...toolsPayload,
       { name: "repair.rollback", description: "Rollback repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["safe-repair"], enabled: true, enablement_flag: null }
     ];
     taskGraphs.run_rollbackapproval = {
       tasks: [
-        {
-          task_id: "review",
-          title: "Review repair before rollback",
-          goal: "Confirm durable repair review artifact",
-          profile: "reviewer",
-          status: "completed",
-          approved: true,
-          required_tools: ["repair.review"],
-          risk: "medium",
-          attempt_count: 1,
-          result: {
-            review_id: "review_rollback123",
-            diff_hash: "feedfacecafebeef",
-            changed_files: ["src/calculator.py"],
-            commit_gate: { approval_required_before_commit: true }
-          }
-        },
+        ...rollbackAuthority.tasks,
         {
           task_id: "rollback",
           title: "Rollback stale repair",
@@ -1346,7 +1366,9 @@ describe("App", () => {
     const approvalCard = await screen.findByRole("group", { name: /approval for repair.rollback/i });
     expect(within(approvalCard).getByText("repair.rollback")).toBeInTheDocument();
     expect(within(approvalCard).getByText(/High risk/i)).toBeInTheDocument();
-    expect(within(approvalCard).getByText(/review_rollback123/)).toBeInTheDocument();
+    expect(within(approvalCard).getByText(
+      new RegExp(rollbackAuthority.reviewId)
+    )).toBeInTheDocument();
     expect(within(approvalCard).getByText(new RegExp(String(preparedArgs.reason)))).toBeInTheDocument();
   });
 
