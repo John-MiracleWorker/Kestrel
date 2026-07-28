@@ -6,6 +6,7 @@ import shlex
 import socket
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -140,8 +141,6 @@ class SystemProcessInspector:
                 "-o",
                 "state=",
                 "-o",
-                "lstart=",
-                "-o",
                 "command=",
             ],
             check=False,
@@ -150,15 +149,17 @@ class SystemProcessInspector:
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
-        parts = result.stdout.strip().split(None, 8)
-        if len(parts) != 9:
+        parts = result.stdout.strip().split(None, 3)
+        if len(parts) != 4:
             raise ServiceControlError(
                 f"Could not parse process identity for PID {pid}.",
                 code="process_inspection_failed",
                 recovery="Run `kestrel doctor` and inspect the process manually.",
             )
-        uid_text, pgid_text, state, *identity_parts, command_text = parts
-        birth_marker = self._birth_marker(pid, " ".join(identity_parts))
+        uid_text, pgid_text, state, command_text = parts
+        birth_marker = self._birth_marker(pid)
+        if birth_marker is None:
+            return None
         try:
             uid = int(uid_text)
             pgid = int(pgid_text)
@@ -346,8 +347,20 @@ class SystemProcessInspector:
             recovery="Run `kestrel doctor` and inspect the process manually.",
         )
 
-    def _birth_marker(self, pid: int, fallback: str) -> str:
-        """Return the highest-resolution creation marker the OS exposes."""
+    def _birth_marker(self, pid: int, _legacy_fallback: str | None = None) -> str | None:
+        """Return a strong process-start identity, or ``None`` if it vanished."""
+        if sys.platform == "darwin":
+            marker = _darwin_process_birth_marker(pid)
+            if marker is None:
+                return None
+            seconds, microseconds = marker
+            return f"darwin-proc-start:{seconds}:{microseconds:06d}"
+        if not sys.platform.startswith("linux"):
+            raise ServiceControlError(
+                f"Could not determine a stable process birth marker for PID {pid}.",
+                code="process_inspection_failed",
+                recovery="Run `kestrel doctor` and inspect the process manually.",
+            )
         proc_stat = Path("/proc") / str(pid) / "stat"
         try:
             remainder = proc_stat.read_text(encoding="ascii").rsplit(") ", 1)[1]
@@ -355,15 +368,97 @@ class SystemProcessInspector:
             start_ticks = fields[19]
             if start_ticks.isdigit():
                 return f"proc-start-ticks:{start_ticks}"
-        except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError):
+        except FileNotFoundError:
+            return None
+        except (IndexError, OSError, UnicodeDecodeError):
             pass
-        if fallback:
-            return f"ps-lstart:{fallback}"
         raise ServiceControlError(
             f"Could not determine a stable process birth marker for PID {pid}.",
             code="process_inspection_failed",
             recovery="Run `kestrel doctor` and inspect the process manually.",
         )
+
+
+def _darwin_process_birth_marker(pid: int) -> tuple[int, int] | None:
+    """Read a Darwin process birth time directly from libproc.
+
+    ``ps lstart`` has only second resolution and must never identify a
+    process during signal escalation.  Importing ctypes and loading libproc
+    happens exclusively on the Darwin path above.
+    """
+    import ctypes
+    import errno
+
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError as exc:
+        raise ServiceControlError(
+            f"Could not load Darwin process inspection for PID {pid}.",
+            code="process_inspection_failed",
+            recovery="Run `kestrel doctor` and inspect the process manually.",
+        ) from exc
+    proc_pidinfo = libproc.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    info = ProcBsdInfo()
+    received = proc_pidinfo(
+        pid,
+        3,  # PROC_PIDTBSDINFO
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if received != ctypes.sizeof(info):
+        if received <= 0 and ctypes.get_errno() == errno.ESRCH:
+            return None
+        raise ServiceControlError(
+            f"Could not read a complete Darwin process identity for PID {pid}.",
+            code="process_inspection_failed",
+            recovery="Run `kestrel doctor` and inspect the process manually.",
+        )
+    if (
+        info.pbi_pid != pid
+        or info.pbi_start_tvsec <= 0
+        or not 0 <= info.pbi_start_tvusec < 1_000_000
+    ):
+        raise ServiceControlError(
+            f"Received an invalid Darwin process identity for PID {pid}.",
+            code="process_inspection_failed",
+            recovery="Run `kestrel doctor` and inspect the process manually.",
+        )
+    return int(info.pbi_start_tvsec), int(info.pbi_start_tvusec)
 
 
 def resolve_kestrel_home(
@@ -1986,13 +2081,32 @@ def _same_process_identity(
     current: ProcessSnapshot,
 ) -> bool:
     return (
-        expected.pid == current.pid
+        _strong_birth_marker(expected.birth_marker)
+        and _strong_birth_marker(current.birth_marker)
+        and expected.pid == current.pid
         and expected.uid == current.uid
         and expected.cwd.resolve() == current.cwd.resolve()
         and expected.command == current.command
         and expected.pgid == current.pgid
         and expected.birth_marker == current.birth_marker
     )
+
+
+def _strong_birth_marker(marker: str) -> bool:
+    if marker.startswith("proc-start-ticks:"):
+        return marker.removeprefix("proc-start-ticks:").isdigit()
+    if marker.startswith("darwin-proc-start:"):
+        seconds, separator, microseconds = marker.removeprefix(
+            "darwin-proc-start:"
+        ).partition(":")
+        return (
+            bool(separator)
+            and seconds.isdigit()
+            and microseconds.isdigit()
+            and len(microseconds) == 6
+            and int(microseconds) < 1_000_000
+        )
+    return False
 
 
 def _identity_changed(pid: int) -> ServiceControlError:

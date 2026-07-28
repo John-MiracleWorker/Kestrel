@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -142,6 +144,7 @@ def _server_snapshot(paths: Any, *, pid: int = 201, **changes: object) -> Proces
         command=command,
         pgid=pid,
         state="S",
+        birth_marker=f"proc-start-ticks:{pid * 100}",
     )
     return replace(snapshot, **changes)
 
@@ -172,6 +175,7 @@ def _supervisor_snapshot(
         ),
         pgid=pid,
         state="S",
+        birth_marker=f"proc-start-ticks:{pid * 100}",
     )
 
 
@@ -1076,9 +1080,9 @@ def test_startup_timeout_hard_kills_only_an_unchanged_verified_supervisor(
     now = [0.0]
 
     def launch(_command: list[str], **_kwargs: object) -> object:
-        server = _server_snapshot(paths, birth_marker="server-birth")
+        server = _server_snapshot(paths, birth_marker="proc-start-ticks:20100")
         supervisor = _supervisor_snapshot(paths, server)
-        supervisor = replace(supervisor, birth_marker="supervisor-birth")
+        supervisor = replace(supervisor, birth_marker="proc-start-ticks:20000")
         write_private_text(paths.supervisor_pid_path, f"{supervisor.pid}\n")
         inspector.processes = {supervisor.pid: supervisor}
         return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
@@ -1245,7 +1249,7 @@ def test_stop_refuses_hard_kill_when_same_shaped_pid_was_reused(
 ) -> None:
     """A PID's command and group can be reused, but its birth marker cannot."""
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
-    server = _server_snapshot(paths, birth_marker="first-start")
+    server = _server_snapshot(paths, birth_marker="proc-start-ticks:1001")
     inspector = FakeInspector(
         processes={server.pid: server},
         listeners=(_listener(paths, server.pid),),
@@ -1259,10 +1263,42 @@ def test_stop_refuses_hard_kill_when_same_shaped_pid_was_reused(
             assert (kind, identifier) == ("pid", server.pid)
             inspector.processes[server.pid] = replace(
                 server,
-                birth_marker="reused-pid",
+                birth_marker="proc-start-ticks:1002",
             )
 
     signaler = FakeSignaler(on_signal)
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        ServiceController(
+            paths,
+            inspector=inspector,
+            client=FakeClient(ServerProbe(True, True, False)),
+            signaler=signaler,
+        ).stop(
+            grace_timeout=0.5,
+            kill_timeout=0.5,
+            poll_interval=0.25,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+    assert exc_info.value.code == "identity_changed"
+    assert signaler.calls == [("pid", server.pid, signal.SIGTERM)]
+
+
+def test_stop_refuses_hard_kill_without_a_strong_birth_marker(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths, birth_marker="")
+    inspector = FakeInspector(
+        processes={server.pid: server},
+        listeners=(_listener(paths, server.pid),),
+        live_groups=frozenset({server.pgid}),
+        bindable=False,
+    )
+    now = [0.0]
+    signaler = FakeSignaler()
 
     with pytest.raises(ServiceControlError) as exc_info:
         ServiceController(
@@ -1383,6 +1419,99 @@ def test_system_process_inspector_treats_a_process_that_vanishes_during_cwd_look
     )
 
     assert inspector.process(200) is None
+
+
+def test_darwin_birth_marker_uses_microseconds_to_reject_same_second_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspector = SystemProcessInspector()
+    markers = iter(((1_753_718_200, 101), (1_753_718_200, 102)))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        service_control,
+        "_darwin_process_birth_marker",
+        lambda _pid: next(markers),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"{os.getuid()} 200 S Mon Jul 28 10:10:10 2026 /bin/sleep 30\n",
+        ),
+    )
+    monkeypatch.setattr(inspector, "_process_cwd", lambda _pid: Path("/tmp"))
+
+    expected = inspector.process(200)
+    current = inspector.process(200)
+
+    assert expected is not None
+    assert current is not None
+    assert expected.birth_marker == "darwin-proc-start:1753718200:000101"
+    assert current.birth_marker == "darwin-proc-start:1753718200:000102"
+    assert not service_control._same_process_identity(expected, current)
+
+
+class _ShortProcPidInfo:
+    argtypes: object | None = None
+    restype: object | None = None
+
+    def __call__(self, *_args: object) -> int:
+        return 1
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "short_result"])
+def test_darwin_birth_marker_fails_closed_when_libproc_cannot_prove_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    class FakeLibproc:
+        proc_pidinfo = _ShortProcPidInfo()
+
+    if failure == "unavailable":
+        def load_libproc(*_args: object, **_kwargs: object) -> object:
+            raise OSError("libproc unavailable")
+    else:
+        def load_libproc(*_args: object, **_kwargs: object) -> object:
+            return FakeLibproc()
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", load_libproc)
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        SystemProcessInspector()._birth_marker(200, "Mon Jul 28 10:10:10 2026")
+
+    assert exc_info.value.code == "process_inspection_failed"
+
+
+def test_linux_birth_marker_uses_proc_start_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        service_control.Path,
+        "read_text",
+        lambda _self, **_kwargs: (
+            "200 (sleep) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 987654\n"
+        ),
+    )
+
+    assert (
+        SystemProcessInspector()._birth_marker(200, "unused")
+        == "proc-start-ticks:987654"
+    )
+
+
+def test_unsupported_platform_birth_marker_fails_closed_without_proc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "freebsd13")
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        SystemProcessInspector()._birth_marker(200, "Mon Jul 28 10:10:10 2026")
+
+    assert exc_info.value.code == "process_inspection_failed"
 
 
 def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None:
