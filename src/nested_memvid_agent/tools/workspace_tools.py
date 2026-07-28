@@ -401,6 +401,22 @@ def _assert_workspace_path_allowed(
     )
     if _workspace_path_is_private(context, path):
         raise ValueError("Access to the configured secret store is not allowed.")
+    root = context.workspace.resolve()
+    try:
+        relative = path.resolve(strict=False).relative_to(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("Workspace path is outside the configured project root.") from exc
+    allowed_paths = context.allowed_paths or (".",)
+    if "." in allowed_paths:
+        return
+    for allowed in allowed_paths:
+        allowed_root = Path(allowed)
+        if relative == allowed_root or allowed_root in relative.parents:
+            return
+    rendered = relative.as_posix() or "."
+    raise ValueError(
+        f"Workspace path {rendered!r} is outside the project allowed paths."
+    )
 
 
 def _assert_opened_file_is_not_secret_store(

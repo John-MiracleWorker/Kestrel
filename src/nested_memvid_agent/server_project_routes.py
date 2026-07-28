@@ -11,7 +11,7 @@ from .projects import (
     export_project,
     import_project_document,
 )
-from .server_capability_routes import _catalog
+from .server_capability_routes import _affected_tool_names, _catalog
 from .server_models import (
     ProjectCreateRequest,
     ProjectImportRequest,
@@ -142,6 +142,7 @@ def register_project_routes(
         request: ProjectUpdateRequest,
     ) -> dict[str, Any]:
         require_owner_api()
+        before = project_or_404(project_id)
         fields = request.model_dump(exclude_unset=True)
         expected_revision = int(fields.pop("expected_revision"))
         for recipe_field in ("test_recipes", "build_recipes"):
@@ -157,7 +158,7 @@ def register_project_routes(
             fields["capability_ceiling"] = tuple(fields["capability_ceiling"])
         if fields.get("repository_path") is not None:
             fields["repository_path"] = Path(str(fields["repository_path"]))
-        return mutation(
+        updated = mutation(
             lambda: state.update_project(
                 project_id,
                 expected_revision=expected_revision,
@@ -165,6 +166,28 @@ def register_project_routes(
                 **fields,
             )
         )
+        removed = set(before.capability_ceiling) - set(
+            str(item) for item in updated["capability_ceiling"]
+        )
+        affected_tools: set[str] = set()
+        for key in removed:
+            kind, _, capability_id = key.partition(":")
+            affected_tools.update(_affected_tool_names(runs, kind, capability_id))
+        project_run_ids = {
+            run.run_id
+            for run in state.list_runs()
+            if run.project_id == project_id
+        }
+        updated["revoked_approvals"] = (
+            runs.revoke_pending_approvals_for_tools(
+                affected_tools,
+                reason="project_capability_ceiling_narrowed",
+                run_ids=project_run_ids,
+            )
+            if affected_tools
+            else 0
+        )
+        return updated
 
     @app.delete("/api/projects/{project_id}")  # type: ignore[untyped-decorator]
     def archive_project(

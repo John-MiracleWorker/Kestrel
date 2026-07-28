@@ -22,6 +22,8 @@ class ToolContext:
     event_log: JsonlEventLog | None = None
     session_id: str = "default"
     run_id: str | None = None
+    project_id: str | None = None
+    allowed_paths: tuple[str, ...] = (".",)
     execution_origin: str = "standalone"
     approval_handler: ApprovalHandler | None = None
     approved_tool_call_ids: frozenset[str] = frozenset()

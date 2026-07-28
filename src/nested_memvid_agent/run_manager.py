@@ -6,7 +6,7 @@ import os
 import re
 import subprocess  # nosec B404
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -90,6 +90,8 @@ _REPAIR_ROLLBACK_ID_RE = re.compile(r"repair_rollback_[0-9a-f]{24}")
 _REPAIR_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
 _GIT_OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_MISSION_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_MISSION_RISK_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
 def _agent_has_unsettled_tool_executions(agent: Any) -> bool:
@@ -1280,12 +1282,25 @@ class RunManager:
         message: str,
         session_id: str | None = None,
         workspace: Path | None = None,
+        project_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
         autonomy_mode: str = "background",
         source: TurnSource | None = None,
+        mission_plan: Sequence[Mapping[str, Any]] | None = None,
     ) -> RunRecord:
         self._require_mutable_runtime("create_run")
+        resolved_workspace = workspace
+        if project_id is not None:
+            project = self.state.get_project(project_id)
+            if project.archived_at is not None:
+                raise ValueError("cannot bind a new run to an archived project")
+            if resolved_workspace is None:
+                resolved_workspace = Path(project.repository_path)
+        normalized_mission_plan = self._validate_mission_plan(
+            mission_plan,
+            project_id=project_id,
+        )
         run_id = f"run_{uuid4().hex}"
         turn_source, turn_origin, transcript_scope = _serialize_run_provenance(source)
         resolved_session_id = session_id or (
@@ -1301,14 +1316,128 @@ class RunManager:
             run_id=run_id,
             message=message,
             session_id=resolved_session_id,
-            workspace=workspace,
+            workspace=resolved_workspace,
+            project_id=project_id,
             provider=provider,
             model=model,
             autonomy_mode=autonomy_mode,
             turn_source=turn_source,
             turn_origin=turn_origin,
             transcript_scope=transcript_scope,
+            mission_plan=normalized_mission_plan,
         )
+
+    def _validate_mission_plan(
+        self,
+        mission_plan: Sequence[Mapping[str, Any]] | None,
+        *,
+        project_id: str | None,
+    ) -> tuple[dict[str, Any], ...]:
+        if mission_plan is None:
+            return ()
+        if project_id is None:
+            raise ValueError("mission_plan requires a project-bound run")
+        if isinstance(mission_plan, (str, bytes)) or not 1 <= len(mission_plan) <= 12:
+            raise ValueError("mission_plan must contain between 1 and 12 tasks")
+
+        project = self.state.get_project(project_id)
+        allowed_capabilities = set(project.capability_ceiling)
+        registry = self.build_registry()
+        normalized: list[dict[str, Any]] = []
+        task_ids: set[str] = set()
+        for raw in mission_plan:
+            if not isinstance(raw, Mapping):
+                raise ValueError("mission_plan tasks must be objects")
+            task_id = str(raw.get("task_id", "")).strip()
+            if _MISSION_TASK_ID_RE.fullmatch(task_id) is None or task_id == "root":
+                raise ValueError("mission task_id is invalid or reserved")
+            if task_id in task_ids:
+                raise ValueError("mission task_id values must be unique")
+            task_ids.add(task_id)
+            title = _bounded_mission_text(
+                raw.get("title"),
+                field_name="mission task title",
+                maximum=512,
+            )
+            rationale = _bounded_mission_text(
+                raw.get("rationale"),
+                field_name="mission task rationale",
+                maximum=4_096,
+            )
+            dependencies = _mission_string_sequence(
+                raw.get("dependencies", ()),
+                field_name="mission task dependencies",
+                maximum_items=12,
+                maximum_chars=128,
+            )
+            if len(dependencies) != len(set(dependencies)):
+                raise ValueError("mission task dependencies must be unique")
+            if task_id in dependencies:
+                raise ValueError("mission task cannot depend on itself")
+            acceptance_criteria = _mission_string_sequence(
+                raw.get("acceptance_criteria", ()),
+                field_name="mission task acceptance criteria",
+                minimum_items=1,
+                maximum_items=32,
+                maximum_chars=2_048,
+            )
+            requested_tools = _mission_string_sequence(
+                raw.get("required_tools", ()),
+                field_name="mission task required tools",
+                maximum_items=64,
+                maximum_chars=640,
+            )
+            canonical_tools: list[str] = []
+            minimum_risk_rank = 0
+            for requested_tool in requested_tools:
+                canonical = registry.canonical_name(requested_tool)
+                spec = registry.spec_for(canonical or requested_tool)
+                if canonical is None or spec is None:
+                    raise ValueError(
+                        f"mission task requires an unknown tool: {requested_tool}"
+                    )
+                capability_key = f"tool:{canonical}"
+                decision = self.capabilities.tool_decision(spec)
+                if not decision.effective_enabled or capability_key not in allowed_capabilities:
+                    raise ValueError(
+                        f"mission task requires a tool outside the effective project ceiling: "
+                        f"{canonical}"
+                    )
+                if canonical not in canonical_tools:
+                    canonical_tools.append(canonical)
+                minimum_risk_rank = max(
+                    minimum_risk_rank,
+                    _MISSION_RISK_RANK.get(spec.risk, 3),
+                    1 if spec.requires_approval else 0,
+                )
+            risk = str(raw.get("risk", "")).strip().lower()
+            if risk not in _MISSION_RISK_RANK:
+                raise ValueError("mission task risk must be low, medium, high, or critical")
+            if _MISSION_RISK_RANK[risk] < minimum_risk_rank:
+                raise ValueError(
+                    "mission task risk cannot downgrade its required tool risk"
+                )
+            normalized.append(
+                {
+                    "task_id": task_id,
+                    "title": title,
+                    "rationale": rationale,
+                    "dependencies": dependencies,
+                    "acceptance_criteria": acceptance_criteria,
+                    "required_tools": tuple(canonical_tools),
+                    "risk": risk,
+                }
+            )
+
+        for task in normalized:
+            unknown = sorted(set(task["dependencies"]) - task_ids)
+            if unknown:
+                raise ValueError(
+                    "mission task dependencies reference unknown tasks: "
+                    + ", ".join(unknown)
+                )
+        _assert_acyclic_mission_plan(normalized)
+        return tuple(normalized)
 
     def create_scheduled_routine_run(
         self,
@@ -1401,15 +1530,23 @@ class RunManager:
         message: str,
         session_id: str,
         workspace: Path | None,
+        project_id: str | None,
         provider: str | None,
         model: str | None,
         autonomy_mode: str,
         turn_source: dict[str, Any] | None,
         turn_origin: str,
         transcript_scope: str,
+        mission_plan: tuple[dict[str, Any], ...],
     ) -> RunRecord:
         self._reserve_primary_run(run_id)
         try:
+            project_allowed_paths: tuple[str, ...] = (".",)
+            if project_id is not None:
+                project = self.state.get_project(project_id)
+                if project.archived_at is not None:
+                    raise ValueError("cannot bind a new run to an archived project")
+                project_allowed_paths = project.allowed_paths
             normalized_autonomy = (
                 autonomy_mode
                 if autonomy_mode in {"background", "manual", "autonomous"}
@@ -1418,6 +1555,8 @@ class RunManager:
             run_config = replace(
                 self.config,
                 workspace=(workspace or self.config.workspace),
+                project_id=project_id,
+                project_allowed_paths=project_allowed_paths,
                 provider=provider or self.config.provider,
                 model=model or self.config.model,
                 enable_autonomous_scheduler=normalized_autonomy == "autonomous"
@@ -1441,6 +1580,7 @@ class RunManager:
                 turn_source=turn_source,
                 turn_origin=turn_origin,
                 transcript_scope=transcript_scope,
+                project_id=project_id,
                 max_nonterminal_runs=self._primary_concurrency_limit(run_config)
                 + max(0, run_config.max_queued_runs),
             )
@@ -1449,6 +1589,7 @@ class RunManager:
                 message=message,
                 autonomy_mode=normalized_autonomy,
                 run_config=run_config,
+                mission_plan=mission_plan,
             )
         except StateCapacityError as exc:
             self._abort_primary_admission(run_id, exc)
@@ -1467,12 +1608,14 @@ class RunManager:
         message: str,
         autonomy_mode: str,
         run_config: AgentConfig,
+        mission_plan: tuple[dict[str, Any], ...] = (),
     ) -> None:
         self._ensure_primary_task_graph(
             run=run,
             message=message,
             autonomy_mode=autonomy_mode,
             run_config=run_config,
+            mission_plan=mission_plan,
         )
         self.events.publish(
             run.run_id,
@@ -1486,6 +1629,8 @@ class RunManager:
                 "turn_source": run.turn_source,
                 "turn_origin": run.turn_origin,
                 "transcript_scope": run.transcript_scope,
+                "project_id": run.project_id,
+                "mission_plan_tasks": len(mission_plan),
             },
         )
         self._schedule_primary_run(
@@ -1503,6 +1648,7 @@ class RunManager:
         message: str,
         autonomy_mode: str,
         run_config: AgentConfig,
+        mission_plan: tuple[dict[str, Any], ...] = (),
     ) -> list[TaskNodeRecord]:
         existing = self.state.list_task_nodes(run.run_id)
         if existing:
@@ -1538,27 +1684,55 @@ class RunManager:
             and _runs_share_transcript_authority(run, prior)
         ][-5:]
         planned_tasks = (
-            _initial_task_plan(message, recent_messages=recent_messages)
-            if autonomy_mode != "manual"
-            else []
+            list(mission_plan)
+            if mission_plan
+            else (
+                _initial_task_plan(message, recent_messages=recent_messages)
+                if autonomy_mode != "manual"
+                else []
+            )
         )
+        mission_task_ids = {
+            str(planned["task_id"]): f"task_{uuid4().hex}"
+            for planned in planned_tasks
+        }
         tasks = [root]
         for planned in planned_tasks:
             dependencies = [
-                root.task_id if dependency == "root" else dependency
+                (
+                    root.task_id
+                    if dependency == "root"
+                    else mission_task_ids.get(str(dependency), str(dependency))
+                )
                 for dependency in planned["dependencies"]
             ]
+            if mission_plan and not dependencies:
+                dependencies = [root.task_id]
+            source_task_id = str(planned["task_id"])
+            task_id = mission_task_ids.get(source_task_id, source_task_id)
+            is_mission_task = bool(mission_plan)
             tasks.append(
                 TaskNodeRecord(
-                    task_id=str(planned["task_id"]),
+                    task_id=task_id,
                     run_id=run.run_id,
                     parent_id=root.task_id,
                     title=str(planned["title"]),
-                    goal=str(planned["goal"]),
-                    profile=str(planned["profile"]),
+                    goal=str(planned.get("goal") or planned.get("rationale") or planned["title"]),
+                    profile=str(planned.get("profile") or _mission_task_profile(source_task_id)),
                     status="queued",
                     approved=planned["risk"] == "low",
-                    plan={"acceptance_evidence": _initial_task_acceptance_evidence_modes(planned)},
+                    plan={
+                        "acceptance_evidence": _initial_task_acceptance_evidence_modes(planned),
+                        **(
+                            {
+                                "source": "mission_control",
+                                "source_task_id": source_task_id,
+                                "rationale": str(planned.get("rationale", "")),
+                            }
+                            if is_mission_task
+                            else {}
+                        ),
+                    },
                     dependencies=tuple(str(item) for item in dependencies),
                     required_tools=tuple(str(item) for item in planned["required_tools"]),
                     risk=str(planned["risk"]),
@@ -1862,12 +2036,15 @@ class RunManager:
         tool_names: set[str],
         *,
         reason: str = "capability_disabled",
+        run_ids: set[str] | None = None,
     ) -> int:
         """Deny pending grants before a newly disabled capability can resume."""
 
         self._require_mutable_runtime("revoke_pending_approvals_for_tools")
         revoked = 0
         for approval in self.state.list_approvals(status="pending"):
+            if run_ids is not None and str(approval.get("run_id")) not in run_ids:
+                continue
             if str(approval.get("tool_name")) not in tool_names:
                 continue
             updated, applied = self.state.decide_approval_once(
@@ -2057,6 +2234,8 @@ class RunManager:
                             event_log=agent.event_log,
                             session_id=session_id,
                             run_id=run_id,
+                            project_id=agent.config.project_id,
+                            allowed_paths=agent.config.project_allowed_paths,
                             execution_origin="manual",
                             approval_handler=self._approval_handler if run_id else None,
                             trusted_request_origin=trusted_request_origin,
@@ -2072,6 +2251,8 @@ class RunManager:
                         event_log=agent.event_log,
                         session_id=session_id,
                         run_id=run_id,
+                        project_id=agent.config.project_id,
+                        allowed_paths=agent.config.project_allowed_paths,
                         execution_origin="manual",
                         approval_handler=self._approval_handler if run_id else None,
                         trusted_request_origin=trusted_request_origin,
@@ -3833,6 +4014,8 @@ class RunManager:
                     event_log=agent.event_log,
                     session_id=session_id,
                     run_id=run_id,
+                    project_id=agent.config.project_id,
+                    allowed_paths=agent.config.project_allowed_paths,
                     execution_origin=execution_origin,
                     approved_tool_call_ids=frozenset({call.id}),
                     approved_tool_call_arguments={call.id: arguments},
@@ -5108,9 +5291,17 @@ class RunManager:
                     base,
                     RuntimeSettings.from_mapping(run.config_snapshot, base),
                 )
+        project_allowed_paths: tuple[str, ...] = (".",)
+        if run.project_id is not None:
+            project = self.state.get_project(run.project_id)
+            if project.archived_at is not None:
+                raise ValueError("project-bound run references an archived project")
+            project_allowed_paths = project.allowed_paths
         return replace(
             base,
             workspace=Path(run.workspace),
+            project_id=run.project_id,
+            project_allowed_paths=project_allowed_paths,
             provider=run.provider,
             model=run.model,
         )
@@ -5185,15 +5376,43 @@ class RunManager:
             *self.skills.tool_adapters(include_disabled=True),
         ]:
             registry.register(adapter)
-        registry.set_capability_gate(self._capability_gate)
+        registry.set_capability_gate(
+            lambda spec: self._capability_gate(spec, config=active_config)
+        )
         return registry
 
-    def _capability_gate(self, spec: ToolSpec) -> tuple[bool, str]:
+    def _capability_gate(
+        self,
+        spec: ToolSpec,
+        *,
+        config: AgentConfig | None = None,
+    ) -> tuple[bool, str]:
         decision = self.capabilities.tool_decision(spec)
-        if decision.effective_enabled:
+        if not decision.effective_enabled:
+            blockers = ", ".join(decision.blocked_by) or "capability policy"
+            return False, f"Tool {spec.name} is disabled by {blockers}."
+        active_config = config or self.config
+        if active_config.project_id is None:
             return True, ""
-        blockers = ", ".join(decision.blocked_by) or "capability policy"
-        return False, f"Tool {spec.name} is disabled by {blockers}."
+        try:
+            project = self.state.get_project(active_config.project_id)
+            workspace = Path(active_config.workspace).resolve(strict=True)
+        except (KeyError, OSError, RuntimeError):
+            return (
+                False,
+                f"Tool {spec.name} is blocked because the project scope is unavailable.",
+            )
+        if project.archived_at is not None or str(workspace) != project.repository_path:
+            return (
+                False,
+                f"Tool {spec.name} is blocked because the project scope changed.",
+            )
+        if f"tool:{spec.name}" not in project.capability_ceiling:
+            return (
+                False,
+                f"Tool {spec.name} is outside the current project capability ceiling.",
+            )
+        return True, ""
 
     def _complete_capsule(
         self,
@@ -6913,6 +7132,81 @@ def _initial_task_plan(
             "acceptance_criteria": ["Remaining risks or next steps are explicit."],
         },
     ]
+
+
+def _bounded_mission_text(
+    value: object,
+    *,
+    field_name: str,
+    maximum: int,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum or any(
+        not character.isprintable() and character not in "\n\t"
+        for character in normalized
+    ):
+        raise ValueError(
+            f"{field_name} must contain between 1 and {maximum} printable characters"
+        )
+    return normalized
+
+
+def _mission_string_sequence(
+    value: object,
+    *,
+    field_name: str,
+    maximum_items: int,
+    maximum_chars: int,
+    minimum_items: int = 0,
+) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{field_name} must be a sequence")
+    if not minimum_items <= len(value) <= maximum_items:
+        raise ValueError(
+            f"{field_name} must contain between {minimum_items} and "
+            f"{maximum_items} items"
+        )
+    return tuple(
+        _bounded_mission_text(
+            item,
+            field_name=f"{field_name} item",
+            maximum=maximum_chars,
+        )
+        for item in value
+    )
+
+
+def _assert_acyclic_mission_plan(tasks: Sequence[Mapping[str, Any]]) -> None:
+    dependencies = {
+        str(task["task_id"]): tuple(str(item) for item in task["dependencies"])
+        for task in tasks
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(task_id: str) -> None:
+        if task_id in visited:
+            return
+        if task_id in visiting:
+            raise ValueError("mission_plan dependencies must be acyclic")
+        visiting.add(task_id)
+        for dependency in dependencies[task_id]:
+            visit(dependency)
+        visiting.remove(task_id)
+        visited.add(task_id)
+
+    for task_id in dependencies:
+        visit(task_id)
+
+
+def _mission_task_profile(source_task_id: str) -> str:
+    if source_task_id in {"review", "synthesize"}:
+        return "reviewer"
+    if source_task_id in {"map", "trace", "understand"}:
+        return "planner"
+    return "worker"
 
 
 def _looks_like_repair_commit_request(message: str) -> bool:

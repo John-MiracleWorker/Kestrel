@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -46,9 +46,44 @@ class CreateRunRequest(BaseModel):
     message: str
     session_id: str | None = None
     workspace: str | None = None
+    project_id: str | None = Field(default=None, min_length=1, max_length=128)
     provider: str | None = None
     model: str | None = None
     autonomy_mode: str = "background"
+    mission_plan: list[MissionPlanTaskRequest] | None = Field(
+        default=None,
+        max_length=12,
+    )
+
+
+class MissionPlanTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    title: str = Field(min_length=1, max_length=512)
+    rationale: str = Field(min_length=1, max_length=4_096)
+    dependencies: list[str] = Field(default_factory=list, max_length=12)
+    acceptance_criteria: list[str] = Field(min_length=1, max_length=32)
+    required_tools: list[str] = Field(default_factory=list, max_length=64)
+    risk: Literal["low", "medium", "high", "critical"] = "low"
+
+
+class MissionPreflightRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str = Field(min_length=1, max_length=20_000)
+    template_id: Literal[
+        "explain_repository",
+        "fix_failing_test",
+        "implement_feature",
+        "safe_refactor",
+        "security_review",
+        "documentation",
+    ]
 
 
 class ChannelIngestRequest(BaseModel):

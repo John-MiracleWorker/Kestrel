@@ -1219,7 +1219,8 @@ export function App() {
       objective: mission.objective,
       sessionId: createThreadId(),
       workspace: mission.project.repository_path,
-      projectId: mission.project.project_id
+      projectId: mission.project.project_id,
+      missionPlan: mission.plan
     });
     setNotice("Mission queued.");
   }
@@ -1228,12 +1229,14 @@ export function App() {
     objective,
     sessionId: targetSessionId,
     workspace: targetWorkspace,
-    projectId
+    projectId,
+    missionPlan
   }: {
     objective: string;
     sessionId: string;
     workspace: string | null;
     projectId?: string;
+    missionPlan?: MissionLaunch["plan"];
   }) {
     if (!objective.trim() || !runtime) return;
     followTranscriptRef.current = true;
@@ -1244,6 +1247,7 @@ export function App() {
     };
     if (targetWorkspace) payload.workspace = targetWorkspace;
     if (projectId) payload.project_id = projectId;
+    if (missionPlan) payload.mission_plan = missionPlan;
     const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
     const runtimeModel = String((runtime as RuntimeConfig | null)?.provider?.model ?? "");
     if (provider.trim() && provider.trim() !== runtimeProvider) payload.provider = provider.trim();

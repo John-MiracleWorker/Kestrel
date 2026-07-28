@@ -5,7 +5,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -106,24 +106,29 @@ class KestrelServerClient:
         message: str,
         session_id: str | None = None,
         workspace: str | None = None,
+        project_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
         autonomy_mode: str = "background",
+        mission_plan: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if not message.strip():
             raise ValueError("run message must not be empty")
-        payload: dict[str, str] = {
+        payload: dict[str, Any] = {
             "message": message,
             "autonomy_mode": autonomy_mode,
         }
         for key, value in (
             ("session_id", session_id),
             ("workspace", workspace),
+            ("project_id", project_id),
             ("provider", provider),
             ("model", model),
         ):
             if value is not None:
                 payload[key] = value
+        if mission_plan is not None:
+            payload["mission_plan"] = [dict(task) for task in mission_plan]
         return self._request_json("POST", "/api/runs", payload=payload)
 
     def get_run(self, run_id: str) -> dict[str, Any]:

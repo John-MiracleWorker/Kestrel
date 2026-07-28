@@ -147,6 +147,7 @@ def _create_app(
         from .server_channel_routes import register_channel_routes
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_mcp_routes import register_mcp_routes
+        from .server_mission_routes import register_mission_routes
         from .server_models import (
             ApprovalDecisionRequest,
             CapsuleApplyAPIRequest,
@@ -514,6 +515,15 @@ def _create_app(
         runs=runs,
         http_exception=HTTPException,
     )
+    register_mission_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        runs=runs,
+        routing_ledger=routing_ledger,
+        routing_config=routing_config,
+        http_exception=HTTPException,
+    )
     register_channel_routes(
         app,
         http_exception=HTTPException,
@@ -533,12 +543,22 @@ def _create_app(
                 message=request.message,
                 session_id=request.session_id,
                 workspace=Path(request.workspace) if request.workspace else None,
+                project_id=request.project_id,
                 provider=request.provider,
                 model=request.model,
                 autonomy_mode=request.autonomy_mode,
+                mission_plan=(
+                    None
+                    if request.mission_plan is None
+                    else tuple(task.model_dump() for task in request.mission_plan)
+                ),
             )
         except RunCapacityError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         runs.events.publish(
             run.run_id,
             "request.correlated",

@@ -107,6 +107,8 @@ class AgentConfig:
     memory_max_layer_bytes: int = 1_073_741_824
     layer_config_path: Path | None = None
     workspace: Path = Path(".")
+    project_id: str | None = None
+    project_allowed_paths: tuple[str, ...] = (".",)
     max_tool_rounds: int = 6
     context_budget_chars: int = 18_000
     allow_shell: bool = False
@@ -427,6 +429,7 @@ class AgentConfig:
                 "trusted_hosts",
                 "cors_origins",
                 "enabled_tools",
+                "project_allowed_paths",
             } and isinstance(value, list):
                 normalized[key] = tuple(str(item) for item in value)
             else:
