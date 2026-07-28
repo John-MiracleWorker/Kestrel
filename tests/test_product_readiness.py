@@ -235,7 +235,48 @@ def test_setup_readiness_gives_mode_specific_next_actions(
     assert demo.next_action.startswith("Demo is ready.")
     assert "`kestrel chat`" in demo.next_action
     assert disconnected.experience_mode.value == "model_not_connected"
+    assert disconnected.ready is True
+    assert disconnected.next_action.startswith("Open Settings")
     assert "live provider smoke request" in disconnected.next_action
+
+
+def test_setup_readiness_open_circuit_gives_settings_recovery(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    for name in ("memory", "state", "logs"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setenv("KESTREL_CIRCUIT_API_TOKEN", "configured-for-test")
+    config = AgentConfig(
+        provider="openai-compatible",
+        model="local-model",
+        base_url="http://127.0.0.1:1234/v1",
+        workspace=tmp_path,
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state" / "agent.db",
+        log_dir=tmp_path / "logs",
+        enable_worker_isolation=True,
+        require_api_auth=True,
+        api_auth_token_env="KESTREL_CIRCUIT_API_TOKEN",
+    )
+
+    global_provider_health_registry.reset()
+    try:
+        global_provider_health_registry.record_failure(
+            provider_health_id(config),
+            failure_class="endpoint_unreachable",
+            retryable=True,
+            failure_threshold=1,
+        )
+        report = build_setup_readiness_report(config)
+
+        assert report.experience_mode.value == "model_not_connected"
+        assert report.ready is False
+        assert report.next_action.startswith("Open Settings")
+        assert "live provider smoke request" in report.next_action
+    finally:
+        global_provider_health_registry.reset()
 
 
 def test_setup_readiness_requires_pinned_oci_image_for_arbitrary_code_tools(

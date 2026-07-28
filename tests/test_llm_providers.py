@@ -217,6 +217,20 @@ def test_provider_404_is_non_retryable_configuration_failure() -> None:
             "environment variable",
         ),
         (
+            "OPENAI_API_KEY is missing",
+            "ConfigurationError",
+            "missing_credential",
+            False,
+            "Settings",
+        ),
+        (
+            "Missing OPENAI_API_KEY",
+            "ConfigurationError",
+            "missing_credential",
+            False,
+            "environment variable",
+        ),
+        (
             "401 unauthorized",
             "AuthenticationError",
             "authentication",
@@ -310,6 +324,33 @@ def test_provider_error_classification_never_echoes_raw_credentials() -> None:
 
     assert error.code == "missing_credential"
     assert raw_secret not in str(error)
+
+
+def test_unrecognized_provider_error_retains_its_error_contract() -> None:
+    error = classify_provider_error(
+        ProviderError("unexpected provider adapter failure", code="provider_error", retryable=True)
+    )
+
+    assert error.code == "provider_error"
+    assert error.retryable is True
+    assert "failed" in str(error).lower()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "OPENAI_API_KEY is missing; rejected value was named-secret-value-123",
+        "Missing OPENAI_API_KEY; rejected value was named-secret-value-123",
+    ],
+)
+def test_named_missing_secret_errors_are_actionable_and_redacted(message: str) -> None:
+    error = classify_provider_error(
+        ProviderError(message, code="ConfigurationError", retryable=False)
+    )
+
+    assert error.code == "missing_credential"
+    assert "Settings" in str(error)
+    assert "named-secret-value-123" not in str(error)
 
 
 @pytest.mark.parametrize(

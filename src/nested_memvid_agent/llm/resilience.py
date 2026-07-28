@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -215,7 +216,15 @@ def classify_provider_error(exc: Exception) -> ProviderError:
         "missing credential",
         "missingcredential",
     )
-    if any(
+    named_missing_credential = bool(
+        re.search(
+            r"(?:\b[a-z][a-z0-9_]*_api[_-]?key\s+is\s+missing\b|"
+            r"\bmissing\s+[a-z][a-z0-9_]*_api[_-]?key\b|"
+            r"\bapi[_-]?key\s+is\s+missing\b)",
+            lowered,
+        )
+    )
+    if named_missing_credential or any(
         marker in lowered or marker in normalized_code
         for marker in missing_credential_markers
     ):

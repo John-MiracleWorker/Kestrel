@@ -170,21 +170,9 @@ def _next_action(
             "when you want non-deterministic responses."
         )
     if experience_mode == ExperienceMode.MODEL_NOT_CONNECTED:
-        for status in (SetupReadinessStatus.FAIL, SetupReadinessStatus.WARN):
-            blocking = next(
-                (
-                    check
-                    for check in checks
-                    if check.check_id in _PROVIDER_CHECK_IDS
-                    and check.status == status
-                ),
-                None,
-            )
-            if blocking is not None:
-                return blocking.recovery
         return (
-            "Open Settings, correct the provider and model configuration, then "
-            "run one live provider request."
+            "Open Settings to correct the provider, credentials, endpoint, or "
+            "model configuration, then run a live provider smoke request."
         )
     return "Provider and setup prerequisites are ready. Run `kestrel chat`."
 
