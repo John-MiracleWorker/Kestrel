@@ -856,3 +856,40 @@ def test_substituted_staged_source_never_remains_public_and_is_preserved_as_evid
     evidence = list(bin_dir.glob(".kestrel-race-*.tombstone"))
     assert len(evidence) == 1
     assert evidence[0].read_bytes() == substituted
+
+
+def test_staged_substitution_before_manifest_is_rejected_by_transaction_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    home = _kestrel_home(tmp_path)
+    racer_home = _kestrel_home(tmp_path / "racer")
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    manifest = home / ".nest" / "transactions" / "launchers.json"
+    preserved_stage = bin_dir / "preserved-transaction-stage"
+    original_write = module._write_staged_shim
+
+    def substitute_after_write(
+        artifact: dict[str, Any], text: str, *, uid: int,
+    ) -> None:
+        original_write(artifact, text, uid=uid)
+        staged = Path(artifact["staged"])
+        staged.rename(preserved_stage)
+        staged.write_text(module._shim_text(racer_home), encoding="utf-8")
+        staged.chmod(0o755)
+
+    monkeypatch.setattr(module, "_write_staged_shim", substitute_after_write)
+    with pytest.raises(
+        module.LauncherArtifactError,
+        match="identity changed before manifest",
+    ):
+        module.prepare_launchers(
+            kestrel_home=home, user_home=user_home, manifest_path=manifest,
+            bin_dir=bin_dir, platform="linux", environ={"PATH": str(bin_dir)},
+        )
+
+    assert preserved_stage.is_file()
+    assert not (bin_dir / "kestrel").exists()
+    assert not manifest.exists()
