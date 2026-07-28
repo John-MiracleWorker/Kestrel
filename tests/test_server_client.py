@@ -240,6 +240,136 @@ def test_run_polling_timeout_preserves_the_durable_run_id() -> None:
 
 
 @pytest.mark.parametrize(
+    "transient_code",
+    ["timeout", "endpoint_unreachable", "service_unavailable"],
+)
+def test_run_polling_retries_a_transient_error_then_returns_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    transient_code: str,
+) -> None:
+    transient_error = ServerClientError(
+        "poll was interrupted",
+        code=transient_code,
+        recovery="retry",
+    )
+    responses: Iterator[dict[str, object] | ServerClientError] = iter(
+        [
+            transient_error,
+            {
+                "run_id": "run_durable",
+                "status": "completed",
+                "assistant_message": "done",
+            },
+        ]
+    )
+    polls: list[str] = []
+
+    def get_run(_client: KestrelServerClient, run_id: str) -> dict[str, object]:
+        polls.append(run_id)
+        result = next(responses)
+        if isinstance(result, ServerClientError):
+            raise result
+        return result
+
+    monkeypatch.setattr(KestrelServerClient, "get_run", get_run)
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    result = KestrelServerClient("http://127.0.0.1:8765").wait_for_run(
+        "run_durable",
+        timeout_seconds=1.0,
+        poll_interval=0.25,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+
+    assert result["status"] == "completed"
+    assert polls == ["run_durable", "run_durable"]
+    assert sleeps == [0.25]
+
+
+def test_run_polling_repeated_transient_timeouts_end_as_durable_run_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polls: list[str] = []
+
+    def get_run(_client: KestrelServerClient, run_id: str) -> dict[str, object]:
+        polls.append(run_id)
+        raise ServerClientError(
+            "poll timed out",
+            code="timeout",
+            recovery="retry",
+        )
+
+    monkeypatch.setattr(KestrelServerClient, "get_run", get_run)
+    now = [0.0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(ServerClientError) as exc_info:
+        KestrelServerClient("http://127.0.0.1:8765").wait_for_run(
+            "run_durable",
+            timeout_seconds=0.5,
+            poll_interval=0.25,
+            clock=lambda: now[0],
+            sleep=sleep,
+        )
+
+    assert exc_info.value.code == "run_timeout"
+    assert exc_info.value.run_id == "run_durable"
+    assert "not cancelled" in exc_info.value.recovery
+    assert polls == ["run_durable", "run_durable", "run_durable"]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "service_locked",
+        "not_found",
+        "conflict",
+        "invalid_response",
+        "rate_limited",
+        "request_failed",
+    ],
+)
+def test_run_polling_does_not_retry_non_transient_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+) -> None:
+    original = ServerClientError(
+        "poll failed",
+        code=code,
+        recovery="operator action required",
+    )
+    polls: list[str] = []
+
+    def get_run(_client: KestrelServerClient, run_id: str) -> dict[str, object]:
+        polls.append(run_id)
+        raise original
+
+    monkeypatch.setattr(KestrelServerClient, "get_run", get_run)
+    sleeps: list[float] = []
+
+    with pytest.raises(ServerClientError) as exc_info:
+        KestrelServerClient("http://127.0.0.1:8765").wait_for_run(
+            "run_durable",
+            timeout_seconds=1.0,
+            poll_interval=0.25,
+            clock=lambda: 0.0,
+            sleep=sleeps.append,
+        )
+
+    assert exc_info.value is original
+    assert polls == ["run_durable"]
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
     ("status", "payload", "expected_code"),
     [
         (401, {"detail": "bad token"}, "service_locked"),

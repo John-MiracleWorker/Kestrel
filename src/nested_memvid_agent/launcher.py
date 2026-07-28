@@ -8,7 +8,6 @@ import time
 import webbrowser
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from functools import partial
 from pathlib import Path
 from typing import Any, NoReturn, TextIO
 from uuid import uuid4
@@ -120,7 +119,7 @@ class LauncherApplication:
     controller: Any
     client: Any
     browser_open: Callable[[str], bool]
-    offline_doctor: Callable[[ServicePaths], dict[str, Any]]
+    offline_doctor: Callable[[ServicePaths], dict[str, Any]] = field(repr=False)
     input_fn: Callable[[str], str]
     stdout: TextIO
     stderr: TextIO
@@ -554,6 +553,14 @@ def _default_offline_doctor(
     return _doctor_runtime(config, environ=environ)
 
 
+@dataclass(frozen=True)
+class _BoundOfflineDoctor:
+    environ: Mapping[str, str] = field(repr=False)
+
+    def __call__(self, paths: ServicePaths) -> dict[str, Any]:
+        return _default_offline_doctor(paths, environ=self.environ)
+
+
 def _default_application(
     paths: ServicePaths,
     *,
@@ -572,10 +579,7 @@ def _default_application(
         controller=controller,
         client=client,
         browser_open=webbrowser.open,
-        offline_doctor=partial(
-            _default_offline_doctor,
-            environ=environment,
-        ),
+        offline_doctor=_BoundOfflineDoctor(environment),
         input_fn=input,
         stdout=stdout,
         stderr=stderr,

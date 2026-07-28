@@ -18,6 +18,9 @@ _DEFAULT_TOKEN_ENV_NAME = "NEST_AGENT_API_TOKEN"
 _TERMINAL_RUN_STATUSES = frozenset(
     {"completed", "failed", "blocked", "cancelled"}
 )
+_TRANSIENT_RUN_POLL_ERROR_CODES = frozenset(
+    {"timeout", "endpoint_unreachable", "service_unavailable"}
+)
 _MAX_ERROR_BODY_BYTES = 16_384
 
 
@@ -149,7 +152,16 @@ class KestrelServerClient:
             raise ValueError("run polling interval must be finite and positive")
         deadline = clock() + timeout
         while True:
-            run = self.get_run(run_id)
+            try:
+                run = self.get_run(run_id)
+            except ServerClientError as exc:
+                if exc.code not in _TRANSIENT_RUN_POLL_ERROR_CODES:
+                    raise
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise _run_timeout(run_id) from None
+                sleep(min(interval, remaining))
+                continue
             status = run.get("status")
             if not isinstance(status, str):
                 raise ServerClientError(
@@ -162,15 +174,7 @@ class KestrelServerClient:
                 return run
             remaining = deadline - clock()
             if remaining <= 0:
-                raise ServerClientError(
-                    f"Run {run_id} is still active after the local wait timeout.",
-                    code="run_timeout",
-                    recovery=(
-                        "Inspect the durable run in the Workbench; it was not "
-                        "cancelled automatically."
-                    ),
-                    run_id=run_id,
-                )
+                raise _run_timeout(run_id)
             sleep(min(interval, remaining))
 
     def _request_json(
@@ -332,6 +336,18 @@ class KestrelServerClient:
             status_code=status_code,
             recovery="Run `kestrel doctor` and verify the requested operation.",
         )
+
+
+def _run_timeout(run_id: str) -> ServerClientError:
+    return ServerClientError(
+        f"Run {run_id} is still active after the local wait timeout.",
+        code="run_timeout",
+        recovery=(
+            "Inspect the durable run in the Workbench; it was not "
+            "cancelled automatically."
+        ),
+        run_id=run_id,
+    )
 
 
 def _validate_base_url(raw: str) -> str:

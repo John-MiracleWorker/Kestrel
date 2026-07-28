@@ -631,6 +631,27 @@ def test_default_application_uses_injected_environment_for_shared_client(
     assert app.sleep is sleep
 
 
+def test_default_application_repr_does_not_expose_offline_doctor_environment(
+    tmp_path: Path,
+) -> None:
+    secret = "opaque-offline-doctor-secret"
+    environment = {
+        "NEST_AGENT_API_KEY_ENV": "PRIVATE_PROVIDER_KEY",
+        "PRIVATE_PROVIDER_KEY": secret,
+    }
+
+    app = _default_application(
+        _paths(tmp_path),
+        environ=environment,
+    )
+
+    application_repr = repr(app)
+    doctor_repr = repr(app.offline_doctor)
+    for sensitive_fragment in (*environment.keys(), *environment.values()):
+        assert sensitive_fragment not in application_repr
+        assert sensitive_fragment not in doctor_repr
+
+
 def test_default_offline_doctor_uses_only_the_injected_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
