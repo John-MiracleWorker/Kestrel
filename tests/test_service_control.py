@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +15,7 @@ from typing import Any
 
 import pytest
 
+import nested_memvid_agent.service_control as service_control
 from nested_memvid_agent.file_lock import lock_exclusive, unlock
 from nested_memvid_agent.private_artifacts import (
     open_private_file_descriptor,
@@ -776,6 +780,36 @@ def test_start_launches_the_existing_supervisor_with_safe_absolute_arguments(
     assert kwargs["shell"] is False
 
 
+def test_artifact_preparation_repairs_existing_sensitive_directories_to_owner_only(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    for directory in {
+        paths.lifecycle_lock_path.parent,
+        paths.memory_dir,
+        paths.state_path.parent,
+        paths.log_path.parent,
+        paths.pid_path.parent,
+        paths.supervisor_pid_path.parent,
+        paths.pgid_path.parent,
+    }:
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o755)
+
+    ServiceController(paths)._prepare_service_artifacts()
+
+    for directory in {
+        paths.lifecycle_lock_path.parent,
+        paths.memory_dir,
+        paths.state_path.parent,
+        paths.log_path.parent,
+        paths.pid_path.parent,
+        paths.supervisor_pid_path.parent,
+        paths.pgid_path.parent,
+    }:
+        assert directory.stat().st_mode & 0o777 == 0o700
+
+
 def test_concurrent_start_calls_serialize_to_one_supervisor(
     tmp_path: Path,
 ) -> None:
@@ -856,6 +890,69 @@ def test_start_removes_only_proven_stale_metadata_before_launch(
     assert paths.pid_path.read_text(encoding="utf-8").strip() == "201"
 
 
+def test_stale_metadata_cleanup_refuses_inode_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    write_private_text(paths.pid_path, "701\n")
+    real_stat = os.stat
+    stat_calls = 0
+
+    def stat_with_replacement(
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal stat_calls
+        if target == paths.pid_path.name and kwargs.get("dir_fd") is not None:
+            stat_calls += 1
+            if stat_calls == 2:
+                paths.pid_path.unlink()
+                paths.pid_path.write_text("999\n", encoding="utf-8")
+                paths.pid_path.chmod(0o600)
+        return real_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(service_control.os, "stat", stat_with_replacement)
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        service_control._unlink_private_identifier(paths.pid_path, 701)
+
+    assert exc_info.value.code == "identity_changed"
+    assert paths.pid_path.read_text(encoding="utf-8") == "999\n"
+
+
+def test_stale_metadata_cleanup_preserves_a_replacement_at_rename_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    write_private_text(paths.pid_path, "701\n")
+    real_rename = os.rename
+
+    def rename_after_replacement(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if source == paths.pid_path.name:
+            paths.pid_path.unlink()
+            paths.pid_path.write_text("999\n", encoding="utf-8")
+            paths.pid_path.chmod(0o600)
+        real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(service_control.os, "rename", rename_after_replacement)
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        service_control._unlink_private_identifier(paths.pid_path, 701)
+
+    assert exc_info.value.code == "identity_changed"
+    quarantined = tuple(paths.pid_path.parent.glob(".server.pid.*.cleanup"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "999\n"
+
+
 def test_start_refuses_unknown_listener_without_launching(
     tmp_path: Path,
 ) -> None:
@@ -880,6 +977,45 @@ def test_start_refuses_unknown_listener_without_launching(
             "conflict must not launch"
         ),
     )
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        controller.start()
+
+    assert exc_info.value.code == "service_conflict"
+
+
+def test_start_rechecks_listener_ownership_after_artifact_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    unknown = ProcessSnapshot(
+        pid=909,
+        uid=os.getuid(),
+        cwd=tmp_path,
+        command=("python", "-m", "http.server", "18765"),
+        pgid=909,
+        state="S",
+        birth_marker="other-service",
+    )
+    inspector = FakeInspector()
+    controller = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(False, False, False, "offline")),
+        popen=lambda *_args, **_kwargs: pytest.fail(
+            "a listener appearing during preparation must prevent launch"
+        ),
+    )
+    prepare = controller._prepare_service_artifacts
+
+    def prepare_then_claim_port() -> None:
+        prepare()
+        inspector.processes[unknown.pid] = unknown
+        inspector.bound_listeners = (_listener(paths, unknown.pid),)
+        inspector.bindable = False
+
+    monkeypatch.setattr(controller, "_prepare_service_artifacts", prepare_then_claim_port)
 
     with pytest.raises(ServiceControlError) as exc_info:
         controller.start()
@@ -929,6 +1065,48 @@ def test_startup_timeout_cleans_up_only_its_verified_supervisor(
 
     assert exc_info.value.code == "startup_failed"
     assert signaler.calls == [("pid", 200, signal.SIGTERM)]
+    assert not paths.supervisor_pid_path.exists()
+
+
+def test_startup_timeout_hard_kills_only_an_unchanged_verified_supervisor(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    inspector = FakeInspector()
+    now = [0.0]
+
+    def launch(_command: list[str], **_kwargs: object) -> object:
+        server = _server_snapshot(paths, birth_marker="server-birth")
+        supervisor = _supervisor_snapshot(paths, server)
+        supervisor = replace(supervisor, birth_marker="supervisor-birth")
+        write_private_text(paths.supervisor_pid_path, f"{supervisor.pid}\n")
+        inspector.processes = {supervisor.pid: supervisor}
+        return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
+
+    def on_signal(_kind: str, _identifier: int, signal_number: int) -> None:
+        if signal_number == signal.SIGKILL:
+            inspector.processes.clear()
+
+    signaler = FakeSignaler(on_signal)
+    with pytest.raises(ServiceControlError) as exc_info:
+        ServiceController(
+            paths,
+            inspector=inspector,
+            client=FakeClient(ServerProbe(False, False, False, "offline")),
+            popen=launch,
+            signaler=signaler,
+        ).start(
+            readiness_timeout=0.5,
+            poll_interval=0.25,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+    assert exc_info.value.code == "startup_failed"
+    assert signaler.calls == [
+        ("pid", 200, signal.SIGTERM),
+        ("pid", 200, signal.SIGKILL),
+    ]
     assert not paths.supervisor_pid_path.exists()
 
 
@@ -1062,6 +1240,48 @@ def test_stop_reverifies_identity_before_hard_kill(tmp_path: Path) -> None:
     assert signaler.calls == [("pid", server.pid, signal.SIGTERM)]
 
 
+def test_stop_refuses_hard_kill_when_same_shaped_pid_was_reused(
+    tmp_path: Path,
+) -> None:
+    """A PID's command and group can be reused, but its birth marker cannot."""
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    server = _server_snapshot(paths, birth_marker="first-start")
+    inspector = FakeInspector(
+        processes={server.pid: server},
+        listeners=(_listener(paths, server.pid),),
+        live_groups=frozenset({server.pgid}),
+        bindable=False,
+    )
+    now = [0.0]
+
+    def on_signal(kind: str, identifier: int, signal_number: int) -> None:
+        if signal_number == signal.SIGTERM:
+            assert (kind, identifier) == ("pid", server.pid)
+            inspector.processes[server.pid] = replace(
+                server,
+                birth_marker="reused-pid",
+            )
+
+    signaler = FakeSignaler(on_signal)
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        ServiceController(
+            paths,
+            inspector=inspector,
+            client=FakeClient(ServerProbe(True, True, False)),
+            signaler=signaler,
+        ).stop(
+            grace_timeout=0.5,
+            kill_timeout=0.5,
+            poll_interval=0.25,
+            clock=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+    assert exc_info.value.code == "identity_changed"
+    assert signaler.calls == [("pid", server.pid, signal.SIGTERM)]
+
+
 @pytest.mark.parametrize("managed", [False, True])
 def test_stop_escalates_only_a_still_verified_signal_target(
     tmp_path: Path,
@@ -1130,6 +1350,7 @@ def test_system_process_inspector_and_signaler_touch_only_test_owned_process(
         assert snapshot.pid == process.pid
         assert snapshot.uid == os.getuid()
         assert snapshot.cwd == tmp_path.resolve()
+        assert snapshot.birth_marker
 
         SystemProcessSignaler().signal_pid(process.pid, signal.SIGTERM)
         assert process.wait(timeout=3) == -signal.SIGTERM
@@ -1137,3 +1358,150 @@ def test_system_process_inspector_and_signaler_touch_only_test_owned_process(
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=3)
+
+
+def test_system_process_inspector_treats_a_process_that_vanishes_during_cwd_lookup_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspector = SystemProcessInspector()
+    results = iter(
+        (
+            SimpleNamespace(
+                returncode=0,
+                stdout=f"{os.getuid()} 200 S Mon Jul 28 10:10:10 2026 /bin/sleep 30\n",
+            ),
+            SimpleNamespace(returncode=1, stdout=""),
+        )
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: next(results))
+    monkeypatch.setattr(
+        inspector,
+        "_process_cwd",
+        lambda _pid: (_ for _ in ()).throw(
+            ServiceControlError("vanished", code="process_inspection_failed", recovery="retry")
+        ),
+    )
+
+    assert inspector.process(200) is None
+
+
+def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None:
+    if os.name == "nt" or shutil.which("lsof") is None:
+        pytest.skip("requires POSIX process inspection with lsof")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=port)
+    paths.server_executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import signal, socket, sys\n"
+        "host = sys.argv[sys.argv.index('--host') + 1]\n"
+        "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
+        "listener = socket.socket()\n"
+        "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "listener.bind((host, port))\n"
+        "listener.listen()\n"
+        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+        "signal.pause()\n",
+        encoding="utf-8",
+    )
+    paths.server_executable.chmod(0o755)
+    paths.supervisor_script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "umask 077\n"
+        "pid_file=$2; supervisor_file=$4; group_file=$6; log_file=$8\n"
+        "shift 8; shift\n"
+        "\"$@\" >>\"$log_file\" 2>&1 &\n"
+        "child=$!\n"
+        "printf '%s\\n' \"$child\" >\"$pid_file\"\n"
+        "printf '%s\\n' \"$$\" >\"$supervisor_file\"\n"
+        "printf '%s\\n' \"$$\" >\"$group_file\"\n"
+        "wait \"$child\"\n",
+        encoding="utf-8",
+    )
+    paths.supervisor_script.chmod(0o755)
+
+    controller = ServiceController(
+        paths,
+        client=FakeClient(ServerProbe(True, True, False)),
+    )
+    try:
+        started = controller.start(readiness_timeout=3, poll_interval=0.05)
+        assert started.state == ServiceState.RUNNING
+        assert started.management == ServiceManagement.MANAGED
+        assert paths.pid_path.exists()
+        assert SystemProcessInspector().process(started.pid or -1) is not None
+
+        stopped = controller.stop(grace_timeout=3, kill_timeout=1, poll_interval=0.05)
+        assert stopped.state == ServiceState.STOPPED
+        assert not paths.pid_path.exists()
+        assert not paths.supervisor_pid_path.exists()
+        assert not paths.pgid_path.exists()
+        assert SystemProcessInspector().listeners(paths.host, paths.port) == ()
+    finally:
+        try:
+            controller.stop(grace_timeout=1, kill_timeout=1, poll_interval=0.05)
+        except ServiceControlError:
+            pass
+        if paths.pgid_path.exists():
+            pgid_text = paths.pgid_path.read_text(encoding="ascii").strip()
+            if pgid_text.isdigit():
+                group_leader = SystemProcessInspector().process(int(pgid_text))
+                if (
+                    group_leader is not None
+                    and group_leader.cwd == paths.home
+                    and str(paths.supervisor_script) in group_leader.command
+                ):
+                    os.killpg(int(pgid_text), signal.SIGKILL)
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline and SystemProcessInspector().process(
+                        group_leader.pid
+                    ) is not None:
+                        time.sleep(0.05)
+
+
+@pytest.mark.parametrize(
+    ("lsof_output", "expected"),
+    [
+        ("p101\nn127.0.0.1:18765\n", (BoundListener(101, "127.0.0.1", 18765),)),
+        ("p102\nn*:18765\n", (BoundListener(102, "*", 18765),)),
+        ("p103\nn[::1]:18765\n", (BoundListener(103, "::1", 18765),)),
+    ],
+)
+def test_system_listener_inspection_parses_complete_lsof_records(
+    monkeypatch: pytest.MonkeyPatch,
+    lsof_output: str,
+    expected: tuple[BoundListener, ...],
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=lsof_output),
+    )
+
+    assert SystemProcessInspector().listeners("127.0.0.1", 18765) == expected
+
+
+@pytest.mark.parametrize(
+    "lsof_output",
+    [
+        "p104\nnnot-an-endpoint\n",
+        "p105\n",
+        "p106\nn127.0.0.1:18765\np107\n",
+    ],
+)
+def test_system_listener_inspection_refuses_incomplete_lsof_records(
+    monkeypatch: pytest.MonkeyPatch,
+    lsof_output: str,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=lsof_output),
+    )
+
+    with pytest.raises(ServiceControlError) as exc_info:
+        SystemProcessInspector().listeners("127.0.0.1", 18765)
+
+    assert exc_info.value.code == "port_inspection_failed"

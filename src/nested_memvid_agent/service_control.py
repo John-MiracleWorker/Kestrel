@@ -13,12 +13,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from .file_lock import lock_exclusive, unlock
 from .platform_primitives import required_signal, signal_process_group
 from .private_artifacts import (
     create_private_empty_file,
     ensure_private_directory,
+    ensure_owner_only_directory,
     open_private_file_descriptor,
 )
 from .server_client import KestrelServerClient, ServerProbe
@@ -62,6 +64,7 @@ class ProcessSnapshot:
     command: tuple[str, ...]
     pgid: int
     state: str
+    birth_marker: str = ""
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,8 @@ class SystemProcessInspector:
                 "-o",
                 "state=",
                 "-o",
+                "lstart=",
+                "-o",
                 "command=",
             ],
             check=False,
@@ -145,14 +150,15 @@ class SystemProcessInspector:
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
-        parts = result.stdout.strip().split(None, 3)
-        if len(parts) != 4:
+        parts = result.stdout.strip().split(None, 8)
+        if len(parts) != 9:
             raise ServiceControlError(
                 f"Could not parse process identity for PID {pid}.",
                 code="process_inspection_failed",
                 recovery="Run `kestrel doctor` and inspect the process manually.",
             )
-        uid_text, pgid_text, state, command_text = parts
+        uid_text, pgid_text, state, *identity_parts, command_text = parts
+        birth_marker = self._birth_marker(pid, " ".join(identity_parts))
         try:
             uid = int(uid_text)
             pgid = int(pgid_text)
@@ -166,7 +172,18 @@ class SystemProcessInspector:
             command = tuple(shlex.split(command_text))
         except ValueError:
             command = (command_text,)
-        cwd = self._process_cwd(pid)
+        try:
+            cwd = self._process_cwd(pid)
+        except ServiceControlError:
+            verification = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "pid="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if verification.returncode != 0 or not verification.stdout.strip():
+                return None
+            raise
         return ProcessSnapshot(
             pid=pid,
             uid=uid,
@@ -174,6 +191,7 @@ class SystemProcessInspector:
             command=command,
             pgid=pgid,
             state=state,
+            birth_marker=birth_marker,
         )
 
     def listeners(self, host: str, port: int) -> tuple[BoundListener, ...]:
@@ -210,11 +228,18 @@ class SystemProcessInspector:
             )
         listeners: set[BoundListener] = set()
         current_pid: int | None = None
+        current_has_endpoint = False
         for line in result.stdout.splitlines():
             if not line:
                 continue
             field, value = line[0], line[1:]
             if field == "p":
+                if current_pid is not None and not current_has_endpoint:
+                    raise ServiceControlError(
+                        f"Received an incomplete listener record for port {port}.",
+                        code="port_inspection_failed",
+                        recovery="Run `kestrel doctor` and inspect the listener manually.",
+                    )
                 if not value.isdigit() or int(value) <= 0:
                     raise ServiceControlError(
                         f"Received an invalid listener PID for port {port}.",
@@ -222,6 +247,7 @@ class SystemProcessInspector:
                         recovery="Run `kestrel doctor` and inspect the listener manually.",
                     )
                 current_pid = int(value)
+                current_has_endpoint = False
                 continue
             if field != "n" or current_pid is None:
                 continue
@@ -245,6 +271,13 @@ class SystemProcessInspector:
                     host=endpoint_host,
                     port=endpoint_port,
                 )
+            )
+            current_has_endpoint = True
+        if current_pid is not None and not current_has_endpoint:
+            raise ServiceControlError(
+                f"Received an incomplete listener record for port {port}.",
+                code="port_inspection_failed",
+                recovery="Run `kestrel doctor` and inspect the listener manually.",
             )
         return tuple(
             sorted(
@@ -309,6 +342,25 @@ class SystemProcessInspector:
                     return Path(line[1:]).resolve()
         raise ServiceControlError(
             f"Cannot resolve the working directory for PID {pid}.",
+            code="process_inspection_failed",
+            recovery="Run `kestrel doctor` and inspect the process manually.",
+        )
+
+    def _birth_marker(self, pid: int, fallback: str) -> str:
+        """Return the highest-resolution creation marker the OS exposes."""
+        proc_stat = Path("/proc") / str(pid) / "stat"
+        try:
+            remainder = proc_stat.read_text(encoding="ascii").rsplit(") ", 1)[1]
+            fields = remainder.split()
+            start_ticks = fields[19]
+            if start_ticks.isdigit():
+                return f"proc-start-ticks:{start_ticks}"
+        except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError):
+            pass
+        if fallback:
+            return f"ps-lstart:{fallback}"
+        raise ServiceControlError(
+            f"Could not determine a stable process birth marker for PID {pid}.",
             code="process_inspection_failed",
             recovery="Run `kestrel doctor` and inspect the process manually.",
         )
@@ -487,6 +539,19 @@ class ServiceController:
                 )
             self._remove_proven_stale_metadata()
             self._prepare_service_artifacts()
+            prelaunch = self._locked_status()
+            if prelaunch.state == ServiceState.RUNNING:
+                return prelaunch
+            if prelaunch.state == ServiceState.CONFLICT:
+                raise _status_conflict(prelaunch)
+            if prelaunch.state == ServiceState.STARTING:
+                return self._wait_for_running(
+                    timeout_seconds=readiness,
+                    poll_interval=interval,
+                    clock=clock,
+                    sleep=sleep,
+                    existing_startup=True,
+                )
             command = self._supervisor_command()
             try:
                 launched = self.popen(
@@ -675,9 +740,23 @@ class ServiceController:
                 code="installation_incomplete",
                 recovery="Repair or reinstall the Kestrel virtual environment.",
             )
-        ensure_private_directory(self.paths.lifecycle_lock_path.parent)
-        ensure_private_directory(self.paths.memory_dir)
-        ensure_private_directory(self.paths.state_path.parent)
+        for directory in {
+            self.paths.lifecycle_lock_path.parent,
+            self.paths.memory_dir,
+            self.paths.state_path.parent,
+            self.paths.log_path.parent,
+            self.paths.pid_path.parent,
+            self.paths.supervisor_pid_path.parent,
+            self.paths.pgid_path.parent,
+        }:
+            try:
+                ensure_owner_only_directory(directory)
+            except ValueError as exc:
+                raise ServiceControlError(
+                    f"Cannot secure Kestrel lifecycle directory {directory}: {exc}",
+                    code="unsafe_metadata",
+                    recovery="Inspect the path manually and remove any symlink or foreign-owned directory.",
+                ) from exc
         create_private_empty_file(self.paths.log_path)
 
     def _supervisor_command(self) -> list[str]:
@@ -764,6 +843,7 @@ class ServiceController:
         sleep: Callable[[float], None],
     ) -> ServiceControlError | None:
         metadata = self._metadata()
+        expected_supervisor = self.inspector.process(launched_pid)
         if metadata.supervisor_pid is not None:
             if metadata.supervisor_pid != launched_pid:
                 return ServiceControlError(
@@ -771,9 +851,8 @@ class ServiceController:
                     code="cleanup_indeterminate",
                     recovery="Run `kestrel doctor` and inspect the recorded supervisor before taking action.",
                 )
-            supervisor = self.inspector.process(launched_pid)
-            if supervisor is not None and not _supervisor_identity_matches(
-                supervisor,
+            if expected_supervisor is not None and not _supervisor_identity_matches(
+                expected_supervisor,
                 self.paths,
             ):
                 return ServiceControlError(
@@ -812,9 +891,8 @@ class ServiceController:
             except ProcessLookupError:
                 pass
         else:
-            supervisor = self.inspector.process(launched_pid)
-            if supervisor is not None:
-                if not _supervisor_identity_matches(supervisor, self.paths):
+            if expected_supervisor is not None:
+                if not _supervisor_identity_matches(expected_supervisor, self.paths):
                     return ServiceControlError(
                         "Startup cleanup detected a reused supervisor PID; evidence was preserved.",
                         code="cleanup_indeterminate",
@@ -835,11 +913,39 @@ class ServiceController:
             sleep=sleep,
         )
         if not stopped:
-            return ServiceControlError(
-                "The verified startup process did not exit; lifecycle evidence was preserved.",
-                code="cleanup_indeterminate",
-                recovery="Run `kestrel doctor` and inspect the service log before taking action.",
-            )
+            current_metadata = self._metadata()
+            current_supervisor = self.inspector.process(launched_pid)
+            if (
+                current_metadata != metadata
+                or expected_supervisor is None
+                or current_supervisor is None
+                or not _same_process_identity(expected_supervisor, current_supervisor)
+                or not _supervisor_identity_matches(current_supervisor, self.paths)
+            ):
+                return ServiceControlError(
+                    "Startup cleanup detected changed process evidence; it was preserved.",
+                    code="cleanup_indeterminate",
+                    recovery="Run `kestrel doctor`; no reused process was signalled.",
+                )
+            try:
+                if metadata.pgid is not None and self.inspector.group_has_live_members(metadata.pgid):
+                    self.signaler.signal_group(metadata.pgid, required_signal("SIGKILL"))
+                else:
+                    self.signaler.signal_pid(launched_pid, required_signal("SIGKILL"))
+            except ProcessLookupError:
+                pass
+            if not _wait_until(
+                lambda: self._startup_processes_absent(metadata, launched_pid),
+                timeout_seconds=timeout_seconds,
+                poll_interval=poll_interval,
+                clock=clock,
+                sleep=sleep,
+            ):
+                return ServiceControlError(
+                    "The verified startup process survived cleanup; lifecycle evidence was preserved.",
+                    code="cleanup_indeterminate",
+                    recovery="Run `kestrel doctor` and inspect the service log before taking action.",
+                )
         try:
             self._remove_proven_stale_metadata()
         except ServiceControlError as exc:
@@ -1586,6 +1692,7 @@ def _supervisor_identity_matches(
         command=child_command,
         pgid=snapshot.pgid,
         state=snapshot.state,
+        birth_marker=snapshot.birth_marker,
     )
     return _server_identity_matches(child, paths, managed=True)
 
@@ -1769,26 +1876,77 @@ def _exclusive_lifecycle_lock(
 
 
 def _unlink_private_identifier(path: Path, expected: int) -> None:
-    current = _read_private_identifier(path)
-    if current is None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_descriptor = os.open(path.parent, flags)
+    except FileNotFoundError:
         return
-    if current != expected:
+    except OSError as exc:
         raise ServiceControlError(
-            f"Lifecycle metadata changed before cleanup: {path}",
-            code="identity_changed",
-            recovery="Run `kestrel doctor`; the changed file was preserved.",
+            f"Cannot safely open lifecycle metadata directory: {path.parent}",
+            code="unsafe_metadata",
+            recovery="Run `kestrel doctor`; the metadata was preserved.",
+        ) from exc
+    file_descriptor = -1
+    try:
+        try:
+            before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        _validate_private_metadata(before, path)
+        file_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
         )
-    before = os.lstat(path)
-    _validate_private_metadata(before, path)
-    after = os.lstat(path)
-    _validate_private_metadata(after, path)
-    if not os.path.samestat(before, after):
-        raise ServiceControlError(
-            f"Lifecycle metadata changed before cleanup: {path}",
-            code="identity_changed",
-            recovery="Run `kestrel doctor`; the changed file was preserved.",
+        opened = os.fstat(file_descriptor)
+        _validate_private_metadata(opened, path)
+        if not os.path.samestat(before, opened):
+            raise _metadata_replaced(path)
+        raw = os.read(file_descriptor, 33)
+        if len(raw) > 32:
+            raise _unsafe_metadata(path, "is oversized")
+        try:
+            current = raw.decode("ascii").strip()
+        except UnicodeDecodeError:
+            raise _unsafe_metadata(path, "is not ASCII") from None
+        if not current.isdigit() or int(current) <= 0:
+            raise _unsafe_metadata(path, "does not contain a positive identifier")
+        if int(current) != expected:
+            raise _metadata_replaced(path)
+        after = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        _validate_private_metadata(after, path)
+        if not os.path.samestat(opened, after):
+            raise _metadata_replaced(path)
+        quarantine_name = f".{path.name}.{uuid4().hex}.cleanup"
+        os.rename(
+            path.name,
+            quarantine_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
         )
-    path.unlink()
+        quarantined = os.stat(
+            quarantine_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_private_metadata(quarantined, path)
+        if not os.path.samestat(opened, quarantined):
+            raise _metadata_replaced(path)
+        os.unlink(quarantine_name, dir_fd=parent_descriptor)
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        os.close(parent_descriptor)
+
+
+def _metadata_replaced(path: Path) -> ServiceControlError:
+    return ServiceControlError(
+        f"Lifecycle metadata changed before cleanup: {path}",
+        code="identity_changed",
+        recovery="Run `kestrel doctor`; the changed file was preserved.",
+    )
 
 
 def _bounded_seconds(
@@ -1833,6 +1991,7 @@ def _same_process_identity(
         and expected.cwd.resolve() == current.cwd.resolve()
         and expected.command == current.command
         and expected.pgid == current.pgid
+        and expected.birth_marker == current.birth_marker
     )
 
 
