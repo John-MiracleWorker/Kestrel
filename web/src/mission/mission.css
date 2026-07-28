@@ -635,6 +635,28 @@ body:has(.mission-shell) .status-dot {
   border-bottom: 0;
 }
 
+.mission-index-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 9px;
+  color: var(--mission-ink);
+  border: 1px solid var(--mission-rule-strong);
+  border-radius: 4px;
+  background: var(--mission-bg);
+  font: 10.5px/1.2 var(--mono);
+}
+
+.mission-index-action:hover:not(:disabled) {
+  border-color: var(--mission-ink);
+}
+
+.mission-index-action:disabled {
+  cursor: wait;
+  opacity: .58;
+}
+
 .mission-check > svg:first-child {
   color: var(--mission-faint);
 }

@@ -141,13 +141,20 @@ def _create_app(
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
+        from .mission_control import (
+            mission_launch_binding_matches,
+            mission_plan_scope_matches,
+        )
         from .provider_probe import ProviderProbeService
         from .server_behavior_delta_routes import register_behavior_delta_routes
         from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_mcp_routes import register_mcp_routes
-        from .server_mission_routes import register_mission_routes
+        from .server_mission_routes import (
+            evaluate_mission_preflight,
+            register_mission_routes,
+        )
         from .server_models import (
             ApprovalDecisionRequest,
             CapsuleApplyAPIRequest,
@@ -538,6 +545,81 @@ def _create_app(
         request: CreateRunRequest,
         http_request: Request,  # type: ignore[valid-type]
     ) -> dict[str, object]:
+        project_revision = request.project_revision
+        if request.mission_plan is not None:
+            if (
+                request.project_id is None
+                or request.mission_template_id is None
+                or request.mission_binding is None
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "mission_plan requires project_id, mission_template_id, and "
+                        "the live Mission preflight binding"
+                    ),
+                )
+            if request.provider is not None or request.model is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Mission launch cannot override the preflighted provider or model",
+                )
+            try:
+                project = state.get_project(request.project_id)
+                live_preflight = evaluate_mission_preflight(
+                    project=project,
+                    objective=request.message,
+                    template_id=request.mission_template_id,
+                    config=active_config,
+                    state=state,
+                    runs=runs,
+                    routing_ledger=routing_ledger,
+                    routing_config=routing_config,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except (PermissionError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            provided_binding = request.mission_binding.model_dump(by_alias=True)
+            expected_binding = live_preflight["launch_binding"]
+            if not mission_launch_binding_matches(
+                provided_binding,
+                expected_binding,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="mission_preflight_binding_stale",
+                )
+            if not bool(live_preflight["can_start"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "mission_preflight_blocked",
+                        "blockers": live_preflight["blockers"],
+                    },
+                )
+            if not mission_plan_scope_matches(
+                [task.model_dump() for task in request.mission_plan],
+                live_preflight["tasks"],
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="mission_plan_scope_changed_since_preflight",
+                )
+            project_revision = int(provided_binding["project_revision"])
+            if (
+                request.project_revision is not None
+                and request.project_revision != project_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="mission_preflight_project_revision_mismatch",
+                )
+        elif request.mission_template_id is not None or request.mission_binding is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="mission binding fields require mission_plan",
+            )
         try:
             run = runs.create_run(
                 message=request.message,
@@ -552,6 +634,7 @@ def _create_app(
                     if request.mission_plan is None
                     else tuple(task.model_dump() for task in request.mission_plan)
                 ),
+                project_revision=project_revision,
             )
         except RunCapacityError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc

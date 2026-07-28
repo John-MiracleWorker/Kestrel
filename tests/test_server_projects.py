@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.repo_index import RepositoryIndex
 from nested_memvid_agent.server import create_app
 
 
@@ -229,6 +230,101 @@ def test_project_api_preserves_explicit_clearing_for_nullable_metadata(
     assert payload["baseline_index_digest"] is None
     assert payload["test_recipes"] == []
     assert payload["build_recipes"] == []
+
+
+def test_project_index_status_and_explicit_revision_bound_rebuild(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    token = "project-index-owner-token-20d7"
+    monkeypatch.setenv("KESTREL_PROJECT_INDEX_TOKEN", token)  # type: ignore[attr-defined]
+    headers = {"X-Kestrel-API-Key": token}
+    repository = tmp_path / "indexed-repository"
+    source = repository / "src" / "app.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "def answer() -> int:\n    return 42\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(
+        create_app(_config(tmp_path, token_env="KESTREL_PROJECT_INDEX_TOKEN"))
+    ) as client:
+        created = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "project_id": "project_index_api",
+                "display_name": "Indexed API",
+                "repository_path": str(repository.resolve()),
+            },
+        )
+        assert created.status_code == 201
+
+        missing = client.get(
+            "/api/projects/project_index_api/index",
+            headers=headers,
+        )
+        assert missing.status_code == 200
+        assert missing.json()["freshness"] == "missing"
+        assert not (repository / ".nest").exists()
+
+        assert client.post(
+            "/api/projects/project_index_api/index/rebuild",
+            json={"expected_project_revision": 1},
+        ).status_code == 401
+        stale = client.post(
+            "/api/projects/project_index_api/index/rebuild",
+            headers=headers,
+            json={"expected_project_revision": 2},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["error"] == "project_revision_conflict"
+        assert not (repository / ".nest").exists()
+
+        rebuilt = client.post(
+            "/api/projects/project_index_api/index/rebuild",
+            headers=headers,
+            json={"expected_project_revision": 1},
+        )
+        assert rebuilt.status_code == 200
+        payload = rebuilt.json()
+        assert payload["report"]["indexed_files"] == 1
+        assert payload["project"]["revision"] == 2
+        assert (
+            payload["project"]["baseline_index_digest"]
+            == payload["report"]["aggregate_digest"]
+        )
+
+        current = client.get(
+            "/api/projects/project_index_api/index",
+            headers=headers,
+        ).json()
+        assert current["status"] == "ready"
+        assert current["freshness"] == "current"
+        assert current["aggregate_digest"] == payload["report"]["aggregate_digest"]
+
+        source.write_text(
+            "def answer() -> int:\n    return 43\n",
+            encoding="utf-8",
+        )
+        changed = client.get(
+            "/api/projects/project_index_api/index",
+            headers=headers,
+        ).json()
+        assert changed["freshness"] == "stale"
+
+        RepositoryIndex(
+            project_id="project_index_api",
+            repository_root=repository,
+        ).rebuild()
+        unbound = client.get(
+            "/api/projects/project_index_api/index",
+            headers=headers,
+        ).json()
+        assert unbound["status"] == "rebuild_required"
+        assert unbound["freshness"] == "unknown"
+        assert "not bound" in unbound["detail"]
 
 
 def _config(tmp_path: Path, *, token_env: str) -> AgentConfig:

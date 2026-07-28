@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from .mission_control import (
+    build_mission_launch_binding,
     build_mission_preflight,
+    build_mission_preflight_digest,
     inspect_git_worktree,
     inspect_index_without_mutation,
     inspect_provider_readiness,
@@ -41,28 +43,74 @@ def register_mission_routes(
         if project.archived_at is not None:
             raise http_exception(status_code=409, detail="project_is_archived")
         try:
-            return build_mission_preflight(
+            return evaluate_mission_preflight(
                 project=project,
                 objective=request.objective,
                 template_id=request.template_id,
-                git=inspect_git_worktree(
-                    project.repository_path,
-                    timeout_seconds=3.0,
-                ),
-                index=inspect_index_without_mutation(project),
-                provider=inspect_provider_readiness(
-                    project=project,
-                    config=config(),
-                    routing_config=routing_config,
-                    provider_profiles=routing_ledger.list_provider_profiles(
-                        enabled_only=False
-                    ),
-                    model_targets=routing_ledger.list_model_targets(
-                        enabled_only=False
-                    ),
-                    template_id=request.template_id,
-                ),
-                capability_catalog=_catalog(state=state, runs=runs),
+                config=config(),
+                state=state,
+                runs=runs,
+                routing_ledger=routing_ledger,
+                routing_config=routing_config,
             )
         except (PermissionError, ValueError) as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
+
+
+def evaluate_mission_preflight(
+    *,
+    project: Any,
+    objective: str,
+    template_id: str,
+    config: Any,
+    state: Any,
+    runs: Any,
+    routing_ledger: Any,
+    routing_config: Any,
+) -> dict[str, Any]:
+    """Build the same live preflight projection for inspection and admission."""
+
+    provider_profiles = routing_ledger.list_provider_profiles(enabled_only=False)
+    model_targets = routing_ledger.list_model_targets(enabled_only=False)
+    route_policies = routing_ledger.list_policies(enabled_only=False)
+    git = inspect_git_worktree(
+        project.repository_path,
+        timeout_seconds=3.0,
+    )
+    index = inspect_index_without_mutation(project)
+    provider = inspect_provider_readiness(
+        project=project,
+        config=config,
+        routing_config=routing_config,
+        provider_profiles=provider_profiles,
+        model_targets=model_targets,
+        route_policies=route_policies,
+        template_id=template_id,
+    )
+    capability_catalog = _catalog(state=state, runs=runs)
+    launch_binding = build_mission_launch_binding(
+        project=project,
+        objective=objective,
+        template_id=template_id,
+        config=config,
+        routing_config=routing_config,
+        provider_profiles=provider_profiles,
+        model_targets=model_targets,
+        route_policies=route_policies,
+        preflight_digest=build_mission_preflight_digest(
+            git=git,
+            index=index,
+            provider=provider,
+            capability_catalog=capability_catalog,
+        ),
+    )
+    return build_mission_preflight(
+        project=project,
+        objective=objective,
+        template_id=template_id,
+        git=git,
+        index=index,
+        provider=provider,
+        capability_catalog=capability_catalog,
+        launch_binding=launch_binding,
+    )

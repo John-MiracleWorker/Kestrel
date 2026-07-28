@@ -40,6 +40,37 @@ _RoutineIdempotencyKey = Annotated[
 ]
 
 
+class MissionLaunchBindingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_name: Literal["kestrel.mission_launch_binding.v1"] = Field(
+        alias="schema"
+    )
+    project_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    project_revision: Annotated[int, Field(strict=True, ge=1)]
+    objective_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    template_id: Literal[
+        "explain_repository",
+        "fix_failing_test",
+        "implement_feature",
+        "safe_refactor",
+        "security_review",
+        "documentation",
+    ]
+    config_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    routing_enabled: Annotated[bool, Field(strict=True)]
+    routing_mode: Literal["off", "shadow", "constrained", "adaptive"]
+    policy_id: str = Field(min_length=1, max_length=240)
+    policy_revision: Annotated[int, Field(strict=True, ge=1)] | None = None
+    inventory_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    preflight_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    binding_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class CreateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,6 +85,16 @@ class CreateRunRequest(BaseModel):
         default=None,
         max_length=12,
     )
+    project_revision: Annotated[int, Field(strict=True, ge=1)] | None = None
+    mission_template_id: Literal[
+        "explain_repository",
+        "fix_failing_test",
+        "implement_feature",
+        "safe_refactor",
+        "security_review",
+        "documentation",
+    ] | None = None
+    mission_binding: MissionLaunchBindingRequest | None = None
 
 
 class MissionPlanTaskRequest(BaseModel):
@@ -182,6 +223,12 @@ class ProjectImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     document: dict[str, Any]
+
+
+class ProjectIndexRebuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_revision: Annotated[int, Field(strict=True, ge=1)]
 
 
 class ApprovalDecisionRequest(BaseModel):

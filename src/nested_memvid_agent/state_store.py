@@ -275,11 +275,14 @@ class AgentStateStore:
         turn_origin: str = "primary_user",
         transcript_scope: str = "primary",
         project_id: str | None = None,
+        expected_project_revision: int | None = None,
         max_nonterminal_runs: int | None = None,
     ) -> RunRecord:
         now = utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if expected_project_revision is not None and project_id is None:
+                raise ValueError("expected_project_revision requires project_id")
             if project_id is not None:
                 project_row = conn.execute(
                     "SELECT * FROM projects WHERE project_id = ?",
@@ -290,6 +293,11 @@ class AgentStateStore:
                 project = _project_from_row(project_row)
                 if project.archived_at is not None:
                     raise ValueError("cannot bind a new run to an archived project")
+                if (
+                    expected_project_revision is not None
+                    and project.revision != expected_project_revision
+                ):
+                    raise ValueError("mission preflight project revision is stale")
                 if str(canonical_repository_path(workspace)) != project.repository_path:
                     raise ValueError(
                         "project-bound run workspace must equal the canonical repository path"

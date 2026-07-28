@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -8,14 +12,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Thread
 from time import monotonic
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from .projects import ProjectRecord, canonical_repository_path
+from .projects import (
+    ProjectRecord,
+    canonical_repository_path,
+    project_routing_constraints,
+    validate_project_direct_route,
+)
 from .repair_integrity import (
     hardened_readonly_git_command,
     hardened_readonly_git_environment,
     trusted_git_executable,
 )
+from .repo_index import RepositoryIndex, RepositoryIndexError
+from .routing.models import RoutingMode
+from .routing.router import RoutingUnavailableError
+from .routing.service import AdaptiveFlockRoutingService
 from .security_boundary import redact_text
 
 MissionCheckStatus = Literal["pass", "warn", "fail", "unknown"]
@@ -23,6 +36,7 @@ WorkingTreeState = Literal["clean", "dirty", "unknown"]
 IndexFreshness = Literal["current", "stale", "missing", "unknown"]
 
 MISSION_PREFLIGHT_SCHEMA = "kestrel.mission_preflight.v1"
+MISSION_LAUNCH_BINDING_SCHEMA = "kestrel.mission_launch_binding.v1"
 MISSION_TEMPLATE_IDS = frozenset(
     {
         "explain_repository",
@@ -36,10 +50,6 @@ MISSION_TEMPLATE_IDS = frozenset(
 _MUTATING_TEMPLATES = frozenset(
     {"fix_failing_test", "implement_feature", "safe_refactor", "documentation"}
 )
-_LOCAL_PROVIDERS = frozenset(
-    {"mock", "ollama", "lmstudio", "lm-studio", "local", "llamacpp", "llama.cpp"}
-)
-_UNAVAILABLE_HEALTH = frozenset({"open", "unavailable"})
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,20 @@ class ProviderInspection:
     estimated_cost_usd: float | None
 
 
+@dataclass(frozen=True)
+class _MissionRouteTask:
+    task_id: str
+    run_id: str
+    title: str
+    goal: str
+    profile: str
+    risk: str
+    required_tools: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    dependencies: tuple[str, ...]
+    plan: Mapping[str, Any] | None = None
+
+
 def build_mission_preflight(
     *,
     project: ProjectRecord,
@@ -74,6 +98,7 @@ def build_mission_preflight(
     index: IndexInspection,
     provider: ProviderInspection,
     capability_catalog: Sequence[Mapping[str, object]],
+    launch_binding: Mapping[str, Any] | None = None,
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Build one deterministic, read-only task projection from current evidence."""
@@ -95,12 +120,29 @@ def build_mission_preflight(
         }
     )
     allowed_capabilities = set(project.capability_ceiling)
-    effective_items = [
-        item
+    catalog_by_key = {
+        str(item.get("key", "")): item
         for item in capability_catalog
-        if bool(item.get("effective_enabled"))
-        and str(item.get("key", "")) in allowed_capabilities
-    ]
+        if str(item.get("key", ""))
+    }
+    effective_items = []
+    for item in capability_catalog:
+        key = str(item.get("key", ""))
+        parent_key = str(item.get("parent_key") or "")
+        parent = catalog_by_key.get(parent_key) if parent_key else None
+        if (
+            bool(item.get("effective_enabled"))
+            and key in allowed_capabilities
+            and (
+                not parent_key
+                or (
+                    parent_key in allowed_capabilities
+                    and parent is not None
+                    and bool(parent.get("effective_enabled"))
+                )
+            )
+        ):
+            effective_items.append(item)
     effective_capabilities = sorted(str(item["key"]) for item in effective_items)
     effective_tools = {
         str(item["key"])[len("tool:") :]
@@ -295,6 +337,7 @@ def build_mission_preflight(
     return {
         "schema": MISSION_PREFLIGHT_SCHEMA,
         "project_id": project.project_id,
+        "project_revision": project.revision,
         "project_name": project.display_name,
         "repository_path": project.repository_path,
         "objective": normalized_objective,
@@ -324,6 +367,7 @@ def build_mission_preflight(
             "status": provider.status,
             "detail": provider.detail,
         },
+        "launch_binding": dict(launch_binding or {}),
         "checks": checks,
         "tasks": tasks,
         "warnings": _deduplicate(warnings),
@@ -331,6 +375,216 @@ def build_mission_preflight(
         "can_start": not blockers,
         "generated_at": created.astimezone(UTC).isoformat(),
     }
+
+
+def build_mission_launch_binding(
+    *,
+    project: ProjectRecord,
+    objective: str,
+    template_id: str,
+    config: Any,
+    routing_config: Any,
+    provider_profiles: Sequence[Any],
+    model_targets: Sequence[Any],
+    route_policies: Sequence[Any],
+    preflight_digest: str,
+) -> dict[str, Any]:
+    """Bind Mission launch to the live project, provider, and routing revisions."""
+
+    normalized_objective = objective.strip()
+    if not normalized_objective:
+        raise ValueError("objective must not be empty")
+    if template_id not in MISSION_TEMPLATE_IDS:
+        raise ValueError(f"unsupported mission template: {template_id}")
+    policy_id = str(
+        project.provider_policy.get("policy_id")
+        or getattr(routing_config, "policy_id", "balanced")
+    )
+    policy_entry = next(
+        (
+            entry
+            for entry in route_policies
+            if str(entry.policy.policy_id) == policy_id
+        ),
+        None,
+    )
+    config_digest = _payload_digest(
+        {
+            "provider": str(getattr(config, "provider", "")),
+            "model": str(getattr(config, "model", "")),
+            "base_url": str(getattr(config, "base_url", "") or ""),
+            "api_key_env": str(getattr(config, "api_key_env", "") or ""),
+            "fallback_provider": str(
+                getattr(config, "fallback_provider", "") or ""
+            ),
+            "fallback_model": str(getattr(config, "fallback_model", "") or ""),
+            "fallback_base_url": str(
+                getattr(config, "fallback_base_url", "") or ""
+            ),
+            "fallback_api_key_env": str(
+                getattr(config, "fallback_api_key_env", "") or ""
+            ),
+            "timeout_seconds": int(getattr(config, "timeout_seconds", 0)),
+            "max_retries": int(getattr(config, "max_retries", 0)),
+        }
+    )
+    inventory_digest = _payload_digest(
+        {
+            "provider_profiles": [
+                {
+                    "id": str(entry.profile.profile_id),
+                    "revision": int(entry.revision),
+                }
+                for entry in sorted(
+                    provider_profiles,
+                    key=lambda item: str(item.profile.profile_id),
+                )
+            ],
+            "model_targets": [
+                {
+                    "id": str(entry.target.target_id),
+                    "revision": int(entry.revision),
+                }
+                for entry in sorted(
+                    model_targets,
+                    key=lambda item: str(item.target.target_id),
+                )
+            ],
+        }
+    )
+    payload: dict[str, Any] = {
+        "schema": MISSION_LAUNCH_BINDING_SCHEMA,
+        "project_id": project.project_id,
+        "project_revision": project.revision,
+        "objective_digest": hashlib.sha256(
+            normalized_objective.encode("utf-8")
+        ).hexdigest(),
+        "template_id": template_id,
+        "config_digest": config_digest,
+        "routing_enabled": bool(getattr(routing_config, "enabled", False)),
+        "routing_mode": str(getattr(routing_config, "mode", "off")),
+        "policy_id": policy_id,
+        "policy_revision": (
+            None if policy_entry is None else int(policy_entry.revision)
+        ),
+        "inventory_digest": inventory_digest,
+        "preflight_digest": preflight_digest,
+    }
+    payload["binding_digest"] = _payload_digest(payload)
+    return payload
+
+
+def build_mission_preflight_digest(
+    *,
+    git: GitInspection,
+    index: IndexInspection,
+    provider: ProviderInspection,
+    capability_catalog: Sequence[Mapping[str, object]],
+) -> str:
+    """Commit the launch binding to every safety-relevant preflight projection."""
+
+    capabilities = [
+        {
+            "key": str(item.get("key", "")),
+            "effective_enabled": bool(item.get("effective_enabled")),
+            "requires_approval": bool(item.get("requires_approval")),
+            "risk": str(item.get("risk", "")),
+            "parent_key": str(item.get("parent_key") or ""),
+            "blocked_by": item.get("blocked_by"),
+        }
+        for item in sorted(
+            capability_catalog,
+            key=lambda candidate: str(candidate.get("key", "")),
+        )
+    ]
+    return _payload_digest(
+        {
+            "git": {
+                "branch": git.branch,
+                "state": git.state,
+                "summary": git.summary,
+            },
+            "index": {
+                "freshness": index.freshness,
+                "detail": index.detail,
+                "digest": index.digest,
+                "indexed_at": index.indexed_at,
+            },
+            "provider": {
+                "status": provider.status,
+                "detail": provider.detail,
+                "route_policy": provider.route_policy,
+                "estimated_cost_usd": provider.estimated_cost_usd,
+            },
+            "capabilities": capabilities,
+        }
+    )
+
+
+def mission_launch_binding_matches(
+    provided: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    """Compare a client-returned preflight binding to the live server projection."""
+
+    try:
+        provided_digest = str(provided.get("binding_digest", ""))
+        expected_digest = str(expected.get("binding_digest", ""))
+        provided_canonical = json.dumps(
+            dict(provided),
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        expected_canonical = json.dumps(
+            dict(expected),
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(provided_digest, expected_digest) and hmac.compare_digest(
+        provided_canonical,
+        expected_canonical,
+    )
+
+
+def mission_plan_scope_matches(
+    provided: Sequence[Mapping[str, Any]],
+    expected: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Allow prose edits while keeping the preflighted graph, tools, and risk exact."""
+
+    if len(provided) != len(expected):
+        return False
+    structural_fields = ("task_id", "dependencies", "required_tools", "risk")
+    try:
+        provided_scope = [
+            {field: item[field] for field in structural_fields}
+            for item in provided
+        ]
+        expected_scope = [
+            {field: item[field] for field in structural_fields}
+            for item in expected
+        ]
+        return json.dumps(
+            provided_scope,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ) == json.dumps(
+            expected_scope,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def inspect_git_worktree(
@@ -360,35 +614,51 @@ def inspect_git_worktree(
         )
     deadline = monotonic() + timeout_seconds
     try:
-        inside, _ = _git_first_line(
+        inside, inside_return_code = _git_first_line(
             root,
             ("rev-parse", "--is-inside-work-tree"),
             deadline=deadline,
         )
+        if inside_return_code != 0:
+            raise OSError(
+                f"git rev-parse failed with status {inside_return_code}"
+            )
         if inside.strip() != "true":
             return GitInspection(
                 branch="not-a-git-worktree",
                 state="unknown",
                 summary="The project directory is not a Git worktree.",
             )
-        branch, _ = _git_first_line(
+        branch, branch_return_code = _git_first_line(
             root,
             ("symbolic-ref", "--short", "-q", "HEAD"),
             deadline=deadline,
         )
+        if branch_return_code not in {0, 1}:
+            raise OSError(
+                f"git symbolic-ref failed with status {branch_return_code}"
+            )
         if not branch:
-            detached, _ = _git_first_line(
+            if branch_return_code != 1:
+                raise OSError("git symbolic-ref returned an empty branch")
+            detached, detached_return_code = _git_first_line(
                 root,
                 ("rev-parse", "--short", "HEAD"),
                 deadline=deadline,
             )
+            if detached_return_code != 0 or not detached:
+                raise OSError(
+                    f"git detached-HEAD inspection failed with status {detached_return_code}"
+                )
             branch = f"detached@{detached}" if detached else "detached"
-        tracked, _ = _git_first_line(
+        tracked, tracked_return_code = _git_first_line(
             root,
             ("status", "--porcelain=v1", "--untracked-files=no"),
             deadline=deadline,
         )
-        untracked, _ = _git_first_line(
+        if tracked_return_code != 0:
+            raise OSError(f"git status failed with status {tracked_return_code}")
+        untracked, untracked_return_code = _git_first_line(
             root,
             (
                 "ls-files",
@@ -399,6 +669,10 @@ def inspect_git_worktree(
             ),
             deadline=deadline,
         )
+        if untracked_return_code != 0:
+            raise OSError(
+                f"git untracked-file inspection failed with status {untracked_return_code}"
+            )
     except TimeoutError:
         return GitInspection(
             branch="unknown",
@@ -431,7 +705,7 @@ def inspect_git_worktree(
 
 
 def inspect_index_without_mutation(project: ProjectRecord) -> IndexInspection:
-    """Describe an existing sidecar without creating, migrating, or opening it."""
+    """Read a current-schema index without creating, migrating, or publishing it."""
 
     sidecar = (
         Path(project.repository_path)
@@ -459,12 +733,45 @@ def inspect_index_without_mutation(project: ProjectRecord) -> IndexInspection:
             digest=project.baseline_index_digest,
             detail="Repository-index sidecar is not a trusted regular file.",
         )
+    try:
+        status = RepositoryIndex(
+            project_id=project.project_id,
+            repository_root=Path(project.repository_path),
+            create=False,
+        ).status()
+    except (OSError, RepositoryIndexError, ValueError) as exc:
+        return IndexInspection(
+            freshness="unknown",
+            digest=project.baseline_index_digest,
+            detail=(
+                "Repository-index authority could not be established without a rebuild: "
+                f"{redact_text(str(exc))}"
+            ),
+        )
+    if (
+        project.baseline_index_digest is None
+        or project.baseline_index_digest != status.aggregate_digest
+    ):
+        return IndexInspection(
+            freshness="unknown",
+            digest=status.aggregate_digest,
+            indexed_at=status.indexed_at,
+            detail=(
+                "The valid index generation is not bound to the current project profile "
+                f"({metadata.st_size} bytes); rebuild it through Project setup."
+            ),
+        )
+    freshness: IndexFreshness = (
+        "current" if status.freshness.value == "current" else "stale"
+    )
     return IndexInspection(
-        freshness="unknown",
-        digest=project.baseline_index_digest,
+        freshness=freshness,
+        digest=status.aggregate_digest,
+        indexed_at=status.indexed_at,
         detail=(
-            "A repository-index sidecar exists, but this read-only preflight cannot bind "
-            f"its generation and freshness ({metadata.st_size} bytes)."
+            "Repository index matches the current repository snapshot."
+            if freshness == "current"
+            else "Repository contents changed after the last index build."
         ),
     )
 
@@ -476,37 +783,47 @@ def inspect_provider_readiness(
     routing_config: Any,
     provider_profiles: Sequence[Any],
     model_targets: Sequence[Any],
+    route_policies: Sequence[Any],
     template_id: str,
 ) -> ProviderInspection:
     """Evaluate provider readiness from durable target state without making a network call."""
 
-    policy = str(
+    active_policy_id = str(
         project.provider_policy.get("policy_id")
-        or project.provider_policy.get("preset")
-        or getattr(routing_config, "policy_id", "direct")
+        or getattr(routing_config, "policy_id", "balanced")
+    )
+    direct_policy_label = str(
+        project.provider_policy.get("preset")
+        or project.provider_policy.get("policy_id")
+        or "direct"
     )
     routing_enabled = bool(getattr(routing_config, "enabled", False))
+    routing_mode = str(getattr(routing_config, "mode", "off"))
+    routing_actionable = routing_enabled and routing_mode in {
+        "constrained",
+        "adaptive",
+    }
     estimated_calls = _estimated_provider_calls(template_id)
-    if not routing_enabled:
-        provider = str(getattr(config, "provider", "")).strip()
-        model = str(getattr(config, "model", "")).strip()
-        if not provider or not model:
+    provider = str(getattr(config, "provider", "")).strip()
+    model = str(getattr(config, "model", "")).strip()
+    if not routing_actionable:
+        try:
+            direct_cost = validate_project_direct_route(
+                project,
+                provider=provider,
+                model=model,
+                base_url=getattr(config, "base_url", None),
+            )
+        except ValueError as exc:
             return ProviderInspection(
                 status="fail",
-                detail="No direct provider and model are configured.",
-                route_policy=policy,
+                detail=redact_text(str(exc)),
+                route_policy=direct_policy_label,
                 estimated_cost_usd=None,
             )
-        if project.privacy_class == "local_required" and provider.casefold() not in _LOCAL_PROVIDERS:
-            return ProviderInspection(
-                status="fail",
-                detail=(
-                    "The project requires local execution, but the direct provider has no "
-                    "locality evidence."
-                ),
-                route_policy=policy,
-                estimated_cost_usd=None,
-            )
+        direct_estimate = (
+            None if direct_cost is None else direct_cost * estimated_calls
+        )
         if provider.casefold() == "mock":
             return ProviderInspection(
                 status="warn",
@@ -514,53 +831,130 @@ def inspect_provider_readiness(
                     "The deterministic mock provider is ready for demos and tests, not "
                     "real engineering completion."
                 ),
-                route_policy=policy,
-                estimated_cost_usd=0.0,
+                route_policy=direct_policy_label,
+                estimated_cost_usd=direct_estimate,
+            )
+        direct_health = str(
+            project.provider_policy.get("direct_health", "")
+        ).strip().casefold()
+        if direct_health != "healthy":
+            return ProviderInspection(
+                status="warn",
+                detail=(
+                    f"Direct provider {provider} with model {model} is configured, but "
+                    "no current healthy probe evidence is bound to the project."
+                ),
+                route_policy=(
+                    f"{active_policy_id} shadow / {direct_policy_label} actual"
+                    if routing_enabled
+                    else direct_policy_label
+                ),
+                estimated_cost_usd=direct_estimate,
             )
         return ProviderInspection(
             status="pass",
-            detail=f"Direct provider {provider} with model {model} is configured.",
-            route_policy=policy,
-            estimated_cost_usd=None,
+            detail=(
+                f"Direct provider {provider} with model {model} has project-bound "
+                "healthy probe evidence."
+            ),
+            route_policy=(
+                f"{active_policy_id} shadow / {direct_policy_label} actual"
+                if routing_enabled
+                else direct_policy_label
+            ),
+            estimated_cost_usd=direct_estimate,
         )
 
-    enabled_profiles = {
-        str(entry.profile.profile_id)
-        for entry in provider_profiles
-        if bool(entry.profile.enabled)
-    }
-    targets = [
-        entry.target
-        for entry in model_targets
-        if bool(entry.target.enabled)
-        and str(entry.target.provider_profile_id) in enabled_profiles
-        and str(entry.target.health) not in _UNAVAILABLE_HEALTH
-        and _target_matches_project(entry.target, project)
-    ]
-    if not targets:
+    policy_entry = next(
+        (
+            entry
+            for entry in route_policies
+            if str(entry.policy.policy_id) == active_policy_id and bool(entry.enabled)
+        ),
+        None,
+    )
+    if policy_entry is None:
         return ProviderInspection(
             status="fail",
-            detail="No policy-eligible durable routing target is currently available.",
-            route_policy=policy,
+            detail=f"Route policy {active_policy_id!r} is unavailable.",
+            route_policy=active_policy_id,
             estimated_cost_usd=None,
         )
-    health = {str(target.health) for target in targets}
+    try:
+        service = AdaptiveFlockRoutingService(
+            profiles=[entry.profile for entry in provider_profiles],
+            targets=[entry.target for entry in model_targets],
+            policy=policy_entry.policy,
+            mode=cast(RoutingMode, routing_mode),
+        )
+        constraints = project_routing_constraints(project)
+        remaining_budget = project.cost_budget
+        selected_targets: list[Any] = []
+        selected_costs: list[float] = []
+        missing_cost = False
+        for raw_task in _plan_for(template_id):
+            task_id = str(raw_task["task_id"])
+            task = _MissionRouteTask(
+                task_id=f"preflight-{task_id}",
+                run_id=f"preflight-{project.project_id}",
+                title=str(raw_task["title"]),
+                goal=str(raw_task["rationale"]),
+                profile=_mission_task_profile(task_id),
+                risk=str(raw_task["risk"]),
+                required_tools=tuple(str(item) for item in raw_task["required_tools"]),
+                acceptance_criteria=tuple(
+                    str(item) for item in raw_task["acceptance_criteria"]
+                ),
+                dependencies=tuple(str(item) for item in raw_task["dependencies"]),
+            )
+            _contract, decision = service.preview(
+                task,
+                default_privacy_class=constraints["default_privacy_class"],
+                local_required=bool(constraints["local_required"]),
+                maximum_cost_usd=remaining_budget,
+                allowed_target_ids=constraints["allowed_target_ids"],
+                forbidden_target_ids=constraints["forbidden_target_ids"],
+                allowed_provider_profiles=constraints["allowed_provider_profiles"],
+                forbidden_provider_profiles=constraints[
+                    "forbidden_provider_profiles"
+                ],
+            )
+            target = decision.selected_target
+            selected_targets.append(target)
+            if target.estimated_cost_usd is None:
+                missing_cost = True
+            else:
+                selected_costs.append(float(target.estimated_cost_usd))
+                if remaining_budget is not None:
+                    remaining_budget = max(
+                        0.0,
+                        remaining_budget - float(target.estimated_cost_usd),
+                    )
+    except (RoutingUnavailableError, ValueError) as exc:
+        return ProviderInspection(
+            status="fail",
+            detail=redact_text(f"No production-equivalent route satisfies the project: {exc}"),
+            route_policy=active_policy_id,
+            estimated_cost_usd=None,
+        )
+    health = {str(target.health) for target in selected_targets}
     status: MissionCheckStatus = (
-        "pass" if health <= {"healthy"} else "warn"
+        "pass" if health <= {"healthy"} and not missing_cost else "warn"
     )
-    costs = [
-        float(target.estimated_cost_usd)
-        for target in targets
-        if target.estimated_cost_usd is not None
-    ]
-    estimate = min(costs) * estimated_calls if costs else None
+    estimate = None if missing_cost else sum(selected_costs)
+    selected_ids = ", ".join(str(target.target_id) for target in selected_targets)
     return ProviderInspection(
         status=status,
         detail=(
-            f"{len(targets)} eligible target{'s are' if len(targets) != 1 else ' is'} "
-            f"available with health states: {', '.join(sorted(health))}."
+            "Production-equivalent task contracts selected "
+            f"{selected_ids}; health states: {', '.join(sorted(health))}. "
+            + (
+                "At least one selected target has no cost estimate."
+                if missing_cost
+                else "Every selected target has cost attribution."
+            )
         ),
-        route_policy=policy,
+        route_policy=active_policy_id,
         estimated_cost_usd=estimate,
     )
 
@@ -592,34 +986,81 @@ def _git_first_line(
     if stream is None:
         _stop_process(process)
         raise OSError("Git preflight stdout pipe was not created")
-    captured: list[bytes] = []
+    first_line = bytearray()
+    first_line_complete = False
+    first_line_too_large = False
+    reader_error: list[OSError] = []
 
-    def read_one() -> None:
-        captured.append(stream.readline(maximum_bytes + 1))
+    def drain_output() -> None:
+        nonlocal first_line_complete, first_line_too_large
+        try:
+            while chunk := stream.read(8_192):
+                if first_line_complete:
+                    continue
+                newline = chunk.find(b"\n")
+                fragment = chunk if newline < 0 else chunk[:newline]
+                remaining_capacity = maximum_bytes + 1 - len(first_line)
+                if remaining_capacity > 0:
+                    first_line.extend(fragment[:remaining_capacity])
+                if len(first_line) > maximum_bytes or (
+                    newline < 0 and len(fragment) > remaining_capacity
+                ):
+                    first_line_too_large = True
+                if newline >= 0:
+                    first_line_complete = True
+        except OSError as exc:
+            reader_error.append(exc)
 
-    reader = Thread(target=read_one, name="kestrel-git-preflight-reader", daemon=True)
+    reader = Thread(
+        target=drain_output,
+        name="kestrel-git-preflight-reader",
+        daemon=True,
+    )
     reader.start()
     reader.join(timeout=remaining)
     if reader.is_alive():
         _stop_process(process)
+        reader.join(timeout=0.25)
         raise TimeoutError
-    if process.poll() is None:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
         _stop_process(process)
-    return_code = process.wait(timeout=0.25)
-    line = captured[0] if captured else b""
-    if len(line) > maximum_bytes:
-        return "", return_code
-    return redact_text(line.decode("utf-8", errors="replace").strip()), return_code
+        raise TimeoutError
+    try:
+        return_code = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        _stop_process(process)
+        raise TimeoutError from None
+    if reader_error:
+        raise OSError(f"Git preflight output could not be read: {reader_error[0]}")
+    if first_line_too_large:
+        raise OSError("Git preflight output exceeded its bounded line envelope")
+    return (
+        redact_text(bytes(first_line).decode("utf-8", errors="replace").strip()),
+        return_code,
+    )
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
-    process.terminate()
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    else:
+        process.terminate()
     try:
         process.wait(timeout=0.2)
     except subprocess.TimeoutExpired:
-        process.kill()
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        else:
+            process.kill()
         process.wait(timeout=0.2)
 
 
@@ -637,7 +1078,7 @@ def _plan_for(template_id: str) -> list[dict[str, Any]]:
                 "Identify bounded entry points, build surfaces, and important directories.",
                 (),
                 ("Repository boundaries and entry points are cited.",),
-                ("repo.map", "repo.search"),
+                ("repo.map", "repo.symbols", "repo.dependencies"),
                 "low",
             ),
             _task(
@@ -646,7 +1087,7 @@ def _plan_for(template_id: str) -> list[dict[str, Any]]:
                 "Follow definitions, references, and configuration with exact file evidence.",
                 ("map",),
                 ("Important execution relationships have file and line evidence.",),
-                ("repo.search", "file.read"),
+                ("repo.references", "repo.tests_for", "repo.context_pack", "file.read"),
                 "low",
             ),
             _task(
@@ -667,7 +1108,7 @@ def _plan_for(template_id: str) -> list[dict[str, Any]]:
                 "Map the documented surface before drafting prose.",
                 (),
                 ("Relevant entry points and current behavior are cited.",),
-                ("repo.map", "repo.search", "file.read"),
+                ("repo.map", "repo.dependencies", "repo.context_pack", "file.read"),
                 "low",
             ),
             _task(
@@ -696,7 +1137,14 @@ def _plan_for(template_id: str) -> list[dict[str, Any]]:
             "Establish current behavior and the smallest relevant code surface.",
             (),
             ("Current behavior or failure is reproduced with exact evidence.",),
-            ("repo.map", "repo.search", "file.read"),
+            (
+                "repo.map",
+                "repo.symbols",
+                "repo.impact",
+                "repo.tests_for",
+                "repo.context_pack",
+                "file.read",
+            ),
             "low",
         ),
         _task(
@@ -809,41 +1257,6 @@ def _check(
     }
 
 
-def _target_matches_project(target: Any, project: ProjectRecord) -> bool:
-    policy = project.provider_policy
-    target_id = str(target.target_id)
-    profile_id = str(target.provider_profile_id)
-    allowed_targets = _string_set(policy.get("allowed_targets"))
-    forbidden_targets = _string_set(policy.get("forbidden_targets"))
-    allowed_profiles = _string_set(policy.get("allowed_profiles"))
-    forbidden_profiles = _string_set(policy.get("forbidden_profiles"))
-    if allowed_targets and target_id not in allowed_targets:
-        return False
-    if target_id in forbidden_targets:
-        return False
-    if allowed_profiles and profile_id not in allowed_profiles:
-        return False
-    if profile_id in forbidden_profiles:
-        return False
-    local_only = str(policy.get("preset", "")).casefold() in {
-        "local_only",
-        "local only",
-        "privacy_first",
-        "privacy-first",
-    }
-    if (local_only or project.privacy_class == "local_required") and str(
-        target.locality
-    ) not in {"local", "hybrid"}:
-        return False
-    return True
-
-
-def _string_set(value: object) -> frozenset[str]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        return frozenset()
-    return frozenset(str(item) for item in value)
-
-
 def _estimated_provider_calls(template_id: str) -> int:
     if template_id in {"explain_repository", "security_review"}:
         return 3
@@ -852,5 +1265,24 @@ def _estimated_provider_calls(template_id: str) -> int:
     return 4
 
 
+def _mission_task_profile(source_task_id: str) -> str:
+    if source_task_id in {"review", "synthesize"}:
+        return "reviewer"
+    if source_task_id in {"map", "trace", "understand"}:
+        return "planner"
+    return "worker"
+
+
 def _deduplicate(items: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(items))
+
+
+def _payload_digest(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(payload),
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

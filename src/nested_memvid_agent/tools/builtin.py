@@ -95,6 +95,14 @@ from .repair_tools import (
     RepairStatusTool,
     RepairValidateTool,
 )
+from .repo_intelligence_tools import (
+    RepoContextPackTool,
+    RepoDependenciesTool,
+    RepoImpactTool,
+    RepoReferencesTool,
+    RepoSymbolsTool,
+    RepoTestsForTool,
+)
 from .validation_helpers import (
     _evidence_refs_arg,
     _validation_evidence_arg,
@@ -2298,6 +2306,12 @@ def build_default_tools(
     register(CodexExecTool())
     register(RepoSearchTool())
     register(RepoMapTool())
+    register(RepoSymbolsTool())
+    register(RepoReferencesTool())
+    register(RepoDependenciesTool())
+    register(RepoTestsForTool())
+    register(RepoImpactTool())
+    register(RepoContextPackTool())
     register(PatchApplyTool())
     register(TestRunTool())
     register(LintRunTool())

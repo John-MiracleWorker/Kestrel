@@ -45,6 +45,10 @@ def compile_task_contract(
     default_privacy_class: PrivacyClass = "approved_cloud",
     local_required: bool = False,
     maximum_cost_usd: float | None = None,
+    allowed_target_ids: Sequence[str] = (),
+    forbidden_target_ids: Sequence[str] = (),
+    allowed_provider_profiles: Sequence[str] = (),
+    forbidden_provider_profiles: Sequence[str] = (),
 ) -> AgentTaskContract:
     text = f"{task.title} {task.goal}".strip()
     lowered = text.lower()
@@ -103,6 +107,10 @@ def compile_task_contract(
         local_required=deterministic_local,
         maximum_cost_usd=maximum_cost_usd,
         preferred_target_tags=tuple(sorted(preferred_tags)),
+        allowed_target_ids=tuple(sorted(set(allowed_target_ids))),
+        forbidden_target_ids=tuple(sorted(set(forbidden_target_ids))),
+        allowed_provider_profiles=tuple(sorted(set(allowed_provider_profiles))),
+        forbidden_provider_profiles=tuple(sorted(set(forbidden_provider_profiles))),
     )
 
 
@@ -148,6 +156,12 @@ def _task_family(text: str, tools: tuple[str, ...], profile: str) -> str:
     if tool_set and tool_set <= {
         "repo.search",
         "repo.map",
+        "repo.symbols",
+        "repo.references",
+        "repo.dependencies",
+        "repo.tests_for",
+        "repo.impact",
+        "repo.context_pack",
         "memory.search",
         "context.pack",
         "file.read",

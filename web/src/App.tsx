@@ -1221,7 +1221,10 @@ export function App() {
       sessionId: createThreadId(),
       workspace: mission.project.repository_path,
       projectId: mission.project.project_id,
-      missionPlan: mission.plan
+      missionPlan: mission.plan,
+      projectRevision: mission.preflight.project_revision,
+      missionTemplateId: mission.templateId,
+      missionBinding: mission.preflight.launch_binding
     });
     setNotice("Mission queued.");
   }
@@ -1231,13 +1234,19 @@ export function App() {
     sessionId: targetSessionId,
     workspace: targetWorkspace,
     projectId,
-    missionPlan
+    missionPlan,
+    projectRevision,
+    missionTemplateId,
+    missionBinding
   }: {
     objective: string;
     sessionId: string;
     workspace: string | null;
     projectId?: string;
     missionPlan?: MissionLaunch["plan"];
+    projectRevision?: number;
+    missionTemplateId?: string;
+    missionBinding?: MissionLaunch["preflight"]["launch_binding"];
   }) {
     if (!objective.trim() || !runtime) return;
     followTranscriptRef.current = true;
@@ -1249,10 +1258,17 @@ export function App() {
     if (targetWorkspace) payload.workspace = targetWorkspace;
     if (projectId) payload.project_id = projectId;
     if (missionPlan) payload.mission_plan = missionPlan;
+    if (projectRevision) payload.project_revision = projectRevision;
+    if (missionTemplateId) payload.mission_template_id = missionTemplateId;
+    if (missionBinding) payload.mission_binding = missionBinding;
     const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
     const runtimeModel = String((runtime as RuntimeConfig | null)?.provider?.model ?? "");
-    if (provider.trim() && provider.trim() !== runtimeProvider) payload.provider = provider.trim();
-    if (model.trim() && model.trim() !== runtimeModel) payload.model = model.trim();
+    if (!missionPlan && provider.trim() && provider.trim() !== runtimeProvider) {
+      payload.provider = provider.trim();
+    }
+    if (!missionPlan && model.trim() && model.trim() !== runtimeModel) {
+      payload.model = model.trim();
+    }
     const run = await postJson<Run>("/api/runs", payload);
     setMessage("");
     selectSessionId(run.session_id);

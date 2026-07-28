@@ -6,15 +6,21 @@ import re
 import stat
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from ipaddress import ip_address
 from math import isfinite
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from .security_boundary import redact_secrets, redact_text
 
 PROJECT_EXPORT_FORMAT = "kestrel.project.v1"
 PROJECT_PRIVACY_CLASSES = frozenset(
     {"local_required", "local_preferred", "approved_cloud"}
+)
+_LOCAL_DEFAULT_PROVIDERS = frozenset({"lm-studio", "ollama"})
+_LOCAL_ENDPOINT_PROVIDERS = frozenset(
+    {"lm-studio", "ollama", "openai-compatible"}
 )
 _PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_TEXT_LENGTH = 4_096
@@ -298,6 +304,166 @@ def _normalize_capability_ceiling(
             + ", ".join(inactive)
         )
     return normalized
+
+
+def project_requires_local(project: ProjectRecord) -> bool:
+    """Return the effective, fail-closed locality requirement for a project."""
+
+    preset = str(project.provider_policy.get("preset", "")).strip().casefold()
+    return project.privacy_class == "local_required" or preset in {
+        "local_only",
+        "local only",
+        "privacy_first",
+        "privacy-first",
+    }
+
+
+def project_policy_string_set(project: ProjectRecord, key: str) -> frozenset[str]:
+    """Read one provider-policy allow/deny set without accepting ambiguous shapes."""
+
+    value = project.provider_policy.get(key)
+    if value is None:
+        return frozenset()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"project provider_policy.{key} must be a list of strings")
+    normalized: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or len(item.strip()) > 512:
+            raise ValueError(
+                f"project provider_policy.{key} must contain bounded non-empty strings"
+            )
+        normalized.add(item.strip())
+    return frozenset(normalized)
+
+
+def direct_provider_is_local(*, provider: str, base_url: str | None) -> bool:
+    """Classify the actual direct-provider endpoint without trusting its label."""
+
+    provider_key = provider.strip().casefold()
+    if provider_key == "mock":
+        return True
+    if base_url is None:
+        return provider_key in _LOCAL_DEFAULT_PROVIDERS
+    if provider_key not in _LOCAL_ENDPOINT_PROVIDERS:
+        return False
+    try:
+        parsed = urlsplit(base_url.strip())
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return False
+    normalized_host = hostname.casefold().rstrip(".")
+    if normalized_host == "localhost" or normalized_host.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(normalized_host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_project_direct_route(
+    project: ProjectRecord,
+    *,
+    provider: str,
+    model: str,
+    base_url: str | None = None,
+) -> float | None:
+    """Validate a direct provider/model against live project policy.
+
+    The returned value is the operator-supplied per-call estimate when one is
+    available. A hard project budget fails closed when no direct-route estimate
+    exists, because missing cost evidence is not zero.
+    """
+
+    normalized_provider = provider.strip()
+    normalized_model = model.strip()
+    if not normalized_provider or not normalized_model:
+        raise ValueError("project-bound runs require a configured provider and model")
+
+    provider_key = normalized_provider.casefold()
+    if project_requires_local(project) and not direct_provider_is_local(
+        provider=normalized_provider,
+        base_url=base_url,
+    ):
+        raise ValueError(
+            "project provider policy requires a local provider; the requested direct "
+            f"provider {normalized_provider!r} endpoint is not locally classified"
+        )
+
+    allowed_providers = {
+        item.casefold() for item in project_policy_string_set(project, "allowed_providers")
+    }
+    forbidden_providers = {
+        item.casefold() for item in project_policy_string_set(project, "forbidden_providers")
+    }
+    allowed_models = project_policy_string_set(project, "allowed_models")
+    forbidden_models = project_policy_string_set(project, "forbidden_models")
+    if allowed_providers and provider_key not in allowed_providers:
+        raise ValueError("direct provider is outside the project provider allowlist")
+    if provider_key in forbidden_providers:
+        raise ValueError("direct provider is forbidden by the project provider policy")
+    if allowed_models and normalized_model not in allowed_models:
+        raise ValueError("direct model is outside the project model allowlist")
+    if normalized_model in forbidden_models:
+        raise ValueError("direct model is forbidden by the project provider policy")
+
+    raw_cost = project.provider_policy.get("direct_estimated_cost_usd")
+    estimated_cost: float | None
+    if provider_key == "mock":
+        estimated_cost = 0.0
+    elif raw_cost is None:
+        estimated_cost = None
+    elif (
+        isinstance(raw_cost, bool)
+        or not isinstance(raw_cost, (int, float))
+        or not isfinite(float(raw_cost))
+        or float(raw_cost) < 0
+    ):
+        raise ValueError(
+            "project provider_policy.direct_estimated_cost_usd must be a finite "
+            "non-negative number"
+        )
+    else:
+        estimated_cost = float(raw_cost)
+
+    if project.cost_budget is not None:
+        if estimated_cost is None:
+            raise ValueError(
+                "project cost budget cannot admit a direct provider without a cost estimate"
+            )
+        if estimated_cost > project.cost_budget:
+            raise ValueError(
+                "direct provider estimate exceeds the current project cost budget"
+            )
+    return estimated_cost
+
+
+def project_routing_constraints(project: ProjectRecord) -> dict[str, Any]:
+    """Compile the project policy fields understood by Adaptive Flock."""
+
+    return {
+        "default_privacy_class": project.privacy_class,
+        "local_required": project_requires_local(project),
+        "allowed_target_ids": tuple(
+            sorted(project_policy_string_set(project, "allowed_targets"))
+        ),
+        "forbidden_target_ids": tuple(
+            sorted(project_policy_string_set(project, "forbidden_targets"))
+        ),
+        "allowed_provider_profiles": tuple(
+            sorted(project_policy_string_set(project, "allowed_profiles"))
+        ),
+        "forbidden_provider_profiles": tuple(
+            sorted(project_policy_string_set(project, "forbidden_profiles"))
+        ),
+    }
 
 
 def _capability_key(value: object) -> str:

@@ -29,6 +29,7 @@ const project: ProjectProfile = {
 const preflight: MissionPreflight = {
   schema: "kestrel.mission_preflight.v1",
   project_id: project.project_id,
+  project_revision: project.revision,
   project_name: project.display_name,
   repository_path: project.repository_path,
   objective: "Fix the failing authentication test without changing the public API",
@@ -48,6 +49,21 @@ const preflight: MissionPreflight = {
     detail: "Current · 3 min"
   },
   provider: { status: "pass", detail: "Local model ready" },
+  launch_binding: {
+    schema: "kestrel.mission_launch_binding.v1",
+    project_id: project.project_id,
+    project_revision: project.revision,
+    objective_digest: "a".repeat(64),
+    template_id: "fix_failing_test",
+    config_digest: "b".repeat(64),
+    routing_enabled: false,
+    routing_mode: "off",
+    policy_id: "balanced",
+    policy_revision: 1,
+    inventory_digest: "c".repeat(64),
+    preflight_digest: "e".repeat(64),
+    binding_digest: "d".repeat(64)
+  },
   checks: [
     { check_id: "route", title: "Route", status: "pass", detail: "Balanced" },
     { check_id: "budget", title: "Budget", status: "pass", detail: "$1.50 cap" },
@@ -202,6 +218,97 @@ describe("MissionControl", () => {
     expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
   });
 
+  it("rebuilds a missing project index through the revision-bound project API", async () => {
+    const missingIndex = {
+      ...preflight,
+      index: {
+        freshness: "missing" as const,
+        digest: null,
+        indexed_at: null,
+        detail: "No repository index exists for this project."
+      }
+    };
+    const currentIndex = {
+      ...preflight,
+      project_revision: 2,
+      index: {
+        freshness: "current" as const,
+        digest: "sha256:rebuilt",
+        indexed_at: "2026-07-27T12:10:00Z",
+        detail: "Repository index matches the current repository snapshot."
+      }
+    };
+    let preflightCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") {
+        return jsonResponse({ items: [project], count: 1 });
+      }
+      if (path.endsWith("/mission/preflight") && init?.method === "POST") {
+        preflightCalls += 1;
+        return jsonResponse(preflightCalls === 1 ? missingIndex : currentIndex);
+      }
+      if (path.endsWith("/index/rebuild") && init?.method === "POST") {
+        return jsonResponse({
+          schema: "kestrel.project_index_rebuild.v1",
+          project: {
+            ...project,
+            revision: 2,
+            baseline_index_digest: "sha256:rebuilt"
+          },
+          report: {
+            aggregate_digest: "sha256:rebuilt",
+            changed_files: 2,
+            reused_files: 0,
+            deleted_files: 0,
+            skipped_files: 0,
+            indexed_files: 2,
+            git_head: null,
+            git_tree: null
+          }
+        });
+      }
+      return jsonResponse({ detail: path }, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <MissionControl
+        runs={[]}
+        activeRun={null}
+        taskGraph={null}
+        approvals={[]}
+        events={[]}
+        onLaunch={async () => undefined}
+        onOpenRun={() => undefined}
+        onOpenHistory={() => undefined}
+        onOpenAdvanced={() => undefined}
+        onOpenDiagnostics={() => undefined}
+        onPrepareTool={() => undefined}
+        onAuthRequired={() => undefined}
+      />
+    );
+
+    await screen.findByRole("option", { name: "Kestrel" });
+    fireEvent.change(screen.getByLabelText("Engineering objective"), {
+      target: { value: preflight.objective }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Inspect plan" }));
+    const rebuild = await screen.findByRole("button", {
+      name: "Rebuild project index"
+    });
+    fireEvent.click(rebuild);
+
+    expect(
+      await screen.findByText("Repository index matches the current repository snapshot.")
+    ).toBeInTheDocument();
+    const rebuildCall = fetchMock.mock.calls.find(([input]) => (
+      String(input).includes("/index/rebuild")
+    ));
+    expect(JSON.parse(String((rebuildCall?.[1] as RequestInit | undefined)?.body))).toEqual({
+      expected_project_revision: 1
+    });
+  });
+
   it("keeps completed repair proof and gated acceptance in the mission timeline", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input), "http://kestrel.test").pathname;
@@ -279,7 +386,11 @@ describe("MissionControl", () => {
               },
               changed_files: ["src/auth.py"],
               diff_preview: {
+                format: "unified",
                 content: preview,
+                bound_diff_digest: digest,
+                redacted: true,
+                authoritative: false,
                 omitted_files: 0,
                 truncated: false
               },

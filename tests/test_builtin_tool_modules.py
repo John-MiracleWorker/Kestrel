@@ -34,6 +34,14 @@ from nested_memvid_agent.tools.repair_tools import (
     RepairStatusTool,
     RepairValidateTool,
 )
+from nested_memvid_agent.tools.repo_intelligence_tools import (
+    RepoContextPackTool,
+    RepoDependenciesTool,
+    RepoImpactTool,
+    RepoReferencesTool,
+    RepoSymbolsTool,
+    RepoTestsForTool,
+)
 from nested_memvid_agent.tools.web_tools import WebFetchTool, WebSearchTool
 from nested_memvid_agent.tools.workspace_tools import (
     FileStatTool,
@@ -85,6 +93,12 @@ def test_default_registry_keeps_extracted_builtin_tools() -> None:
     assert registered_types["repo.search"] is RepoSearchTool
     assert specs["repo.map"].name == RepoMapTool.spec.name
     assert registered_types["repo.map"] is RepoMapTool
+    assert registered_types["repo.symbols"] is RepoSymbolsTool
+    assert registered_types["repo.references"] is RepoReferencesTool
+    assert registered_types["repo.dependencies"] is RepoDependenciesTool
+    assert registered_types["repo.tests_for"] is RepoTestsForTool
+    assert registered_types["repo.impact"] is RepoImpactTool
+    assert registered_types["repo.context_pack"] is RepoContextPackTool
     assert specs["shell.run"].name == ShellRunTool.spec.name
     assert registered_types["shell.run"] is ShellRunTool
     assert specs["codex.exec"].name == CodexExecTool.spec.name

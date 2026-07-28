@@ -33,6 +33,9 @@ class AgentTaskContract:
     maximum_cost_usd: float | None = None
     preferred_target_tags: tuple[str, ...] = ()
     forbidden_target_tags: tuple[str, ...] = ()
+    allowed_target_ids: tuple[str, ...] = ()
+    forbidden_target_ids: tuple[str, ...] = ()
+    allowed_provider_profiles: tuple[str, ...] = ()
     preferred_provider_profiles: tuple[str, ...] = ()
     forbidden_provider_profiles: tuple[str, ...] = ()
     schema_version: int = 1
@@ -60,6 +63,9 @@ class AgentTaskContract:
             "required_modalities",
             "preferred_target_tags",
             "forbidden_target_tags",
+            "allowed_target_ids",
+            "forbidden_target_ids",
+            "allowed_provider_profiles",
             "preferred_provider_profiles",
             "forbidden_provider_profiles",
         ):

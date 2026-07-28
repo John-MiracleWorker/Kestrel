@@ -7,6 +7,7 @@ import pytest
 
 from nested_memvid_agent.projects import (
     ProjectConflictError,
+    direct_provider_is_local,
     export_project,
     import_project_document,
 )
@@ -18,6 +19,28 @@ ACTIVE_CAPABILITIES = {
     "tool:file.write",
     "tool:test.run",
 }
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "expected"),
+    [
+        ("mock", None, True),
+        ("lm-studio", None, True),
+        ("ollama", None, True),
+        ("openai-compatible", "http://127.0.0.1:1234/v1", True),
+        ("openai-compatible", "http://[::1]:1234/v1", True),
+        ("openai-compatible", "https://models.example.com/v1", False),
+        ("ollama", "https://ollama.com/api", False),
+        ("openai", "http://127.0.0.1:1234/v1", False),
+        ("local", None, False),
+    ],
+)
+def test_direct_provider_locality_is_bound_to_the_actual_endpoint(
+    provider: str,
+    base_url: str | None,
+    expected: bool,
+) -> None:
+    assert direct_provider_is_local(provider=provider, base_url=base_url) is expected
 
 
 def test_project_profiles_are_isolated_and_revision_fenced(tmp_path: Path) -> None:
@@ -261,6 +284,17 @@ def test_new_runs_may_bind_only_to_an_active_matching_project(
     )
 
     assert bound.project_id == project.project_id
+    with pytest.raises(ValueError, match="revision is stale"):
+        state.create_run(
+            run_id="stale_project_revision",
+            message="stale",
+            session_id="session",
+            workspace=str(repository.resolve()),
+            provider="mock",
+            model="mock",
+            project_id=project.project_id,
+            expected_project_revision=project.revision + 1,
+        )
     with pytest.raises(ValueError, match="workspace"):
         state.create_run(
             run_id="wrong_workspace",

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from dataclasses import asdict
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
@@ -11,10 +13,13 @@ from .projects import (
     export_project,
     import_project_document,
 )
+from .repo_index import RepositoryIndex, RepositoryIndexError
+from .security_boundary import redact_text
 from .server_capability_routes import _affected_tool_names, _catalog
 from .server_models import (
     ProjectCreateRequest,
     ProjectImportRequest,
+    ProjectIndexRebuildRequest,
     ProjectUpdateRequest,
 )
 
@@ -28,6 +33,8 @@ def register_project_routes(
     http_exception: Any,
 ) -> None:
     """Register owner-controlled project profile routes."""
+
+    index_rebuild_lock = Lock()
 
     def config() -> Any:
         return active_config() if callable(active_config) else active_config
@@ -135,6 +142,170 @@ def register_project_routes(
     @app.get("/api/projects/{project_id}")  # type: ignore[untyped-decorator]
     def get_project(project_id: str) -> dict[str, Any]:
         return asdict(project_or_404(project_id))
+
+    @app.get("/api/projects/{project_id}/index")  # type: ignore[untyped-decorator]
+    def get_project_index(project_id: str) -> dict[str, Any]:
+        project = project_or_404(project_id)
+        sidecar = (
+            Path(project.repository_path)
+            / ".nest"
+            / "repo-index"
+            / f"{project.project_id}.sqlite"
+        )
+        try:
+            sidecar_metadata = sidecar.lstat()
+        except FileNotFoundError:
+            return {
+                "schema": "kestrel.project_index_status.v1",
+                "project_id": project.project_id,
+                "project_revision": project.revision,
+                "status": "missing",
+                "freshness": "missing",
+                "aggregate_digest": project.baseline_index_digest,
+                "indexed_at": None,
+                "detail": "No repository index exists for this project.",
+            }
+        except OSError as exc:
+            return {
+                "schema": "kestrel.project_index_status.v1",
+                "project_id": project.project_id,
+                "project_revision": project.revision,
+                "status": "rebuild_required",
+                "freshness": "unknown",
+                "aggregate_digest": project.baseline_index_digest,
+                "indexed_at": None,
+                "detail": redact_text(str(exc)),
+            }
+        if stat.S_ISLNK(sidecar_metadata.st_mode) or not stat.S_ISREG(
+            sidecar_metadata.st_mode
+        ):
+            return {
+                "schema": "kestrel.project_index_status.v1",
+                "project_id": project.project_id,
+                "project_revision": project.revision,
+                "status": "rebuild_required",
+                "freshness": "unknown",
+                "aggregate_digest": project.baseline_index_digest,
+                "indexed_at": None,
+                "detail": (
+                    "Repository-index sidecar is not a trusted regular file "
+                    f"({sidecar_metadata.st_size} bytes)."
+                ),
+            }
+        try:
+            status = RepositoryIndex(
+                project_id=project.project_id,
+                repository_root=Path(project.repository_path),
+                create=False,
+            ).status()
+        except (OSError, RepositoryIndexError, sqlite3.Error, ValueError) as exc:
+            return {
+                "schema": "kestrel.project_index_status.v1",
+                "project_id": project.project_id,
+                "project_revision": project.revision,
+                "status": "rebuild_required",
+                "freshness": "unknown",
+                "aggregate_digest": project.baseline_index_digest,
+                "indexed_at": None,
+                "detail": redact_text(str(exc)),
+            }
+        if (
+            project.baseline_index_digest is None
+            or project.baseline_index_digest != status.aggregate_digest
+        ):
+            return {
+                "schema": "kestrel.project_index_status.v1",
+                "project_id": project.project_id,
+                "project_revision": project.revision,
+                "status": "rebuild_required",
+                "freshness": "unknown",
+                "aggregate_digest": status.aggregate_digest,
+                "indexed_at": status.indexed_at,
+                "indexed_files": None,
+                "git_head": status.git_head,
+                "git_tree": status.git_tree,
+                "detail": (
+                    "The valid index generation is not bound to the current project "
+                    "revision; rebuild it explicitly."
+                ),
+            }
+        return {
+            "schema": "kestrel.project_index_status.v1",
+            "project_id": project.project_id,
+            "project_revision": project.revision,
+            "status": "ready",
+            "freshness": status.freshness.value,
+            "aggregate_digest": status.aggregate_digest,
+            "indexed_at": status.indexed_at,
+            "indexed_files": None,
+            "git_head": status.git_head,
+            "git_tree": status.git_tree,
+            "detail": (
+                "Repository index matches the current project snapshot."
+                if status.freshness.value == "current"
+                else "Repository contents changed after the last index build."
+            ),
+        }
+
+    @app.post("/api/projects/{project_id}/index/rebuild")  # type: ignore[untyped-decorator]
+    def rebuild_project_index(
+        project_id: str,
+        request: ProjectIndexRebuildRequest,
+    ) -> dict[str, Any]:
+        require_owner_api()
+        project = project_or_404(project_id)
+        if project.archived_at is not None:
+            raise http_exception(
+                status_code=409,
+                detail="cannot_rebuild_index_for_archived_project",
+            )
+        if project.revision != request.expected_project_revision:
+            raise http_exception(
+                status_code=409,
+                detail={
+                    "error": "project_revision_conflict",
+                    "current": asdict(project),
+                },
+            )
+        if not index_rebuild_lock.acquire(blocking=False):
+            raise http_exception(
+                status_code=409,
+                detail="repository_index_rebuild_in_progress",
+            )
+        try:
+            report = RepositoryIndex(
+                project_id=project.project_id,
+                repository_root=Path(project.repository_path),
+            ).rebuild()
+            updated = state.update_project(
+                project.project_id,
+                expected_revision=request.expected_project_revision,
+                active_capability_keys=active_capability_keys(),
+                baseline_index_digest=report.aggregate_digest,
+            )
+        except ProjectConflictError as exc:
+            raise http_exception(
+                status_code=409,
+                detail={
+                    "error": "project_revision_conflict_after_index_build",
+                    "current": asdict(exc.current),
+                },
+            ) from exc
+        except (OSError, RepositoryIndexError, sqlite3.Error, ValueError) as exc:
+            raise http_exception(
+                status_code=409,
+                detail={
+                    "error": "repository_index_rebuild_failed",
+                    "message": redact_text(str(exc)),
+                },
+            ) from exc
+        finally:
+            index_rebuild_lock.release()
+        return {
+            "schema": "kestrel.project_index_rebuild.v1",
+            "project": asdict(updated),
+            "report": asdict(report),
+        }
 
     @app.put("/api/projects/{project_id}")  # type: ignore[untyped-decorator]
     def update_project(

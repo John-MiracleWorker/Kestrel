@@ -124,6 +124,15 @@ def _ineligibility_reasons(
         reasons.append(f"target_health_{target.health}")
     if contract.local_required and target.locality != "local":
         reasons.append("local_required")
+    if contract.allowed_target_ids and target.target_id not in contract.allowed_target_ids:
+        reasons.append("target_not_allowed")
+    if target.target_id in contract.forbidden_target_ids:
+        reasons.append("target_forbidden")
+    if (
+        contract.allowed_provider_profiles
+        and target.provider_profile_id not in contract.allowed_provider_profiles
+    ):
+        reasons.append("provider_profile_not_allowed")
     if target.provider_profile_id in contract.forbidden_provider_profiles:
         reasons.append("provider_profile_forbidden")
     if set(target.capability_tags) & set(contract.forbidden_target_tags):

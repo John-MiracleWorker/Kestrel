@@ -61,6 +61,14 @@ def test_mission_preflight_is_read_only_and_plan_becomes_project_bound_graph(
         assert preflight["can_start"] is True
         assert not (repository / ".nest").exists()
         assert client.get("/api/runs", headers=headers).json() == []
+        edited_tasks = [dict(task) for task in preflight["tasks"]]
+        edited_tasks[0] = {
+            **edited_tasks[0],
+            "title": "Map the repository precisely",
+            "acceptance_criteria": [
+                "Repository boundaries, entry points, and unknowns are cited."
+            ],
+        }
 
         launched = client.post(
             "/api/runs",
@@ -69,7 +77,10 @@ def test_mission_preflight_is_read_only_and_plan_becomes_project_bound_graph(
                 "message": preflight["objective"],
                 "project_id": "mission_project",
                 "autonomy_mode": "manual",
-                "mission_plan": preflight["tasks"],
+                "mission_plan": edited_tasks,
+                "project_revision": preflight["project_revision"],
+                "mission_template_id": preflight["template_id"],
+                "mission_binding": preflight["launch_binding"],
             },
         )
         assert launched.status_code == 200
@@ -87,9 +98,29 @@ def test_mission_preflight_is_read_only_and_plan_becomes_project_bound_graph(
             task for task in tasks if task.get("plan", {}).get("source") == "mission_control"
         ]
         assert [task["title"] for task in mission_tasks] == [
-            item["title"] for item in preflight["tasks"]
+            item["title"] for item in edited_tasks
         ]
         assert all(task["run_id"] == run["run_id"] for task in mission_tasks)
+
+        (repository / "README.md").write_text(
+            "# Repository changed after preflight\n",
+            encoding="utf-8",
+        )
+        stale_repository = client.post(
+            "/api/runs",
+            headers=headers,
+            json={
+                "message": preflight["objective"],
+                "project_id": "mission_project",
+                "autonomy_mode": "manual",
+                "mission_plan": edited_tasks,
+                "project_revision": preflight["project_revision"],
+                "mission_template_id": preflight["template_id"],
+                "mission_binding": preflight["launch_binding"],
+            },
+        )
+        assert stale_repository.status_code == 409
+        assert stale_repository.json()["detail"] == "mission_preflight_binding_stale"
 
         mismatch = client.post(
             "/api/runs",
@@ -124,6 +155,7 @@ def test_mission_launch_rejects_client_risk_downgrade(
     headers = {"X-Kestrel-API-Key": token}
     repository = tmp_path / "risk-repository"
     repository.mkdir()
+    _git(repository, "init", "-b", "main")
     config = _config(tmp_path)
 
     with TestClient(create_app(config)) as client:
@@ -139,6 +171,20 @@ def test_mission_launch_rejects_client_risk_downgrade(
                 "capability_ceiling": active,
             },
         ).status_code == 201
+        preflight = client.post(
+            "/api/projects/risk_project/mission/preflight",
+            headers=headers,
+            json={
+                "objective": "Attempt a downgraded repair",
+                "template_id": "fix_failing_test",
+            },
+        ).json()
+        assert preflight["can_start"] is True, preflight["blockers"]
+        downgraded_plan = [dict(task) for task in preflight["tasks"]]
+        downgraded_plan[1] = {
+            **downgraded_plan[1],
+            "risk": "low",
+        }
 
         response = client.post(
             "/api/runs",
@@ -147,22 +193,97 @@ def test_mission_launch_rejects_client_risk_downgrade(
                 "message": "Attempt a downgraded repair",
                 "project_id": "risk_project",
                 "autonomy_mode": "manual",
+                "project_revision": 1,
+                "mission_template_id": "fix_failing_test",
+                "mission_binding": preflight["launch_binding"],
+                "mission_plan": downgraded_plan,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "mission_plan_scope_changed_since_preflight"
+
+
+def test_project_launch_rejects_cloud_override_and_stale_preflight_revision(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    token = "mission-route-token-4af6fb0d"
+    monkeypatch.setenv("KESTREL_MISSION_TEST_TOKEN", token)  # type: ignore[attr-defined]
+    headers = {"X-Kestrel-API-Key": token}
+    repository = tmp_path / "route-repository"
+    repository.mkdir()
+
+    with TestClient(create_app(_config(tmp_path))) as client:
+        capabilities = client.get("/api/capabilities", headers=headers).json()["items"]
+        active = [item["key"] for item in capabilities if item["effective_enabled"]]
+        created = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "project_id": "local_project",
+                "display_name": "Local project",
+                "repository_path": str(repository.resolve()),
+                "privacy_class": "local_required",
+                "provider_policy": {"preset": "local_only"},
+                "capability_ceiling": active,
+            },
+        )
+        assert created.status_code == 201
+        preflight = client.post(
+            "/api/projects/local_project/mission/preflight",
+            headers=headers,
+            json={
+                "objective": "Launch a stale mission",
+                "template_id": "explain_repository",
+            },
+        ).json()
+        updated = client.put(
+            "/api/projects/local_project",
+            headers=headers,
+            json={"expected_revision": 1, "display_name": "Updated local project"},
+        )
+        assert updated.status_code == 200
+
+        cloud = client.post(
+            "/api/runs",
+            headers=headers,
+            json={
+                "message": "Do not send this repository to a cloud provider",
+                "project_id": "local_project",
+                "provider": "openai",
+                "model": "gpt-cloud",
+                "autonomy_mode": "manual",
+            },
+        )
+        stale = client.post(
+            "/api/runs",
+            headers=headers,
+            json={
+                "message": "Launch a stale mission",
+                "project_id": "local_project",
+                "project_revision": 1,
+                "autonomy_mode": "manual",
+                "mission_template_id": "explain_repository",
+                "mission_binding": preflight["launch_binding"],
                 "mission_plan": [
                     {
-                        "task_id": "write",
-                        "title": "Write",
-                        "rationale": "Try to label an approval-bound write as low risk.",
+                        "task_id": "inspect",
+                        "title": "Inspect",
+                        "rationale": "Read one allowed file.",
                         "dependencies": [],
-                        "acceptance_criteria": ["A reviewed change exists."],
-                        "required_tools": ["repair.apply_patch"],
+                        "acceptance_criteria": ["Evidence is cited."],
+                        "required_tools": ["file.read"],
                         "risk": "low",
                     }
                 ],
             },
         )
 
-    assert response.status_code == 400
-    assert "risk" in response.json()["detail"].lower()
+    assert cloud.status_code == 400
+    assert "local provider" in cloud.json()["detail"]
+    assert stale.status_code == 409
+    assert stale.json()["detail"] == "mission_preflight_binding_stale"
 
 
 def test_project_scope_live_gates_tools_and_allowed_paths(
@@ -267,6 +388,7 @@ def _config(tmp_path: Path) -> AgentConfig:
         api_auth_token_env="KESTREL_MISSION_TEST_TOKEN",
         enable_agentic_cycle=False,
         allow_file_write=True,
+        allow_shell=True,
     )
 
 

@@ -31,6 +31,21 @@ export type ProjectListResponse = {
   count: number;
 };
 
+export type ProjectIndexRebuildResponse = {
+  schema: "kestrel.project_index_rebuild.v1";
+  project: ProjectProfile;
+  report: {
+    aggregate_digest: string;
+    changed_files: number;
+    reused_files: number;
+    deleted_files: number;
+    skipped_files: number;
+    indexed_files: number;
+    git_head?: string | null;
+    git_tree?: string | null;
+  };
+};
+
 export type MissionGoalTemplate = {
   template_id: string;
   label: string;
@@ -59,6 +74,7 @@ export type MissionPreflightCheck = {
 export type MissionPreflight = {
   schema: "kestrel.mission_preflight.v1";
   project_id: string;
+  project_revision: number;
   project_name: string;
   repository_path: string;
   objective: string;
@@ -87,6 +103,21 @@ export type MissionPreflight = {
   provider: {
     status: MissionCheckStatus;
     detail: string;
+  };
+  launch_binding: {
+    schema: "kestrel.mission_launch_binding.v1";
+    project_id: string;
+    project_revision: number;
+    objective_digest: string;
+    template_id: string;
+    config_digest: string;
+    routing_enabled: boolean;
+    routing_mode: "off" | "shadow" | "constrained" | "adaptive";
+    policy_id: string;
+    policy_revision: number | null;
+    inventory_digest: string;
+    preflight_digest: string;
+    binding_digest: string;
   };
   checks: MissionPreflightCheck[];
   tasks: MissionPlanTask[];

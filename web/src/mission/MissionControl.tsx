@@ -32,6 +32,7 @@ import type {
   MissionPlanTask,
   MissionPreflight,
   MissionPreflightCheck,
+  ProjectIndexRebuildResponse,
   ProjectListResponse,
   ProjectProfile
 } from "./types";
@@ -124,6 +125,7 @@ export function MissionControl({
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [preflightPending, setPreflightPending] = useState(false);
   const [launchPending, setLaunchPending] = useState(false);
+  const [indexRebuildPending, setIndexRebuildPending] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const selectedProject = useMemo(
@@ -225,6 +227,31 @@ export function MissionControl({
       setLoadError(errorMessage(error));
     } finally {
       setLaunchPending(false);
+    }
+  }
+
+  async function rebuildIndex() {
+    if (!selectedProject || indexRebuildPending) return;
+    setIndexRebuildPending(true);
+    setLoadError(null);
+    try {
+      const response = await postJson<ProjectIndexRebuildResponse>(
+        `/api/projects/${encodeURIComponent(selectedProject.project_id)}/index/rebuild`,
+        { expected_project_revision: selectedProject.revision }
+      );
+      setProjects((current) => current.map((project) => (
+        project.project_id === response.project.project_id ? response.project : project
+      )));
+      clearProjection();
+      await inspectPlan();
+    } catch (error) {
+      if (isAuthError(error)) {
+        onAuthRequired();
+        return;
+      }
+      setLoadError(errorMessage(error));
+    } finally {
+      setIndexRebuildPending(false);
     }
   }
 
@@ -464,6 +491,17 @@ export function MissionControl({
             status={checkStatus(preflight, "capabilities")}
           />
           <PreflightRow title="Index" detail={indexDetail} status={indexStatus(preflight)} />
+          {preflight && preflight.index.freshness !== "current" ? (
+            <button
+              type="button"
+              className="mission-index-action"
+              onClick={() => void rebuildIndex()}
+              disabled={indexRebuildPending}
+            >
+              <RefreshCw className={indexRebuildPending ? "spin" : ""} size={13} />
+              {indexRebuildPending ? "Rebuilding index…" : "Rebuild project index"}
+            </button>
+          ) : null}
           <PreflightRow title="Provider" detail={providerDetail} status={preflight?.provider.status ?? "unknown"} />
           <PreflightRow
             title="Validation"

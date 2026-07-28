@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from ..config import AgentConfig
@@ -55,6 +56,10 @@ class DurableRoutingCoordinator:
         default_privacy_class: PrivacyClass = "approved_cloud",
         local_required: bool = False,
         maximum_cost_usd: float | None = None,
+        allowed_target_ids: Sequence[str] = (),
+        forbidden_target_ids: Sequence[str] = (),
+        allowed_provider_profiles: Sequence[str] = (),
+        forbidden_provider_profiles: Sequence[str] = (),
         direct_target_id: str | None = None,
         review_context: ReviewDiversityContext | None = None,
     ) -> DurableRoutingAssignment:
@@ -88,6 +93,10 @@ class DurableRoutingCoordinator:
                 default_privacy_class=default_privacy_class,
                 local_required=local_required,
                 maximum_cost_usd=maximum_cost_usd,
+                allowed_target_ids=allowed_target_ids,
+                forbidden_target_ids=forbidden_target_ids,
+                allowed_provider_profiles=allowed_provider_profiles,
+                forbidden_provider_profiles=forbidden_provider_profiles,
                 review_context=review_context,
             )
 
@@ -98,6 +107,10 @@ class DurableRoutingCoordinator:
             default_privacy_class=default_privacy_class,
             local_required=local_required,
             maximum_cost_usd=maximum_cost_usd,
+            allowed_target_ids=allowed_target_ids,
+            forbidden_target_ids=forbidden_target_ids,
+            allowed_provider_profiles=allowed_provider_profiles,
+            forbidden_provider_profiles=forbidden_provider_profiles,
             direct_target_id=direct_target_id,
             review_context=review_context,
         )
@@ -176,6 +189,10 @@ class DurableRoutingCoordinator:
         default_privacy_class: PrivacyClass,
         local_required: bool,
         maximum_cost_usd: float | None,
+        allowed_target_ids: Sequence[str],
+        forbidden_target_ids: Sequence[str],
+        allowed_provider_profiles: Sequence[str],
+        forbidden_provider_profiles: Sequence[str],
         review_context: ReviewDiversityContext | None,
     ) -> DurableRoutingAssignment:
         target_entry = self.ledger.get_model_target(existing.selected_target_id)
@@ -203,6 +220,10 @@ class DurableRoutingCoordinator:
             default_privacy_class=default_privacy_class,
             local_required=local_required,
             maximum_cost_usd=maximum_cost_usd,
+            allowed_target_ids=allowed_target_ids,
+            forbidden_target_ids=forbidden_target_ids,
+            allowed_provider_profiles=allowed_provider_profiles,
+            forbidden_provider_profiles=forbidden_provider_profiles,
             direct_target_id=existing.selected_target_id,
             review_context=review_context,
         )

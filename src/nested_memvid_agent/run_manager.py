@@ -36,6 +36,7 @@ from .models import MemoryLayer
 from .nested_learning import STABLE_MEMORY_LAYERS, NestedLearningKernel
 from .plugin_manager import PluginManager
 from .process_liveness import process_is_alive
+from .projects import validate_project_direct_route
 from .repair_integrity import (
     hardened_readonly_git_command,
     hardened_readonly_git_environment,
@@ -194,6 +195,11 @@ class RunManager:
         except BaseException:
             self._release_runtime_ownership()
             raise
+
+    def _uses_actionable_project_routing(self) -> bool:
+        """Return whether task-level routing, rather than the direct LLM, is authoritative."""
+
+        return False
 
     @property
     def started(self) -> bool:
@@ -1289,19 +1295,46 @@ class RunManager:
         autonomy_mode: str = "background",
         source: TurnSource | None = None,
         mission_plan: Sequence[Mapping[str, Any]] | None = None,
+        project_revision: int | None = None,
     ) -> RunRecord:
         self._require_mutable_runtime("create_run")
         resolved_workspace = workspace
+        project = None
+        direct_estimated_cost: float | None = None
         if project_id is not None:
             project = self.state.get_project(project_id)
             if project.archived_at is not None:
                 raise ValueError("cannot bind a new run to an archived project")
+            if mission_plan is not None and project_revision is None:
+                raise ValueError(
+                    "mission_plan requires the project revision from Mission preflight"
+                )
+            if project_revision is not None and project.revision != project_revision:
+                raise ValueError("mission preflight project revision is stale")
+            if not self._uses_actionable_project_routing():
+                direct_estimated_cost = validate_project_direct_route(
+                    project,
+                    provider=provider or self.config.provider,
+                    model=model or self.config.model,
+                    base_url=self.config.base_url,
+                )
             if resolved_workspace is None:
                 resolved_workspace = Path(project.repository_path)
         normalized_mission_plan = self._validate_mission_plan(
             mission_plan,
             project_id=project_id,
         )
+        if (
+            project is not None
+            and project.cost_budget is not None
+            and direct_estimated_cost is not None
+            and normalized_mission_plan
+            and direct_estimated_cost * len(normalized_mission_plan)
+            > project.cost_budget
+        ):
+            raise ValueError(
+                "mission direct-provider estimate exceeds the current project cost budget"
+            )
         run_id = f"run_{uuid4().hex}"
         turn_source, turn_origin, transcript_scope = _serialize_run_provenance(source)
         resolved_session_id = session_id or (
@@ -1326,6 +1359,7 @@ class RunManager:
             turn_origin=turn_origin,
             transcript_scope=transcript_scope,
             mission_plan=normalized_mission_plan,
+            project_revision=project_revision,
         )
 
     def _validate_mission_plan(
@@ -1397,9 +1431,11 @@ class RunManager:
                     raise ValueError(
                         f"mission task requires an unknown tool: {requested_tool}"
                     )
-                capability_key = f"tool:{canonical}"
                 decision = self.capabilities.tool_decision(spec)
-                if not decision.effective_enabled or capability_key not in allowed_capabilities:
+                required_capability_keys = _project_capability_keys_for_tool(spec)
+                if not decision.effective_enabled or any(
+                    key not in allowed_capabilities for key in required_capability_keys
+                ):
                     raise ValueError(
                         f"mission task requires a tool outside the effective project ceiling: "
                         f"{canonical}"
@@ -1539,6 +1575,7 @@ class RunManager:
         turn_origin: str,
         transcript_scope: str,
         mission_plan: tuple[dict[str, Any], ...],
+        project_revision: int | None,
     ) -> RunRecord:
         self._reserve_primary_run(run_id)
         try:
@@ -1547,6 +1584,15 @@ class RunManager:
                 project = self.state.get_project(project_id)
                 if project.archived_at is not None:
                     raise ValueError("cannot bind a new run to an archived project")
+                if project_revision is not None and project.revision != project_revision:
+                    raise ValueError("mission preflight project revision is stale")
+                if not self._uses_actionable_project_routing():
+                    validate_project_direct_route(
+                        project,
+                        provider=provider or self.config.provider,
+                        model=model or self.config.model,
+                        base_url=self.config.base_url,
+                    )
                 project_allowed_paths = project.allowed_paths
             normalized_autonomy = (
                 autonomy_mode
@@ -1582,6 +1628,7 @@ class RunManager:
                 turn_origin=turn_origin,
                 transcript_scope=transcript_scope,
                 project_id=project_id,
+                expected_project_revision=project_revision,
                 max_nonterminal_runs=self._primary_concurrency_limit(run_config)
                 + max(0, run_config.max_queued_runs),
             )
@@ -5408,10 +5455,16 @@ class RunManager:
                 False,
                 f"Tool {spec.name} is blocked because the project scope changed.",
             )
-        if f"tool:{spec.name}" not in project.capability_ceiling:
+        missing_project_keys = [
+            key
+            for key in _project_capability_keys_for_tool(spec)
+            if key not in project.capability_ceiling
+        ]
+        if missing_project_keys:
             return (
                 False,
-                f"Tool {spec.name} is outside the current project capability ceiling.",
+                f"Tool {spec.name} is outside the current project capability ceiling "
+                f"({', '.join(missing_project_keys)} is not allowed).",
             )
         return True, ""
 
@@ -6379,6 +6432,21 @@ def _effective_config_snapshot(
         ).encode("utf-8")
     ).hexdigest()
     return payload
+
+
+def _project_capability_keys_for_tool(spec: ToolSpec) -> tuple[str, ...]:
+    keys = [f"tool:{spec.name}"]
+    if spec.source == "mcp":
+        if not spec.server_id:
+            keys.append("mcp_server:<missing>")
+        else:
+            keys.append(f"mcp_server:{spec.server_id}")
+    elif spec.source == "skill":
+        if not spec.skill_id:
+            keys.append("skill:<missing>")
+        else:
+            keys.append(f"skill:{spec.skill_id}")
+    return tuple(keys)
 
 
 def _run_autonomy_mode(run: RunRecord) -> str:
