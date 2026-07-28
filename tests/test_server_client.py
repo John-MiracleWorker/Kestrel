@@ -285,6 +285,29 @@ def test_server_error_detail_is_redacted() -> None:
     assert secret not in repr(exc_info.value)
 
 
+def test_server_error_detail_redacts_token_from_opaque_configured_env_name() -> None:
+    token = "opaque-loopback-token-value"
+    routes: dict[tuple[str, str], Route] = {
+        ("GET", "/api/runtime/config"): (
+            500,
+            {"detail": f"server reflected configured credential {token}"},
+        ),
+    }
+    environ = {
+        "NEST_AGENT_API_AUTH_TOKEN_ENV": "AUTH",
+        "AUTH": token,
+    }
+    with _http_server(routes) as (base_url, _requests):
+        with pytest.raises(ServerClientError) as exc_info:
+            KestrelServerClient(
+                base_url,
+                environ=environ,
+            ).get_runtime_config()
+
+    assert token not in str(exc_info.value)
+    assert token not in repr(exc_info.value)
+
+
 def test_malformed_json_is_a_reachable_invalid_response() -> None:
     routes: dict[tuple[str, str], Route] = {
         ("GET", "/api/health"): (200, b"not-json"),

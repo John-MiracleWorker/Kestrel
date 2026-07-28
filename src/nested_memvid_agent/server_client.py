@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
-from .security_boundary import redact_text
+from .security_boundary import REDACTED, redact_text
 
 _DEFAULT_TOKEN_ENV_NAME = "NEST_AGENT_API_TOKEN"
 _TERMINAL_RUN_STATUSES = frozenset(
@@ -206,7 +206,7 @@ class KestrelServerClient:
                 raw = response.read(_MAX_ERROR_BODY_BYTES + 1)
         except HTTPError as exc:
             raw = exc.read(_MAX_ERROR_BODY_BYTES + 1)
-            detail = self._error_detail(raw)
+            detail = self._error_detail(raw, token=token)
             raise self._http_error(exc.code, detail) from None
         except TimeoutError as exc:
             raise ServerClientError(
@@ -215,7 +215,7 @@ class KestrelServerClient:
                 recovery="Start Kestrel or inspect `.nest/server.log`, then retry.",
             ) from exc
         except URLError as exc:
-            detail = redact_text(str(exc.reason), environ=self.environ)
+            detail = self._redact_detail(str(exc.reason), token=token)
             raise ServerClientError(
                 f"Cannot reach the Kestrel loopback service: {detail}",
                 code="endpoint_unreachable",
@@ -254,7 +254,7 @@ class KestrelServerClient:
         )
         return self.environ.get(configured_name, "").strip()
 
-    def _error_detail(self, raw: bytes) -> str:
+    def _error_detail(self, raw: bytes, *, token: str) -> str:
         truncated = raw[:_MAX_ERROR_BODY_BYTES]
         try:
             decoded = json.loads(truncated)
@@ -270,7 +270,12 @@ class KestrelServerClient:
                 detail = detail_value
             else:
                 detail = json.dumps(detail_value, sort_keys=True)
-        return redact_text(detail.strip(), environ=self.environ)
+        return self._redact_detail(detail.strip(), token=token)
+
+    def _redact_detail(self, detail: str, *, token: str) -> str:
+        if token:
+            detail = detail.replace(token, REDACTED)
+        return redact_text(detail, environ=self.environ)
 
     def _http_error(self, status_code: int, detail: str) -> ServerClientError:
         if status_code == 401:
