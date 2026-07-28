@@ -4,7 +4,7 @@ import base64
 import json
 import math
 import sys
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -12,6 +12,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 _REQUEST_SCHEMA = "kestrel.provider_http_request.v1"
 _RESPONSE_SCHEMA = "kestrel.provider_http_response.v1"
 _READ_CHUNK_BYTES = 16 * 1024
+MAX_PROVIDER_HTTP_REQUEST_BYTES = 4 * 1024 * 1024
 
 
 class _RejectRedirectHandler(HTTPRedirectHandler):
@@ -185,7 +186,7 @@ def _exchange(payload: dict[str, object]) -> dict[str, object]:
 
 def main() -> int:
     try:
-        raw_request = sys.stdin.buffer.read()
+        raw_request = _read_request_bytes(sys.stdin.buffer)
         parsed = json.loads(raw_request.decode("utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError("provider transport request must be a JSON object")
@@ -205,6 +206,15 @@ def main() -> int:
     sys.stdout.buffer.write(encoded)
     sys.stdout.buffer.flush()
     return 0
+
+
+def _read_request_bytes(stream: BinaryIO) -> bytes:
+    payload = stream.read(MAX_PROVIDER_HTTP_REQUEST_BYTES + 1)
+    if len(payload) > MAX_PROVIDER_HTTP_REQUEST_BYTES:
+        raise ValueError(
+            f"provider transport request exceeds {MAX_PROVIDER_HTTP_REQUEST_BYTES} bytes"
+        )
+    return payload
 
 
 if __name__ == "__main__":

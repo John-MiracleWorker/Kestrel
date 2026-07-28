@@ -79,6 +79,7 @@ SecretResolver = Callable[[str | None], str | None]
 MAX_MODEL_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_MODEL_CATALOG_ENTRIES = 2048
 MAX_MODEL_ID_CHARS = 512
+MAX_PROVIDER_HTTP_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_CONCURRENT_PROVIDER_HTTP_EXCHANGES = 8
 _PROVIDER_HTTP_WORKER_SLOTS = BoundedSemaphore(MAX_CONCURRENT_PROVIDER_HTTP_EXCHANGES)
 _PROVIDER_HTTP_REQUEST_SCHEMA = "kestrel.provider_http_request.v1"
@@ -540,12 +541,17 @@ def _encode_provider_http_request(
         "max_bytes": max_bytes,
         "error_max_bytes": error_max_bytes,
     }
-    return json.dumps(
+    encoded = json.dumps(
         payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
+    if len(encoded) > MAX_PROVIDER_HTTP_REQUEST_BYTES:
+        raise ValueError(
+            f"provider transport request exceeds {MAX_PROVIDER_HTTP_REQUEST_BYTES} bytes"
+        )
+    return encoded
 
 
 def _provider_http_worker_command() -> list[str]:

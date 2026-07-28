@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,9 +14,17 @@ from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.llm.model_catalog import (
     MAX_MODEL_CATALOG_BYTES,
     MAX_MODEL_ID_CHARS,
+    MAX_PROVIDER_HTTP_REQUEST_BYTES,
     ProviderModelCatalog,
+    _encode_provider_http_request,
     _fetch_json,
     model_catalog_for_provider,
+)
+from nested_memvid_agent.llm.provider_http_worker import (
+    MAX_PROVIDER_HTTP_REQUEST_BYTES as WORKER_MAX_PROVIDER_HTTP_REQUEST_BYTES,
+)
+from nested_memvid_agent.llm.provider_http_worker import (
+    _read_request_bytes,
 )
 from nested_memvid_agent.provider_probe import (
     CapabilityEvidence,
@@ -516,15 +525,22 @@ def test_slow_header_timeouts_release_transport_capacity_for_recovery() -> None:
     handler = _saturating_slow_header_handler(stop=stop, started=started)
     try:
         with _serve(handler) as base_url:
-            for _index in range(9):
-                with pytest.raises(TimeoutError, match="deadline"):
+            def slow_request(_index: int) -> str:
+                try:
                     _fetch_json(
                         f"{base_url}/slow",
-                        timeout_seconds=0.1,
+                        timeout_seconds=0.2,
                         api_key=None,
                     )
+                except TimeoutError as exc:
+                    return str(exc)
+                return "unexpected_success"
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                outcomes = list(executor.map(slow_request, range(16)))
 
             assert started.wait(timeout=0.5)
+            assert outcomes == ["provider response deadline exceeded"] * 16
             assert _fetch_json(
                 f"{base_url}/healthy",
                 timeout_seconds=1.0,
@@ -532,6 +548,27 @@ def test_slow_header_timeouts_release_transport_capacity_for_recovery() -> None:
             ) == {"recovered": True}
     finally:
         stop.set()
+
+
+def test_provider_transport_request_envelope_is_capped_on_both_sides() -> None:
+    from io import BytesIO
+    from urllib.request import Request
+
+    assert WORKER_MAX_PROVIDER_HTTP_REQUEST_BYTES == MAX_PROVIDER_HTTP_REQUEST_BYTES
+    oversized = Request(
+        "http://127.0.0.1:1234/v1/chat/completions",
+        data=b"x" * MAX_PROVIDER_HTTP_REQUEST_BYTES,
+        method="POST",
+    )
+    with pytest.raises(ValueError, match="request exceeds"):
+        _encode_provider_http_request(
+            oversized,
+            timeout_seconds=1.0,
+            max_bytes=1024,
+            error_max_bytes=1024,
+        )
+    with pytest.raises(ValueError, match="request exceeds"):
+        _read_request_bytes(BytesIO(b"x" * (MAX_PROVIDER_HTTP_REQUEST_BYTES + 1)))
 
 
 def test_catalog_wall_deadline_covers_slow_response_headers() -> None:
