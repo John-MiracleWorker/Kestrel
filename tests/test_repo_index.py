@@ -47,7 +47,7 @@ def _unlink_read_only_fixture(path: Path) -> None:
 
 
 def _row_ids(index_path: Path, table: str) -> list[tuple[int, int]]:
-    with sqlite3.connect(index_path) as connection:
+    with closing(sqlite3.connect(index_path)) as connection:
         return [
             (int(row[0]), int(row[1]))
             for row in connection.execute(
