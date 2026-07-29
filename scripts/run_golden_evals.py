@@ -864,26 +864,41 @@ def _eval_summary_first_expand_raw(config: AgentConfig, eval_id: str) -> dict[st
     agent = build_agent(config)
     try:
         marker = f"{eval_id} summary expand"
+        summary_id = _new_id("summary_expand_summary")
+        raw_id = _new_id("summary_expand_raw")
+        raw_content = (
+            f"{marker}: Raw exact evidence includes verbose logs and complete command output."
+        )
         agent.memory.put(
             MemoryRecord(
+                id=summary_id,
                 layer=MemoryLayer.EPISODIC,
                 kind=MemoryKind.SUMMARY,
                 title=f"{marker} summary",
                 content=f"{marker}: Summary says the fix is to pack summaries before raw evidence.",
                 confidence=0.8,
                 importance=0.8,
-                metadata={"frame_type": "task_summary"},
+                metadata={
+                    "frame_type": "task_summary",
+                    "frame_id": summary_id,
+                    "child_ids": [raw_id],
+                },
             )
         )
         agent.memory.put(
             MemoryRecord(
+                id=raw_id,
                 layer=MemoryLayer.EPISODIC,
                 kind=MemoryKind.EVENT,
                 title=f"{marker} raw",
-                content=f"{marker}: Raw exact evidence includes verbose logs and complete command output.",
+                content=raw_content,
                 confidence=0.8,
                 importance=0.7,
-                metadata={"frame_type": "raw_chunk"},
+                metadata={
+                    "frame_type": "raw_chunk",
+                    "frame_id": raw_id,
+                    "parent_ids": [summary_id],
+                },
             )
         )
         # Force the vector sidecar to index both records so retrieval is
@@ -911,10 +926,14 @@ def _eval_summary_first_expand_raw(config: AgentConfig, eval_id: str) -> dict[st
         expanded_titles = {item.frame.title for item in expanded.items}
         return {
             "passed": f"{marker} summary" in compact_titles
-            and f"{marker} raw" not in compact_titles
-            and f"{marker} raw" in expanded_titles,
+            and raw_content not in compact.prompt
+            and raw_content in expanded.prompt,
             "memory_hits": len(expanded.items),
             "context_chars": len(expanded.prompt),
+            "summary_in_compact": f"{marker} summary" in compact_titles,
+            "raw_in_compact": raw_content in compact.prompt,
+            "raw_in_expanded": raw_content in expanded.prompt,
+            "raw_retrieved_as_peer": f"{marker} raw" in expanded_titles,
         }
     finally:
         agent.close()
@@ -1466,21 +1485,29 @@ def _eval_plan_completion(config: AgentConfig) -> dict[str, Any]:
     graph_contract = root["plan"]["graph_runtime"]
     review = (root.get("result") or {}).get("orchestration_review") or {}
     artifact = review.get("artifact") or {}
+    span_counts = trace["summary"]["span_counts"]
     return {
         "passed": final["status"] == "completed"
         and root["status"] == "completed"
-        and graph_contract["can_revise_plan"] is False
-        and graph_contract["can_rewrite_task_dag"] is False
+        and graph_contract["can_revise_plan"] is True
+        and graph_contract["can_rewrite_task_dag"] is True
         and root["plan"]["semantic_plan"]["source"] == "deterministic_task_graph"
         and artifact.get("decision") == "pass"
         and bool(artifact.get("evidence"))
-        and trace["summary"]["span_counts"].get("plan", 0) >= 1
-        and trace["summary"]["span_counts"].get("review", 0) >= 1,
+        and span_counts.get("plan", 0) >= 1
+        and span_counts.get("review", 0) >= 1,
         "tool_count": int(final.get("tool_count", 0)),
         "plan_task_count": len(graph["tasks"]),
         "span_count": trace["summary"]["span_count"],
         "semantic_plan_source": root["plan"]["semantic_plan"]["source"],
         "review_decision": artifact.get("decision"),
+        "final_status": final["status"],
+        "root_status": root["status"],
+        "can_revise_plan": graph_contract["can_revise_plan"],
+        "can_rewrite_task_dag": graph_contract["can_rewrite_task_dag"],
+        "review_evidence_count": len(artifact.get("evidence") or ()),
+        "plan_span_count": span_counts.get("plan", 0),
+        "review_span_count": span_counts.get("review", 0),
     }
 
 

@@ -38,6 +38,8 @@ IndexFreshness = Literal["current", "stale", "missing", "unknown"]
 
 MISSION_PREFLIGHT_SCHEMA = "kestrel.mission_preflight.v1"
 MISSION_LAUNCH_BINDING_SCHEMA = "kestrel.mission_launch_binding.v1"
+_PLATFORM_OS: Any = os
+_PLATFORM_SIGNAL: Any = signal
 MISSION_TEMPLATE_IDS = frozenset(
     {
         "explain_repository",
@@ -1389,7 +1391,7 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
         return
     if os.name != "nt":
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            _PLATFORM_OS.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             return
     else:
@@ -1399,7 +1401,7 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         if os.name != "nt":
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                _PLATFORM_OS.killpg(process.pid, _PLATFORM_SIGNAL.SIGKILL)
             except ProcessLookupError:
                 return
         else:
@@ -1628,4 +1630,4 @@ def _payload_digest(payload: Mapping[str, Any]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha3_256(encoded).hexdigest()

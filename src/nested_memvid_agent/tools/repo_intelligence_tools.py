@@ -23,6 +23,7 @@ from .workspace_tools import (
 )
 
 _MAX_TOOL_QUERY_LIMIT = 100
+_PLATFORM_OS: Any = os
 _MAX_CONTEXT_CHARS = 50_000
 _MAX_CONTEXT_FILE_BYTES = 1_000_000
 _MAX_CONTEXT_EVIDENCE = 24
@@ -829,7 +830,8 @@ def _existing_project_index(context: ToolContext) -> RepositoryIndex:
             "The project repository-index sidecar is not a trusted regular file.",
         )
     if os.name == "posix" and (
-        metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022
+        metadata.st_uid != _PLATFORM_OS.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
         raise _RepoToolFailure(
             "repo_index_untrusted",

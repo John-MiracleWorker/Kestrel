@@ -128,7 +128,7 @@ def test_prepare_creates_executable_managed_shim_that_forwards_exactly(
     assert str(home.resolve() / ".venv" / "bin" / "kestrel") in text
     assert '"$@"' in text
     assert "secret-not-for-shim" not in text
-    assert shim.stat().st_mode & 0o777 == 0o755
+    assert shim.stat().st_mode & 0o777 == 0o700
     assert manifest.stat().st_mode & 0o777 == 0o600
 
     capture = tmp_path / "capture.txt"
@@ -453,7 +453,7 @@ def test_darwin_prepare_creates_owned_parseable_app_with_static_recovery(
     assert "osascript" in executable_text
     assert str(home.resolve() / ".nest" / "server.log") in executable_text
     assert "kestrel doctor" in executable_text
-    assert executable.stat().st_mode & 0o777 == 0o755
+    assert executable.stat().st_mode & 0o777 == 0o700
 
 
 def test_rollback_restores_prior_managed_artifacts_byte_for_byte(

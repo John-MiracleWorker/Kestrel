@@ -13,7 +13,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, Generic, TypeVar, cast
+from typing import IO, Any, Generic, TypeVar, cast
 
 from ..file_lock import lock_exclusive, lock_shared, unlock
 from .models import (
@@ -31,6 +31,7 @@ from .models import (
 )
 
 SCHEMA_VERSION = 5
+_PLATFORM_OS: Any = os
 _APPLICATION_ID = 0x4B535452
 _GENERATION_HISTORY_LIMIT = 64
 _LOCK_SECRET_PREFIX = b"KESTREL-REPO-INDEX-LOCK-V1\n"
@@ -1089,7 +1090,7 @@ class RepoIndexStore:
         except OSError as exc:
             raise RepositoryIndexError(f"{label} is inaccessible") from exc
         if os.name == "posix":
-            if info.st_uid != os.getuid():
+            if info.st_uid != _PLATFORM_OS.getuid():
                 raise RepositoryIndexError(f"{label} has an unsafe owner")
             if stat.S_IMODE(info.st_mode) & 0o022:
                 raise RepositoryIndexError(f"{label} has unsafe write permissions")
@@ -1145,7 +1146,7 @@ class RepoIndexStore:
                     expected_mode=None if created else 0o600,
                 )
                 if os.name == "posix" and created:
-                    os.fchmod(lock_descriptor, 0o600)
+                    _PLATFORM_OS.fchmod(lock_descriptor, 0o600)
                     lock_info = os.fstat(lock_descriptor)
                 self._require_safe_private_file(
                     lock_info,
@@ -1561,7 +1562,7 @@ class RepoIndexStore:
             raise RepositoryIndexError(f"{label} must not be a hard link")
         if os.name != "posix":
             return
-        if int(info.st_uid) != os.getuid():
+        if int(info.st_uid) != _PLATFORM_OS.getuid():
             raise RepositoryIndexError(f"{label} has an unsafe owner")
         if expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode:
             raise RepositoryIndexError(f"{label} has unsafe permissions")
@@ -2783,7 +2784,7 @@ class RepoIndexStore:
                 expected_mode=None,
             )
             if os.name == "posix":
-                os.fchmod(descriptor, mode)
+                _PLATFORM_OS.fchmod(descriptor, mode)
             opened_info = os.fstat(descriptor)
             self._require_safe_private_file(
                 opened_info,

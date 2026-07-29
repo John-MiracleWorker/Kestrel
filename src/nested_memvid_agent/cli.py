@@ -45,6 +45,7 @@ from .runtime_models import LLMStreamEvent, ToolCall
 from .runtime_ownership import PrimaryRuntimeOwnership, RuntimeOwnershipError
 from .runtime_settings import default_runtime_settings_path
 from .secret_broker import build_secret_broker
+from .security_boundary import redact_secrets
 from .setup_readiness import build_setup_readiness_report
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RoutineConflictError
@@ -1769,7 +1770,7 @@ def _doctor_provider(
         "provider": config.provider,
         "model": config.model,
         "base_url_configured": bool(config.base_url),
-        "api_key_env": key_env,
+        "credential_env_configured": bool(key_env),
         "api_key_present": api_key_present,
         "timeout_seconds": config.timeout_seconds,
         "max_retries": config.max_retries,
@@ -1800,7 +1801,8 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "git_write_mode": config.git_write_mode,
         "protected_branches": list(config.protected_branches),
         "secret_store_path": str(config.secret_store_path),
-        "secret_backend": config.secret_backend,
+        "secret_store_keyring": config.secret_backend == "keyring",
+        "secret_store_file_backed": config.secret_backend == "json",
         "allow_memory_import": config.allow_memory_import,
         "allow_executable_skills": config.allow_executable_skills,
         "allow_browser_validation": config.allow_browser_validation,
@@ -2442,6 +2444,7 @@ def _write_plugin_audit(
 
 
 def _print_plugins(plugins: list[dict[str, Any]], *, json_output: bool) -> None:
+    plugins = redact_secrets(plugins)
     if json_output:
         print(json.dumps({"plugins": plugins}, indent=2))
         return
@@ -2457,6 +2460,7 @@ def _print_plugins(plugins: list[dict[str, Any]], *, json_output: bool) -> None:
 
 
 def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
+    plugin = redact_secrets(plugin)
     if json_output:
         print(json.dumps(plugin, indent=2))
         return
@@ -2478,6 +2482,7 @@ def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
 
 
 def _print_plugin_review(review: dict[str, Any], *, json_output: bool) -> None:
+    review = redact_secrets(review)
     if json_output:
         print(json.dumps(review, indent=2))
         return

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -30,6 +32,24 @@ from nested_memvid_agent.routing.models import ModelTarget, ProviderProfile, Rou
 from nested_memvid_agent.routing.runtime import AdaptiveFlockRuntimeConfig
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.runtime_models import ToolSpec
+
+
+def test_mission_binding_digest_uses_sha3_for_credential_references() -> None:
+    payload = {
+        "provider": "openai",
+        "credential_env_ref": "OPENAI_API_KEY",
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert mission_control_module._payload_digest(payload) == hashlib.sha3_256(
+        encoded
+    ).hexdigest()
 
 
 def test_preflight_is_deterministic_and_truthful_about_warnings() -> None:

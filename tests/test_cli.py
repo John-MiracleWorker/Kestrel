@@ -18,6 +18,7 @@ from pytest import MonkeyPatch, raises
 from nested_memvid_agent.agent_backup import AgentBackupManager
 from nested_memvid_agent.cli import (
     _cli_run_idle_timeout_seconds,
+    _print_plugin,
     _run_exit_code,
     _shutdown_run_manager,
     _validate_server_bind,
@@ -36,6 +37,7 @@ from nested_memvid_agent.models import (
 from nested_memvid_agent.orchestrator import build_memory_system
 from nested_memvid_agent.promotion_ledger import PromotionEntry, PromotionLedger
 from nested_memvid_agent.runtime_ownership import PrimaryRuntimeOwnership
+from nested_memvid_agent.security_boundary import register_secret_value
 from nested_memvid_agent.state_store import AgentStateStore, routine_session_id
 
 PINNED_VALIDATION_IMAGE = "example.invalid/kestrel-validation@sha256:" + "a" * 64
@@ -818,6 +820,29 @@ def test_tools_subcommand_lists_risk_levels(monkeypatch: MonkeyPatch, capsys: ob
     assert "git.commit [high, approval required]" in output
 
 
+def test_plugin_json_output_redacts_untrusted_sensitive_fields(capsys: object) -> None:
+    secret = "plugin-output-sensitive-value-4b19"  # gitleaks:allow
+    register_secret_value(secret)
+
+    _print_plugin(
+        {
+            "id": "safe-plugin",
+            "name": "Safe Plugin",
+            "source_url": "https://example.invalid/plugin",
+            "commit_sha": "a" * 40,
+            "format": "kestrel.plugin.v1",
+            "enabled": False,
+            "capabilities": [],
+            "metadata": {"password": secret},
+        },
+        json_output=True,
+    )
+
+    output = capsys.readouterr().out
+    assert secret not in output
+    assert "<redacted>" in output
+
+
 def test_chat_self_and_web_slash_commands(
     tmp_path: Path, monkeypatch: MonkeyPatch, capsys: object
 ) -> None:
@@ -992,6 +1017,26 @@ def test_doctor_subcommand_reports_runtime_readiness(
     assert '"required": false' in output
     assert '"host_fallback": false' in output
     assert '"default_command": "pytest -q"' in output
+
+
+def test_doctor_reports_credential_readiness_without_raw_descriptors() -> None:
+    from nested_memvid_agent import cli
+
+    key_env = "KESTREL_DOCTOR_PROVIDER_KEY"
+    config = AgentConfig(
+        provider="openai",
+        api_key_env=key_env,
+        secret_backend="keyring",
+    )
+
+    provider = cli._doctor_provider(config, environ={key_env: "configured-value"})
+    tools = cli._doctor_tool_config(config)
+
+    assert "api_key_env" not in provider
+    assert provider["credential_env_configured"] is True
+    assert provider["api_key_present"] is True
+    assert "secret_backend" not in tools
+    assert tools["secret_store_keyring"] is True
 
 
 def test_doctor_validation_container_fails_closed_for_enabled_tools() -> None:

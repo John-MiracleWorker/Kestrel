@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from .models import (
     DEFAULT_QUERY_LIMIT,
@@ -41,6 +41,8 @@ from .store import (
     StoreQueryPage,
     StoreQuerySnapshot,
 )
+
+_PLATFORM_OS: Any = os
 
 _VALID_PROJECT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _GIT_OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{40,64}\Z")
@@ -464,7 +466,7 @@ class RepositoryIndex:
         if hasattr(os, "O_DIRECTORY"):
             flags = os.O_RDONLY | os.O_DIRECTORY
             if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
+                flags |= _PLATFORM_OS.O_NOFOLLOW
             try:
                 descriptor = os.open(self.repository_root, flags)
             except OSError as exc:

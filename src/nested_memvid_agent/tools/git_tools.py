@@ -43,6 +43,8 @@ from .workspace_tools import (
 )
 
 _MAX_EXACT_PATCH_BYTES = 16 * 1024 * 1024
+_PLATFORM_OS: Any = os
+_PLATFORM_SIGNAL: Any = signal
 _MAX_EXACT_PATCH_STDERR_BYTES = 64 * 1024
 
 
@@ -1643,14 +1645,14 @@ def _settle_git_process_tree(
         return False
     deadline = time.monotonic() + 2.0
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        _PLATFORM_OS.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return True
     except OSError:
         return False
     while time.monotonic() < deadline:
         try:
-            os.killpg(process.pid, 0)
+            _PLATFORM_OS.killpg(process.pid, 0)
         except ProcessLookupError:
             try:
                 process.wait(timeout=0.1)
@@ -1661,7 +1663,7 @@ def _settle_git_process_tree(
             return False
         time.sleep(0.01)
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        _PLATFORM_OS.killpg(process.pid, _PLATFORM_SIGNAL.SIGKILL)
     except ProcessLookupError:
         pass
     except OSError:

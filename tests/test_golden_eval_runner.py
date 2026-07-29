@@ -262,3 +262,23 @@ def test_honest_failure_fixture_isolated_from_caller_workspace_secrets(
         "tool_count": 1,
         "error": "nonzero_exit",
     }
+
+
+def test_durable_plan_golden_matches_revisable_graph_contract(tmp_path: Path) -> None:
+    result = _run_isolated_case(
+        name="durable_plan_completion",
+        category="plan_completion_rate",
+        receipt_path=tmp_path / "receipts" / "durable-plan.json",
+        timeout_seconds=30,
+        backend="memory",
+        memory_dir=tmp_path / "memory",
+        provider="mock",
+        model="mock",
+        workspace=tmp_path,
+        seed=1729,
+        validation_container_image=None,
+    )
+
+    assert result["passed"] is True
+    assert result["can_revise_plan"] is True
+    assert result["can_rewrite_task_dag"] is True

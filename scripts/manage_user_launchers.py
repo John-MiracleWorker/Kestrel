@@ -563,7 +563,7 @@ def _write_staged_shim(artifact: dict[str, Any], text: str, *, uid: int) -> None
         descriptor = os.open(
             staged.name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW,
-            0o755,
+            0o700,
             dir_fd=parent_fd,
         )
         identity = os.fstat(descriptor)
@@ -691,8 +691,8 @@ def _build_macos_app(
     transaction_id: str = "0" * 32,
 ) -> None:
     contents, macos_dir, resources_dir = app_path / "Contents", app_path / "Contents" / "MacOS", app_path / "Contents" / "Resources"
-    macos_dir.mkdir(parents=True, mode=0o755)
-    resources_dir.mkdir(parents=True, mode=0o755)
+    macos_dir.mkdir(parents=True, mode=0o700)
+    resources_dir.mkdir(parents=True, mode=0o700)
     with (contents / "Info.plist").open("wb") as handle:
         plistlib.dump({"CFBundleDevelopmentRegion": "en", "CFBundleDisplayName": "Kestrel",
                        "CFBundleExecutable": "Kestrel", "CFBundleIdentifier": "com.kestrel.local-launcher",
@@ -716,10 +716,10 @@ def _build_macos_app_at(
     app_fd: int, *, shim_path: Path, log_path: Path, transaction_id: str,
 ) -> None:
     """Build the app entirely below an already pinned staging-directory fd."""
-    os.mkdir("Contents", 0o755, dir_fd=app_fd)
+    os.mkdir("Contents", 0o700, dir_fd=app_fd)
     with _open_dir_at(app_fd, "Contents", uid=_current_uid()) as contents_fd:
-        os.mkdir("MacOS", 0o755, dir_fd=contents_fd)
-        os.mkdir("Resources", 0o755, dir_fd=contents_fd)
+        os.mkdir("MacOS", 0o700, dir_fd=contents_fd)
+        os.mkdir("Resources", 0o700, dir_fd=contents_fd)
         plist = {"CFBundleDevelopmentRegion": "en", "CFBundleDisplayName": "Kestrel",
                  "CFBundleExecutable": "Kestrel", "CFBundleIdentifier": "com.kestrel.local-launcher",
                  "CFBundleInfoDictionaryVersion": "6.0", "CFBundleName": "Kestrel",
@@ -741,7 +741,7 @@ def _build_macos_app_at(
                       f"if ! {shlex.quote(str(shim_path))} open; then\n"
                       f"  /usr/bin/osascript -e {shlex.quote(applescript)} >/dev/null 2>&1 || true\n  exit 1\nfi\n")
         with _open_dir_at(contents_fd, "MacOS", uid=_current_uid()) as macos_fd:
-            _write_file_at(macos_fd, "Kestrel", executable.encode(), 0o755)
+            _write_file_at(macos_fd, "Kestrel", executable.encode(), 0o700)
 
 
 def _codesign_app(app_path: Path, *, which: Callable[[str], str | None]) -> str:
@@ -1145,7 +1145,13 @@ def _unlink_manifest(path: Path, *, expected_payload: Mapping[str, Any] | None =
 
 
 def _write_file_at(parent_fd: int, name: str, data: bytes, mode: int) -> None:
-    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW, mode, dir_fd=parent_fd)
+    private_mode = stat.S_IMODE(mode) & 0o700
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW,
+        private_mode,
+        dir_fd=parent_fd,
+    )
     try:
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
@@ -1255,7 +1261,11 @@ def _assert_entry_matches_fd(parent_fd: int, name: str, fd: int) -> None:
 
 
 def _write_executable(path: Path, text: str) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW, 0o755)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW,
+        0o700,
+    )
     try:
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
