@@ -128,6 +128,54 @@ def test_windows_candidate_identity_uses_open_descriptor_metadata(
     assert closed == [17]
 
 
+def test_windows_candidate_rejects_same_api_path_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "candidate.py"
+    path.write_text("pass\n", encoding="utf-8")
+    visible_before = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o600,
+        st_dev=0,
+        st_ino=0,
+        st_size=5,
+        st_mtime_ns=101,
+        st_ctime_ns=202,
+        st_file_attributes=0,
+        st_reparse_tag=0,
+    )
+    visible_after = SimpleNamespace(
+        **{**visible_before.__dict__, "st_mtime_ns": 102}
+    )
+    opened = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o600,
+        st_dev=7,
+        st_ino=11,
+        st_size=5,
+        st_mtime_ns=404,
+        st_ctime_ns=303,
+        st_file_attributes=0,
+    )
+    visible = iter((visible_before, visible_after))
+    monkeypatch.setattr(repo_indexer, "_PLATFORM_OS", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(repo_indexer.os, "open", lambda *_args, **_kwargs: 17)
+    monkeypatch.setattr(repo_indexer.os, "fstat", lambda _descriptor: opened)
+    monkeypatch.setattr(repo_indexer.os, "lstat", lambda _path: next(visible))
+    monkeypatch.setattr(repo_indexer.os, "close", lambda _descriptor: None)
+
+    with pytest.raises(
+        RepositoryChangedDuringIndexingError,
+        match="repository file changed during scan",
+    ):
+        repo_indexer._candidate_from_stat(
+            path=path,
+            relative_path="candidate.py",
+            info=visible_before,
+            limits=IndexLimits(),
+            candidate_count=0,
+        )
+
+
 def _git(repository: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments],

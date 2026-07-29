@@ -1343,20 +1343,12 @@ def _untracked_content_manifest(
             raise OSError("Untracked content exceeds the Git preflight envelope")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(candidate, flags)
+        descriptor = _PLATFORM_OS.open(candidate, flags)
         try:
-            opened = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_dev != metadata.st_dev
-                or opened.st_ino != metadata.st_ino
-                or opened.st_size != metadata.st_size
-                or opened.st_mtime_ns != metadata.st_mtime_ns
-            ):
-                raise OSError("An untracked file changed during Git preflight")
+            opened = _PLATFORM_OS.fstat(descriptor)
             digest = hashlib.sha256()
             read_bytes = 0
-            while chunk := os.read(descriptor, 64 * 1024):
+            while chunk := _PLATFORM_OS.read(descriptor, 64 * 1024):
                 if monotonic() > deadline:
                     raise TimeoutError
                 read_bytes += len(chunk)
@@ -1365,25 +1357,94 @@ def _untracked_content_manifest(
                         "An untracked file exceeded the Git preflight envelope"
                     )
                 digest.update(chunk)
-            after = os.fstat(descriptor)
-            if (
-                after.st_size != opened.st_size
-                or after.st_mtime_ns != opened.st_mtime_ns
-                or read_bytes != opened.st_size
+            after = _PLATFORM_OS.fstat(descriptor)
+            try:
+                visible_after = candidate.lstat()
+            except OSError as exc:
+                raise OSError(
+                    "An untracked path changed during Git preflight"
+                ) from exc
+            if _untracked_file_changed(
+                visible_before=metadata,
+                opened_before=opened,
+                opened_after=after,
+                visible_after=visible_after,
+                read_bytes=read_bytes,
             ):
                 raise OSError("An untracked file changed during Git preflight")
         finally:
-            os.close(descriptor)
+            _PLATFORM_OS.close(descriptor)
         manifest.append(
             {
                 "path": relative,
                 "kind": "file",
-                "mode": stat.S_IMODE(metadata.st_mode),
-                "size": metadata.st_size,
+                "mode": _regular_worktree_mode(metadata),
+                "size": opened.st_size,
                 "sha256": digest.hexdigest(),
             }
         )
     return manifest
+
+
+def _untracked_file_changed(
+    *,
+    visible_before: os.stat_result,
+    opened_before: os.stat_result,
+    opened_after: os.stat_result,
+    visible_after: os.stat_result,
+    read_bytes: int,
+) -> bool:
+    if (
+        not stat.S_ISREG(opened_before.st_mode)
+        or not stat.S_ISREG(opened_after.st_mode)
+        or not stat.S_ISREG(visible_after.st_mode)
+        or _descriptor_file_snapshot(opened_before)
+        != _descriptor_file_snapshot(opened_after)
+        or read_bytes != opened_before.st_size
+    ):
+        return True
+    if getattr(_PLATFORM_OS, "name", os.name) == "nt":
+        return (
+            _path_file_snapshot(visible_before)
+            != _path_file_snapshot(visible_after)
+            or opened_before.st_size != visible_before.st_size
+        )
+    return (
+        not os.path.samestat(visible_before, opened_before)
+        or not os.path.samestat(opened_after, visible_after)
+        or opened_before.st_mtime_ns != visible_before.st_mtime_ns
+        or opened_after.st_mtime_ns != visible_after.st_mtime_ns
+    )
+
+
+def _descriptor_file_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _path_file_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+        int(getattr(metadata, "st_file_attributes", 0)),
+        int(getattr(metadata, "st_reparse_tag", 0)),
+    )
+
+
+def _regular_worktree_mode(metadata: os.stat_result) -> int:
+    if getattr(_PLATFORM_OS, "name", os.name) == "nt":
+        return 0o644
+    return stat.S_IMODE(metadata.st_mode)
 
 
 def _is_git_object_id(value: str) -> bool:

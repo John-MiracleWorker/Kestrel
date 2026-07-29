@@ -807,7 +807,7 @@ def test_timeout_writes_atomic_redacted_iteration_and_aggregate_receipts(
         assert receipt["capture"] == {
             "limit_bytes_per_stream": 262144,
             "stderr_total_bytes": len(
-                b"OPENAI_API_KEY=sk-proj-timeout-secret123\n"
+                f"OPENAI_API_KEY=sk-proj-timeout-secret123{os.linesep}".encode()
             ),
             "stderr_truncated": False,
             "stdout_total_bytes": 0,

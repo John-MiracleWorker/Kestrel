@@ -735,6 +735,20 @@ def _candidate_from_stat(
         return None
     stable_info = info
     if getattr(_PLATFORM_OS, "name", os.name) == "nt":
+        try:
+            visible_before = os.lstat(path)
+        except OSError as exc:
+            raise RepositoryChangedDuringIndexingError(
+                f"repository file changed during scan: {relative_path}"
+            ) from exc
+        if (
+            is_link_or_reparse_point(visible_before)
+            or not stat.S_ISREG(visible_before.st_mode)
+            or visible_before.st_size > limits.max_file_bytes
+        ):
+            raise RepositoryChangedDuringIndexingError(
+                f"repository file changed during scan: {relative_path}"
+            )
         flags = (
             os.O_RDONLY
             | getattr(os, "O_BINARY", 0)
@@ -761,20 +775,26 @@ def _candidate_from_stat(
             or not stat.S_ISREG(opened.st_mode)
             or not stat.S_ISREG(visible.st_mode)
             or (
+                visible_before.st_mode,
+                visible_before.st_dev,
+                visible_before.st_ino,
+                visible_before.st_size,
+                visible_before.st_mtime_ns,
+                visible_before.st_ctime_ns,
+                getattr(visible_before, "st_file_attributes", 0),
+                getattr(visible_before, "st_reparse_tag", 0),
+            )
+            != (
+                visible.st_mode,
                 visible.st_dev,
                 visible.st_ino,
                 visible.st_size,
                 visible.st_mtime_ns,
                 visible.st_ctime_ns,
+                getattr(visible, "st_file_attributes", 0),
+                getattr(visible, "st_reparse_tag", 0),
             )
-            != (
-                info.st_dev,
-                info.st_ino,
-                info.st_size,
-                info.st_mtime_ns,
-                info.st_ctime_ns,
-            )
-            or opened.st_size != info.st_size
+            or opened.st_size != visible_before.st_size
         ):
             raise RepositoryChangedDuringIndexingError(
                 f"repository file changed during scan: {relative_path}"

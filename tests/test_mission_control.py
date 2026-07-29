@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -222,6 +223,58 @@ def test_git_inspection_detects_dirty_state_without_refreshing_index(tmp_path: P
         after.st_ino,
         after.st_mtime_ns,
         after.st_size,
+    )
+
+
+def test_windows_untracked_read_uses_same_api_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    visible = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o666,
+        st_dev=0,
+        st_ino=0,
+        st_size=3,
+        st_mtime_ns=101,
+        st_ctime_ns=202,
+        st_file_attributes=0,
+        st_reparse_tag=0,
+    )
+    opened = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o666,
+        st_dev=7,
+        st_ino=11,
+        st_size=3,
+        st_mtime_ns=404,
+        st_ctime_ns=505,
+    )
+    monkeypatch.setattr(
+        mission_control_module,
+        "_PLATFORM_OS",
+        SimpleNamespace(name="nt"),
+    )
+
+    assert (
+        mission_control_module._untracked_file_changed(  # noqa: SLF001
+            visible_before=visible,
+            opened_before=opened,
+            opened_after=opened,
+            visible_after=visible,
+            read_bytes=3,
+        )
+        is False
+    )
+    changed_visible = SimpleNamespace(
+        **{**visible.__dict__, "st_mtime_ns": visible.st_mtime_ns + 1}
+    )
+    assert (
+        mission_control_module._untracked_file_changed(  # noqa: SLF001
+            visible_before=visible,
+            opened_before=opened,
+            opened_after=opened,
+            visible_after=changed_visible,
+            read_bytes=3,
+        )
+        is True
     )
 
 

@@ -410,6 +410,44 @@ def test_changed_path_manifest_opens_literal_bytes_in_binary_mode(
     assert manifest["size"] == len(candidate.read_bytes())
 
 
+def test_windows_regular_manifest_mode_uses_git_index_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = SimpleNamespace(st_mode=0o100666)
+    monkeypatch.setattr(
+        repair_integrity_module,
+        "_PLATFORM_OS",
+        SimpleNamespace(name="nt"),
+    )
+    monkeypatch.setattr(
+        repair_integrity_module,
+        "_git_bytes",
+        lambda *_args, **_kwargs: b"100755 abcdef 0\ttracked.py\0",
+    )
+
+    assert (
+        repair_integrity_module._regular_manifest_mode(  # noqa: SLF001
+            tmp_path,
+            "tracked.py",
+            metadata,
+            tracked=True,
+            deadline=time.monotonic() + 1,
+        )
+        == 0o755
+    )
+    assert (
+        repair_integrity_module._regular_manifest_mode(  # noqa: SLF001
+            tmp_path,
+            "untracked.py",
+            metadata,
+            tracked=False,
+            deadline=time.monotonic() + 1,
+        )
+        == 0o644
+    )
+
+
 def test_repair_key_creation_closes_stdio_before_key_publication(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     key_path = repo / ".nest" / "repair_receipt_signing.v2.key"

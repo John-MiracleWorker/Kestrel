@@ -607,7 +607,7 @@ class ServiceController:
     def start(
         self,
         *,
-        readiness_timeout: float = 15.0,
+        readiness_timeout: float = 30.0,
         lifecycle_lock_timeout: float = 5.0,
         poll_interval: float = 0.1,
         clock: Callable[[], float] = time.monotonic,

@@ -6601,7 +6601,7 @@ def test_queued_generic_approval_handoff_is_atomic_and_restart_safe(
         claimed_run = original_claim(*args, **kwargs)
         if claimed_run is not None:
             claimed.set()
-            assert release.wait(timeout=3)
+            assert release.wait(timeout=_DURABLE_RUN_TIMEOUT_SECONDS)
         return claimed_run
 
     monkeypatch.setattr(

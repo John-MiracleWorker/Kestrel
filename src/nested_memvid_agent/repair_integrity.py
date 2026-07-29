@@ -46,6 +46,7 @@ _REPAIR_INTEGRITY_SCHEMA_VERSION = 2
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_FLAGS |= getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+_PLATFORM_OS: Any = os
 
 
 @dataclass(frozen=True)
@@ -1451,10 +1452,53 @@ def _changed_path_manifest(
     return {
         "path": relative_path,
         "type": "regular",
-        "mode": stat.S_IMODE(before.st_mode),
+        "mode": _regular_manifest_mode(
+            workspace,
+            relative_path,
+            before,
+            tracked=not reject_symlink,
+            deadline=deadline,
+        ),
         "size": size,
         "sha256": digest.hexdigest(),
     }
+
+
+def _regular_manifest_mode(
+    workspace: Path,
+    relative_path: str,
+    metadata: os.stat_result,
+    *,
+    tracked: bool,
+    deadline: float,
+) -> int:
+    if getattr(_PLATFORM_OS, "name", os.name) != "nt":
+        return stat.S_IMODE(metadata.st_mode)
+    if not tracked:
+        return 0o644
+    if time.monotonic() > deadline:
+        raise TimeoutError("Repair fingerprint exceeded its bounded time budget.")
+    entries = [
+        item
+        for item in _git_bytes(
+            workspace,
+            ["ls-files", "--stage", "-z", "--", relative_path],
+        ).split(b"\0")
+        if item
+    ]
+    if not entries:
+        return 0o644
+    if len(entries) != 1:
+        raise ValueError(f"Changed repair path has unresolved Git stages: {relative_path}")
+    header = entries[0].split(b"\t", 1)[0].split()
+    if len(header) != 3 or header[2] != b"0":
+        raise ValueError(f"Changed repair path has invalid Git index metadata: {relative_path}")
+    git_mode = header[0]
+    if git_mode == b"100644":
+        return 0o644
+    if git_mode == b"100755":
+        return 0o755
+    raise ValueError(f"Changed repair path has unsupported Git mode: {relative_path}")
 
 
 def _mutable_stat_fields(metadata: os.stat_result) -> tuple[int, int, int, int]:
