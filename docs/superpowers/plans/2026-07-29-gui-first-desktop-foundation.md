@@ -36,17 +36,21 @@
 - Create: `desktop/package.json`
 - Create: `desktop/package-lock.json`
 - Create: `desktop/tsconfig.json`
+- Create: `desktop/tsconfig.build.json`
 - Create: `desktop/vitest.config.ts`
 - Create: `desktop/src/contracts.ts`
 - Create: `desktop/src/contracts.test.ts`
+- Create: `desktop/src/build-boundary.test.ts`
 - Modify: `.gitignore`
 - Modify: `.github/workflows/ci.yml`
 - Modify: `tests/test_packaging_deployment.py`
 
 **Interfaces:**
 
-- Consume: bundled renderer output from `web/dist`.
-- Produce: compiled Electron main/preload JavaScript in `desktop/dist`.
+- Consume: no renderer or Electron runtime payload in this task; Task 5 later
+  consumes bundled renderer output from `web/dist`.
+- Produce: only compiled `desktop/dist/contracts.js` and
+  `desktop/dist/contracts.d.ts`.
 - Produce: `DesktopBridge`, `DesktopConnection`, `DesktopLifecycleState`, and `DesktopRecoveryReason` TypeScript contracts.
 - Invariant: production dependencies are exact-pinned in `desktop/package-lock.json`; no remote renderer dependency is loaded at runtime.
 
@@ -55,10 +59,10 @@
 Add a Python repository test:
 
 ```python
-def test_desktop_workspace_is_exact_pinned_and_renderer_is_external() -> None:
+def test_desktop_workspace_is_exact_pinned_and_stages_entrypoints() -> None:
     package = json.loads((ROOT / "desktop" / "package.json").read_text())
     assert package["private"] is True
-    assert package["main"] == "dist/main.js"
+    assert "main" not in package
     assert package["dependencies"] == {
         "electron-updater": "6.8.9",
         "zod": "4.4.3",
@@ -68,6 +72,10 @@ def test_desktop_workspace_is_exact_pinned_and_renderer_is_external() -> None:
     assert package["devDependencies"]["vitest"] == "4.1.6"
     assert "react" not in package["dependencies"]
 ```
+
+Add a build-boundary test that runs `npm run build` from a clean `desktop/dist`
+and requires exactly `contracts.js` and `contracts.d.ts`; it must reject an
+emitted main entrypoint, preload entrypoint, renderer asset, or React runtime.
 
 Add `desktop/src/contracts.test.ts`:
 
@@ -131,7 +139,15 @@ export const desktopConnectionSchema = z.object({
 }).strict();
 ```
 
-Add npm scripts for `build`, `test`, `test:typecheck`, and `licenses:check`. Add `desktop/node_modules`, `desktop/dist`, and `desktop/release` to `.gitignore`. Extend CI with `npm ci`, typecheck, tests, audit, and build for this workspace.
+Add npm scripts for `build`, `test`, `test:typecheck`, and `licenses:check`.
+Do not set `package.json.main`: Task 5 owns the real Electron main entrypoint.
+Keep `desktop/tsconfig.json` as the strict no-emit typecheck configuration for
+source and tests. Create `desktop/tsconfig.build.json` extending it with emit
+enabled, declarations enabled, `dist` as `outDir`, `src` as `rootDir`, only
+`src/contracts.ts` included, and tests excluded. Make `npm run build` use this
+emitting configuration. Add `desktop/node_modules`, `desktop/dist`, and
+`desktop/release` to `.gitignore`. Extend CI with `npm ci`, typecheck, tests,
+audit, and build for this workspace.
 
 - [ ] **Step 4: Run tests and build**
 
@@ -145,7 +161,9 @@ npm --prefix desktop run build
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest -q tests/test_packaging_deployment.py
 ```
 
-Expected: all pass and `desktop/dist` contains only main/preload output.
+Expected: all pass and `desktop/dist` contains exactly `contracts.js` and
+`contracts.d.ts`; no main/preload entrypoint, renderer asset, or runtime
+dependency is emitted.
 
 - [ ] **Step 5: Commit**
 
@@ -496,12 +514,18 @@ git commit -m "feat: add desktop sidecar entrypoint"
 - Create: `desktop/src/main/security.test.ts`
 - Create: `desktop/src/main/protocol.test.ts`
 - Create: `desktop/resources/csp.txt`
+- Modify: `desktop/src/build-boundary.test.ts`
+- Modify: `desktop/package.json`
+- Modify: `desktop/tsconfig.build.json`
 - Modify: `desktop/src/contracts.ts`
 
 **Interfaces:**
 
 - Produce: one single-instance `BrowserWindow` loading `kestrel://app/index.html`.
 - Consume: packaged `web/dist` directory resolved relative to `process.resourcesPath`.
+- Build ownership: add `src/main.ts` and `src/main/**/*.ts` to the emitting
+  build, then set `package.json.main` to `dist/main.js` only after the hardened
+  main process exists.
 - Invariant: no `file://`, remote page, `<webview>`, arbitrary navigation, arbitrary external URL, or unreviewed permission.
 
 - [ ] **Step 1: Write failing security assertions**
@@ -557,6 +581,10 @@ frame-ancestors 'none';
 
 Deny every session permission request. Prevent navigation except same-app routes. Keep external URL opening behind a later explicit, allowlisted IPC action; do not call `shell.openExternal` from clicked content.
 
+Extend `desktop/tsconfig.build.json` to emit the reviewed main-process source
+alongside contracts, and add `package.json.main` only for the real emitted
+`dist/main.js`; do not introduce a placeholder entrypoint.
+
 - [ ] **Step 4: Test and typecheck**
 
 Run:
@@ -573,7 +601,7 @@ Expected: all pass.
 
 ```bash
 git add desktop/src/main.ts desktop/src/main desktop/resources/csp.txt \
-  desktop/src/contracts.ts
+  desktop/src/contracts.ts desktop/package.json desktop/tsconfig.build.json
 git commit -m "feat: harden desktop renderer boundary"
 ```
 
@@ -775,6 +803,8 @@ git commit -m "feat: authenticate desktop renderer without token exposure"
 - Create: `web/src/platform/desktopBridge.ts`
 - Create: `web/src/platform/desktopBridge.test.ts`
 - Create: `web/src/global.d.ts`
+- Modify: `desktop/src/build-boundary.test.ts`
+- Modify: `desktop/tsconfig.build.json`
 - Modify: `desktop/src/contracts.ts`
 - Modify: `desktop/src/main.ts`
 
@@ -782,6 +812,8 @@ git commit -m "feat: authenticate desktop renderer without token exposure"
 
 - Expose exactly: connection status, select project folder, select storage folder, save support bundle, request credential dialog, request external URL open, app version, update status, and lifecycle/recovery actions.
 - Every request and response has a strict Zod schema, a size limit, a sender check, and a stable error code.
+- Build ownership: add `src/preload.ts` to the emitting build only after the
+  reviewed bridge and schema-validation tests pass.
 - Invariant: no generic `invoke(channel, payload)`, filesystem path read/write, process spawn, shell command, environment access, or raw IPC object crosses preload.
 
 - [ ] **Step 1: Write the failing bridge snapshot and fuzz tests**
@@ -827,6 +859,10 @@ Use `contextBridge.exposeInMainWorld("kestrelDesktop", Object.freeze(...))`. Val
 
 The credential dialog returns only Secret Broker metadata such as `secret://provider-key`, validation state, and fingerprint. The raw value flows from the isolated credential window to Electron main and then directly to the authenticated secret endpoint; it never returns to the primary renderer.
 
+Extend `desktop/tsconfig.build.json` with the reviewed preload entrypoint only
+after these tests pass; the resulting `dist/preload.js` is the first preload
+output in the sequence.
+
 - [ ] **Step 4: Run security and build gates**
 
 Run:
@@ -847,6 +883,7 @@ Expected: strict bridge snapshot passes and malformed payloads never reach handl
 git add desktop/src/preload.ts desktop/src/preload.test.ts \
   desktop/src/main/ipc.ts desktop/src/main/ipc.test.ts \
   desktop/src/contracts.ts desktop/src/main.ts \
+  desktop/tsconfig.build.json \
   web/src/platform/desktopBridge.ts \
   web/src/platform/desktopBridge.test.ts \
   web/src/global.d.ts
