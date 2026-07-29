@@ -1644,7 +1644,7 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         client=FakeClient(ServerProbe(True, True, False)),
     )
     try:
-        started = controller.start(readiness_timeout=3, poll_interval=0.05)
+        started = controller.start(poll_interval=0.05)
         assert started.state == ServiceState.RUNNING
         assert started.management == ServiceManagement.MANAGED
         assert paths.pid_path.exists()
