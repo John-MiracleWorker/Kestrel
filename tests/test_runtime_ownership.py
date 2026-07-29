@@ -26,6 +26,10 @@ from nested_memvid_agent.runtime_ownership import (
     RuntimeOwnershipError,
     runtime_ownership_lock_path,
 )
+from nested_memvid_agent.runtime_profile_lease import (
+    RuntimeProfileLease,
+    current_runtime_lease_identity,
+)
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
@@ -49,6 +53,66 @@ def test_windows_lock_violation_is_recognized_as_runtime_contention() -> None:
     error = _WindowsLockViolation(33, "injected Windows lock violation")
 
     assert runtime_ownership_module._is_lock_contention(error) is True
+
+
+def test_cli_server_exits_before_opening_writers_when_desktop_owns_profile(
+    tmp_path: Path,
+) -> None:
+    profile_root = tmp_path / "profile"
+    state_path = profile_root / "state" / "agent.db"
+    memory_dir = profile_root / "memory"
+    desktop = RuntimeProfileLease.acquire(
+        profile_root,
+        current_runtime_lease_identity(
+            profile_id="default",
+            management="desktop",
+            base_url="http://127.0.0.1:8765/",
+            launch_nonce="desktop-test-nonce",
+        ),
+    )
+    environment = dict(os.environ)
+    source_root = Path(__file__).parents[1] / "src"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), environment.get("PYTHONPATH", "")]
+    )
+    try:
+        result = subprocess.run(  # noqa: S603
+            [
+                sys.executable,
+                "-m",
+                "nested_memvid_agent.cli",
+                "server",
+                "--backend",
+                "memory",
+                "--provider",
+                "mock",
+                "--model",
+                "mock",
+                "--state-path",
+                str(state_path),
+                "--memory-dir",
+                str(memory_dir),
+                "--workspace",
+                str(tmp_path),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8765",
+            ],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        desktop.release()
+
+    assert result.returncode == 1
+    assert result.stderr.strip() == "profile_owned_by_desktop"
+    assert not state_path.exists()
+    assert not memory_dir.exists()
 
 
 def _build_manager(

@@ -12,6 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from .runtime_profile_lease import LeaseDisposition
 from .security_boundary import REDACTED, redact_text
 
 _DEFAULT_TOKEN_ENV_NAME = "NEST_AGENT_API_TOKEN"
@@ -46,6 +47,14 @@ class ServerProbe:
     reachable: bool
     healthy: bool
     locked: bool
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ServerCompatibility:
+    disposition: LeaseDisposition
+    profile_id: str | None
+    version: str | None
     detail: str | None = None
 
 
@@ -99,6 +108,63 @@ class KestrelServerClient:
 
     def get_setup_readiness(self) -> dict[str, Any]:
         return self._request_json("GET", "/api/product/setup")
+
+    def probe_desktop_compatibility(
+        self,
+        *,
+        profile_id: str,
+        version: str,
+    ) -> ServerCompatibility:
+        expected_profile = profile_id.strip()
+        expected_version = version.strip()
+        if not expected_profile:
+            raise ValueError("profile ID must not be empty")
+        if not expected_version:
+            raise ValueError("version must not be empty")
+        try:
+            payload = self._request_json("GET", "/api/desktop/readiness")
+        except ServerClientError:
+            return ServerCompatibility(
+                disposition="foreign_or_unrelated",
+                profile_id=None,
+                version=None,
+                detail="desktop_readiness_unavailable",
+            )
+        actual_profile = payload.get("profile_id")
+        actual_version = payload.get("sidecar_version")
+        if (
+            payload.get("schema") != "kestrel.desktop.readiness.v1"
+            or payload.get("ready") is not True
+            or not isinstance(actual_profile, str)
+            or not actual_profile
+            or not isinstance(actual_version, str)
+            or not actual_version
+        ):
+            return ServerCompatibility(
+                disposition="foreign_or_unrelated",
+                profile_id=None,
+                version=None,
+                detail="desktop_readiness_invalid",
+            )
+        if actual_profile != expected_profile:
+            return ServerCompatibility(
+                disposition="foreign_or_unrelated",
+                profile_id=actual_profile,
+                version=actual_version,
+                detail="desktop_profile_mismatch",
+            )
+        if actual_version != expected_version:
+            return ServerCompatibility(
+                disposition="version_conflict",
+                profile_id=actual_profile,
+                version=actual_version,
+                detail="desktop_version_mismatch",
+            )
+        return ServerCompatibility(
+            disposition="attach_desktop",
+            profile_id=actual_profile,
+            version=actual_version,
+        )
 
     def create_run(
         self,

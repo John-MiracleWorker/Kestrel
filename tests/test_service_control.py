@@ -23,7 +23,12 @@ from nested_memvid_agent.private_artifacts import (
     open_private_file_descriptor,
     write_private_text,
 )
-from nested_memvid_agent.server_client import ServerProbe
+from nested_memvid_agent.runtime_profile_lease import (
+    LeaseProcessSnapshot,
+    RuntimeLeaseIdentity,
+    RuntimeProfileLease,
+)
+from nested_memvid_agent.server_client import ServerCompatibility, ServerProbe
 from nested_memvid_agent.service_control import (
     BoundListener,
     ProcessSnapshot,
@@ -81,13 +86,29 @@ class FakeInspector:
 
 
 class FakeClient:
-    def __init__(self, probe: ServerProbe) -> None:
+    def __init__(
+        self,
+        probe: ServerProbe,
+        compatibility: ServerCompatibility | None = None,
+    ) -> None:
         self._probe = probe
+        self._compatibility = compatibility
         self.probe_count = 0
 
     def probe(self) -> ServerProbe:
         self.probe_count += 1
         return self._probe
+
+    def probe_desktop_compatibility(
+        self,
+        *,
+        profile_id: str,
+        version: str,
+    ) -> ServerCompatibility:
+        del profile_id, version
+        if self._compatibility is None:
+            raise AssertionError("unexpected desktop compatibility probe")
+        return self._compatibility
 
 
 class FakeSignaler:
@@ -748,6 +769,148 @@ def test_start_reuses_running_managed_and_external_services(
             if managed
             else ServiceManagement.EXTERNAL
         )
+
+
+def test_start_attaches_only_to_a_verified_compatible_desktop_lease(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    profile_root = paths.state_path.parent.parent
+    identity = RuntimeLeaseIdentity(
+        profile_id="default",
+        management="desktop",
+        owner_digest="1" * 64,
+        pid=4242,
+        process_birth_marker="desktop-process-birth",
+        executable_digest="2" * 64,
+        launch_nonce_digest="3" * 64,
+        base_url=paths.url,
+        version="0.5.0",
+        created_at="2026-07-29T12:00:00+00:00",
+    )
+    lease = RuntimeProfileLease.acquire(profile_root, identity)
+    popen_calls: list[object] = []
+
+    def inspect_lease_process(pid: int) -> LeaseProcessSnapshot | None:
+        assert pid == identity.pid
+        return LeaseProcessSnapshot(
+            pid=identity.pid,
+            owner_digest=identity.owner_digest,
+            process_birth_marker=identity.process_birth_marker,
+            executable_digest=identity.executable_digest,
+        )
+
+    try:
+        status = ServiceController(
+            paths,
+            inspector=FakeInspector(),
+            lease_inspector=inspect_lease_process,
+            client=FakeClient(
+                ServerProbe(True, False, True),
+                ServerCompatibility(
+                    disposition="attach_desktop",
+                    profile_id="default",
+                    version="0.5.0",
+                ),
+            ),
+            popen=lambda *_args, **_kwargs: popen_calls.append(object()),
+        ).start()
+    finally:
+        lease.release()
+
+    assert status.state == ServiceState.RUNNING
+    assert status.management == ServiceManagement.EXTERNAL
+    assert status.pid == identity.pid
+    assert status.detail == "profile_owned_by_desktop"
+    assert popen_calls == []
+
+
+def test_start_does_not_launch_when_desktop_lease_cannot_be_authenticated(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    profile_root = paths.state_path.parent.parent
+    identity = RuntimeLeaseIdentity(
+        profile_id="default",
+        management="desktop",
+        owner_digest="1" * 64,
+        pid=4242,
+        process_birth_marker="desktop-process-birth",
+        executable_digest="2" * 64,
+        launch_nonce_digest="3" * 64,
+        base_url=paths.url,
+        version="0.5.0",
+        created_at="2026-07-29T12:00:00+00:00",
+    )
+    lease = RuntimeProfileLease.acquire(profile_root, identity)
+    popen_calls: list[object] = []
+    try:
+        with pytest.raises(ServiceControlError) as raised:
+            ServiceController(
+                paths,
+                inspector=FakeInspector(),
+                lease_inspector=lambda _pid: LeaseProcessSnapshot(
+                    pid=identity.pid,
+                    owner_digest=identity.owner_digest,
+                    process_birth_marker=identity.process_birth_marker,
+                    executable_digest=identity.executable_digest,
+                ),
+                client=FakeClient(
+                    ServerProbe(True, False, True),
+                    ServerCompatibility(
+                        disposition="foreign_or_unrelated",
+                        profile_id=None,
+                        version=None,
+                        detail="desktop readiness could not be authenticated",
+                    ),
+                ),
+                popen=lambda *_args, **_kwargs: popen_calls.append(object()),
+            ).start()
+    finally:
+        lease.release()
+
+    assert raised.value.code == "profile_owned_by_desktop"
+    assert popen_calls == []
+
+
+def test_start_does_not_race_a_cli_lease_before_its_listener_is_ready(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    profile_root = paths.state_path.parent.parent
+    identity = RuntimeLeaseIdentity(
+        profile_id="default",
+        management="cli",
+        owner_digest="1" * 64,
+        pid=4242,
+        process_birth_marker="cli-process-birth",
+        executable_digest="2" * 64,
+        launch_nonce_digest="3" * 64,
+        base_url=paths.url,
+        version="0.5.0",
+        created_at="2026-07-29T12:00:00+00:00",
+    )
+    lease = RuntimeProfileLease.acquire(profile_root, identity)
+    popen_calls: list[object] = []
+    try:
+        with pytest.raises(ServiceControlError) as raised:
+            ServiceController(
+                paths,
+                inspector=FakeInspector(),
+                lease_inspector=lambda _pid: LeaseProcessSnapshot(
+                    pid=identity.pid,
+                    owner_digest=identity.owner_digest,
+                    process_birth_marker=identity.process_birth_marker,
+                    executable_digest=identity.executable_digest,
+                ),
+                client=FakeClient(ServerProbe(False, False, False)),
+                popen=lambda *_args, **_kwargs: popen_calls.append(object()),
+            ).start()
+    finally:
+        lease.release()
+
+    assert raised.value.code == "runtime_profile_lease_conflict"
+    assert popen_calls == []
 
 
 def test_start_launches_the_existing_supervisor_with_safe_absolute_arguments(
