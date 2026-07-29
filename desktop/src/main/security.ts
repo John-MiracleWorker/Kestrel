@@ -1,3 +1,7 @@
+import type {
+  Event as ElectronEvent,
+  WebContentsWillFrameNavigateEventParams
+} from "electron";
 import { DESKTOP_APP_HOST, DESKTOP_APP_SCHEME } from "../contracts.js";
 
 export type NavigationDecision = "allow" | "deny";
@@ -55,19 +59,27 @@ export function windowOpenDecision(_value: string): { action: "deny" } {
   return { action: "deny" };
 }
 
-function denyUntrustedNavigation(
+type NavigationListener = {
+  (
+    event: ElectronEvent<WebContentsWillFrameNavigateEventParams>
+  ): void;
+  (event: PreventableEvent, deprecatedUrl?: string): void;
+};
+
+const denyUntrustedNavigation: NavigationListener = (
   event: PreventableEvent,
   deprecatedUrl?: string
-): void {
+): void => {
   const target = event.url ?? deprecatedUrl ?? "";
   if (navigationDecision(target) === "deny") {
     event.preventDefault();
   }
-}
+};
 
 export function installWebContentsBoundary(
   webContents: RestrictedWebContents
 ): void {
+  webContents.on("will-frame-navigate", denyUntrustedNavigation);
   webContents.on("will-navigate", denyUntrustedNavigation);
   webContents.on("will-redirect", denyUntrustedNavigation);
   webContents.on("will-attach-webview", (event) => {

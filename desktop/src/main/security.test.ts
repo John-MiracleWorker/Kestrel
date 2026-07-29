@@ -60,6 +60,47 @@ describe("desktop renderer security", () => {
     });
   });
 
+  it("prevents untrusted Electron 43 subframe navigations", () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const webContents = {
+      on: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
+        listeners.set(event, listener);
+      }),
+      setWindowOpenHandler: vi.fn()
+    };
+    const remoteSubframe = {
+      preventDefault: vi.fn(),
+      url: "https://example.com/embed",
+      isMainFrame: false
+    };
+    const fileSubframe = {
+      preventDefault: vi.fn(),
+      url: "file:///tmp/embed.html",
+      isMainFrame: false
+    };
+    const malformedSubframe = {
+      preventDefault: vi.fn(),
+      url: "not a URL",
+      isMainFrame: false
+    };
+    const privateSubframe = {
+      preventDefault: vi.fn(),
+      url: "kestrel://app/mission",
+      isMainFrame: false
+    };
+
+    installWebContentsBoundary(webContents);
+    listeners.get("will-frame-navigate")?.(remoteSubframe);
+    listeners.get("will-frame-navigate")?.(fileSubframe);
+    listeners.get("will-frame-navigate")?.(malformedSubframe);
+    listeners.get("will-frame-navigate")?.(privateSubframe);
+
+    expect(remoteSubframe.preventDefault).toHaveBeenCalledOnce();
+    expect(fileSubframe.preventDefault).toHaveBeenCalledOnce();
+    expect(malformedSubframe.preventDefault).toHaveBeenCalledOnce();
+    expect(privateSubframe.preventDefault).not.toHaveBeenCalled();
+  });
+
   it("denies every permission request and permission check", () => {
     let requestHandler:
       | ((
