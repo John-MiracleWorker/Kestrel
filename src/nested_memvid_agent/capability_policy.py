@@ -71,6 +71,20 @@ class CapabilityPolicy:
         self.state = state
         self._config = config
 
+    def with_config(self, config: AgentConfig) -> CapabilityPolicy:
+        """Return a policy anchored to one explicit base configuration.
+
+        Durable state (owner overrides, parent skill/MCP resources) stays shared
+        and fail-closed; only the volatile per-process gates read from the
+        config object -- the CLI enablement flags and the ``enabled_tools``
+        launch allowlist -- are anchored. Approval continuation uses this to
+        evaluate the run's durable ``config_snapshot`` instead of the approving
+        process's own CLI flags, which are not part of the durable grant
+        binding (see docs/SECURITY.md).
+        """
+
+        return CapabilityPolicy(self.state, config)
+
     def tool_decision(self, spec: ToolSpec) -> CapabilityDecision:
         enablement_flag = enablement_flag_for_tool(spec)
         default_enabled = spec.source == "builtin" and not (

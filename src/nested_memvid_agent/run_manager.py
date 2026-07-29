@@ -2411,10 +2411,25 @@ class RunManager:
         )
         return revoked
 
-    def tool_resource_digest(self, spec: ToolSpec) -> str:
-        """Bind approvals to the live tool spec, parent resource, and policy."""
+    def tool_resource_digest(
+        self,
+        spec: ToolSpec,
+        *,
+        base_config: AgentConfig | None = None,
+    ) -> str:
+        """Bind approvals to the live tool spec, parent resource, and policy.
 
-        decision = self.capabilities.tool_decision(spec)
+        ``base_config`` anchors volatile per-process gates to an explicit
+        configuration -- the run's durable snapshot during approval
+        continuation. Durable components are always read live so later owner or
+        resource changes still fail closed.
+        """
+
+        capabilities = (
+            self.capabilities if base_config is None else self.capabilities.with_config(base_config)
+        )
+        digest_config = self.config if base_config is None else base_config
+        decision = capabilities.tool_decision(spec)
         payload: dict[str, Any] = {
             "tool_spec": tool_spec_digest(spec),
             "tool_revision": decision.revision,
@@ -2422,9 +2437,9 @@ class RunManager:
             "global_gate": (
                 None
                 if decision.enablement_flag is None
-                else bool(getattr(self.config, decision.enablement_flag, False))
+                else bool(getattr(digest_config, decision.enablement_flag, False))
             ),
-            "launch_allowlist": list(self.config.enabled_tools),
+            "launch_allowlist": list(digest_config.enabled_tools),
         }
         if spec.source == "mcp" and spec.server_id:
             row = self.state.get_mcp_server(spec.server_id)
@@ -3445,7 +3460,21 @@ class RunManager:
             )
             self._release_primary_reservation(run_id)
             return
-        current_approval = self._validated_approval_continuation(approval, arguments)
+        base_config = self._base_config_for_approval(approval, run_id)
+        if base_config is None:
+            self._record_unexecuted_approval(
+                approval,
+                arguments,
+                content="Approved tool continuation lost its run before validation.",
+                error="approval_continuation_interrupted",
+            )
+            self._release_primary_reservation(run_id)
+            return
+        current_approval = self._validated_approval_continuation(
+            approval,
+            arguments,
+            base_config=base_config,
+        )
         if current_approval is None:
             try:
                 scheduler_context = self._scheduler_approval_context(approval)
@@ -3531,10 +3560,15 @@ class RunManager:
                     arguments,
                     run.session_id,
                     scheduler_context,
+                    base_config,
                 )
             elif run.status == "completed":
                 self._run_approved_tool_for_terminal_run(
-                    config, approval, arguments, run.session_id
+                    config,
+                    approval,
+                    arguments,
+                    run.session_id,
+                    base_config=base_config,
                 )
             else:
                 self._record_unexecuted_approval(
@@ -3562,6 +3596,7 @@ class RunManager:
                     approval,
                     arguments,
                     run.session_id,
+                    base_config,
                 )
             else:
                 self._schedule_primary_run(
@@ -3572,6 +3607,7 @@ class RunManager:
                     arguments,
                     run.session_id,
                     scheduler_context,
+                    base_config,
                 )
         except Exception as exc:
             self._record_unexecuted_approval(
@@ -3589,10 +3625,26 @@ class RunManager:
         approval: dict[str, Any],
         arguments: dict[str, Any],
         session_id: str,
+        *,
+        base_config: AgentConfig | None = None,
     ) -> None:
         """Execute one atomically claimed manual approval after a terminal run."""
         run_id = str(approval["run_id"])
-        current_approval = self._validated_approval_continuation(approval, arguments)
+        if base_config is None:
+            base_config = self._base_config_for_approval(approval, run_id)
+            if base_config is None:
+                self._record_unexecuted_approval(
+                    approval,
+                    arguments,
+                    content="Approved tool lost its run before terminal execution.",
+                    error="approval_continuation_interrupted",
+                )
+                return
+        current_approval = self._validated_approval_continuation(
+            approval,
+            arguments,
+            base_config=base_config,
+        )
         if current_approval is None:
             self._record_unexecuted_approval(
                 approval,
@@ -3611,6 +3663,7 @@ class RunManager:
                 arguments,
                 session_id,
                 execution_origin="manual",
+                base_config=base_config,
             )
         except Exception as exc:  # noqa: BLE001
             error_text = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
@@ -3804,6 +3857,7 @@ class RunManager:
         arguments: dict[str, Any],
         session_id: str,
         continuation_context: dict[str, str],
+        base_config: AgentConfig | None = None,
     ) -> None:
         """Resume the exact blocked scheduler worker after its tool approval."""
 
@@ -3846,7 +3900,11 @@ class RunManager:
             agent: NestedMV2Agent | None = None
             resumed = False
             try:
-                current_approval = self._validated_approval_continuation(approval, arguments)
+                current_approval = self._validated_approval_continuation(
+                    approval,
+                    arguments,
+                    base_config=base_config,
+                )
                 if current_approval is None:
                     raise RuntimeError("approval_invalid_before_task_continuation")
                 approval = current_approval
@@ -3893,12 +3951,14 @@ class RunManager:
                         scheduler_subagent_id=subagent_id,
                         run_lease_generation=lease.lease_generation,
                         execution_origin=f"subagent:{subagent_id}",
+                        base_config=base_config,
                     )
                     if (
                         self._validated_approval_continuation(
                             approval,
                             arguments,
                             phase="completed",
+                            base_config=base_config,
                         )
                         is None
                     ):
@@ -4219,6 +4279,7 @@ class RunManager:
         approval: dict[str, Any],
         arguments: dict[str, Any],
         session_id: str,
+        base_config: AgentConfig | None = None,
     ) -> None:
         with self._approval_resume_lease(run_id, config) as lease:
             if lease is None:
@@ -4260,6 +4321,7 @@ class RunManager:
                 current_approval = self._validated_approval_continuation(
                     approval,
                     arguments,
+                    base_config=base_config,
                 )
                 if current_approval is None:
                     failed = self.state.transition_run(
@@ -4284,6 +4346,7 @@ class RunManager:
                     arguments,
                     session_id,
                     run_lease_generation=lease.lease_generation,
+                    base_config=base_config,
                 )
                 if self._is_cancelled(run_id) or not self.state.run_lease_matches(
                     run_id,
@@ -4296,6 +4359,7 @@ class RunManager:
                         approval,
                         arguments,
                         phase="completed",
+                        base_config=base_config,
                     )
                     is None
                 ):
@@ -4377,8 +4441,21 @@ class RunManager:
         *,
         phase: str = "pre_execution",
         claim_id: str | None = None,
+        base_config: AgentConfig | None = None,
     ) -> dict[str, Any] | None:
-        """Re-read and validate the durable exact-call grant before side effects."""
+        """Re-read and validate the durable exact-call grant before side effects.
+
+        Volatile per-process gates are evaluated against the run's durable
+        configuration snapshot. Exact arguments, principal, capability
+        revision, parent resource digests, and single-use claims remain live
+        fail-closed fences.
+        """
+
+        if base_config is None:
+            base_config = self._base_config_for_approval(approval)
+            if base_config is None:
+                return None
+        capabilities = self.capabilities.with_config(base_config)
 
         try:
             current = self.state.get_approval(str(approval["approval_id"]), expire=False)
@@ -4440,16 +4517,19 @@ class RunManager:
             return None
         if decision.get("principal") != current.get("principal"):
             return None
-        registry = self.build_registry()
+        registry = self.build_registry(base_config)
         spec = registry.spec_for(str(current["tool_name"]))
         if spec is None:
             return None
-        capability = self.capabilities.tool_decision(spec)
+        capability = capabilities.tool_decision(spec)
         if not capability.effective_enabled:
             return None
         if int(current.get("capability_revision", 0)) != capability.revision:
             return None
-        if str(current.get("resource_digest", "")) != self.tool_resource_digest(spec):
+        if str(current.get("resource_digest", "")) != self.tool_resource_digest(
+            spec,
+            base_config=base_config,
+        ):
             return None
         return current
 
@@ -4464,6 +4544,7 @@ class RunManager:
         scheduler_subagent_id: str | None = None,
         run_lease_generation: int | None = None,
         execution_origin: str = "primary",
+        base_config: AgentConfig | None = None,
     ) -> tuple[ToolCall, ToolExecution]:
         run_id = str(approval["run_id"])
         call = ToolCall(
@@ -4491,6 +4572,7 @@ class RunManager:
                 arguments,
                 phase="claimed",
                 claim_id=claim_id,
+                base_config=base_config,
             )
             is None
         ):
@@ -4561,6 +4643,14 @@ class RunManager:
         )
         heartbeat_thread.start()
         try:
+            if base_config is not None:
+                agent.tools.set_capability_gate(
+                    lambda spec: self._capability_gate(
+                        spec,
+                        config=base_config,
+                        anchor_volatile_config=True,
+                    )
+                )
             execution = agent.tools.execute(
                 call,
                 ToolContext(
@@ -6018,6 +6108,23 @@ class RunManager:
             model=run.model,
         )
 
+    def _base_config_for_approval(
+        self, approval: dict[str, Any], run_id: str | None = None
+    ) -> AgentConfig | None:
+        """Resolve the owning run's durable config for approval continuation."""
+
+        resolved_run_id = run_id or str(approval.get("run_id") or "")
+        if not resolved_run_id:
+            return None
+        try:
+            run = self.state.get_run(resolved_run_id)
+        except KeyError:
+            return None
+        try:
+            return self._config_for_run(run)
+        except ValueError:
+            return None
+
     def _run_uses_autonomous_scheduler(self, run_id: str) -> bool:
         run = self.state.get_run(run_id)
         if self._config_for_run(run).enable_autonomous_scheduler:
@@ -6098,12 +6205,18 @@ class RunManager:
         spec: ToolSpec,
         *,
         config: AgentConfig | None = None,
+        anchor_volatile_config: bool = False,
     ) -> tuple[bool, str]:
-        decision = self.capabilities.tool_decision(spec)
+        active_config = config or self.config
+        capabilities = (
+            self.capabilities.with_config(active_config)
+            if anchor_volatile_config
+            else self.capabilities
+        )
+        decision = capabilities.tool_decision(spec)
         if not decision.effective_enabled:
             blockers = ", ".join(decision.blocked_by) or "capability policy"
             return False, f"Tool {spec.name} is disabled by {blockers}."
-        active_config = config or self.config
         if active_config.project_id is None:
             return True, ""
         try:
