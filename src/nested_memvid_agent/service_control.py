@@ -816,14 +816,15 @@ class ServiceController:
         deadline = clock() + timeout_seconds
         while True:
             status = self._locked_status()
-            if status.state == ServiceState.RUNNING:
+            verified_transition = self._is_verified_startup_transition(
+                status,
+                expected_supervisor_pid,
+            )
+            if status.state == ServiceState.RUNNING and not verified_transition:
                 return status
             if (
                 status.state == ServiceState.CONFLICT
-                and not self._is_verified_startup_transition(
-                    status,
-                    expected_supervisor_pid,
-                )
+                and not verified_transition
             ):
                 raise _status_conflict(status)
             remaining = deadline - clock()
@@ -843,13 +844,19 @@ class ServiceController:
         status: ServiceStatus,
         expected_supervisor_pid: int | None,
     ) -> bool:
-        if (
-            expected_supervisor_pid is None
-            or not status.detail.startswith(
+        if expected_supervisor_pid is None:
+            return False
+        transient_status = (
+            status.state == ServiceState.RUNNING
+            and status.management == ServiceManagement.EXTERNAL
+        ) or (
+            status.state == ServiceState.CONFLICT
+            and status.detail.startswith(
                 "The configured loopback port is occupied by an "
                 "unidentifiable listener."
             )
-        ):
+        )
+        if not transient_status:
             return False
         supervisor = self.inspector.process(expected_supervisor_pid)
         return supervisor is not None and _supervisor_identity_matches(

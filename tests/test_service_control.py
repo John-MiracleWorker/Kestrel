@@ -830,6 +830,47 @@ def test_start_retries_transient_port_conflict_while_launched_supervisor_is_veri
     assert status.supervisor_pid == supervisor.pid
 
 
+def test_start_waits_for_launched_supervisor_metadata_before_classifying_external(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    inspector = FakeInspector()
+    server = _server_snapshot(paths)
+    supervisor = _supervisor_snapshot(paths, server)
+    sleep_calls: list[float] = []
+
+    def launch(_command: list[str], **_kwargs: object) -> object:
+        inspector.processes = {
+            server.pid: server,
+            supervisor.pid: supervisor,
+        }
+        inspector.bound_listeners = (_listener(paths, server.pid),)
+        inspector.live_groups = frozenset({server.pgid})
+        inspector.bindable = False
+        return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
+
+    def finish_metadata(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        _managed_metadata(paths)
+
+    status = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        popen=launch,
+    ).start(
+        readiness_timeout=1,
+        poll_interval=0.05,
+        sleep=finish_metadata,
+    )
+
+    assert sleep_calls == [0.05]
+    assert status.state == ServiceState.RUNNING
+    assert status.management == ServiceManagement.MANAGED
+    assert status.pid == server.pid
+    assert status.supervisor_pid == supervisor.pid
+
+
 def test_artifact_preparation_repairs_existing_sensitive_directories_to_owner_only(
     tmp_path: Path,
 ) -> None:
