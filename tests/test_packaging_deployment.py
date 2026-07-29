@@ -606,11 +606,11 @@ def test_runtime_artifacts_are_not_tracked() -> None:
     assert tracked == []
 
 
-def test_desktop_workspace_is_exact_pinned_and_stages_entrypoints() -> None:
+def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
     package = json.loads((ROOT / "desktop" / "package.json").read_text())
 
     assert package["private"] is True
-    assert "main" not in package
+    assert package["main"] == "dist/main.js"
     assert package["dependencies"] == {
         "electron-updater": "6.8.9",
         "zod": "4.4.3",
@@ -629,5 +629,9 @@ def test_desktop_workspace_is_exact_pinned_and_stages_entrypoints() -> None:
         "outDir": "dist",
         "rootDir": "src",
     }
-    assert build_config["include"] == ["src/contracts.ts"]
+    assert build_config["include"] == [
+        "src/contracts.ts",
+        "src/main.ts",
+        "src/main/**/*.ts",
+    ]
     assert build_config["exclude"] == ["src/**/*.test.ts"]

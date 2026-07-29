@@ -2,6 +2,13 @@ import { z } from "zod";
 
 const loopbackHosts = new Set(["127.0.0.1", "[::1]"]);
 
+export const DESKTOP_APP_SCHEME = "kestrel";
+export const DESKTOP_APP_HOST = "app";
+export const DESKTOP_APP_ORIGIN =
+  `${DESKTOP_APP_SCHEME}://${DESKTOP_APP_HOST}` as const;
+export const DESKTOP_APP_ENTRY_URL =
+  `${DESKTOP_APP_ORIGIN}/index.html` as const;
+
 export const desktopLifecycleStateSchema = z.enum([
   "starting",
   "ready",

@@ -6,6 +6,6 @@
     "outDir": "dist",
     "rootDir": "src"
   },
-  "include": ["src/contracts.ts"],
+  "include": ["src/contracts.ts", "src/main.ts", "src/main/**/*.ts"],
   "exclude": ["src/**/*.test.ts"]
 }
