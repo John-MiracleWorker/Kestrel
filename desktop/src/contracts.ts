@@ -10,8 +10,11 @@ export const DESKTOP_APP_ENTRY_URL =
   `${DESKTOP_APP_ORIGIN}/index.html` as const;
 
 export const desktopLifecycleStateSchema = z.enum([
+  "verifying",
   "starting",
   "ready",
+  "stopping",
+  "restarting",
   "recovery"
 ]);
 
@@ -19,7 +22,8 @@ export const desktopRecoveryReasonSchema = z.enum([
   "sidecar_unavailable",
   "sidecar_unverified",
   "profile_conflict",
-  "version_incompatible"
+  "version_incompatible",
+  "reconciliation_required"
 ]);
 
 export const desktopRecoverySchema = z

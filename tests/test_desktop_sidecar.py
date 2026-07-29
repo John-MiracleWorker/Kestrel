@@ -5,10 +5,12 @@ import json
 import os
 import socket
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from urllib.request import Request, urlopen
 
 import pytest
 from fastapi.testclient import TestClient
@@ -39,6 +41,10 @@ from nested_memvid_agent.runtime_profile_lease import (
     RuntimeLeaseIdentity,
 )
 from nested_memvid_agent.runtime_settings import RuntimeSettings, RuntimeSettingsStore
+from nested_memvid_agent.server_desktop_routes import (
+    DesktopShutdownController,
+    register_desktop_routes,
+)
 
 
 class _RecordingServer:
@@ -575,7 +581,9 @@ def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
         config: AgentConfig,
         *,
         desktop_context: DesktopLaunchConfig,
+        desktop_shutdown: DesktopShutdownController,
     ) -> object:
+        del desktop_shutdown
         events.append("app")
         assert events.index("lease") < events.index("app")
         assert desktop_context == launch
@@ -618,6 +626,108 @@ def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
     serialized = json.dumps(captured_readiness[0], sort_keys=True)
     assert "desktop-secret-token" not in serialized
     assert "launch-nonce" not in serialized
+
+
+def test_authenticated_shutdown_exits_real_serve_loop_before_lease_release(
+    tmp_path: Path,
+) -> None:
+    from fastapi import FastAPI
+    from fastapi import Request as FastAPIRequest
+    from starlette.responses import JSONResponse
+
+    bootstrap, manifest, launch, snapshots, identity_factory = (
+        _verified_sidecar_inputs(tmp_path)
+    )
+    readiness_path = desktop_readiness_path(launch)
+    events: list[str] = []
+
+    class FakeLease:
+        def release(self) -> None:
+            assert not readiness_path.exists()
+            events.append("lease_release")
+
+    def app_factory(
+        config: AgentConfig,
+        *,
+        desktop_context: DesktopLaunchConfig,
+        desktop_shutdown: DesktopShutdownController,
+    ) -> object:
+        del config
+
+        @asynccontextmanager
+        async def lifespan(app: object) -> Any:
+            del app
+            events.append("lifespan_start")
+            try:
+                yield
+            finally:
+                events.append("lifespan_stop")
+
+        app = FastAPI(lifespan=lifespan)
+
+        @app.middleware("http")
+        async def authenticate(request: FastAPIRequest, call_next: Any) -> Any:
+            if request.headers.get("authorization") != "Bearer desktop-secret-token":
+                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+            return await call_next(request)
+
+        register_desktop_routes(
+            app,
+            launch=desktop_context,
+            shutdown_controller=desktop_shutdown,
+        )
+        return app
+
+    async def exercise() -> tuple[int, dict[str, object]]:
+        sidecar = asyncio.create_task(
+            run_desktop_sidecar(
+                bootstrap,
+                manifest_path=manifest,
+                inspector=lambda pid: snapshots.get(pid),
+                identity_factory=identity_factory,
+                lease_acquirer=lambda profile_root, identity: FakeLease(),
+                preflight=lambda memory_dir: None,
+                app_factory=app_factory,
+            )
+        )
+        for _attempt in range(200):
+            if readiness_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            sidecar.cancel()
+            pytest.fail("sidecar readiness was not published")
+        payload = json.loads(readiness_path.read_text(encoding="utf-8"))
+        request = Request(
+            f"http://127.0.0.1:{payload['port']}/api/desktop/shutdown",
+            data=b"",
+            method="POST",
+            headers={"Authorization": "Bearer desktop-secret-token"},
+        )
+
+        def send() -> tuple[int, dict[str, object]]:
+            with urlopen(request, timeout=5.0) as response:  # nosec B310 - loopback fixture
+                return response.status, json.loads(response.read())
+
+        response = await asyncio.to_thread(send)
+        events.append("shutdown_response")
+        await asyncio.wait_for(sidecar, timeout=10.0)
+        return response
+
+    status, response = asyncio.run(exercise())
+
+    assert status == 202
+    assert response == {
+        "schema": "kestrel.desktop.shutdown.v1",
+        "accepted": True,
+    }
+    assert events == [
+        "lifespan_start",
+        "shutdown_response",
+        "lifespan_stop",
+        "lease_release",
+    ]
+    assert not readiness_path.exists()
 
 
 def test_preflight_failure_closes_socket_before_releasing_lease(
@@ -687,7 +797,7 @@ def test_preflight_failure_closes_socket_before_releasing_lease(
                 identity_factory=identity_factory,
                 lease_acquirer=lease_acquirer,
                 preflight=fail_preflight,
-                app_factory=lambda config, *, desktop_context: pytest.fail(
+                app_factory=lambda config, *, desktop_context, desktop_shutdown: pytest.fail(
                     f"app opened after failed preflight: {config} {desktop_context}"
                 ),
             )
@@ -740,7 +850,7 @@ def test_post_publication_failure_removes_owned_readiness_before_lease_release(
                 identity_factory=identity_factory,
                 lease_acquirer=lambda profile_root, identity: FakeLease(),
                 preflight=lambda memory_dir: None,
-                app_factory=lambda config, *, desktop_context: object(),
+                app_factory=lambda config, *, desktop_context, desktop_shutdown: object(),
                 server_factory=lambda app: pytest.fail(
                     f"server started after readiness publication failed: {app}"
                 ),
@@ -795,7 +905,7 @@ def test_readiness_removal_failure_still_closes_socket_and_releases_lease_last(
                 identity_factory=identity_factory,
                 lease_acquirer=lambda profile_root, identity: FakeLease(),
                 preflight=lambda memory_dir: None,
-                app_factory=lambda config, *, desktop_context: object(),
+                app_factory=lambda config, *, desktop_context, desktop_shutdown: object(),
                 server_factory=lambda app: ReturningServer(),
             )
         )
@@ -849,7 +959,7 @@ def test_server_failure_remains_primary_when_readiness_cleanup_also_fails(
                 identity_factory=identity_factory,
                 lease_acquirer=lambda profile_root, identity: FakeLease(),
                 preflight=lambda memory_dir: None,
-                app_factory=lambda config, *, desktop_context: object(),
+                app_factory=lambda config, *, desktop_context, desktop_shutdown: object(),
                 server_factory=lambda app: FailingServer(),
             )
         )

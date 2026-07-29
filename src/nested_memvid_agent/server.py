@@ -6,7 +6,7 @@ from functools import partial
 from importlib import import_module
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from .behavior_delta_ledger import BehaviorDeltaLedger
@@ -84,6 +84,9 @@ from .server_support import (
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, CapabilityConflictError
 
+if TYPE_CHECKING:
+    from .server_desktop_routes import DesktopShutdownController
+
 _BROWSER_SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; "
@@ -121,6 +124,7 @@ def create_app(
     config: AgentConfig | None = None,
     *,
     desktop_context: DesktopLaunchConfig | None = None,
+    desktop_shutdown: "DesktopShutdownController | None" = None,
 ) -> Any:
     """Create the local Kestrel web/API app."""
 
@@ -129,6 +133,7 @@ def create_app(
         return _create_app(
             config,
             desktop_context=desktop_context,
+            desktop_shutdown=desktop_shutdown,
             construction_cleanup=construction_cleanup,
         )
     except BaseException:
@@ -144,6 +149,7 @@ def _create_app(
     config: AgentConfig | None,
     *,
     desktop_context: DesktopLaunchConfig | None,
+    desktop_shutdown: "DesktopShutdownController | None",
     construction_cleanup: list[Callable[[], None]],
 ) -> Any:
     """Assemble an app while exposing acquired resources to the factory guard."""
@@ -550,7 +556,11 @@ def _create_app(
         ),
     )
     if desktop_context is not None:
-        register_desktop_routes(app, launch=desktop_context)
+        register_desktop_routes(
+            app,
+            launch=desktop_context,
+            shutdown_controller=desktop_shutdown,
+        )
     register_routing_routes(
         app,
         ledger=routing_ledger,

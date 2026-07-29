@@ -38,6 +38,7 @@ from .runtime_profile_lease import (
     resolve_runtime_profile_root,
 )
 from .server import create_app
+from .server_desktop_routes import DesktopShutdownController
 
 _UVICORN_BACKLOG = 2048
 _SIDECAR_READINESS_SCHEMA = "kestrel.desktop.sidecar_readiness.v1"
@@ -47,6 +48,8 @@ _RESOURCE_MANIFEST_NAME = "kestrel-resource-manifest.json"
 
 
 class _DesktopServer(Protocol):
+    should_exit: bool
+
     async def serve(self, *, sockets: list[socket.socket]) -> None: ...
 
 
@@ -91,6 +94,7 @@ class AppFactory(Protocol):
         config: AgentConfig,
         *,
         desktop_context: DesktopLaunchConfig,
+        desktop_shutdown: DesktopShutdownController,
     ) -> Any: ...
 
 
@@ -191,6 +195,7 @@ async def serve_desktop_app(
     app: Any,
     sock: socket.socket,
     *,
+    shutdown_controller: DesktopShutdownController | None = None,
     server_factory: ServerFactory | None = None,
 ) -> None:
     """Serve an app without reopening or replacing its already-bound socket."""
@@ -203,7 +208,17 @@ async def serve_desktop_app(
         server: _DesktopServer = uvicorn.Server(config)
     else:
         server = server_factory(app)
-    await server.serve(sockets=[sock])
+
+    def request_exit() -> None:
+        server.should_exit = True
+
+    if shutdown_controller is not None:
+        shutdown_controller.bind(request_exit)
+    try:
+        await server.serve(sockets=[sock])
+    finally:
+        if shutdown_controller is not None:
+            shutdown_controller.unbind(request_exit)
 
 
 def run_desktop_sidecar_preflight(
@@ -334,7 +349,12 @@ async def run_desktop_sidecar(
         prepare_desktop_profile_directories(launch)
         preflight(launch.memory_dir)
         config = build_desktop_agent_config(launch)
-        app = app_factory(config, desktop_context=launch)
+        shutdown_controller = DesktopShutdownController()
+        app = app_factory(
+            config,
+            desktop_context=launch,
+            desktop_shutdown=shutdown_controller,
+        )
         readiness = DesktopSidecarReadiness.from_runtime(
             identity,
             port=port,
@@ -345,6 +365,7 @@ async def run_desktop_sidecar(
         await serve_desktop_app(
             app,
             sock,
+            shutdown_controller=shutdown_controller,
             server_factory=server_factory,
         )
     except BaseException as exc:

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { desktopConnectionSchema } from "./contracts";
+import {
+  desktopConnectionSchema,
+  desktopLifecycleStateSchema,
+  desktopRecoveryReasonSchema
+} from "./contracts";
 
 describe("desktopConnectionSchema", () => {
   it("rejects a token-bearing renderer payload", () => {
@@ -13,5 +17,28 @@ describe("desktopConnectionSchema", () => {
         apiToken: "must-never-cross"
       })
     ).toThrow();
+  });
+
+  it("represents every supervisor transition without exposing authority", () => {
+    expect(
+      [
+        "verifying",
+        "starting",
+        "ready",
+        "stopping",
+        "restarting",
+        "recovery"
+      ].map((state) => desktopLifecycleStateSchema.parse(state))
+    ).toEqual([
+      "verifying",
+      "starting",
+      "ready",
+      "stopping",
+      "restarting",
+      "recovery"
+    ]);
+    expect(
+      desktopRecoveryReasonSchema.parse("reconciliation_required")
+    ).toBe("reconciliation_required");
   });
 });

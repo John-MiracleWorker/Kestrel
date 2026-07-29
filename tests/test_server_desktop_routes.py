@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
 from nested_memvid_agent.server import create_app
+from nested_memvid_agent.server_desktop_routes import DesktopShutdownController
 
 _MEMORY_LAYERS = [
     "working",
@@ -103,3 +104,53 @@ def test_browser_server_does_not_expose_desktop_readiness(tmp_path: Path) -> Non
     assert health.status_code == 200
     assert response.status_code == 404
     assert response.json() == {"detail": "Not Found"}
+
+
+def test_desktop_shutdown_is_authenticated_idempotent_and_desktop_only(
+    tmp_path: Path,
+) -> None:
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    controller = DesktopShutdownController()
+    shutdown_requests: list[str] = []
+    controller.bind(lambda: shutdown_requests.append("requested"))
+    app = create_app(
+        _config(profile_root),
+        desktop_context=_desktop_context(profile_root),
+        desktop_shutdown=controller,
+    )
+
+    with TestClient(app) as client:
+        unauthorized = client.post("/api/desktop/shutdown")
+        wrong_token = client.post(
+            "/api/desktop/shutdown",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        first = client.post(
+            "/api/desktop/shutdown",
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+        repeated = client.post(
+            "/api/desktop/shutdown",
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert wrong_token.status_code == 401
+    assert first.status_code == 202
+    assert first.json() == {
+        "schema": "kestrel.desktop.shutdown.v1",
+        "accepted": True,
+    }
+    assert repeated.status_code == 202
+    assert repeated.json() == first.json()
+    assert shutdown_requests == ["requested"]
+
+    browser_root = tmp_path / "browser-profile"
+    browser_root.mkdir()
+    with TestClient(create_app(_config(browser_root))) as client:
+        absent = client.post(
+            "/api/desktop/shutdown",
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+    assert absent.status_code == 404

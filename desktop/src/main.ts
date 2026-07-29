@@ -1,3 +1,5 @@
+import { createPublicKey } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { app, BrowserWindow, protocol, session } from "electron";
 import {
@@ -15,6 +17,65 @@ import {
   createSingleWindowController,
   type AppWindow
 } from "./main/window.js";
+import {
+  createNodeSupervisorDependencies,
+  SidecarSupervisor
+} from "./main/sidecar-supervisor.js";
+
+const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
+const RELEASE_MANIFEST_KEY_ID = "release";
+
+async function createPackagedSidecarSupervisor(): Promise<SidecarSupervisor> {
+  const resourceRoot = process.resourcesPath;
+  const sidecarName =
+    process.platform === "win32"
+      ? "kestrel-desktop-sidecar.exe"
+      : "kestrel-desktop-sidecar";
+  const sidecarRelativePath = `sidecar/${sidecarName}`;
+  const publicKeyBytes = await readFile(
+    join(app.getAppPath(), "config", "desktop-release-public-key.pem")
+  );
+  if (
+    publicKeyBytes.byteLength === 0 ||
+    publicKeyBytes.byteLength > MAX_PUBLIC_KEY_BYTES
+  ) {
+    throw new Error("desktop_resource_key_unavailable");
+  }
+  const publicKey = createPublicKey(publicKeyBytes);
+  const profileRoot = join(app.getPath("userData"), "profiles", "default");
+  const sidecarVersion = app.getVersion();
+  const dependencies = createNodeSupervisorDependencies({
+    resourceVerification: {
+      resourceRoot,
+      manifestPath: join(resourceRoot, "kestrel-resource-manifest.json"),
+      signaturePath: join(resourceRoot, "kestrel-resource-manifest.sig"),
+      trustedKeys: new Map([[RELEASE_MANIFEST_KEY_ID, publicKey]]),
+      requiredFiles: [sidecarRelativePath, "web/dist/index.html"]
+    },
+    profile: {
+      profileId: "default",
+      profileRoot,
+      statePath: join(profileRoot, "state", "agent.db"),
+      memoryDir: join(profileRoot, "memory"),
+      runtimeSettingsPath: join(
+        profileRoot,
+        "config",
+        "runtime_settings.json"
+      )
+    },
+    sidecarVersion
+  });
+  return new SidecarSupervisor(
+    {
+      sidecarRelativePath,
+      sidecarVersion,
+      readinessTimeoutMs: 15_000,
+      shutdownTimeoutMs: 10_000,
+      environment: process.env
+    },
+    dependencies
+  );
+}
 
 registerKestrelScheme(protocol);
 
@@ -40,6 +101,9 @@ if (!app.requestSingleInstanceLock()) {
     return created.window;
   });
   let desktopReady = false;
+  let supervisor: SidecarSupervisor | null = null;
+  let stoppingForQuit = false;
+  let quitAfterStop = false;
 
   app.on("second-instance", () => {
     if (desktopReady) {
@@ -59,15 +123,47 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
 
-  void app.whenReady().then(() => {
-    installSessionBoundary(
-      session.defaultSession as unknown as RestrictedSession
-    );
-    registerAppProtocol(
-      protocol,
-      join(process.resourcesPath, "web", "dist")
-    );
-    desktopReady = true;
-    windows.openOrFocus();
+  app.on("before-quit", (event) => {
+    if (quitAfterStop || supervisor === null) {
+      return;
+    }
+    event.preventDefault();
+    if (stoppingForQuit) {
+      return;
+    }
+    stoppingForQuit = true;
+    void supervisor
+      .stop()
+      .then(() => {
+        quitAfterStop = true;
+        app.quit();
+      })
+      .catch(() => {
+        stoppingForQuit = false;
+      });
   });
+
+  void app
+    .whenReady()
+    .then(async () => {
+      installSessionBoundary(
+        session.defaultSession as unknown as RestrictedSession
+      );
+      registerAppProtocol(
+        protocol,
+        join(process.resourcesPath, "web", "dist")
+      );
+      try {
+        supervisor = await createPackagedSidecarSupervisor();
+        await supervisor.start();
+      } catch {
+        // The renderer opens into a fail-closed recovery state. Task 10 owns
+        // projecting that non-secret state and its operator recovery actions.
+      }
+      desktopReady = true;
+      windows.openOrFocus();
+    })
+    .catch(() => {
+      app.quit();
+    });
 }
