@@ -546,38 +546,38 @@ jobs:
         run: |
           installer_help="$(bash dist/install.sh --help)"
           grep -Fq "https://github.com/John-MiracleWorker/Kestrel/releases/download/$GITHUB_REF_NAME/install.sh | bash" <<< "$installer_help"
-          installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-plan bash dist/install.sh)"
+          installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-plan" bash dist/install.sh)"
           grep -Fq "ref: $GITHUB_REF_NAME" <<< "$installer_plan"
           grep -Fq "immutable release commit: $RELEASE_COMMIT_SHA" <<< "$installer_plan"
           grep -Fq "verify checkout HEAD equals immutable release commit $RELEASE_COMMIT_SHA" <<< "$installer_plan"
           grep -Fq "verify SHA256SUMS" <<< "$installer_plan"
           grep -Fq "pip install --require-hashes" <<< "$installer_plan"
           grep -Fq "pip install --no-deps" <<< "$installer_plan"
-          stdin_installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-stdin-plan bash < dist/install.sh)"
+          stdin_installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-stdin-plan" bash < dist/install.sh)"
           grep -Fq "ref: $GITHUB_REF_NAME" <<< "$stdin_installer_plan"
           grep -Fq "verify SHA256SUMS" <<< "$stdin_installer_plan"
-          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-ref-override \
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-ref-override" \
             KESTREL_REF=main bash dist/install.sh; then
             echo "staged release installer accepted KESTREL_REF override" >&2
             exit 1
           fi
-          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-repo-override \
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-repo-override" \
             KESTREL_REPO=https://example.invalid/fork.git bash dist/install.sh; then
             echo "staged release installer accepted KESTREL_REPO override" >&2
             exit 1
           fi
-          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-requirements-override \
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-requirements-override" \
             KESTREL_REQUIREMENTS_URL=https://example.invalid/replacement-requirements.txt \
             bash dist/install.sh; then
             echo "staged release installer accepted KESTREL_REQUIREMENTS_URL override" >&2
             exit 1
           fi
-          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-wheel-override \
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-wheel-override" \
             KESTREL_WHEEL_URL=https://example.invalid/replacement.whl bash dist/install.sh; then
             echo "staged release installer accepted KESTREL_WHEEL_URL override" >&2
             exit 1
           fi
-          if KESTREL_DRY_RUN=1 KESTREL_HOME=/tmp/kestrel-installer-checksums-override \
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-checksums-override" \
             KESTREL_CHECKSUMS_URL=https://example.invalid/replacement-SHA256SUMS \
             bash dist/install.sh; then
             echo "staged release installer accepted KESTREL_CHECKSUMS_URL override" >&2
