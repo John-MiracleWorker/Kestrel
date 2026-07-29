@@ -1,7 +1,7 @@
 # Kestrel GUI-First Desktop Product Design
 
 Date: 2026-07-29  
-Status: Design approved in dialogue; written specification awaiting owner review  
+Status: Owner approved for implementation planning
 Target release: first desktop-product release after Kestrel v0.5.0  
 Supported security profile: one trusted owner, one local or privately networked node
 

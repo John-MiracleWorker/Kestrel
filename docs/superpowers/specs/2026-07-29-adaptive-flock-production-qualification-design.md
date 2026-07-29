@@ -1,7 +1,7 @@
 # Adaptive Flock Production Qualification and Scoped Activation Design
 
 Date: 2026-07-29  
-Status: Design approved in dialogue; written specification awaiting owner review  
+Status: Owner approved for implementation planning
 Target profile: one trusted owner, one local or privately networked Kestrel node  
 Depends on: existing Adaptive Flock routing/ledger implementation and the
 GUI-first Flock workspace
