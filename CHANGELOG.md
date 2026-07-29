@@ -6,6 +6,18 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-29
+
+### Fixed
+
+- Recovery release for the burned `v0.5.0` tag. Its tag-triggered workflow
+  completed the release candidate, multi-platform package, Memvid v2, web,
+  container, and security gates, then failed before any public GitHub Release,
+  PyPI, or GHCR publication because the staged installer dry run used the
+  root-owned `/tmp` directory. The installer ownership guard correctly failed
+  closed. Release validation now uses GitHub Actions' runner-owned
+  `${RUNNER_TEMP}` while preserving that ownership boundary.
+
 ## [0.5.0] - 2026-07-29
 
 ### Added
@@ -395,7 +407,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.11...v0.5.0
 [0.4.11]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.10...v0.4.11
 [0.4.10]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.9...v0.4.10
