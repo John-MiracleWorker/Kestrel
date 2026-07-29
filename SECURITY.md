@@ -12,7 +12,7 @@ Users should upgrade to the newest patch release before reporting a problem that
 
 | Version | Supported |
 | --- | --- |
-| Latest `0.4.x` patch | Yes |
+| Latest `0.5.x` patch | Yes |
 | `0.3.x` and older | No |
 
 ## Confidential Reporting

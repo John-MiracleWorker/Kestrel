@@ -6,6 +6,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-29
+
 ### Added
 
 - A unified engineering-run surface for Mission Control covering bounded graph amendments,
@@ -393,7 +395,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.11...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.11...v0.5.0
 [0.4.11]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.10...v0.4.11
 [0.4.10]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.9...v0.4.10
 [0.4.9]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.8...v0.4.9
