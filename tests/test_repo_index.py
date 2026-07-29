@@ -51,6 +51,32 @@ def _row_ids(index_path: Path, table: str) -> list[tuple[int, int]]:
         ]
 
 
+def test_repository_index_opens_artifacts_in_binary_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = repo_store.RepoIndexStore(tmp_path / "index.sqlite")
+    observed: dict[str, object] = {}
+    binary_flag = 1 << 29
+
+    def fake_open(path: object, flags: int, mode: int = 0o600) -> int:
+        observed.update(path=path, flags=flags, mode=mode)
+        return 17
+
+    monkeypatch.setattr(repo_store, "_binary_open_flag", lambda: binary_flag)
+    monkeypatch.setattr(repo_store.os, "open", fake_open)
+
+    assert (
+        store._open_relative(
+            "index.sqlite",
+            os.O_RDONLY,
+            parent_descriptor=None,
+        )
+        == 17
+    )
+    assert int(observed["flags"]) & binary_flag
+
+
 def _git(repository: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments],

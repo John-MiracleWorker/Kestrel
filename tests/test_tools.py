@@ -3899,7 +3899,21 @@ def test_reviewed_patch_export_captures_staged_unstaged_deleted_and_untracked_by
 
     application = tmp_path.parent / f"{tmp_path.name}-patch-application"
     subprocess.run(
-        ["git", "clone", "--no-hardlinks", str(tmp_path), str(application)],
+        [
+            "git",
+            "-c",
+            "core.autocrlf=false",
+            "clone",
+            "--no-hardlinks",
+            str(tmp_path),
+            str(application),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=application,
         check=True,
         capture_output=True,
     )

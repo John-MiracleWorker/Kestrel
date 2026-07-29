@@ -6,11 +6,17 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="the Bash launcher transaction is supported only on macOS and Linux",
+)
 
 
 def _module() -> ModuleType:
@@ -678,6 +684,7 @@ def test_final_mutation_parent_replacement_fails_closed(
     assert not (tmp_path / "attacker" / "kestrel").exists()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin /var compatibility alias")
 def test_var_compatibility_is_lexical_and_user_symlink_is_still_rejected(
     tmp_path: Path,
 ) -> None:

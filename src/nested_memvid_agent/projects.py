@@ -142,6 +142,10 @@ def canonical_repository_path(value: str | Path) -> Path:
     if lexical != resolved:
         raise ValueError("repository_path must be canonical and contain no symbolic links")
 
+    if _windows_path_validation_required():
+        _validate_windows_repository_directory(resolved)
+        return resolved
+
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -165,6 +169,37 @@ def canonical_repository_path(value: str | Path) -> Path:
     finally:
         os.close(descriptor)
     return resolved
+
+
+def _windows_path_validation_required() -> bool:
+    return os.name == "nt"
+
+
+def _validate_windows_repository_directory(path: Path) -> None:
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ValueError("repository_path must be an existing directory")
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if int(getattr(before, "st_file_attributes", 0)) & reparse_flag:
+            raise ValueError("repository_path must not be a reparse point")
+        # Opening a scandir iterator proves the directory is traversable without
+        # relying on POSIX-only directory descriptors.
+        with os.scandir(path):
+            pass
+        after = os.lstat(path)
+        if int(getattr(after, "st_file_attributes", 0)) & reparse_flag:
+            raise ValueError("repository_path must not be a reparse point")
+        if not stat.S_ISDIR(after.st_mode):
+            raise ValueError("repository_path must be an existing directory")
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("repository_path changed during validation")
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(
+            "repository_path must be an accessible non-symlink directory"
+        ) from exc
 
 
 def normalize_allowed_paths(values: Sequence[str]) -> tuple[str, ...]:

@@ -156,7 +156,7 @@ function New-Check {
     }
 }
 
-$isWindows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+$runningOnWindows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 $checks = [ordered] @{}
 
 $gitReady = $false
@@ -417,9 +417,9 @@ else {
     }
 }
 
-$nativeReady = $isWindows -and $gitReady -and $null -ne $pythonSelection
-$wslPathReady = $isWindows -and $wslReady
-$dockerPathReady = $isWindows -and $dockerReady
+$nativeReady = $runningOnWindows -and $gitReady -and $null -ne $pythonSelection
+$wslPathReady = $runningOnWindows -and $wslReady
+$dockerPathReady = $runningOnWindows -and $dockerReady
 $paths = [ordered] @{
     native_wheel = [ordered] @{
         ready = $nativeReady
@@ -512,7 +512,7 @@ if ($null -ne $selectedPath) {
 $report = [ordered] @{
     schema = "kestrel.windows_bootstrap_report.v1"
     platform = [ordered] @{
-        native_windows = $isWindows
+        native_windows = $runningOnWindows
         powershell = $PSVersionTable.PSVersion.ToString()
     }
     action = $Action

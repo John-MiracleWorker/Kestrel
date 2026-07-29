@@ -37,6 +37,11 @@ from nested_memvid_agent.service_control import (
     resolve_service_paths,
 )
 
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="the POSIX service-controller contract is not used by native Windows bootstrap",
+)
+
 
 def _current_uid() -> int:
     getuid = getattr(os, "getuid", None)
@@ -1417,6 +1422,11 @@ def test_system_process_inspector_treats_a_process_that_vanishes_during_cwd_look
     monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: next(results))
     monkeypatch.setattr(
         inspector,
+        "_birth_marker",
+        lambda _pid, _legacy_fallback=None: "test-process-birth",
+    )
+    monkeypatch.setattr(
+        inspector,
         "_process_cwd",
         lambda _pid: (_ for _ in ()).throw(
             ServiceControlError("vanished", code="process_inspection_failed", recovery="retry")
@@ -1536,7 +1546,9 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         "listener.bind((host, port))\n"
         "listener.listen()\n"
         "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
-        "signal.pause()\n",
+        "while True:\n"
+        "    connection, _address = listener.accept()\n"
+        "    connection.close()\n",
         encoding="utf-8",
     )
     paths.server_executable.chmod(0o755)
@@ -1581,7 +1593,10 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         if paths.pgid_path.exists():
             pgid_text = paths.pgid_path.read_text(encoding="ascii").strip()
             if pgid_text.isdigit():
-                group_leader = SystemProcessInspector().process(int(pgid_text))
+                try:
+                    group_leader = SystemProcessInspector().process(int(pgid_text))
+                except ServiceControlError:
+                    group_leader = None
                 if (
                     group_leader is not None
                     and group_leader.cwd == paths.home
@@ -1601,6 +1616,7 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
 )
 def test_system_port_bindability_ignores_closed_connection_residue() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         listener.listen()

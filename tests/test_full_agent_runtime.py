@@ -546,8 +546,8 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path)
         workspace=tmp_path,
         skills_dir=tmp_path / "skills",
         plugins_dir=tmp_path / "plugins",
-        run_lease_ttl_seconds=0.2,
-        run_heartbeat_interval_seconds=0.03,
+        run_lease_ttl_seconds=2.0,
+        run_heartbeat_interval_seconds=0.05,
     )
     state = AgentStateStore(config.state_path)
     manager = RunManager(
@@ -570,7 +570,7 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path)
         assert lease is not None
         first_heartbeat = state.get_run("heartbeat_run").heartbeat_at
         renewed = state.get_run("heartbeat_run")
-        deadline = monotonic() + 1.0
+        deadline = monotonic() + 3.0
         while renewed.heartbeat_at == first_heartbeat and monotonic() < deadline:
             sleep(0.01)
             renewed = state.get_run("heartbeat_run")

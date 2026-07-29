@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import nested_memvid_agent.projects as projects
 from nested_memvid_agent.projects import (
     ProjectConflictError,
+    canonical_repository_path,
     direct_provider_is_local,
     export_project,
     import_project_document,
@@ -19,6 +23,73 @@ ACTIVE_CAPABILITIES = {
     "tool:file.write",
     "tool:test.run",
 }
+
+
+def test_canonical_repository_path_uses_windows_safe_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    observed: list[Path] = []
+
+    monkeypatch.setattr(projects, "_windows_path_validation_required", lambda: True)
+    monkeypatch.setattr(
+        projects,
+        "_validate_windows_repository_directory",
+        lambda path: observed.append(path),
+    )
+
+    assert canonical_repository_path(repository) == repository.resolve()
+    assert observed == [repository.resolve()]
+
+
+def test_windows_repository_validation_rejects_reparse_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reparse = SimpleNamespace(
+        st_mode=stat.S_IFDIR,
+        st_dev=1,
+        st_ino=2,
+        st_file_attributes=0x400,
+    )
+    monkeypatch.setattr(projects.os, "lstat", lambda _path: reparse)
+
+    with pytest.raises(ValueError, match="reparse point"):
+        projects._validate_windows_repository_directory(tmp_path)
+
+
+def test_windows_repository_validation_rejects_identity_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = SimpleNamespace(
+        st_mode=stat.S_IFDIR,
+        st_dev=1,
+        st_ino=2,
+        st_file_attributes=0,
+    )
+    second = SimpleNamespace(
+        st_mode=stat.S_IFDIR,
+        st_dev=1,
+        st_ino=3,
+        st_file_attributes=0,
+    )
+    observations = iter((first, second))
+    monkeypatch.setattr(projects.os, "lstat", lambda _path: next(observations))
+    monkeypatch.setattr(projects.os, "scandir", lambda _path: _EmptyScandir())
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        projects._validate_windows_repository_directory(tmp_path)
+
+
+class _EmptyScandir:
+    def __enter__(self) -> _EmptyScandir:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
 
 
 @pytest.mark.parametrize(

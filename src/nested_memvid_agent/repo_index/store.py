@@ -1941,11 +1941,9 @@ class RepoIndexStore:
             ):
                 raise RepositoryIndexError("repository index generation changed in place")
             return
-        if (
-            observed.binding.device == expected.binding.device
-            and observed.binding.inode == expected.binding.inode
-        ):
-            raise RepositoryIndexError("repository index generation changed in place")
+        # Atomic replacement can legitimately recycle an older inode on
+        # filesystems with eager inode reuse. The authenticated generation
+        # lineage, not inode novelty alone, proves an authorized advance.
         self._validate_generation_lineage(
             connection,
             expected=expected,
@@ -2944,6 +2942,7 @@ class RepoIndexStore:
         mode: int = 0o600,
         parent_descriptor: int | None,
     ) -> int:
+        flags |= _binary_open_flag()
         if parent_descriptor is not None:
             return os.open(name, flags, mode, dir_fd=parent_descriptor)
         return os.open(self.path.parent / name, flags, mode)
@@ -3134,6 +3133,10 @@ def _verified_content_cache_key(
         canonical_binding,
         snapshot_binding,
     )
+
+
+def _binary_open_flag() -> int:
+    return int(getattr(os, "O_BINARY", 0))
 
 
 def _verified_content_cache_contains(

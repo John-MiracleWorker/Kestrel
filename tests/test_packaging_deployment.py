@@ -24,8 +24,10 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     assert project["version"] == "0.4.11"
     assert "pip>=26.1.2" in project["dependencies"]
     assert "setuptools>=83.0.0" in project["dependencies"]
+    assert "tzdata>=2026.3" in project["dependencies"]
     assert locked_versions["pip"] == "26.1.2"
     assert locked_versions["setuptools"] == "83.0.0"
+    assert locked_versions["tzdata"] == "2026.3"
     assert locked_versions["build"] == "1.5.0"
     assert locked_versions["keyring"] == "25.7.0"
     keyring_deps = project["optional-dependencies"]["keyring"]

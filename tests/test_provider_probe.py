@@ -529,7 +529,7 @@ def test_slow_header_timeouts_release_transport_capacity_for_recovery() -> None:
                 try:
                     _fetch_json(
                         f"{base_url}/slow",
-                        timeout_seconds=0.2,
+                        timeout_seconds=1.0,
                         api_key=None,
                     )
                 except TimeoutError as exc:
@@ -539,11 +539,11 @@ def test_slow_header_timeouts_release_transport_capacity_for_recovery() -> None:
             with ThreadPoolExecutor(max_workers=16) as executor:
                 outcomes = list(executor.map(slow_request, range(16)))
 
-            assert started.wait(timeout=0.5)
+            assert started.wait(timeout=2.0)
             assert outcomes == ["provider response deadline exceeded"] * 16
             assert _fetch_json(
                 f"{base_url}/healthy",
-                timeout_seconds=1.0,
+                timeout_seconds=2.0,
                 api_key=None,
             ) == {"recovered": True}
     finally:

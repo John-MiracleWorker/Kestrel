@@ -90,7 +90,13 @@ def _run_install(
     cwd: Path = ROOT,
 ) -> subprocess.CompletedProcess[str]:
     install_env = os.environ.copy()
-    install_env.update(env or {})
+    requested_env = env or {}
+    install_env.update(requested_env)
+    if "HOME" not in requested_env and requested_env.get("KESTREL_HOME"):
+        # Editable installs expose a real `kestrel` console script beside the
+        # test interpreter. Give installer tests a fresh user boundary so
+        # PATH discovery cannot collide with or mutate that runner-owned file.
+        install_env["HOME"] = str(Path(requested_env["KESTREL_HOME"]).parent)
     return subprocess.run(
         ["bash", str(install), *(args or [])],
         cwd=cwd,
@@ -671,6 +677,18 @@ def test_installer_embeds_the_exact_launcher_helper_checksum() -> None:
     text = INSTALL.read_text(encoding="utf-8")
 
     assert f'DEFAULT_LAUNCHER_HELPER_SHA256="{helper_digest}"' in text
+
+
+def test_installer_uses_local_launcher_helper_only_for_a_real_source_file() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    dry_run_selection = text.split(
+        "# A dry run must use the helper belonging to this installer",
+        maxsplit=1,
+    )[1].split("elif [[", maxsplit=1)[0]
+
+    assert '-f "$installer_source"' in dry_run_selection
+    assert '! -L "$installer_source"' in dry_run_selection
+    assert '"$installer_source" != "/dev/stdin"' in dry_run_selection
 
 
 def _launcher_transaction_home(tmp_path: Path) -> tuple[Path, Path, Path]:

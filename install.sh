@@ -333,7 +333,12 @@ prepare_user_launchers() {
     # potentially older helper in the target checkout.
     local_helper_available=0
     local installer_source="${BASH_SOURCE[0]:-}"
-    if [[ -n "$installer_source" && "$installer_source" != "/dev/stdin" ]]; then
+    if [[
+      -n "$installer_source" &&
+      "$installer_source" != "/dev/stdin" &&
+      ! -L "$installer_source" &&
+      -f "$installer_source"
+    ]]; then
       local source_launcher_manager
       source_launcher_manager="$(dirname "$installer_source")/scripts/manage_user_launchers.py"
       if [[ ! -L "$source_launcher_manager" && -f "$source_launcher_manager" ]]; then

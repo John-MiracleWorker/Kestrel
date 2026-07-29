@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -54,9 +55,14 @@ def test_native_bootstrap_discloses_version_pinned_index_install_assurance() -> 
     assert "version_pinned_package_index" in source
     assert "not hash-bound" in source
     assert "Published exact wheel" not in source
+    assert "$runningOnWindows =" in source
+    assert "$isWindows =" not in source
 
 
-@pytest.mark.skipif(_powershell() is None, reason="PowerShell is not available")
+@pytest.mark.skipif(
+    sys.platform != "win32" or _powershell() is None,
+    reason="native Windows PowerShell is not available",
+)
 def test_windows_doctor_reports_supported_paths_without_mutation() -> None:
     completed = subprocess.run(
         [
@@ -75,6 +81,7 @@ def test_windows_doctor_reports_supported_paths_without_mutation() -> None:
         check=False,
         text=True,
     )
+    assert completed.stdout.strip(), completed.stderr
     report = json.loads(completed.stdout)
 
     assert report["schema"] == "kestrel.windows_bootstrap_report.v1"
@@ -86,7 +93,10 @@ def test_windows_doctor_reports_supported_paths_without_mutation() -> None:
     assert completed.returncode == (0 if report["passed"] else 1)
 
 
-@pytest.mark.skipif(_powershell() is None, reason="PowerShell is not available")
+@pytest.mark.skipif(
+    sys.platform != "win32" or _powershell() is None,
+    reason="native Windows PowerShell is not available",
+)
 def test_windows_bootstrap_only_prints_operator_executed_commands() -> None:
     before = subprocess.run(
         ["git", "status", "--porcelain=v1"],
@@ -121,6 +131,7 @@ def test_windows_bootstrap_only_prints_operator_executed_commands() -> None:
         check=True,
         text=True,
     ).stdout
+    assert completed.stdout.strip(), completed.stderr
     report = json.loads(completed.stdout)
 
     assert report["mutation_performed"] is False
