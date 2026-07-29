@@ -30,6 +30,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     assert locked_versions["keyring"] == "25.7.0"
     keyring_deps = project["optional-dependencies"]["keyring"]
     assert any(str(dep).startswith("keyring>=25.6.0") for dep in keyring_deps)
+    assert "mcp>=1.0,<2" in project["optional-dependencies"]["mcp"]
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"

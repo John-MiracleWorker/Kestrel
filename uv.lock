@@ -1151,7 +1151,7 @@ requires-dist = [
     { name = "httplib2", marker = "extra == 'runtime'", specifier = ">=0.32.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "keyring", marker = "extra == 'keyring'", specifier = ">=25.6.0" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0,<2" },
     { name = "memvid-sdk", marker = "extra == 'memvid'", specifier = ">=2.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.26,<2.5" },

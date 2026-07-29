@@ -20,6 +20,7 @@ def test_browser_validation_image_is_immutable_and_version_aligned() -> None:
     )
     assert re.search(r"@sha256:[0-9a-f]{64}", dockerfile)
     assert "npm ci --omit=dev --ignore-scripts" in dockerfile
+    assert "WORKDIR /opt/kestrel\nCOPY package.json package-lock.json ./" in dockerfile
     assert "/opt/kestrel/browser-validate" in dockerfile
     assert "kestrel.browser_validation.v1" in runner
     assert '"--no-sandbox"' in runner

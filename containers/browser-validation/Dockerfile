@@ -3,11 +3,11 @@ FROM mcr.microsoft.com/playwright:v1.62.0-noble@sha256:baed2032d533817f3dbe6425d
 ENV NODE_ENV=production \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
-WORKDIR /opt/kestrel/browser-validation
+WORKDIR /opt/kestrel
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force \
-    && chmod -R a=rX /opt/kestrel/browser-validation
+    && chmod -R a=rX /opt/kestrel
 
 COPY browser-validate.mjs /opt/kestrel/browser-validate
 RUN chmod 0555 /opt/kestrel/browser-validate
