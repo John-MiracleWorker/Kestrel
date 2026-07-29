@@ -1,9 +1,7 @@
 import { createHash, randomBytes as secureRandomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import {
-  chmod,
   lstat,
-  mkdir,
   open,
   realpath,
   unlink
@@ -45,8 +43,19 @@ const sidecarReadinessSchema = z
 
 export type SidecarReadiness = z.infer<typeof sidecarReadinessSchema>;
 
+export interface CapturedPrivateFileIdentity {
+  dev: number;
+  ino: number;
+}
+
+export interface CapturedSidecarReadiness {
+  readiness: SidecarReadiness;
+  identity: CapturedPrivateFileIdentity;
+}
+
 export interface PrivateProfileInput {
   profileId: string;
+  trustedAnchor: string;
   profileRoot: string;
   statePath: string;
   memoryDir: string;
@@ -68,6 +77,10 @@ export interface PrivateFilePlatformAdapter {
   platform: NodeJS.Platform;
   currentOwnerId(): number | string | null;
   qualifyOwnerOnly(path: string, kind: "directory" | "file"): Promise<void>;
+  preparePrivateDirectory(
+    trustedAnchor: string,
+    path: string
+  ): Promise<string>;
 }
 
 export interface PrivateLaunchFiles {
@@ -77,7 +90,7 @@ export interface PrivateLaunchFiles {
   launchNonceDigest: string;
   apiToken: string;
   profile: ResolvedPrivateProfile;
-  cleanup(): Promise<void>;
+  cleanup(readinessIdentity?: CapturedPrivateFileIdentity): Promise<void>;
 }
 
 export interface CreatePrivateLaunchFilesInput {
@@ -145,25 +158,13 @@ export function createNodePrivateFileAdapter(
       if ((metadata.mode & 0o777) !== expectedMode) {
         throw new Error("private_artifact_permissions_untrusted");
       }
+    },
+    async preparePrivateDirectory(): Promise<string> {
+      // Node does not expose mkdirat/openat2-style directory-relative mutation.
+      // A platform implementation must prove its anchor and no-symlink walk.
+      throw new Error("private_directory_mutation_unqualified");
     }
   };
-}
-
-async function preparePrivateDirectory(
-  path: string,
-  adapter: PrivateFilePlatformAdapter
-): Promise<string> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const leaf = await lstat(path);
-  if (leaf.isSymbolicLink() || !leaf.isDirectory()) {
-    throw new Error("private_profile_symlink_untrusted");
-  }
-  if (adapter.platform !== "win32") {
-    await chmod(path, 0o700);
-  }
-  const canonical = await realpath(path);
-  await adapter.qualifyOwnerOnly(canonical, "directory");
-  return canonical;
 }
 
 function resolvedDescendant(
@@ -212,21 +213,39 @@ async function validateOptionalPrivateFile(
   await adapter.qualifyOwnerOnly(canonical, "file");
 }
 
+export function runtimeProfileControlIdentityBytes(
+  statePath: string,
+  memoryDir: string,
+  profileId: string
+): Buffer {
+  return Buffer.from(
+    JSON.stringify({
+      memory_dir: memoryDir,
+      profile_id: profileId,
+      schema: "kestrel.runtime_profile_control.v1",
+      state_path: statePath
+    }),
+    "utf8"
+  );
+}
+
 function leaseControlRoot(
   statePath: string,
   memoryDir: string,
   profileId: string
 ): string {
-  const identity = JSON.stringify({
-    memory_dir: memoryDir,
-    profile_id: profileId,
-    schema: "kestrel.runtime_profile_control.v1",
-    state_path: statePath
-  });
   return join(
     dirname(statePath),
     ".kestrel-runtime-profiles",
-    createHash("sha256").update(identity).digest("hex")
+    createHash("sha256")
+      .update(
+        runtimeProfileControlIdentityBytes(
+          statePath,
+          memoryDir,
+          profileId
+        )
+      )
+      .digest("hex")
   );
 }
 
@@ -235,8 +254,38 @@ export async function resolvePrivateProfile(
   adapter: PrivateFilePlatformAdapter = createNodePrivateFileAdapter()
 ): Promise<ResolvedPrivateProfile> {
   const profileId = requiredText(input.profileId, "profile_id", 120);
+  const requestedAnchor = resolve(input.trustedAnchor);
+  const anchorMetadata = await lstat(requestedAnchor);
+  if (anchorMetadata.isSymbolicLink() || !anchorMetadata.isDirectory()) {
+    throw new Error("trusted_anchor_untrusted");
+  }
+  const trustedAnchor = await realpath(requestedAnchor);
+  await adapter.qualifyOwnerOnly(trustedAnchor, "directory");
   const requestedRoot = resolve(input.profileRoot);
-  const profileRoot = await preparePrivateDirectory(requestedRoot, adapter);
+  if (
+    !isContained(requestedAnchor, requestedRoot) ||
+    requestedRoot === requestedAnchor
+  ) {
+    throw new Error("profile_root_outside_trusted_anchor");
+  }
+  const rootWithinAnchor = relative(requestedAnchor, requestedRoot);
+  const anchoredRoot = resolve(trustedAnchor, rootWithinAnchor);
+  if (
+    !isContained(trustedAnchor, anchoredRoot) ||
+    anchoredRoot === trustedAnchor
+  ) {
+    throw new Error("profile_root_outside_trusted_anchor");
+  }
+  const profileRoot = await adapter.preparePrivateDirectory(
+    trustedAnchor,
+    anchoredRoot
+  );
+  if (
+    !isContained(trustedAnchor, profileRoot) ||
+    profileRoot !== anchoredRoot
+  ) {
+    throw new Error("profile_root_outside_trusted_anchor");
+  }
   const statePath = resolvedDescendant(
     input.statePath,
     requestedRoot,
@@ -263,8 +312,14 @@ export async function resolvePrivateProfile(
     dirname(runtimeSettingsPath),
     runtimeDirectory
   ]) {
-    const canonical = await preparePrivateDirectory(directory, adapter);
-    if (!isContained(profileRoot, canonical)) {
+    const canonical = await adapter.preparePrivateDirectory(
+      trustedAnchor,
+      directory
+    );
+    if (
+      !isContained(profileRoot, canonical) ||
+      canonical !== directory
+    ) {
       throw new Error("private_profile_path_untrusted");
     }
   }
@@ -347,10 +402,13 @@ async function removeCapturedFile(
   }
 }
 
-export async function readPrivateJsonArtifact(
+async function readPrivateJsonArtifactWithIdentity(
   path: string,
   adapter: PrivateFilePlatformAdapter
-): Promise<unknown> {
+): Promise<{
+  value: unknown;
+  identity: CapturedPrivateFileIdentity;
+}> {
   let before;
   try {
     before = await lstat(path);
@@ -410,7 +468,10 @@ export async function readPrivateJsonArtifact(
       throw new Error("private_artifact_changed_during_read");
     }
     try {
-      return JSON.parse(bytes.toString("utf8"));
+      return {
+        value: JSON.parse(bytes.toString("utf8")),
+        identity: { dev: opened.dev, ino: opened.ino }
+      };
     } catch {
       throw new Error("private_artifact_json_invalid");
     }
@@ -419,17 +480,28 @@ export async function readPrivateJsonArtifact(
   }
 }
 
+export async function readPrivateJsonArtifact(
+  path: string,
+  adapter: PrivateFilePlatformAdapter
+): Promise<unknown> {
+  return (await readPrivateJsonArtifactWithIdentity(path, adapter)).value;
+}
+
 export async function readSidecarReadiness(
   path: string,
   adapter: PrivateFilePlatformAdapter = createNodePrivateFileAdapter()
-): Promise<SidecarReadiness> {
+): Promise<CapturedSidecarReadiness> {
+  const captured = await readPrivateJsonArtifactWithIdentity(path, adapter);
   const result = sidecarReadinessSchema.safeParse(
-    await readPrivateJsonArtifact(path, adapter)
+    captured.value
   );
   if (!result.success) {
     throw new Error("desktop_readiness_invalid");
   }
-  return result.data;
+  return {
+    readiness: result.data,
+    identity: captured.identity
+  };
 }
 
 export async function createPrivateLaunchFiles(
@@ -509,31 +581,15 @@ export async function createPrivateLaunchFiles(
     launchNonceDigest,
     apiToken,
     profile: input.profile,
-    async cleanup(): Promise<void> {
+    async cleanup(
+      readinessIdentity?: CapturedPrivateFileIdentity
+    ): Promise<void> {
       await removeCapturedFile(bootstrapPath, bootstrapIdentity);
-      try {
-        const readiness = await readSidecarReadiness(
+      if (readinessIdentity !== undefined) {
+        await removeCapturedFile(
           input.profile.readinessPath,
-          adapter
+          readinessIdentity
         );
-        if (
-          readiness.profile_id === input.profile.profileId &&
-          readiness.launch_nonce_digest === launchNonceDigest
-        ) {
-          const metadata = await lstat(input.profile.readinessPath);
-          await removeCapturedFile(input.profile.readinessPath, {
-            dev: metadata.dev,
-            ino: metadata.ino
-          });
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "";
-        if (
-          message !== "private_artifact_missing" &&
-          message !== "desktop_readiness_invalid"
-        ) {
-          throw error;
-        }
       }
     }
   };

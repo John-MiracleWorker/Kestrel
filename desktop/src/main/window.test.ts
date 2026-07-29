@@ -3,6 +3,7 @@ import { DESKTOP_APP_ENTRY_URL } from "../contracts";
 import {
   createAppWindow,
   createSingleWindowController,
+  startVerifiedDesktopSession,
   windowOptions
 } from "./window";
 
@@ -111,5 +112,43 @@ describe("desktop renderer window", () => {
     first.destroyed = true;
     expect(controller.openOrFocus()).not.toBe(first);
     expect(windows).toHaveLength(2);
+  });
+
+  it("quits without registering or opening resource UI when verified startup fails", async () => {
+    const events: string[] = [];
+
+    const started = await startVerifiedDesktopSession({
+      startSupervisor: async () => {
+        events.push("supervisor");
+        throw new Error("resource_signature_invalid");
+      },
+      registerVerifiedProtocol: () => events.push("protocol"),
+      openWindow: () => events.push("window"),
+      quit: () => events.push("quit")
+    });
+
+    expect(started).toBe(false);
+    expect(events).toEqual(["supervisor", "quit"]);
+  });
+
+  it("registers verified snapshots only after supervisor readiness and before opening", async () => {
+    const events: string[] = [];
+    const resources = { renderer: "verified" };
+
+    const started = await startVerifiedDesktopSession({
+      startSupervisor: async () => {
+        events.push("ready");
+        return resources;
+      },
+      registerVerifiedProtocol: (received) => {
+        expect(received).toBe(resources);
+        events.push("protocol");
+      },
+      openWindow: () => events.push("window"),
+      quit: () => events.push("quit")
+    });
+
+    expect(started).toBe(true);
+    expect(events).toEqual(["ready", "protocol", "window"]);
   });
 });

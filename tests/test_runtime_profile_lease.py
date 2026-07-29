@@ -6,10 +6,12 @@ import stat
 import subprocess
 import sys
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
+import nested_memvid_agent.runtime_profile_lease as runtime_profile_lease_module
 from nested_memvid_agent.file_lock import lock_exclusive, unlock
 from nested_memvid_agent.private_artifacts import (
     open_private_file_descriptor,
@@ -292,6 +294,35 @@ def test_profile_control_directory_supports_independent_writer_volumes(
     )
     assert len(control_directory.name) == 64
     assert all(character in "0123456789abcdef" for character in control_directory.name)
+
+
+def test_runtime_profile_identity_bytes_match_cross_language_golden_vectors() -> None:
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "desktop-canonical-vectors.json"
+        ).read_text(encoding="utf-8")
+    )
+    identity_bytes = getattr(
+        runtime_profile_lease_module,
+        "runtime_profile_control_identity_bytes",
+        None,
+    )
+
+    assert callable(identity_bytes)
+    for vector in fixture["runtime_profile_identities"]:
+        encoded = identity_bytes(
+            vector["state_path"],
+            vector["memory_dir"],
+            vector["profile_id"],
+        )
+        assert encoded.hex() == vector["canonical_utf8_hex"]
+        assert sha256(encoded).hexdigest() == vector["sha256"]
+    assert (
+        fixture["runtime_profile_identities"][0]["sha256"]
+        != fixture["runtime_profile_identities"][1]["sha256"]
+    )
 
 
 def test_sibling_runtime_profiles_have_distinct_control_directories(

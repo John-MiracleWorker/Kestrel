@@ -343,22 +343,38 @@ def resolve_runtime_profile_root(
 ) -> Path:
     canonical_state = Path(state_path).expanduser().resolve(strict=False)
     canonical_memory = Path(memory_dir).expanduser().resolve(strict=False)
-    identity = json.dumps(
-        {
-            "schema": "kestrel.runtime_profile_control.v1",
-            "profile_id": _required_text(profile_id, "profile_id"),
-            "state_path": str(canonical_state),
-            "memory_dir": str(canonical_memory),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    identity_bytes = runtime_profile_control_identity_bytes(
+        str(canonical_state),
+        str(canonical_memory),
+        profile_id,
     )
-    identity_digest = sha256(identity.encode("utf-8")).hexdigest()
+    identity_digest = sha256(identity_bytes).hexdigest()
     return (
         canonical_state.parent
         / _LEASE_CONTROL_DIRECTORY_NAME
         / identity_digest
     )
+
+
+def runtime_profile_control_identity_bytes(
+    state_path: str,
+    memory_dir: str,
+    profile_id: str,
+) -> bytes:
+    """Return the shared, normalization-preserving UTF-8 lease identity."""
+
+    identity = json.dumps(
+        {
+            "schema": "kestrel.runtime_profile_control.v1",
+            "profile_id": _required_text(profile_id, "profile_id"),
+            "state_path": str(state_path),
+            "memory_dir": str(memory_dir),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return identity.encode("utf-8")
 
 
 def current_runtime_lease_identity(

@@ -17,6 +17,25 @@ export interface AppWindowResult<TWindow extends AppWindow> {
   loaded: Promise<void>;
 }
 
+export async function startVerifiedDesktopSession<TVerified>(
+  dependencies: {
+    startSupervisor(): Promise<TVerified>;
+    registerVerifiedProtocol(resources: TVerified): void;
+    openWindow(): void;
+    quit(): void;
+  }
+): Promise<boolean> {
+  try {
+    const verified = await dependencies.startSupervisor();
+    dependencies.registerVerifiedProtocol(verified);
+    dependencies.openWindow();
+    return true;
+  } catch {
+    dependencies.quit();
+    return false;
+  }
+}
+
 export function windowOptions(): BrowserWindowConstructorOptions {
   return {
     width: 1320,

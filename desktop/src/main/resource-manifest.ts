@@ -23,6 +23,9 @@ const MANIFEST_SCHEMA = "kestrel.desktop.resources.v1";
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_SIGNATURE_BYTES = 4 * 1024;
 const READ_CHUNK_BYTES = 1024 * 1024;
+const MAX_RENDERER_ASSET_BYTES = 16 * 1024 * 1024;
+const MAX_RENDERER_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+const RENDERER_PREFIX = "web/dist/";
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 const resourceFileSchema = z
   .object({
@@ -58,6 +61,12 @@ export interface VerifiedResourceSet {
   manifestDigest: `sha256:${string}`;
   manifest: ResourceManifest;
   files: Map<string, VerifiedResourceFile>;
+  rendererAssets: VerifiedRendererAssets;
+}
+
+export interface VerifiedRendererAssets {
+  readonly totalBytes: number;
+  read(relativePath: string): Uint8Array | undefined;
 }
 
 export interface VerifyResourceManifestInput {
@@ -80,10 +89,25 @@ export class ResourceVerificationError extends Error {
       | "resource_signature_invalid"
       | "resource_signature_too_large"
       | "resource_signing_key_untrusted"
+      | "renderer_asset_too_large"
+      | "renderer_snapshot_too_large"
   ) {
     super(code);
     this.name = "ResourceVerificationError";
   }
+}
+
+function compareUnicodeCodePoints(left: string, right: string): number {
+  const leftPoints = Array.from(left, (value) => value.codePointAt(0) ?? 0);
+  const rightPoints = Array.from(right, (value) => value.codePointAt(0) ?? 0);
+  const length = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (leftPoints[index] ?? 0) - (rightPoints[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return leftPoints.length - rightPoints.length;
 }
 
 function canonicalValue(value: unknown): unknown {
@@ -93,7 +117,7 @@ function canonicalValue(value: unknown): unknown {
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
         .map(([key, child]) => [key, canonicalValue(child)])
     );
   }
@@ -275,8 +299,12 @@ async function reviewedControlPath(
 async function verifyResourceFile(
   canonicalRoot: string,
   relativePath: string,
-  expected: ResourceManifestFile
-): Promise<VerifiedResourceFile> {
+  expected: ResourceManifestFile,
+  captureBytes: boolean
+): Promise<{
+  file: VerifiedResourceFile;
+  captured?: Buffer;
+}> {
   const path = await reviewedResourcePath(canonicalRoot, relativePath);
   const { handle, metadata } = await stableOpen(path, Number.MAX_SAFE_INTEGER);
   try {
@@ -285,6 +313,9 @@ async function verifyResourceFile(
     }
     const digest = createHash("sha256");
     const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    const captured = captureBytes
+      ? Buffer.allocUnsafe(metadata.size)
+      : undefined;
     let position = 0;
     while (position < metadata.size) {
       const length = Math.min(buffer.byteLength, metadata.size - position);
@@ -293,6 +324,7 @@ async function verifyResourceFile(
         throw new ResourceVerificationError("resource_digest_mismatch");
       }
       digest.update(buffer.subarray(0, bytesRead));
+      captured?.set(buffer.subarray(0, bytesRead), position);
       position += bytesRead;
     }
     const final = await handle.stat();
@@ -307,12 +339,35 @@ async function verifyResourceFile(
       throw new ResourceVerificationError("resource_digest_mismatch");
     }
     return {
-      path,
-      size: metadata.size,
-      sha256: actual
+      file: {
+        path,
+        size: metadata.size,
+        sha256: actual
+      },
+      ...(captured === undefined ? {} : { captured })
     };
   } finally {
     await handle.close();
+  }
+}
+
+class ImmutableRendererAssets implements VerifiedRendererAssets {
+  readonly totalBytes: number;
+  readonly #assets: Map<string, Buffer>;
+
+  constructor(assets: ReadonlyMap<string, Uint8Array>) {
+    this.#assets = new Map(
+      [...assets].map(([path, bytes]) => [path, Buffer.from(bytes)])
+    );
+    this.totalBytes = [...this.#assets.values()].reduce(
+      (total, bytes) => total + bytes.byteLength,
+      0
+    );
+  }
+
+  read(relativePath: string): Uint8Array | undefined {
+    const bytes = this.#assets.get(relativePath);
+    return bytes === undefined ? undefined : Uint8Array.from(bytes);
   }
 }
 
@@ -392,17 +447,51 @@ export async function verifyResourceManifest(
     input.requiredFiles.map((path) => normalizeManifestPath(path))
   );
   for (const requiredPath of required) {
-    if (manifest.files[requiredPath] === undefined) {
+    if (!Object.hasOwn(manifest.files, requiredPath)) {
       throw new ResourceVerificationError("resource_missing");
     }
   }
 
-  const verifiedFiles = new Map<string, VerifiedResourceFile>();
+  let rendererSnapshotBytes = 0;
   for (const [relativePath, expected] of Object.entries(manifest.files)) {
+    if (!relativePath.startsWith(RENDERER_PREFIX)) {
+      continue;
+    }
+    if (expected.size > MAX_RENDERER_ASSET_BYTES) {
+      throw new ResourceVerificationError("renderer_asset_too_large");
+    }
+    rendererSnapshotBytes += expected.size;
+    if (
+      !Number.isSafeInteger(rendererSnapshotBytes) ||
+      rendererSnapshotBytes > MAX_RENDERER_SNAPSHOT_BYTES
+    ) {
+      throw new ResourceVerificationError("renderer_snapshot_too_large");
+    }
+  }
+
+  const verifiedFiles = new Map<string, VerifiedResourceFile>();
+  const rendererAssets = new Map<string, Buffer>();
+  for (const [relativePath, expected] of Object.entries(manifest.files)) {
+    const rendererRelativePath = relativePath.startsWith(RENDERER_PREFIX)
+      ? relativePath.slice(RENDERER_PREFIX.length)
+      : undefined;
+    const verified = await verifyResourceFile(
+      canonicalRoot,
+      relativePath,
+      expected,
+      rendererRelativePath !== undefined
+    );
     verifiedFiles.set(
       relativePath,
-      await verifyResourceFile(canonicalRoot, relativePath, expected)
+      verified.file
     );
+    if (
+      rendererRelativePath !== undefined &&
+      rendererRelativePath.length > 0 &&
+      verified.captured !== undefined
+    ) {
+      rendererAssets.set(rendererRelativePath, verified.captured);
+    }
   }
   return {
     resourceRoot: canonicalRoot,
@@ -410,6 +499,7 @@ export async function verifyResourceManifest(
       .update(manifestBytes)
       .digest("hex")}`,
     manifest,
-    files: verifiedFiles
+    files: verifiedFiles,
+    rendererAssets: new ImmutableRendererAssets(rendererAssets)
   };
 }

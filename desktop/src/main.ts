@@ -15,6 +15,7 @@ import {
 import {
   createAppWindow,
   createSingleWindowController,
+  startVerifiedDesktopSession,
   type AppWindow
 } from "./main/window.js";
 import {
@@ -54,6 +55,7 @@ async function createPackagedSidecarSupervisor(): Promise<SidecarSupervisor> {
     },
     profile: {
       profileId: "default",
+      trustedAnchor: app.getPath("userData"),
       profileRoot,
       statePath: join(profileRoot, "state", "agent.db"),
       memoryDir: join(profileRoot, "memory"),
@@ -149,19 +151,22 @@ if (!app.requestSingleInstanceLock()) {
       installSessionBoundary(
         session.defaultSession as unknown as RestrictedSession
       );
-      registerAppProtocol(
-        protocol,
-        join(process.resourcesPath, "web", "dist")
-      );
-      try {
-        supervisor = await createPackagedSidecarSupervisor();
-        await supervisor.start();
-      } catch {
-        // The renderer opens into a fail-closed recovery state. Task 10 owns
-        // projecting that non-secret state and its operator recovery actions.
-      }
-      desktopReady = true;
-      windows.openOrFocus();
+      await startVerifiedDesktopSession({
+        async startSupervisor() {
+          supervisor = await createPackagedSidecarSupervisor();
+          return supervisor.start();
+        },
+        registerVerifiedProtocol(rendererAssets) {
+          registerAppProtocol(protocol, rendererAssets);
+        },
+        openWindow() {
+          desktopReady = true;
+          windows.openOrFocus();
+        },
+        quit() {
+          app.quit();
+        }
+      });
     })
     .catch(() => {
       app.quit();

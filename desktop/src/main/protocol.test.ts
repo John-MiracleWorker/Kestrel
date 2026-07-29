@@ -1,19 +1,10 @@
-import {
-  mkdtemp,
-  mkdir,
-  realpath,
-  symlink,
-  writeFile
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { VerifiedRendererAssets } from "./resource-manifest";
 import {
   APP_CONTENT_SECURITY_POLICY,
   appProtocolResponse,
   registerAppProtocol,
-  registerKestrelScheme,
-  resolveAppAsset
+  registerKestrelScheme
 } from "./protocol";
 
 const expectedCsp =
@@ -21,92 +12,117 @@ const expectedCsp =
   "img-src 'self' data: blob:; connect-src http://127.0.0.1:*; object-src 'none'; " +
   "base-uri 'none'; form-action 'none'; frame-ancestors 'none';";
 
+class TestRendererAssets implements VerifiedRendererAssets {
+  readonly totalBytes: number;
+  readonly reads: string[] = [];
+  readonly #assets: Map<string, Uint8Array>;
+
+  constructor(entries: Readonly<Record<string, string>>) {
+    this.#assets = new Map(
+      Object.entries(entries).map(([path, body]) => [
+        path,
+        Buffer.from(body)
+      ])
+    );
+    this.totalBytes = [...this.#assets.values()].reduce(
+      (total, bytes) => total + bytes.byteLength,
+      0
+    );
+  }
+
+  read(relativePath: string): Uint8Array | undefined {
+    this.reads.push(relativePath);
+    const bytes = this.#assets.get(relativePath);
+    return bytes === undefined ? undefined : Uint8Array.from(bytes);
+  }
+}
+
+function rendererAssets(): TestRendererAssets {
+  return new TestRendererAssets({
+    "index.html": "<h1>Kestrel</h1>",
+    "assets/app.js": "export {};"
+  });
+}
+
 describe("private app protocol", () => {
-  let testRoot: string;
-  let rendererRoot: string;
-
-  beforeEach(async () => {
-    testRoot = await mkdtemp(join(tmpdir(), "kestrel-protocol-"));
-    rendererRoot = join(testRoot, "web", "dist");
-    await mkdir(join(rendererRoot, "assets"), { recursive: true });
-    await writeFile(join(rendererRoot, "index.html"), "<h1>Kestrel</h1>");
-    await writeFile(join(rendererRoot, "assets", "app.js"), "export {};");
-  });
-
-  afterEach(async () => {
-    const { rm } = await import("node:fs/promises");
-    await rm(testRoot, { force: true, recursive: true });
-  });
-
-  it("serves only normalized files beneath the renderer root", async () => {
-    await expect(
-      resolveAppAsset("../secrets.json", rendererRoot)
-    ).rejects.toThrow();
-    await expect(
-      resolveAppAsset("%2e%2e/secrets.json", rendererRoot)
-    ).rejects.toThrow();
-    await expect(
-      resolveAppAsset("%252e%252e%252fsecrets.json", rendererRoot)
-    ).rejects.toThrow();
-    await expect(
-      resolveAppAsset("assets%5capp.js", rendererRoot)
-    ).rejects.toThrow();
-    await expect(resolveAppAsset("assets\u0000app.js", rendererRoot)).rejects.toThrow();
-    await expect(resolveAppAsset("assets/%ZZ.js", rendererRoot)).rejects.toThrow();
+  it("rejects ambiguous or traversing URL paths before snapshot lookup", async () => {
+    const assets = rendererAssets();
+    for (const url of [
+      "kestrel://app/%2e%2e/secrets.json",
+      "kestrel://app/%252e%252e%252fsecrets.json",
+      "kestrel://app/assets%5capp.js",
+      "kestrel://app/assets/%00app.js",
+      "kestrel://app/assets/%ZZ.js"
+    ]) {
+      const response = await appProtocolResponse({ method: "GET", url }, assets);
+      expect(response.status).toBe(400);
+    }
+    expect(assets.reads).toEqual([]);
   });
 
   it("maps routes intentionally and admits only reviewed asset types", async () => {
-    const indexPath = await realpath(join(rendererRoot, "index.html"));
-    const scriptPath = await realpath(join(rendererRoot, "assets", "app.js"));
-    await expect(resolveAppAsset("mission", rendererRoot)).resolves.toBe(
-      indexPath
+    const assets = rendererAssets();
+    const mission = await appProtocolResponse(
+      { method: "GET", url: "kestrel://app/mission" },
+      assets
     );
-    await expect(resolveAppAsset("/", rendererRoot)).resolves.toBe(
-      indexPath
-    );
-    await expect(resolveAppAsset("assets/app.js", rendererRoot)).resolves.toBe(
-      scriptPath
-    );
-    await writeFile(join(rendererRoot, "assets", "app.js.map"), "{}");
-    await writeFile(join(rendererRoot, "private.env"), "secret");
-    await expect(
-      resolveAppAsset("assets/app.js.map", rendererRoot)
-    ).rejects.toThrow();
-    await expect(resolveAppAsset("private.env", rendererRoot)).rejects.toThrow();
-  });
-
-  it("rejects a symlink that escapes the real renderer root", async () => {
-    const outside = join(testRoot, "outside.js");
-    await writeFile(outside, "secret");
-    await symlink(outside, join(rendererRoot, "assets", "escape.js"));
-
-    await expect(
-      resolveAppAsset("assets/escape.js", rendererRoot)
-    ).rejects.toThrow();
-  });
-
-  it("attaches the exact CSP and safe media types to success and error responses", async () => {
-    expect(APP_CONTENT_SECURITY_POLICY).toBe(expectedCsp);
-
-    const html = await appProtocolResponse(
-      { method: "GET", url: "kestrel://app/index.html" },
-      rendererRoot
+    const root = await appProtocolResponse(
+      { method: "GET", url: "kestrel://app/" },
+      assets
     );
     const script = await appProtocolResponse(
       { method: "GET", url: "kestrel://app/assets/app.js" },
-      rendererRoot
+      assets
+    );
+    const sourceMap = await appProtocolResponse(
+      { method: "GET", url: "kestrel://app/assets/app.js.map" },
+      assets
+    );
+    const privateFile = await appProtocolResponse(
+      { method: "GET", url: "kestrel://app/private.env" },
+      assets
+    );
+
+    expect(await mission.text()).toBe("<h1>Kestrel</h1>");
+    expect(await root.text()).toBe("<h1>Kestrel</h1>");
+    expect(await script.text()).toBe("export {};");
+    expect(sourceMap.status).toBe(400);
+    expect(privateFile.status).toBe(400);
+  });
+
+  it("rejects every reviewed path absent from the verified snapshot", async () => {
+    const assets = rendererAssets();
+    const missing = await appProtocolResponse(
+      { method: "GET", url: "kestrel://app/assets/not-signed.js" },
+      assets
+    );
+
+    expect(missing.status).toBe(404);
+    expect(assets.reads).toEqual(["assets/not-signed.js"]);
+  });
+
+  it("attaches the exact CSP and safe media types to success and error responses", async () => {
+    const assets = rendererAssets();
+    expect(APP_CONTENT_SECURITY_POLICY).toBe(expectedCsp);
+    const html = await appProtocolResponse(
+      { method: "GET", url: "kestrel://app/index.html" },
+      assets
+    );
+    const script = await appProtocolResponse(
+      { method: "GET", url: "kestrel://app/assets/app.js" },
+      assets
     );
     const missing = await appProtocolResponse(
       { method: "GET", url: "kestrel://app/assets/missing.js" },
-      rendererRoot
+      assets
     );
     const malformed = await appProtocolResponse(
       { method: "GET", url: "kestrel://app/assets/%ZZ.js" },
-      rendererRoot
+      assets
     );
     const methodDenied = await appProtocolResponse(
       { method: "POST", url: "kestrel://app/index.html" },
-      rendererRoot
+      assets
     );
 
     for (const response of [
@@ -121,43 +137,45 @@ describe("private app protocol", () => {
     }
     expect(html.status).toBe(200);
     expect(html.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
-    expect(await html.text()).toBe("<h1>Kestrel</h1>");
     expect(script.headers.get("Content-Type")).toBe(
       "text/javascript; charset=utf-8"
     );
     expect(missing.status).toBe(404);
-    expect(missing.headers.get("Content-Type")).toBe(
-      "text/plain; charset=utf-8"
-    );
     expect(malformed.status).toBe(400);
     expect(methodDenied.status).toBe(405);
   });
 
   it("rejects non-app origins before reading any asset", async () => {
-    const reader = vi.fn(async (_path: string) => new Uint8Array());
+    const assets = rendererAssets();
     const response = await appProtocolResponse(
       { method: "GET", url: "kestrel://other/index.html" },
-      rendererRoot,
-      reader
+      assets
     );
 
     expect(response.status).toBe(400);
-    expect(reader).not.toHaveBeenCalled();
+    expect(assets.reads).toEqual([]);
   });
 
-  it("rejects URL-level traversal before URL normalization can hide it", async () => {
+  it("serves a defensive copy returned by the verified source", async () => {
+    const original = Buffer.from("<h1>Verified snapshot</h1>");
+    const source: VerifiedRendererAssets = {
+      totalBytes: original.byteLength,
+      read: (relativePath) =>
+        relativePath === "index.html"
+          ? Uint8Array.from(original)
+          : undefined
+    };
     const response = await appProtocolResponse(
-      {
-        method: "GET",
-        url: "kestrel://app/%2e%2e/assets/app.js"
-      },
-      rendererRoot
+      { method: "GET", url: "kestrel://app/mission" },
+      source
     );
+    original.fill(0);
 
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("<h1>Verified snapshot</h1>");
   });
 
-  it("registers the scheme as privileged and binds exactly one app handler", async () => {
+  it("registers the scheme as privileged and binds exactly one verified handler", async () => {
     const privilegeCalls: unknown[] = [];
     registerKestrelScheme({
       registerSchemesAsPrivileged: (schemes) => {
@@ -195,8 +213,9 @@ describe("private app protocol", () => {
         }
       )
     };
+    const assets = rendererAssets();
 
-    registerAppProtocol(protocol, rendererRoot);
+    registerAppProtocol(protocol, assets);
     const response = await handler?.({
       method: "GET",
       url: "kestrel://app/index.html"
@@ -204,5 +223,6 @@ describe("private app protocol", () => {
 
     expect(protocol.handle).toHaveBeenCalledOnce();
     expect(response?.status).toBe(200);
+    expect(assets.reads).toEqual(["index.html"]);
   });
 });

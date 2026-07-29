@@ -1,17 +1,10 @@
-import { readFile, realpath } from "node:fs/promises";
-import {
-  extname,
-  isAbsolute,
-  posix,
-  relative,
-  resolve,
-  sep
-} from "node:path";
+import { extname, posix } from "node:path";
 import {
   DESKTOP_APP_HOST,
   DESKTOP_APP_ORIGIN,
   DESKTOP_APP_SCHEME
 } from "../contracts.js";
+import type { VerifiedRendererAssets } from "./resource-manifest.js";
 
 export const APP_CONTENT_SECURITY_POLICY =
   "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; " +
@@ -79,19 +72,7 @@ export interface ProtocolHandlerRegistrar {
   ): unknown;
 }
 
-type AssetReader = (path: string) => Promise<Uint8Array>;
-
 class InvalidAppPathError extends Error {}
-
-function isContained(root: string, candidate: string): boolean {
-  const pathFromRoot = relative(root, candidate);
-  return (
-    pathFromRoot === "" ||
-    (!isAbsolute(pathFromRoot) &&
-      pathFromRoot !== ".." &&
-      !pathFromRoot.startsWith(`..${sep}`))
-  );
-}
 
 function decodedAssetPath(rawPath: string): string {
   if (rawPath.includes("\\") || /%(?:00|2f|5c)/i.test(rawPath)) {
@@ -151,27 +132,6 @@ function reviewedRelativeAsset(rawPath: string): string {
   return normalized;
 }
 
-export async function resolveAppAsset(
-  rawPath: string,
-  rendererRoot: string
-): Promise<string> {
-  const relativeAsset = reviewedRelativeAsset(rawPath);
-  const canonicalRoot = await realpath(rendererRoot);
-  const candidate = resolve(
-    canonicalRoot,
-    ...relativeAsset.split(posix.sep)
-  );
-  if (!isContained(canonicalRoot, candidate)) {
-    throw new InvalidAppPathError("app asset escapes renderer root");
-  }
-
-  const canonicalCandidate = await realpath(candidate);
-  if (!isContained(canonicalRoot, canonicalCandidate)) {
-    throw new InvalidAppPathError("app asset escapes renderer root");
-  }
-  return canonicalCandidate;
-}
-
 function responseHeaders(contentType: string): HeadersInit {
   return {
     "Content-Security-Policy": APP_CONTENT_SECURITY_POLICY,
@@ -201,18 +161,9 @@ function rawPathFromAppUrl(value: string): string {
   return rawPath || "/";
 }
 
-function isMissingFileError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    (error as NodeJS.ErrnoException).code === "ENOENT"
-  );
-}
-
 export async function appProtocolResponse(
   request: ProtocolRequest,
-  rendererRoot: string,
-  readAsset: AssetReader = readFile
+  rendererAssets: VerifiedRendererAssets
 ): Promise<Response> {
   if (request.method !== "GET") {
     return textResponse("Method not allowed", 405);
@@ -236,10 +187,13 @@ export async function appProtocolResponse(
 
   try {
     const rawPath = rawPathFromAppUrl(request.url);
-    const assetPath = await resolveAppAsset(rawPath, rendererRoot);
-    const body = await readAsset(assetPath);
+    const relativeAsset = reviewedRelativeAsset(rawPath);
+    const body = rendererAssets.read(relativeAsset);
+    if (body === undefined) {
+      return textResponse("Not found", 404);
+    }
     const contentType =
-      contentTypes.get(extname(assetPath).toLowerCase()) ??
+      contentTypes.get(extname(relativeAsset).toLowerCase()) ??
       "application/octet-stream";
     const responseBody = new Uint8Array(body.byteLength);
     responseBody.set(body);
@@ -250,9 +204,6 @@ export async function appProtocolResponse(
   } catch (error) {
     if (error instanceof InvalidAppPathError) {
       return textResponse("Bad request", 400);
-    }
-    if (isMissingFileError(error)) {
-      return textResponse("Not found", 404);
     }
     return textResponse("Not found", 404);
   }
@@ -274,9 +225,9 @@ export function registerKestrelScheme(registrar: SchemeRegistrar): void {
 
 export function registerAppProtocol(
   registrar: ProtocolHandlerRegistrar,
-  rendererRoot: string
+  rendererAssets: VerifiedRendererAssets
 ): void {
   registrar.handle(DESKTOP_APP_SCHEME, (request) =>
-    appProtocolResponse(request, rendererRoot)
+    appProtocolResponse(request, rendererAssets)
   );
 }

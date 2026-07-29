@@ -1,5 +1,4 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import {
   lstat,
@@ -17,6 +16,8 @@ import {
   readPrivateJsonArtifact,
   readSidecarReadiness,
   resolvePrivateProfile,
+  type CapturedPrivateFileIdentity,
+  type CapturedSidecarReadiness,
   type CreatePrivateLaunchFilesInput,
   type PrivateFilePlatformAdapter,
   type PrivateLaunchFiles,
@@ -26,6 +27,8 @@ import {
 } from "./private-files.js";
 import {
   verifyResourceManifest,
+  type VerifiedRendererAssets,
+  type VerifiedResourceFile,
   type VerifiedResourceSet,
   type VerifyResourceManifestInput
 } from "./resource-manifest.js";
@@ -167,8 +170,27 @@ export interface SidecarSpawnRequest {
   };
 }
 
+export interface VerifiedExecutableSpawnRequest {
+  args: [string];
+  options: SidecarSpawnRequest["options"];
+}
+
+export interface VerifiedExecutableLaunchCapability {
+  readonly resource: VerifiedResourceFile;
+  readonly mechanism:
+    | "linux_openat2_fexecve"
+    | "sealed_verified_native"
+    | "test_verified_handle";
+  spawn(request: VerifiedExecutableSpawnRequest): RetainedSidecarChild;
+  close(): Promise<void>;
+}
+
 export interface SidecarSupervisorDependencies {
   verifyResources(): Promise<VerifiedResourceSet>;
+  acquireVerifiedExecutable(
+    resources: VerifiedResourceSet,
+    relativePath: string
+  ): Promise<VerifiedExecutableLaunchCapability>;
   resolveProfile(): Promise<ResolvedPrivateProfile>;
   inspectLease(
     profile: ResolvedPrivateProfile
@@ -177,12 +199,12 @@ export interface SidecarSupervisorDependencies {
   createLaunchFiles(
     input: CreatePrivateLaunchFilesInput
   ): Promise<PrivateLaunchFiles>;
-  spawnSidecar(request: SidecarSpawnRequest): RetainedSidecarChild;
   waitForReadiness(input: {
     path: string;
     child: RetainedSidecarChild;
     timeoutMs: number;
-  }): Promise<SidecarReadiness>;
+    signal: AbortSignal;
+  }): Promise<CapturedSidecarReadiness>;
   inspectProcess(pid: number): Promise<SidecarProcessIdentity | null>;
   requestReadiness(input: {
     baseUrl: string;
@@ -192,13 +214,6 @@ export interface SidecarSupervisorDependencies {
     baseUrl: string;
     apiToken: string;
   }): Promise<void>;
-  reconcileUnexpectedExit(input: {
-    profile: ResolvedPrivateProfile;
-    exitCode: number | null;
-    signal: NodeJS.Signals | null;
-  }): Promise<{
-    status: "safe_to_restart" | "reconciliation_required" | "ambiguous";
-  }>;
   waitForExit(
     child: RetainedSidecarChild,
     timeoutMs: number
@@ -224,7 +239,6 @@ export type SidecarSupervisorState =
       sidecarVersion: string;
     }
   | { kind: "stopping" }
-  | { kind: "restarting" }
   | {
       kind: "recovery";
       reason:
@@ -238,10 +252,15 @@ export type SidecarSupervisorState =
 
 interface ActiveSidecar {
   child: RetainedSidecarChild;
+  executable: VerifiedExecutableLaunchCapability;
+  executableClosed: boolean;
   launch: PrivateLaunchFiles;
   profile: ResolvedPrivateProfile;
   resources: VerifiedResourceSet;
   baseUrl: string;
+  processIdentity: SidecarProcessIdentity | null;
+  readiness: SidecarReadiness | null;
+  readinessIdentity: CapturedPrivateFileIdentity | null;
   verified: boolean;
 }
 
@@ -448,54 +467,80 @@ export class SidecarSupervisor {
   private active: ActiveSidecar | null = null;
   private starting = false;
   private stopping = false;
-  private restartUsed = false;
-  private ambiguousHighRiskCall = false;
   private generation = 0;
+  private startPromise: Promise<VerifiedRendererAssets> | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private launchAbort: AbortController | null = null;
 
   constructor(
     private readonly config: SidecarSupervisorConfig,
     private readonly dependencies: SidecarSupervisorDependencies
   ) {}
 
-  async start(): Promise<void> {
-    if (this.starting || this.active !== null) {
+  async start(): Promise<VerifiedRendererAssets> {
+    if (this.startPromise !== null || this.active !== null) {
       throw new SidecarSupervisorError(
         "sidecar_already_started",
         "sidecar_unavailable"
       );
     }
-    this.restartUsed = false;
-    this.ambiguousHighRiskCall = false;
     this.stopping = false;
-    await this.launch(false);
-  }
-
-  markHighRiskCallAmbiguous(): void {
-    this.ambiguousHighRiskCall = true;
-  }
-
-  private async launch(restarting: boolean): Promise<void> {
-    this.starting = true;
     this.generation += 1;
     const generation = this.generation;
-    this.state = restarting ? { kind: "restarting" } : { kind: "verifying" };
+    const abort = new AbortController();
+    this.launchAbort = abort;
+    const operation = this.launch(generation, abort.signal);
+    this.startPromise = operation;
+    void operation.then(
+      () => {
+        if (this.startPromise === operation) {
+          this.startPromise = null;
+        }
+        if (this.launchAbort === abort) {
+          this.launchAbort = null;
+        }
+      },
+      () => {
+        if (this.startPromise === operation) {
+          this.startPromise = null;
+        }
+        if (this.launchAbort === abort) {
+          this.launchAbort = null;
+        }
+      }
+    );
+    return operation;
+  }
+
+  private throwIfLaunchCancelled(
+    generation: number,
+    signal: AbortSignal
+  ): void {
+    if (
+      signal.aborted ||
+      this.stopping ||
+      generation !== this.generation
+    ) {
+      throw new SidecarSupervisorError(
+        "sidecar_start_cancelled",
+        "sidecar_unavailable"
+      );
+    }
+  }
+
+  private async launch(
+    generation: number,
+    signal: AbortSignal
+  ): Promise<VerifiedRendererAssets> {
+    this.starting = true;
+    this.state = { kind: "verifying" };
     let launch: PrivateLaunchFiles | null = null;
     let child: RetainedSidecarChild | null = null;
+    let executable: VerifiedExecutableLaunchCapability | null = null;
     let expectedExecutableDigest: string | null = null;
     try {
       const resources = await this.dependencies.verifyResources();
-      const profile = await this.dependencies.resolveProfile();
-      const initialLease = await this.dependencies.inspectLease(profile);
-      if (initialLease.status !== "available") {
-        throw recoveryForLease(initialLease);
-      }
-      const parent = await this.dependencies.parentIdentity();
-      launch = await this.dependencies.createLaunchFiles({
-        profile,
-        parentPid: parent.pid,
-        parentBirthMarker: parent.processBirthMarker,
-        resourceManifestDigest: resources.manifestDigest
-      });
+      this.throwIfLaunchCancelled(generation, signal);
       const sidecar = resources.files.get(this.config.sidecarRelativePath);
       if (sidecar === undefined) {
         throw new SidecarSupervisorError(
@@ -503,10 +548,40 @@ export class SidecarSupervisor {
           "sidecar_unverified"
         );
       }
+      executable = await this.dependencies.acquireVerifiedExecutable(
+        resources,
+        this.config.sidecarRelativePath
+      );
+      this.throwIfLaunchCancelled(generation, signal);
+      if (
+        executable.resource.path !== sidecar.path ||
+        executable.resource.size !== sidecar.size ||
+        executable.resource.sha256 !== sidecar.sha256
+      ) {
+        throw new SidecarSupervisorError(
+          "verified_executable_capability_mismatch",
+          "sidecar_unverified"
+        );
+      }
+      const profile = await this.dependencies.resolveProfile();
+      this.throwIfLaunchCancelled(generation, signal);
+      const initialLease = await this.dependencies.inspectLease(profile);
+      this.throwIfLaunchCancelled(generation, signal);
+      if (initialLease.status !== "available") {
+        throw recoveryForLease(initialLease);
+      }
+      const parent = await this.dependencies.parentIdentity();
+      this.throwIfLaunchCancelled(generation, signal);
+      launch = await this.dependencies.createLaunchFiles({
+        profile,
+        parentPid: parent.pid,
+        parentBirthMarker: parent.processBirthMarker,
+        resourceManifestDigest: resources.manifestDigest
+      });
+      this.throwIfLaunchCancelled(generation, signal);
       expectedExecutableDigest = sidecar.sha256;
-      this.state = restarting ? { kind: "restarting" } : { kind: "starting" };
-      child = this.dependencies.spawnSidecar({
-        executable: sidecar.path,
+      this.state = { kind: "starting" };
+      child = executable.spawn({
         args: [launch.bootstrapPath],
         options: {
           shell: false,
@@ -515,6 +590,45 @@ export class SidecarSupervisor {
           env: minimalEnvironment(this.config.environment)
         }
       });
+      let terminal: SidecarSupervisorError | null = null;
+      let rejectTerminal!: (error: SidecarSupervisorError) => void;
+      const terminalPromise = new Promise<never>((_resolve, reject) => {
+        rejectTerminal = reject;
+      });
+      const reportTerminal = (error: SidecarSupervisorError): void => {
+        if (terminal !== null) {
+          return;
+        }
+        terminal = error;
+        rejectTerminal(error);
+        const current = this.active;
+        if (current !== null && current.child === child && current.verified) {
+          void this.handleUnexpectedExit(
+            generation,
+            child?.exitCode ?? null,
+            child?.signalCode ?? null
+          );
+        }
+      };
+      child.once("error", () => {
+        reportTerminal(
+          new SidecarSupervisorError(
+            "sidecar_spawn_failed",
+            "sidecar_unavailable"
+          )
+        );
+      });
+      child.once(
+        "exit",
+        (_code: number | null, _exitSignal: NodeJS.Signals | null) => {
+          reportTerminal(
+            new SidecarSupervisorError(
+              "sidecar_exited_before_readiness",
+              "sidecar_unavailable"
+            )
+          );
+        }
+      );
       if (child.pid === undefined || child.pid <= 0) {
         throw new SidecarSupervisorError(
           "sidecar_spawn_identity_missing",
@@ -535,21 +649,64 @@ export class SidecarSupervisor {
       );
       const active: ActiveSidecar = {
         child,
+        executable,
+        executableClosed: false,
         launch,
         profile,
         resources,
         baseUrl: "",
+        processIdentity: null,
+        readiness: null,
+        readinessIdentity: null,
         verified: false
       };
       this.active = active;
-      const readiness = await this.dependencies.waitForReadiness({
-        path: launch.readinessPath,
-        child,
-        timeoutMs: this.config.readinessTimeoutMs
-      });
+      const spawnedIdentity = await Promise.race([
+        this.dependencies.inspectProcess(child.pid),
+        terminalPromise
+      ]);
+      this.throwIfLaunchCancelled(generation, signal);
+      if (
+        spawnedIdentity === null ||
+        spawnedIdentity.pid !== child.pid ||
+        spawnedIdentity.executableDigest !== expectedExecutableDigest
+      ) {
+        throw new SidecarSupervisorError(
+          "sidecar_process_identity_unverified",
+          "sidecar_unverified"
+        );
+      }
+      active.processIdentity = spawnedIdentity;
+      try {
+        await this.closeActiveExecutable(active);
+      } catch {
+        throw new SidecarSupervisorError(
+          "verified_executable_close_failed",
+          "sidecar_unverified"
+        );
+      }
+      this.throwIfLaunchCancelled(generation, signal);
+      const capturedReadiness = await Promise.race([
+        this.dependencies.waitForReadiness({
+          path: launch.readinessPath,
+          child,
+          timeoutMs: this.config.readinessTimeoutMs,
+          signal
+        }),
+        terminalPromise
+      ]);
+      const readiness = capturedReadiness.readiness;
+      this.throwIfLaunchCancelled(generation, signal);
+      if (terminal !== null) {
+        throw terminal;
+      }
       const processIdentity = await this.dependencies.inspectProcess(
         child.pid
       );
+      this.throwIfLaunchCancelled(generation, signal);
+      if (terminal !== null) {
+        throw terminal;
+      }
       if (
         processIdentity === null ||
         processIdentity.executableDigest !== expectedExecutableDigest
@@ -560,6 +717,10 @@ export class SidecarSupervisor {
         );
       }
       const postLaunchLease = await this.dependencies.inspectLease(profile);
+      this.throwIfLaunchCancelled(generation, signal);
+      if (terminal !== null) {
+        throw terminal;
+      }
       const baseUrl = validateLocalReadinessEvidence(
         active,
         readiness,
@@ -568,60 +729,109 @@ export class SidecarSupervisor {
         this.config.sidecarVersion,
         expectedExecutableDigest
       );
+      active.processIdentity = processIdentity;
+      active.readiness = readiness;
+      active.readinessIdentity = capturedReadiness.identity;
+      active.baseUrl = baseUrl;
       const apiReadiness = await this.dependencies.requestReadiness({
         baseUrl,
         apiToken: launch.apiToken
       });
+      this.throwIfLaunchCancelled(generation, signal);
+      if (terminal !== null) {
+        throw terminal;
+      }
       validateAuthenticatedReadiness(
         active,
         apiReadiness,
         this.config.sidecarVersion
       );
-      active.baseUrl = baseUrl;
       active.verified = true;
-      child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
-        void this.handleUnexpectedExit(generation, code, signal);
-      });
       this.state = {
         kind: "ready",
         profileId: profile.profileId,
         baseUrl: active.baseUrl,
         sidecarVersion: this.config.sidecarVersion
       };
+      return resources.rendererAssets;
     } catch (error) {
-      if (
-        child !== null &&
-        child.pid !== undefined &&
-        child.exitCode === null &&
-        expectedExecutableDigest !== null
-      ) {
-        const identity = await this.dependencies
-          .inspectProcess(child.pid)
-          .catch(() => null);
+      let surfacedError: unknown =
+        this.stopping || signal.aborted || generation !== this.generation
+          ? new SidecarSupervisorError(
+              "sidecar_start_cancelled",
+              "sidecar_unavailable"
+            )
+          : error;
+      const active = this.active?.child === child ? this.active : null;
+      if (active !== null) {
+        let terminationFailure: unknown = null;
+        try {
+          await this.terminateActive(active, false);
+        } catch (terminationError) {
+          terminationFailure = terminationError;
+          this.dependencies.log(
+            `[sidecar:supervisor] ${fixedErrorCode(terminationError)}`
+          );
+        }
+        try {
+          await this.closeActiveExecutable(active);
+        } catch {
+          surfacedError = new SidecarSupervisorError(
+            "verified_executable_close_failed",
+            "sidecar_unverified"
+          );
+        }
         if (
-          identity !== null &&
-          identity.pid === child.pid &&
-          identity.executableDigest === expectedExecutableDigest
+          terminationFailure instanceof SidecarSupervisorError &&
+          (terminationFailure.code === "sidecar_cleanup_failed" ||
+            terminationFailure.code ===
+              "verified_executable_close_failed")
         ) {
-          child.kill("SIGTERM");
+          surfacedError = terminationFailure;
+        }
+      } else {
+        let cleanupFailed = false;
+        let closeFailed = false;
+        if (launch !== null) {
+          try {
+            await launch.cleanup();
+          } catch {
+            cleanupFailed = true;
+          }
+        }
+        if (executable !== null) {
+          try {
+            await executable.close();
+          } catch {
+            closeFailed = true;
+          }
+        }
+        if (cleanupFailed) {
+          surfacedError = new SidecarSupervisorError(
+            "sidecar_cleanup_failed",
+            "sidecar_unavailable"
+          );
+        } else if (closeFailed) {
+          surfacedError = new SidecarSupervisorError(
+            "verified_executable_close_failed",
+            "sidecar_unverified"
+          );
         }
       }
-      await launch?.cleanup().catch(() => undefined);
-      if (this.active?.child === child) {
-        this.active = null;
-      }
       const recoveryReason =
-        error instanceof SidecarSupervisorError
-          ? error.recoveryReason
-          : fixedErrorCode(error).startsWith("resource_")
+        surfacedError instanceof SidecarSupervisorError
+          ? surfacedError.recoveryReason
+          : fixedErrorCode(surfacedError).startsWith("resource_")
             ? "sidecar_unverified"
             : "sidecar_unavailable";
-      this.state = {
-        kind: "recovery",
-        reason: recoveryReason,
-        detail: fixedErrorCode(error)
-      };
-      throw error;
+      if (!this.stopping) {
+        this.state = {
+          kind: "recovery",
+          reason: recoveryReason,
+          detail: fixedErrorCode(surfacedError)
+        };
+      }
+      throw surfacedError;
     } finally {
       this.starting = false;
     }
@@ -629,8 +839,8 @@ export class SidecarSupervisor {
 
   private async handleUnexpectedExit(
     generation: number,
-    exitCode: number | null,
-    signal: NodeJS.Signals | null
+    _exitCode: number | null,
+    _signal: NodeJS.Signals | null
   ): Promise<void> {
     const active = this.active;
     if (active === null || generation !== this.generation) {
@@ -639,107 +849,233 @@ export class SidecarSupervisor {
     if (this.stopping) {
       return;
     }
-    this.active = null;
-    await active.launch.cleanup().catch(() => undefined);
-    if (this.restartUsed) {
-      this.state = {
-        kind: "recovery",
-        reason: "sidecar_unavailable",
-        detail: "sidecar_restart_limit_reached"
-      };
+    try {
+      await this.finalizeExitedActive(active);
+    } catch (error) {
+      this.dependencies.log(
+        `[sidecar:supervisor] ${fixedErrorCode(error)}`
+      );
       return;
     }
-    if (this.ambiguousHighRiskCall) {
-      this.state = {
-        kind: "recovery",
-        reason: "reconciliation_required",
-        detail: "ambiguous_high_risk_call"
-      };
-      return;
-    }
-    this.state = { kind: "restarting" };
-    let reconciliation: {
-      status: "safe_to_restart" | "reconciliation_required" | "ambiguous";
+    this.state = {
+      kind: "recovery",
+      reason: "reconciliation_required",
+      detail: "unexpected_exit_reconciliation_required"
     };
-    try {
-      reconciliation =
-        await this.dependencies.reconcileUnexpectedExit({
-          profile: active.profile,
-          exitCode,
-          signal
-        });
-    } catch {
-      reconciliation = { status: "ambiguous" };
-    }
-    if (reconciliation.status !== "safe_to_restart") {
-      this.state = {
-        kind: "recovery",
-        reason: "reconciliation_required",
-        detail: reconciliation.status
-      };
-      return;
-    }
-    this.restartUsed = true;
-    try {
-      await this.launch(true);
-    } catch {
-      // launch() has already projected a fixed recovery state.
-    }
   }
 
   async stop(): Promise<void> {
-    const active = this.active;
+    if (this.stopPromise !== null) {
+      return this.stopPromise;
+    }
     this.stopping = true;
+    this.generation += 1;
+    this.launchAbort?.abort();
     this.state = { kind: "stopping" };
-    if (active === null || !active.verified) {
+    const start = this.startPromise;
+    const operation = this.stopAfterStartSettles(start);
+    this.stopPromise = operation;
+    void operation.then(
+      () => {
+        if (this.stopPromise === operation) {
+          this.stopPromise = null;
+        }
+      },
+      () => {
+        if (this.stopPromise === operation) {
+          this.stopPromise = null;
+        }
+      }
+    );
+    return operation;
+  }
+
+  private async stopAfterStartSettles(
+    start: Promise<VerifiedRendererAssets> | null
+  ): Promise<void> {
+    await start?.catch(() => undefined);
+    const active = this.active;
+    if (active === null) {
       return;
     }
-    let exited = false;
+    await this.terminateActive(active, active.verified);
+  }
+
+  private childHasExited(child: RetainedSidecarChild): boolean {
+    return child.exitCode !== null || child.signalCode !== null;
+  }
+
+  private terminationError(code: string): SidecarSupervisorError {
+    this.state = {
+      kind: "recovery",
+      reason: "sidecar_unavailable",
+      detail: code
+    };
+    return new SidecarSupervisorError(code, "sidecar_unavailable");
+  }
+
+  private async waitForTerminationStage(
+    child: RetainedSidecarChild
+  ): Promise<boolean> {
     try {
-      await this.dependencies.requestShutdown({
-        baseUrl: active.baseUrl,
-        apiToken: active.launch.apiToken
-      });
-      exited = await this.dependencies.waitForExit(
-        active.child,
+      const exited = await this.dependencies.waitForExit(
+        child,
         this.config.shutdownTimeoutMs
       );
+      return exited || this.childHasExited(child);
     } catch {
-      exited = false;
-    }
-    if (!exited && active.child.exitCode === null) {
-      active.child.kill("SIGTERM");
-      exited = await this.dependencies.waitForExit(
-        active.child,
-        this.config.shutdownTimeoutMs
+      this.dependencies.log(
+        "[sidecar:supervisor] sidecar_exit_wait_failed"
       );
+      return this.childHasExited(child);
     }
-    if (!exited && active.child.exitCode === null) {
-      active.child.kill("SIGKILL");
-      exited = await this.dependencies.waitForExit(
-        active.child,
-        this.config.shutdownTimeoutMs
-      );
+  }
+
+  private async reattestTerminationAuthority(
+    active: ActiveSidecar
+  ): Promise<boolean> {
+    const expected = active.processIdentity;
+    const pid = active.child.pid;
+    if (expected === null || pid === undefined || pid !== expected.pid) {
+      return false;
+    }
+    let current: SidecarProcessIdentity | null;
+    try {
+      current = await this.dependencies.inspectProcess(pid);
+    } catch {
+      return false;
     }
     if (
-      !exited &&
-      active.child.exitCode === null &&
-      active.child.signalCode === null
+      current === null ||
+      current.pid !== expected.pid ||
+      current.processBirthMarker !== expected.processBirthMarker ||
+      current.executableDigest !== expected.executableDigest ||
+      (expected.ownerDigest !== undefined &&
+        current.ownerDigest !== expected.ownerDigest)
     ) {
-      this.state = {
-        kind: "recovery",
-        reason: "sidecar_unavailable",
-        detail: "sidecar_termination_unconfirmed"
-      };
-      throw new SidecarSupervisorError(
-        "sidecar_termination_unconfirmed",
-        "sidecar_unavailable"
-      );
+      return false;
     }
-    await active.launch.cleanup().catch(() => undefined);
+    const readiness = active.readiness;
+    if (readiness === null) {
+      return true;
+    }
+    let lease: ProfileLeaseEvidence;
+    try {
+      lease = await this.dependencies.inspectLease(active.profile);
+    } catch {
+      return false;
+    }
+    const leaseCurrent = lease.current;
+    return (
+      lease.status === "attach_desktop" &&
+      leaseCurrent !== undefined &&
+      leaseCurrent.management === "desktop" &&
+      leaseCurrent.profileId === active.profile.profileId &&
+      leaseCurrent.pid === expected.pid &&
+      leaseCurrent.processBirthMarker === expected.processBirthMarker &&
+      leaseCurrent.executableDigest === expected.executableDigest &&
+      leaseCurrent.launchNonceDigest ===
+        active.launch.launchNonceDigest &&
+      leaseCurrent.baseUrl === active.baseUrl &&
+      leaseCurrent.version === this.config.sidecarVersion
+    );
+  }
+
+  private async finalizeExitedActive(active: ActiveSidecar): Promise<void> {
+    let cleanupFailed = false;
+    let closeFailed = false;
+    try {
+      await active.launch.cleanup(active.readinessIdentity ?? undefined);
+    } catch {
+      cleanupFailed = true;
+    }
+    try {
+      await this.closeActiveExecutable(active);
+    } catch {
+      closeFailed = true;
+    }
     if (this.active === active) {
       this.active = null;
     }
+    if (cleanupFailed) {
+      throw this.terminationError("sidecar_cleanup_failed");
+    }
+    if (closeFailed) {
+      throw this.terminationError(
+        "verified_executable_close_failed"
+      );
+    }
+  }
+
+  private async closeActiveExecutable(
+    active: ActiveSidecar
+  ): Promise<void> {
+    if (active.executableClosed) {
+      return;
+    }
+    await active.executable.close();
+    active.executableClosed = true;
+  }
+
+  private async terminateActive(
+    active: ActiveSidecar,
+    requestGraceful: boolean
+  ): Promise<void> {
+    if (this.childHasExited(active.child)) {
+      await this.finalizeExitedActive(active);
+      return;
+    }
+
+    if (requestGraceful) {
+      try {
+        await this.dependencies.requestShutdown({
+          baseUrl: active.baseUrl,
+          apiToken: active.launch.apiToken
+        });
+      } catch {
+        // The exit wait below is mandatory even when the request failed.
+        this.dependencies.log(
+          "[sidecar:supervisor] authenticated_shutdown_failed"
+        );
+      }
+      if (await this.waitForTerminationStage(active.child)) {
+        await this.finalizeExitedActive(active);
+        return;
+      }
+    }
+
+    if (!(await this.reattestTerminationAuthority(active))) {
+      throw this.terminationError(
+        "sidecar_termination_identity_unverified"
+      );
+    }
+    const termAccepted = active.child.kill("SIGTERM");
+    if (await this.waitForTerminationStage(active.child)) {
+      await this.finalizeExitedActive(active);
+      return;
+    }
+    if (!termAccepted) {
+      throw this.terminationError(
+        "sidecar_termination_signal_rejected"
+      );
+    }
+
+    if (!(await this.reattestTerminationAuthority(active))) {
+      throw this.terminationError(
+        "sidecar_termination_identity_unverified"
+      );
+    }
+    const killAccepted = active.child.kill("SIGKILL");
+    if (await this.waitForTerminationStage(active.child)) {
+      await this.finalizeExitedActive(active);
+      return;
+    }
+    if (!killAccepted) {
+      throw this.terminationError(
+        "sidecar_termination_signal_rejected"
+      );
+    }
+    throw this.terminationError("sidecar_termination_unconfirmed");
   }
 }
 
@@ -1013,6 +1349,12 @@ export function createNodeSupervisorDependencies(
   return {
     verifyResources: () =>
       verifyResourceManifest(input.resourceVerification),
+    async acquireVerifiedExecutable() {
+      throw new SidecarSupervisorError(
+        "verified_executable_launch_unqualified",
+        "sidecar_unverified"
+      );
+    },
     resolveProfile: () => resolvePrivateProfile(input.profile, adapter),
     inspectLease: (profile) =>
       inspectProfileLeaseMetadata(
@@ -1039,16 +1381,20 @@ export function createNodeSupervisorDependencies(
         ...launchInput,
         platformAdapter: adapter
       }),
-    spawnSidecar(request): RetainedSidecarChild {
-      return spawn(request.executable, request.args, request.options);
-    },
     async waitForReadiness({
       path,
       child,
-      timeoutMs
-    }): Promise<SidecarReadiness> {
+      timeoutMs,
+      signal
+    }): Promise<CapturedSidecarReadiness> {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() <= deadline) {
+        if (signal.aborted) {
+          throw new SidecarSupervisorError(
+            "sidecar_start_cancelled",
+            "sidecar_unavailable"
+          );
+        }
         if (child.exitCode !== null || child.signalCode !== null) {
           throw new SidecarSupervisorError(
             "sidecar_exited_before_readiness",
@@ -1065,8 +1411,21 @@ export function createNodeSupervisorDependencies(
             throw error;
           }
         }
-        await new Promise<void>((resolvePromise) => {
-          setTimeout(resolvePromise, input.readinessPollMs ?? 25);
+        await new Promise<void>((resolvePromise, rejectPromise) => {
+          const onAbort = (): void => {
+            clearTimeout(timer);
+            rejectPromise(
+              new SidecarSupervisorError(
+                "sidecar_start_cancelled",
+                "sidecar_unavailable"
+              )
+            );
+          };
+          const timer = setTimeout(() => {
+            signal.removeEventListener("abort", onAbort);
+            resolvePromise();
+          }, input.readinessPollMs ?? 25);
+          signal.addEventListener("abort", onAbort, { once: true });
         });
       }
       throw new SidecarSupervisorError(
@@ -1113,20 +1472,6 @@ export function createNodeSupervisorDependencies(
       if (response.statusCode !== 202 || !parsed.success) {
         throw new Error("authenticated_shutdown_rejected");
       }
-    },
-    async reconcileUnexpectedExit({ profile }) {
-      const lease = await inspectProfileLeaseMetadata(
-        profile,
-        input.sidecarVersion,
-        adapter,
-        inspectProcess
-      );
-      return {
-        status:
-          lease.status === "available"
-            ? "safe_to_restart"
-            : "reconciliation_required"
-      };
     },
     waitForExit: waitForRetainedChildExit,
     log: input.log ?? (() => undefined)

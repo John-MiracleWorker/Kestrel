@@ -1,19 +1,8 @@
 import { createHash } from "node:crypto";
-import {
-  chmod,
-  mkdtemp,
-  mkdir,
-  rm,
-  writeFile
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { resolvePrivateProfile } from "./private-files";
 import type { VerifiedResourceSet } from "./resource-manifest";
 import {
-  createNodeSupervisorDependencies,
   SidecarSupervisor,
   type AuthenticatedDesktopReadiness,
   type ProfileLeaseEvidence,
@@ -44,6 +33,24 @@ async function eventually(assertion: () => void): Promise<void> {
     }
   }
   throw lastError;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+} {
+  let resolvePromise!: (value: T) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return {
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise
+  };
 }
 
 function verifiedResources(): VerifiedResourceSet {
@@ -81,7 +88,14 @@ function verifiedResources(): VerifiedResourceSet {
           sha256: "c".repeat(64)
         }
       ]
-    ])
+    ]),
+    rendererAssets: {
+      totalBytes: 16,
+      read: (relativePath) =>
+        relativePath === "index.html"
+          ? Buffer.from("<h1>Kestrel</h1>")
+          : undefined
+    }
   };
 }
 
@@ -133,6 +147,22 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
   let leaseInspection = 0;
   const dependencies: SidecarSupervisorDependencies = {
     verifyResources: async () => verifiedResources(),
+    acquireVerifiedExecutable: async (resources, relativePath) => {
+      const resource = resources.files.get(relativePath);
+      if (resource === undefined) {
+        throw new Error("missing verified executable");
+      }
+      return {
+        resource,
+        mechanism: "test_verified_handle",
+        spawn: (request) =>
+          spawner.spawn({
+            executable: resource.path,
+            ...request
+          }),
+        close: async () => undefined
+      };
+    },
     resolveProfile: async () => ({
       profileId: "default",
       profileRoot: "/profile",
@@ -146,7 +176,7 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
     inspectLease: async () => {
       const phase = leaseInspection;
       leaseInspection += 1;
-      if (phase % 2 === 0) {
+      if (phase === 0) {
         return { status: "available" };
       }
       const child = spawner.children.at(-1);
@@ -168,22 +198,24 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
       profile: input.profile,
       cleanup: async () => undefined
     }),
-    spawnSidecar: spawner.spawn,
     waitForReadiness: async ({ child }) => {
       const pid = child.pid;
       if (pid === undefined) {
         throw new Error("missing child PID");
       }
       return {
-        schema: "kestrel.desktop.sidecar_readiness.v1",
-        pid,
-        process_birth_marker: `birth-${pid}`,
-        port: 43000 + pid,
-        profile_id: "default",
-        sidecar_version: "0.5.0",
-        executable_digest: executableDigest,
-        resource_manifest_digest: manifestDigest,
-        launch_nonce_digest: launchNonceDigest
+        identity: { dev: 1, ino: pid },
+        readiness: {
+          schema: "kestrel.desktop.sidecar_readiness.v1",
+          pid,
+          process_birth_marker: `birth-${pid}`,
+          port: 43000 + pid,
+          profile_id: "default",
+          sidecar_version: "0.5.0",
+          executable_digest: executableDigest,
+          resource_manifest_digest: manifestDigest,
+          launch_nonce_digest: launchNonceDigest
+        }
       };
     },
     inspectProcess: async (pid) => ({
@@ -196,7 +228,6 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
       shutdownRequests.push(request);
       spawner.children.at(-1)?.exit(0);
     },
-    reconcileUnexpectedExit: async () => ({ status: "safe_to_restart" }),
     waitForExit: async (child) => child.exitCode !== null,
     log: (line) => logs.push(line),
     ...overrides
@@ -243,6 +274,37 @@ describe("verified sidecar supervisor", () => {
     });
   });
 
+  it("acquires an exact executable capability before profile or secret mutation", async () => {
+    let profileResolved = false;
+    let launchFilesCreated = false;
+    let capabilityRequested = false;
+    const { supervisor, spawner } = harness({
+      acquireVerifiedExecutable: async () => {
+        capabilityRequested = true;
+        throw Object.assign(
+          new Error("verified_executable_launch_unqualified"),
+          { code: "verified_executable_launch_unqualified" }
+        );
+      },
+      resolveProfile: async () => {
+        profileResolved = true;
+        throw new Error("profile_must_not_be_resolved");
+      },
+      createLaunchFiles: async () => {
+        launchFilesCreated = true;
+        throw new Error("launch_files_must_not_be_created");
+      }
+    });
+
+    await expect(supervisor.start()).rejects.toMatchObject({
+      code: "verified_executable_launch_unqualified"
+    });
+    expect(capabilityRequested).toBe(true);
+    expect(profileResolved).toBe(false);
+    expect(launchFilesCreated).toBe(false);
+    expect(spawner.children).toHaveLength(0);
+  });
+
   it("uses the exact executable and sole bootstrap argv with a secret-free environment", async () => {
     const { supervisor, spawner } = harness();
 
@@ -268,40 +330,196 @@ describe("verified sidecar supervisor", () => {
     expect(JSON.stringify(supervisor.state)).not.toContain(apiToken);
   });
 
-  it("restarts once after explicit safe reconciliation and then enters recovery", async () => {
-    const { supervisor, spawner } = harness();
+  it("preserves the asynchronous rejection contract for duplicate start", async () => {
+    const { supervisor } = harness();
     await supervisor.start();
 
-    spawner.children[0]?.exit(17);
-    await eventually(() => {
-      expect(spawner.children).toHaveLength(2);
-      expect(supervisor.state.kind).toBe("ready");
-    });
-
-    spawner.children[1]?.exit(17);
-    await eventually(() => {
-      expect(supervisor.state).toMatchObject({
-        kind: "recovery",
-        reason: "sidecar_unavailable"
-      });
-    });
-    expect(spawner.children).toHaveLength(2);
+    await expect(supervisor.start()).rejects.toThrow(
+      "sidecar_already_started"
+    );
   });
 
-  it("does not restart when a high-risk call is ambiguous", async () => {
+  it("closes the exact executable capability as soon as the spawned identity is retained", async () => {
+    let closeCalls = 0;
+    const { supervisor, spawner } = harness({
+      acquireVerifiedExecutable: async (resources, relativePath) => {
+        const resource = resources.files.get(relativePath);
+        if (resource === undefined) {
+          throw new Error("missing verified executable");
+        }
+        return {
+          resource,
+          mechanism: "test_verified_handle",
+          spawn: (request) =>
+            spawner.spawn({ executable: resource.path, ...request }),
+          close: async () => {
+            closeCalls += 1;
+          }
+        };
+      }
+    });
+
+    await supervisor.start();
+
+    expect(closeCalls).toBe(1);
+    await supervisor.stop();
+    expect(closeCalls).toBe(1);
+  });
+
+  it("never auto-restarts after an unexpected exit without a unified durable reconciliation authority", async () => {
     const { supervisor, spawner } = harness();
     await supervisor.start();
-    supervisor.markHighRiskCallAmbiguous();
 
     spawner.children[0]?.exit(17);
-
     await eventually(() => {
       expect(supervisor.state).toMatchObject({
         kind: "recovery",
-        reason: "reconciliation_required"
+        reason: "reconciliation_required",
+        detail: "unexpected_exit_reconciliation_required"
       });
     });
     expect(spawner.children).toHaveLength(1);
+  });
+
+  it("serializes stop against in-flight verification and prevents later profile or bootstrap mutation", async () => {
+    const verification = deferred<VerifiedResourceSet>();
+    let profileResolved = false;
+    let launchFilesCreated = false;
+    const { supervisor, spawner } = harness({
+      verifyResources: () => verification.promise,
+      resolveProfile: async () => {
+        profileResolved = true;
+        throw new Error("profile_must_not_be_resolved");
+      },
+      createLaunchFiles: async () => {
+        launchFilesCreated = true;
+        throw new Error("launch_files_must_not_be_created");
+      }
+    });
+
+    const start = supervisor.start();
+    const stop = supervisor.stop();
+    let stopSettled = false;
+    void stop.finally(() => {
+      stopSettled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopSettled).toBe(false);
+
+    verification.resolve(verifiedResources());
+    await expect(start).rejects.toThrow("sidecar_start_cancelled");
+    await expect(stop).resolves.toBeUndefined();
+    expect(profileResolved).toBe(false);
+    expect(launchFilesCreated).toBe(false);
+    expect(spawner.children).toHaveLength(0);
+    expect(supervisor.state.kind).toBe("stopping");
+  });
+
+  it("attaches spawn error and exit handlers before awaiting readiness", async () => {
+    const readiness = deferred<never>();
+    const { supervisor, spawner } = harness({
+      acquireVerifiedExecutable: async (resources, relativePath) => {
+        const resource = resources.files.get(relativePath);
+        if (resource === undefined) {
+          throw new Error("missing verified executable");
+        }
+        return {
+          resource,
+          mechanism: "test_verified_handle",
+          spawn: (request) => {
+            const child = spawner.spawn({
+              executable: resource.path,
+              ...request
+            });
+            queueMicrotask(() => {
+              child.fail(Object.assign(new Error("spawn ENOENT"), {
+                code: "ENOENT"
+              }));
+            });
+            return child;
+          },
+          close: async () => undefined
+        };
+      },
+      waitForReadiness: () => readiness.promise
+    });
+
+    await expect(supervisor.start()).rejects.toThrow("sidecar_spawn_failed");
+    expect(supervisor.state).toMatchObject({
+      kind: "recovery",
+      detail: "sidecar_spawn_failed"
+    });
+  });
+
+  it("buffers an exit before readiness and rejects without authenticating", async () => {
+    const readiness = deferred<never>();
+    let authenticated = false;
+    const { supervisor, spawner } = harness({
+      waitForReadiness: () => readiness.promise,
+      requestReadiness: async () => {
+        authenticated = true;
+        return apiReadiness();
+      }
+    });
+
+    const start = supervisor.start();
+    await eventually(() => expect(spawner.children).toHaveLength(1));
+    spawner.children[0]?.exit(127);
+
+    await expect(start).rejects.toThrow("sidecar_exited_before_readiness");
+    expect(authenticated).toBe(false);
+  });
+
+  it("aborts readiness and awaits launch cleanup before stop resolves", async () => {
+    let cleanupFinished = false;
+    const cleanupGate = deferred<void>();
+    const { supervisor, spawner } = harness({
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: async () => {
+          await cleanupGate.promise;
+          cleanupFinished = true;
+        }
+      }),
+      waitForReadiness: ({ signal }) =>
+        new Promise((_, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new Error("readiness_aborted")),
+            { once: true }
+          );
+        }),
+      waitForExit: async (child) => {
+        const fake = child as FakeSidecarChild;
+        if (fake.killSignals.length > 0) {
+          fake.exit(0, "SIGTERM");
+          return true;
+        }
+        return false;
+      }
+    });
+
+    const start = supervisor.start();
+    await eventually(() => expect(spawner.children).toHaveLength(1));
+    const stop = supervisor.stop();
+    let stopped = false;
+    void stop.finally(() => {
+      stopped = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    expect(cleanupFinished).toBe(false);
+
+    cleanupGate.resolve();
+    await expect(start).rejects.toThrow("sidecar_start_cancelled");
+    await expect(stop).resolves.toBeUndefined();
+    expect(cleanupFinished).toBe(true);
+    expect(supervisor.state.kind).toBe("stopping");
   });
 
   it("never kills a conflicting listener it did not spawn", async () => {
@@ -345,15 +563,18 @@ describe("verified sidecar supervisor", () => {
     let tokenWasSent = false;
     const { supervisor } = harness({
       waitForReadiness: async ({ child }) => ({
-        schema: "kestrel.desktop.sidecar_readiness.v1",
-        pid: child.pid ?? 0,
-        process_birth_marker: `birth-${child.pid}`,
-        port: 43000 + (child.pid ?? 0),
-        profile_id: "default",
-        sidecar_version: "0.5.0",
-        executable_digest: executableDigest,
-        resource_manifest_digest: manifestDigest,
-        launch_nonce_digest: "0".repeat(64)
+        identity: { dev: 1, ino: child.pid ?? 0 },
+        readiness: {
+          schema: "kestrel.desktop.sidecar_readiness.v1",
+          pid: child.pid ?? 0,
+          process_birth_marker: `birth-${child.pid}`,
+          port: 43000 + (child.pid ?? 0),
+          profile_id: "default",
+          sidecar_version: "0.5.0",
+          executable_digest: executableDigest,
+          resource_manifest_digest: manifestDigest,
+          launch_nonce_digest: "0".repeat(64)
+        }
       }),
       requestReadiness: async () => {
         tokenWasSent = true;
@@ -428,6 +649,122 @@ describe("verified sidecar supervisor", () => {
     });
   });
 
+  it("waits for graceful exit even when the authenticated shutdown request fails", async () => {
+    const waitsWithSignals: number[] = [];
+    const { supervisor, spawner } = harness({
+      requestShutdown: async () => {
+        throw new Error("shutdown_unavailable");
+      },
+      waitForExit: async (child) => {
+        waitsWithSignals.push(
+          (child as FakeSidecarChild).killSignals.length
+        );
+        return false;
+      }
+    });
+    await supervisor.start();
+
+    await expect(supervisor.stop()).rejects.toThrow(
+      "sidecar_termination_unconfirmed"
+    );
+    expect(waitsWithSignals).toEqual([0, 1, 2]);
+  });
+
+  it("refuses TERM when fresh process or lease identity cannot be reattested", async () => {
+    let drifted = false;
+    const { supervisor, spawner } = harness({
+      requestShutdown: async () => {
+        drifted = true;
+        throw new Error("shutdown_unavailable");
+      },
+      waitForExit: async () => false,
+      inspectProcess: async (pid) => ({
+        pid,
+        processBirthMarker: drifted
+          ? `substituted-${pid}`
+          : `birth-${pid}`,
+        executableDigest
+      })
+    });
+    await supervisor.start();
+
+    await expect(supervisor.stop()).rejects.toThrow(
+      "sidecar_termination_identity_unverified"
+    );
+    expect(spawner.children[0]?.killSignals).toEqual([]);
+  });
+
+  it("reattests again and refuses KILL when identity changes after TERM", async () => {
+    const { supervisor, spawner } = harness({
+      requestShutdown: async () => {
+        throw new Error("shutdown_unavailable");
+      },
+      waitForExit: async () => false,
+      inspectProcess: async (pid) => ({
+        pid,
+        processBirthMarker:
+          (spawner.children[0]?.killSignals.length ?? 0) > 0
+            ? `substituted-${pid}`
+            : `birth-${pid}`,
+        executableDigest
+      })
+    });
+    await supervisor.start();
+
+    await expect(supervisor.stop()).rejects.toThrow(
+      "sidecar_termination_identity_unverified"
+    );
+    expect(spawner.children[0]?.killSignals).toEqual(["SIGTERM"]);
+  });
+
+  it("checks a rejected retained-handle signal and reports a fixed error", async () => {
+    const { supervisor, spawner } = harness({
+      requestShutdown: async () => {
+        throw new Error("shutdown_unavailable");
+      },
+      waitForExit: async () => false
+    });
+    await supervisor.start();
+    const child = spawner.children[0];
+    if (child === undefined) {
+      throw new Error("missing child");
+    }
+    child.kill = (signal?: NodeJS.Signals | number): boolean => {
+      child.killSignals.push(signal);
+      return false;
+    };
+
+    await expect(supervisor.stop()).rejects.toThrow(
+      "sidecar_termination_signal_rejected"
+    );
+    expect(child.killSignals).toEqual(["SIGTERM"]);
+  });
+
+  it("surfaces launch-artifact cleanup failure after confirmed exit", async () => {
+    const { supervisor } = harness({
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: async () => {
+          throw new Error("cleanup_io_failure");
+        }
+      })
+    });
+    await supervisor.start();
+
+    await expect(supervisor.stop()).rejects.toThrow(
+      "sidecar_cleanup_failed"
+    );
+    expect(supervisor.state).toMatchObject({
+      kind: "recovery",
+      detail: "sidecar_cleanup_failed"
+    });
+  });
+
   it("bounds and redacts child logs without retaining split secrets", async () => {
     const { supervisor, spawner, logs } = harness();
     await supervisor.start();
@@ -448,65 +785,4 @@ describe("verified sidecar supervisor", () => {
     );
   });
 
-  it("allows production restart reconciliation only after lease evidence is absent", async () => {
-    const testRoot = await mkdtemp(join(tmpdir(), "kestrel-reconcile-"));
-    const profileInput = {
-      profileId: "default",
-      profileRoot: join(testRoot, "profile"),
-      statePath: join(testRoot, "profile", "state", "agent.db"),
-      memoryDir: join(testRoot, "profile", "memory"),
-      runtimeSettingsPath: join(
-        testRoot,
-        "profile",
-        "config",
-        "runtime_settings.json"
-      )
-    };
-    try {
-      const profile = await resolvePrivateProfile(profileInput);
-      const dependencies = createNodeSupervisorDependencies({
-        resourceVerification: {
-          resourceRoot: testRoot,
-          manifestPath: join(testRoot, "resources.json"),
-          signaturePath: join(testRoot, "resources.sig"),
-          trustedKeys: new Map(),
-          requiredFiles: []
-        },
-        profile: profileInput,
-        sidecarVersion: "0.5.0"
-      });
-
-      await expect(
-        dependencies.reconcileUnexpectedExit({
-          profile,
-          exitCode: 17,
-          signal: null
-        })
-      ).resolves.toEqual({ status: "safe_to_restart" });
-
-      await mkdir(profile.leaseControlRoot, {
-        recursive: true,
-        mode: 0o700
-      });
-      await chmod(profile.leaseControlRoot, 0o700);
-      const metadataPath = join(
-        profile.leaseControlRoot,
-        "runtime-profile.json"
-      );
-      await writeFile(metadataPath, '{"schema":"untrusted"}', {
-        mode: 0o600
-      });
-      await chmod(metadataPath, 0o600);
-
-      await expect(
-        dependencies.reconcileUnexpectedExit({
-          profile,
-          exitCode: 17,
-          signal: null
-        })
-      ).resolves.toEqual({ status: "reconciliation_required" });
-    } finally {
-      await rm(testRoot, { force: true, recursive: true });
-    }
-  });
 });

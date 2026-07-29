@@ -32,6 +32,10 @@ export class FakeSidecarChild
     this.signalCode = signal;
     this.emit("exit", code, signal);
   }
+
+  fail(error: Error): void {
+    this.emit("error", error);
+  }
 }
 
 export class FakeSidecarSpawner {
