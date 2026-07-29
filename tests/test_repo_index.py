@@ -7,6 +7,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -36,6 +37,13 @@ def _copy_fixture(tmp_path: Path) -> Path:
     repository = tmp_path / "repository"
     shutil.copytree(FIXTURE, repository)
     return repository
+
+
+def _unlink_read_only_fixture(path: Path) -> None:
+    """Remove an immutable publication artifact while rewriting test history."""
+    if os.name == "nt":
+        path.chmod(stat.S_IWRITE)
+    path.unlink()
 
 
 def _row_ids(index_path: Path, table: str) -> list[tuple[int, int]]:
@@ -242,7 +250,7 @@ def test_dotted_project_id_matches_project_profile_contract(tmp_path: Path) -> N
 
 
 def _convert_current_sidecar_to_v4(index: RepositoryIndex) -> None:
-    with sqlite3.connect(index.index_path) as connection:
+    with closing(sqlite3.connect(index.index_path)) as connection:
         generation_id = str(
             connection.execute(
                 """
@@ -258,8 +266,8 @@ def _convert_current_sidecar_to_v4(index: RepositoryIndex) -> None:
         f".{index.index_path.name}.generation-{generation_id}"
     )
     receipt_path = generation_path.with_name(f"{generation_path.name}.receipt")
-    generation_path.unlink()
-    receipt_path.unlink()
+    _unlink_read_only_fixture(generation_path)
+    _unlink_read_only_fixture(receipt_path)
     os.link(index.index_path, generation_path)
     lock_path = index.index_path.parent / f".{index.index_path.name}.lock"
     lock_payload = lock_path.read_bytes()
@@ -369,7 +377,7 @@ def test_no_change_rebuild_preserves_file_and_child_rows(tmp_path: Path) -> None
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     first = index.rebuild()
-    with sqlite3.connect(index.index_path) as connection:
+    with closing(sqlite3.connect(index.index_path)) as connection:
         file_rows_before = list(
             connection.execute("SELECT id, path, digest FROM files ORDER BY id")
         )
@@ -394,7 +402,7 @@ def test_change_and_deletion_update_only_affected_rows_and_digest(tmp_path: Path
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     first = index.rebuild()
-    with sqlite3.connect(index.index_path) as connection:
+    with closing(sqlite3.connect(index.index_path)) as connection:
         original_ids = dict(connection.execute("SELECT path, id FROM files"))
 
     changed = repository / "src" / "widget.py"
@@ -475,7 +483,7 @@ def test_schema_v1_sidecar_migrates_and_forces_digest_revalidation(tmp_path: Pat
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     index.rebuild()
-    with sqlite3.connect(index.index_path) as connection:
+    with closing(sqlite3.connect(index.index_path)) as connection:
         connection.execute("ALTER TABLE files DROP COLUMN device")
         connection.execute("ALTER TABLE files DROP COLUMN inode")
         connection.execute("DROP TABLE index_generation_checkpoint")
@@ -483,7 +491,7 @@ def test_schema_v1_sidecar_migrates_and_forces_digest_revalidation(tmp_path: Pat
         connection.execute("PRAGMA user_version = 1")
         connection.execute("PRAGMA application_id = 0")
     for artifact in index.index_path.parent.glob(f".{index.index_path.name}.generation-*"):
-        artifact.unlink()
+        _unlink_read_only_fixture(artifact)
     # A real v1 sidecar predates the authenticated publication lock. Remove the
     # current-format fixture lock instead of asking migration to overwrite its
     # valid high-water authority with an unrelated legacy lineage.
@@ -731,7 +739,7 @@ def test_generation_snapshot_is_not_a_mutable_alias_of_the_canonical_sidecar(
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     index.rebuild()
-    with sqlite3.connect(index.index_path) as connection:
+    with closing(sqlite3.connect(index.index_path)) as connection:
         generation_id = str(
             connection.execute(
                 """
@@ -809,7 +817,7 @@ def test_fresh_process_rejects_sidecar_rollback_below_lock_high_water(
     repository = _copy_fixture(tmp_path)
     index = RepositoryIndex(project_id="project-1", repository_root=repository)
     index.rebuild()
-    with sqlite3.connect(index.index_path) as connection:
+    with closing(sqlite3.connect(index.index_path)) as connection:
         generation_id = str(
             connection.execute(
                 """
@@ -1050,7 +1058,20 @@ def test_authenticated_file_bindings_avoid_full_database_hash_per_query(
     ).symbols("Widget")
 
     assert first.authoritative and second.authoritative
-    assert digested == []
+    if os.name == "posix":
+        assert digested == []
+    else:
+        # Windows creation time is not a change-time binding. Keep hashing both
+        # authenticated images until a trustworthy change-journal key exists.
+        generation_names = {
+            path.name
+            for path in (repository / ".nest" / "repo-index").glob(
+                ".project-1.sqlite.generation-*"
+            )
+            if not path.name.endswith(".receipt")
+        }
+        assert digested
+        assert set(digested) == {"project-1.sqlite", *generation_names}
 
 
 def test_database_snapshot_read_rejects_oversized_sidecar_before_allocation(
@@ -1405,6 +1426,10 @@ def test_long_lived_instances_accept_lock_coordinated_generation_advances(
     assert [record.name for record in first.symbols("canonicalize").records] == ["canonicalize"]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows denies the open-file rename primitive used by this ABA harness",
+)
 def test_wrapped_sqlite_connect_aba_is_rejected_before_returning_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1416,7 +1441,7 @@ def test_wrapped_sqlite_connect_aba_is_rejected_before_returning_data(
     parked = tmp_path / "parked.sqlite"
     decoy = tmp_path / "decoy.sqlite"
     shutil.copy2(index.index_path, decoy)
-    with sqlite3.connect(decoy) as connection:
+    with closing(sqlite3.connect(decoy)) as connection:
         connection.execute(
             "UPDATE index_metadata SET aggregate_digest = 'decoy' WHERE singleton = 1"
         )

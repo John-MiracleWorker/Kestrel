@@ -229,7 +229,10 @@ def test_pr_workflow_binds_reviewed_commit_and_ingests_failed_ci(
     assert published.status == "published"
     assert published.external_number == 42
     assert published.external_url == "https://github.com/acme/repo/pull/42"
-    assert any(Path(command[0]).name == "git" and "push" in command for command in runner.commands)
+    assert any(
+        Path(command[0]).stem.casefold() == "git" and "push" in command
+        for command in runner.commands
+    )
 
     synced = service.sync(
         request.request_id,

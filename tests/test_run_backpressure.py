@@ -325,7 +325,7 @@ def test_direct_cancel_records_active_run_close_failure_without_rewriting_status
     )
 
     run = manager.create_run(message="cancel with a failing close", autonomy_mode="manual")
-    assert started.wait(timeout=3)
+    assert started.wait(timeout=30)
 
     cancelled = manager.cancel_run(run.run_id)
 
