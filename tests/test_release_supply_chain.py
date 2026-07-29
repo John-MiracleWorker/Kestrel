@@ -133,6 +133,7 @@ def _write_payload(
         archive.addfile(member, io.BytesIO(package_info))
     artifacts = {
         "install.sh": b"#!/usr/bin/env bash\n",
+        "install.ps1": b'param([string] $Version = "0.4.11")\n',
         "requirements-release.txt": (
             b"memvid-sdk==2.0.160 \\\n"
             b"    --hash=sha256:8eab5aec9a30eb459f553ed091038b6916d02a2f33569b32a7aee1b556820243\n"
@@ -179,7 +180,7 @@ def test_release_payload_verifier_covers_every_artifact_and_detects_tampering(
     report = verify_release_payload(tmp_path, expected_version="v0.4.11")
 
     assert report["verified"] is True
-    assert report["artifact_count"] == 5
+    assert report["artifact_count"] == 6
     assert report["requirement_count"] == 1
     assert report["distribution"] == "nested-memvid-agent"
     assert report["version"] == "0.4.11"
@@ -245,7 +246,7 @@ def test_oci_record_is_identity_bound_and_added_to_the_release_manifest(
     )
 
     report = verify_release_payload(tmp_path, expected_version="v0.4.11")
-    assert report["artifact_count"] == 6
+    assert report["artifact_count"] == 7
     sums = (tmp_path / "SHA256SUMS").read_text(encoding="ascii")
     assert f"  {OCI_RECORD_NAME}\n" in sums
     record = validate_oci_record(
@@ -408,6 +409,7 @@ def test_release_workflow_builds_once_then_tests_the_exact_wheel_matrix() -> Non
     assert "python -m build --no-isolation --outdir dist" in workflow
     assert "python scripts/verify_release_payload.py dist --expected-version" in workflow
     assert "python -m scripts.verify_exact_wheel_install dist" in workflow
+    assert "powershell -NoProfile -ExecutionPolicy Bypass -File dist/install.ps1" in workflow
     assert "importlib.metadata.version" in workflow
     assert "cross-platform release wheel smoke" in (
         ROOT / "scripts" / "verify_exact_wheel_install.py"
@@ -415,6 +417,14 @@ def test_release_workflow_builds_once_then_tests_the_exact_wheel_matrix() -> Non
     assert "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093" in workflow
     assert "- cross-platform\n      - build-release-candidate" in workflow
     assert "pip install --upgrade pip" not in workflow
+
+
+def test_release_payload_stages_and_checksums_windows_diagnostics() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert "cp install.ps1 dist/install.ps1" in workflow
+    assert 'Path("dist/install.ps1")' in workflow
+    assert "sha256sum install.sh install.ps1 requirements-release.txt" in workflow
 
 
 def test_release_requires_successful_exact_sha_main_ci_before_build() -> None:

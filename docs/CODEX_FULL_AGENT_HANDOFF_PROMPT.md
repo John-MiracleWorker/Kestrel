@@ -131,15 +131,15 @@ Treat these as implemented unless current verification proves otherwise:
 - `memory.learn`, `memory.consolidate`, and promotion gate metadata.
 - `web.search` and `web.fetch` behind `NEST_AGENT_ALLOW_WEB`, with deterministic mock backend support and public-network fetch checks.
 - Exact-call approval gates for high-risk tools.
-- SQLite state schema version 19, including durable trace spans, persisted run provider and turn source/origin/scope provenance, promotion outcome ledger tables, behavior-delta ledger/activation/outcome tables, fenced run ownership, revisioned tool/MCP-server/skill capability overrides, append-only capability changes, expiring owner-bound approvals tied to capability revision and policy/spec/parent digest, renewable claimant-only approval execution with exact scheduler task/subagent bindings, plus revisioned proactive routines, leased deterministic occurrences, and hashed manual-run idempotency claims.
+- SQLite state schema version 21, including revisioned local project profiles and nullable run-to-project bindings, durable trace spans, persisted run provider and turn source/origin/scope provenance, promotion outcome ledger tables, behavior-delta ledger/activation/outcome tables, fenced run ownership, revisioned tool/MCP-server/skill capability overrides, append-only capability changes, expiring owner-bound approvals tied to capability revision and policy/spec/parent digest, renewable claimant-only approval execution with exact scheduler task/subagent bindings, plus revisioned proactive routines, named-timezone cron, leased deterministic occurrences, hashed manual-run idempotency claims, and durable routine-delivery reconciliation.
 - Settings Capability Center plus `GET /api/capabilities`, revision-checked `PUT /api/capabilities/{kind}/{capability_id}`, and `GET /api/capabilities/history`; configured state never bypasses effective blockers, master flags, parent state, resource-change invalidation, or exact-call approval.
 - Replay-safe terminal run and approval decisions.
 - Managed stdio MCP sessions.
 - Skills with manifest validation, provenance hashes, instruction capsules, and digest-pinned OCI execution; host Python/shell execution fails closed.
-- Alpha plugin registry/CLI with GitHub source fetch, manifest parsing, and materialization of plugin-declared skills/MCP server entries.
+- Alpha plugin registry/CLI with GitHub source fetch, signature/source provenance, dependency-lock and compatibility review, authority-delta-gated updates, reproducible install receipts, and materialization of plugin-declared skills/MCP server entries.
 - API token gate and generic HMAC webhook verification.
 - Opt-in autonomous scheduler.
-- Opt-in proactive UTC one-shot/fixed-interval routines with disabled drafts, revision CAS, bounded background polling, atomic internal run admission, normal tool approvals, CLI/API/workbench editing and history, plus idempotent manual run-now. Cron/timezone calendars and connector delivery remain partial.
+- Opt-in proactive UTC one-shot/fixed-interval/named-timezone cron routines with disabled drafts, revision CAS, bounded background polling, atomic internal run admission, normal tool approvals, CLI/API/workbench editing and history, idempotent manual run-now, destination-bound delivery receipts, and explicit ambiguous-outcome reconciliation.
 - Branch-isolated repair primitives, diagnosis-gated validation, process-signed review artifacts, literal-tree repair commits, approval-bound rollback snapshots, and recovery quarantine.
 - Docker/Compose alpha packaging.
 

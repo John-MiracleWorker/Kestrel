@@ -14,6 +14,7 @@ import type {
   Run,
   SecretRef,
   Session,
+  SetupReadinessReport,
   Skill,
   TaskGraph,
   Tool,
@@ -55,6 +56,68 @@ const otherRun: Run = {
   created_at: "2026-05-16T00:05:00Z",
   updated_at: "2026-05-16T00:05:01Z"
 };
+
+function projectedRepairAuthority(seed: string, reviewTitle: string) {
+  const validationId = `repair_validation_${seed.repeat(24)}`;
+  const reviewId = `repair_review_${seed.repeat(24)}`;
+  const snapshot = {
+    branch: `kestrel/worker/run-${seed}/repair`,
+    head_sha: seed.repeat(40),
+    diff_digest: seed.repeat(64)
+  };
+  return {
+    validationId,
+    reviewId,
+    snapshot,
+    tasks: [
+      {
+        task_id: `validate-${seed}`,
+        title: "Validate repair",
+        goal: "Validate exact repair candidate",
+        profile: "worker",
+        status: "completed",
+        approved: true,
+        required_tools: ["repair.validate"],
+        risk: "high",
+        attempt_count: 1,
+        result: {
+          repair_artifact: {
+            schema_version: 1,
+            tool: "repair.validate",
+            validation_id: validationId,
+            success: true,
+            repair_snapshot: snapshot
+          }
+        }
+      },
+      {
+        task_id: `review-${seed}`,
+        title: reviewTitle,
+        goal: "Create durable review artifact",
+        profile: "reviewer",
+        status: "completed",
+        approved: true,
+        required_tools: ["repair.review"],
+        risk: "medium",
+        attempt_count: 1,
+        result: {
+          repair_artifact: {
+            schema_version: 1,
+            tool: "repair.review",
+            validation_id: validationId,
+            review_id: reviewId,
+            repair_snapshot: snapshot,
+            changed_files: ["src/calculator.py"],
+            commit_gate: {
+              commit_allowed: true,
+              approval_required_before_commit: true
+            }
+          }
+        }
+      }
+    ]
+  };
+}
 
 const pendingApproval: Approval = {
   approval_id: "approval_1",
@@ -133,6 +196,41 @@ let routineRunNowAmbiguousFailures: number;
 let routineRunNowAmbiguousStatuses: number[];
 let routineRunNowAccepted: Map<string, RoutineOccurrence>;
 let routineRunNowInitialStatus: string;
+let setupReadinessPayload: SetupReadinessReport;
+let setupReadinessFailure: { detail: string; status?: number; reject?: boolean } | null;
+let runtimeProviderName: string;
+let runtimeModelName: string;
+
+function readinessFixture(
+  overrides: Partial<SetupReadinessReport> = {}
+): SetupReadinessReport {
+  return {
+    schema: "kestrel.setup_readiness.v1",
+    ready: true,
+    experience_mode: "demo",
+    pass_count: 2,
+    warn_count: 0,
+    fail_count: 0,
+    next_action: "Demo is ready. Connect a live model in Settings when you want provider-backed responses.",
+    checks: [
+      {
+        check_id: "provider_configuration",
+        title: "Provider configuration",
+        status: "pass",
+        detail: "Mock provider is selected.",
+        recovery: "Choose a live provider in Settings when needed."
+      },
+      {
+        check_id: "provider_operational",
+        title: "Provider operational health",
+        status: "pass",
+        detail: "Deterministic Demo responses are available.",
+        recovery: "Connect a live provider for model-backed responses."
+      }
+    ],
+    ...overrides
+  };
+}
 
 function installRoutineHistoryPollTimers() {
   const nativeSetTimeout = window.setTimeout.bind(window);
@@ -163,6 +261,12 @@ function installRoutineHistoryPollTimers() {
       return next[1];
     }
   };
+}
+
+function openAdvancedWorkspace(name: "Routines" | "Routing" | "Settings") {
+  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  const workspaceNav = screen.getByRole("navigation", { name: "Advanced workspaces" });
+  fireEvent.click(within(workspaceNav).getByRole("button", { name }));
 }
 
 describe("App", () => {
@@ -330,6 +434,10 @@ describe("App", () => {
     routineRunNowAmbiguousStatuses = [];
     routineRunNowAccepted = new Map();
     routineRunNowInitialStatus = "completed";
+    setupReadinessPayload = readinessFixture();
+    setupReadinessFailure = null;
+    runtimeProviderName = "mock";
+    runtimeModelName = "mock";
     vi.stubGlobal("fetch", vi.fn(fetchMock));
     vi.stubGlobal("EventSource", MockEventSource);
   });
@@ -354,7 +462,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /new chat/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /send/i })).toBeDisabled();
     expect(screen.getByText("Safe Auto")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /routing/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /workbench/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /advanced/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /chats/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /details/i })).toBeInTheDocument();
@@ -371,11 +479,27 @@ describe("App", () => {
     expect(results.violations).toEqual([]);
   });
 
+  it("opens the task-first Workbench with a durable project selector", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+
+    expect(await screen.findByRole("heading", { name: "What should Kestrel accomplish?" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Kestrel" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
+    expect(
+      screen.getByText(
+        "No run will start until you inspect the route, permissions, validation, and rollback projection."
+      )
+    ).toBeInTheDocument();
+  });
+
   it("opens the Adaptive Flock Routing Center from primary navigation", async () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Ask Kestrel" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /routing/i }));
+    openAdvancedWorkspace("Routing");
 
     expect(await screen.findByRole("heading", { name: "Adaptive Flock Routing" })).toBeInTheDocument();
     expect((await screen.findAllByText("Local server")).length).toBeGreaterThan(0);
@@ -529,7 +653,7 @@ describe("App", () => {
     const { container } = render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     const workbench = await screen.findByRole("region", { name: "Routine Workbench" });
     expect(within(workbench).getByRole("heading", { name: "Routine Workbench." })).toBeInTheDocument();
@@ -558,7 +682,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     expect(await screen.findByText("Proactive dispatch is disabled.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run Morning review now" })).toBeDisabled();
@@ -571,7 +695,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     expect(await screen.findByText("routine_status_unavailable")).toBeInTheDocument();
     expect(screen.getAllByText("Morning review").length).toBeGreaterThan(0);
@@ -584,7 +708,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     await waitFor(() => {
@@ -633,7 +757,7 @@ describe("App", () => {
 
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     const acceptedResult = await waitFor(() => {
@@ -697,7 +821,7 @@ describe("App", () => {
 
     render(<App />);
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     await screen.findByText("run_routine_1");
     await waitFor(() => expect(timers.count()).toBe(1));
     const staleSelectionPoll = timers.takeNext();
@@ -716,7 +840,7 @@ describe("App", () => {
     await screen.findByText("run_routine_1");
     await waitFor(() => expect(timers.count()).toBe(1));
     const staleUnmountPoll = timers.takeNext();
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
     await screen.findByRole("heading", { name: "Ask Kestrel" });
     const callsAfterUnmount = fetchSpy.mock.calls.length;
     await act(async () => {
@@ -733,7 +857,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     expect(await screen.findByText(/No response was received for Morning review/)).toBeInTheDocument();
@@ -742,9 +866,9 @@ describe("App", () => {
     const stored = JSON.parse(String(sessionStorage.getItem(storageKey)));
     expect(stored.expectedRevision).toBe(3);
 
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Retry Morning review now" }));
 
     await waitFor(() => {
@@ -767,7 +891,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
     fireEvent.click(await screen.findByRole("button", { name: "Run Morning review now" }));
 
     expect(await screen.findByText(/server returned 500 before confirming the outcome/i)).toBeInTheDocument();
@@ -852,6 +976,7 @@ describe("App", () => {
               schema_version: 1,
               tool: "repair.validate",
               validation_id: validationId,
+              success: true,
               repair_snapshot: repairSnapshot
             }
           }
@@ -874,6 +999,24 @@ describe("App", () => {
               review_id: reviewId,
               repair_snapshot: repairSnapshot,
               changed_files: ["src/calculator.py"],
+              diff_preview: {
+                format: "unified",
+                content: [
+                  "diff --git a/src/calculator.py b/src/calculator.py",
+                  "--- a/src/calculator.py",
+                  "+++ b/src/calculator.py",
+                  "@@ -1 +1 @@",
+                  "-  return a - b",
+                  "+  return a + b"
+                ].join("\n"),
+                sha256: "f".repeat(64),
+                bound_diff_digest: repairSnapshot.diff_digest,
+                redacted: true,
+                authoritative: false,
+                truncated: false,
+                included_files: ["src/calculator.py"],
+                omitted_files: 0
+              },
               commit_gate: { commit_allowed: true, approval_required_before_commit: true }
             }
           }
@@ -911,12 +1054,17 @@ describe("App", () => {
     expect(within(panel).getByText(`Review gate: ${reviewId} · commit approval required`)).toBeInTheDocument();
     expect(within(panel).getByText(`Diff ${repairSnapshot.diff_digest} · src/calculator.py`)).toBeInTheDocument();
     expect(within(panel).getByText(`Candidate ${repairSnapshot.branch} @ ${repairSnapshot.head_sha}`)).toBeInTheDocument();
+    expect(within(panel).getByRole("heading", { name: "Unified diff preview" })).toBeInTheDocument();
+    expect(within(panel).getByText(/\+\s+return a \+ b/)).toBeInTheDocument();
+    expect(within(panel).getByText(/redacted advisory preview/i)).toBeInTheDocument();
+    fireEvent.click(within(panel).getByRole("button", { name: "Split" }));
+    expect(within(panel).getByRole("heading", { name: "Split diff preview" })).toBeInTheDocument();
     expect(within(panel).getByText("Rollback state: ready · rollback_abc123")).toBeInTheDocument();
     expect(within(panel).getByText("Restores src/calculator.py and preserves .nest/repair_rollbacks/rollback_abc123.json")).toBeInTheDocument();
   });
 
   it("treats an explicit failed repair validation as authoritative over artifact fallback", async () => {
-    const validationId = "repair_validation_failed_aaaaaaaaaaaaaa";
+    const validationId = `repair_validation_${"f".repeat(24)}`;
     const repairRun: Run = {
       ...baseRun,
       run_id: "run_repairfailedvalidation",
@@ -949,15 +1097,11 @@ describe("App", () => {
         risk: "high",
         attempt_count: 1,
         result: {
-          validation: {
-            success: false,
-            validation_id: validationId,
-            command: ["pytest", "-q"]
-          },
           repair_artifact: {
             schema_version: 1,
             tool: "repair.validate",
             validation_id: validationId,
+            success: false,
             repair_snapshot: {
               branch: "kestrel/worker/run-repair-failed/repair",
               head_sha: "2222222222222222222222222222222222222222",
@@ -977,7 +1121,8 @@ describe("App", () => {
 
     const panel = await screen.findByLabelText("Repair Patch Review");
     expect(within(panel).getByText("Validation failed")).toBeInTheDocument();
-    expect(within(panel).getByText("Validation failed: pytest -q")).toBeInTheDocument();
+    expect(within(panel).getByText(`Validation failed: ${validationId}`)).toBeInTheDocument();
+    expect(within(panel).queryByText("pytest -q")).not.toBeInTheDocument();
     expect(within(panel).queryByText("Validation passed")).not.toBeInTheDocument();
   });
 
@@ -1005,6 +1150,7 @@ describe("App", () => {
     ];
     sessionRuns = { session_repair_actions: [repairRun] };
     approvals = [];
+    const actionAuthority = projectedRepairAuthority("3", "Review repair before commit");
     toolsPayload = [
       ...toolsPayload,
       { name: "git.commit", description: "Commit reviewed repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["git"], enabled: true, enablement_flag: null },
@@ -1012,23 +1158,7 @@ describe("App", () => {
     ];
     taskGraphs.run_repairactions = {
       tasks: [
-        {
-          task_id: "review",
-          title: "Review repair before commit",
-          goal: "Create durable review artifact",
-          profile: "reviewer",
-          status: "completed",
-          approved: true,
-          required_tools: ["repair.review"],
-          risk: "medium",
-          attempt_count: 1,
-          result: {
-            review_id: "review_action123",
-            diff_hash: "feedfacecafebeef",
-            changed_files: ["src/calculator.py"],
-            commit_gate: { approval_required_before_commit: true }
-          }
-        },
+        ...actionAuthority.tasks,
         {
           task_id: "rollback",
           title: "Rollback stale repair",
@@ -1061,21 +1191,26 @@ describe("App", () => {
     expect(screen.getByLabelText("Tool")).toHaveValue("git.commit");
     const toolArgsInput = screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement;
     const commitArgs = JSON.parse(toolArgsInput.value);
-    expect(commitArgs).toMatchObject({ repair_review_id: "review_action123" });
-    expect(String(commitArgs.message)).toContain("review_action123");
+    expect(commitArgs).toMatchObject({ repair_review_id: actionAuthority.reviewId });
+    expect(String(commitArgs.message)).toContain(actionAuthority.reviewId);
     let preview = screen.getByLabelText("Exact-call approval preview");
     expect(within(preview).getByText("Prepared exact-call request: git.commit")).toBeInTheDocument();
     expect(within(preview).getByText("Invoking this request will create or require approval before execution; it has not run yet.")).toBeInTheDocument();
     expect(within(preview).getByRole("link", { name: /review prepared request in tool form/i })).toHaveAttribute("href", "#tools");
-    expect(within(preview).getByText(/review_action123/)).toBeInTheDocument();
+    expect(within(preview).getByText(new RegExp(actionAuthority.reviewId))).toBeInTheDocument();
 
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));
     expect(screen.getByLabelText("Tool")).toHaveValue("repair.rollback");
     const rollbackArgs = JSON.parse(toolArgsInput.value);
-    expect(rollbackArgs).toMatchObject({ review_id: "review_action123", reason: "Rollback reviewed repair review_action123" });
+    expect(rollbackArgs).toMatchObject({
+      review_id: actionAuthority.reviewId,
+      reason: `Rollback reviewed repair ${actionAuthority.reviewId}`
+    });
     preview = screen.getByLabelText("Exact-call approval preview");
     expect(within(preview).getByText("Prepared exact-call request: repair.rollback")).toBeInTheDocument();
-    expect(within(preview).getByText(/Rollback reviewed repair review_action123/)).toBeInTheDocument();
+    expect(within(preview).getByText(
+      new RegExp(`Rollback reviewed repair ${actionAuthority.reviewId}`)
+    )).toBeInTheDocument();
     expect(fetchSpy.mock.calls.some(([path, init]) => String(path).includes("/api/tools/") && init?.method === "POST")).toBe(false);
   });
 
@@ -1107,30 +1242,13 @@ describe("App", () => {
     sessionRuns = { session_repair_approval: [repairRun] };
     runs = [repairRun];
     approvals = [];
+    const commitAuthority = projectedRepairAuthority("4", "Review repair before commit");
     toolsPayload = [
       ...toolsPayload,
       { name: "git.commit", description: "Commit reviewed repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["git"], enabled: true, enablement_flag: null }
     ];
     taskGraphs.run_repairapproval = {
-      tasks: [
-        {
-          task_id: "review",
-          title: "Review repair before commit",
-          goal: "Create durable review artifact",
-          profile: "reviewer",
-          status: "completed",
-          approved: true,
-          required_tools: ["repair.review"],
-          risk: "medium",
-          attempt_count: 1,
-          result: {
-            review_id: "review_approval123",
-            diff_hash: "feedfacecafebeef",
-            changed_files: ["src/calculator.py"],
-            commit_gate: { approval_required_before_commit: true }
-          }
-        }
-      ],
+      tasks: commitAuthority.tasks,
       ready_tasks: [],
       approval_blocked_tasks: [],
       subagents: []
@@ -1160,7 +1278,9 @@ describe("App", () => {
     const approvalCard = await screen.findByRole("group", { name: /approval for git.commit/i });
     expect(within(approvalCard).getByText("git.commit")).toBeInTheDocument();
     expect(within(approvalCard).getByText(/High risk/i)).toBeInTheDocument();
-    expect(within(approvalCard).getByText(/review_approval123/)).toBeInTheDocument();
+    expect(within(approvalCard).getByText(
+      new RegExp(commitAuthority.reviewId)
+    )).toBeInTheDocument();
     expect(within(approvalCard).getByText(new RegExp(String(preparedArgs.message)))).toBeInTheDocument();
   });
 
@@ -1192,29 +1312,14 @@ describe("App", () => {
     sessionRuns = { session_rollback_approval: [repairRun] };
     runs = [repairRun];
     approvals = [];
+    const rollbackAuthority = projectedRepairAuthority("5", "Review repair before rollback");
     toolsPayload = [
       ...toolsPayload,
       { name: "repair.rollback", description: "Rollback repair.", risk: "high", requires_approval: true, source: "builtin", capabilities: ["safe-repair"], enabled: true, enablement_flag: null }
     ];
     taskGraphs.run_rollbackapproval = {
       tasks: [
-        {
-          task_id: "review",
-          title: "Review repair before rollback",
-          goal: "Confirm durable repair review artifact",
-          profile: "reviewer",
-          status: "completed",
-          approved: true,
-          required_tools: ["repair.review"],
-          risk: "medium",
-          attempt_count: 1,
-          result: {
-            review_id: "review_rollback123",
-            diff_hash: "feedfacecafebeef",
-            changed_files: ["src/calculator.py"],
-            commit_gate: { approval_required_before_commit: true }
-          }
-        },
+        ...rollbackAuthority.tasks,
         {
           task_id: "rollback",
           title: "Rollback stale repair",
@@ -1261,7 +1366,9 @@ describe("App", () => {
     const approvalCard = await screen.findByRole("group", { name: /approval for repair.rollback/i });
     expect(within(approvalCard).getByText("repair.rollback")).toBeInTheDocument();
     expect(within(approvalCard).getByText(/High risk/i)).toBeInTheDocument();
-    expect(within(approvalCard).getByText(/review_rollback123/)).toBeInTheDocument();
+    expect(within(approvalCard).getByText(
+      new RegExp(rollbackAuthority.reviewId)
+    )).toBeInTheDocument();
     expect(within(approvalCard).getByText(new RegExp(String(preparedArgs.reason)))).toBeInTheDocument();
   });
 
@@ -1324,7 +1431,7 @@ describe("App", () => {
     expect(workspace).not.toBeNull();
     workspace!.scrollTop = 420;
 
-    fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Routines" }));
+    openAdvancedWorkspace("Routines");
 
     await screen.findByRole("region", { name: "Routine Workbench" });
     expect(workspace!.scrollTop).toBe(0);
@@ -1500,6 +1607,7 @@ describe("App", () => {
 
     await screen.findAllByText("Inspect the repo");
     expect(await screen.findByLabelText("Kestrel is responding")).toHaveTextContent("Working");
+    expect(document.querySelector(".status-pill")).toHaveTextContent("Working");
   });
 
   it("hydrates thinking and tool use from the selected run trace", async () => {
@@ -1541,6 +1649,7 @@ describe("App", () => {
     render(<App />);
 
     expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
+    expect(document.querySelector(".status-pill")).toHaveTextContent("Needs approval");
     const approvalCard = screen.getByRole("group", { name: /approval for shell.run/i });
     expect(within(approvalCard).getByText("shell.run")).toBeInTheDocument();
     expect(within(approvalCard).getByText("High risk")).toBeInTheDocument();
@@ -1687,7 +1796,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
     fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "codex-cli" } });
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4" } });
@@ -1751,7 +1860,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
 
     const card = await screen.findByRole("group", { name: /telegram setup/i });
@@ -1841,7 +1950,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
 
     expect(within(center).getAllByText(/Blocked by:/).some((item) => item.parentElement?.textContent?.includes("allow shell"))).toBe(true);
@@ -1930,7 +2039,7 @@ describe("App", () => {
     expect(within(await screen.findByLabelText("MCP tool")).queryByRole("option", { name: /read_file/ })).not.toBeInTheDocument();
     expect(within(screen.getByLabelText("Skill")).queryByRole("option", { name: "writer" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("switch", { name: "Enable Filesystem MCP" }));
     await within(center).findByRole("switch", { name: "Disable Filesystem MCP" });
@@ -2008,7 +2117,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("switch", { name: "Enable Shell run" }));
 
@@ -2026,7 +2135,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("button", { name: "Reauthorize" }));
 
@@ -2044,7 +2153,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     const center = await screen.findByRole("region", { name: "Capabilities" });
     fireEvent.click(within(center).getByRole("switch", { name: "Disable Memory search" }));
 
@@ -2057,7 +2166,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
     fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "ollama-cloud" } });
 
@@ -2073,7 +2182,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
 
     expect(screen.getByRole("option", { name: /LM Studio/i })).toBeInTheDocument();
@@ -2130,13 +2239,237 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    openAdvancedWorkspace("Settings");
     await screen.findByRole("heading", { name: /settings/i });
 
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "deepseek-v4-pro" } });
     fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "grok" } });
 
     expect(await screen.findByDisplayValue("grok-4.3")).toBeInTheDocument();
+  });
+
+  it("labels deterministic mock responses as Demo instead of a live model", async () => {
+    approvals = [];
+    runs = [];
+    sessions = [];
+    sessionRuns = {};
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Demo");
+    });
+    expect(
+      screen.getByText(/deterministic responses; no live model connected/i)
+    ).toBeInTheDocument();
+  });
+
+  it("shows provider and model recovery when a live model is not connected", async () => {
+    approvals = [];
+    runtimeProviderName = "openai";
+    runtimeModelName = "gpt-5.5";
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      experience_mode: "model_not_connected",
+      pass_count: 0,
+      warn_count: 1,
+      fail_count: 1,
+      next_action: "Open Settings and verify the OpenAI credential.",
+      checks: [
+        {
+          check_id: "provider_configuration",
+          title: "Provider configuration",
+          status: "fail",
+          detail: "The configured OpenAI credential is missing.",
+          recovery: "Store the credential in Settings."
+        },
+        {
+          check_id: "provider_operational",
+          title: "Provider operational health",
+          status: "warn",
+          detail: "No successful request is recorded for this server process.",
+          recovery: "Send a live request after fixing provider configuration."
+        }
+      ]
+    });
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent(
+        "Model not connected"
+      );
+    });
+    expect(screen.getByText(/OpenAI.*gpt-5\.5/i)).toBeInTheDocument();
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Needs setup");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /open model settings/i })
+    );
+    expect(await screen.findByRole("heading", { name: /settings/i })).toBeInTheDocument();
+  });
+
+  it("shows Ready only for a connected non-mock model", async () => {
+    approvals = [];
+    runtimeProviderName = "openai";
+    runtimeModelName = "gpt-5.5";
+    setupReadinessPayload = readinessFixture({
+      experience_mode: "connected",
+      next_action: "Start a provider-backed run."
+    });
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Ready");
+    });
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Demo");
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent(
+      "Model not connected"
+    );
+  });
+
+  it.each([
+    ["a setup 5xx response", { detail: "Setup readiness is temporarily unavailable.", status: 503 }],
+    ["a rejected setup request", { detail: "Setup readiness request failed.", reject: true }]
+  ])("does not claim Ready after %s", async (_case, failure) => {
+    approvals = [];
+    setupReadinessFailure = failure;
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Checking setup");
+    });
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Ready");
+    expect(
+      screen.getByText(/could not verify setup readiness/i)
+    ).toBeInTheDocument();
+    expect(
+      within(container.querySelector(".simple-conv-head") as HTMLElement).getByRole(
+        "button",
+        { name: /refresh/i }
+      )
+    ).toBeInTheDocument();
+  });
+
+  it.each(["absent", "unknown"])(
+    "does not claim Ready when experience_mode is %s",
+    async (modeCase) => {
+      approvals = [];
+      const readiness = readinessFixture({
+        next_action: "Review setup before starting a live task."
+      });
+      if (modeCase === "absent") {
+        const { experience_mode: _experienceMode, ...withoutExperienceMode } = readiness;
+        setupReadinessPayload = withoutExperienceMode as SetupReadinessReport;
+      } else {
+        setupReadinessPayload = {
+          ...readiness,
+          experience_mode: "future_mode"
+        } as unknown as SetupReadinessReport;
+      }
+      const { container } = render(<App />);
+
+      await screen.findByRole("heading", { name: "Ask Kestrel" });
+      await waitFor(() => {
+        expect(container.querySelector(".status-pill")).toHaveTextContent("Needs setup");
+      });
+      expect(container.querySelector(".status-pill")).not.toHaveTextContent("Ready");
+      expect(screen.getByText("Review setup before starting a live task.")).toBeInTheDocument();
+      expect(
+        within(container.querySelector(".simple-conv-head") as HTMLElement).getByRole(
+          "button",
+          { name: /^setup$/i }
+        )
+      ).toBeInTheDocument();
+    }
+  );
+
+  it("keeps non-provider setup failures above the experience mode", async () => {
+    approvals = [];
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      fail_count: 1,
+      next_action: "Create or select the workspace Kestrel should use.",
+      checks: [
+        ...readinessFixture().checks,
+        {
+          check_id: "workspace",
+          title: "Workspace",
+          status: "fail",
+          detail: "The configured workspace does not exist.",
+          recovery: "Create or select a workspace."
+        }
+      ]
+    });
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Needs setup");
+    });
+    expect(screen.getByText("Create or select the workspace Kestrel should use.")).toBeInTheDocument();
+    expect(container.querySelector(".status-pill")).not.toHaveTextContent("Demo");
+  });
+
+  it("keeps connecting above the experience mode until the API loads", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    let releaseHealth: ((response: Response) => void) | null = null;
+    fetchSpy.mockImplementationOnce(
+      () => new Promise<Response>((resolve) => {
+        releaseHealth = resolve;
+      })
+    );
+    const { container } = render(<App />);
+
+    expect(container.querySelector(".status-pill")).toHaveTextContent("Connecting");
+    await act(async () => {
+      releaseHealth?.(jsonResponse({ ok: true }));
+    });
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+  });
+
+  it("keeps a failed run above a disconnected model state", async () => {
+    approvals = [];
+    runtimeProviderName = "openai";
+    runtimeModelName = "gpt-5.5";
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      experience_mode: "model_not_connected",
+      fail_count: 1,
+      checks: [
+        {
+          check_id: "provider_configuration",
+          title: "Provider configuration",
+          status: "fail",
+          detail: "The provider is not configured.",
+          recovery: "Open Settings."
+        }
+      ]
+    });
+    const failedRun = {
+      ...otherRun,
+      status: "failed",
+      error: "The last provider-backed run failed."
+    };
+    runs = [failedRun, secondRun, baseRun];
+    sessionRuns.session_2 = [failedRun];
+    sessions = [
+      {
+        ...sessions[0],
+        latest_run_id: failedRun.run_id,
+        latest_status: failedRun.status
+      },
+      sessions[1]
+    ];
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    await waitFor(() => {
+      expect(container.querySelector(".status-pill")).toHaveTextContent("Needs attention");
+    });
+    expect(screen.getByText("The last provider-backed run failed.")).toBeInTheDocument();
   });
 
   it("renders behavior delta review panel from the ledger API", async () => {
@@ -2158,6 +2491,36 @@ describe("App", () => {
   it("runs the setup wizard and saves onboarding to Soul memory", async () => {
     const fetchSpy = vi.mocked(fetch);
     onboardingProfile = null;
+    setupReadinessPayload = readinessFixture({
+      ready: false,
+      pass_count: 5,
+      warn_count: 2,
+      fail_count: 1,
+      next_action: "Fix failing setup checks before starting the golden local workflow.",
+      checks: [
+        {
+          check_id: "provider_configuration",
+          title: "Provider configuration",
+          status: "pass",
+          detail: "Mock provider is selected, so deterministic first-run smoke tests can run without credentials.",
+          recovery: "Choose a live provider later and rerun setup readiness before claiming provider support."
+        },
+        {
+          check_id: "workspace",
+          title: "Workspace",
+          status: "fail",
+          detail: "Workspace `/tmp/missing` does not exist.",
+          recovery: "Create the workspace or pass `--workspace` pointing at the repo/project Kestrel should operate on."
+        },
+        {
+          check_id: "memory_storage",
+          title: "Memory storage",
+          status: "warn",
+          detail: "Memory directory is not present yet. Path: `/tmp/memory`.",
+          recovery: "Run `nest-agent init` or start a local run so Kestrel can initialize memory layers."
+        }
+      ]
+    });
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Meet your Kestrel" })).toBeInTheDocument();
@@ -2268,6 +2631,15 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
   const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
   const url = new URL(raw, "http://kestrel.test");
   const path = `${url.pathname}${url.search}`;
+  if (path === "/api/product/setup" && setupReadinessFailure?.reject) {
+    throw new Error(setupReadinessFailure.detail);
+  }
+  if (path === "/api/product/setup" && setupReadinessFailure) {
+    return jsonResponse(
+      { detail: setupReadinessFailure.detail },
+      setupReadinessFailure.status ?? 503
+    );
+  }
   if (path === "/api/runs" && init?.method === "POST") {
     const body = JSON.parse(String(init.body ?? "{}"));
     const run: Run = {
@@ -2781,7 +3153,12 @@ function payloadFor(path: string): unknown {
         display_name: "Soul",
         description: "A local-first, memory-native engineering agent runtime."
       },
-      provider: { provider: "mock", model: "mock", api_key_env: null, api_key_configured: false },
+      provider: {
+        provider: runtimeProviderName,
+        model: runtimeModelName,
+        api_key_env: null,
+        api_key_configured: runtimeProviderName !== "mock"
+      },
       config: { allow_self_modification: false, allow_web: false },
       memory_layers: [{ layer: "self", mv2_file: "self.mv2" }],
       tools: [],
@@ -2799,36 +3176,32 @@ function payloadFor(path: string): unknown {
     };
   }
   if (path === "/api/product/setup") {
+    return setupReadinessPayload;
+  }
+  if (path === "/api/projects") {
     return {
-      schema: "kestrel.setup_readiness.v1",
-      ready: false,
-      pass_count: 5,
-      warn_count: 2,
-      fail_count: 1,
-      next_action: "Fix failing setup checks before starting the golden local workflow.",
-      checks: [
+      items: [
         {
-          check_id: "provider_configuration",
-          title: "Provider configuration",
-          status: "pass",
-          detail: "Mock provider is selected, so deterministic first-run smoke tests can run without credentials.",
-          recovery: "Choose a live provider later and rerun setup readiness before claiming provider support."
-        },
-        {
-          check_id: "workspace",
-          title: "Workspace",
-          status: "fail",
-          detail: "Workspace `/tmp/missing` does not exist.",
-          recovery: "Create the workspace or pass `--workspace` pointing at the repo/project Kestrel should operate on."
-        },
-        {
-          check_id: "memory_storage",
-          title: "Memory storage",
-          status: "warn",
-          detail: "Memory directory is not present yet. Path: `/tmp/memory`.",
-          recovery: "Run `nest-agent init` or start a local run so Kestrel can initialize memory layers."
+          project_id: "project_kestrel",
+          display_name: "Kestrel",
+          repository_path: "/tmp/kestrel",
+          remote: null,
+          default_branch: "main",
+          allowed_paths: ["."],
+          provider_policy: {},
+          cost_budget: 1.5,
+          privacy_class: "local_required",
+          test_recipes: [{ name: "pytest", command: "pytest -q" }],
+          build_recipes: [],
+          capability_ceiling: ["file.read"],
+          baseline_index_digest: null,
+          archived_at: null,
+          revision: 1,
+          created_at: "2026-05-16T00:00:00Z",
+          updated_at: "2026-05-16T00:00:00Z"
         }
-      ]
+      ],
+      count: 1
     };
   }
   if (path === "/api/runtime/config") {
@@ -2836,7 +3209,12 @@ function payloadFor(path: string): unknown {
       name: "Kestrel",
       version: "0.1.0",
       schema_version: 9,
-      provider: { name: "mock", model: "mock", api_key_env: null, api_key_configured: false },
+      provider: {
+        name: runtimeProviderName,
+        model: runtimeModelName,
+        api_key_env: null,
+        api_key_configured: runtimeProviderName !== "mock"
+      },
       feature_flags: {
         enable_autonomous_scheduler: false,
         require_approval_for_high_risk_tools: true,
@@ -2848,8 +3226,8 @@ function payloadFor(path: string): unknown {
       paths: { workspace: "/tmp/kestrel", memory_dir: "/tmp/memory" },
       settings: {
         runtime: {
-          provider: "mock",
-          model: "mock",
+          provider: runtimeProviderName,
+          model: runtimeModelName,
           backend: "memory",
           memory_dir: "/tmp/memory",
           workspace: "/tmp/kestrel",

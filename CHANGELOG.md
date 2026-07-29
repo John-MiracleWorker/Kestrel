@@ -6,6 +6,57 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+### Added
+
+- A unified engineering-run surface for Mission Control covering bounded graph amendments,
+  isolated same-contract candidate fan-out and evidence-ranked selection, digest-bound OCI browser
+  validation evidence, per-call approval packets, and review-bound GitHub pull-request/CI feedback.
+- Project/time-filtered outcome analytics with explicit evidence coverage and missing-versus-zero
+  metrics, redacted private benchmark fixtures, deterministic replay records, and redacted export.
+- Five-field proactive-routine cron schedules in named IANA timezones, including deterministic DST
+  gap/fold handling, plus destination-bound delivery receipts and explicit ambiguous-outcome
+  reconciliation.
+- Extension-manifest dependency locks, compatibility ranges, Ed25519/source-pinned provenance,
+  authority-delta review, and reproducible install receipts.
+- Intent-aware repository context packs that deterministically blend definitions, references,
+  imports, and test ownership, plus a seven-language recall@5 and evidence-freshness CI gate.
+
+### Changed
+
+- Advanced the SQLite control plane to schema version 21 for cron schedules and durable routine
+  deliveries; v20 introduced local project records and nullable run-to-project bindings.
+- Replaced hard-coded provider/model suggestions in the workbench with discovered catalogs and
+  the deterministic mock default.
+- Defined the strongest-model baseline from the declared target quality tier rather than observed
+  hindsight success, and separated browser evidence coverage from browser pass rate.
+
+### Security
+
+- Approval packets preserve an individual exact-call digest, capability revision, resource digest,
+  and decision for every call; grouping does not broaden authority.
+- GitHub publication requires a current signed repair review, unchanged reviewed commit tree,
+  remote-mutation/push enablement, and exact-call approval. Feedback ingestion cannot mutate a
+  reviewed request and recovery re-enters through a bounded graph amendment.
+- GitHub publication accepts only canonical credential-free `https://github.com/<owner>/<repo>/pull/<number>`
+  receipt URLs; query strings, fragments, user info, ports, and non-PR paths fail closed.
+- Enabled plugin updates fail closed when a new manifest adds authority, and signed manifests fail
+  closed when signature verification is unavailable or invalid.
+- Plugin manifests reject raw registered secrets, and install receipts distinguish reproducible
+  reviewed source from a runnable dependency environment; unmanaged dependencies cannot claim
+  runtime reproducibility.
+- Ambiguous external routine delivery is recorded as `uncertain` and never automatically retried;
+  reconciliation is an explicit owner action tied to the original idempotency key.
+- Provider and operator routine-delivery receipts are bounded, finite, and secret-safe before
+  durable persistence; provider receipt fields are redacted and raw reconciliation secrets fail
+  closed.
+- Engineering mutation APIs require configured owner authentication, and registered secrets are
+  refused before browser-validation commands or deterministic fixtures can enter containment.
+- Graph-amendment payloads, candidate results/review provenance, and approval-packet display fields
+  reject registered secrets before hashing or durable persistence; graph and candidate JSON also
+  reject non-finite values.
+- Browser evidence must return one schema-valid result for every exact requested assertion and
+  interaction; missing, reordered, renamed, or non-boolean proof cannot produce a passing record.
+
 ## [0.4.11] - 2026-07-26
 
 ### Fixed

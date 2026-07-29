@@ -8,6 +8,7 @@ import platform
 import sqlite3
 import subprocess  # nosec B404
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from importlib import metadata as importlib_metadata
@@ -44,6 +45,7 @@ from .runtime_models import LLMStreamEvent, ToolCall
 from .runtime_ownership import PrimaryRuntimeOwnership, RuntimeOwnershipError
 from .runtime_settings import default_runtime_settings_path
 from .secret_broker import build_secret_broker
+from .security_boundary import redact_secrets
 from .setup_readiness import build_setup_readiness_report
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, RoutineConflictError
@@ -106,7 +108,7 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
         default=argparse.SUPPRESS,
         help=(
             "Preloaded immutable name@sha256:<64 hex> OCI image used by test.run, "
-            "lint.run, repair validation, and codex.exec; there is no host fallback."
+            "lint.run, repair/browser validation, and codex.exec; there is no host fallback."
         ),
     )
     parser.add_argument("--allow-plugin-install", action="store_true", default=argparse.SUPPRESS)
@@ -117,6 +119,11 @@ def _add_agent_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protected-branches", default=argparse.SUPPRESS)
     parser.add_argument("--allow-memory-import", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--allow-executable-skills", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--allow-browser-validation",
+        action="store_true",
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--allow-mcp-network-endpoints", action="store_true", default=argparse.SUPPRESS
     )
@@ -769,7 +776,8 @@ def main() -> None:
 
     if args.cmd == "doctor":
         report = _doctor_runtime(config)
-        print(json.dumps(report, indent=2))
+        json.dump(report, sys.stdout, indent=2)
+        sys.stdout.write("\n")
         if report.get("ok") is not True:
             raise SystemExit(1)
         return
@@ -1034,6 +1042,7 @@ _CONFIG_ARG_FIELDS = {
     "git_write_mode": "git_write_mode",
     "allow_memory_import": "allow_memory_import",
     "allow_executable_skills": "allow_executable_skills",
+    "allow_browser_validation": "allow_browser_validation",
     "allow_mcp_network_endpoints": "allow_mcp_network_endpoints",
     "allow_web": "allow_web",
     "allow_self_modification": "allow_self_modification",
@@ -1667,13 +1676,17 @@ def _doctor_memory(memory: object, *, dry_run: bool) -> dict[str, Any]:
     return report
 
 
-def _doctor_runtime(config: AgentConfig) -> dict[str, Any]:
+def _doctor_runtime(
+    config: AgentConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     memory_dir_exists = config.memory_dir.exists()
     report: dict[str, Any] = {
         "python": _doctor_python(),
         "package": _doctor_package(),
         "optional_extras": _doctor_optional_extras(),
-        "provider": _doctor_provider(config),
+        "provider": _doctor_provider(config, environ=environ),
         "workspace": _doctor_workspace(config),
         "tool_config": _doctor_tool_config(config),
         "validation_container": _doctor_validation_container(config),
@@ -1740,11 +1753,20 @@ def _doctor_optional_module(module_name: str) -> dict[str, Any]:
     return report
 
 
-def _doctor_provider(config: AgentConfig) -> dict[str, Any]:
+def _doctor_provider(
+    config: AgentConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     key_env = config.api_key_env
     if key_env is None and config.provider == "openai":
         key_env = "OPENAI_API_KEY"
-    api_key_present = bool(key_env and _env_has_value(key_env))
+    credential_env_configured = False
+    api_key_present = False
+    if key_env:
+        credential_env_configured = True
+        if _env_has_value(key_env, environ=environ):
+            api_key_present = True
     needs_key = config.provider == "openai"
     needs_base_url = config.provider == "openai-compatible"
     return {
@@ -1752,7 +1774,7 @@ def _doctor_provider(config: AgentConfig) -> dict[str, Any]:
         "provider": config.provider,
         "model": config.model,
         "base_url_configured": bool(config.base_url),
-        "api_key_env": key_env,
+        "credential_env_configured": credential_env_configured,
         "api_key_present": api_key_present,
         "timeout_seconds": config.timeout_seconds,
         "max_retries": config.max_retries,
@@ -1770,6 +1792,12 @@ def _doctor_workspace(config: AgentConfig) -> dict[str, Any]:
 
 
 def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
+    secret_store_keyring = False
+    secret_store_file_backed = False
+    if config.secret_backend == "keyring":
+        secret_store_keyring = True
+    elif config.secret_backend == "json":
+        secret_store_file_backed = True
     return {
         "ok": True,
         "allow_shell": config.allow_shell,
@@ -1782,10 +1810,11 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_remote_mutation": config.allow_remote_mutation,
         "git_write_mode": config.git_write_mode,
         "protected_branches": list(config.protected_branches),
-        "secret_store_path": str(config.secret_store_path),
-        "secret_backend": config.secret_backend,
+        "secret_store_keyring": secret_store_keyring,
+        "secret_store_file_backed": secret_store_file_backed,
         "allow_memory_import": config.allow_memory_import,
         "allow_executable_skills": config.allow_executable_skills,
+        "allow_browser_validation": config.allow_browser_validation,
         "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
         "allow_web": config.allow_web,
         "allow_self_modification": config.allow_self_modification,
@@ -1813,6 +1842,8 @@ def _doctor_validation_container(config: AgentConfig) -> dict[str, Any]:
         )
     if config.allow_codex_cli:
         required_by.append("codex.exec")
+    if config.allow_browser_validation:
+        required_by.append("browser.validate")
     required = bool(required_by)
     if not configured:
         detail = (
@@ -1910,10 +1941,15 @@ def _section_ok(value: dict[str, Any]) -> bool:
     return True
 
 
-def _env_has_value(name: str) -> bool:
+def _env_has_value(
+    name: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
     import os
 
-    return bool(os.getenv(name, "").strip())
+    environment = os.environ if environ is None else environ
+    return bool(environment.get(name, "").strip())
 
 
 def _build_run_manager(
@@ -2417,6 +2453,7 @@ def _write_plugin_audit(
 
 
 def _print_plugins(plugins: list[dict[str, Any]], *, json_output: bool) -> None:
+    plugins = redact_secrets(plugins)
     if json_output:
         print(json.dumps({"plugins": plugins}, indent=2))
         return
@@ -2432,6 +2469,7 @@ def _print_plugins(plugins: list[dict[str, Any]], *, json_output: bool) -> None:
 
 
 def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
+    plugin = redact_secrets(plugin)
     if json_output:
         print(json.dumps(plugin, indent=2))
         return
@@ -2453,6 +2491,7 @@ def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
 
 
 def _print_plugin_review(review: dict[str, Any], *, json_output: bool) -> None:
+    review = redact_secrets(review)
     if json_output:
         print(json.dumps(review, indent=2))
         return

@@ -6,7 +6,7 @@ import os
 import re
 import subprocess  # nosec B404
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -22,6 +22,24 @@ from .app_factory import build_agent
 from .capability_policy import CapabilityPolicy, parent_resource_digest, tool_spec_digest
 from .config import AgentConfig
 from .diagnosis import classify_failure
+from .engineering.approval_packets import (
+    ApprovalPacketCall,
+    ApprovalPacketService,
+)
+from .engineering.browser_validation import (
+    BrowserAssertion,
+    BrowserInteraction,
+    BrowserValidationRequest,
+    BrowserValidationService,
+)
+from .engineering.candidates import (
+    CandidateFanoutRecord,
+    CandidateFanoutService,
+    CandidateIsolation,
+)
+from .engineering.github_workflow import GitHubWorkflowService
+from .engineering.graph_amendments import GraphAmendmentRecord, GraphAmendmentService
+from .engineering.outcomes import OutcomeAnalyticsService
 from .event_bus import RunEventBus
 from .event_log import redact_secrets
 from .graph_runtime import (
@@ -36,6 +54,7 @@ from .models import MemoryLayer
 from .nested_learning import STABLE_MEMORY_LAYERS, NestedLearningKernel
 from .plugin_manager import PluginManager
 from .process_liveness import process_is_alive
+from .projects import validate_project_direct_route
 from .repair_integrity import (
     hardened_readonly_git_command,
     hardened_readonly_git_environment,
@@ -74,7 +93,7 @@ from .tools.builtin import build_default_tools
 from .tools.process_tools import cancel_subprocesses_for_run
 from .tools.registry import RuntimeToolFence, ToolRegistry
 from .tracing import SpanRecorder
-from .worker_isolation import prepare_git_worktree
+from .worker_isolation import plan_git_worktree_isolation, prepare_git_worktree
 
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "skipped"}
@@ -84,12 +103,15 @@ _REPAIR_ARTIFACT_SCHEMA_VERSION = 1
 _MAX_REPAIR_DEPENDENCY_ARTIFACTS = 16
 _MAX_REPAIR_CHANGED_FILES = 128
 _MAX_REPAIR_PATH_CHARS = 512
+_MAX_REPAIR_DIFF_PREVIEW_CHARS = 80_000
 _REPAIR_VALIDATION_ID_RE = re.compile(r"repair_validation_[0-9a-f]{24}")
 _REPAIR_REVIEW_ID_RE = re.compile(r"repair_review_[0-9a-f]{24}")
 _REPAIR_ROLLBACK_ID_RE = re.compile(r"repair_rollback_[0-9a-f]{24}")
 _REPAIR_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
 _GIT_OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_MISSION_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_MISSION_RISK_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
 def _agent_has_unsettled_tool_executions(agent: Any) -> bool:
@@ -140,6 +162,12 @@ class RunManager:
         try:
             self.plugins = plugins or PluginManager(config.plugins_dir, state)
             self.capabilities = CapabilityPolicy(state, lambda: self.config)
+            self.graph_amendments = GraphAmendmentService(state)
+            self.candidate_fanouts = CandidateFanoutService(state)
+            self.browser_validations = BrowserValidationService(state)
+            self.approval_packets = ApprovalPacketService(state)
+            self.outcomes = OutcomeAnalyticsService(state)
+            self.github_workflow = GitHubWorkflowService(state)
             self.mcp.capability_policy = self.capabilities
             self.skills.capability_policy = self.capabilities
             self._lock = Lock()
@@ -191,6 +219,11 @@ class RunManager:
         except BaseException:
             self._release_runtime_ownership()
             raise
+
+    def _uses_actionable_project_routing(self) -> bool:
+        """Return whether task-level routing, rather than the direct LLM, is authoritative."""
+
+        return False
 
     @property
     def started(self) -> bool:
@@ -1280,12 +1313,52 @@ class RunManager:
         message: str,
         session_id: str | None = None,
         workspace: Path | None = None,
+        project_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
         autonomy_mode: str = "background",
         source: TurnSource | None = None,
+        mission_plan: Sequence[Mapping[str, Any]] | None = None,
+        project_revision: int | None = None,
     ) -> RunRecord:
         self._require_mutable_runtime("create_run")
+        resolved_workspace = workspace
+        project = None
+        direct_estimated_cost: float | None = None
+        if project_id is not None:
+            project = self.state.get_project(project_id)
+            if project.archived_at is not None:
+                raise ValueError("cannot bind a new run to an archived project")
+            if mission_plan is not None and project_revision is None:
+                raise ValueError(
+                    "mission_plan requires the project revision from Mission preflight"
+                )
+            if project_revision is not None and project.revision != project_revision:
+                raise ValueError("mission preflight project revision is stale")
+            if not self._uses_actionable_project_routing():
+                direct_estimated_cost = validate_project_direct_route(
+                    project,
+                    provider=provider or self.config.provider,
+                    model=model or self.config.model,
+                    base_url=self.config.base_url,
+                )
+            if resolved_workspace is None:
+                resolved_workspace = Path(project.repository_path)
+        normalized_mission_plan = self._validate_mission_plan(
+            mission_plan,
+            project_id=project_id,
+        )
+        if (
+            project is not None
+            and project.cost_budget is not None
+            and direct_estimated_cost is not None
+            and normalized_mission_plan
+            and direct_estimated_cost * len(normalized_mission_plan)
+            > project.cost_budget
+        ):
+            raise ValueError(
+                "mission direct-provider estimate exceeds the current project cost budget"
+            )
         run_id = f"run_{uuid4().hex}"
         turn_source, turn_origin, transcript_scope = _serialize_run_provenance(source)
         resolved_session_id = session_id or (
@@ -1301,14 +1374,131 @@ class RunManager:
             run_id=run_id,
             message=message,
             session_id=resolved_session_id,
-            workspace=workspace,
+            workspace=resolved_workspace,
+            project_id=project_id,
             provider=provider,
             model=model,
             autonomy_mode=autonomy_mode,
             turn_source=turn_source,
             turn_origin=turn_origin,
             transcript_scope=transcript_scope,
+            mission_plan=normalized_mission_plan,
+            project_revision=project_revision,
         )
+
+    def _validate_mission_plan(
+        self,
+        mission_plan: Sequence[Mapping[str, Any]] | None,
+        *,
+        project_id: str | None,
+    ) -> tuple[dict[str, Any], ...]:
+        if mission_plan is None:
+            return ()
+        if project_id is None:
+            raise ValueError("mission_plan requires a project-bound run")
+        if isinstance(mission_plan, (str, bytes)) or not 1 <= len(mission_plan) <= 12:
+            raise ValueError("mission_plan must contain between 1 and 12 tasks")
+
+        project = self.state.get_project(project_id)
+        allowed_capabilities = set(project.capability_ceiling)
+        registry = self.build_registry()
+        normalized: list[dict[str, Any]] = []
+        task_ids: set[str] = set()
+        for raw in mission_plan:
+            if not isinstance(raw, Mapping):
+                raise ValueError("mission_plan tasks must be objects")
+            task_id = str(raw.get("task_id", "")).strip()
+            if _MISSION_TASK_ID_RE.fullmatch(task_id) is None or task_id == "root":
+                raise ValueError("mission task_id is invalid or reserved")
+            if task_id in task_ids:
+                raise ValueError("mission task_id values must be unique")
+            task_ids.add(task_id)
+            title = _bounded_mission_text(
+                raw.get("title"),
+                field_name="mission task title",
+                maximum=512,
+            )
+            rationale = _bounded_mission_text(
+                raw.get("rationale"),
+                field_name="mission task rationale",
+                maximum=4_096,
+            )
+            dependencies = _mission_string_sequence(
+                raw.get("dependencies", ()),
+                field_name="mission task dependencies",
+                maximum_items=12,
+                maximum_chars=128,
+            )
+            if len(dependencies) != len(set(dependencies)):
+                raise ValueError("mission task dependencies must be unique")
+            if task_id in dependencies:
+                raise ValueError("mission task cannot depend on itself")
+            acceptance_criteria = _mission_string_sequence(
+                raw.get("acceptance_criteria", ()),
+                field_name="mission task acceptance criteria",
+                minimum_items=1,
+                maximum_items=32,
+                maximum_chars=2_048,
+            )
+            requested_tools = _mission_string_sequence(
+                raw.get("required_tools", ()),
+                field_name="mission task required tools",
+                maximum_items=64,
+                maximum_chars=640,
+            )
+            canonical_tools: list[str] = []
+            minimum_risk_rank = 0
+            for requested_tool in requested_tools:
+                canonical = registry.canonical_name(requested_tool)
+                spec = registry.spec_for(canonical or requested_tool)
+                if canonical is None or spec is None:
+                    raise ValueError(
+                        f"mission task requires an unknown tool: {requested_tool}"
+                    )
+                decision = self.capabilities.tool_decision(spec)
+                required_capability_keys = _project_capability_keys_for_tool(spec)
+                if not decision.effective_enabled or any(
+                    key not in allowed_capabilities for key in required_capability_keys
+                ):
+                    raise ValueError(
+                        f"mission task requires a tool outside the effective project ceiling: "
+                        f"{canonical}"
+                    )
+                if canonical not in canonical_tools:
+                    canonical_tools.append(canonical)
+                minimum_risk_rank = max(
+                    minimum_risk_rank,
+                    _MISSION_RISK_RANK.get(spec.risk, 3),
+                    1 if spec.requires_approval else 0,
+                )
+            risk = str(raw.get("risk", "")).strip().lower()
+            if risk not in _MISSION_RISK_RANK:
+                raise ValueError("mission task risk must be low, medium, high, or critical")
+            if _MISSION_RISK_RANK[risk] < minimum_risk_rank:
+                raise ValueError(
+                    "mission task risk cannot downgrade its required tool risk"
+                )
+            normalized.append(
+                {
+                    "task_id": task_id,
+                    "title": title,
+                    "rationale": rationale,
+                    "dependencies": dependencies,
+                    "acceptance_criteria": acceptance_criteria,
+                    "required_tools": tuple(canonical_tools),
+                    "risk": risk,
+                }
+            )
+
+        for task in normalized:
+            unknown = sorted(set(task["dependencies"]) - task_ids)
+            if unknown:
+                raise ValueError(
+                    "mission task dependencies reference unknown tasks: "
+                    + ", ".join(unknown)
+                )
+        _assert_acyclic_mission_plan(normalized)
+        return tuple(normalized)
 
     def create_scheduled_routine_run(
         self,
@@ -1401,15 +1591,37 @@ class RunManager:
         message: str,
         session_id: str,
         workspace: Path | None,
+        project_id: str | None,
         provider: str | None,
         model: str | None,
         autonomy_mode: str,
         turn_source: dict[str, Any] | None,
         turn_origin: str,
         transcript_scope: str,
+        mission_plan: tuple[dict[str, Any], ...],
+        project_revision: int | None,
     ) -> RunRecord:
         self._reserve_primary_run(run_id)
         try:
+            project_allowed_paths: tuple[str, ...] = (".",)
+            project_baseline_index_digest: str | None = None
+            effective_project_revision: int | None = None
+            if project_id is not None:
+                project = self.state.get_project(project_id)
+                if project.archived_at is not None:
+                    raise ValueError("cannot bind a new run to an archived project")
+                if project_revision is not None and project.revision != project_revision:
+                    raise ValueError("mission preflight project revision is stale")
+                if not self._uses_actionable_project_routing():
+                    validate_project_direct_route(
+                        project,
+                        provider=provider or self.config.provider,
+                        model=model or self.config.model,
+                        base_url=self.config.base_url,
+                    )
+                project_allowed_paths = project.allowed_paths
+                project_baseline_index_digest = project.baseline_index_digest
+                effective_project_revision = project.revision
             normalized_autonomy = (
                 autonomy_mode
                 if autonomy_mode in {"background", "manual", "autonomous"}
@@ -1418,6 +1630,10 @@ class RunManager:
             run_config = replace(
                 self.config,
                 workspace=(workspace or self.config.workspace),
+                project_id=project_id,
+                project_revision=effective_project_revision,
+                project_baseline_index_digest=project_baseline_index_digest,
+                project_allowed_paths=project_allowed_paths,
                 provider=provider or self.config.provider,
                 model=model or self.config.model,
                 enable_autonomous_scheduler=normalized_autonomy == "autonomous"
@@ -1441,6 +1657,8 @@ class RunManager:
                 turn_source=turn_source,
                 turn_origin=turn_origin,
                 transcript_scope=transcript_scope,
+                project_id=project_id,
+                expected_project_revision=project_revision,
                 max_nonterminal_runs=self._primary_concurrency_limit(run_config)
                 + max(0, run_config.max_queued_runs),
             )
@@ -1449,6 +1667,7 @@ class RunManager:
                 message=message,
                 autonomy_mode=normalized_autonomy,
                 run_config=run_config,
+                mission_plan=mission_plan,
             )
         except StateCapacityError as exc:
             self._abort_primary_admission(run_id, exc)
@@ -1467,12 +1686,14 @@ class RunManager:
         message: str,
         autonomy_mode: str,
         run_config: AgentConfig,
+        mission_plan: tuple[dict[str, Any], ...] = (),
     ) -> None:
         self._ensure_primary_task_graph(
             run=run,
             message=message,
             autonomy_mode=autonomy_mode,
             run_config=run_config,
+            mission_plan=mission_plan,
         )
         self.events.publish(
             run.run_id,
@@ -1486,6 +1707,8 @@ class RunManager:
                 "turn_source": run.turn_source,
                 "turn_origin": run.turn_origin,
                 "transcript_scope": run.transcript_scope,
+                "project_id": run.project_id,
+                "mission_plan_tasks": len(mission_plan),
             },
         )
         self._schedule_primary_run(
@@ -1503,6 +1726,7 @@ class RunManager:
         message: str,
         autonomy_mode: str,
         run_config: AgentConfig,
+        mission_plan: tuple[dict[str, Any], ...] = (),
     ) -> list[TaskNodeRecord]:
         existing = self.state.list_task_nodes(run.run_id)
         if existing:
@@ -1538,27 +1762,55 @@ class RunManager:
             and _runs_share_transcript_authority(run, prior)
         ][-5:]
         planned_tasks = (
-            _initial_task_plan(message, recent_messages=recent_messages)
-            if autonomy_mode != "manual"
-            else []
+            list(mission_plan)
+            if mission_plan
+            else (
+                _initial_task_plan(message, recent_messages=recent_messages)
+                if autonomy_mode != "manual"
+                else []
+            )
         )
+        mission_task_ids = {
+            str(planned["task_id"]): f"task_{uuid4().hex}"
+            for planned in planned_tasks
+        }
         tasks = [root]
         for planned in planned_tasks:
             dependencies = [
-                root.task_id if dependency == "root" else dependency
+                (
+                    root.task_id
+                    if dependency == "root"
+                    else mission_task_ids.get(str(dependency), str(dependency))
+                )
                 for dependency in planned["dependencies"]
             ]
+            if mission_plan and not dependencies:
+                dependencies = [root.task_id]
+            source_task_id = str(planned["task_id"])
+            task_id = mission_task_ids.get(source_task_id, source_task_id)
+            is_mission_task = bool(mission_plan)
             tasks.append(
                 TaskNodeRecord(
-                    task_id=str(planned["task_id"]),
+                    task_id=task_id,
                     run_id=run.run_id,
                     parent_id=root.task_id,
                     title=str(planned["title"]),
-                    goal=str(planned["goal"]),
-                    profile=str(planned["profile"]),
+                    goal=str(planned.get("goal") or planned.get("rationale") or planned["title"]),
+                    profile=str(planned.get("profile") or _mission_task_profile(source_task_id)),
                     status="queued",
                     approved=planned["risk"] == "low",
-                    plan={"acceptance_evidence": _initial_task_acceptance_evidence_modes(planned)},
+                    plan={
+                        "acceptance_evidence": _initial_task_acceptance_evidence_modes(planned),
+                        **(
+                            {
+                                "source": "mission_control",
+                                "source_task_id": source_task_id,
+                                "rationale": str(planned.get("rationale", "")),
+                            }
+                            if is_mission_task
+                            else {}
+                        ),
+                    },
                     dependencies=tuple(str(item) for item in dependencies),
                     required_tools=tuple(str(item) for item in planned["required_tools"]),
                     risk=str(planned["risk"]),
@@ -1587,6 +1839,225 @@ class RunManager:
         if not self.read_only_observer:
             self.expire_pending_approvals()
         return self.state.list_approvals(status=status, expire=False)
+
+    def create_approval_packet(
+        self,
+        *,
+        packet_id: str,
+        run_id: str,
+        objective: str,
+        calls: tuple[dict[str, Any], ...],
+        checkpoint: str = "",
+        actor: str = "planner",
+    ) -> dict[str, Any]:
+        """Materialize display metadata and immutable bindings for exact calls."""
+
+        self._require_mutable_runtime("create_approval_packet")
+        run = self._require_run_accepts_work(run_id, operation="approval_packet")
+        registry = self.build_registry()
+        project = self.state.get_project(run.project_id) if run.project_id else None
+        packet_calls: list[ApprovalPacketCall] = []
+        for raw in calls:
+            if not isinstance(raw, dict):
+                raise ValueError("approval packet calls must be objects")
+            requested_name = str(raw.get("tool_name") or "")
+            canonical = registry.canonical_name(requested_name)
+            spec = registry.spec_for(canonical or requested_name)
+            if canonical is None or spec is None:
+                raise ValueError(f"approval packet contains an unknown tool: {requested_name}")
+            capability = self.capabilities.tool_decision(spec)
+            if not capability.effective_enabled:
+                raise PermissionError(
+                    f"approval packet tool is disabled: {canonical}"
+                )
+            if project is not None:
+                missing = [
+                    key
+                    for key in _project_capability_keys_for_tool(spec)
+                    if key not in project.capability_ceiling
+                ]
+                if missing:
+                    raise PermissionError(
+                        f"approval packet tool is outside the project ceiling: {canonical}"
+                    )
+            arguments = raw.get("arguments")
+            if not isinstance(arguments, dict):
+                raise ValueError("approval packet call arguments must be an object")
+            packet_calls.append(
+                ApprovalPacketCall(
+                    tool_call_id=str(raw.get("tool_call_id") or ""),
+                    tool_name=canonical,
+                    arguments=arguments,
+                    risk=spec.risk,
+                    capability_revision=capability.revision,
+                    resource_digest=self.tool_resource_digest(spec),
+                    reason=str(raw.get("reason") or ""),
+                    resource_scope=str(raw.get("resource_scope") or ""),
+                    expected_side_effect=str(
+                        raw.get("expected_side_effect") or ""
+                    ),
+                    rollback=str(raw.get("rollback") or ""),
+                )
+            )
+        packet = self.approval_packets.create(
+            packet_id=packet_id,
+            run_id=run_id,
+            objective=objective,
+            calls=tuple(packet_calls),
+            actor=actor,
+            checkpoint=checkpoint,
+        )
+        payload = packet.to_payload()
+        self.events.publish(run_id, "approval.packet_requested", payload)
+        return payload
+
+    def decide_approval_packet(
+        self,
+        packet_id: str,
+        *,
+        expected_packet_digest: str,
+        decisions: dict[str, bool],
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        self._require_mutable_runtime("decide_approval_packet")
+        packet = self.approval_packets.decide(
+            packet_id,
+            expected_packet_digest=expected_packet_digest,
+            decisions=decisions,
+            actor=actor,
+        )
+        payload = packet.to_payload()
+        self.events.publish(packet.run_id, "approval.packet_decided", payload)
+        return payload
+
+    def start_benchmark_replay(
+        self,
+        *,
+        replay_id: str,
+        case_id: str,
+        route_policy_id: str | None,
+        context_strategy: str,
+        baseline: str,
+        existing_run_id: str | None = None,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        """Launch or bind one private benchmark without changing live policy."""
+
+        self._require_mutable_runtime("start_benchmark_replay")
+        case = self.outcomes.get_benchmark(case_id)
+        if route_policy_id is not None:
+            coordinator = getattr(self, "routing_coordinator", None)
+            configured_policy_id = getattr(coordinator, "policy_id", None)
+            if configured_policy_id is not None and route_policy_id != configured_policy_id:
+                raise ValueError(
+                    "benchmark replay cannot silently change the live route policy; "
+                    "select the configured policy or provide an existing run"
+                )
+        if existing_run_id is None:
+            objective = str(case.fixture["objective"])
+            project = self.state.get_project(case.project_id)
+            run = self.create_run(
+                message=objective,
+                project_id=case.project_id,
+                workspace=Path(project.repository_path),
+                autonomy_mode="background",
+            )
+        else:
+            run = self.state.get_run(existing_run_id)
+        replay = self.outcomes.link_replay(
+            replay_id=replay_id,
+            case_id=case.case_id,
+            run_id=run.run_id,
+            route_policy_id=route_policy_id,
+            context_strategy=context_strategy,
+            baseline=baseline,
+            actor=actor,
+        )
+        payload = replay.to_payload()
+        self.events.publish(run.run_id, "benchmark.replay_linked", payload)
+        return payload
+
+    def prepare_github_change_request(
+        self,
+        *,
+        request_id: str,
+        run_id: str,
+        review_id: str,
+        title: str,
+        base_branch: str,
+        head_branch: str | None = None,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        self._require_mutable_runtime("prepare_github_change_request")
+        request = self.github_workflow.prepare(
+            request_id=request_id,
+            run_id=run_id,
+            review_id=review_id,
+            title=title,
+            base_branch=base_branch,
+            head_branch=head_branch,
+            actor=actor,
+        )
+        payload = request.to_payload()
+        self.events.publish(run_id, "github.change_request_prepared", payload)
+        return payload
+
+    def recover_github_feedback(
+        self,
+        request_id: str,
+        *,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        """Launch one bounded recovery run from persisted failing PR evidence."""
+
+        self._require_mutable_runtime("recover_github_feedback")
+        request = self.github_workflow.get(request_id)
+        if request.recovery_run_id is not None:
+            return request.to_payload()
+        if request.status not in {"ci_failed", "changes_requested"}:
+            raise ValueError("GitHub change request has no actionable failure")
+        original = self.state.get_run(request.run_id)
+        if request.project_id is None:
+            raise ValueError("GitHub recovery requires a project-bound run")
+        project = self.state.get_project(request.project_id)
+        latest = request.feedback[-1] if request.feedback else None
+        evidence = latest.to_payload() if latest is not None else {}
+        message = (
+            f"Recover GitHub pull request #{request.external_number or 'unknown'} "
+            f"for {request.title}. Preserve the reviewed objective and address only "
+            f"the recorded {request.status} evidence. Source run: {original.run_id}. "
+            f"Feedback snapshot: {json.dumps(evidence, sort_keys=True)[:12_000]}"
+        )
+        recovery = self.create_run(
+            message=message,
+            project_id=request.project_id,
+            workspace=Path(project.repository_path),
+            autonomy_mode="background",
+        )
+        updated = self.github_workflow.bind_recovery_run(
+            request.request_id,
+            recovery_run_id=recovery.run_id,
+        )
+        payload = updated.to_payload()
+        payload["recovery_actor"] = actor
+        self.events.publish(
+            request.run_id,
+            "github.recovery_run_created",
+            {
+                "request_id": request.request_id,
+                "recovery_run_id": recovery.run_id,
+                "source_run_id": request.run_id,
+            },
+        )
+        self.events.publish(
+            recovery.run_id,
+            "github.recovery_run_linked",
+            {
+                "request_id": request.request_id,
+                "source_run_id": request.run_id,
+            },
+        )
+        return payload
 
     def expire_pending_approvals(self) -> list[dict[str, Any]]:
         """Expire and terminally reconcile exact-call approvals without a UI read."""
@@ -1862,12 +2333,15 @@ class RunManager:
         tool_names: set[str],
         *,
         reason: str = "capability_disabled",
+        run_ids: set[str] | None = None,
     ) -> int:
         """Deny pending grants before a newly disabled capability can resume."""
 
         self._require_mutable_runtime("revoke_pending_approvals_for_tools")
         revoked = 0
         for approval in self.state.list_approvals(status="pending"):
+            if run_ids is not None and str(approval.get("run_id")) not in run_ids:
+                continue
             if str(approval.get("tool_name")) not in tool_names:
                 continue
             updated, applied = self.state.decide_approval_once(
@@ -1931,12 +2405,31 @@ class RunManager:
                     )
             except KeyError:
                 pass
+        revoked += self.approval_packets.invalidate_tools(
+            tool_names,
+            reason=reason,
+        )
         return revoked
 
-    def tool_resource_digest(self, spec: ToolSpec) -> str:
-        """Bind approvals to the live tool spec, parent resource, and policy."""
+    def tool_resource_digest(
+        self,
+        spec: ToolSpec,
+        *,
+        base_config: AgentConfig | None = None,
+    ) -> str:
+        """Bind approvals to the live tool spec, parent resource, and policy.
 
-        decision = self.capabilities.tool_decision(spec)
+        ``base_config`` anchors volatile per-process gates to an explicit
+        configuration -- the run's durable snapshot during approval
+        continuation. Durable components are always read live so later owner or
+        resource changes still fail closed.
+        """
+
+        capabilities = (
+            self.capabilities if base_config is None else self.capabilities.with_config(base_config)
+        )
+        digest_config = self.config if base_config is None else base_config
+        decision = capabilities.tool_decision(spec)
         payload: dict[str, Any] = {
             "tool_spec": tool_spec_digest(spec),
             "tool_revision": decision.revision,
@@ -1944,9 +2437,9 @@ class RunManager:
             "global_gate": (
                 None
                 if decision.enablement_flag is None
-                else bool(getattr(self.config, decision.enablement_flag, False))
+                else bool(getattr(digest_config, decision.enablement_flag, False))
             ),
-            "launch_allowlist": list(self.config.enabled_tools),
+            "launch_allowlist": list(digest_config.enabled_tools),
         }
         if spec.source == "mcp" and spec.server_id:
             row = self.state.get_mcp_server(spec.server_id)
@@ -2057,6 +2550,12 @@ class RunManager:
                             event_log=agent.event_log,
                             session_id=session_id,
                             run_id=run_id,
+                            project_id=agent.config.project_id,
+                            project_revision=agent.config.project_revision,
+                            project_baseline_index_digest=(
+                                agent.config.project_baseline_index_digest
+                            ),
+                            allowed_paths=agent.config.project_allowed_paths,
                             execution_origin="manual",
                             approval_handler=self._approval_handler if run_id else None,
                             trusted_request_origin=trusted_request_origin,
@@ -2072,6 +2571,12 @@ class RunManager:
                         event_log=agent.event_log,
                         session_id=session_id,
                         run_id=run_id,
+                        project_id=agent.config.project_id,
+                        project_revision=agent.config.project_revision,
+                        project_baseline_index_digest=(
+                            agent.config.project_baseline_index_digest
+                        ),
+                        allowed_paths=agent.config.project_allowed_paths,
                         execution_origin="manual",
                         approval_handler=self._approval_handler if run_id else None,
                         trusted_request_origin=trusted_request_origin,
@@ -2310,6 +2815,9 @@ class RunManager:
             if "failed" in executed_statuses:
                 stop_reason = "task_failed"
                 break
+            if "recovery_approval_required" in executed_statuses:
+                stop_reason = "graph_amendment_approval_required"
+                break
             if step["blocked"]:
                 stop_reason = "tool_approval_required"
                 break
@@ -2536,6 +3044,247 @@ class RunManager:
                 payload["scheduler"] = scheduler
             return payload
 
+    def preview_candidate_fanout(
+        self,
+        *,
+        fanout_id: str,
+        run_id: str,
+        source_task_id: str,
+        candidate_count: int,
+        estimated_budget_delta_usd: float,
+    ) -> dict[str, Any]:
+        """Build a read-only, exact plan for isolated parallel candidates."""
+
+        if (
+            isinstance(candidate_count, bool)
+            or not isinstance(candidate_count, int)
+            or not 2 <= candidate_count <= 8
+        ):
+            raise ValueError("candidate_count must be between two and eight")
+        run = self._require_run_accepts_work(run_id, operation="candidate_fanout_preview")
+        source = self.state.get_task_node(source_task_id)
+        if source.run_id != run_id:
+            raise ValueError("source task does not belong to the candidate run")
+        config = self._config_for_run(run)
+        worktree_root = config.worker_worktree_dir
+        if not worktree_root.is_absolute():
+            worktree_root = Path(run.workspace) / worktree_root
+        isolations: list[CandidateIsolation] = []
+        for index in range(candidate_count):
+            suffix = hashlib.sha256(
+                f"{fanout_id}:{run_id}:{source_task_id}:{index}".encode()
+            ).hexdigest()[:20]
+            candidate_id = f"candidate_{suffix}"
+            task_id = f"task_candidate_{suffix}"
+            planned = plan_git_worktree_isolation(
+                worktree_root=worktree_root,
+                branch_prefix=config.worker_branch_prefix,
+                run_id=run_id,
+                worker_id=candidate_id,
+            )
+            isolations.append(
+                CandidateIsolation(
+                    candidate_id=candidate_id,
+                    task_id=task_id,
+                    workspace=planned.workspace,
+                    branch=planned.branch,
+                )
+            )
+        return self.candidate_fanouts.preview(
+            fanout_id=fanout_id,
+            run_id=run_id,
+            source_task_id=source_task_id,
+            task_contract_digest=self.candidate_fanouts.task_contract_digest(
+                source_task_id
+            ),
+            candidates=tuple(isolations),
+            estimated_budget_delta_usd=estimated_budget_delta_usd,
+        )
+
+    def create_candidate_fanout(
+        self,
+        *,
+        fanout_id: str,
+        plan: dict[str, Any],
+        approved_plan_digest: str,
+        actor: str = "owner",
+        start: bool = True,
+    ) -> dict[str, Any]:
+        """Materialize approved worktrees/tasks and optionally launch them in parallel."""
+
+        self._require_mutable_runtime("create_candidate_fanout")
+        validated = self.candidate_fanouts.validate_approved_plan(
+            fanout_id=fanout_id,
+            plan=plan,
+            approved_plan_digest=approved_plan_digest,
+        )
+        run_id = str(validated["run_id"])
+        run = self._require_run_accepts_work(run_id, operation="candidate_fanout")
+        config = self._config_for_run(run)
+        raw_candidates = validated.get("candidates")
+        if not isinstance(raw_candidates, list):
+            raise ValueError("candidate fanout plan has no candidate list")
+        prepared: list[dict[str, str]] = []
+        for raw in raw_candidates:
+            if not isinstance(raw, dict):
+                raise ValueError("candidate fanout isolation is invalid")
+            candidate_id = str(raw.get("candidate_id") or "")
+            isolation = prepare_git_worktree(
+                workspace=Path(run.workspace),
+                worktree_root=(
+                    config.worker_worktree_dir
+                    if config.worker_worktree_dir.is_absolute()
+                    else Path(run.workspace) / config.worker_worktree_dir
+                ),
+                branch_prefix=config.worker_branch_prefix,
+                run_id=run_id,
+                worker_id=candidate_id,
+            )
+            if (
+                str(isolation.workspace) != str(raw.get("workspace"))
+                or isolation.branch != str(raw.get("branch"))
+            ):
+                raise ValueError(
+                    "prepared candidate isolation does not match the approved plan"
+                )
+            prepared.append(isolation.to_payload())
+        fanout = self.candidate_fanouts.create_fanout(
+            fanout_id=fanout_id,
+            plan=plan,
+            approved_plan_digest=approved_plan_digest,
+            actor=actor,
+            materialize_tasks=True,
+        )
+        self.events.publish(run_id, "candidate.fanout.created", fanout.to_payload())
+        launches: list[dict[str, Any]] = []
+        if start:
+            source = self.state.get_task_node(fanout.source_task_id)
+            for candidate in fanout.candidates:
+                try:
+                    launch = self.create_subagent(
+                        run_id=run_id,
+                        profile=source.profile,
+                        goal=source.goal,
+                        task_id=candidate.task_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retain every candidate receipt
+                    launch = {
+                        "candidate_id": candidate.candidate_id,
+                        "task_id": candidate.task_id,
+                        "status": "launch_failed",
+                        "error": str(redact_secrets(f"{type(exc).__name__}: {exc}")),
+                    }
+                else:
+                    launch["candidate_id"] = candidate.candidate_id
+                launches.append(launch)
+        return {
+            "fanout": self.candidate_fanouts.get_fanout(fanout_id).to_payload(),
+            "isolations": prepared,
+            "launches": launches,
+        }
+
+    def validate_browser_evidence(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        candidate_id: str | None,
+        expected_candidate_digest: str,
+        start_command: tuple[str, ...],
+        target_url: str,
+        assertions: tuple[dict[str, Any], ...],
+        interactions: tuple[dict[str, Any], ...],
+        allowed_domains: tuple[str, ...] = (),
+        network_fixtures: dict[str, dict[str, Any]] | None = None,
+        image: str | None = None,
+        timeout_seconds: float = 90.0,
+    ) -> dict[str, Any]:
+        """Capture candidate-bound rendered, interaction, and accessibility proof."""
+
+        self._require_mutable_runtime("validate_browser_evidence")
+        run = self._require_run_accepts_work(run_id, operation="browser_validation")
+        task = self.state.get_task_node(task_id)
+        if task.run_id != run_id:
+            raise ValueError("browser validation task does not belong to the run")
+        workspace = Path(run.workspace)
+        if candidate_id is not None:
+            candidate = next(
+                (
+                    item
+                    for fanout in self._candidate_fanouts_for_run(run_id)
+                    for item in fanout.candidates
+                    if item.candidate_id == candidate_id
+                    and item.task_id == task_id
+                ),
+                None,
+            )
+            if candidate is None:
+                raise ValueError("browser validation candidate binding is invalid")
+            workspace = Path(candidate.workspace)
+        config = self._config_for_run(run)
+        if not config.allow_browser_validation:
+            raise PermissionError(
+                "browser validation is disabled by allow_browser_validation"
+            )
+        selected_image = str(image or config.validation_container_image or "").strip()
+        record = self.browser_validations.validate(
+            BrowserValidationRequest(
+                run_id=run_id,
+                task_id=task_id,
+                candidate_id=candidate_id,
+                workspace=workspace,
+                image=selected_image,
+                start_command=start_command,
+                target_url=target_url,
+                assertions=tuple(
+                    BrowserAssertion(
+                        selector=str(item.get("selector") or ""),
+                        expectation=str(item.get("expectation") or ""),
+                        value=(
+                            None
+                            if item.get("value") is None
+                            else str(item.get("value"))
+                        ),
+                    )
+                    for item in assertions
+                ),
+                interactions=tuple(
+                    BrowserInteraction(
+                        action=str(item.get("action") or ""),
+                        selector=str(item.get("selector") or ""),
+                        value=(
+                            None
+                            if item.get("value") is None
+                            else str(item.get("value"))
+                        ),
+                    )
+                    for item in interactions
+                ),
+                allowed_domains=allowed_domains,
+                network_fixtures=network_fixtures or {},
+                timeout_seconds=timeout_seconds,
+            ),
+            expected_candidate_digest=expected_candidate_digest,
+        )
+        payload = record.to_payload()
+        self.events.publish(run_id, "browser.validation.completed", payload)
+        return payload
+
+    def _candidate_fanouts_for_run(self, run_id: str) -> list[CandidateFanoutRecord]:
+        with self.state._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT fanout_id FROM candidate_fanouts
+                WHERE run_id = ?
+                ORDER BY created_at ASC, fanout_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            self.candidate_fanouts.get_fanout(str(row["fanout_id"]))
+            for row in rows
+        ]
+
     def create_subagent(
         self, *, run_id: str, profile: str, goal: str, task_id: str | None = None
     ) -> dict[str, Any]:
@@ -2686,6 +3435,7 @@ class RunManager:
                 scheduler_outcome=_scheduler_run_outcome,
                 reconcile_root_task=self._reconcile_root_task,
                 is_cancelled=cancelled,
+                graph_amendments=self.graph_amendments,
             )
             try:
                 DurableOrchestrationRuntime(services).run_chat_turn(
@@ -2710,7 +3460,21 @@ class RunManager:
             )
             self._release_primary_reservation(run_id)
             return
-        current_approval = self._validated_approval_continuation(approval, arguments)
+        base_config = self._base_config_for_approval(approval, run_id)
+        if base_config is None:
+            self._record_unexecuted_approval(
+                approval,
+                arguments,
+                content="Approved tool continuation lost its run before validation.",
+                error="approval_continuation_interrupted",
+            )
+            self._release_primary_reservation(run_id)
+            return
+        current_approval = self._validated_approval_continuation(
+            approval,
+            arguments,
+            base_config=base_config,
+        )
         if current_approval is None:
             try:
                 scheduler_context = self._scheduler_approval_context(approval)
@@ -2796,10 +3560,15 @@ class RunManager:
                     arguments,
                     run.session_id,
                     scheduler_context,
+                    base_config,
                 )
             elif run.status == "completed":
                 self._run_approved_tool_for_terminal_run(
-                    config, approval, arguments, run.session_id
+                    config,
+                    approval,
+                    arguments,
+                    run.session_id,
+                    base_config=base_config,
                 )
             else:
                 self._record_unexecuted_approval(
@@ -2827,6 +3596,7 @@ class RunManager:
                     approval,
                     arguments,
                     run.session_id,
+                    base_config,
                 )
             else:
                 self._schedule_primary_run(
@@ -2837,6 +3607,7 @@ class RunManager:
                     arguments,
                     run.session_id,
                     scheduler_context,
+                    base_config,
                 )
         except Exception as exc:
             self._record_unexecuted_approval(
@@ -2854,10 +3625,26 @@ class RunManager:
         approval: dict[str, Any],
         arguments: dict[str, Any],
         session_id: str,
+        *,
+        base_config: AgentConfig | None = None,
     ) -> None:
         """Execute one atomically claimed manual approval after a terminal run."""
         run_id = str(approval["run_id"])
-        current_approval = self._validated_approval_continuation(approval, arguments)
+        if base_config is None:
+            base_config = self._base_config_for_approval(approval, run_id)
+            if base_config is None:
+                self._record_unexecuted_approval(
+                    approval,
+                    arguments,
+                    content="Approved tool lost its run before terminal execution.",
+                    error="approval_continuation_interrupted",
+                )
+                return
+        current_approval = self._validated_approval_continuation(
+            approval,
+            arguments,
+            base_config=base_config,
+        )
         if current_approval is None:
             self._record_unexecuted_approval(
                 approval,
@@ -2876,6 +3663,7 @@ class RunManager:
                 arguments,
                 session_id,
                 execution_origin="manual",
+                base_config=base_config,
             )
         except Exception as exc:  # noqa: BLE001
             error_text = str(redact_secrets(f"{type(exc).__name__}: {exc}"))
@@ -3069,6 +3857,7 @@ class RunManager:
         arguments: dict[str, Any],
         session_id: str,
         continuation_context: dict[str, str],
+        base_config: AgentConfig | None = None,
     ) -> None:
         """Resume the exact blocked scheduler worker after its tool approval."""
 
@@ -3111,7 +3900,11 @@ class RunManager:
             agent: NestedMV2Agent | None = None
             resumed = False
             try:
-                current_approval = self._validated_approval_continuation(approval, arguments)
+                current_approval = self._validated_approval_continuation(
+                    approval,
+                    arguments,
+                    base_config=base_config,
+                )
                 if current_approval is None:
                     raise RuntimeError("approval_invalid_before_task_continuation")
                 approval = current_approval
@@ -3158,12 +3951,14 @@ class RunManager:
                         scheduler_subagent_id=subagent_id,
                         run_lease_generation=lease.lease_generation,
                         execution_origin=f"subagent:{subagent_id}",
+                        base_config=base_config,
                     )
                     if (
                         self._validated_approval_continuation(
                             approval,
                             arguments,
                             phase="completed",
+                            base_config=base_config,
                         )
                         is None
                     ):
@@ -3237,6 +4032,8 @@ class RunManager:
                     "context_chars": result.context_chars,
                     "tool_count": len(combined_result.tool_executions),
                     "memory_writes": list(result.memory_writes),
+                    "provider_usage": result.provider_usage,
+                    "provider_attempts": [dict(item) for item in result.provider_attempts],
                     "acceptance_validation": validation,
                     "worker_isolation": worker_isolation,
                 }
@@ -3482,6 +4279,7 @@ class RunManager:
         approval: dict[str, Any],
         arguments: dict[str, Any],
         session_id: str,
+        base_config: AgentConfig | None = None,
     ) -> None:
         with self._approval_resume_lease(run_id, config) as lease:
             if lease is None:
@@ -3523,6 +4321,7 @@ class RunManager:
                 current_approval = self._validated_approval_continuation(
                     approval,
                     arguments,
+                    base_config=base_config,
                 )
                 if current_approval is None:
                     failed = self.state.transition_run(
@@ -3547,6 +4346,7 @@ class RunManager:
                     arguments,
                     session_id,
                     run_lease_generation=lease.lease_generation,
+                    base_config=base_config,
                 )
                 if self._is_cancelled(run_id) or not self.state.run_lease_matches(
                     run_id,
@@ -3559,6 +4359,7 @@ class RunManager:
                         approval,
                         arguments,
                         phase="completed",
+                        base_config=base_config,
                     )
                     is None
                 ):
@@ -3640,8 +4441,21 @@ class RunManager:
         *,
         phase: str = "pre_execution",
         claim_id: str | None = None,
+        base_config: AgentConfig | None = None,
     ) -> dict[str, Any] | None:
-        """Re-read and validate the durable exact-call grant before side effects."""
+        """Re-read and validate the durable exact-call grant before side effects.
+
+        Volatile per-process gates are evaluated against the run's durable
+        configuration snapshot. Exact arguments, principal, capability
+        revision, parent resource digests, and single-use claims remain live
+        fail-closed fences.
+        """
+
+        if base_config is None:
+            base_config = self._base_config_for_approval(approval)
+            if base_config is None:
+                return None
+        capabilities = self.capabilities.with_config(base_config)
 
         try:
             current = self.state.get_approval(str(approval["approval_id"]), expire=False)
@@ -3703,16 +4517,19 @@ class RunManager:
             return None
         if decision.get("principal") != current.get("principal"):
             return None
-        registry = self.build_registry()
+        registry = self.build_registry(base_config)
         spec = registry.spec_for(str(current["tool_name"]))
         if spec is None:
             return None
-        capability = self.capabilities.tool_decision(spec)
+        capability = capabilities.tool_decision(spec)
         if not capability.effective_enabled:
             return None
         if int(current.get("capability_revision", 0)) != capability.revision:
             return None
-        if str(current.get("resource_digest", "")) != self.tool_resource_digest(spec):
+        if str(current.get("resource_digest", "")) != self.tool_resource_digest(
+            spec,
+            base_config=base_config,
+        ):
             return None
         return current
 
@@ -3727,6 +4544,7 @@ class RunManager:
         scheduler_subagent_id: str | None = None,
         run_lease_generation: int | None = None,
         execution_origin: str = "primary",
+        base_config: AgentConfig | None = None,
     ) -> tuple[ToolCall, ToolExecution]:
         run_id = str(approval["run_id"])
         call = ToolCall(
@@ -3754,6 +4572,7 @@ class RunManager:
                 arguments,
                 phase="claimed",
                 claim_id=claim_id,
+                base_config=base_config,
             )
             is None
         ):
@@ -3824,6 +4643,14 @@ class RunManager:
         )
         heartbeat_thread.start()
         try:
+            if base_config is not None:
+                agent.tools.set_capability_gate(
+                    lambda spec: self._capability_gate(
+                        spec,
+                        config=base_config,
+                        anchor_volatile_config=True,
+                    )
+                )
             execution = agent.tools.execute(
                 call,
                 ToolContext(
@@ -3833,6 +4660,12 @@ class RunManager:
                     event_log=agent.event_log,
                     session_id=session_id,
                     run_id=run_id,
+                    project_id=agent.config.project_id,
+                    project_revision=agent.config.project_revision,
+                    project_baseline_index_digest=(
+                        agent.config.project_baseline_index_digest
+                    ),
+                    allowed_paths=agent.config.project_allowed_paths,
                     execution_origin=execution_origin,
                     approved_tool_call_ids=frozenset({call.id}),
                     approved_tool_call_arguments={call.id: arguments},
@@ -4177,6 +5010,8 @@ class RunManager:
                     "context_chars": result.context_chars,
                     "tool_count": len(result.tool_executions),
                     "memory_writes": list(result.memory_writes),
+                    "provider_usage": result.provider_usage,
+                    "provider_attempts": [dict(item) for item in result.provider_attempts],
                     "acceptance_validation": validation,
                     "worker_isolation": worker_isolation,
                     "approval_continuation": self._approval_continuation_for_task(
@@ -4213,6 +5048,10 @@ class RunManager:
             completed_result: dict[str, Any] = {
                 "assistant_message": result.assistant_message,
                 "stop_reason": result.stop_reason,
+                "context_chars": result.context_chars,
+                "tool_count": len(result.tool_executions),
+                "provider_usage": result.provider_usage,
+                "provider_attempts": [dict(item) for item in result.provider_attempts],
                 "acceptance_validation": validation,
                 "worker_isolation": worker_isolation,
             }
@@ -4481,6 +5320,8 @@ class RunManager:
                 "context_chars": result.context_chars,
                 "tool_count": len(result.tool_executions),
                 "memory_writes": list(result.memory_writes),
+                "provider_usage": result.provider_usage,
+                "provider_attempts": [dict(item) for item in result.provider_attempts],
                 "acceptance_validation": validation,
                 "worker_isolation": worker_isolation,
             }
@@ -4558,6 +5399,26 @@ class RunManager:
                 }.get(status, "subagent.completed"),
                 asdict(updated_subagent),
             )
+            if status == "failed":
+                amendment = self._propose_bounded_recovery(
+                    run_id=run.run_id,
+                    failed_task=updated_task,
+                    error=failure_reason or "task acceptance validation failed",
+                    diagnosis=dict(updated_task.diagnosis or {}),
+                )
+                if amendment is not None:
+                    return {
+                        "task_id": task.task_id,
+                        "subagent_id": subagent.subagent_id,
+                        "status": (
+                            "replanned"
+                            if amendment.status == "applied"
+                            else "recovery_approval_required"
+                        ),
+                        "failure_status": "failed",
+                        "error": failure_reason,
+                        "graph_amendment": amendment.to_payload(),
+                    }
             return {
                 "task_id": task.task_id,
                 "subagent_id": subagent.subagent_id,
@@ -4636,6 +5497,25 @@ class RunManager:
                     {"task_id": task.task_id, "source": "scheduler", **diagnosis},
                 )
                 self.events.publish(run.run_id, "subagent.failed", asdict(failed_subagent))
+                amendment = self._propose_bounded_recovery(
+                    run_id=run.run_id,
+                    failed_task=failed_task,
+                    error=error_text,
+                    diagnosis=diagnosis,
+                )
+                if amendment is not None:
+                    return {
+                        "task_id": task.task_id,
+                        "subagent_id": subagent.subagent_id,
+                        "status": (
+                            "replanned"
+                            if amendment.status == "applied"
+                            else "recovery_approval_required"
+                        ),
+                        "failure_status": "failed",
+                        "error": error_text,
+                        "graph_amendment": amendment.to_payload(),
+                    }
             return {
                 "task_id": task.task_id,
                 "subagent_id": subagent.subagent_id,
@@ -4647,6 +5527,58 @@ class RunManager:
         finally:
             if agent is not None:
                 self._close_agent_for_run(run.run_id, agent)
+
+    def _propose_bounded_recovery(
+        self,
+        *,
+        run_id: str,
+        failed_task: TaskNodeRecord,
+        error: str,
+        diagnosis: dict[str, Any],
+    ) -> GraphAmendmentRecord | None:
+        """Create one evidence-first retry without repeating a failed strategy."""
+
+        plan = dict(failed_task.plan or {})
+        if plan.get("disable_bounded_recovery") is True:
+            return None
+        try:
+            estimated = _bounded_recovery_budget(
+                plan.get("recovery_estimated_cost_usd", 0.01),
+                field="recovery_estimated_cost_usd",
+            )
+            preauthorized = _bounded_recovery_budget(
+                plan.get("preauthorized_recovery_budget_usd", 0.0),
+                field="preauthorized_recovery_budget_usd",
+            )
+            amendment = self.graph_amendments.propose_recovery(
+                run_id=run_id,
+                failed_task_id=failed_task.task_id,
+                error=error,
+                diagnosis=diagnosis,
+                actor="scheduler.RecoveryNode",
+                estimated_budget_delta_usd=estimated,
+                preauthorized_budget_usd=preauthorized,
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            self.events.publish(
+                run_id,
+                "graph.amendment.exhausted",
+                {
+                    "task_id": failed_task.task_id,
+                    "reason": str(redact_secrets(str(exc))),
+                },
+            )
+            return None
+        self.events.publish(
+            run_id,
+            (
+                "graph.amendment.applied"
+                if amendment.status == "applied"
+                else "graph.amendment.requested"
+            ),
+            amendment.to_payload(),
+        )
+        return amendment
 
     def _worker_config(
         self,
@@ -4669,8 +5601,15 @@ class RunManager:
         worktree_root = config.worker_worktree_dir
         if not worktree_root.is_absolute():
             worktree_root = run_workspace / worktree_root
+        candidate_isolation_id = (
+            str((task.plan or {}).get("candidate_isolation_worker_id") or "").strip()
+            if task is not None
+            else ""
+        )
         isolation_worker_id = (
-            "repair"
+            candidate_isolation_id
+            if candidate_isolation_id
+            else "repair"
             if task is not None and _task_requires_default_worker_isolation(task)
             else worker_id
         )
@@ -4694,9 +5633,18 @@ class RunManager:
         children = [task for task in tasks if task.parent_id == root.task_id]
         if not children:
             return
-        child_statuses = {task.status for task in children}
+        superseded_task_ids = {
+            str((task.plan or {}).get("replaces_task_id"))
+            for task in children
+            if str((task.plan or {}).get("replaces_task_id") or "").strip()
+        }
+        effective_children = [
+            task for task in children if task.task_id not in superseded_task_ids
+        ]
+        child_statuses = {task.status for task in effective_children}
         root_result = dict(root.result or {})
         root_result["child_statuses"] = sorted(child_statuses)
+        root_result["superseded_task_ids"] = sorted(superseded_task_ids)
         if any(status == "failed" for status in child_statuses):
             updated = self.state.update_task_node(root.task_id, status="failed", result=root_result)
             self.events.publish(run_id, "task.failed", _task_payload(updated))
@@ -4761,6 +5709,37 @@ class RunManager:
         stored_arguments = _approval_storage_arguments(raw_arguments)
         capability = self.capabilities.tool_decision(spec)
         resource_digest = self.tool_resource_digest(spec)
+        try:
+            packet_grant = self.approval_packets.consume_exact(
+                run_id=run_id,
+                tool_call_id=call.id,
+                tool_name=spec.name,
+                arguments=raw_arguments,
+                risk=spec.risk,
+                capability_revision=capability.revision,
+                resource_digest=resource_digest,
+            )
+        except ValueError:
+            # Packet identifiers and persisted arguments are intentionally
+            # stricter than arbitrary provider call IDs. Incompatible calls
+            # simply continue through the ordinary exact-call approval path.
+            packet_grant = None
+        if packet_grant is not None:
+            grant_payload = {
+                "runtime_exact_call_approved": True,
+                "packet_id": packet_grant.packet_id,
+                "packet_call_id": packet_grant.packet_call_id,
+                "call_digest": packet_grant.call_digest,
+                "capability_revision": packet_grant.capability_revision,
+                "resource_digest": packet_grant.resource_digest,
+            }
+            self.events.publish(run_id, "approval.packet_call_consumed", grant_payload)
+            return ToolExecution(
+                call=replace(call, name=spec.name, arguments=stored_arguments),
+                success=True,
+                content="Exact call authorized by the displayed approval packet.",
+                data=grant_payload,
+            )
         scheduler_continuation = getattr(
             self._execution_context,
             "scheduler_approval_context",
@@ -5108,12 +6087,43 @@ class RunManager:
                     base,
                     RuntimeSettings.from_mapping(run.config_snapshot, base),
                 )
+        project_allowed_paths: tuple[str, ...] = (".",)
+        project_baseline_index_digest: str | None = None
+        project_revision: int | None = None
+        if run.project_id is not None:
+            project = self.state.get_project(run.project_id)
+            if project.archived_at is not None:
+                raise ValueError("project-bound run references an archived project")
+            project_allowed_paths = project.allowed_paths
+            project_baseline_index_digest = project.baseline_index_digest
+            project_revision = project.revision
         return replace(
             base,
             workspace=Path(run.workspace),
+            project_id=run.project_id,
+            project_revision=project_revision,
+            project_baseline_index_digest=project_baseline_index_digest,
+            project_allowed_paths=project_allowed_paths,
             provider=run.provider,
             model=run.model,
         )
+
+    def _base_config_for_approval(
+        self, approval: dict[str, Any], run_id: str | None = None
+    ) -> AgentConfig | None:
+        """Resolve the owning run's durable config for approval continuation."""
+
+        resolved_run_id = run_id or str(approval.get("run_id") or "")
+        if not resolved_run_id:
+            return None
+        try:
+            run = self.state.get_run(resolved_run_id)
+        except KeyError:
+            return None
+        try:
+            return self._config_for_run(run)
+        except ValueError:
+            return None
 
     def _run_uses_autonomous_scheduler(self, run_id: str) -> bool:
         run = self.state.get_run(run_id)
@@ -5185,15 +6195,71 @@ class RunManager:
             *self.skills.tool_adapters(include_disabled=True),
         ]:
             registry.register(adapter)
-        registry.set_capability_gate(self._capability_gate)
+        registry.set_capability_gate(
+            lambda spec: self._capability_gate(spec, config=active_config)
+        )
         return registry
 
-    def _capability_gate(self, spec: ToolSpec) -> tuple[bool, str]:
-        decision = self.capabilities.tool_decision(spec)
-        if decision.effective_enabled:
+    def _capability_gate(
+        self,
+        spec: ToolSpec,
+        *,
+        config: AgentConfig | None = None,
+        anchor_volatile_config: bool = False,
+    ) -> tuple[bool, str]:
+        active_config = config or self.config
+        capabilities = (
+            self.capabilities.with_config(active_config)
+            if anchor_volatile_config
+            else self.capabilities
+        )
+        decision = capabilities.tool_decision(spec)
+        if not decision.effective_enabled:
+            blockers = ", ".join(decision.blocked_by) or "capability policy"
+            return False, f"Tool {spec.name} is disabled by {blockers}."
+        if active_config.project_id is None:
             return True, ""
-        blockers = ", ".join(decision.blocked_by) or "capability policy"
-        return False, f"Tool {spec.name} is disabled by {blockers}."
+        try:
+            project = self.state.get_project(active_config.project_id)
+            workspace = Path(active_config.workspace).resolve(strict=True)
+        except (KeyError, OSError, RuntimeError):
+            return (
+                False,
+                f"Tool {spec.name} is blocked because the project scope is unavailable.",
+            )
+        if project.archived_at is not None or str(workspace) != project.repository_path:
+            return (
+                False,
+                f"Tool {spec.name} is blocked because the project scope changed.",
+            )
+        if (
+            (
+                active_config.project_revision is not None
+                and active_config.project_revision != project.revision
+            )
+            or (
+                active_config.project_baseline_index_digest is not None
+                and active_config.project_baseline_index_digest
+                != project.baseline_index_digest
+            )
+        ):
+            return (
+                False,
+                f"Tool {spec.name} is blocked because the project revision or "
+                "repository-index baseline changed.",
+            )
+        missing_project_keys = [
+            key
+            for key in _project_capability_keys_for_tool(spec)
+            if key not in project.capability_ceiling
+        ]
+        if missing_project_keys:
+            return (
+                False,
+                f"Tool {spec.name} is outside the current project capability ceiling "
+                f"({', '.join(missing_project_keys)} is not allowed).",
+            )
+        return True, ""
 
     def _complete_capsule(
         self,
@@ -6093,6 +7159,8 @@ def _turn_payload(result: AgentTurnResult) -> dict[str, Any]:
         "memory_writes": list(result.memory_writes),
         "stop_reason": result.stop_reason,
         "proof_of_work": result.proof_of_work,
+        "provider_usage": result.provider_usage,
+        "provider_attempts": [dict(item) for item in result.provider_attempts],
     }
 
 
@@ -6159,6 +7227,21 @@ def _effective_config_snapshot(
         ).encode("utf-8")
     ).hexdigest()
     return payload
+
+
+def _project_capability_keys_for_tool(spec: ToolSpec) -> tuple[str, ...]:
+    keys = [f"tool:{spec.name}"]
+    if spec.source == "mcp":
+        if not spec.server_id:
+            keys.append("mcp_server:<missing>")
+        else:
+            keys.append(f"mcp_server:{spec.server_id}")
+    elif spec.source == "skill":
+        if not spec.skill_id:
+            keys.append("skill:<missing>")
+        else:
+            keys.append(f"skill:{spec.skill_id}")
+    return tuple(keys)
 
 
 def _run_autonomy_mode(run: RunRecord) -> str:
@@ -6247,9 +7330,23 @@ def _scheduler_run_outcome(scheduler: dict[str, Any]) -> tuple[str, str]:
         return "failed", stop_reason
     if stop_reason in {"scheduler_busy", "tasks_in_progress"}:
         return "running", stop_reason
-    if stop_reason in {"tool_approval_required", "task_approval_required", "cycle_limit_reached"}:
+    if stop_reason in {
+        "tool_approval_required",
+        "task_approval_required",
+        "graph_amendment_approval_required",
+        "cycle_limit_reached",
+    }:
         return "blocked", stop_reason
     return "completed", "scheduler_idle"
+
+
+def _bounded_recovery_budget(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    amount = float(value)
+    if not 0 <= amount <= 100_000:
+        raise ValueError(f"{field} must be between zero and 100000")
+    return amount
 
 
 def _repair_task_artifact(
@@ -6325,6 +7422,7 @@ def _project_repair_tool_artifact(
             return None
         artifact["validation_id"] = validation_id
         artifact["repair_snapshot"] = snapshot
+        artifact["success"] = validation.get("success") is True
         return artifact
 
     if tool_name == "repair.review":
@@ -6338,6 +7436,11 @@ def _project_repair_tool_artifact(
         if _sha256_digest(data.get("diff_digest")) != snapshot["diff_digest"]:
             return None
         changed_files, truncated = _repair_changed_files(data.get("changed_files"))
+        diff_preview = _repair_diff_preview_projection(
+            data.get("diff_preview"),
+            expected_diff_digest=snapshot["diff_digest"],
+            allowed_files=set(changed_files),
+        )
         commit_gate = data.get("commit_gate")
         artifact.update(
             {
@@ -6357,6 +7460,22 @@ def _project_repair_tool_artifact(
                 },
             }
         )
+        safe_summary = redact_secrets(str(data.get("summary", "")).strip())
+        if isinstance(safe_summary, str) and safe_summary:
+            artifact["summary"] = safe_summary[:4_096]
+        raw_risks = data.get("risks")
+        if isinstance(raw_risks, list):
+            safe_risks = redact_secrets(
+                [str(item).strip()[:2_048] for item in raw_risks[:32]]
+            )
+            if isinstance(safe_risks, list):
+                artifact["risks"] = [
+                    item
+                    for item in safe_risks
+                    if isinstance(item, str) and item
+                ]
+        if diff_preview is not None:
+            artifact["diff_preview"] = diff_preview
         return artifact
 
     if tool_name == "git.commit":
@@ -6546,6 +7665,56 @@ def _repair_changed_files(value: Any) -> tuple[list[str], bool]:
         safe_paths.add(candidate)
     ordered = sorted(safe_paths)
     return ordered[:_MAX_REPAIR_CHANGED_FILES], len(ordered) > _MAX_REPAIR_CHANGED_FILES
+
+
+def _repair_diff_preview_projection(
+    value: Any,
+    *,
+    expected_diff_digest: str,
+    allowed_files: set[str],
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    content = value.get("content")
+    if (
+        value.get("format") != "unified"
+        or not isinstance(content, str)
+        or len(content) > _MAX_REPAIR_DIFF_PREVIEW_CHARS
+        or "\x00" in content
+        or any(
+            ord(character) < 32 and character not in {"\n", "\r", "\t"}
+            for character in content
+        )
+        or str(redact_secrets(content)) != content
+        or value.get("bound_diff_digest") != expected_diff_digest
+        or value.get("redacted") is not True
+        or value.get("authoritative") is not False
+    ):
+        return None
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if value.get("sha256") != content_sha256:
+        return None
+    included_files, included_truncated = _repair_changed_files(value.get("included_files"))
+    if included_truncated or not set(included_files).issubset(allowed_files):
+        return None
+    omitted_files = value.get("omitted_files")
+    if (
+        isinstance(omitted_files, bool)
+        or not isinstance(omitted_files, int)
+        or not 0 <= omitted_files <= 10_000
+    ):
+        return None
+    return {
+        "format": "unified",
+        "content": content,
+        "sha256": content_sha256,
+        "bound_diff_digest": expected_diff_digest,
+        "redacted": True,
+        "authoritative": False,
+        "truncated": value.get("truncated") is True,
+        "included_files": included_files,
+        "omitted_files": omitted_files,
+    }
 
 
 def _bounded_artifact_text(value: Any, *, max_chars: int) -> str | None:
@@ -6913,6 +8082,81 @@ def _initial_task_plan(
             "acceptance_criteria": ["Remaining risks or next steps are explicit."],
         },
     ]
+
+
+def _bounded_mission_text(
+    value: object,
+    *,
+    field_name: str,
+    maximum: int,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum or any(
+        not character.isprintable() and character not in "\n\t"
+        for character in normalized
+    ):
+        raise ValueError(
+            f"{field_name} must contain between 1 and {maximum} printable characters"
+        )
+    return normalized
+
+
+def _mission_string_sequence(
+    value: object,
+    *,
+    field_name: str,
+    maximum_items: int,
+    maximum_chars: int,
+    minimum_items: int = 0,
+) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{field_name} must be a sequence")
+    if not minimum_items <= len(value) <= maximum_items:
+        raise ValueError(
+            f"{field_name} must contain between {minimum_items} and "
+            f"{maximum_items} items"
+        )
+    return tuple(
+        _bounded_mission_text(
+            item,
+            field_name=f"{field_name} item",
+            maximum=maximum_chars,
+        )
+        for item in value
+    )
+
+
+def _assert_acyclic_mission_plan(tasks: Sequence[Mapping[str, Any]]) -> None:
+    dependencies = {
+        str(task["task_id"]): tuple(str(item) for item in task["dependencies"])
+        for task in tasks
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(task_id: str) -> None:
+        if task_id in visited:
+            return
+        if task_id in visiting:
+            raise ValueError("mission_plan dependencies must be acyclic")
+        visiting.add(task_id)
+        for dependency in dependencies[task_id]:
+            visit(dependency)
+        visiting.remove(task_id)
+        visited.add(task_id)
+
+    for task_id in dependencies:
+        visit(task_id)
+
+
+def _mission_task_profile(source_task_id: str) -> str:
+    if source_task_id in {"review", "synthesize"}:
+        return "reviewer"
+    if source_task_id in {"map", "trace", "understand"}:
+        return "planner"
+    return "worker"
 
 
 def _looks_like_repair_commit_request(message: str) -> bool:

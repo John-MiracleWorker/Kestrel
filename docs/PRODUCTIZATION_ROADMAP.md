@@ -1,6 +1,6 @@
 # Kestrel Productization Roadmap
 
-Last updated: 2026-05-21
+Last updated: 2026-07-28
 
 This is the long-horizon full-product roadmap, including hosted/team capabilities. It is not the release gate for the supported single-user, single-node local/private profile; use `docs/PRODUCTION_OPERATIONS.md` and the latest dated readiness review for that decision.
 
@@ -275,7 +275,7 @@ Tasks:
 3. Create a demo repo fixture with known failure and expected repair. ✅ `examples/golden_repair_demo` seeds a deterministic failing test plus expected fix patch.
 4. Finish branch/worktree isolated repair run as the default for code modification. ✅ Repair/code-modification scheduler tasks now default to git worktree isolation when the workspace supports worktrees.
 5. Persist a coherent repair workspace across the full repair DAG instead of creating a separate worker worktree per isolated task. ✅ Repair DAG tasks now reuse one coherent git worktree for the run.
-6. Add patch review UI with validation and rollback state.
+6. Add patch review UI with validation and rollback state. ✅ Mission Control renders strict projected validation/review evidence, redacted unified/split diff, risk, rollback, and exact-call local commit/export actions.
 7. Add support bundle export. ✅ `nest-agent product support-bundle` and `POST /api/product/support-bundle` now generate redacted local diagnostic archives.
 8. Add provider certification reporting. ✅ `nest-agent product provider-certification` and `GET /api/product/provider-certification` now expose redacted per-provider status and live-validation commands.
 9. Add durable per-tool, MCP-server, and skill controls. ✅ The Settings Capability Center and revisioned capability API expose configured/effective state, blockers, default-off dynamic capabilities, and change history for the local single-owner profile.
@@ -312,39 +312,29 @@ Tasks:
 4. Billing/limits if commercialized.
 5. Production monitoring and incident playbooks.
 
-## First implementation slice
+## Current integrated usefulness slice — v0.5 through v0.7
 
-The first implementation slice is deliberately low-risk:
+The “first useful hour” slice now joins previously separate runtime capabilities:
 
-> Add a product-readiness checklist/report that makes alpha-to-product gaps visible from CLI/API/UI without changing runtime behavior.
+- task-first Mission Control with local project selection, objective templates, preflight, editable acceptance plan, and one run timeline;
+- schema-v21 local project profiles that narrow repository paths, capability ceiling, budget, provider policy, and validation recipes;
+- a digest-keyed, rebuildable structural repository index with freshness-bound, intent-aware
+  definition/reference/import/test context packs and a seven-language recall@5 CI gate;
+- bounded local/OpenAI-compatible provider discovery, evidence-tagged probes, disabled target drafts, stale-model handling, and constraining presets;
+- strict review projections with exact reviewed-candidate patch export and local commit preparation;
+- repeat-run determinism reporting, Windows doctor/bootstrap diagnostics, and disposable release rehearsal.
 
-Why first:
+The roadmap release sequence is now represented by integrated, default-safe local
+implementation slices:
 
-- It turns this roadmap into an operational dashboard.
-- It gives every future implementation pass a visible target.
-- It is read-only and safe.
-- It avoids pretending the product is done while surfacing real progress.
+1. **v0.6 — Adaptive Flock Learns:** ✅ provider usage/cost attribution, durable learned-router shadow integration, per-project/family/risk/capability calibration, savings/regret evidence, failure-specific escalation, evidence-gated low/medium-risk constrained routing, project-scoped memory retrieval, and a readable comparison dashboard. Learned activation remains default-off until its explicit replay gate is verified.
+2. **v0.7 — Parallel Flock:** ✅ bounded durable graph amendments, isolated candidate fan-out and evidence-ranked selection, digest-bound OCI browser validation, per-call approval packets, private benchmarks/outcome analytics, and review-bound GitHub PR/CI feedback are wired through the API and Mission Control. Provider-authored graph changes and candidate generation remain bounded by the existing planner/worker integrations rather than receiving new authority.
+3. **Later ecosystem work:** ✅ extension manifests now carry reviewable dependency locks, compatibility constraints, signature/source provenance, authority deltas, and reproducible install receipts; proactive routines now support five-field cron in named timezones plus durable idempotent delivery and explicit reconciliation. Portable non-Docker containment and automatic third-party dependency installation remain separate hardening work.
 
-Initial checklist categories:
-
-- local product stability
-- golden repair workflow
-- safe autonomous learning
-- production auth/workspaces
-- sandboxed extensibility
-- provider certification
-- product UX/onboarding
-- operations/release engineering
-- channels/ingress
-- metrics/proof
-
-The report should classify each category as:
-
-- `ready`
-- `partial`
-- `missing`
-
-and include evidence, remaining work, and recommended next action.
+These are implementation slices, not a `v0.5`, `v0.6`, or `v0.7`
+publication claim. The dated implementation reviews record exact local
+evidence and limitations; they are not release publication, hosted CI
+evidence, or live-provider certification.
 
 ## Product definition of done
 

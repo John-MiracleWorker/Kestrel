@@ -5,6 +5,7 @@ import os
 import runpy
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -89,7 +90,21 @@ def _run_install(
     cwd: Path = ROOT,
 ) -> subprocess.CompletedProcess[str]:
     install_env = os.environ.copy()
-    install_env.update(env or {})
+    requested_env = env or {}
+    install_env.update(requested_env)
+    if "HOME" not in requested_env and requested_env.get("KESTREL_HOME"):
+        # Editable installs expose a real `kestrel` console script beside the
+        # test interpreter. Give installer tests a fresh user boundary so
+        # PATH discovery cannot collide with or mutate that runner-owned file.
+        install_env["HOME"] = str(Path(requested_env["KESTREL_HOME"]).parent)
+    if "KESTREL_BIN_DIR" not in requested_env and requested_env.get("KESTREL_HOME"):
+        # Hosted Python toolcache directories are valid writable PATH entries,
+        # but their editable-install console scripts belong to the runner.
+        # Installer tests always target a disposable launcher directory unless
+        # a case explicitly supplies its own selection contract.
+        install_env["KESTREL_BIN_DIR"] = str(
+            Path(install_env["HOME"]) / ".local" / "bin"
+        )
     return subprocess.run(
         ["bash", str(install), *(args or [])],
         cwd=cwd,
@@ -155,6 +170,32 @@ def _run_installer_function(
         capture_output=True,
         check=False,
     )
+
+
+def _fake_launcher_helper_fetch(
+    tmp_path: Path,
+    *,
+    payload: bytes | None = None,
+) -> dict[str, str]:
+    tools = tmp_path / "fake-fetch-tools"
+    tools.mkdir()
+    helper = tmp_path / "fetched-manage-user-launchers.py"
+    helper.write_bytes(
+        payload
+        if payload is not None
+        else (ROOT / "scripts" / "manage_user_launchers.py").read_bytes()
+    )
+    curl = tools / "curl"
+    curl.write_text(
+        "#!/bin/bash\n"
+        'exec /bin/cat -- "$FAKE_LAUNCHER_HELPER_PATH"\n',
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    return {
+        "PATH": f"{tools}{os.pathsep}{os.environ.get('PATH', '')}",
+        "FAKE_LAUNCHER_HELPER_PATH": str(helper),
+    }
 
 
 def _stage_release_installer(
@@ -625,6 +666,7 @@ def test_install_help_documents_github_curl_and_options() -> None:
         "KESTREL_SKIP_SMOKE",
         "KESTREL_START_SERVER",
         "KESTREL_OPEN_BROWSER",
+        "KESTREL_BIN_DIR",
         "KESTREL_SERVER_SESSION",
         "KESTREL_SERVER_LOG",
         "KESTREL_SERVER_PID",
@@ -634,6 +676,558 @@ def test_install_help_documents_github_curl_and_options() -> None:
         "KESTREL_DRY_RUN",
     ]:
         assert option in result.stdout
+
+
+def test_installer_embeds_the_exact_launcher_helper_checksum() -> None:
+    canonical_helper = (
+        ROOT / "scripts" / "manage_user_launchers.py"
+    ).read_bytes().replace(b"\r\n", b"\n")
+    helper_digest = hashlib.sha256(
+        canonical_helper
+    ).hexdigest()
+    text = INSTALL.read_text(encoding="utf-8")
+
+    assert f'DEFAULT_LAUNCHER_HELPER_SHA256="{helper_digest}"' in text
+
+
+def test_installer_uses_local_launcher_helper_only_for_a_real_source_file() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    dry_run_selection = text.split(
+        "# A dry run must use the helper belonging to this installer",
+        maxsplit=1,
+    )[1].split("elif [[", maxsplit=1)[0]
+
+    assert '-f "$installer_source"' in dry_run_selection
+    assert '! -L "$installer_source"' in dry_run_selection
+    assert '"$installer_source" != "/dev/stdin"' in dry_run_selection
+
+
+def _launcher_transaction_home(tmp_path: Path) -> tuple[Path, Path, Path]:
+    home = tmp_path / "home"
+    scripts = home / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "manage_user_launchers.py", scripts)
+    executable = home / ".venv" / "bin" / "kestrel"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    bin_dir = user_home / "bin"
+    return home, user_home, bin_dir
+
+
+@POSIX_SHELL_ONLY
+def test_installer_user_launcher_transaction_commits_managed_shim(
+    tmp_path: Path,
+) -> None:
+    home, user_home, bin_dir = _launcher_transaction_home(tmp_path)
+    state_path = home / ".nest" / "custom-state" / "agent.db"
+    port = _unused_local_port()
+
+    result = _run_installer_function(
+        (
+            "start_release_install_transaction; "
+            "prepare_user_launchers; "
+            "finalize_release_install_transaction; "
+            "finish_post_commit_maintenance"
+        ),
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=port,
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+            "KESTREL_STATE_PATH": str(state_path),
+        },
+    )
+
+    shim = bin_dir / "kestrel"
+    assert result.returncode == 0, result.stderr
+    assert shim.is_file()
+    shim_text = shim.read_text(encoding="utf-8")
+    assert "KESTREL_MANAGED_COMMAND_SHIM_V1" in shim_text
+    assert f"export KESTREL_PORT={port}" in shim_text
+    assert f"export NEST_AGENT_STATE_PATH={state_path}" in shim_text
+    assert f"export NEST_AGENT_MEMORY_DIR={home / '.nest' / 'memory'}" in shim_text
+    assert not (home / ".nest" / "user-launchers.install.json").exists()
+
+
+@POSIX_SHELL_ONLY
+def test_installer_failure_rolls_back_new_user_launchers(
+    tmp_path: Path,
+) -> None:
+    home, user_home, bin_dir = _launcher_transaction_home(tmp_path)
+
+    result = _run_installer_function(
+        "start_release_install_transaction; prepare_user_launchers; false",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+
+    assert result.returncode != 0
+    assert not (bin_dir / "kestrel").exists()
+    assert not (home / ".nest" / "user-launchers.install.json").exists()
+    assert "Rolled back Kestrel user launchers" in result.stdout
+
+
+@POSIX_SHELL_ONLY
+def test_installer_term_during_launcher_prepare_restores_predecessor(
+    tmp_path: Path,
+) -> None:
+    home, user_home, bin_dir = _launcher_transaction_home(tmp_path)
+    port = _unused_local_port()
+    initial = _run_installer_function(
+        (
+            "start_release_install_transaction; prepare_user_launchers; "
+            "finalize_release_install_transaction; finish_post_commit_maintenance"
+        ),
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=port,
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+    assert initial.returncode == 0, initial.stderr
+    shim = bin_dir / "kestrel"
+    predecessor_shim = shim.read_bytes()
+    app = user_home / "Applications" / "Kestrel.app"
+    predecessor_app = {
+        path.relative_to(app): path.read_bytes()
+        for path in app.rglob("*")
+        if path.is_file()
+    } if app.exists() else {}
+
+    ready = tmp_path / "launcher-prepare-ready"
+    release = tmp_path / "release-launcher-prepare"
+    manager = home / "scripts" / "manage_user_launchers.py"
+    manager.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import os, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            f"real = {str(ROOT / 'scripts' / 'manage_user_launchers.py')!r}\n"
+            "completed = subprocess.run(\n"
+            "    [sys.executable, real, *sys.argv[1:]],\n"
+            "    stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
+            ")\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'prepare' and completed.returncode == 0:\n"
+            "    Path(os.environ['READY_FILE']).touch()\n"
+            "    while not Path(os.environ['RELEASE_FILE']).exists():\n"
+            "        time.sleep(0.01)\n"
+            "sys.stdout.buffer.write(completed.stdout)\n"
+            "sys.stderr.buffer.write(completed.stderr)\n"
+            "raise SystemExit(completed.returncode)\n"
+        ),
+        encoding="utf-8",
+    )
+    manifest = home / ".nest" / "user-launchers.install.json"
+    pid_file = home / ".nest" / "server.pid"
+    environment = {
+        **_clean_kestrel_env(),
+        "HOME": str(user_home),
+        "KESTREL_HOME": str(home),
+        "KESTREL_STATE_PATH": str(home / ".nest" / "state" / "agent.db"),
+        "KESTREL_SERVER_PID": str(pid_file),
+        "KESTREL_SERVER_SUPERVISOR_PID": str(
+            pid_file.with_name("server.supervisor.pid")
+        ),
+        "KESTREL_SERVER_PROCESS_GROUP": str(pid_file.with_name("server.pgid")),
+        "KESTREL_SERVER_LOG": str(pid_file.with_name("server.log")),
+        "KESTREL_SERVER_SESSION": "kestrel-installer-test",
+        "KESTREL_PORT": str(port),
+        "KESTREL_BIN_DIR": str(bin_dir),
+        "KESTREL_START_SERVER": "0",
+        "KESTREL_DRY_RUN": "0",
+        "PYTHON_BIN": sys.executable,
+        "READY_FILE": str(ready),
+        "RELEASE_FILE": str(release),
+    }
+    installer = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; start_release_install_transaction; '
+                "prepare_user_launchers; finalize_release_install_transaction; "
+                "finish_post_commit_maintenance"
+            ),
+            "bash",
+            str(INSTALL),
+        ],
+        cwd=home,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_file(ready)
+        assert manifest.is_file()
+        assert shim.read_bytes() != predecessor_shim
+        installer.send_signal(signal.SIGTERM)
+        release.touch()
+        stdout, stderr = installer.communicate(timeout=15)
+    finally:
+        release.touch(exist_ok=True)
+        _stop_process(installer)
+
+    assert installer.returncode == 143, f"{stdout}\n{stderr}"
+    assert shim.read_bytes() == predecessor_shim
+    if predecessor_app:
+        assert {
+            path.relative_to(app): path.read_bytes()
+            for path in app.rglob("*")
+            if path.is_file()
+        } == predecessor_app
+    assert not manifest.exists()
+    assert not list(bin_dir.glob(".kestrel-stage-*"))
+    assert not list(bin_dir.glob(".kestrel-backup-*"))
+    assert not list((user_home / "Applications").glob(".kestrel-stage-*"))
+    assert not list((user_home / "Applications").glob(".kestrel-backup-*"))
+    assert "Rolled back Kestrel user launchers" in stdout
+
+
+@POSIX_SHELL_ONLY
+def test_installer_helper_failure_with_manifest_restores_predecessor(
+    tmp_path: Path,
+) -> None:
+    home, user_home, bin_dir = _launcher_transaction_home(tmp_path)
+    port = _unused_local_port()
+    initial = _run_installer_function(
+        (
+            "start_release_install_transaction; prepare_user_launchers; "
+            "finalize_release_install_transaction; finish_post_commit_maintenance"
+        ),
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=port,
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+    assert initial.returncode == 0, initial.stderr
+    shim = bin_dir / "kestrel"
+    predecessor = shim.read_bytes()
+
+    manager = home / "scripts" / "manage_user_launchers.py"
+    manager.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import subprocess, sys\n"
+            f"real = {str(ROOT / 'scripts' / 'manage_user_launchers.py')!r}\n"
+            "completed = subprocess.run(\n"
+            "    [sys.executable, real, *sys.argv[1:]],\n"
+            "    stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
+            ")\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'prepare' and completed.returncode == 0:\n"
+            "    sys.stderr.write('simulated post-prepare helper failure\\n')\n"
+            "    raise SystemExit(73)\n"
+            "sys.stdout.buffer.write(completed.stdout)\n"
+            "sys.stderr.buffer.write(completed.stderr)\n"
+            "raise SystemExit(completed.returncode)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_installer_function(
+        "start_release_install_transaction; prepare_user_launchers",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=port,
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "simulated post-prepare helper failure" in result.stderr
+    assert shim.read_bytes() == predecessor
+    assert not (home / ".nest" / "user-launchers.install.json").exists()
+    assert not list(bin_dir.glob(".kestrel-stage-*"))
+    assert not list(bin_dir.glob(".kestrel-backup-*"))
+    assert "Rolled back Kestrel user launchers" in result.stdout
+
+
+@POSIX_SHELL_ONLY
+def test_installer_helper_failure_before_manifest_proves_no_public_mutation(
+    tmp_path: Path,
+) -> None:
+    home, user_home, bin_dir = _launcher_transaction_home(tmp_path)
+    manager = home / "scripts" / "manage_user_launchers.py"
+    manager.write_text(
+        (
+            "#!/usr/bin/env python3\n"
+            "import subprocess, sys\n"
+            f"real = {str(ROOT / 'scripts' / 'manage_user_launchers.py')!r}\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'prepare':\n"
+            "    sys.stderr.write('simulated pre-manifest helper failure\\n')\n"
+            "    raise SystemExit(74)\n"
+            "raise SystemExit(subprocess.run([sys.executable, real, *sys.argv[1:]]).returncode)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_installer_function(
+        "start_release_install_transaction; prepare_user_launchers",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "simulated pre-manifest helper failure" in result.stderr
+    assert not (bin_dir / "kestrel").exists()
+    assert not (home / ".nest" / "user-launchers.install.json").exists()
+    assert "Verified that no public Kestrel launcher mutation" in result.stdout
+
+
+@POSIX_SHELL_ONLY
+def test_installer_refuses_unrelated_user_launcher_without_mutation(
+    tmp_path: Path,
+) -> None:
+    home, user_home, bin_dir = _launcher_transaction_home(tmp_path)
+    bin_dir.mkdir()
+    unrelated = bin_dir / "kestrel"
+    unrelated.write_bytes(b"#!/bin/sh\necho unrelated\n")
+    before = unrelated.read_bytes()
+
+    result = _run_installer_function(
+        "start_release_install_transaction; prepare_user_launchers",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+
+    assert result.returncode != 0
+    assert unrelated.read_bytes() == before
+    assert "unrelated existing launcher" in result.stderr
+
+
+@POSIX_SHELL_ONLY
+def test_installer_dry_run_reports_user_launchers_without_mutation(
+    tmp_path: Path,
+) -> None:
+    home, user_home, bin_dir = _launcher_transaction_home(tmp_path)
+
+    result = _run_installer_function(
+        "start_release_install_transaction; prepare_user_launchers",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+        dry_run=True,
+        extra_env={
+            "HOME": str(user_home),
+            "KESTREL_BIN_DIR": str(bin_dir),
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "DRY RUN: would install the Kestrel command shim" in result.stdout
+    assert str(bin_dir / "kestrel") in result.stdout
+    assert not (bin_dir / "kestrel").exists()
+
+
+@POSIX_SHELL_ONLY
+def test_installer_dry_run_uses_helper_path_selection_without_mutation(
+    tmp_path: Path,
+) -> None:
+    home, user_home, _bin_dir = _launcher_transaction_home(tmp_path)
+    preferred = user_home / "preferred-path-bin"
+    preferred.mkdir()
+    fallback = user_home / ".local" / "bin"
+    before = sorted(path.relative_to(user_home) for path in user_home.rglob("*"))
+
+    result = _run_installer_function(
+        "start_release_install_transaction; prepare_user_launchers",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+        dry_run=True,
+        extra_env={
+            "HOME": str(user_home),
+            "PATH": f"{preferred}{os.pathsep}{os.environ.get('PATH', '')}",
+            "KESTREL_BIN_DIR": "",
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert str(preferred / "kestrel") in result.stdout
+    assert str(fallback / "kestrel") not in result.stdout
+    assert sorted(path.relative_to(user_home) for path in user_home.rglob("*")) == before
+    assert not fallback.exists()
+
+
+@POSIX_SHELL_ONLY
+def test_installer_dry_run_reports_launcher_collision_without_mutation(
+    tmp_path: Path,
+) -> None:
+    home, user_home, _bin_dir = _launcher_transaction_home(tmp_path)
+    preferred = user_home / "preferred-path-bin"
+    preferred.mkdir()
+    unrelated = preferred / "kestrel"
+    unrelated.write_text("#!/bin/sh\necho unrelated\n", encoding="utf-8")
+    before = unrelated.read_bytes()
+
+    result = _run_installer_function(
+        "start_release_install_transaction; prepare_user_launchers",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=_unused_local_port(),
+        dry_run=True,
+        extra_env={
+            "HOME": str(user_home),
+            "PATH": f"{preferred}{os.pathsep}{os.environ.get('PATH', '')}",
+            "KESTREL_BIN_DIR": "",
+            "KESTREL_START_SERVER": "0",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "unrelated existing launcher" in result.stderr
+    assert unrelated.read_bytes() == before
+    assert not list(preferred.glob(".kestrel-*"))
+
+
+@POSIX_SHELL_ONLY
+def test_installer_easy_launch_invokes_product_facade_with_browser_choice(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    opened = _run_installer_function(
+        "launch_kestrel_facade",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=18765,
+        dry_run=True,
+        extra_env={
+            "KESTREL_START_SERVER": "1",
+            "KESTREL_OPEN_BROWSER": "1",
+        },
+    )
+    headless = _run_installer_function(
+        "launch_kestrel_facade",
+        home=home,
+        pid_file=home / ".nest" / "server.pid",
+        port=18765,
+        dry_run=True,
+        extra_env={
+            "KESTREL_START_SERVER": "1",
+            "KESTREL_OPEN_BROWSER": "0",
+        },
+    )
+
+    assert opened.returncode == 0, opened.stderr
+    assert ".venv/bin/kestrel --home" in opened.stdout
+    assert "--port 18765 open" in opened.stdout
+    assert "--no-browser" not in opened.stdout
+    assert headless.returncode == 0, headless.stderr
+    assert "--port 18765 open --no-browser" in headless.stdout
+
+
+def test_installer_orders_launchers_inside_release_transaction() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    main_body = text.split("main() {", maxsplit=1)[1]
+    finalize_body = text.split(
+        "finalize_release_install_transaction() {",
+        maxsplit=1,
+    )[1].split("finish_post_commit_maintenance() {", maxsplit=1)[0]
+    trap_body = text.split(
+        "release_install_exit_trap() {",
+        maxsplit=1,
+    )[1].split("start_release_install_transaction() {", maxsplit=1)[0]
+
+    assert main_body.index("commit_staged_state") < main_body.index(
+        "prepare_user_launchers"
+    )
+    assert main_body.index("prepare_user_launchers") < main_body.index(
+        "launch_kestrel_facade"
+    )
+    assert finalize_body.index("commit_user_launchers") < finalize_body.index(
+        "RELEASE_TRANSACTION_ACTIVE=0"
+    )
+    assert "rollback_user_launchers" in trap_body
+
+
+def test_installer_next_steps_keep_product_facade_dominant_with_advanced_handoff() -> None:
+    text = INSTALL.read_text(encoding="utf-8")
+    next_steps = text.split("print_next_steps() {", maxsplit=1)[1].split(
+        "main() {",
+        maxsplit=1,
+    )[0]
+
+    for command in (
+        "kestrel open",
+        "kestrel status",
+        "kestrel chat",
+        "kestrel doctor",
+        "kestrel stop",
+    ):
+        assert command in next_steps
+    assert 'kill "\\$(cat' not in next_steps
+    assert 'advanced_cli="${KESTREL_HOME}/.venv/bin/nest-agent"' in next_steps
+    assert "${advanced_cli} --help" in next_steps
+    assert "README.md#advanced-nest-agent-operation" in next_steps
+    assert ".venv/bin/nest-agent chat" not in next_steps
+    assert ".venv/bin/nest-agent server" not in next_steps
+
+
+@POSIX_SHELL_ONLY
+def test_installer_custom_lifecycle_completion_avoids_facade_management_claims(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    custom_root = tmp_path / "custom-lifecycle"
+    result = _run_installer_function(
+        "INSTALLED_KESTREL_BIN_ON_PATH=1; print_next_steps",
+        home=home,
+        pid_file=custom_root / "server.pid",
+        port=19422,
+        extra_env={
+            "KESTREL_START_SERVER": "1",
+            "KESTREL_SERVER_LOG": str(custom_root / "server.log"),
+            "KESTREL_SERVER_PID": str(custom_root / "server.pid"),
+            "KESTREL_SERVER_SUPERVISOR_PID": str(custom_root / "supervisor.pid"),
+            "KESTREL_SERVER_PROCESS_GROUP": str(custom_root / "server.pgid"),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "custom lifecycle metadata" in result.stdout
+    assert str(custom_root / "server.pid") in result.stdout
+    assert "kestrel status" not in result.stdout
+    assert "kestrel stop" not in result.stdout
+    assert "kestrel open" not in result.stdout
+    assert "nest-agent --help" in result.stdout
 
 
 @POSIX_SHELL_ONLY
@@ -693,6 +1287,7 @@ def test_install_resolves_the_runtime_state_path_from_kestrel_home(
         env={
             "KESTREL_DRY_RUN": "1",
             "KESTREL_HOME": str(home),
+            "KESTREL_START_SERVER": "1",
             "NEST_AGENT_STATE_PATH": str(configured),
         }
     )
@@ -700,21 +1295,192 @@ def test_install_resolves_the_runtime_state_path_from_kestrel_home(
     expected = configured if absolute else home / configured
     assert result.returncode == 0, result.stderr
     assert f"state: {expected}" in result.stdout
-    assert f'--state-path "{expected}"' in result.stdout
+    assert f"NEST_AGENT_STATE_PATH={expected}" in result.stdout
 
 
 @POSIX_SHELL_ONLY
 def test_documented_stdin_installer_path_executes_main(tmp_path: Path) -> None:
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    preferred_bin = user_home / "preferred-bin"
+    preferred_bin.mkdir()
+    fetch_environment = _fake_launcher_helper_fetch(tmp_path)
+    fetch_environment["PATH"] = (
+        f"{fetch_environment['PATH'].split(os.pathsep, maxsplit=1)[0]}"
+        f"{os.pathsep}{preferred_bin}"
+        f"{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+    before = sorted(path.relative_to(user_home) for path in user_home.rglob("*"))
     result = _run_install_stdin(
         env={
+            **fetch_environment,
+            "HOME": str(user_home),
             "KESTREL_DRY_RUN": "1",
-            "KESTREL_HOME": str(tmp_path / "kestrel-home"),
+            "KESTREL_HOME": str(user_home / "kestrel-home"),
         }
     )
 
     assert result.returncode == 0, result.stderr
     assert "[kestrel-install] Install plan:" in result.stdout
     assert "DRY RUN" in result.stdout
+    assert str(preferred_bin / "kestrel") in result.stdout
+    if sys.platform == "darwin":
+        assert str(user_home / "Applications" / "Kestrel.app") in result.stdout
+    assert sorted(path.relative_to(user_home) for path in user_home.rglob("*")) == before
+
+
+@POSIX_SHELL_ONLY
+def test_stdin_dry_run_reports_collision_without_filesystem_mutation(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    preferred_bin = user_home / "preferred-bin"
+    preferred_bin.mkdir()
+    collision = preferred_bin / "kestrel"
+    collision.write_text("#!/bin/sh\necho unrelated\n", encoding="utf-8")
+    fetch_environment = _fake_launcher_helper_fetch(tmp_path)
+    fetch_environment["PATH"] = (
+        f"{fetch_environment['PATH'].split(os.pathsep, maxsplit=1)[0]}"
+        f"{os.pathsep}{preferred_bin}"
+        f"{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+    before = {
+        path.relative_to(user_home): (
+            path.read_bytes() if path.is_file() else None
+        )
+        for path in user_home.rglob("*")
+    }
+
+    result = _run_install_stdin(
+        env={
+            **fetch_environment,
+            "HOME": str(user_home),
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(user_home / "kestrel-home"),
+        }
+    )
+
+    assert result.returncode != 0
+    assert "unrelated existing launcher" in result.stderr
+    assert {
+        path.relative_to(user_home): (
+            path.read_bytes() if path.is_file() else None
+        )
+        for path in user_home.rglob("*")
+    } == before
+    assert "would install the Kestrel command shim" not in result.stdout
+
+
+@POSIX_SHELL_ONLY
+def test_stdin_dry_run_rejects_unverified_helper_without_target_claim(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    preferred_bin = user_home / "preferred-bin"
+    preferred_bin.mkdir()
+    fetch_environment = _fake_launcher_helper_fetch(
+        tmp_path,
+        payload=b"print('tampered helper')\n",
+    )
+    fetch_environment["PATH"] = (
+        f"{fetch_environment['PATH'].split(os.pathsep, maxsplit=1)[0]}"
+        f"{os.pathsep}{preferred_bin}"
+        f"{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+
+    result = _run_install_stdin(
+        env={
+            **fetch_environment,
+            "HOME": str(user_home),
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(user_home / "kestrel-home"),
+        }
+    )
+
+    assert result.returncode != 0
+    assert "launcher helper checksum mismatch" in result.stderr
+    assert "would install the Kestrel command shim" not in result.stdout
+
+
+@POSIX_SHELL_ONLY
+def test_stdin_planner_ignores_hostile_curl_and_python_configuration(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user"
+    user_home.mkdir()
+    preferred_bin = user_home / "preferred-bin"
+    preferred_bin.mkdir()
+    curl_side_effect = tmp_path / "curl-config-loaded"
+    python_side_effect = tmp_path / "python-shadow-loaded"
+    user_home.joinpath(".curlrc").write_text(
+        (
+            f'output = "{curl_side_effect}"\n'
+            f'trace = "{tmp_path / "curl-trace"}"\n'
+            "url = https://attacker.invalid/extra\n"
+            f'netrc-file = "{tmp_path / "hostile-netrc"}"\n'
+        ),
+        encoding="utf-8",
+    )
+    hostile_cwd = tmp_path / "hostile-python"
+    hostile_cwd.mkdir()
+    hostile_cwd.joinpath("hashlib.py").write_text(
+        (
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['PYTHON_SIDE_EFFECT']).touch()\n"
+            "raise RuntimeError('cwd hashlib shadow loaded')\n"
+        ),
+        encoding="utf-8",
+    )
+    hostile_cwd.joinpath("sitecustomize.py").write_text(
+        (
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['PYTHON_SIDE_EFFECT']).touch()\n"
+        ),
+        encoding="utf-8",
+    )
+    fetch_environment = _fake_launcher_helper_fetch(tmp_path)
+    fake_tools = Path(fetch_environment["PATH"].split(os.pathsep, maxsplit=1)[0])
+    fake_tools.joinpath("curl").write_text(
+        (
+            "#!/bin/bash\n"
+            'if [[ "${1:-}" != "--disable" ]]; then\n'
+            '  : >"$CURL_CONFIG_SIDE_EFFECT"\n'
+            "  exit 91\n"
+            "fi\n"
+            'exec /bin/cat -- "$FAKE_LAUNCHER_HELPER_PATH"\n'
+        ),
+        encoding="utf-8",
+    )
+    fake_tools.joinpath("curl").chmod(0o755)
+    fetch_environment["PATH"] = (
+        f"{fake_tools}{os.pathsep}{preferred_bin}"
+        f"{os.pathsep}{os.environ.get('PATH', '')}"
+    )
+
+    result = _run_install_stdin(
+        env={
+            **fetch_environment,
+            "HOME": str(user_home),
+            "CURL_HOME": str(user_home),
+            "CURL_CONFIG_SIDE_EFFECT": str(curl_side_effect),
+            "PYTHONPATH": str(hostile_cwd),
+            "PYTHONSTARTUP": str(hostile_cwd / "sitecustomize.py"),
+            "PYTHON_SIDE_EFFECT": str(python_side_effect),
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(user_home / "kestrel-home"),
+        },
+        cwd=hostile_cwd,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert str(preferred_bin / "kestrel") in result.stdout
+    assert not curl_side_effect.exists()
+    assert not python_side_effect.exists()
+    assert not (tmp_path / "curl-trace").exists()
 
 
 @POSIX_SHELL_ONLY
@@ -762,7 +1528,11 @@ def test_staged_release_installer_uses_verified_locked_artifacts(tmp_path: Path)
     )
 
     result = _run_install(
-        env={"KESTREL_DRY_RUN": "1", "KESTREL_HOME": str(tmp_path / "kestrel-home")},
+        env={
+            **_fake_launcher_helper_fetch(tmp_path),
+            "KESTREL_DRY_RUN": "1",
+            "KESTREL_HOME": str(tmp_path / "kestrel-home"),
+        },
         install=staged,
     )
 
@@ -1388,8 +2158,10 @@ def test_install_script_launches_server_detached_and_checks_health() -> None:
     assert main_body.index("require_offline_server_upgrade_preflight") < main_body.index(
         "ensure_git_target"
     )
-    assert main_body.index("commit_staged_state") < main_body.index("start_server_detached")
-    assert main_body.index("start_server_detached") < main_body.index(
+    assert main_body.index("commit_staged_state") < main_body.index(
+        "launch_kestrel_facade"
+    )
+    assert main_body.index("launch_kestrel_facade") < main_body.index(
         "finalize_release_install_transaction"
     )
     assert main_body.index("validate_candidate_memory_isolated") < main_body.index(
@@ -1404,7 +2176,7 @@ def test_install_script_launches_server_detached_and_checks_health() -> None:
     assert main_body.index("commit_staged_memory") < main_body.index(
         "finalize_release_install_transaction"
     )
-    assert main_body.index("start_server_detached") < main_body.index(
+    assert main_body.index("launch_kestrel_facade") < main_body.index(
         "finish_post_commit_maintenance"
     )
     assert "run .venv/bin/nest-agent server --backend memvid" not in text
@@ -2511,7 +3283,7 @@ def test_server_handoff_remains_rollback_owned_until_transaction_acceptance() ->
     handoff = script.split('if is_true "$KESTREL_START_SERVER"; then', 1)[1]
 
     release_lock = handoff.index("MAINTENANCE_LOCK_RELEASED_FOR_SERVER=1")
-    launch = handoff.index("start_server_detached", release_lock)
+    launch = handoff.index("launch_kestrel_facade", release_lock)
     accept = handoff.index("finalize_release_install_transaction", launch)
     clear_server_cleanup = handoff.index("SERVER_LAUNCH_ATTEMPTED=0", accept)
     clear_reacquire = handoff.index("MAINTENANCE_LOCK_RELEASED_FOR_SERVER=0", accept)

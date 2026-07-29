@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import scripts.run_golden_evals as golden_runner
 from nested_memvid_agent.config import AgentConfig
+from scripts.bounded_process import BoundedProcessResult
 from scripts.run_golden_evals import (
     _aggregate_passed,
     _case_config,
@@ -11,6 +14,8 @@ from scripts.run_golden_evals import (
     _golden_case_workspace,
     _report_exit_code,
     _run_case,
+    _run_isolated_case,
+    _sort_case_results,
     _summary,
 )
 
@@ -26,6 +31,18 @@ def test_golden_eval_report_exits_nonzero_when_any_case_fails() -> None:
 
     assert report["passed"] is False
     assert _report_exit_code(report) == 1
+
+
+def test_seeded_golden_case_results_have_stable_name_order() -> None:
+    results = [
+        {"name": "zeta", "passed": True},
+        {"name": "alpha", "passed": True},
+    ]
+
+    assert [item["name"] for item in _sort_case_results(results)] == [
+        "alpha",
+        "zeta",
+    ]
 
 
 def test_golden_eval_report_exits_zero_only_for_explicit_pass() -> None:
@@ -142,9 +159,7 @@ def test_golden_case_workspace_is_portable_and_bounded_to_eval_root(tmp_path: Pa
     workspace.resolve().relative_to(config.memory_dir.parent.resolve())
     assert workspace == tmp_path / "golden" / "workspaces" / "case-memory-patch"
     assert workspace.is_dir()
-    assert "/private/tmp" not in Path("scripts/run_golden_evals.py").read_text(
-        encoding="utf-8"
-    )
+    assert "/private/tmp" not in Path("scripts/run_golden_evals.py").read_text(encoding="utf-8")
 
 
 def test_golden_case_errors_are_redacted() -> None:
@@ -157,6 +172,66 @@ def test_golden_case_errors_are_redacted() -> None:
 
     assert result["passed"] is False
     assert "validationsecret" not in str(result["error"])
+
+
+def test_isolated_case_timeout_writes_machine_receipt(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    seen_command: list[str] = []
+
+    def fake_bounded_process(
+        command: list[str],
+        **_kwargs: object,
+    ) -> BoundedProcessResult:
+        seen_command.extend(command)
+        return BoundedProcessResult(
+            returncode=-9,
+            stdout="",
+            stderr="",
+            elapsed_seconds=0.25,
+            timed_out=True,
+            cleanup_attempted=True,
+            cleanup_succeeded=True,
+            termination_method="test_process_group",
+            stdout_total_bytes=0,
+            stderr_total_bytes=0,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            capture_limit_bytes=64 * 1024,
+        )
+
+    monkeypatch.setattr(golden_runner, "run_bounded_process", fake_bounded_process)  # type: ignore[attr-defined]
+    receipt_path = tmp_path / "receipts" / "map_repository.json"
+
+    result = _run_isolated_case(
+        name="map_repository",
+        category="repo_regression",
+        receipt_path=receipt_path,
+        timeout_seconds=0.25,
+        backend="memory",
+        memory_dir=tmp_path / "memory",
+        provider="mock",
+        model="mock",
+        workspace=tmp_path,
+        seed=1729,
+        validation_container_image=None,
+    )
+
+    assert result["passed"] is False
+    assert result["error"] == "case exceeded monotonic deadline of 0.25 seconds"
+    assert "--_case-name" in seen_command
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "timed_out"
+    assert receipt["process"]["deadline_clock"] == "monotonic"
+    assert receipt["process"]["cleanup"]["succeeded"] is True
+    assert receipt["process"]["capture"] == {
+        "limit_bytes_per_stream": 65536,
+        "stderr_total_bytes": 0,
+        "stderr_truncated": False,
+        "stdout_total_bytes": 0,
+        "stdout_truncated": False,
+    }
 
 
 def test_honest_failure_fixture_isolated_from_caller_workspace_secrets(
@@ -187,3 +262,23 @@ def test_honest_failure_fixture_isolated_from_caller_workspace_secrets(
         "tool_count": 1,
         "error": "nonzero_exit",
     }
+
+
+def test_durable_plan_golden_matches_revisable_graph_contract(tmp_path: Path) -> None:
+    result = _run_isolated_case(
+        name="durable_plan_completion",
+        category="plan_completion_rate",
+        receipt_path=tmp_path / "receipts" / "durable-plan.json",
+        timeout_seconds=30,
+        backend="memory",
+        memory_dir=tmp_path / "memory",
+        provider="mock",
+        model="mock",
+        workspace=tmp_path,
+        seed=1729,
+        validation_container_image=None,
+    )
+
+    assert result["passed"] is True
+    assert result["can_revise_plan"] is True
+    assert result["can_rewrite_task_dag"] is True

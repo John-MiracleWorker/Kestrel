@@ -1,0 +1,159 @@
+.engineering-run-panel {
+  display: grid;
+  gap: 16px;
+  margin-top: 20px;
+  padding: 20px;
+  border: 1px solid var(--line, #d9ddd8);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--panel, #fff) 94%, #edf4ef);
+}
+
+.engineering-run-panel > header,
+.engineering-card-title,
+.engineering-evidence-group > h4,
+.approval-packet-call > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.engineering-run-panel h3,
+.engineering-evidence-group h4,
+.engineering-card p {
+  margin: 0;
+}
+
+.engineering-run-panel > header p {
+  margin: 4px 0 0;
+  color: var(--muted, #66706a);
+}
+
+.engineering-error,
+.engineering-failure {
+  color: #8e2929;
+  background: #fff0ed;
+  border: 1px solid #e9b8ae;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.engineering-empty {
+  margin: 0;
+  color: var(--muted, #66706a);
+}
+
+.engineering-evidence-group {
+  display: grid;
+  gap: 10px;
+}
+
+.engineering-evidence-group > h4 {
+  justify-content: flex-start;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line, #d9ddd8);
+}
+
+.engineering-evidence-group > h4 span {
+  margin-left: auto;
+  min-width: 24px;
+  text-align: center;
+  border-radius: 999px;
+  background: #e8eee9;
+  color: #32483a;
+}
+
+.engineering-evidence-group > div {
+  display: grid;
+  gap: 10px;
+}
+
+.engineering-card {
+  display: grid;
+  gap: 9px;
+  padding: 14px;
+  border: 1px solid var(--line, #d9ddd8);
+  border-radius: 13px;
+  background: var(--panel, #fff);
+}
+
+.engineering-actions,
+.engineering-pr-form,
+.approval-packet-call [role="group"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.engineering-pr-form input {
+  flex: 1 1 260px;
+}
+
+.approval-packet-card {
+  gap: 12px;
+}
+
+.approval-packet-call {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid #e2e6e1;
+  border-radius: 10px;
+  background: #fafcf9;
+}
+
+.approval-packet-call small {
+  color: var(--muted, #66706a);
+}
+
+.approval-packet-call button.active {
+  color: #fff;
+  background: #28583a;
+}
+
+.approval-packet-call button.active.danger {
+  background: #8e2929;
+}
+
+.candidate-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 9px;
+}
+
+.candidate {
+  display: grid;
+  gap: 6px;
+  padding: 11px;
+  border: 1px solid #e1e5df;
+  border-radius: 10px;
+}
+
+.candidate.selected {
+  border-color: #3b7650;
+  box-shadow: inset 0 0 0 1px #3b7650;
+}
+
+.candidate small {
+  color: var(--muted, #66706a);
+}
+
+.browser-evidence-card img {
+  width: 100%;
+  height: auto;
+  max-height: 440px;
+  object-fit: contain;
+  border: 1px solid var(--line, #d9ddd8);
+  border-radius: 10px;
+  background: #eef0ed;
+}
+
+@media (max-width: 720px) {
+  .engineering-run-panel {
+    padding: 14px;
+  }
+
+  .engineering-run-panel > header {
+    align-items: flex-start;
+  }
+}

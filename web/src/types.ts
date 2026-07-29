@@ -1,5 +1,6 @@
 export type Run = {
   run_id: string;
+  project_id?: string | null;
   status: string;
   message: string;
   session_id: string;
@@ -230,6 +231,17 @@ export type PluginReviewReport = {
   risk_report: Record<string, unknown>;
   dependency_review: Record<string, unknown>;
   isolation_review: Record<string, unknown>;
+  compatibility_review?: Record<string, unknown>;
+  provenance_review?: Record<string, unknown>;
+  authority_delta?: {
+    initial_install: boolean;
+    added: string[];
+    removed: string[];
+    expands_authority: boolean;
+    authority_digest: string;
+  };
+  install_receipt?: Record<string, unknown>;
+  current_commit_sha?: string;
   enable_blockers: string[];
   warnings: string[];
   unsupported_features: string[];
@@ -265,9 +277,16 @@ export type Routine = {
   routine_id: string;
   name: string;
   prompt: string;
-  schedule_kind: "once" | "interval";
+  schedule_kind: "once" | "interval" | "cron";
   start_at: string;
   interval_seconds: number | null;
+  cron_expression?: string | null;
+  timezone?: string;
+  delivery?: {
+    channel_id: string;
+    conversation_id: string;
+    template: string;
+  } | Record<string, never>;
   enabled: boolean;
   revision: number;
   next_run_at: string | null;
@@ -278,6 +297,27 @@ export type Routine = {
   misfire_grace_seconds: number;
   last_scheduled_at?: string | null;
   deleted_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RoutineDelivery = {
+  delivery_id: string;
+  occurrence_id: string;
+  routine_id: string;
+  run_id: string;
+  destination: {
+    channel_id: string;
+    conversation_id: string;
+    template: string;
+  };
+  destination_digest: string;
+  idempotency_key: string;
+  status: "pending" | "delivering" | "delivered" | "failed" | "blocked" | "uncertain";
+  attempt_count: number;
+  receipt: Record<string, unknown>;
+  error?: string | null;
+  delivered_at?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -565,6 +605,11 @@ export type SelfOnboardingSaveResult = {
 
 export type SetupReadinessStatus = "pass" | "warn" | "fail";
 
+export type SetupExperienceMode =
+  | "demo"
+  | "model_not_connected"
+  | "connected";
+
 export type SetupReadinessCheck = {
   check_id: string;
   title: string;
@@ -576,6 +621,7 @@ export type SetupReadinessCheck = {
 export type SetupReadinessReport = {
   schema: string;
   ready: boolean;
+  experience_mode: SetupExperienceMode;
   pass_count: number;
   warn_count: number;
   fail_count: number;

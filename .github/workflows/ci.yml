@@ -59,7 +59,7 @@ jobs:
           python -m pip check
           python -c 'import keyring; assert callable(keyring.get_keyring)'
       - name: Compile
-        run: python -m compileall -q src tests scripts
+        run: python -m compileall -q benchmarks src tests scripts
       - name: Validate project metadata
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         run: python scripts/check_project_metadata.py
@@ -96,6 +96,14 @@ jobs:
           MYPYPATH=src mypy --strict benchmarks/real_agent_learning_benchmark.py
           python benchmarks/real_agent_learning_benchmark.py \
             --output "${RUNNER_TEMP}/agent-learning-gate.json"
+      - name: Repository navigation quality gate
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        run: |
+          ruff check benchmarks/repository_navigation_benchmark.py tests/test_repository_navigation_benchmark.py
+          MYPYPATH=src mypy --strict benchmarks/repository_navigation_benchmark.py
+          python benchmarks/repository_navigation_benchmark.py \
+            --minimum-recall-at-5 0.70 \
+            --output "${RUNNER_TEMP}/repository-navigation-gate.json"
 
   foundational-integrations:
     runs-on: ubuntu-latest
@@ -159,6 +167,47 @@ jobs:
       - name: Test executable-skill OCI containment
         run: python -m pytest -q tests/integration/test_extension_container_integration.py
 
+  browser-validation-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Build digest-based Playwright validation fixture
+        run: >-
+          docker build
+          -t kestrel-browser-validation:ci
+          containers/browser-validation
+      - name: Verify networkless browser and accessibility runtime
+        run: |
+          report="$(
+            docker run --rm \
+              --network=none \
+              --read-only \
+              --cap-drop=ALL \
+              --security-opt=no-new-privileges:true \
+              --pids-limit=64 \
+              --memory=1g \
+              --cpus=1 \
+              --ipc=none \
+              --user=65534:65534 \
+              --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m \
+              kestrel-browser-validation:ci \
+              /opt/kestrel/browser-validate --self-test
+          )"
+          REPORT="$report" python - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["REPORT"])
+          assert payload == {
+              "schema": "kestrel.browser_validation_image.v1",
+              "browser": "chromium",
+              "heading": "Kestrel browser validation",
+              "axe_ready": True,
+          }
+          PY
+
   web:
     runs-on: ubuntu-latest
     steps:
@@ -219,6 +268,7 @@ jobs:
       - python
       - foundational-integrations
       - extension-sandbox
+      - browser-validation-image
       - web
       - codeql
     steps:

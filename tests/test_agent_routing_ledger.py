@@ -86,7 +86,7 @@ def test_routing_ledger_uses_additive_schema_and_round_trips_inventory(tmp_path:
     ledger = _configured_ledger(state)
 
     assert state.schema_version() >= 19
-    assert ledger.schema_version() == 1
+    assert ledger.schema_version() == 2
     profile = ledger.get_provider_profile("local")
     target = ledger.get_model_target("local-scout")
     policy = ledger.get_policy("balanced")

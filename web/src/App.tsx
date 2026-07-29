@@ -41,6 +41,10 @@ import remarkGfm from "remark-gfm";
 import { ApiAuthError, ApiResponseError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
+import { MissionControl } from "./mission/MissionControl";
+import type { MissionLaunch } from "./mission/types";
+import { OutcomesDashboard } from "./outcomes/OutcomesDashboard";
+import { RepairReviewPanel } from "./repair/RepairReviewPanel";
 import { RoutingCenter } from "./routing/RoutingCenter";
 import {
   activityItemsForEvents,
@@ -77,6 +81,7 @@ import type {
   Run,
   RunTrace,
   Routine,
+  RoutineDelivery,
   RoutineOccurrence,
   RoutineRunNowResult,
   RoutineStatus,
@@ -105,7 +110,13 @@ type ProviderOption = {
   requiresKey?: boolean;
 };
 
-type AppSection = "chat" | "routines" | "routing" | "advanced" | "settings";
+type AppSection = "mission" | "chat" | "outcomes" | "routines" | "routing" | "advanced" | "settings";
+
+type SimpleChatStatus = {
+  label: string;
+  detail: string;
+  action?: "setup" | "model-settings";
+};
 
 const RUN_EVENT_REFRESH_DEBOUNCE_MS = 250;
 
@@ -160,21 +171,7 @@ const providerOptions: ProviderOption[] = [
 ];
 const providerOptionMap = Object.fromEntries(providerOptions.map((item) => [item.value, item]));
 const providerGroups: Array<ProviderOption["group"]> = ["Local", "Cloud", "Advanced"];
-const modelSuggestionsByProvider: Record<string, string[]> = {
-  mock: ["mock"],
-  "lm-studio": ["local-model"],
-  ollama: ["llama3.1", "qwen2.5-coder", "mistral"],
-  openai: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
-  "openai-compatible": ["local-model"],
-  "ollama-cloud": ["gpt-oss:120b", "gpt-oss:20b"],
-  openrouter: ["openai/gpt-5.5", "anthropic/claude-sonnet-4.5"],
-  deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
-  kimi: ["kimi-k2.6", "kimi-k2.5"],
-  anthropic: ["claude-sonnet-4.5", "claude-opus-4.1"],
-  grok: ["grok-4.3", "grok-build-0.1", "grok-4.20"],
-  gemini: ["gemini-2.5-pro", "gemini-2.5-flash"],
-  "codex-cli": ["gpt-5.5", "gpt-5.4"]
-};
+const deterministicModelDefaults: Record<string, string[]> = { mock: ["mock"] };
 const autonomyOptions = [
   { value: "background", label: "Safe Auto" },
   { value: "manual", label: "Manual" },
@@ -258,6 +255,7 @@ const emptyCapabilitySnapshot: CapabilitySnapshot = {
 };
 const capabilityKindOrder: CapabilityKind[] = ["mcp_server", "tool", "skill"];
 const HASH_ROUTING_ENABLED = typeof navigator === "undefined" || !navigator.userAgent.toLowerCase().includes("jsdom");
+const DEFAULT_APP_SECTION: AppSection = HASH_ROUTING_ENABLED ? "mission" : "chat";
 const runEventTypes = [
   "run.queued",
   "run.started",
@@ -418,7 +416,7 @@ export function App() {
   const [localThreads, setLocalThreads] = useState<ThreadSummary[]>([]);
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
-  const activeSectionRef = useRef<AppSection>("chat");
+  const activeSectionRef = useRef<AppSection>(DEFAULT_APP_SECTION);
   const threadRunsRef = useRef<Run[]>([]);
   const topbarRef = useRef<HTMLElement | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
@@ -428,7 +426,7 @@ export function App() {
   const memoryBackendHydratedRef = useRef(false);
   const setupDraftHydratedRef = useRef(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [activeSection, setActiveSection] = useState<AppSection>("chat");
+  const [activeSection, setActiveSection] = useState<AppSection>(DEFAULT_APP_SECTION);
 
   const [message, setMessage] = useState("");
   const [sessionId, setSessionId] = useState("");
@@ -512,6 +510,7 @@ export function App() {
   const [pluginReview, setPluginReview] = useState<PluginReviewReport | null>(null);
   const [pluginReviewSource, setPluginReviewSource] = useState("");
   const [pluginReviewRef, setPluginReviewRef] = useState<string | null>(null);
+  const [pluginUpdateReviews, setPluginUpdateReviews] = useState<Record<string, string>>({});
 
   const [channelId, setChannelId] = useState("webhook");
   const [channelProvider, setChannelProvider] = useState("webhook");
@@ -585,16 +584,18 @@ export function App() {
     return [...rows.values()].sort((left, right) => eventTimestamp(left).localeCompare(eventTimestamp(right)));
   }, [events, activeRun?.run_id, runTrace]);
   const providerCatalog = modelCatalogs[provider] ?? null;
-  const modelSuggestions = providerCatalog?.models?.length ? providerCatalog.models : (modelSuggestionsByProvider[provider] ?? []);
+  const modelSuggestions = providerCatalog?.models?.length
+    ? providerCatalog.models
+    : deterministicModelDefaults[provider] ?? [];
   const modelCatalogLabel = modelCatalogLoading
     ? "loading"
     : providerCatalog?.ok
       ? providerCatalog.source === "provider"
         ? `${providerCatalog.models.length} provider models`
-        : "static models"
+        : `${providerCatalog.models.length} discovered models`
       : providerCatalog?.error
-        ? "fallback models"
-        : "static models";
+        ? "catalog unavailable"
+        : "not discovered";
   const streamedAssistant = useMemo(
     () =>
       events
@@ -733,7 +734,7 @@ export function App() {
     const suggestions = modelsForProvider(nextProvider, modelCatalogs);
     setModel((current) => {
       if (!current.trim() || !isKnownProviderModel(nextProvider, current, modelCatalogs)) {
-        return suggestions[0] ?? current;
+        return suggestions[0] ?? "";
       }
       return current;
     });
@@ -747,14 +748,13 @@ export function App() {
       setApiKeyEnv((current) => current.trim() || catalog.api_key_env || providerOptionMap[catalog.provider]?.apiKeyEnv || "");
       setModel((current) => {
         if (!catalog.models.length || !catalog.ok) return current;
-        const staticModels = modelSuggestionsByProvider[catalog.provider] ?? [];
-        if (!current.trim() || staticModels.includes(current)) {
+        if (!current.trim()) {
           return catalog.models[0] ?? current;
         }
         return current;
       });
     } catch {
-      const fallback = modelSuggestionsByProvider[nextProvider] ?? [];
+      const fallback = deterministicModelDefaults[nextProvider] ?? [];
       setModelCatalogs((catalogs) => ({
         ...catalogs,
         [nextProvider]: {
@@ -1197,41 +1197,89 @@ export function App() {
   async function submitRun(event: FormEvent) {
     event.preventDefault();
     await guarded(async () => {
-      if (!message.trim() || !runtime) return;
-      followTranscriptRef.current = true;
-      const targetSessionId = sessionId.trim() || activeSessionIdRef.current || createThreadId();
-      const payload: Record<string, unknown> = {
-        message,
-        session_id: targetSessionId,
-        autonomy_mode: submissionAutonomyMode(autonomyMode)
-      };
-      if (workspace.trim()) payload.workspace = workspace.trim();
-      const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
-      const runtimeModel = String((runtime as RuntimeConfig | null)?.provider?.model ?? "");
-      if (provider.trim() && provider.trim() !== runtimeProvider) payload.provider = provider.trim();
-      if (model.trim() && model.trim() !== runtimeModel) payload.model = model.trim();
-      const run = await postJson<Run>("/api/runs", payload);
-      setMessage("");
-      selectSessionId(run.session_id);
-      selectRunId(run.run_id);
-      setThreadRuns((rows) => [...rows.filter((row) => row.run_id !== run.run_id), run]);
-      setLocalThreads((threads) => [
-        {
-          session_id: run.session_id,
-          title: deriveThreadTitle(run.message),
-          latest_message: run.message,
-          latest_status: run.status,
-          latest_run_id: run.run_id,
-          run_count: Math.max(1, (threads.find((thread) => thread.session_id === run.session_id)?.run_count ?? 0) + 1),
-          updated_at: run.updated_at,
-          is_local: true
-        },
-        ...threads.filter((thread) => thread.session_id !== run.session_id)
-      ]);
-      await refreshSummary();
-      await refreshThreadRuns(run.session_id);
-      await refreshRunDetails(run.run_id);
+      await enqueueRun({
+        objective: message,
+        sessionId: sessionId.trim() || activeSessionIdRef.current || createThreadId(),
+        workspace: workspace.trim() || null
+      });
     }, "Run queued.");
+  }
+
+  async function launchMission(mission: MissionLaunch) {
+    await enqueueRun({
+      objective: mission.objective,
+      sessionId: createThreadId(),
+      workspace: mission.project.repository_path,
+      projectId: mission.project.project_id,
+      missionPlan: mission.plan,
+      projectRevision: mission.preflight.project_revision,
+      missionTemplateId: mission.templateId,
+      missionBinding: mission.preflight.launch_binding
+    });
+    setNotice("Mission queued.");
+  }
+
+  async function enqueueRun({
+    objective,
+    sessionId: targetSessionId,
+    workspace: targetWorkspace,
+    projectId,
+    missionPlan,
+    projectRevision,
+    missionTemplateId,
+    missionBinding
+  }: {
+    objective: string;
+    sessionId: string;
+    workspace: string | null;
+    projectId?: string;
+    missionPlan?: MissionLaunch["plan"];
+    projectRevision?: number;
+    missionTemplateId?: string;
+    missionBinding?: MissionLaunch["preflight"]["launch_binding"];
+  }) {
+    if (!objective.trim() || !runtime) return;
+    followTranscriptRef.current = true;
+    const payload: Record<string, unknown> = {
+      message: objective.trim(),
+      session_id: targetSessionId,
+      autonomy_mode: submissionAutonomyMode(autonomyMode)
+    };
+    if (targetWorkspace) payload.workspace = targetWorkspace;
+    if (projectId) payload.project_id = projectId;
+    if (missionPlan) payload.mission_plan = missionPlan;
+    if (projectRevision) payload.project_revision = projectRevision;
+    if (missionTemplateId) payload.mission_template_id = missionTemplateId;
+    if (missionBinding) payload.mission_binding = missionBinding;
+    const runtimeProvider = String((runtime as RuntimeConfig | null)?.provider?.name ?? "");
+    const runtimeModel = String((runtime as RuntimeConfig | null)?.provider?.model ?? "");
+    if (!missionPlan && provider.trim() && provider.trim() !== runtimeProvider) {
+      payload.provider = provider.trim();
+    }
+    if (!missionPlan && model.trim() && model.trim() !== runtimeModel) {
+      payload.model = model.trim();
+    }
+    const run = await postJson<Run>("/api/runs", payload);
+    setMessage("");
+    selectSessionId(run.session_id);
+    selectRunId(run.run_id);
+    setThreadRuns((rows) => [...rows.filter((row) => row.run_id !== run.run_id), run]);
+    setLocalThreads((threads) => [
+      {
+        session_id: run.session_id,
+        title: deriveThreadTitle(run.message),
+        latest_message: run.message,
+        latest_status: run.status,
+        latest_run_id: run.run_id,
+        run_count: Math.max(1, (threads.find((thread) => thread.session_id === run.session_id)?.run_count ?? 0) + 1),
+        updated_at: run.updated_at,
+        is_local: true
+      },
+      ...threads.filter((thread) => thread.session_id !== run.session_id)
+    ]);
+    await refreshSummary();
+    await refreshThreadRuns(run.session_id);
+    await refreshRunDetails(run.run_id);
   }
 
   function createNewThread() {
@@ -1618,10 +1666,34 @@ export function App() {
   async function pluginAction(plugin: Plugin, action: "enable" | "disable" | "update" | "remove") {
     await guarded(async () => {
       const path = `/api/plugins/${encodeURIComponent(plugin.id)}`;
+      if (action === "update" && !pluginUpdateReviews[plugin.id]) {
+        const review = await postJson<PluginReviewReport>(
+          `${path}/review-update`,
+          { ref: plugin.source_ref }
+        );
+        setPluginUpdateReviews((current) => ({
+          ...current,
+          [plugin.id]: review.commit_sha
+        }));
+        setPluginResult(review as unknown as Record<string, unknown>);
+        setNotice(
+          review.authority_delta?.expands_authority
+            ? "Update review found added authority. Disable the plugin before applying it."
+            : "Update reviewed. Apply only after inspecting provenance, compatibility, and authority delta."
+        );
+        return;
+      }
       const result =
         action === "remove"
           ? await deleteJson<Record<string, unknown>>(path)
           : await postJson<Record<string, unknown>>(`${path}/${action}`, action === "update" ? { ref: plugin.source_ref } : {});
+      if (action === "update" || action === "remove") {
+        setPluginUpdateReviews((current) => {
+          const next = { ...current };
+          delete next[plugin.id];
+          return next;
+        });
+      }
       setPluginResult(result);
       await refreshSummary();
     });
@@ -1844,7 +1916,7 @@ export function App() {
   const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
   const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
-  const simpleStatus = authPromptOpen
+  const simpleStatus: SimpleChatStatus = authPromptOpen
     ? {
         label: "Locked",
         detail: "Enter the local API token before using this Kestrel."
@@ -1854,10 +1926,20 @@ export function App() {
           label: "Connecting",
           detail: "Loading the authoritative Kestrel runtime configuration."
         }
-    : simpleChatStatus(activeRun, pendingApprovalCount, setupReadiness);
+    : simpleChatStatus(
+        activeRun,
+        pendingApprovalCount,
+        setupReadiness,
+        providerDisplayName,
+        model
+      );
   const chatIntro = userDisplayName
     ? `Ready when you are, ${userDisplayName}.`
     : "Ready when you are.";
+  const chatStatusDetail =
+    activeRun || simpleStatus.label !== "Ready"
+      ? simpleStatus.detail
+      : chatIntro;
 
   return (
     <>
@@ -1873,10 +1955,9 @@ export function App() {
             </span>
           </a>
           <nav className="primary-nav" aria-label="Primary">
-            <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => routeToSection("chat")}>Chat</button>
-            <button type="button" className={activeSection === "routines" ? "active" : ""} onClick={() => routeToSection("routines")}>Routines</button>
-            <button type="button" className={activeSection === "routing" ? "active" : ""} onClick={() => routeToSection("routing")}>Routing</button>
-            <button type="button" className={activeSection === "settings" ? "active" : ""} onClick={() => routeToSection("settings")}>Settings</button>
+            <button type="button" className={activeSection === "mission" ? "active" : ""} onClick={() => routeToSection("mission")}>Workbench</button>
+            <button type="button" className={activeSection === "chat" ? "active" : ""} onClick={() => routeToSection("chat")}>History</button>
+            <button type="button" className={activeSection === "outcomes" ? "active" : ""} onClick={() => routeToSection("outcomes")}>Outcomes</button>
             <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => routeToSection("advanced")}>Advanced</button>
           </nav>
           <div className="topbar-meta">
@@ -1932,6 +2013,33 @@ export function App() {
             </Panel>
           </section>
         </main>
+      ) : activeSection === "mission" ? (
+        <MissionControl
+          runs={runs}
+          activeRun={activeRun}
+          taskGraph={taskGraph}
+          approvals={approvals}
+          events={activeRunEvents}
+          onLaunch={launchMission}
+          onOpenRun={(run) => {
+            void selectRun(run.run_id);
+          }}
+          onOpenHistory={() => routeToSection("chat")}
+          onOpenAdvanced={() => routeToSection("advanced")}
+          onOpenDiagnostics={() => jumpToAdvanced("observability")}
+          onPrepareTool={(name, args) => {
+            setToolName(name);
+            setToolArgs(JSON.stringify(args, null, 2));
+            setPreparedToolPreview({ name, args });
+            jumpToAdvanced("tools");
+          }}
+          onAuthRequired={() => {
+            setAuthPromptOpen(true);
+            setApiTokenDraft(getApiToken());
+          }}
+        />
+      ) : activeSection === "outcomes" ? (
+        <OutcomesDashboard onBack={() => routeToSection("mission")} />
       ) : (
       <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`} data-active-section={activeSection}>
       <a className="skip-link" href="#workspace">Skip to workspace</a>
@@ -1974,14 +2082,19 @@ export function App() {
             <div className="conv-meta simple-meta">
               <span>{activeThread ? "Current chat" : "New chat"}</span>
               <span className="sep">·</span>
-              <span>{activeRun ? simpleStatus.detail : chatIntro}</span>
+              <span>{chatStatusDetail}</span>
             </div>
           </div>
           <div className="conv-tools simple-conv-tools">
             <StatusBadge value={simpleStatus.label} />
-            {setupReadiness && !setupReadiness.ready && (
+            {simpleStatus.action === "setup" && (
               <button type="button" onClick={() => setSetupOpen(true)}>
                 <Sparkles size={15} /> Setup
+              </button>
+            )}
+            {simpleStatus.action === "model-settings" && (
+              <button type="button" onClick={() => routeToSection("settings")}>
+                <Settings size={15} /> Open model settings
               </button>
             )}
             {activeRun && (
@@ -2131,6 +2244,20 @@ export function App() {
                 </button>
               </div>
             </header>
+            <nav className="advanced-surface-nav" aria-label="Advanced workspaces">
+              <button type="button" onClick={() => routeToSection("routines")}>
+                <CalendarClock size={15} /> Routines
+              </button>
+              <button type="button" onClick={() => routeToSection("routing")}>
+                <Route size={15} /> Routing
+              </button>
+              <button type="button" onClick={() => routeToSection("outcomes")}>
+                <LineChart size={15} /> Outcomes
+              </button>
+              <button type="button" onClick={() => routeToSection("settings")}>
+                <Settings size={15} /> Settings
+              </button>
+            </nav>
             {error && <ActionError message={error} onDismiss={() => setError(null)} />}
             <section className="stitch-command-deck advanced-overview" aria-label="Advanced overview">
               <div className="stitch-hero-card">
@@ -2312,8 +2439,9 @@ export function App() {
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("step")}>Step</button>
               <button type="button" disabled={!activeRun} onClick={() => runScheduler("run")}>Run Until Idle</button>
             </div>
-            <RepairPatchReview
+            <RepairReviewPanel
               tasks={taskGraph?.tasks ?? []}
+              allowedPaths={[]}
               onPrepareTool={(name, args) => {
                 setToolName(name);
                 setToolArgs(JSON.stringify(args, null, 2));
@@ -2999,6 +3127,11 @@ export function App() {
                 <InlineMeta items={[String(pluginReview.risk_report.risk ?? "medium"), pluginReview.commit_sha.slice(0, 12)]} />
                 <p>Dependencies: {pluginDependencySummary(pluginReview)}</p>
                 <p>Isolation: {pluginIsolationSummary(pluginReview)}</p>
+                <p>Provenance: {String(pluginReview.provenance_review?.status ?? "unverified")}</p>
+                <p>Compatibility: {String(pluginReview.compatibility_review?.status ?? "unknown")}</p>
+                {pluginReview.authority_delta?.added.length ? (
+                  <p>Added authority: {pluginReview.authority_delta.added.join(", ")}</p>
+                ) : null}
                 {pluginEnableBlockers.length > 0 && <InlineMeta items={pluginEnableBlockers} />}
               </div>
             )}
@@ -3016,7 +3149,9 @@ export function App() {
                   >
                     {plugin.enabled ? "Disable" : "Enable"}
                   </button>
-                  <button type="button" onClick={() => pluginAction(plugin, "update")}>Update</button>
+                  <button type="button" onClick={() => pluginAction(plugin, "update")}>
+                    {pluginUpdateReviews[plugin.id] ? "Apply reviewed update" : "Review update"}
+                  </button>
                   <button type="button" className="btn danger" onClick={() => pluginAction(plugin, "remove")}>Remove</button>
                 </div>
               </div>
@@ -3739,9 +3874,14 @@ export function App() {
 type RoutineDraft = {
   name: string;
   prompt: string;
-  schedule_kind: "once" | "interval";
+  schedule_kind: "once" | "interval" | "cron";
   start_at_local: string;
   interval_seconds: string;
+  cron_expression: string;
+  timezone: string;
+  delivery_channel_id: string;
+  delivery_conversation_id: string;
+  delivery_template: string;
   workspace: string;
   provider: string;
   model: string;
@@ -3772,6 +3912,7 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
   const [selectedRoutineId, setSelectedRoutineId] = useState<string | null>(null);
   const selectedRoutineIdRef = useRef<string | null>(null);
   const [history, setHistory] = useState<RoutineOccurrence[]>([]);
+  const [deliveries, setDeliveries] = useState<RoutineDelivery[]>([]);
   const [loading, setLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -3798,6 +3939,7 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
       historyRequestRef.current?.controller.abort();
       historyRequestRef.current = null;
       setHistory([]);
+      setDeliveries([]);
       setHistoryError(null);
       setHistoryLoading(false);
     }
@@ -3838,6 +3980,19 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
         );
         if (controller.signal.aborted || selectedRoutineIdRef.current !== routineId) return;
         setHistory(rows);
+        try {
+          const deliveryRows = await getJson<RoutineDelivery[]>(
+            `/api/routines/${encodeURIComponent(routineId)}/deliveries${queryString({ limit: 50 })}`,
+            { signal: controller.signal }
+          );
+          if (!controller.signal.aborted && selectedRoutineIdRef.current === routineId) {
+            setDeliveries(Array.isArray(deliveryRows) ? deliveryRows : []);
+          }
+        } catch {
+          if (!controller.signal.aborted && selectedRoutineIdRef.current === routineId) {
+            setDeliveries([]);
+          }
+        }
         setRunNowResult((current) => {
           if (!current || current.occurrence.routine_id !== routineId) return current;
           const occurrence = rows.find(
@@ -3859,6 +4014,7 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
       } catch (value) {
         if (controller.signal.aborted || selectedRoutineIdRef.current !== routineId) return;
         setHistory([]);
+        setDeliveries([]);
         setHistoryError(handleError(value, "Routine history is unavailable."));
       } finally {
         if (historyRequestRef.current === request) historyRequestRef.current = null;
@@ -3905,12 +4061,14 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
         await refreshHistory(nextSelection);
       } else {
         setHistory([]);
+        setDeliveries([]);
         setHistoryError(null);
       }
     } else {
       setRoutines([]);
       selectRoutineId(null);
       setHistory([]);
+      setDeliveries([]);
       const message = handleError(routinesResult.reason, "Routine definitions are unavailable.");
       setLoadError((current) => current ? `${current} ${message}` : message);
     }
@@ -4085,6 +4243,33 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
     }
   }
 
+  async function reconcileRoutineDelivery(
+    delivery: RoutineDelivery,
+    resolution: "retry" | "delivered" | "failed"
+  ) {
+    setMutationPending(true);
+    setActionError(null);
+    setNotice(null);
+    try {
+      const updated = await postJson<RoutineDelivery>(
+        `/api/routine-deliveries/${encodeURIComponent(delivery.delivery_id)}/actions/reconcile`,
+        {
+          expected_attempt_count: delivery.attempt_count,
+          resolution,
+          receipt: resolution === "delivered"
+            ? { operator_confirmed: true }
+            : null
+        }
+      );
+      setNotice(`Delivery ${updated.delivery_id} reconciled as ${updated.status}.`);
+      await refreshHistory(delivery.routine_id);
+    } catch (value) {
+      setActionError(handleError(value, "Routine delivery could not be reconciled."));
+    } finally {
+      setMutationPending(false);
+    }
+  }
+
   const enabledCount = routines.filter((routine) => routine.enabled).length;
   const selectedIsUncertain = selectedRoutine ? uncertainRoutineIds.has(selectedRoutine.routine_id) : false;
 
@@ -4205,7 +4390,15 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
                 <div><dt>Workspace</dt><dd>{selectedRoutine.workspace || "Configured default"}</dd></div>
                 <div><dt>Provider</dt><dd>{[selectedRoutine.provider, selectedRoutine.model].filter(Boolean).join(" / ") || "Configured default"}</dd></div>
                 <div><dt>Autonomy</dt><dd>{selectedRoutine.autonomy_mode}</dd></div>
-                <div><dt>Timezone</dt><dd>{localTimeZone} display · UTC storage</dd></div>
+                <div><dt>Timezone</dt><dd>{selectedRoutine.timezone || "UTC"} schedule · {localTimeZone} display</dd></div>
+                <div>
+                  <dt>Delivery</dt>
+                  <dd>
+                    {selectedRoutine.delivery && "channel_id" in selectedRoutine.delivery
+                      ? `${selectedRoutine.delivery.channel_id} / ${selectedRoutine.delivery.conversation_id}`
+                      : "No external destination"}
+                  </dd>
+                </div>
               </dl>
               <button
                 type="button"
@@ -4253,6 +4446,56 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
                   {!historyLoading && !historyError && history.length === 0 && <EmptyState>No occurrences recorded for this routine.</EmptyState>}
                 </div>
               </section>
+              <section className="routine-history" aria-labelledby="routine-delivery-title">
+                <div className="routine-history-head">
+                  <h3 id="routine-delivery-title">Delivery history</h3>
+                  <StatusBadge value={`${deliveries.length} records`} />
+                </div>
+                <div className="list compact-list">
+                  {deliveries.map((delivery) => (
+                    <article className="data-row" key={delivery.delivery_id}>
+                      <div className="run-title">
+                        <strong>{delivery.destination.channel_id} / {delivery.destination.conversation_id}</strong>
+                        <StatusBadge value={delivery.status} />
+                      </div>
+                      <InlineMeta items={[
+                        `attempt ${delivery.attempt_count}`,
+                        delivery.idempotency_key,
+                        formatRoutineDate(delivery.delivered_at ?? delivery.updated_at)
+                      ]} />
+                      {delivery.error ? <p className="danger-text">{delivery.error}</p> : null}
+                      {["uncertain", "failed", "blocked"].includes(delivery.status) ? (
+                        <div className="page-actions">
+                          <button
+                            type="button"
+                            disabled={mutationPending || !status?.enabled}
+                            onClick={() => void reconcileRoutineDelivery(delivery, "retry")}
+                          >
+                            Retry with same key
+                          </button>
+                          <button
+                            type="button"
+                            disabled={mutationPending || !status?.enabled}
+                            onClick={() => void reconcileRoutineDelivery(delivery, "delivered")}
+                          >
+                            Mark delivered
+                          </button>
+                          <button
+                            type="button"
+                            disabled={mutationPending || !status?.enabled}
+                            onClick={() => void reconcileRoutineDelivery(delivery, "failed")}
+                          >
+                            Mark failed
+                          </button>
+                        </div>
+                      ) : null}
+                    </article>
+                  ))}
+                  {!historyLoading && deliveries.length === 0 ? (
+                    <EmptyState>No delivery attempts recorded for this routine.</EmptyState>
+                  ) : null}
+                </div>
+              </section>
             </div>
           ) : (
             <EmptyState>Select a routine to inspect its schedule and run history.</EmptyState>
@@ -4275,9 +4518,10 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
             </Field>
             <div className="field-row">
               <Field label="Schedule">
-                <select value={draft.schedule_kind} onChange={(event) => setDraft((current) => ({ ...current, schedule_kind: event.target.value as "once" | "interval" }))}>
+                <select value={draft.schedule_kind} onChange={(event) => setDraft((current) => ({ ...current, schedule_kind: event.target.value as "once" | "interval" | "cron" }))}>
                   <option value="once">Once</option>
                   <option value="interval">Fixed interval</option>
+                  <option value="cron">Cron / calendar</option>
                 </select>
               </Field>
               <Field label={`Start time (${localTimeZone})`} hint="Stored as UTC after submission.">
@@ -4287,6 +4531,16 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
                 <Field label="Interval seconds" hint="Minimum 60 seconds.">
                   <input type="number" required min="60" max="31536000" step="1" value={draft.interval_seconds} onChange={(event) => setDraft((current) => ({ ...current, interval_seconds: event.target.value }))} />
                 </Field>
+              )}
+              {draft.schedule_kind === "cron" && (
+                <>
+                  <Field label="Cron expression" hint="Five fields: minute hour day month weekday.">
+                    <input required value={draft.cron_expression} onChange={(event) => setDraft((current) => ({ ...current, cron_expression: event.target.value }))} placeholder="0 9 * * 1-5" />
+                  </Field>
+                  <Field label="IANA timezone" hint="DST is evaluated in this named timezone.">
+                    <input required maxLength={128} value={draft.timezone} onChange={(event) => setDraft((current) => ({ ...current, timezone: event.target.value }))} placeholder="America/Detroit" />
+                  </Field>
+                </>
               )}
               <Field label="Misfire grace seconds">
                 <input type="number" required min="0" max="604800" step="1" value={draft.misfire_grace_seconds} onChange={(event) => setDraft((current) => ({ ...current, misfire_grace_seconds: event.target.value }))} />
@@ -4310,6 +4564,17 @@ function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
                 </select>
               </Field>
             </div>
+            <div className="field-row">
+              <Field label="Delivery channel" hint="Optional configured channel id.">
+                <input maxLength={128} value={draft.delivery_channel_id} onChange={(event) => setDraft((current) => ({ ...current, delivery_channel_id: event.target.value }))} placeholder="telegram" />
+              </Field>
+              <Field label="Delivery conversation" hint="Required when a channel is selected.">
+                <input maxLength={512} value={draft.delivery_conversation_id} onChange={(event) => setDraft((current) => ({ ...current, delivery_conversation_id: event.target.value }))} placeholder="chat or webhook destination" />
+              </Field>
+              <Field label="Delivery template" hint="Supports {result}, {run_id}, and {run_status}.">
+                <input maxLength={4000} value={draft.delivery_template} onChange={(event) => setDraft((current) => ({ ...current, delivery_template: event.target.value }))} />
+              </Field>
+            </div>
             <div className="page-actions">
               <button className="btn primary" type="submit" disabled={mutationPending}>{mutationPending ? "Saving…" : "Save routine"}</button>
               <button className="btn subtle" type="button" onClick={() => setEditorMode(null)} disabled={mutationPending}>Cancel</button>
@@ -4330,6 +4595,11 @@ function emptyRoutineDraft(): RoutineDraft {
     schedule_kind: "once",
     start_at_local: localDateTimeInput(start),
     interval_seconds: "3600",
+    cron_expression: "0 9 * * 1-5",
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    delivery_channel_id: "",
+    delivery_conversation_id: "",
+    delivery_template: "{result}",
     workspace: "",
     provider: "",
     model: "",
@@ -4345,6 +4615,17 @@ function routineDraftFrom(routine: Routine): RoutineDraft {
     schedule_kind: routine.schedule_kind,
     start_at_local: localDateTimeInput(new Date(routine.start_at)),
     interval_seconds: String(routine.interval_seconds ?? 3600),
+    cron_expression: routine.cron_expression ?? "0 9 * * 1-5",
+    timezone: routine.timezone ?? "UTC",
+    delivery_channel_id: routine.delivery && "channel_id" in routine.delivery
+      ? routine.delivery.channel_id
+      : "",
+    delivery_conversation_id: routine.delivery && "conversation_id" in routine.delivery
+      ? routine.delivery.conversation_id
+      : "",
+    delivery_template: routine.delivery && "template" in routine.delivery
+      ? routine.delivery.template
+      : "{result}",
     workspace: routine.workspace ?? "",
     provider: routine.provider ?? "",
     model: routine.model ?? "",
@@ -4367,12 +4648,29 @@ function routinePayload(draft: RoutineDraft): Record<string, unknown> {
   if (!Number.isInteger(misfireGraceSeconds) || misfireGraceSeconds < 0 || misfireGraceSeconds > 604_800) {
     throw new Error("Misfire grace seconds must be an integer between 0 and 604800.");
   }
+  if (draft.schedule_kind === "cron" && draft.cron_expression.trim().split(/\s+/).length !== 5) {
+    throw new Error("Cron expression must contain five fields.");
+  }
+  const deliveryChannel = draft.delivery_channel_id.trim();
+  const deliveryConversation = draft.delivery_conversation_id.trim();
+  if (Boolean(deliveryChannel) !== Boolean(deliveryConversation)) {
+    throw new Error("Delivery channel and conversation must be configured together.");
+  }
   return {
     name: draft.name.trim(),
     prompt: draft.prompt.trim(),
     schedule_kind: draft.schedule_kind,
     start_at: start.toISOString(),
     interval_seconds: draft.schedule_kind === "interval" ? intervalSeconds : null,
+    cron_expression: draft.schedule_kind === "cron" ? draft.cron_expression.trim() : null,
+    timezone: draft.timezone.trim() || "UTC",
+    delivery: deliveryChannel
+      ? {
+          channel_id: deliveryChannel,
+          conversation_id: deliveryConversation,
+          template: draft.delivery_template.trim() || "{result}"
+        }
+      : null,
     workspace: draft.workspace.trim() || null,
     provider: draft.provider.trim() || null,
     model: draft.model.trim() || null,
@@ -4387,6 +4685,9 @@ function localDateTimeInput(date: Date): string {
 }
 
 function routineScheduleLabel(routine: Routine): string {
+  if (routine.schedule_kind === "cron") {
+    return `${routine.cron_expression ?? "Cron"} · ${routine.timezone ?? "UTC"}`;
+  }
   if (routine.schedule_kind === "interval") {
     return `Every ${formatDuration(routine.interval_seconds ?? 0)} from ${formatRoutineDate(routine.start_at)}`;
   }
@@ -4626,130 +4927,6 @@ function ExactCallApprovalPreview({ preview }: { preview: PreparedToolPreview })
       <JsonBlock value={preview.args} maxHeight="180px" />
     </section>
   );
-}
-
-function RepairPatchReview({
-  tasks,
-  onPrepareTool
-}: {
-  tasks: TaskNode[];
-  onPrepareTool: (name: string, args: Record<string, unknown>) => void;
-}) {
-  const repairTasks = tasks.filter((task) =>
-    (task.required_tools ?? []).some((tool) => tool.startsWith("repair.") || tool === "git.commit")
-  );
-  if (repairTasks.length === 0) return null;
-
-  const validationTask = repairTasks.find((task) => taskUsesTool(task, "repair.validate") || taskUsesTool(task, "repair.orchestrate_validate"));
-  const reviewTask = repairTasks.find((task) => taskUsesTool(task, "repair.review"));
-  const rollbackTask = repairTasks.find((task) => taskUsesTool(task, "repair.rollback"));
-
-  const validationResult = validationTask?.result ?? null;
-  const validationArtifact = readRecord(validationResult?.repair_artifact);
-  const validation = readRecord(validationResult?.validation);
-  const validationSnapshot = readRecord(validationArtifact?.repair_snapshot);
-  const validationId = String(validationArtifact?.validation_id ?? validation?.validation_id ?? "pending");
-  const explicitValidationSuccess = validation?.success;
-  const validationSuccess = explicitValidationSuccess === true || (
-    explicitValidationSuccess === undefined
-    && validationTask?.status === "completed"
-    && ["repair.validate", "repair.orchestrate_validate"].includes(String(validationArtifact?.tool ?? ""))
-    && validationId !== "pending"
-  );
-  const validationFailed = explicitValidationSuccess === false;
-  const validationLabel = validationSuccess
-    ? "Validation passed"
-    : validationFailed
-      ? "Validation failed"
-      : "Validation pending";
-  const validationCommand = formatCommand(validation?.command);
-  const validationEvidence = validationCommand || (validationId !== "pending" ? validationId : validationTask?.title ?? "pending");
-
-  const reviewResult = reviewTask?.result ?? null;
-  const reviewArtifact = readRecord(reviewResult?.repair_artifact);
-  const reviewSnapshot = readRecord(reviewArtifact?.repair_snapshot);
-  const reviewId = String(reviewArtifact?.review_id ?? reviewResult?.review_id ?? "pending");
-  const diffHash = String(reviewSnapshot?.diff_digest ?? reviewResult?.diff_hash ?? "pending");
-  const reviewBranch = String(reviewSnapshot?.branch ?? "pending");
-  const reviewHead = String(reviewSnapshot?.head_sha ?? "pending");
-  const changedFiles = asStringArray(reviewArtifact?.changed_files ?? reviewResult?.changed_files);
-  const commitGate = readRecord(reviewArtifact?.commit_gate ?? reviewResult?.commit_gate);
-  const commitApprovalRequired = commitGate?.approval_required_before_commit === true;
-
-  const rollbackResult = rollbackTask?.result ?? null;
-  const rollbackId = String(rollbackResult?.rollback_id ?? "pending");
-  const restoredFiles = asStringArray(rollbackResult?.restored_files);
-  const artifactPath = String(rollbackResult?.artifact_path ?? ".nest/repair_rollbacks");
-  const hasReviewArtifact = reviewId !== "pending";
-  const prepareCommit = () => {
-    onPrepareTool("git.commit", {
-      message: `repair: commit reviewed changes for ${reviewId}`,
-      repair_review_id: reviewId
-    });
-  };
-  const prepareRollback = () => {
-    onPrepareTool("repair.rollback", {
-      reason: `Rollback reviewed repair ${reviewId}`,
-      review_id: reviewId,
-      expected_current_diff_digest: diffHash
-    });
-  };
-
-  return (
-    <section aria-label="Repair Patch Review" className="run-detail repair-review-panel">
-      <div className="run-title">
-        <h3>Repair Patch Review</h3>
-        <StatusBadge value={reviewTask?.status ?? validationTask?.status ?? "pending"} />
-      </div>
-      <p className="muted">Validation, reviewer gate, and rollback evidence for the selected repair DAG.</p>
-      <div className="list compact-list">
-        {validationTask && (
-          <div className="data-row">
-            <strong>{validationLabel}</strong>
-            <InlineMeta items={[validationTask.status, validationTask.risk, validationTask.scheduler_reason]} />
-            <p>{`${validationSuccess || validationFailed ? validationLabel : "Validation state"}: ${validationEvidence}`}</p>
-            {Boolean(validationSnapshot?.diff_digest) && <p>{`Candidate digest ${String(validationSnapshot?.diff_digest)}`}</p>}
-          </div>
-        )}
-        {reviewTask && (
-          <div className="data-row">
-            <strong>Review gate</strong>
-            <InlineMeta items={[reviewTask.status, reviewTask.profile, commitApprovalRequired ? "exact-call commit approval" : "commit gate pending"]} />
-            <p>{`Review gate: ${reviewId} · ${commitApprovalRequired ? "commit approval required" : "commit gate pending"}`}</p>
-            <p>{`Diff ${diffHash} · ${changedFiles.length ? changedFiles.join(", ") : "no changed files recorded"}`}</p>
-            {reviewBranch !== "pending" && <p>{`Candidate ${reviewBranch} @ ${reviewHead}`}</p>}
-            <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareCommit}>
-              Prepare exact-call git.commit request
-            </button>
-          </div>
-        )}
-        {rollbackTask && (
-          <div className="data-row">
-            <strong>Rollback state</strong>
-            <InlineMeta items={[rollbackTask.status, rollbackTask.risk, rollbackTask.approved ? "approved" : "approval required"]} />
-            <p>{`Rollback state: ${rollbackTask.status} · ${rollbackId}`}</p>
-            <p>{`Restores ${restoredFiles.length ? restoredFiles.join(", ") : "recorded repair files"} and preserves ${artifactPath}`}</p>
-            <button type="button" className="btn subtle" disabled={!hasReviewArtifact} onClick={prepareRollback}>
-              Prepare exact-call repair.rollback request
-            </button>
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
-
-function taskUsesTool(task: TaskNode, toolName: string): boolean {
-  return (task.required_tools ?? []).includes(toolName);
-}
-
-function readRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-}
-
-function formatCommand(value: unknown): string {
-  if (Array.isArray(value)) return value.map((part) => String(part)).filter(Boolean).join(" ");
-  return typeof value === "string" ? value : "";
 }
 
 function TaskList({ title, tasks, onApprove }: { title: string; tasks: TaskNode[]; onApprove: (task: TaskNode) => void }) {
@@ -5033,8 +5210,10 @@ function extractProofOfWork(trace: RunTrace | null): Record<string, unknown> | n
 function simpleChatStatus(
   activeRun: Run | null,
   pendingApprovalCount: number,
-  setupReadiness: SetupReadinessReport | null
-): { label: string; detail: string } {
+  setupReadiness: SetupReadinessReport | null,
+  providerName: string,
+  modelName: string
+): SimpleChatStatus {
   if (pendingApprovalCount > 0) {
     return {
       label: "Needs approval",
@@ -5059,16 +5238,62 @@ function simpleChatStatus(
       detail: activeRun.error || "The last run failed."
     };
   }
-  if (setupReadiness && !setupReadiness.ready) {
+  const setupIssue = firstNonProviderSetupIssue(setupReadiness);
+  if (setupReadiness && !setupReadiness.ready && setupIssue) {
     return {
       label: "Needs setup",
-      detail: setupReadiness.next_action || "Finish setup before relying on this Kestrel."
+      detail:
+        setupReadiness.next_action ||
+        setupIssue.recovery ||
+        "Finish setup before relying on this Kestrel.",
+      action: "setup"
+    };
+  }
+  if (setupReadiness?.experience_mode === "demo") {
+    return {
+      label: "Demo",
+      detail: "Demo uses deterministic responses; no live model connected."
+    };
+  }
+  if (setupReadiness?.experience_mode === "model_not_connected") {
+    const providerModel = [providerName, modelName].filter(Boolean).join(" / ");
+    return {
+      label: "Model not connected",
+      detail: `${providerModel || "The configured provider and model"} has no verified live model connection. Open Settings to configure or test it.`,
+      action: "model-settings"
+    };
+  }
+  if (setupReadiness?.experience_mode === "connected" && setupReadiness.ready) {
+    return {
+      label: "Ready",
+      detail: activeRun ? "Kestrel is ready for the next message." : "Start a chat to begin."
+    };
+  }
+  if (!setupReadiness) {
+    return {
+      label: "Checking setup",
+      detail: "Kestrel could not verify setup readiness. Refresh before relying on this connection."
     };
   }
   return {
-    label: "Ready",
-    detail: activeRun ? "Kestrel is ready for the next message." : "Start a chat to begin."
+    label: "Needs setup",
+    detail:
+      setupReadiness.next_action ||
+      "Kestrel received an unrecognized setup state. Review setup before relying on this connection.",
+    action: "setup"
   };
+}
+
+function firstNonProviderSetupIssue(
+  setupReadiness: SetupReadinessReport | null
+) {
+  if (!setupReadiness || !Array.isArray(setupReadiness.checks)) return null;
+  return setupReadiness.checks.find(
+    (check) =>
+      check.status !== "pass" &&
+      check.check_id !== "provider_configuration" &&
+      check.check_id !== "provider_operational"
+  ) ?? null;
 }
 
 function simpleThreadStatus(status: string): string {
@@ -5134,7 +5359,9 @@ function createThreadId(): string {
 
 function sectionFromHash(hash: string): AppSection | null {
   const normalized = hash.replace(/^#/, "").toLowerCase();
-  return normalized === "chat" ||
+  return normalized === "mission" ||
+    normalized === "chat" ||
+    normalized === "outcomes" ||
     normalized === "routines" ||
     normalized === "routing" ||
     normalized === "advanced" ||
@@ -5197,11 +5424,11 @@ function ProviderSelectOptions() {
 
 function modelsForProvider(provider: string, catalogs: Record<string, ProviderModelCatalog>): string[] {
   const catalogModels = catalogs[provider]?.models ?? [];
-  return catalogModels.length ? catalogModels : (modelSuggestionsByProvider[provider] ?? []);
+  return catalogModels.length ? catalogModels : (deterministicModelDefaults[provider] ?? []);
 }
 
 function isKnownProviderModel(provider: string, model: string, catalogs: Record<string, ProviderModelCatalog>): boolean {
-  return [...modelsForProvider(provider, catalogs), ...(modelSuggestionsByProvider[provider] ?? [])].includes(model);
+  return modelsForProvider(provider, catalogs).includes(model);
 }
 
 function toolPermissionsFromRuntime(config: RuntimeConfig): ToolPermissionDraft {

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from ..config import AgentConfig
 from .contracts import TaskLike
-from .ledger import RoutingLedger, stable_decision_id, stable_outcome_id
+from .learned_router import LearnedRouterConfig, build_route_examples, evaluate_shadow
+from .ledger import (
+    RoutingLedger,
+    capability_scope_key,
+    stable_decision_id,
+    stable_outcome_id,
+)
 from .ledger_records import (
     RouteDecisionEntry,
     RouteOutcomeEntry,
     RoutingRevisionConflict,
+    RoutingShadowDraft,
 )
 from .models import PrivacyClass, RouteDecision, RoutingMode
 from .router import ReviewDiversityContext, RoutingUnavailableError
@@ -35,6 +43,7 @@ class DurableRoutingCoordinator:
         *,
         policy_id: str = "balanced",
         mode: RoutingMode = "shadow",
+        learned_config: LearnedRouterConfig | None = None,
     ) -> None:
         if mode == "off":
             raise ValueError(
@@ -43,6 +52,7 @@ class DurableRoutingCoordinator:
         self.ledger = ledger
         self.policy_id = policy_id
         self.mode = mode
+        self.learned_config = learned_config or LearnedRouterConfig()
 
     def assign(
         self,
@@ -55,6 +65,10 @@ class DurableRoutingCoordinator:
         default_privacy_class: PrivacyClass = "approved_cloud",
         local_required: bool = False,
         maximum_cost_usd: float | None = None,
+        allowed_target_ids: Sequence[str] = (),
+        forbidden_target_ids: Sequence[str] = (),
+        allowed_provider_profiles: Sequence[str] = (),
+        forbidden_provider_profiles: Sequence[str] = (),
         direct_target_id: str | None = None,
         review_context: ReviewDiversityContext | None = None,
     ) -> DurableRoutingAssignment:
@@ -88,18 +102,68 @@ class DurableRoutingCoordinator:
                 default_privacy_class=default_privacy_class,
                 local_required=local_required,
                 maximum_cost_usd=maximum_cost_usd,
+                allowed_target_ids=allowed_target_ids,
+                forbidden_target_ids=forbidden_target_ids,
+                allowed_provider_profiles=allowed_provider_profiles,
+                forbidden_provider_profiles=forbidden_provider_profiles,
                 review_context=review_context,
             )
 
-        assignment = service.assign(
+        (
+            effective_direct_target_id,
+            effective_forbidden_targets,
+            escalation_reason,
+            prior_target_id,
+        ) = self._prior_failure_directive(
+            task=task,
+            subagent_id=subagent_id,
+            attempt=attempt,
+            direct_target_id=direct_target_id,
+            forbidden_target_ids=forbidden_target_ids,
+        )
+        static_assignment = service.assign(
             base_config,
             task,
             planner_guidance=planner_guidance,
             default_privacy_class=default_privacy_class,
             local_required=local_required,
             maximum_cost_usd=maximum_cost_usd,
-            direct_target_id=direct_target_id,
+            allowed_target_ids=allowed_target_ids,
+            forbidden_target_ids=effective_forbidden_targets,
+            allowed_provider_profiles=allowed_provider_profiles,
+            forbidden_provider_profiles=forbidden_provider_profiles,
+            direct_target_id=effective_direct_target_id,
             review_context=review_context,
+        )
+        if escalation_reason == "capability_escalation":
+            static_assignment = self._select_stronger_capability_target(
+                service,
+                base_config=base_config,
+                task=task,
+                current=static_assignment,
+                previous_target_id=prior_target_id,
+                planner_guidance=planner_guidance,
+                default_privacy_class=default_privacy_class,
+                local_required=local_required,
+                maximum_cost_usd=maximum_cost_usd,
+                allowed_target_ids=allowed_target_ids,
+                forbidden_target_ids=effective_forbidden_targets,
+                allowed_provider_profiles=allowed_provider_profiles,
+                forbidden_provider_profiles=forbidden_provider_profiles,
+                review_context=review_context,
+            )
+        if escalation_reason is not None:
+            static_assignment = _annotate_assignment(
+                service,
+                base_config=base_config,
+                assignment=static_assignment,
+                selection_kind=escalation_reason,
+                reason_code=escalation_reason,
+            )
+        assignment, shadow = self._evaluate_learned_route(
+            service,
+            base_config=base_config,
+            assignment=static_assignment,
         )
         decision_id = stable_decision_id(
             run_id=task.run_id,
@@ -117,6 +181,8 @@ class DurableRoutingCoordinator:
             attempt=attempt,
             decision=assignment.decision,
             policy_revision=policy_entry.revision,
+            contract=assignment.contract,
+            shadow=shadow,
         )
         return DurableRoutingAssignment(assignment=assignment, record=record, reused=False)
 
@@ -144,6 +210,24 @@ class DurableRoutingCoordinator:
         outcome_labels: tuple[str, ...] = (),
         evidence_refs: tuple[str, ...] = (),
     ) -> RouteOutcomeEntry:
+        resolved_cost = (
+            actual_cost_usd
+            if actual_cost_usd is not None
+            else _actual_cost_from_usage(
+                durable.record,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        )
+        labels = list(outcome_labels)
+        labels.append(
+            "usage_attributed"
+            if input_tokens is not None and output_tokens is not None
+            else "usage_unavailable"
+        )
+        labels.append(
+            "cost_attributed" if resolved_cost is not None else "cost_unavailable"
+        )
         return self.ledger.record_outcome(
             outcome_id=stable_outcome_id(durable.record.decision_id),
             decision_id=durable.record.decision_id,
@@ -155,14 +239,249 @@ class DurableRoutingCoordinator:
             latency_seconds=latency_seconds,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            actual_cost_usd=actual_cost_usd,
+            actual_cost_usd=resolved_cost,
             tool_count=tool_count,
             changed_file_count=changed_file_count,
             retry_count=retry_count,
             escalated=escalated,
             reward_components=reward_components,
-            outcome_labels=outcome_labels,
+            outcome_labels=tuple(dict.fromkeys(labels)),
             evidence_refs=evidence_refs,
+        )
+
+    def _evaluate_learned_route(
+        self,
+        service: AdaptiveFlockRoutingService,
+        *,
+        base_config: AgentConfig,
+        assignment: RoutingAssignment,
+    ) -> tuple[RoutingAssignment, RoutingShadowDraft]:
+        contract = assignment.contract
+        static_decision = assignment.decision
+        static_target_id = static_decision.selected_target.target_id
+        eligible_target_ids = tuple(
+            sorted(
+                candidate.target.target_id
+                for candidate in static_decision.candidates
+                if candidate.eligible
+            )
+        )
+        all_target_ids = {target.target_id for target in service.targets}
+        hard_filtered = frozenset(all_target_ids - set(eligible_target_ids))
+        learned_config = replace(
+            self.learned_config,
+            hard_filtered_targets=hard_filtered,
+        )
+        project_id = self.ledger.state.get_run(contract.run_id).project_id
+        capability_key = capability_scope_key(contract.required_capabilities)
+        raw_outcomes = self.ledger.list_learning_outcomes(
+            project_id=project_id,
+            task_family=contract.task_family,
+            risk=contract.risk,
+            capability_key=capability_key,
+            eligible_target_ids=eligible_target_ids,
+        )
+        evaluation = evaluate_shadow(
+            examples=build_route_examples(raw_outcomes),
+            static_target_id=static_target_id,
+            config=learned_config,
+        )
+        learned_target_id = evaluation.learned_target_id
+        activation_reason = evaluation.abstention_reason
+        activate = False
+        if self.mode == "shadow":
+            activation_reason = activation_reason or "shadow_only"
+        elif self.mode == "constrained":
+            activation_reason = activation_reason or "constrained_shadow_only"
+        elif contract.risk not in {"low", "medium"}:
+            activation_reason = "high_risk"
+        elif not learned_config.replay_gate_enabled:
+            activation_reason = "replay_gate_not_enabled"
+        elif learned_target_id == static_target_id:
+            activation_reason = "learned_matches_static"
+        elif evaluation.should_activate and learned_target_id in eligible_target_ids:
+            activate = True
+
+        effective_assignment = assignment
+        if activate and learned_target_id is not None:
+            target = next(
+                item for item in service.targets if item.target_id == learned_target_id
+            )
+            candidate = next(
+                item
+                for item in static_decision.candidates
+                if item.target.target_id == learned_target_id
+            )
+            learned_decision: RouteDecision = replace(
+                static_decision,
+                selected_target=target,
+                selection_kind="learned_constrained",
+                score=float(candidate.score or evaluation.learned_utility or 0.0),
+                reason_codes=tuple(
+                    dict.fromkeys(
+                        (
+                            *static_decision.reason_codes,
+                            "learned_route_activated",
+                            "verified_scope_evidence",
+                            "hard_eligibility_preserved",
+                        )
+                    )
+                ),
+                actionable=True,
+            )
+            effective_assignment = RoutingAssignment(
+                contract=contract,
+                decision=learned_decision,
+                config=service.apply_decision(base_config, learned_decision),
+                executes_selected_target=True,
+            )
+            activation_reason = None
+
+        actual_target_id = (
+            effective_assignment.decision.selected_target.target_id
+            if effective_assignment.executes_selected_target
+            else None
+        )
+        actual_provider = (
+            effective_assignment.decision.selected_target.provider
+            if actual_target_id is not None
+            else base_config.provider
+        )
+        actual_model = (
+            effective_assignment.decision.selected_target.model
+            if actual_target_id is not None
+            else base_config.model
+        )
+        return effective_assignment, RoutingShadowDraft(
+            project_id=project_id,
+            task_family=contract.task_family,
+            risk=contract.risk,
+            capability_key=capability_key,
+            static_target_id=static_target_id,
+            learned_target_id=learned_target_id,
+            actual_target_id=actual_target_id,
+            actual_provider=actual_provider,
+            actual_model=actual_model,
+            evidence_count=evaluation.evidence_count,
+            target_example_count=evaluation.target_example_count,
+            cost_coverage=evaluation.cost_coverage,
+            confidence=evaluation.confidence,
+            static_utility=evaluation.static_utility,
+            learned_utility=evaluation.learned_utility,
+            utility_delta=evaluation.utility_improvement,
+            estimated_savings_usd=evaluation.estimated_savings_usd,
+            activated=activate,
+            abstention_reason=activation_reason,
+            config_digest=evaluation.config_digest,
+        )
+
+    def _prior_failure_directive(
+        self,
+        *,
+        task: TaskLike,
+        subagent_id: str | None,
+        attempt: int,
+        direct_target_id: str | None,
+        forbidden_target_ids: Sequence[str],
+    ) -> tuple[str | None, tuple[str, ...], str | None, str | None]:
+        forbidden = tuple(sorted(set(forbidden_target_ids)))
+        if direct_target_id is not None or attempt <= 1:
+            return direct_target_id, forbidden, None, None
+        previous = self.ledger.get_attempt_decision(
+            run_id=task.run_id,
+            task_id=task.task_id,
+            subagent_id=subagent_id,
+            attempt=attempt - 1,
+        )
+        if previous is None:
+            return None, forbidden, None, None
+        outcome = self.ledger.get_outcome(previous.decision_id)
+        if outcome is None:
+            return None, forbidden, None, previous.selected_target_id
+        if outcome.failure_category == "provider_outage":
+            return (
+                previous.selected_target_id,
+                forbidden,
+                "transport_retry_same_target",
+                previous.selected_target_id,
+            )
+        if outcome.failure_category == "capability_failure":
+            return (
+                None,
+                tuple(sorted({*forbidden, previous.selected_target_id})),
+                "capability_escalation",
+                previous.selected_target_id,
+            )
+        if outcome.failure_category == "contract_failure":
+            raise RoutingUnavailableError(
+                "the previous attempt failed its task contract and requires replanning",
+                reason_codes=("route_contract_replan_required",),
+            )
+        return None, forbidden, None, previous.selected_target_id
+
+    def _select_stronger_capability_target(
+        self,
+        service: AdaptiveFlockRoutingService,
+        *,
+        base_config: AgentConfig,
+        task: TaskLike,
+        current: RoutingAssignment,
+        previous_target_id: str | None,
+        planner_guidance: dict[str, object] | None,
+        default_privacy_class: PrivacyClass,
+        local_required: bool,
+        maximum_cost_usd: float | None,
+        allowed_target_ids: Sequence[str],
+        forbidden_target_ids: Sequence[str],
+        allowed_provider_profiles: Sequence[str],
+        forbidden_provider_profiles: Sequence[str],
+        review_context: ReviewDiversityContext | None,
+    ) -> RoutingAssignment:
+        previous = next(
+            (
+                target
+                for target in service.targets
+                if target.target_id == previous_target_id
+            ),
+            None,
+        )
+        if previous is None:
+            raise RoutingUnavailableError(
+                "capability escalation references an unavailable previous target",
+                reason_codes=("previous_route_target_unavailable",),
+            )
+        stronger = [
+            candidate
+            for candidate in current.decision.candidates
+            if candidate.eligible
+            and candidate.target.quality_tier > previous.quality_tier
+        ]
+        if not stronger:
+            raise RoutingUnavailableError(
+                "no stronger eligible target is available after capability failure",
+                reason_codes=("no_stronger_capability_target",),
+            )
+        selected = max(
+            stronger,
+            key=lambda candidate: (
+                float(candidate.score or 0.0),
+                candidate.target.quality_tier,
+                candidate.target.target_id,
+            ),
+        )
+        return service.assign(
+            base_config,
+            task,
+            planner_guidance=planner_guidance,
+            default_privacy_class=default_privacy_class,
+            local_required=local_required,
+            maximum_cost_usd=maximum_cost_usd,
+            allowed_target_ids=allowed_target_ids,
+            forbidden_target_ids=forbidden_target_ids,
+            allowed_provider_profiles=allowed_provider_profiles,
+            forbidden_provider_profiles=forbidden_provider_profiles,
+            direct_target_id=selected.target.target_id,
+            review_context=review_context,
         )
 
     def _reuse_assignment(
@@ -176,6 +495,10 @@ class DurableRoutingCoordinator:
         default_privacy_class: PrivacyClass,
         local_required: bool,
         maximum_cost_usd: float | None,
+        allowed_target_ids: Sequence[str],
+        forbidden_target_ids: Sequence[str],
+        allowed_provider_profiles: Sequence[str],
+        forbidden_provider_profiles: Sequence[str],
         review_context: ReviewDiversityContext | None,
     ) -> DurableRoutingAssignment:
         target_entry = self.ledger.get_model_target(existing.selected_target_id)
@@ -203,6 +526,10 @@ class DurableRoutingCoordinator:
             default_privacy_class=default_privacy_class,
             local_required=local_required,
             maximum_cost_usd=maximum_cost_usd,
+            allowed_target_ids=allowed_target_ids,
+            forbidden_target_ids=forbidden_target_ids,
+            allowed_provider_profiles=allowed_provider_profiles,
+            forbidden_provider_profiles=forbidden_provider_profiles,
             direct_target_id=existing.selected_target_id,
             review_context=review_context,
         )
@@ -230,3 +557,48 @@ class DurableRoutingCoordinator:
             record=existing,
             reused=True,
         )
+
+
+def _actual_cost_from_usage(
+    decision: RouteDecisionEntry,
+    *,
+    input_tokens: int | None,
+    output_tokens: int | None,
+) -> float | None:
+    if input_tokens is None or output_tokens is None:
+        return None
+    input_rate = decision.input_cost_per_million_usd
+    output_rate = decision.output_cost_per_million_usd
+    if input_rate is None or output_rate is None:
+        return None
+    return round(
+        (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000.0,
+        12,
+    )
+
+
+def _annotate_assignment(
+    service: AdaptiveFlockRoutingService,
+    *,
+    base_config: AgentConfig,
+    assignment: RoutingAssignment,
+    selection_kind: str,
+    reason_code: str,
+) -> RoutingAssignment:
+    decision = replace(
+        assignment.decision,
+        selection_kind=selection_kind,
+        reason_codes=tuple(
+            dict.fromkeys((*assignment.decision.reason_codes, reason_code))
+        ),
+    )
+    return RoutingAssignment(
+        contract=assignment.contract,
+        decision=decision,
+        config=(
+            service.apply_decision(base_config, decision)
+            if decision.actionable
+            else base_config
+        ),
+        executes_selected_target=decision.actionable,
+    )

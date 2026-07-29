@@ -5,15 +5,29 @@ import { RoutingCenter } from "./RoutingCenter";
 
 const statusPayload = {
   schema: "kestrel.adaptive_flock.status.v1",
-  runtime: { enabled: false, mode: "off", policy_id: "balanced" },
-  routing_schema_version: 1,
+  runtime: {
+    enabled: false,
+    mode: "off",
+    policy_id: "balanced",
+    learned: {
+      min_examples: 5,
+      min_target_examples: 3,
+      confidence_threshold: 0.7,
+      activation_margin: 0.08,
+      cost_coverage_threshold: 0.8,
+      decay_half_life_days: 30,
+      activation_replay_verified: false
+    }
+  },
+  routing_schema_version: 2,
   counts: {
     provider_profiles: 1,
     enabled_provider_profiles: 1,
     model_targets: 1,
     enabled_model_targets: 1,
     policies: 1,
-    enabled_policies: 1
+    enabled_policies: 1,
+    calibrations: 1
   }
 };
 
@@ -54,6 +68,8 @@ const targetPayload = {
   latency_tier: 2,
   operator_priority: 0,
   estimated_cost_usd: 0,
+  input_cost_per_million_usd: 0,
+  output_cost_per_million_usd: 0,
   health: "healthy",
   recent_failure_rate: 0,
   predicted_success: 0.86,
@@ -141,7 +157,85 @@ beforeEach(() => {
       if (path === "/api/routing/policies") return jsonResponse([policyPayload]);
       if (path === "/api/routing/preview") return jsonResponse(previewPayload);
       if (path === "/api/runs/run-1/routing?task_id=task-1") {
-        return jsonResponse({ run_id: "run-1", task_id: "task-1", decisions: [], outcomes: [] });
+        return jsonResponse({
+          run_id: "run-1",
+          task_id: "task-1",
+          decisions: [
+            {
+              decision_id: "decision-1",
+              task_id: "task-1",
+              attempt: 1,
+              status: "completed",
+              mode: "constrained",
+              selected_target_id: "local-worker",
+              selected_provider: "openai-compatible",
+              selected_model: "qwen-coder",
+              selection_kind: "deterministic_router",
+              actionable: true,
+              task_family: "bounded_code_change",
+              risk: "low"
+            }
+          ],
+          outcomes: [
+            {
+              decision_id: "decision-1",
+              validation_passed: true,
+              execution_status: "completed",
+              failure_category: null,
+              latency_seconds: 4,
+              input_tokens: 100,
+              output_tokens: 20,
+              actual_cost_usd: 0,
+              retry_count: 0,
+              escalated: false,
+              outcome_labels: ["validated_success", "cost_attributed"]
+            }
+          ],
+          shadows: [
+            {
+              shadow_id: "shadow-1",
+              decision_id: "decision-1",
+              project_id: "project-1",
+              task_family: "bounded_code_change",
+              risk: "low",
+              static_target_id: "frontier-review",
+              learned_target_id: "local-worker",
+              actual_target_id: "local-worker",
+              actual_provider: "openai-compatible",
+              actual_model: "qwen-coder",
+              evidence_count: 12,
+              target_example_count: 9,
+              cost_coverage: 1,
+              confidence: 0.75,
+              utility_delta: 0.2,
+              estimated_savings_usd: 0.03,
+              route_regret_usd: 0,
+              activated: true,
+              abstention_reason: null,
+              resolved_at: "2026-07-27T00:00:00Z",
+              actual_validation_passed: true,
+              actual_cost_usd: 0
+            }
+          ],
+          calibrations: [
+            {
+              calibration_key: "cal-1",
+              project_id: "project-1",
+              target_id: "local-worker",
+              task_family: "bounded_code_change",
+              risk: "low",
+              validation_rate: 0.9,
+              recent_failure_rate: 0.1,
+              provider_outage_rate: 0,
+              average_cost_usd: 0,
+              average_latency_seconds: 4,
+              cost_coverage: 1,
+              example_count: 12,
+              effective_sample_size: 11.5,
+              updated_at: "2026-07-27T00:00:00Z"
+            }
+          ]
+        });
       }
       return new Response(JSON.stringify({ detail: `Unhandled ${method} ${path}` }), { status: 404 });
     })
@@ -160,9 +254,11 @@ describe("RoutingCenter", () => {
     expect((await screen.findAllByText("Local server")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("local-worker").length).toBeGreaterThan(0);
     expect(screen.getAllByText("balanced").length).toBeGreaterThan(0);
-    expect(screen.getByText("0 decisions")).toBeInTheDocument();
+    expect(screen.getByText("1 decisions")).toBeInTheDocument();
     expect(screen.getByText("Runtime")).toBeInTheDocument();
     expect(screen.getByText("off")).toBeInTheDocument();
+    expect(screen.getByText("frontier-review → local-worker")).toBeInTheDocument();
+    expect(screen.getByText("The evidence-gated learned route executed.", { exact: false })).toBeInTheDocument();
   });
 
   it("previews a task without executing it", async () => {

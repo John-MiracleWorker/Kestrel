@@ -318,7 +318,7 @@ def test_schema_18_to_19_preserves_scheduled_occurrences(tmp_path: Path) -> None
     migrated = AgentStateStore(path)
     preserved = migrated.get_routine_occurrence(occurrence.occurrence_id)
 
-    assert migrated.schema_version() == 19
+    assert migrated.schema_version() == 21
     assert preserved.trigger_kind == "scheduled"
     assert preserved.trigger_key_digest is None
     assert preserved.requested_at is None
@@ -1551,6 +1551,183 @@ def test_thread_start_and_shutdown_are_atomic(
     assert shutdown_results == [True]
 
 
+def test_named_timezone_cron_routine_advances_by_matching_local_time(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    created = _create_routine(
+        state,
+        routine_id="weekday-cron",
+        start=datetime(2026, 7, 27, 0, 0, tzinfo=UTC),
+        schedule_kind="cron",
+        cron_expression="0 9 * * 1-5",
+        timezone="America/Detroit",
+    )
+    assert created.next_run_at == "2026-07-27T13:00:00+00:00"
+    enabled = state.update_routine(
+        created.routine_id,
+        expected_revision=created.revision,
+        enabled=True,
+    )
+
+    batch = state.claim_due_routine_occurrences(
+        now=datetime(2026, 7, 27, 13, 0, tzinfo=UTC),
+        claim_owner="cron-test",
+    )
+
+    assert len(batch.claimed) == 1
+    assert batch.claimed[0].scheduled_for == "2026-07-27T13:00:00+00:00"
+    current = state.get_routine(enabled.routine_id)
+    assert current.next_run_at == "2026-07-28T13:00:00+00:00"
+
+
+def test_routine_delivery_is_idempotent_and_reconcilable(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    secret = "routine-delivery-sensitive-value-51729"  # gitleaks:allow
+    register_secret_value(secret)
+
+    class DeliveryProbe:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        def deliver_routine_result(
+            self,
+            *,
+            channel_id: str,
+            conversation_id: str,
+            text: str,
+            idempotency_key: str,
+        ) -> dict[str, object]:
+            self.calls.append(
+                {
+                    "channel_id": channel_id,
+                    "conversation_id": conversation_id,
+                    "text": text,
+                    "idempotency_key": idempotency_key,
+                }
+            )
+            return {
+                "ok": True,
+                "delivery": {
+                    "sent": True,
+                    "dry_run": False,
+                    "status_code": 200,
+                },
+                "provider": {"token": secret},
+            }
+
+    delivery = DeliveryProbe()
+    due = datetime.now(UTC)
+    created = _create_routine(
+        manager.state,
+        routine_id="delivered-routine",
+        start=due,
+        delivery={
+            "channel_id": "telegram",
+            "conversation_id": "1234",
+            "template": "Routine result: {result}",
+        },
+    )
+    manager.state.update_routine(
+        created.routine_id,
+        expected_revision=created.revision,
+        enabled=True,
+    )
+    service = RoutineService(manager.state, manager, delivery=delivery)
+
+    tick = service.tick(now=due)
+    run_id = tick.dispatches[0].run_id
+    _wait_for_run(manager, run_id)
+    service.reconcile(now=due + timedelta(seconds=1))
+    service.reconcile(now=due + timedelta(seconds=2))
+
+    records = manager.state.list_routine_deliveries(
+        routine_id=created.routine_id
+    )
+    assert len(records) == 1
+    assert records[0].status == "delivered"
+    assert records[0].attempt_count == 1
+    assert records[0].receipt["provider"]["token"] == "<redacted>"
+    assert secret not in str(records[0].receipt)
+    assert len(delivery.calls) == 1
+    assert delivery.calls[0]["idempotency_key"] == records[0].idempotency_key
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_ambiguous_routine_delivery_requires_explicit_reconciliation(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+
+    class AmbiguousDelivery:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def deliver_routine_result(
+            self,
+            *,
+            channel_id: str,
+            conversation_id: str,
+            text: str,
+            idempotency_key: str,
+        ) -> dict[str, object]:
+            del channel_id, conversation_id, text, idempotency_key
+            self.calls += 1
+            raise TimeoutError("remote receipt unavailable")
+
+    delivery = AmbiguousDelivery()
+    due = datetime.now(UTC)
+    created = _create_routine(
+        manager.state,
+        routine_id="uncertain-delivery",
+        start=due,
+        delivery={"channel_id": "webhook", "conversation_id": "ops"},
+    )
+    manager.state.update_routine(
+        created.routine_id,
+        expected_revision=created.revision,
+        enabled=True,
+    )
+    service = RoutineService(manager.state, manager, delivery=delivery)
+
+    tick = service.tick(now=due)
+    _wait_for_run(manager, tick.dispatches[0].run_id)
+    service.reconcile(now=due + timedelta(seconds=1))
+    service.reconcile(now=due + timedelta(seconds=2))
+    uncertain = manager.state.list_routine_deliveries(
+        routine_id=created.routine_id
+    )[0]
+
+    assert uncertain.status == "uncertain"
+    assert delivery.calls == 1
+    secret = "routine-reconcile-sensitive-value-16428"  # gitleaks:allow
+    register_secret_value(secret)
+    with pytest.raises(ValueError, match="may not contain raw secrets"):
+        service.reconcile_delivery(
+            uncertain.delivery_id,
+            expected_attempt_count=uncertain.attempt_count,
+            resolution="delivered",
+            receipt={"operator": f"confirmed with {secret}"},
+            now=due + timedelta(seconds=3),
+        )
+    assert (
+        manager.state.get_routine_delivery(uncertain.delivery_id).status
+        == "uncertain"
+    )
+    resolved = service.reconcile_delivery(
+        uncertain.delivery_id,
+        expected_attempt_count=uncertain.attempt_count,
+        resolution="delivered",
+        receipt={"operator": "confirmed"},
+        now=due + timedelta(seconds=4),
+    )
+    assert resolved.status == "delivered"
+    assert resolved.receipt == {"operator": "confirmed"}
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+
 def _create_routine(
     state: AgentStateStore,
     *,
@@ -1560,6 +1737,9 @@ def _create_routine(
     prompt: str = "Give a deterministic mock response",
     schedule_kind: str = "once",
     interval_seconds: int | None = None,
+    cron_expression: str | None = None,
+    timezone: str = "UTC",
+    delivery: dict[str, object] | None = None,
     enabled: bool = False,
     workspace: str | None = None,
     provider: str | None = None,
@@ -1573,6 +1753,9 @@ def _create_routine(
         schedule_kind=schedule_kind,
         start_at=start,
         interval_seconds=interval_seconds,
+        cron_expression=cron_expression,
+        timezone=timezone,
+        delivery=delivery,
         enabled=enabled,
         workspace=workspace,
         provider=provider,

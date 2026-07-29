@@ -3920,6 +3920,34 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
   margin: -28px 0 24px;
 }
 
+.advanced-surface-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -18px 0 28px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--rule-strong);
+}
+
+.advanced-surface-nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  color: var(--ink-soft);
+  border: 1px solid var(--rule-strong);
+  border-radius: 5px;
+  background: rgba(28, 27, 27, .82);
+  font: 600 12px/1 var(--sans);
+  cursor: pointer;
+}
+
+.advanced-surface-nav button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 @media (max-width: 1180px) {
   .stitch-command-deck {
     grid-template-columns: 1fr;
@@ -4017,4 +4045,105 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
     grid-column: 2;
     grid-row: 1 / span 2;
   }
+}
+.repair-diff {
+  margin: 14px 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 88%, #07111f);
+}
+
+.repair-diff > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.repair-diff h4 {
+  margin: 0;
+}
+
+.repair-diff > p {
+  margin: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.repair-diff-mode {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.repair-diff-mode button {
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+}
+
+.repair-diff-mode button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.repair-diff-unified {
+  display: grid;
+  max-height: 420px;
+  margin: 0;
+  overflow: auto;
+  background: #08101c;
+  color: #cbd5e1;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.repair-diff-unified code,
+.repair-diff-split code {
+  min-height: 1.55em;
+  padding: 0 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.repair-diff-unified .diff-add,
+.repair-diff-row.add code:last-child {
+  background: rgb(34 197 94 / 14%);
+  color: #bbf7d0;
+}
+
+.repair-diff-unified .diff-delete,
+.repair-diff-row.delete code:first-child {
+  background: rgb(248 113 113 / 15%);
+  color: #fecaca;
+}
+
+.repair-diff-unified .diff-meta,
+.repair-diff-unified .diff-file,
+.repair-diff-row.meta code {
+  color: #93c5fd;
+  background: rgb(59 130 246 / 9%);
+}
+
+.repair-diff-split {
+  max-height: 420px;
+  overflow: auto;
+  background: #08101c;
+  color: #cbd5e1;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.repair-diff-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.repair-diff-row code + code {
+  border-left: 1px solid rgb(148 163 184 / 18%);
 }

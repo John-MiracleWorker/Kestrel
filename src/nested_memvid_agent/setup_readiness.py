@@ -19,6 +19,12 @@ class SetupReadinessStatus(StrEnum):
     FAIL = "fail"
 
 
+class ExperienceMode(StrEnum):
+    DEMO = "demo"
+    MODEL_NOT_CONNECTED = "model_not_connected"
+    CONNECTED = "connected"
+
+
 @dataclass(frozen=True)
 class SetupReadinessCheck:
     check_id: str
@@ -41,6 +47,7 @@ class SetupReadinessCheck:
 class SetupReadinessReport:
     schema: str
     ready: bool
+    experience_mode: ExperienceMode
     pass_count: int
     warn_count: int
     fail_count: int
@@ -51,6 +58,7 @@ class SetupReadinessReport:
         return {
             "schema": self.schema,
             "ready": self.ready,
+            "experience_mode": self.experience_mode.value,
             "pass_count": self.pass_count,
             "warn_count": self.warn_count,
             "fail_count": self.fail_count,
@@ -107,21 +115,66 @@ def build_setup_readiness_report(
     warn_count = sum(1 for check in checks if check.status == SetupReadinessStatus.WARN)
     fail_count = sum(1 for check in checks if check.status == SetupReadinessStatus.FAIL)
     ready = fail_count == 0
-    if fail_count:
-        next_action = "Fix failing setup checks before starting the golden local workflow."
-    elif warn_count:
-        next_action = "You can run locally now; resolve warnings before treating this setup as product-ready."
-    else:
-        next_action = "Setup prerequisites are ready for the local golden workflow."
+    experience_mode = _experience_mode(config, checks)
+    next_action = _next_action(checks, experience_mode)
     return SetupReadinessReport(
         schema="kestrel.setup_readiness.v1",
         ready=ready,
+        experience_mode=experience_mode,
         pass_count=pass_count,
         warn_count=warn_count,
         fail_count=fail_count,
         checks=checks,
         next_action=next_action,
     )
+
+
+_PROVIDER_CHECK_IDS = frozenset({"provider_configuration", "provider_operational"})
+
+
+def _experience_mode(
+    config: AgentConfig,
+    checks: tuple[SetupReadinessCheck, ...],
+) -> ExperienceMode:
+    provider = config.provider.strip() or "mock"
+    if provider == "mock":
+        return ExperienceMode.DEMO
+    by_id = {check.check_id: check for check in checks}
+    configured = by_id["provider_configuration"]
+    operational = by_id["provider_operational"]
+    if (
+        configured.status == SetupReadinessStatus.PASS
+        and operational.status == SetupReadinessStatus.PASS
+    ):
+        return ExperienceMode.CONNECTED
+    return ExperienceMode.MODEL_NOT_CONNECTED
+
+
+def _next_action(
+    checks: tuple[SetupReadinessCheck, ...],
+    experience_mode: ExperienceMode,
+) -> str:
+    non_provider_checks = tuple(
+        check for check in checks if check.check_id not in _PROVIDER_CHECK_IDS
+    )
+    for status in (SetupReadinessStatus.FAIL, SetupReadinessStatus.WARN):
+        blocking = next(
+            (check for check in non_provider_checks if check.status == status),
+            None,
+        )
+        if blocking is not None:
+            return blocking.recovery
+    if experience_mode == ExperienceMode.DEMO:
+        return (
+            "Demo is ready. Run `kestrel chat`; connect a live model in Settings "
+            "when you want non-deterministic responses."
+        )
+    if experience_mode == ExperienceMode.MODEL_NOT_CONNECTED:
+        return (
+            "Open Settings to correct the provider, credentials, endpoint, or "
+            "model configuration, then run a live provider smoke request."
+        )
+    return "Provider and setup prerequisites are ready. Run `kestrel chat`."
 
 
 def _provider_check(config: AgentConfig, *, secret_resolver: SecretResolver | None = None) -> SetupReadinessCheck:
@@ -304,6 +357,7 @@ def _permission_gate_check(config: AgentConfig) -> SetupReadinessCheck:
             ("git_commit", config.allow_git_commit),
             ("git_push", config.allow_git_push),
             ("remote_mutation", config.allow_remote_mutation),
+            ("browser_validation", config.allow_browser_validation),
             ("policy_writes", config.allow_policy_writes),
         )
         if enabled
@@ -346,6 +400,8 @@ def _validation_container_check(config: AgentConfig) -> SetupReadinessCheck:
         )
     if config.allow_codex_cli:
         enabled_tools.append("codex.exec")
+    if config.allow_browser_validation:
+        enabled_tools.append("browser.validate")
     if not enabled_tools:
         return SetupReadinessCheck(
             "validation_container",

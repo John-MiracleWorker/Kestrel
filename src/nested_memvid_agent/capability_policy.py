@@ -22,11 +22,14 @@ TOOL_ENABLEMENT_FLAGS: dict[str, str] = {
     "repair.orchestrate_validate": "allow_shell",
     "repair.review": "allow_file_write",
     "repair.rollback": "allow_file_write",
+    "browser.validate": "allow_browser_validation",
     "codex.exec": "allow_codex_cli",
     "skill.install": "allow_file_write",
     "plugin.review": "allow_plugin_install",
     "plugin.install": "allow_plugin_install",
     "git.commit": "allow_git_commit",
+    "github.pr.create": "allow_remote_mutation",
+    "github.pr.sync": "allow_remote_mutation",
     "memory.import": "allow_memory_import",
     "memory.correct": "allow_memory_import",
     "web.search": "allow_web",
@@ -67,6 +70,20 @@ class CapabilityPolicy:
     ) -> None:
         self.state = state
         self._config = config
+
+    def with_config(self, config: AgentConfig) -> CapabilityPolicy:
+        """Return a policy anchored to one explicit base configuration.
+
+        Durable state (owner overrides, parent skill/MCP resources) stays shared
+        and fail-closed; only the volatile per-process gates read from the
+        config object -- the CLI enablement flags and the ``enabled_tools``
+        launch allowlist -- are anchored. Approval continuation uses this to
+        evaluate the run's durable ``config_snapshot`` instead of the approving
+        process's own CLI flags, which are not part of the durable grant
+        binding (see docs/SECURITY.md).
+        """
+
+        return CapabilityPolicy(self.state, config)
 
     def tool_decision(self, spec: ToolSpec) -> CapabilityDecision:
         enablement_flag = enablement_flag_for_tool(spec)

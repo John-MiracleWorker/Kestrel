@@ -141,11 +141,22 @@ def _create_app(
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
+        from .mission_control import (
+            mission_launch_binding_matches,
+            mission_plan_scope_matches,
+            validated_mission_plan,
+        )
+        from .provider_probe import ProviderProbeService
         from .server_behavior_delta_routes import register_behavior_delta_routes
         from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
         from .server_diagnosis_routes import register_diagnosis_routes
+        from .server_engineering_routes import register_engineering_routes
         from .server_mcp_routes import register_mcp_routes
+        from .server_mission_routes import (
+            evaluate_mission_preflight,
+            register_mission_routes,
+        )
         from .server_models import (
             ApprovalDecisionRequest,
             CapsuleApplyAPIRequest,
@@ -173,6 +184,7 @@ def _create_app(
         )
         from .server_observability_routes import register_observability_routes
         from .server_product_routes import register_product_routes
+        from .server_project_routes import register_project_routes
         from .server_routine_routes import register_routine_routes
         from .server_routing_routes import register_routing_routes
         from .server_runtime_routes import register_runtime_routes
@@ -245,6 +257,7 @@ def _create_app(
         runs,
         claim_ttl_seconds=active_config.routine_claim_ttl_seconds,
         max_occurrences_per_tick=active_config.max_routines_per_tick,
+        delivery=channels,
     )
     routine_loop = (
         RoutineLoop(
@@ -485,6 +498,9 @@ def _create_app(
         ledger=routing_ledger,
         runtime=routing_config,
         http_exception=HTTPException,
+        provider_probe_service=ProviderProbeService(
+            secret_resolver=secret_broker.resolve,
+        ),
     )
     register_routine_routes(
         app,
@@ -502,6 +518,29 @@ def _create_app(
         sensitive_material_transition=mcp_sensitive_material_transition,
     )
     register_product_routes(app, active_config=lambda: active_config, secret_resolver=secret_broker.resolve)
+    register_project_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        runs=runs,
+        http_exception=HTTPException,
+    )
+    register_mission_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        runs=runs,
+        routing_ledger=routing_ledger,
+        routing_config=routing_config,
+        http_exception=HTTPException,
+    )
+    register_engineering_routes(
+        app,
+        active_config=lambda: active_config,
+        state=state,
+        runs=runs,
+        http_exception=HTTPException,
+    )
     register_channel_routes(
         app,
         http_exception=HTTPException,
@@ -516,17 +555,120 @@ def _create_app(
         request: CreateRunRequest,
         http_request: Request,  # type: ignore[valid-type]
     ) -> dict[str, object]:
+        project_revision = request.project_revision
+        if request.mission_plan is not None:
+            if (
+                request.project_id is None
+                or request.mission_template_id is None
+                or request.mission_binding is None
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "mission_plan requires project_id, mission_template_id, and "
+                        "the live Mission preflight binding"
+                    ),
+                )
+            if request.provider is not None or request.model is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Mission launch cannot override the preflighted provider or model",
+                )
+            proposed_mission_plan = [task.model_dump() for task in request.mission_plan]
+            try:
+                project = state.get_project(request.project_id)
+                provided_binding = request.mission_binding.model_dump(by_alias=True)
+                if provided_binding["project_revision"] != project.revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="mission_preflight_binding_stale",
+                    )
+                try:
+                    validated_mission_plan(
+                        request.mission_template_id,
+                        proposed_mission_plan,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="mission_plan_scope_changed_since_preflight",
+                    ) from exc
+                live_preflight = evaluate_mission_preflight(
+                    project=project,
+                    objective=request.message,
+                    template_id=request.mission_template_id,
+                    config=active_config,
+                    state=state,
+                    runs=runs,
+                    routing_ledger=routing_ledger,
+                    routing_config=routing_config,
+                    mission_plan=proposed_mission_plan,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except (PermissionError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            expected_binding = live_preflight["launch_binding"]
+            if not mission_launch_binding_matches(
+                provided_binding,
+                expected_binding,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="mission_preflight_binding_stale",
+                )
+            if not bool(live_preflight["can_start"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "mission_preflight_blocked",
+                        "blockers": live_preflight["blockers"],
+                    },
+                )
+            if not mission_plan_scope_matches(
+                [task.model_dump() for task in request.mission_plan],
+                live_preflight["tasks"],
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="mission_plan_scope_changed_since_preflight",
+                )
+            project_revision = int(provided_binding["project_revision"])
+            if (
+                request.project_revision is not None
+                and request.project_revision != project_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="mission_preflight_project_revision_mismatch",
+                )
+        elif request.mission_template_id is not None or request.mission_binding is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="mission binding fields require mission_plan",
+            )
         try:
             run = runs.create_run(
                 message=request.message,
                 session_id=request.session_id,
                 workspace=Path(request.workspace) if request.workspace else None,
+                project_id=request.project_id,
                 provider=request.provider,
                 model=request.model,
                 autonomy_mode=request.autonomy_mode,
+                mission_plan=(
+                    None
+                    if request.mission_plan is None
+                    else tuple(task.model_dump() for task in request.mission_plan)
+                ),
+                project_revision=project_revision,
             )
         except RunCapacityError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         runs.events.publish(
             run.run_id,
             "request.correlated",
@@ -812,6 +954,21 @@ def _create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (PluginError, FileExistsError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/{plugin_id}/review-update")  # type: ignore[untyped-decorator]
+    def review_plugin_update(
+        plugin_id: str, request: PluginUpdateRequest | None = None
+    ) -> dict[str, object]:
+        require_plugin_install_enabled()
+        try:
+            return plugins.review_update(
+                plugin_id,
+                ref=request.ref if request else None,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PluginError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.delete("/api/plugins/{plugin_id}")  # type: ignore[untyped-decorator]

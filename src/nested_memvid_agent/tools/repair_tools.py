@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess  # nosec B404
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -57,6 +58,13 @@ from .validation_helpers import (
     _tool_validation_evidence_payload,
 )
 from .workspace_tools import _assert_workspace_path_allowed
+
+_MAX_REPAIR_DIFF_PREVIEW_CHARS = 80_000
+_MAX_REPAIR_DIFF_PREVIEW_BYTES = 160_000
+_MAX_REPAIR_DIFF_PREVIEW_FILES = 128
+_MAX_REPAIR_DIFF_PREVIEW_PATH_BYTES = 64 * 1024
+_MAX_REPAIR_DIFF_PREVIEW_CANDIDATE_BYTES = 2 * 1024 * 1024
+_REPAIR_DIFF_PREVIEW_TIMEOUT_SECONDS = 10.0
 
 
 class RepairPrepareTool(AgentTool):
@@ -449,6 +457,8 @@ class RepairValidateTool(AgentTool):
                     output_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
                     session_id=context.session_id,
                     run_id=context.run_id,
+                    project_id=context.project_id,
+                    project_revision=context.project_revision,
                     signed_artifact_source="repair.validate",
                     signed_artifact_locator=str(receipt["validation_id"]),
                     subject_record_id=str(arguments.get("subject_record_id") or "").strip() or None,
@@ -624,6 +634,8 @@ class RepairOrchestrateValidateTool(AgentTool):
                     output_sha256=hashlib.sha256(validation_content.encode("utf-8")).hexdigest(),
                     session_id=context.session_id,
                     run_id=context.run_id,
+                    project_id=context.project_id,
+                    project_revision=context.project_revision,
                     signed_artifact_source="repair.validate",
                     signed_artifact_locator=str(receipt["validation_id"]),
                     subject_record_id=str(arguments.get("subject_record_id") or "").strip() or None,
@@ -870,6 +882,26 @@ class RepairReviewTool(AgentTool):
                         error="empty_repair_diff",
                         data={"branch": branch},
                     )
+                diff_preview = _repair_diff_preview(root, snapshot)
+                after_preview = repair_snapshot(root)
+                preview_drift = _snapshot_drift_fields(snapshot, after_preview)
+                if preview_drift:
+                    return self._result(
+                        call,
+                        success=False,
+                        content=(
+                            "Repair changed while its review preview was being captured; "
+                            "validate and review the current candidate again."
+                        ),
+                        error="validation_receipt_stale",
+                        data={
+                            "validation_id": validation_id,
+                            "drift_fields": preview_drift,
+                            "validated_diff_digest": snapshot.get("diff_digest"),
+                            "current_diff_digest": after_preview.get("diff_digest"),
+                        },
+                    )
+                snapshot = after_preview
                 created_at = utc_now()
                 review_seed = json.dumps(
                     {
@@ -911,6 +943,7 @@ class RepairReviewTool(AgentTool):
                     "diff_digest": snapshot["diff_digest"],
                     "changed_files": snapshot["changed_files"],
                     "repair_snapshot": snapshot,
+                    "diff_preview": diff_preview,
                     "summary": summary,
                     "risks": risks,
                     "created_at": created_at,
@@ -943,6 +976,8 @@ class RepairReviewTool(AgentTool):
                 ).hexdigest(),
                 session_id=context.session_id,
                 run_id=context.run_id,
+                project_id=context.project_id,
+                project_revision=context.project_revision,
                 signed_artifact_source="repair.review",
                 signed_artifact_locator=review_id,
                 subject_record_id=str(arguments.get("subject_record_id") or "").strip() or None,
@@ -1281,6 +1316,231 @@ def _snapshot_drift_fields(
         for field in ("branch", "head_sha", "diff_digest")
         if before.get(field) != after.get(field)
     ]
+
+
+def _repair_diff_preview(workspace: Path, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Capture a bounded, redacted display aid bound to a reviewed fingerprint.
+
+    The signed repair fingerprint and commit-time revalidation remain the
+    authority. This preview is intentionally labelled advisory because source
+    text is redacted and may be truncated. Bounded tracked, deleted, and
+    untracked files are admitted through an isolated temporary Git index;
+    unusual or oversized paths remain visible in ``changed_files`` but are
+    omitted from inline content.
+    """
+
+    changed = _safe_preview_paths(snapshot.get("changed_files"))
+    tracked = set(_safe_preview_paths(snapshot.get("tracked_files")))
+    untracked = set(_safe_preview_paths(snapshot.get("untracked_files")))
+    manifest = {
+        str(item.get("path")): item
+        for item in snapshot.get("changed_manifest", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    selected: list[str] = []
+    selected_path_bytes = 0
+    selected_candidate_bytes = 0
+    for path in changed:
+        entry = manifest.get(path, {})
+        size = int(entry.get("size", 0)) if isinstance(entry.get("size", 0), int) else 0
+        encoded_size = len(os.fsencode(path)) + 1
+        if (
+            path not in tracked | untracked
+            or size < 0
+            or len(selected) >= _MAX_REPAIR_DIFF_PREVIEW_FILES
+            or selected_path_bytes + encoded_size > _MAX_REPAIR_DIFF_PREVIEW_PATH_BYTES
+            or selected_candidate_bytes + size > _MAX_REPAIR_DIFF_PREVIEW_CANDIDATE_BYTES
+        ):
+            continue
+        selected.append(path)
+        selected_path_bytes += encoded_size
+        selected_candidate_bytes += size
+
+    content = ""
+    output_truncated = False
+    unavailable_reason: str | None = None
+    if selected:
+        try:
+            raw, output_truncated = _capture_bounded_repair_diff(
+                workspace,
+                selected,
+                untracked_paths=[path for path in selected if path in untracked],
+            )
+            content = redact_text(raw.decode("utf-8", errors="replace"))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            unavailable_reason = redact_text(str(exc))[:500]
+    if len(content) > _MAX_REPAIR_DIFF_PREVIEW_CHARS:
+        content = content[:_MAX_REPAIR_DIFF_PREVIEW_CHARS]
+        output_truncated = True
+    omitted_files = max(0, len(changed) - len(selected))
+    truncated = output_truncated or omitted_files > 0
+    if truncated and content:
+        suffix = "\n... inline review preview truncated; inspect the changed-file manifest ...\n"
+        content = content[: _MAX_REPAIR_DIFF_PREVIEW_CHARS - len(suffix)] + suffix
+    return {
+        "format": "unified",
+        "content": content,
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "bound_diff_digest": str(snapshot.get("diff_digest", "")),
+        "redacted": True,
+        "authoritative": False,
+        "truncated": truncated,
+        "included_files": selected,
+        "omitted_files": omitted_files,
+        "available": bool(content),
+        "unavailable_reason": unavailable_reason,
+    }
+
+
+def _safe_preview_paths(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            continue
+        pure = PurePosixPath(item)
+        if (
+            pure.is_absolute()
+            or ".." in pure.parts
+            or any(ord(character) < 32 or ord(character) == 127 for character in item)
+        ):
+            continue
+        paths.append(item)
+    return sorted(set(paths))
+
+
+def _capture_bounded_repair_diff(
+    workspace: Path,
+    paths: list[str],
+    *,
+    untracked_paths: list[str],
+) -> tuple[bytes, bool]:
+    deadline = time.monotonic() + _REPAIR_DIFF_PREVIEW_TIMEOUT_SECONDS
+    environment = _sanitized_git_environment(None)
+    with tempfile.TemporaryDirectory(prefix="kestrel-review-index-") as temporary:
+        environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
+        _run_preview_index_command(
+            workspace,
+            ["read-tree", "HEAD"],
+            environment=environment,
+            deadline=deadline,
+        )
+        if untracked_paths:
+            _run_preview_index_command(
+                workspace,
+                ["add", "--intent-to-add", "--", *untracked_paths],
+                environment=environment,
+                deadline=deadline,
+            )
+        command = _hardened_git_command(
+            [
+                "diff",
+                "--binary",
+                "--ita-visible-in-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "HEAD",
+                "--",
+                *paths,
+            ],
+            workspace=workspace,
+        )
+        return _capture_preview_command(
+            workspace,
+            command,
+            environment=environment,
+            deadline=deadline,
+        )
+
+
+def _run_preview_index_command(
+    workspace: Path,
+    arguments: list[str],
+    *,
+    environment: dict[str, str],
+    deadline: float,
+) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(arguments, _REPAIR_DIFF_PREVIEW_TIMEOUT_SECONDS)
+    command = _hardened_git_command(arguments, workspace=workspace)
+    with tempfile.TemporaryFile() as stderr_file:
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed Git and structured argv
+                command,
+                cwd=workspace,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                check=False,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            raise
+        stderr_size = os.fstat(stderr_file.fileno()).st_size
+        stderr_file.seek(0)
+        stderr = stderr_file.read(16_000)
+    if completed.returncode != 0:
+        suffix = " (truncated)" if stderr_size > len(stderr) else ""
+        raise RuntimeError(
+            redact_text(
+                "Unable to prepare repair diff preview: "
+                + stderr.decode("utf-8", errors="replace")
+                + suffix
+            )
+        )
+
+
+def _capture_preview_command(
+    workspace: Path,
+    command: list[str],
+    *,
+    environment: dict[str, str],
+    deadline: float,
+) -> tuple[bytes, bool]:
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(  # noqa: S603 - fixed Git executable and structured argv
+            command,
+            cwd=workspace,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=os.name != "nt",
+        )
+        truncated = False
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait(timeout=2)
+                raise subprocess.TimeoutExpired(command, _REPAIR_DIFF_PREVIEW_TIMEOUT_SECONDS)
+            if os.fstat(stdout_file.fileno()).st_size > _MAX_REPAIR_DIFF_PREVIEW_BYTES:
+                truncated = True
+                process.kill()
+                process.wait(timeout=2)
+                break
+            time.sleep(0.01)
+        stdout_size = os.fstat(stdout_file.fileno()).st_size
+        stderr_size = os.fstat(stderr_file.fileno()).st_size
+        if stdout_size > _MAX_REPAIR_DIFF_PREVIEW_BYTES:
+            truncated = True
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(_MAX_REPAIR_DIFF_PREVIEW_BYTES)
+        stderr = stderr_file.read(min(_MAX_REPAIR_DIFF_PREVIEW_BYTES, 16_000))
+    if process.returncode not in {0, -9} and not truncated:
+        raise RuntimeError(
+            redact_text(
+                "Unable to render repair diff preview: "
+                + stderr.decode("utf-8", errors="replace")
+            )
+        )
+    if stderr_size > 16_000:
+        truncated = True
+    return stdout, truncated
 
 
 def _assert_repair_snapshot_paths_allowed(

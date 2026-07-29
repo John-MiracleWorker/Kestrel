@@ -58,6 +58,8 @@ const emptyTargetDraft: ModelTargetDraft = {
   latency_tier: 2,
   operator_priority: 0,
   estimated_cost_usd: 0,
+  input_cost_per_million_usd: null,
+  output_cost_per_million_usd: null,
   health: "unknown",
   recent_failure_rate: 0,
   predicted_success: null,
@@ -260,6 +262,8 @@ export function RoutingCenter({
       latency_tier: target.latency_tier,
       operator_priority: target.operator_priority,
       estimated_cost_usd: target.estimated_cost_usd,
+      input_cost_per_million_usd: target.input_cost_per_million_usd,
+      output_cost_per_million_usd: target.output_cost_per_million_usd,
       health: target.health,
       recent_failure_rate: target.recent_failure_rate,
       predicted_success: target.predicted_success,
@@ -290,13 +294,17 @@ export function RoutingCenter({
               <RoutingMetric label="Policy" value={status.runtime.policy_id} />
               <RoutingMetric label="Providers" value={status.counts.provider_profiles} />
               <RoutingMetric label="Targets" value={status.counts.model_targets} />
+              <RoutingMetric label="Calibrations" value={status.counts.calibrations ?? 0} />
             </div>
             <InlineMeta
               items={[
                 `schema v${status.routing_schema_version}`,
                 `${enabledTargetsByLocality.local} local`,
                 `${enabledTargetsByLocality.cloud} cloud`,
-                `${enabledTargetsByLocality.hybrid} hybrid`
+                `${enabledTargetsByLocality.hybrid} hybrid`,
+                status.runtime.learned?.activation_replay_verified
+                  ? "learned activation gate verified"
+                  : "learned routing shadow-only"
               ]}
             />
             <p className="muted">
@@ -546,6 +554,50 @@ export function RoutingCenter({
             />
           </div>
           <div className="field-row">
+            <Field label="Estimated task cost (USD)" hint="Used for preflight ranking and hard budgets.">
+              <input
+                type="number"
+                min={0}
+                step="any"
+                value={targetDraft.estimated_cost_usd ?? ""}
+                onChange={(event) =>
+                  setTargetDraft({
+                    ...targetDraft,
+                    estimated_cost_usd: nullableNumber(event.target.value)
+                  })
+                }
+              />
+            </Field>
+            <Field label="Input / 1M tokens (USD)" hint="Leave blank when pricing is unknown.">
+              <input
+                type="number"
+                min={0}
+                step="any"
+                value={targetDraft.input_cost_per_million_usd ?? ""}
+                onChange={(event) =>
+                  setTargetDraft({
+                    ...targetDraft,
+                    input_cost_per_million_usd: nullableNumber(event.target.value)
+                  })
+                }
+              />
+            </Field>
+            <Field label="Output / 1M tokens (USD)" hint="Missing pricing is shown as missing, never free.">
+              <input
+                type="number"
+                min={0}
+                step="any"
+                value={targetDraft.output_cost_per_million_usd ?? ""}
+                onChange={(event) =>
+                  setTargetDraft({
+                    ...targetDraft,
+                    output_cost_per_million_usd: nullableNumber(event.target.value)
+                  })
+                }
+              />
+            </Field>
+          </div>
+          <div className="field-row">
             <Field label="Capability tags">
               <input value={targetCapabilityTags} onChange={(event) => setTargetCapabilityTags(event.target.value)} />
             </Field>
@@ -644,7 +696,11 @@ export function RoutingCenter({
                 `${runReport.outcomes.length} outcomes`
               ]}
             />
-            <JsonBlock value={runReport} maxHeight="420px" />
+            <RoutingRunHistory report={runReport} />
+            <details>
+              <summary>Advanced route JSON</summary>
+              <JsonBlock value={runReport} maxHeight="420px" />
+            </details>
           </>
         ) : (
           <EmptyState>Select a run to inspect its route history.</EmptyState>
@@ -681,6 +737,84 @@ function PreviewResult({ preview }: { preview: TaskRoutePreview }) {
   );
 }
 
+function RoutingRunHistory({ report }: { report: RoutingRunReport }) {
+  const shadows = report.shadows ?? [];
+  const calibrations = report.calibrations ?? [];
+  if (shadows.length === 0) {
+    return (
+      <EmptyState>
+        No measured route comparisons yet. New routed attempts persist static, learned, and actual choices before
+        execution.
+      </EmptyState>
+    );
+  }
+  const decisions = new Map(report.decisions.map((decision) => [decision.decision_id, decision]));
+  const outcomes = new Map(report.outcomes.map((outcome) => [outcome.decision_id, outcome]));
+  return (
+    <div className="list separated" aria-label="Measured route comparisons">
+      {shadows.map((shadow) => {
+        const decision = decisions.get(shadow.decision_id);
+        const outcome = outcomes.get(shadow.decision_id);
+        const actual = shadow.actual_target_id ?? `${shadow.actual_provider}/${shadow.actual_model}`;
+        return (
+          <div className="data-row" key={shadow.shadow_id}>
+            <strong>
+              {shadow.static_target_id} → {actual}
+            </strong>
+            <InlineMeta
+              items={[
+                decision ? `${decision.task_family} · ${decision.risk}` : shadow.task_family,
+                `learned ${shadow.learned_target_id ?? "abstained"}`,
+                `${shadow.evidence_count} scoped outcomes`,
+                `${formatPercent(shadow.confidence)} confidence`,
+                `${formatPercent(shadow.cost_coverage)} cost coverage`
+              ]}
+            />
+            <StatusBadge
+              value={
+                outcome
+                  ? outcome.validation_passed
+                    ? "validated"
+                    : "failed"
+                  : shadow.activated
+                    ? "activated"
+                    : "shadow"
+              }
+            />
+            <span>
+              {shadow.activated
+                ? "The evidence-gated learned route executed."
+                : humanizeReason(shadow.abstention_reason)}
+              {" · "}
+              actual cost {formatUsd(shadow.actual_cost_usd)}
+              {" · "}
+              estimated savings {formatUsd(shadow.estimated_savings_usd)}
+              {" · "}
+              route regret {formatUsd(shadow.route_regret_usd)}
+            </span>
+          </div>
+        );
+      })}
+      {calibrations.slice(0, 6).map((calibration) => (
+        <div className="data-row" key={calibration.calibration_key}>
+          <strong>{calibration.target_id} calibration</strong>
+          <InlineMeta
+            items={[
+              calibration.task_family,
+              calibration.risk,
+              `${formatPercent(calibration.validation_rate)} validated`,
+              `${formatPercent(calibration.provider_outage_rate)} provider outage`,
+              `${calibration.example_count} outcomes`,
+              `avg ${formatUsd(calibration.average_cost_usd)}`
+            ]}
+          />
+          <StatusBadge value={calibration.cost_coverage >= 0.8 ? "measured" : "partial data"} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function RoutingMetric({ label, value }: { label: string; value: string | number }) {
   return (
     <div className="metric">
@@ -688,6 +822,20 @@ function RoutingMetric({ label, value }: { label: string; value: string | number
       <strong>{value}</strong>
     </div>
   );
+}
+
+function formatUsd(value: number | null): string {
+  if (value === null) return "missing";
+  return `$${value.toFixed(value < 0.01 ? 6 : 4)}`;
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}
+
+function humanizeReason(value: string | null): string {
+  if (!value) return "The static route remained in control.";
+  return value.replaceAll("_", " ");
 }
 
 function LocalityField({

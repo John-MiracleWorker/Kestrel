@@ -5,13 +5,14 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from .routine_limits import validate_routine_claim_ttl, validate_routines_per_tick
-from .security_boundary import redact_text
+from .security_boundary import redact_secrets, redact_text
 from .state_store import (
     AgentStateStore,
+    RoutineDeliveryRecord,
     RoutineOccurrenceRecord,
     RunRecord,
 )
@@ -34,6 +35,17 @@ class ScheduledRunManager(Protocol):
         model: str | None = None,
         autonomy_mode: str = "background",
     ) -> RunRecord: ...
+
+
+class RoutineResultDelivery(Protocol):
+    def deliver_routine_result(
+        self,
+        *,
+        channel_id: str,
+        conversation_id: str,
+        text: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,7 @@ class RoutineService:
         claim_owner: str | None = None,
         claim_ttl_seconds: float = 30.0,
         max_occurrences_per_tick: int = 10,
+        delivery: RoutineResultDelivery | None = None,
     ) -> None:
         self.state = state
         self.runs = runs
@@ -116,6 +129,7 @@ class RoutineService:
             max_occurrences_per_tick,
             field_name="max_occurrences_per_tick",
         )
+        self.delivery = delivery
 
     def tick(self, now: datetime | None = None) -> RoutineTickResult:
         instant = _utc_instant(now if now is not None else self.clock())
@@ -128,6 +142,7 @@ class RoutineService:
         )
         dispatches = tuple(self._dispatch(item, instant) for item in batch.claimed)
         reconciled += self._reconcile_running(instant)
+        self._reconcile_deliveries(instant)
         return RoutineTickResult(
             ticked_at=instant.isoformat(),
             claim_owner=self.claim_owner,
@@ -180,7 +195,30 @@ class RoutineService:
         expire_approvals = getattr(self.runs, "expire_pending_approvals", None)
         if callable(expire_approvals):
             expire_approvals()
-        return self._reconcile_running(instant)
+        reconciled = self._reconcile_running(instant)
+        self._reconcile_deliveries(instant)
+        return reconciled
+
+    def reconcile_delivery(
+        self,
+        delivery_id: str,
+        *,
+        expected_attempt_count: int,
+        resolution: str,
+        receipt: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> RoutineDeliveryRecord:
+        instant = _utc_instant(now if now is not None else self.clock())
+        current = self.state.reconcile_routine_delivery(
+            delivery_id,
+            expected_attempt_count=expected_attempt_count,
+            resolution=resolution,
+            receipt=receipt,
+            now=instant,
+        )
+        if current.status == "pending":
+            return self._attempt_delivery(current, instant)
+        return current
 
     def _dispatch(
         self,
@@ -311,6 +349,137 @@ class RoutineService:
             error=None if completed else redact_text(run.error or run.stop_reason or run.status),
             now=instant,
         )
+        if completed and current.status == "completed":
+            self._deliver_completed_occurrence(current, run, instant)
+        return current
+
+    def _deliver_completed_occurrence(
+        self,
+        occurrence: RoutineOccurrenceRecord,
+        run: RunRecord,
+        instant: datetime,
+    ) -> RoutineDeliveryRecord | None:
+        destination = occurrence.request.get("delivery")
+        if not isinstance(destination, dict) or not destination:
+            return None
+        delivery = self.state.ensure_routine_delivery(
+            occurrence.occurrence_id,
+            destination=destination,
+            now=instant,
+        )
+        if delivery.status == "delivered":
+            return delivery
+        return self._attempt_delivery(delivery, instant, run=run)
+
+    def _reconcile_deliveries(self, instant: datetime) -> tuple[str, ...]:
+        reconciled = list(self.state.expire_routine_delivery_claims(now=instant))
+        pending = self.state.list_routine_deliveries(
+            statuses=("pending", "failed"),
+            limit=max(100, self.max_occurrences_per_tick * 10),
+        )
+        for delivery in pending:
+            if delivery.attempt_count >= 3:
+                continue
+            current = self._attempt_delivery(delivery, instant)
+            if current.status != delivery.status:
+                reconciled.append(current.delivery_id)
+        return tuple(dict.fromkeys(reconciled))
+
+    def _attempt_delivery(
+        self,
+        delivery: RoutineDeliveryRecord,
+        instant: datetime,
+        *,
+        run: RunRecord | None = None,
+    ) -> RoutineDeliveryRecord:
+        claimed, acquired = self.state.claim_routine_delivery(
+            delivery.delivery_id,
+            claim_owner=self.claim_owner,
+            lease_ttl_seconds=self.claim_ttl_seconds,
+            now=instant,
+        )
+        if not acquired:
+            return claimed
+        destination = claimed.destination
+        if run is None:
+            try:
+                run = self.state.get_run(claimed.run_id)
+            except KeyError:
+                return self._finish_delivery(
+                    claimed,
+                    status="failed",
+                    error="routine delivery run record is missing",
+                    now=instant,
+                )
+        if self.delivery is None:
+            return self._finish_delivery(
+                claimed,
+                status="blocked",
+                error="routine delivery manager is unavailable",
+                now=instant,
+            )
+        text = _routine_delivery_text(destination, run)
+        try:
+            receipt = self.delivery.deliver_routine_result(
+                channel_id=str(destination["channel_id"]),
+                conversation_id=str(destination["conversation_id"]),
+                text=text,
+                idempotency_key=claimed.idempotency_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - ambiguity is preserved durably
+            return self._finish_delivery(
+                claimed,
+                status="uncertain",
+                error=redact_text(f"{type(exc).__name__}: {exc}"),
+                now=instant,
+            )
+        public_receipt = _redacted_mapping(receipt)
+        delivery_payload = receipt.get("delivery")
+        delivery_detail = (
+            delivery_payload if isinstance(delivery_payload, dict) else receipt
+        )
+        if bool(receipt.get("ok")) or bool(delivery_detail.get("sent")):
+            status = "delivered"
+            error = None
+        elif bool(delivery_detail.get("dry_run")) or delivery_detail.get(
+            "blocked_reason"
+        ):
+            status = "blocked"
+            error = str(
+                delivery_detail.get("blocked_reason") or "routine delivery blocked"
+            )
+        elif delivery_detail.get("status_code") is None:
+            status = "uncertain"
+            error = str(delivery_detail.get("error") or "delivery outcome uncertain")
+        else:
+            status = "failed"
+            error = str(delivery_detail.get("error") or "routine delivery failed")
+        return self._finish_delivery(
+            claimed,
+            status=status,
+            receipt=public_receipt,
+            error=redact_text(error) if error else None,
+            now=instant,
+        )
+
+    def _finish_delivery(
+        self,
+        delivery: RoutineDeliveryRecord,
+        *,
+        status: str,
+        receipt: dict[str, Any] | None = None,
+        error: str | None = None,
+        now: datetime,
+    ) -> RoutineDeliveryRecord:
+        current, _ = self.state.finish_routine_delivery(
+            delivery.delivery_id,
+            claim_owner=self.claim_owner,
+            claim_generation=delivery.claim_generation,
+            status=status,
+            receipt=receipt,
+            error=error,
+            now=now,
+        )
         return current
 
 
@@ -335,3 +504,34 @@ def _dispatch_result(occurrence: RoutineOccurrenceRecord) -> RoutineDispatchResu
         status=occurrence.status,
         error=occurrence.error,
     )
+
+
+def _routine_delivery_text(destination: dict[str, Any], run: RunRecord) -> str:
+    result = run.assistant_message.strip() or run.stop_reason or run.status
+    template = str(destination.get("template") or "{result}")
+    replacements = {
+        "{result}": result,
+        "{run_id}": run.run_id,
+        "{run_status}": run.status,
+    }
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+    return template[:20_000]
+
+
+def _redacted_mapping(value: dict[str, Any]) -> dict[str, Any]:
+    def clean(item: object) -> object:
+        if isinstance(item, dict):
+            return {str(key): clean(nested) for key, nested in item.items()}
+        if isinstance(item, list):
+            return [clean(nested) for nested in item]
+        if isinstance(item, tuple):
+            return [clean(nested) for nested in item]
+        if isinstance(item, str):
+            return redact_text(item)
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        return redact_text(str(item))
+
+    cleaned = clean(redact_secrets(value))
+    return cleaned if isinstance(cleaned, dict) else {}

@@ -10,6 +10,7 @@ from ..config import AgentConfig
 from ..event_bus import RunEventBus
 from ..mcp_manager import MCPManager
 from ..plugin_manager import PluginManager
+from ..projects import project_routing_constraints
 from ..run_manager import RunManager, _task_payload
 from ..security_boundary import redact_secrets
 from ..skill_manager import SkillManager
@@ -51,6 +52,7 @@ class AdaptiveFlockRunManager(RunManager):
         auto_start: bool = True,
     ) -> None:
         self.routing_coordinator = routing_coordinator
+        self._routing_assignment_lock = Lock()
         self._scheduler_routing_lock = Lock()
         self._scheduler_routing_attempts: dict[
             tuple[str, str], tuple[DurableRoutingAssignment, float]
@@ -80,9 +82,10 @@ class AdaptiveFlockRunManager(RunManager):
         attempt = max(1, task.attempt_count + 1)
         durable: DurableRoutingAssignment | None = None
         try:
-            durable = self.routing_coordinator.assign(
+            durable = self._assign_with_project_policy(
                 config,
                 task,
+                run=run,
                 subagent_id=subagent.subagent_id,
                 attempt=attempt,
             )
@@ -225,6 +228,9 @@ class AdaptiveFlockRunManager(RunManager):
             f"{category}:{','.join(reason_codes)}:{error}"
         ) from exc
 
+    def _uses_actionable_project_routing(self) -> bool:
+        return self.routing_coordinator.mode in {"constrained", "adaptive"}
+
     def _run_subagent(
         self,
         thread_key: str,
@@ -239,7 +245,8 @@ class AdaptiveFlockRunManager(RunManager):
             super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
             return
         task = self.state.get_task_node(task_id)
-        if self._is_cancelled(run_id) or self.state.get_run(run_id).status in {
+        run = self.state.get_run(run_id)
+        if self._is_cancelled(run_id) or run.status in {
             "completed",
             "failed",
             "cancelled",
@@ -249,9 +256,10 @@ class AdaptiveFlockRunManager(RunManager):
 
         attempt = max(1, task.attempt_count + 1)
         try:
-            durable = self.routing_coordinator.assign(
+            durable = self._assign_with_project_policy(
                 config,
                 task,
+                run=run,
                 subagent_id=subagent_id,
                 attempt=attempt,
             )
@@ -317,6 +325,86 @@ class AdaptiveFlockRunManager(RunManager):
                 subagent_id=subagent_id,
                 run_id=run_id,
             )
+
+    def _assign_with_project_policy(
+        self,
+        config: AgentConfig,
+        task: TaskNodeRecord,
+        *,
+        run: RunRecord,
+        subagent_id: str | None,
+        attempt: int,
+    ) -> DurableRoutingAssignment:
+        def assign() -> DurableRoutingAssignment:
+            if run.project_id is None:
+                return self.routing_coordinator.assign(
+                    config,
+                    task,
+                    subagent_id=subagent_id,
+                    attempt=attempt,
+                )
+            project = self.state.get_project(run.project_id)
+            if project.archived_at is not None:
+                raise RoutingUnavailableError(
+                    "project-bound route references an archived project",
+                    reason_codes=("project_archived",),
+                )
+            configured_policy_id = str(
+                project.provider_policy.get("policy_id", "")
+            ).strip()
+            if (
+                configured_policy_id
+                and configured_policy_id != self.routing_coordinator.policy_id
+            ):
+                raise RoutingUnavailableError(
+                    "project routing policy does not match the active durable coordinator",
+                    reason_codes=("project_route_policy_mismatch",),
+                )
+            constraints = project_routing_constraints(project)
+            maximum_cost_usd = project.cost_budget
+            if maximum_cost_usd is not None:
+                existing = self.routing_coordinator.ledger.get_attempt_decision(
+                    run_id=run.run_id,
+                    task_id=task.task_id,
+                    subagent_id=subagent_id,
+                    attempt=attempt,
+                )
+                spent = 0.0
+                for decision in self.routing_coordinator.ledger.list_decisions(
+                    run_id=run.run_id
+                ):
+                    if existing is not None and decision.decision_id == existing.decision_id:
+                        continue
+                    if not decision.actionable:
+                        continue
+                    if decision.estimated_cost_usd is None:
+                        raise RoutingUnavailableError(
+                            "project route budget has unattributed prior estimated cost",
+                            reason_codes=("project_route_cost_unknown",),
+                        )
+                    spent += decision.estimated_cost_usd
+                maximum_cost_usd = max(0.0, maximum_cost_usd - spent)
+            return self.routing_coordinator.assign(
+                config,
+                task,
+                subagent_id=subagent_id,
+                attempt=attempt,
+                default_privacy_class=constraints["default_privacy_class"],
+                local_required=bool(constraints["local_required"]),
+                maximum_cost_usd=maximum_cost_usd,
+                allowed_target_ids=constraints["allowed_target_ids"],
+                forbidden_target_ids=constraints["forbidden_target_ids"],
+                allowed_provider_profiles=constraints["allowed_provider_profiles"],
+                forbidden_provider_profiles=constraints[
+                    "forbidden_provider_profiles"
+                ],
+            )
+
+        lock = getattr(self, "_routing_assignment_lock", None)
+        if lock is None:
+            return assign()
+        with lock:
+            return assign()
 
     def _handle_pre_execution_routing_failure(
         self,
@@ -439,13 +527,42 @@ class AdaptiveFlockRunManager(RunManager):
         validation_passed = task.status == "completed" and bool(validation.get("passed"))
         validation_codes = _validation_codes(validation, passed=validation_passed)
         diagnosis = task.diagnosis if isinstance(task.diagnosis, dict) else {}
-        outcome_labels = (
+        provider_usage_raw = result.get("provider_usage")
+        provider_usage = (
+            provider_usage_raw if isinstance(provider_usage_raw, dict) else {}
+        )
+        input_tokens = _optional_non_negative_int(provider_usage.get("input_tokens"))
+        output_tokens = _optional_non_negative_int(provider_usage.get("output_tokens"))
+        failure_codes_raw = provider_usage.get("provider_failure_codes")
+        failure_codes = (
+            sorted(str(item) for item in failure_codes_raw if str(item))
+            if isinstance(failure_codes_raw, list)
+            else []
+        )
+        provider_failure_code = failure_codes[0] if failure_codes else None
+        fallback_count = _non_negative_int(provider_usage.get("fallback_count"))
+        provider_error_count = _non_negative_int(
+            provider_usage.get("provider_error_count")
+        )
+        diagnosis_category = (
+            str(diagnosis.get("category")) if diagnosis.get("category") else None
+        )
+        failure_category = _provider_failure_category(
+            provider_failure_code,
+            default=diagnosis_category,
+        )
+        outcome_labels: tuple[str, ...] = (
             ("validated_success",)
             if validation_passed
             else ("cancelled",)
             if task.status == "cancelled"
             else ("acceptance_failed",)
         )
+        if provider_usage:
+            if provider_usage.get("complete") is True:
+                outcome_labels = (*outcome_labels, "usage_complete")
+            elif _non_negative_int(provider_usage.get("reported_call_count")):
+                outcome_labels = (*outcome_labels, "usage_partial")
         reward = 1.0 if validation_passed else 0.0 if task.status == "cancelled" else -1.0
         try:
             outcome = self.routing_coordinator.record_outcome(
@@ -453,12 +570,19 @@ class AdaptiveFlockRunManager(RunManager):
                 execution_status=subagent.status,
                 validation_passed=validation_passed,
                 validation_codes=validation_codes,
-                failure_category=(
-                    str(diagnosis.get("category")) if diagnosis.get("category") else None
-                ),
+                failure_category=failure_category,
+                provider_failure_code=provider_failure_code,
                 latency_seconds=max(0.0, monotonic() - started_at),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 tool_count=_non_negative_int(result.get("tool_count")),
-                retry_count=max(0, task.attempt_count - 1),
+                changed_file_count=_changed_file_count(result),
+                retry_count=max(
+                    0,
+                    task.attempt_count - 1,
+                    fallback_count + provider_error_count,
+                ),
+                escalated=fallback_count > 0,
                 reward_components={"completion": reward},
                 outcome_labels=outcome_labels,
                 evidence_refs=_validation_evidence_refs(validation),
@@ -524,3 +648,67 @@ def _non_negative_int(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return max(0, value)
+
+
+def _optional_non_negative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _provider_failure_category(
+    provider_failure_code: str | None,
+    *,
+    default: str | None,
+) -> str | None:
+    if provider_failure_code is None:
+        return default
+    normalized = provider_failure_code.lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "timeout",
+            "rate_limit",
+            "unavailable",
+            "connection",
+            "network",
+            "overload",
+            "transport",
+        )
+    ):
+        return "provider_outage"
+    if any(
+        marker in normalized
+        for marker in (
+            "unsupported",
+            "capability",
+            "context_length",
+            "tool",
+            "vision",
+            "structured_output",
+        )
+    ):
+        return "capability_failure"
+    return default or "provider_failure"
+
+
+def _changed_file_count(result: dict[str, Any]) -> int | None:
+    candidates: list[object] = [
+        result.get("changed_files"),
+        result.get("files_changed"),
+    ]
+    for key in ("repair_artifact", "review", "patch_review"):
+        nested = result.get(key)
+        if isinstance(nested, dict):
+            candidates.extend(
+                (
+                    nested.get("changed_files"),
+                    nested.get("files_changed"),
+                )
+            )
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return len({str(item) for item in candidate if str(item)})
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            return candidate
+    return None

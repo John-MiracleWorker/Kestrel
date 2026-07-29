@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
+from dataclasses import replace
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
@@ -199,7 +200,40 @@ class ToolRegistry:
             if _is_exact_call_approved(call, arguments, context):
                 return self._run_registered_tool(tool, call, arguments, context)
             if context.approval_handler is not None:
-                return context.approval_handler(call, tool.spec, context)
+                approval = context.approval_handler(call, tool.spec, context)
+                if (
+                    approval.success
+                    and approval.error is None
+                    and approval.data.get("runtime_exact_call_approved") is True
+                    and approval.call.id == call.id
+                    and approval.call.name == tool.spec.name
+                    and _arguments_match(approval.call.arguments, arguments)
+                ):
+                    executed = self._run_registered_tool(
+                        tool,
+                        call,
+                        arguments,
+                        context,
+                    )
+                    return replace(
+                        executed,
+                        data={
+                            **executed.data,
+                            "approval_packet": {
+                                key: value
+                                for key, value in approval.data.items()
+                                if key
+                                in {
+                                    "packet_id",
+                                    "packet_call_id",
+                                    "call_digest",
+                                    "capability_revision",
+                                    "resource_digest",
+                                }
+                            },
+                        },
+                    )
+                return approval
             return _failure(
                 call,
                 content=f"Tool {call.name} requires explicit approval for this exact call.",
@@ -707,11 +741,14 @@ _ENABLEMENT_BY_TOOL = {
     "repair.orchestrate_validate": "allow_shell",
     "repair.review": "allow_file_write",
     "repair.rollback": "allow_file_write",
+    "browser.validate": "allow_browser_validation",
     "codex.exec": "allow_codex_cli",
     "skill.install": "allow_file_write",
     "plugin.review": "allow_plugin_install",
     "plugin.install": "allow_plugin_install",
     "git.commit": "allow_git_commit",
+    "github.pr.create": "allow_remote_mutation",
+    "github.pr.sync": "allow_remote_mutation",
     "memory.import": "allow_memory_import",
     "memory.correct": "allow_memory_import",
     "memory.policy_promote": "allow_policy_writes",

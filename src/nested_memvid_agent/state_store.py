@@ -13,11 +13,17 @@ from math import isfinite
 from pathlib import Path
 from threading import RLock
 from time import sleep
-from typing import Any
+from typing import Any, cast
 
 from .file_lock import lock_exclusive, unlock
 from .platform_primitives import chmod_descriptor
 from .private_artifacts import open_private_file_descriptor
+from .projects import (
+    ProjectConflictError,
+    ProjectRecord,
+    canonical_repository_path,
+    normalize_project_fields,
+)
 from .routine_limits import (
     MAX_ROUTINE_INTERVAL_SECONDS,
     MAX_ROUTINE_MISFIRE_GRACE_SECONDS,
@@ -30,9 +36,14 @@ from .routine_limits import (
     validate_routine_reconciliation_limit,
     validate_routines_per_tick,
 )
-from .security_boundary import redact_text
+from .routine_schedule import (
+    next_cron_instant,
+    normalize_timezone,
+    parse_cron_expression,
+)
+from .security_boundary import redact_secrets, redact_text
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 21
 DEFAULT_APPROVAL_TTL_SECONDS = 900.0
 CAPABILITY_KINDS = frozenset({"tool", "mcp_server", "skill"})
 _STATE_DIRECTORY_MODE = 0o700
@@ -118,6 +129,7 @@ class RunRecord:
     turn_source: dict[str, Any] | None = None
     turn_origin: str = "primary_user"
     transcript_scope: str = "primary"
+    project_id: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -186,6 +198,9 @@ class RoutineRecord:
     enabled: bool
     revision: int
     next_run_at: str | None
+    cron_expression: str | None = None
+    timezone: str = "UTC"
+    delivery: dict[str, Any] = field(default_factory=dict)
     workspace: str | None = None
     provider: str | None = None
     model: str | None = None
@@ -234,6 +249,27 @@ class RoutineManualClaim:
     created: bool
 
 
+@dataclass(frozen=True)
+class RoutineDeliveryRecord:
+    delivery_id: str
+    occurrence_id: str
+    routine_id: str
+    run_id: str
+    destination: dict[str, Any]
+    destination_digest: str
+    idempotency_key: str
+    status: str
+    attempt_count: int
+    claim_owner: str | None = None
+    claim_generation: int = 1
+    claim_expires_at: str | None = None
+    receipt: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+    delivered_at: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
 class AgentStateStore:
     """SQLite control-plane state for runs, approvals, capabilities, and extensions."""
 
@@ -267,11 +303,34 @@ class AgentStateStore:
         turn_source: dict[str, Any] | None = None,
         turn_origin: str = "primary_user",
         transcript_scope: str = "primary",
+        project_id: str | None = None,
+        expected_project_revision: int | None = None,
         max_nonterminal_runs: int | None = None,
     ) -> RunRecord:
         now = utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if expected_project_revision is not None and project_id is None:
+                raise ValueError("expected_project_revision requires project_id")
+            if project_id is not None:
+                project_row = conn.execute(
+                    "SELECT * FROM projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if project_row is None:
+                    raise KeyError(f"Unknown project: {project_id}")
+                project = _project_from_row(project_row)
+                if project.archived_at is not None:
+                    raise ValueError("cannot bind a new run to an archived project")
+                if (
+                    expected_project_revision is not None
+                    and project.revision != expected_project_revision
+                ):
+                    raise ValueError("mission preflight project revision is stale")
+                if str(canonical_repository_path(workspace)) != project.repository_path:
+                    raise ValueError(
+                        "project-bound run workspace must equal the canonical repository path"
+                    )
             if max_nonterminal_runs is not None:
                 row = conn.execute(
                     "SELECT COUNT(*) AS count FROM runs WHERE status IN ('queued', 'running', 'blocked')"
@@ -285,8 +344,8 @@ class AgentStateStore:
                     run_id, status, message, session_id, workspace, provider, model,
                     assistant_message, context_chars, tool_count, stop_reason, error,
                     config_revision, config_snapshot_json, turn_source_json,
-                    turn_origin, transcript_scope, created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?, ?, ?, ?)
+                    turn_origin, transcript_scope, project_id, created_at, updated_at
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -300,6 +359,7 @@ class AgentStateStore:
                     _encode(turn_source) if turn_source is not None else None,
                     turn_origin,
                     transcript_scope,
+                    project_id,
                     now,
                     now,
                 ),
@@ -981,6 +1041,9 @@ class AgentStateStore:
         schedule_kind: str,
         start_at: datetime | str,
         interval_seconds: int | None = None,
+        cron_expression: str | None = None,
+        timezone: str = "UTC",
+        delivery: dict[str, Any] | None = None,
         enabled: bool = False,
         workspace: str | None = None,
         provider: str | None = None,
@@ -997,6 +1060,9 @@ class AgentStateStore:
             schedule_kind=schedule_kind,
             start_at=start_at,
             interval_seconds=interval_seconds,
+            cron_expression=cron_expression,
+            timezone=timezone,
+            delivery=delivery,
             enabled=enabled,
             workspace=workspace,
             provider=provider,
@@ -1004,16 +1070,20 @@ class AgentStateStore:
             autonomy_mode=autonomy_mode,
             misfire_grace_seconds=misfire_grace_seconds,
         )
+        next_run_at = _initial_routine_next_run_at(normalized)
         now = utc_now()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO routines (
                     routine_id, name, prompt, schedule_kind, start_at,
-                    interval_seconds, enabled, revision, next_run_at, workspace,
+                    interval_seconds, cron_expression, timezone, delivery_json,
+                    enabled, revision, next_run_at, workspace,
                     provider, model, autonomy_mode, misfire_grace_seconds,
                     last_scheduled_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, ?, ?
+                )
                 """,
                 (
                     normalized["routine_id"],
@@ -1022,8 +1092,11 @@ class AgentStateStore:
                     normalized["schedule_kind"],
                     normalized["start_at"],
                     normalized["interval_seconds"],
+                    normalized["cron_expression"],
+                    normalized["timezone"],
+                    _encode(cast(dict[str, Any], normalized["delivery"])),
                     1 if normalized["enabled"] is True else 0,
-                    normalized["start_at"],
+                    next_run_at,
                     normalized["workspace"],
                     normalized["provider"],
                     normalized["model"],
@@ -1073,6 +1146,9 @@ class AgentStateStore:
             "schedule_kind",
             "start_at",
             "interval_seconds",
+            "cron_expression",
+            "timezone",
+            "delivery",
             "enabled",
             "workspace",
             "provider",
@@ -1104,6 +1180,9 @@ class AgentStateStore:
                 "schedule_kind": current.schedule_kind,
                 "start_at": current.start_at,
                 "interval_seconds": current.interval_seconds,
+                "cron_expression": current.cron_expression,
+                "timezone": current.timezone,
+                "delivery": current.delivery,
                 "enabled": current.enabled,
                 "workspace": current.workspace,
                 "provider": current.provider,
@@ -1113,7 +1192,16 @@ class AgentStateStore:
             }
             merged.update(fields)
             normalized = _normalize_routine_fields(**merged)
-            schedule_changed = bool({"schedule_kind", "start_at", "interval_seconds"} & set(fields))
+            schedule_changed = bool(
+                {
+                    "schedule_kind",
+                    "start_at",
+                    "interval_seconds",
+                    "cron_expression",
+                    "timezone",
+                }
+                & set(fields)
+            )
             claimed_once = conn.execute(
                 """
                 SELECT scheduled_for FROM routine_occurrences
@@ -1123,7 +1211,11 @@ class AgentStateStore:
                 """,
                 (normalized_id, current.revision),
             ).fetchone()
-            next_run_at = str(normalized["start_at"]) if schedule_changed else current.next_run_at
+            next_run_at = (
+                _initial_routine_next_run_at(normalized)
+                if schedule_changed
+                else current.next_run_at
+            )
             if (
                 not schedule_changed
                 and normalized["schedule_kind"] == "once"
@@ -1138,7 +1230,8 @@ class AgentStateStore:
             cursor = conn.execute(
                 """
                 UPDATE routines SET name = ?, prompt = ?, schedule_kind = ?,
-                    start_at = ?, interval_seconds = ?, enabled = ?, revision = ?,
+                    start_at = ?, interval_seconds = ?, cron_expression = ?,
+                    timezone = ?, delivery_json = ?, enabled = ?, revision = ?,
                     next_run_at = ?, workspace = ?, provider = ?, model = ?,
                     autonomy_mode = ?, misfire_grace_seconds = ?, updated_at = ?
                 WHERE routine_id = ? AND revision = ?
@@ -1149,6 +1242,9 @@ class AgentStateStore:
                     normalized["schedule_kind"],
                     normalized["start_at"],
                     normalized["interval_seconds"],
+                    normalized["cron_expression"],
+                    normalized["timezone"],
+                    _encode(cast(dict[str, Any], normalized["delivery"])),
                     1 if normalized["enabled"] is True else 0,
                     current.revision + 1,
                     next_run_at,
@@ -1795,6 +1891,274 @@ class AgentStateStore:
                 ),
             )
         return cursor.rowcount == 1
+
+    def ensure_routine_delivery(
+        self,
+        occurrence_id: str,
+        *,
+        destination: dict[str, Any],
+        now: datetime | None = None,
+    ) -> RoutineDeliveryRecord:
+        instant = _lease_instant(now)
+        normalized_destination = _normalize_routine_delivery(destination)
+        if not normalized_destination:
+            raise ValueError("routine delivery destination is required")
+        canonical = json.dumps(
+            normalized_destination,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        destination_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        delivery_id = routine_delivery_id(occurrence_id, destination_digest)
+        idempotency_key = f"routine-delivery:{delivery_id}"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            occurrence_row = conn.execute(
+                "SELECT * FROM routine_occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
+            if occurrence_row is None:
+                raise KeyError(f"Unknown routine occurrence: {occurrence_id}")
+            occurrence = _routine_occurrence_from_row(occurrence_row)
+            if occurrence.status != "completed":
+                raise ValueError("routine delivery requires a completed occurrence")
+            conn.execute(
+                """
+                INSERT INTO routine_deliveries (
+                    delivery_id, occurrence_id, routine_id, run_id,
+                    destination_json, destination_digest, idempotency_key,
+                    status, attempt_count, claim_owner, claim_generation,
+                    claim_expires_at, receipt_json, error, delivered_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, 1,
+                    NULL, '{}', NULL, NULL, ?, ?)
+                ON CONFLICT(occurrence_id, destination_digest) DO NOTHING
+                """,
+                (
+                    delivery_id,
+                    occurrence.occurrence_id,
+                    occurrence.routine_id,
+                    occurrence.run_id,
+                    canonical,
+                    destination_digest,
+                    idempotency_key,
+                    instant.isoformat(),
+                    instant.isoformat(),
+                ),
+            )
+        return self.get_routine_delivery(delivery_id)
+
+    def get_routine_delivery(self, delivery_id: str) -> RoutineDeliveryRecord:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routine_deliveries WHERE delivery_id = ?",
+                (delivery_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown routine delivery: {delivery_id}")
+        return _routine_delivery_from_row(row)
+
+    def list_routine_deliveries(
+        self,
+        *,
+        routine_id: str | None = None,
+        occurrence_id: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> list[RoutineDeliveryRecord]:
+        bounded_limit = validate_routine_history_limit(limit)
+        predicates: list[str] = []
+        values: list[object] = []
+        if routine_id is not None:
+            predicates.append("routine_id = ?")
+            values.append(_routine_identifier(routine_id))
+        if occurrence_id is not None:
+            predicates.append("occurrence_id = ?")
+            values.append(str(occurrence_id))
+        if statuses:
+            normalized_statuses = tuple(
+                _routine_delivery_status(status) for status in statuses
+            )
+            predicates.append(
+                "status IN (" + ", ".join("?" for _ in normalized_statuses) + ")"
+            )
+            values.extend(normalized_statuses)
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+        values.append(bounded_limit)
+        with self._connect() as conn:
+            rows = conn.execute(  # nosec - predicates are fixed above
+                f"SELECT * FROM routine_deliveries {where} "
+                "ORDER BY created_at DESC, delivery_id DESC LIMIT ?",
+                values,
+            ).fetchall()
+        return [_routine_delivery_from_row(row) for row in rows]
+
+    def claim_routine_delivery(
+        self,
+        delivery_id: str,
+        *,
+        claim_owner: str,
+        lease_ttl_seconds: float,
+        now: datetime | None = None,
+    ) -> tuple[RoutineDeliveryRecord, bool]:
+        instant = _lease_instant(now)
+        owner = claim_owner.strip()
+        if not owner:
+            raise ValueError("routine delivery claim owner is required")
+        ttl = validate_routine_claim_ttl(
+            lease_ttl_seconds,
+            field_name="routine delivery lease_ttl_seconds",
+        )
+        expires_at = instant + timedelta(seconds=ttl)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE routine_deliveries SET status = 'uncertain',
+                    claim_owner = NULL, claim_expires_at = NULL,
+                    error = COALESCE(error, 'delivery claim expired before receipt'),
+                    updated_at = ?
+                WHERE delivery_id = ? AND status = 'delivering'
+                    AND claim_expires_at <= ?
+                """,
+                (instant.isoformat(), delivery_id, instant.isoformat()),
+            )
+            cursor = conn.execute(
+                """
+                UPDATE routine_deliveries SET status = 'delivering',
+                    attempt_count = attempt_count + 1,
+                    claim_owner = ?,
+                    claim_generation = claim_generation + 1,
+                    claim_expires_at = ?, error = NULL, updated_at = ?
+                WHERE delivery_id = ?
+                    AND status IN ('pending', 'failed', 'blocked')
+                """,
+                (
+                    owner,
+                    expires_at.isoformat(),
+                    instant.isoformat(),
+                    delivery_id,
+                ),
+            )
+        return self.get_routine_delivery(delivery_id), cursor.rowcount == 1
+
+    def finish_routine_delivery(
+        self,
+        delivery_id: str,
+        *,
+        claim_owner: str,
+        claim_generation: int,
+        status: str,
+        receipt: dict[str, Any] | None = None,
+        error: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[RoutineDeliveryRecord, bool]:
+        normalized_status = _routine_delivery_terminal_status(status)
+        normalized_receipt = _normalize_routine_delivery_receipt(receipt)
+        normalized_error = _secret_safe_optional_text(
+            error,
+            "routine delivery error",
+            4_000,
+        )
+        instant = _lease_instant(now)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE routine_deliveries SET status = ?, receipt_json = ?,
+                    error = ?, delivered_at = ?, claim_owner = NULL,
+                    claim_expires_at = NULL, updated_at = ?
+                WHERE delivery_id = ? AND status = 'delivering'
+                    AND claim_owner = ? AND claim_generation = ?
+                """,
+                (
+                    normalized_status,
+                    _encode(normalized_receipt),
+                    normalized_error,
+                    instant.isoformat()
+                    if normalized_status == "delivered"
+                    else None,
+                    instant.isoformat(),
+                    delivery_id,
+                    claim_owner,
+                    claim_generation,
+                ),
+            )
+        return self.get_routine_delivery(delivery_id), cursor.rowcount == 1
+
+    def expire_routine_delivery_claims(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[str, ...]:
+        instant = _lease_instant(now)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT delivery_id FROM routine_deliveries
+                WHERE status = 'delivering' AND claim_expires_at <= ?
+                ORDER BY delivery_id
+                """,
+                (instant.isoformat(),),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE routine_deliveries SET status = 'uncertain',
+                    claim_owner = NULL, claim_expires_at = NULL,
+                    error = COALESCE(error, 'delivery claim expired before receipt'),
+                    updated_at = ?
+                WHERE status = 'delivering' AND claim_expires_at <= ?
+                """,
+                (instant.isoformat(), instant.isoformat()),
+            )
+        return tuple(str(row["delivery_id"]) for row in rows)
+
+    def reconcile_routine_delivery(
+        self,
+        delivery_id: str,
+        *,
+        expected_attempt_count: int,
+        resolution: str,
+        receipt: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> RoutineDeliveryRecord:
+        if (
+            isinstance(expected_attempt_count, bool)
+            or not isinstance(expected_attempt_count, int)
+            or expected_attempt_count < 0
+        ):
+            raise ValueError("expected_attempt_count must be a non-negative integer")
+        normalized_resolution = resolution.strip().lower()
+        if normalized_resolution not in {"retry", "delivered", "failed"}:
+            raise ValueError("resolution must be retry, delivered, or failed")
+        normalized_receipt = _normalize_routine_delivery_receipt(receipt)
+        status = "pending" if normalized_resolution == "retry" else normalized_resolution
+        instant = _lease_instant(now)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE routine_deliveries SET status = ?, receipt_json = ?,
+                    error = ?, delivered_at = ?, claim_owner = NULL,
+                    claim_expires_at = NULL, updated_at = ?
+                WHERE delivery_id = ? AND attempt_count = ?
+                    AND status IN ('uncertain', 'failed', 'blocked')
+                """,
+                (
+                    status,
+                    _encode(normalized_receipt),
+                    None if status in {"pending", "delivered"} else "reconciled_failed",
+                    instant.isoformat() if status == "delivered" else None,
+                    instant.isoformat(),
+                    delivery_id,
+                    expected_attempt_count,
+                ),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_routine_delivery(delivery_id)
+            raise ValueError(
+                "routine_delivery_reconciliation_conflict:"
+                f"{current.status}:{current.attempt_count}"
+            )
+        return self.get_routine_delivery(delivery_id)
 
     def list_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -4415,6 +4779,288 @@ class AgentStateStore:
             ).fetchall()
         return [_trace_span_from_row(row) for row in rows]
 
+    def create_project(
+        self,
+        *,
+        project_id: str,
+        display_name: str,
+        repository_path: str | Path,
+        remote: str | None = None,
+        default_branch: str = "main",
+        allowed_paths: tuple[str, ...] = (".",),
+        provider_policy: dict[str, Any] | None = None,
+        cost_budget: float | int | None = None,
+        privacy_class: str = "local_required",
+        test_recipes: tuple[dict[str, str], ...] = (),
+        build_recipes: tuple[dict[str, str], ...] = (),
+        capability_ceiling: tuple[str, ...] | None = None,
+        active_capability_keys: set[str] | frozenset[str] = frozenset(),
+        baseline_index_digest: str | None = None,
+    ) -> ProjectRecord:
+        fields = normalize_project_fields(
+            project_id=project_id,
+            display_name=display_name,
+            repository_path=repository_path,
+            remote=remote,
+            default_branch=default_branch,
+            allowed_paths=allowed_paths,
+            provider_policy=provider_policy,
+            cost_budget=cost_budget,
+            privacy_class=privacy_class,
+            test_recipes=test_recipes,
+            build_recipes=build_recipes,
+            capability_ceiling=capability_ceiling,
+            active_capability_keys=active_capability_keys,
+            baseline_index_digest=baseline_index_digest,
+        )
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO projects (
+                    project_id, display_name, repository_path, remote,
+                    default_branch, allowed_paths_json, provider_policy_json,
+                    cost_budget, privacy_class, test_recipes_json,
+                    build_recipes_json, capability_ceiling_json,
+                    baseline_index_digest, revision, archived_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                """,
+                (
+                    fields["project_id"],
+                    fields["display_name"],
+                    fields["repository_path"],
+                    fields["remote"],
+                    fields["default_branch"],
+                    _encode(fields["allowed_paths"]),
+                    _encode(fields["provider_policy"]),
+                    fields["cost_budget"],
+                    fields["privacy_class"],
+                    _encode(fields["test_recipes"]),
+                    _encode(fields["build_recipes"]),
+                    _encode(fields["capability_ceiling"]),
+                    fields["baseline_index_digest"],
+                    now,
+                    now,
+                ),
+            )
+        return self.get_project(str(fields["project_id"]))
+
+    def get_project(self, project_id: str) -> ProjectRecord:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown project: {project_id}")
+        return _project_from_row(row)
+
+    def list_projects(self, *, include_archived: bool = False) -> list[ProjectRecord]:
+        query = "SELECT * FROM projects"
+        if not include_archived:
+            query += " WHERE archived_at IS NULL"
+        query += " ORDER BY project_id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(query).fetchall()
+        return [_project_from_row(row) for row in rows]
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        expected_revision: int,
+        active_capability_keys: set[str] | frozenset[str],
+        **updates: object,
+    ) -> ProjectRecord:
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        allowed = {
+            "display_name",
+            "repository_path",
+            "remote",
+            "default_branch",
+            "allowed_paths",
+            "provider_policy",
+            "cost_budget",
+            "privacy_class",
+            "test_recipes",
+            "build_recipes",
+            "capability_ceiling",
+            "baseline_index_digest",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"unsupported project update fields: {sorted(unknown)}")
+        if not updates:
+            raise ValueError("project update must change at least one field")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown project: {project_id}")
+            current = _project_from_row(row)
+            if current.revision != expected_revision:
+                raise ProjectConflictError(current)
+            if current.archived_at is not None:
+                raise ValueError("archived projects cannot be updated")
+
+            merged: dict[str, object] = {
+                "project_id": current.project_id,
+                "display_name": current.display_name,
+                "repository_path": current.repository_path,
+                "remote": current.remote,
+                "default_branch": current.default_branch,
+                "allowed_paths": current.allowed_paths,
+                "provider_policy": current.provider_policy,
+                "cost_budget": current.cost_budget,
+                "privacy_class": current.privacy_class,
+                "test_recipes": current.test_recipes,
+                "build_recipes": current.build_recipes,
+                "capability_ceiling": current.capability_ceiling,
+                "baseline_index_digest": current.baseline_index_digest,
+            }
+            merged.update(updates)
+            validation_capabilities = set(active_capability_keys)
+            if "capability_ceiling" not in updates:
+                validation_capabilities.update(current.capability_ceiling)
+            normalized = normalize_project_fields(
+                project_id=str(merged["project_id"]),
+                display_name=cast(str, merged["display_name"]),
+                repository_path=cast(str | Path, merged["repository_path"]),
+                remote=cast(str | None, merged["remote"]),
+                default_branch=cast(str, merged["default_branch"]),
+                allowed_paths=cast(tuple[str, ...], merged["allowed_paths"]),
+                provider_policy=cast(dict[str, Any], merged["provider_policy"]),
+                cost_budget=cast(float | int | None, merged["cost_budget"]),
+                privacy_class=cast(str, merged["privacy_class"]),
+                test_recipes=cast(
+                    tuple[dict[str, str], ...],
+                    merged["test_recipes"],
+                ),
+                build_recipes=cast(
+                    tuple[dict[str, str], ...],
+                    merged["build_recipes"],
+                ),
+                capability_ceiling=cast(
+                    tuple[str, ...],
+                    merged["capability_ceiling"],
+                ),
+                active_capability_keys=validation_capabilities,
+                baseline_index_digest=cast(
+                    str | None,
+                    merged["baseline_index_digest"],
+                ),
+            )
+            next_revision = current.revision + 1
+            cursor = conn.execute(
+                """
+                UPDATE projects SET
+                    display_name = ?, repository_path = ?, remote = ?,
+                    default_branch = ?, allowed_paths_json = ?,
+                    provider_policy_json = ?, cost_budget = ?, privacy_class = ?,
+                    test_recipes_json = ?, build_recipes_json = ?,
+                    capability_ceiling_json = ?, baseline_index_digest = ?,
+                    revision = ?, updated_at = ?
+                WHERE project_id = ? AND revision = ? AND archived_at IS NULL
+                """,
+                (
+                    normalized["display_name"],
+                    normalized["repository_path"],
+                    normalized["remote"],
+                    normalized["default_branch"],
+                    _encode(normalized["allowed_paths"]),
+                    _encode(normalized["provider_policy"]),
+                    normalized["cost_budget"],
+                    normalized["privacy_class"],
+                    _encode(normalized["test_recipes"]),
+                    _encode(normalized["build_recipes"]),
+                    _encode(normalized["capability_ceiling"]),
+                    normalized["baseline_index_digest"],
+                    next_revision,
+                    utc_now(),
+                    current.project_id,
+                    current.revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT * FROM projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if latest is None:
+                    raise KeyError(f"Unknown project: {project_id}")
+                raise ProjectConflictError(_project_from_row(latest))
+            updated = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("project update was not durable")
+            return _project_from_row(updated)
+
+    def archive_project(
+        self,
+        project_id: str,
+        *,
+        expected_revision: int,
+    ) -> ProjectRecord:
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown project: {project_id}")
+            current = _project_from_row(row)
+            if current.revision != expected_revision or current.archived_at is not None:
+                raise ProjectConflictError(current)
+            cursor = conn.execute(
+                """
+                UPDATE projects SET archived_at = ?, revision = ?, updated_at = ?
+                WHERE project_id = ? AND revision = ? AND archived_at IS NULL
+                """,
+                (
+                    now,
+                    current.revision + 1,
+                    now,
+                    project_id,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT * FROM projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if latest is None:
+                    raise KeyError(f"Unknown project: {project_id}")
+                raise ProjectConflictError(_project_from_row(latest))
+            archived = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if archived is None:
+                raise RuntimeError("project archive was not durable")
+            return _project_from_row(archived)
+
     def schema_version(self) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
@@ -4516,6 +5162,12 @@ class AgentStateStore:
             if current < 19:
                 _apply_schema_v19(conn)
                 current = 19
+            if current < 20:
+                _apply_schema_v20(conn)
+                current = 20
+            if current < 21:
+                _apply_schema_v21(conn)
+                current = 21
             if current < SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}"
@@ -5150,6 +5802,178 @@ def _apply_schema_v19(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v20(conn: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            project_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            repository_path TEXT NOT NULL UNIQUE,
+            remote TEXT,
+            default_branch TEXT NOT NULL,
+            allowed_paths_json TEXT NOT NULL,
+            provider_policy_json TEXT NOT NULL,
+            cost_budget REAL,
+            privacy_class TEXT NOT NULL
+                CHECK (
+                    privacy_class IN (
+                        'local_required',
+                        'local_preferred',
+                        'approved_cloud'
+                    )
+                ),
+            test_recipes_json TEXT NOT NULL,
+            build_recipes_json TEXT NOT NULL,
+            capability_ceiling_json TEXT NOT NULL,
+            baseline_index_digest TEXT,
+            revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+            archived_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_projects_active
+            ON projects(archived_at, display_name, project_id);
+        """
+    )
+    run_columns = _columns(conn, "runs")
+    if run_columns and "project_id" not in run_columns:
+        conn.execute(
+            """
+            ALTER TABLE runs
+            ADD COLUMN project_id TEXT REFERENCES projects(project_id)
+        """
+        )
+    if run_columns:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_project_id ON runs(project_id, created_at)"
+        )
+
+
+def _apply_schema_v21(conn: sqlite3.Connection) -> None:
+    routine_columns = _columns(conn, "routines")
+    if routine_columns and "cron_expression" not in routine_columns:
+        conn.execute("PRAGMA defer_foreign_keys=ON")
+        _execute_schema_script(
+            conn,
+            f"""
+            CREATE TABLE routines_v21 (
+                routine_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                schedule_kind TEXT NOT NULL
+                    CHECK (schedule_kind IN ('once', 'interval', 'cron')),
+                start_at TEXT NOT NULL,
+                interval_seconds INTEGER,
+                cron_expression TEXT,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                delivery_json TEXT NOT NULL DEFAULT '{{}}',
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+                next_run_at TEXT,
+                workspace TEXT,
+                provider TEXT,
+                model TEXT,
+                autonomy_mode TEXT NOT NULL DEFAULT 'background'
+                    CHECK (autonomy_mode IN ('background', 'manual', 'autonomous')),
+                misfire_grace_seconds INTEGER NOT NULL DEFAULT 60
+                    CHECK (
+                        misfire_grace_seconds BETWEEN
+                            {MIN_ROUTINE_MISFIRE_GRACE_SECONDS}
+                            AND {MAX_ROUTINE_MISFIRE_GRACE_SECONDS}
+                    ),
+                last_scheduled_at TEXT,
+                deleted_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (
+                        schedule_kind = 'once'
+                        AND interval_seconds IS NULL
+                        AND cron_expression IS NULL
+                    )
+                    OR (
+                        schedule_kind = 'interval'
+                        AND interval_seconds BETWEEN {MIN_ROUTINE_INTERVAL_SECONDS}
+                            AND {MAX_ROUTINE_INTERVAL_SECONDS}
+                        AND cron_expression IS NULL
+                    )
+                    OR (
+                        schedule_kind = 'cron'
+                        AND interval_seconds IS NULL
+                        AND cron_expression IS NOT NULL
+                    )
+                )
+            );
+
+            INSERT INTO routines_v21 (
+                routine_id, name, prompt, schedule_kind, start_at,
+                interval_seconds, cron_expression, timezone, delivery_json,
+                enabled, revision, next_run_at, workspace, provider, model,
+                autonomy_mode, misfire_grace_seconds, last_scheduled_at,
+                deleted_at, created_at, updated_at
+            )
+            SELECT
+                routine_id, name, prompt, schedule_kind, start_at,
+                interval_seconds, NULL, 'UTC', '{{}}',
+                enabled, revision, next_run_at, workspace, provider, model,
+                autonomy_mode, misfire_grace_seconds, last_scheduled_at,
+                deleted_at, created_at, updated_at
+            FROM routines;
+
+            DROP TABLE routines;
+            ALTER TABLE routines_v21 RENAME TO routines;
+
+            CREATE INDEX IF NOT EXISTS idx_routines_due
+                ON routines(enabled, deleted_at, next_run_at);
+            """
+        )
+    _execute_schema_script(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS routine_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            occurrence_id TEXT NOT NULL,
+            routine_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            destination_json TEXT NOT NULL,
+            destination_digest TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            status TEXT NOT NULL
+                CHECK (
+                    status IN (
+                        'pending',
+                        'delivering',
+                        'delivered',
+                        'failed',
+                        'blocked',
+                        'uncertain'
+                    )
+                ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            claim_owner TEXT,
+            claim_generation INTEGER NOT NULL DEFAULT 1 CHECK (claim_generation > 0),
+            claim_expires_at TEXT,
+            receipt_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT,
+            delivered_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (occurrence_id, destination_digest),
+            FOREIGN KEY (occurrence_id)
+                REFERENCES routine_occurrences(occurrence_id),
+            FOREIGN KEY (routine_id) REFERENCES routines(routine_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_routine_deliveries_occurrence
+            ON routine_deliveries(occurrence_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_routine_deliveries_status
+            ON routine_deliveries(status, claim_expires_at, updated_at);
+        """
+    )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -5455,6 +6279,56 @@ def _run_from_row(row: sqlite3.Row) -> RunRecord:
         turn_source=_json_dict_or_none(_row_get(row, "turn_source_json")),
         turn_origin=str(_row_get(row, "turn_origin", "primary_user") or "primary_user"),
         transcript_scope=str(_row_get(row, "transcript_scope", "primary") or "primary"),
+        project_id=_optional_str(_row_get(row, "project_id")),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _project_from_row(row: sqlite3.Row) -> ProjectRecord:
+    return ProjectRecord(
+        project_id=str(row["project_id"]),
+        display_name=str(row["display_name"]),
+        repository_path=str(row["repository_path"]),
+        remote=_optional_str(row["remote"]),
+        default_branch=str(row["default_branch"]),
+        allowed_paths=tuple(
+            str(item) for item in json.loads(str(row["allowed_paths_json"]))
+        ),
+        provider_policy=cast(
+            dict[str, Any],
+            json.loads(str(row["provider_policy_json"])),
+        ),
+        cost_budget=(
+            None if row["cost_budget"] is None else float(row["cost_budget"])
+        ),
+        privacy_class=str(row["privacy_class"]),
+        test_recipes=tuple(
+            {
+                str(key): str(value)
+                for key, value in item.items()
+            }
+            for item in cast(
+                list[dict[str, object]],
+                json.loads(str(row["test_recipes_json"])),
+            )
+        ),
+        build_recipes=tuple(
+            {
+                str(key): str(value)
+                for key, value in item.items()
+            }
+            for item in cast(
+                list[dict[str, object]],
+                json.loads(str(row["build_recipes_json"])),
+            )
+        ),
+        capability_ceiling=tuple(
+            str(item) for item in json.loads(str(row["capability_ceiling_json"]))
+        ),
+        baseline_index_digest=_optional_str(row["baseline_index_digest"]),
+        revision=int(row["revision"]),
+        archived_at=_optional_str(row["archived_at"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -5959,6 +6833,9 @@ def _routine_from_row(row: sqlite3.Row) -> RoutineRecord:
         enabled=bool(row["enabled"]),
         revision=int(row["revision"]),
         next_run_at=_optional_str(row["next_run_at"]),
+        cron_expression=_optional_str(row["cron_expression"]),
+        timezone=str(row["timezone"]),
+        delivery=_json_or_empty(row["delivery_json"]),
         workspace=_optional_str(row["workspace"]),
         provider=_optional_str(row["provider"]),
         model=_optional_str(row["model"]),
@@ -5996,6 +6873,28 @@ def _routine_occurrence_from_row(row: sqlite3.Row) -> RoutineOccurrenceRecord:
     )
 
 
+def _routine_delivery_from_row(row: sqlite3.Row) -> RoutineDeliveryRecord:
+    return RoutineDeliveryRecord(
+        delivery_id=str(row["delivery_id"]),
+        occurrence_id=str(row["occurrence_id"]),
+        routine_id=str(row["routine_id"]),
+        run_id=str(row["run_id"]),
+        destination=_json_or_empty(row["destination_json"]),
+        destination_digest=str(row["destination_digest"]),
+        idempotency_key=str(row["idempotency_key"]),
+        status=str(row["status"]),
+        attempt_count=int(row["attempt_count"]),
+        claim_owner=_optional_str(row["claim_owner"]),
+        claim_generation=int(row["claim_generation"]),
+        claim_expires_at=_optional_str(row["claim_expires_at"]),
+        receipt=_json_or_empty(row["receipt_json"]),
+        error=_optional_str(row["error"]),
+        delivered_at=_optional_str(row["delivered_at"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
 def routine_occurrence_id(
     routine_id: str,
     routine_revision: int,
@@ -6022,6 +6921,15 @@ def routine_run_id(routine_id: str, occurrence_id: str) -> str:
     return "run_routine_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
+def routine_delivery_id(occurrence_id: str, destination_digest: str) -> str:
+    payload = json.dumps(
+        [str(occurrence_id), str(destination_digest)],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return "delivery_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:40]
+
+
 def routine_manual_occurrence_id(routine_id: str, trigger_key_digest: str) -> str:
     payload = json.dumps(
         [_routine_identifier(routine_id), str(trigger_key_digest)],
@@ -6045,6 +6953,9 @@ def _normalize_routine_fields(
     schedule_kind: object,
     start_at: object,
     interval_seconds: object = None,
+    cron_expression: object = None,
+    timezone: object = "UTC",
+    delivery: object = None,
     enabled: object = False,
     workspace: object = None,
     provider: object = None,
@@ -6053,13 +6964,20 @@ def _normalize_routine_fields(
     misfire_grace_seconds: object = 60,
 ) -> dict[str, object]:
     normalized_kind = str(schedule_kind).strip().lower()
-    if normalized_kind not in {"once", "interval"}:
-        raise ValueError("schedule_kind must be once or interval")
+    if normalized_kind not in {"once", "interval", "cron"}:
+        raise ValueError("schedule_kind must be once, interval, or cron")
     interval: int | None = None
+    normalized_cron: str | None = None
     if normalized_kind == "interval":
         interval = validate_routine_interval(interval_seconds)
     elif interval_seconds is not None:
-        raise ValueError("once routines cannot set interval_seconds")
+        raise ValueError(f"{normalized_kind} routines cannot set interval_seconds")
+    if normalized_kind == "cron":
+        normalized_cron = parse_cron_expression(cron_expression).expression
+    elif cron_expression is not None:
+        raise ValueError(
+            f"{normalized_kind} routines cannot set cron_expression"
+        )
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be a boolean")
     misfire_grace = validate_routine_misfire_grace(misfire_grace_seconds)
@@ -6073,6 +6991,9 @@ def _normalize_routine_fields(
         "schedule_kind": normalized_kind,
         "start_at": _routine_datetime(start_at, "start_at").isoformat(),
         "interval_seconds": interval,
+        "cron_expression": normalized_cron,
+        "timezone": normalize_timezone(timezone),
+        "delivery": _normalize_routine_delivery(delivery),
         "enabled": enabled,
         "workspace": _secret_safe_optional_text(workspace, "workspace", 4096),
         "provider": _secret_safe_optional_text(provider, "provider", 256),
@@ -6093,6 +7014,62 @@ def _routine_identifier(value: object) -> str:
             "routine_id may contain only letters, numbers, dot, underscore, and hyphen"
         )
     return normalized
+
+
+def _normalize_routine_delivery(value: object) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("delivery must be an object or null")
+    if not value:
+        return {}
+    allowed = {"channel_id", "conversation_id", "template"}
+    unknown = sorted(str(key) for key in value if str(key) not in allowed)
+    if unknown:
+        raise ValueError(f"unsupported delivery fields: {', '.join(unknown)}")
+    channel_id = _secret_safe_required_text(
+        value.get("channel_id"),
+        "delivery.channel_id",
+        128,
+    )
+    conversation_id = _secret_safe_required_text(
+        value.get("conversation_id"),
+        "delivery.conversation_id",
+        512,
+    )
+    template = _secret_safe_optional_text(
+        value.get("template"),
+        "delivery.template",
+        4_000,
+    )
+    return {
+        "channel_id": channel_id,
+        "conversation_id": conversation_id,
+        "template": template or "{result}",
+    }
+
+
+def _normalize_routine_delivery_receipt(value: object) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("routine delivery receipt must be an object or null")
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise ValueError("routine delivery receipt must be finite JSON") from exc
+    if len(encoded) > 128_000:
+        raise ValueError("routine delivery receipt exceeds the 128 KiB bound")
+    loaded = json.loads(encoded)
+    if redact_secrets(loaded) != loaded:
+        raise ValueError("routine delivery receipt may not contain raw secrets")
+    return cast(dict[str, Any], loaded)
 
 
 def _positive_routine_revision(
@@ -6197,7 +7174,22 @@ def _routine_request_snapshot(routine: RoutineRecord) -> dict[str, Any]:
         "provider": routine.provider,
         "model": routine.model,
         "autonomy_mode": routine.autonomy_mode,
+        "delivery": routine.delivery,
     }
+
+
+def _initial_routine_next_run_at(normalized: dict[str, object]) -> str:
+    start_at = _require_timestamp(normalized["start_at"], "start_at")
+    if normalized["schedule_kind"] != "cron":
+        return start_at.isoformat()
+    expression = str(normalized["cron_expression"])
+    timezone = str(normalized["timezone"])
+    return next_cron_instant(
+        expression,
+        timezone,
+        after=start_at,
+        inclusive=True,
+    ).isoformat()
 
 
 def _next_routine_run_at(
@@ -6208,6 +7200,23 @@ def _next_routine_run_at(
 ) -> tuple[str | None, int]:
     if routine.schedule_kind == "once":
         return None, 0
+    if routine.schedule_kind == "cron":
+        if routine.cron_expression is None:
+            raise ValueError("cron routine is missing cron_expression")
+        candidate = next_cron_instant(
+            routine.cron_expression,
+            routine.timezone,
+            after=scheduled,
+        )
+        missed = 0
+        while candidate <= now:
+            missed += 1
+            candidate = next_cron_instant(
+                routine.cron_expression,
+                routine.timezone,
+                after=candidate,
+            )
+        return candidate.isoformat(), missed
     interval = routine.interval_seconds
     if interval is None or interval <= 0:
         raise ValueError("interval routine is missing interval_seconds")
@@ -6323,6 +7332,31 @@ def _routine_terminal_occurrence_status(value: str) -> str:
     normalized = _routine_occurrence_status(value)
     if normalized not in {"completed", "failed"}:
         raise ValueError("routine occurrence terminal status must be completed or failed")
+    return normalized
+
+
+def _routine_delivery_status(value: str) -> str:
+    normalized = str(value).strip().lower()
+    allowed = {
+        "pending",
+        "delivering",
+        "delivered",
+        "failed",
+        "blocked",
+        "uncertain",
+    }
+    if normalized not in allowed:
+        raise ValueError(f"unsupported routine delivery status: {normalized}")
+    return normalized
+
+
+def _routine_delivery_terminal_status(value: str) -> str:
+    normalized = _routine_delivery_status(value)
+    if normalized not in {"delivered", "failed", "blocked", "uncertain"}:
+        raise ValueError(
+            "routine delivery terminal status must be delivered, failed, blocked, "
+            "or uncertain"
+        )
     return normalized
 
 

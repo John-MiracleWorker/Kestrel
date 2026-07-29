@@ -8,6 +8,7 @@ from uuid import uuid4
 from .routine_limits import MAX_ROUTINE_HISTORY_LIMIT
 from .server_models import (
     RoutineCreateRequest,
+    RoutineDeliveryReconcileRequest,
     RoutineRunNowRequest,
     RoutineToggleRequest,
     RoutineUpdateRequest,
@@ -104,6 +105,9 @@ def register_routine_routes(
                 schedule_kind=request.schedule_kind,
                 start_at=request.start_at,
                 interval_seconds=request.interval_seconds,
+                cron_expression=request.cron_expression,
+                timezone=request.timezone,
+                delivery=request.delivery,
                 enabled=False,
                 workspace=request.workspace,
                 provider=request.provider,
@@ -203,6 +207,47 @@ def register_routine_routes(
         except ValueError as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
         return [asdict(item) for item in occurrences]
+
+    @app.get("/api/routines/{routine_id}/deliveries")  # type: ignore[untyped-decorator]
+    def routine_deliveries(
+        routine_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        routine_or_404(routine_id)
+        try:
+            bounded_limit = max(1, min(int(limit), MAX_ROUTINE_HISTORY_LIMIT))
+            deliveries = state.list_routine_deliveries(
+                routine_id=routine_id,
+                limit=bounded_limit,
+            )
+        except ValueError as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+        return [asdict(item) for item in deliveries]
+
+    @app.post("/api/routine-deliveries/{delivery_id}/actions/reconcile")  # type: ignore[untyped-decorator]
+    def reconcile_routine_delivery(
+        delivery_id: str,
+        request: RoutineDeliveryReconcileRequest,
+    ) -> dict[str, Any]:
+        require_dispatch_enabled()
+        try:
+            return asdict(
+                service.reconcile_delivery(
+                    delivery_id,
+                    expected_attempt_count=request.expected_attempt_count,
+                    resolution=request.resolution,
+                    receipt=request.receipt,
+                )
+            )
+        except KeyError as exc:
+            raise http_exception(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            status_code = (
+                409
+                if str(exc).startswith("routine_delivery_reconciliation_conflict")
+                else 400
+            )
+            raise http_exception(status_code=status_code, detail=str(exc)) from exc
 
 
 def _tick_payload(result: Any) -> dict[str, Any]:

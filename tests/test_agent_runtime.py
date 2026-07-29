@@ -1214,6 +1214,69 @@ def test_agent_executes_tool_call_and_continues(tmp_path: Path) -> None:
     assert "memory.write" in event_types
 
 
+def test_agent_aggregates_provider_usage_and_fallback_receipts(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    llm = MockLLMProvider(
+        [
+            LLMResponse(
+                content="I will inspect memory.",
+                tool_calls=(
+                    ToolCall(name="memory.search", arguments={"query": "needle", "k": 2}),
+                ),
+                usage={"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+            ),
+            LLMResponse(
+                content="Inspection complete.",
+                usage={"input_tokens": 17, "output_tokens": 5, "total_tokens": 22},
+                raw={
+                    "provider_fallback": {
+                        "from": "primary",
+                        "to": "secondary",
+                        "from_error_code": "timeout",
+                    }
+                },
+            ),
+        ]
+    )
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=llm,
+            tools=build_default_tools(),
+            config=AgentConfig(
+                provider="openai-compatible",
+                model="worker-model",
+                memory_dir=tmp_path / "memory",
+                log_dir=tmp_path / "logs",
+            ),
+        )
+    )
+
+    result = agent.chat("inspect needle", session_id="usage-test")
+
+    assert result.provider_usage == {
+        "call_count": 2,
+        "completed_call_count": 2,
+        "reported_call_count": 2,
+        "attribution_coverage": 1.0,
+        "complete": True,
+        "input_tokens": 28,
+        "output_tokens": 8,
+        "total_tokens": 36,
+        "fallback_count": 1,
+        "provider_error_count": 0,
+        "provider_failure_codes": [],
+        "providers": ["openai-compatible"],
+        "models": ["worker-model"],
+    }
+    assert len(result.provider_attempts) == 2
+    assert result.provider_attempts[1]["fallback"] == {
+        "from": "primary",
+        "to": "secondary",
+        "from_error_code": "timeout",
+    }
+
+
 def test_agent_writes_full_tool_output_and_budgeted_summary(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = ToolRegistry()

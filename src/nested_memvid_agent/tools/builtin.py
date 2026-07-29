@@ -27,6 +27,7 @@ from ..extension_transaction import (
     remove_tree_verified,
     write_regular_file,
 )
+from ..layers import memory_record_matches_project_scope
 from ..models import EvidenceRef, MemoryHit, MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from ..nested_learning import (
     STABLE_MEMORY_LAYERS,
@@ -59,6 +60,7 @@ from ..skill_validation import validate_skill_manifest
 from ..state_store import AgentStateStore
 from ..task_capsule import capsule_signal_staging_record, summarize_run_capsule
 from .base import AgentTool, ToolContext
+from .browser_tools import BrowserValidateTool
 from .command_tools import (
     CodexExecTool,
     LintRunTool,
@@ -85,6 +87,7 @@ from .git_tools import (
     GitShowTool,
     GitStatusTool,
 )
+from .github_tools import GitHubCreatePullRequestTool, GitHubSyncPullRequestTool
 from .registry import RuntimeToolFence, ToolRegistry
 from .repair_tools import (
     RepairApplyPatchTool,
@@ -94,6 +97,14 @@ from .repair_tools import (
     RepairRollbackTool,
     RepairStatusTool,
     RepairValidateTool,
+)
+from .repo_intelligence_tools import (
+    RepoContextPackTool,
+    RepoDependenciesTool,
+    RepoImpactTool,
+    RepoReferencesTool,
+    RepoSymbolsTool,
+    RepoTestsForTool,
 )
 from .validation_helpers import (
     _evidence_refs_arg,
@@ -158,6 +169,7 @@ class MemorySearchTool(AgentTool):
                 include_retrieval_artifacts=bool(
                     arguments.get("include_retrieval_artifacts", False)
                 ),
+                project_id=context.project_id,
             )
         )
         rows = []
@@ -270,7 +282,20 @@ class MemoryWriteTool(AgentTool):
                     "frame_type": frame_type,
                     "parent_ids": parent_ids,
                     "child_ids": child_ids,
+                    **(
+                        {
+                            "project_id": context.project_id,
+                            "project_revision": context.project_revision,
+                        }
+                        if context.project_id is not None
+                        else {}
+                    ),
                 },
+                tags=(
+                    {"project_id": context.project_id}
+                    if context.project_id is not None
+                    else {}
+                ),
             )
             record_id = context.memory.put(record)
             return self._result(
@@ -320,6 +345,7 @@ class ContextPackTool(AgentTool):
                         arguments.get("expand_raw", context.config.context_pack_expand_raw)
                     ),
                     include_telemetry=bool(arguments.get("include_telemetry", True)),
+                    project_id=context.project_id,
                 )
             )
             payload = {
@@ -616,10 +642,16 @@ class MemoryConflictsTool(AgentTool):
                     token_budget=context.config.context_pack_token_budget,
                     k_per_layer=k,
                     include_telemetry=True,
+                    project_id=context.project_id,
                 )
             )
             hits = context.memory.retrieve(
-                RetrievalQuery(query=query, layers=layers, k_per_layer=k)
+                RetrievalQuery(
+                    query=query,
+                    layers=layers,
+                    k_per_layer=k,
+                    project_id=context.project_id,
+                )
             )
             possible_conflicts = []
             for hit in hits[:k]:
@@ -798,7 +830,12 @@ class MemoryConsolidateTool(AgentTool):
             source_layer = _layer_arg(arguments.get("source_layer"))
             layers = (source_layer,) if source_layer else tuple(MemoryLayer)
             hits = context.memory.retrieve(
-                RetrievalQuery(query=query, layers=layers, k_per_layer=1)
+                RetrievalQuery(
+                    query=query,
+                    layers=layers,
+                    k_per_layer=1,
+                    project_id=context.project_id,
+                )
             )
             if not hits:
                 return self._result(
@@ -859,6 +896,7 @@ class MemoryConsolidateTool(AgentTool):
                     "run_id": context.run_id,
                 }
             )
+            _bind_record_to_project(promoted, context=context)
             dry_run = bool(arguments.get("dry_run", False))
             source_ids = tuple(str(item) for item in promoted.metadata.get("source_record_ids", []))
             record_id = (
@@ -945,6 +983,11 @@ class MemoryLearnTool(AgentTool):
                 if source_record_id
                 else None
             )
+            if source_record is not None and not memory_record_matches_project_scope(
+                source_record,
+                project_id=context.project_id,
+            ):
+                source_record = None
             target_layer = _layer_arg(arguments.get("target_layer"))
             kind = MemoryKind(str(arguments.get("kind", MemoryKind.OBSERVATION.value)))
             validation_evidence = _validation_evidence_arg(arguments)
@@ -987,7 +1030,18 @@ class MemoryLearnTool(AgentTool):
                 explicit_instruction=bool(arguments.get("explicit_instruction", False)),
                 source=str(arguments.get("source", "tool.memory.learn")),
                 locator=str(arguments.get("locator", context.session_id)),
-                metadata={"session_id": context.session_id, "run_id": context.run_id},
+                metadata={
+                    "session_id": context.session_id,
+                    "run_id": context.run_id,
+                    **(
+                        {
+                            "project_id": context.project_id,
+                            "project_revision": context.project_revision,
+                        }
+                        if context.project_id is not None
+                        else {}
+                    ),
+                },
                 requested_target_layer=target_layer,
             )
             kernel = NestedLearningKernel()
@@ -1051,6 +1105,7 @@ class MemoryLearnTool(AgentTool):
                     error="stable_learning_source_mismatch",
                 )
             record = kernel.to_memory_record(signal, decision)
+            _bind_record_to_project(record, context=context)
             dry_run = bool(arguments.get("dry_run", False))
             source_ids = tuple(
                 dict.fromkeys(
@@ -1420,6 +1475,7 @@ class MemoryInspectTool(AgentTool):
                 include_retrieval_artifacts=bool(
                     arguments.get("include_retrieval_artifacts", False)
                 ),
+                project_id=context.project_id,
             )
         )
         rows = [_memory_hit_payload(hit) for hit in hits]
@@ -1465,7 +1521,10 @@ class MemoryCorrectTool(AgentTool):
                 error="missing_correction_text",
             )
         target = context.memory.get_record(None, target_id, include_inactive=True)
-        if target is None:
+        if target is None or not memory_record_matches_project_scope(
+            target,
+            project_id=context.project_id,
+        ):
             return self._result(
                 call,
                 success=False,
@@ -1484,6 +1543,7 @@ class MemoryCorrectTool(AgentTool):
         record_id = None
         if not dry_run:
             correction_record = to_memory_record(frame)
+            _inherit_record_project_scope(correction_record, source=target)
             correction_record.evidence.append(
                 EvidenceRef(source="memory_record", locator=target.id)
             )
@@ -1570,6 +1630,7 @@ class MemoryExportTool(AgentTool):
                     layers=layers,
                     k_per_layer=k_per_layer,
                     include_inactive=include_inactive,
+                    project_id=context.project_id,
                 )
             )
             rows = [_memory_record_payload(hit.record) for hit in hits]
@@ -1598,6 +1659,11 @@ class MemoryExportTool(AgentTool):
                     layer,
                     include_inactive=include_inactive,
                 ):
+                    if not memory_record_matches_project_scope(
+                        record,
+                        project_id=context.project_id,
+                    ):
+                        continue
                     if offset <= total < offset + limit:
                         rows.append(_memory_record_payload(record))
                     total += 1
@@ -2276,6 +2342,7 @@ def build_default_tools(
     register(RepairOrchestrateValidateTool())
     register(RepairReviewTool())
     register(RepairRollbackTool())
+    register(BrowserValidateTool())
     register(SelfInspectTool())
     register(SelfReflectTool())
     register(SelfRememberTool())
@@ -2298,6 +2365,12 @@ def build_default_tools(
     register(CodexExecTool())
     register(RepoSearchTool())
     register(RepoMapTool())
+    register(RepoSymbolsTool())
+    register(RepoReferencesTool())
+    register(RepoDependenciesTool())
+    register(RepoTestsForTool())
+    register(RepoImpactTool())
+    register(RepoContextPackTool())
     register(PatchApplyTool())
     register(TestRunTool())
     register(LintRunTool())
@@ -2309,6 +2382,8 @@ def build_default_tools(
     register(GitLogTool())
     register(GitShowTool())
     register(GitCommitTool())
+    register(GitHubCreatePullRequestTool())
+    register(GitHubSyncPullRequestTool())
     register(MemvidVerifyTool())
     register(MemvidDoctorTool())
     register(MemvidStatsTool())
@@ -2392,6 +2467,7 @@ def _self_snapshot(
             "protected_branches": list(config.protected_branches),
             "allow_memory_import": config.allow_memory_import,
             "allow_executable_skills": config.allow_executable_skills,
+            "allow_browser_validation": config.allow_browser_validation,
             "allow_mcp_network_endpoints": config.allow_mcp_network_endpoints,
             "allow_web": config.allow_web,
             "allow_self_modification": config.allow_self_modification,
@@ -2624,9 +2700,21 @@ def _find_memory_by_id(context: ToolContext, lookup_id: str) -> Any | None:
         if isinstance(records, list):
             for record in records:
                 metadata = getattr(record, "metadata", {})
-                if record.id == lookup_id or str(metadata.get("frame_id", "")) == lookup_id:
+                if (
+                    record.id == lookup_id
+                    or str(metadata.get("frame_id", "")) == lookup_id
+                ) and memory_record_matches_project_scope(
+                    record,
+                    project_id=context.project_id,
+                ):
                     return type("_Hit", (), {"record": record})()
-    hits = context.memory.retrieve(RetrievalQuery(query=lookup_id, k_per_layer=5))
+    hits = context.memory.retrieve(
+        RetrievalQuery(
+            query=lookup_id,
+            k_per_layer=5,
+            project_id=context.project_id,
+        )
+    )
     for hit in hits:
         metadata = hit.record.metadata
         if (
@@ -3016,12 +3104,51 @@ def _memory_has_content_hash(context: ToolContext, layer: MemoryLayer, content_h
     backend = context.memory.backends.get(layer)
     records = getattr(backend, "records", None)
     if isinstance(records, list):
-        return any(getattr(record, "content_hash", None) == content_hash for record in records)
+        return any(
+            getattr(record, "content_hash", None) == content_hash
+            and memory_record_matches_project_scope(
+                record,
+                project_id=context.project_id,
+            )
+            for record in records
+        )
     hits = context.memory.retrieve(
-        RetrievalQuery(query=content_hash, layers=(layer,), k_per_layer=3)
+        RetrievalQuery(
+            query=content_hash,
+            layers=(layer,),
+            k_per_layer=3,
+            project_id=context.project_id,
+        )
     )
     return any(
         hit.record.content_hash == content_hash
         or hit.record.metadata.get("content_hash") == content_hash
         for hit in hits
     )
+
+
+def _bind_record_to_project(record: MemoryRecord, *, context: ToolContext) -> None:
+    if record.layer in {MemoryLayer.SELF, MemoryLayer.POLICY}:
+        record.metadata.pop("project_id", None)
+        record.metadata.pop("project_revision", None)
+        record.tags.pop("project_id", None)
+        return
+    if context.project_id is None:
+        return
+    record.metadata["project_id"] = context.project_id
+    record.metadata["project_revision"] = context.project_revision
+    record.tags["project_id"] = context.project_id
+
+
+def _inherit_record_project_scope(
+    record: MemoryRecord,
+    *,
+    source: MemoryRecord,
+) -> None:
+    project_id = str(source.metadata.get("project_id") or "").strip()
+    if not project_id:
+        return
+    record.metadata["project_id"] = project_id
+    if "project_revision" in source.metadata:
+        record.metadata["project_revision"] = source.metadata["project_revision"]
+    record.tags["project_id"] = project_id

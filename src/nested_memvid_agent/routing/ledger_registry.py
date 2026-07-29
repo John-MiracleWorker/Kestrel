@@ -162,9 +162,10 @@ class RoutingRegistry:
                     task_family_affinities_json, max_context_tokens, supports_tools,
                     supports_json, supports_vision, supports_reasoning, supports_streaming,
                     quality_tier, latency_tier, operator_priority, estimated_cost_usd,
-                    health, recent_failure_rate, predicted_success, metadata_json,
-                    revision, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    input_cost_per_million_usd, output_cost_per_million_usd, health,
+                    recent_failure_rate, predicted_success, metadata_json, revision,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(target_id) DO UPDATE SET
                     provider_profile_id = excluded.provider_profile_id,
                     provider = excluded.provider,
@@ -185,6 +186,8 @@ class RoutingRegistry:
                     latency_tier = excluded.latency_tier,
                     operator_priority = excluded.operator_priority,
                     estimated_cost_usd = excluded.estimated_cost_usd,
+                    input_cost_per_million_usd = excluded.input_cost_per_million_usd,
+                    output_cost_per_million_usd = excluded.output_cost_per_million_usd,
                     health = excluded.health,
                     recent_failure_rate = excluded.recent_failure_rate,
                     predicted_success = excluded.predicted_success,
@@ -218,6 +221,174 @@ class RoutingRegistry:
         with self.state._connect() as conn:
             rows = conn.execute(sql).fetchall()
         return [_target_entry_from_row(row) for row in rows]
+
+    def apply_provider_inventory(
+        self,
+        profile: ProviderProfile,
+        *,
+        expected_profile_revision: int,
+        target_updates: tuple[tuple[ModelTarget, int], ...],
+    ) -> tuple[ProviderProfileEntry, tuple[ModelTargetEntry, ...]]:
+        """Atomically publish one catalog refresh and all derived target changes."""
+
+        _validate_secret_ref(profile.secret_ref)
+        _validate_base_url(profile.base_url)
+        _validate_metadata(profile.metadata)
+        target_ids = [target.target_id for target, _revision in target_updates]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("provider inventory target updates must be unique")
+        for target, expected_revision in target_updates:
+            if expected_revision < 0:
+                raise ValueError("target expected revision must be non-negative")
+            _validate_metadata(target.metadata)
+            if target.provider_profile_id != profile.profile_id:
+                raise ValueError("inventory target does not belong to provider profile")
+            if target.provider != profile.adapter:
+                raise ValueError("target provider does not match provider profile adapter")
+            if profile.locality != "hybrid" and target.locality != profile.locality:
+                raise ValueError("target locality does not match provider profile locality")
+
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            profile_row = conn.execute(
+                "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
+                (profile.profile_id,),
+            ).fetchone()
+            profile_revision, profile_created_at = _next_revision(
+                "provider_profile",
+                profile.profile_id,
+                profile_row,
+                expected_revision=expected_profile_revision,
+                now=now,
+            )
+            planned_targets: list[tuple[ModelTarget, int, str]] = []
+            for target, expected_revision in target_updates:
+                target_row = conn.execute(
+                    "SELECT * FROM routing_model_targets WHERE target_id = ?",
+                    (target.target_id,),
+                ).fetchone()
+                target_revision, target_created_at = _next_revision(
+                    "model_target",
+                    target.target_id,
+                    target_row,
+                    expected_revision=expected_revision,
+                    now=now,
+                )
+                planned_targets.append(
+                    (target, target_revision, target_created_at)
+                )
+
+            conn.execute(
+                """
+                INSERT INTO routing_provider_profiles (
+                    profile_id, display_name, adapter, base_url, secret_ref, enabled,
+                    locality, trust_class, max_concurrency, metadata_json, revision,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    adapter = excluded.adapter,
+                    base_url = excluded.base_url,
+                    secret_ref = excluded.secret_ref,
+                    enabled = excluded.enabled,
+                    locality = excluded.locality,
+                    trust_class = excluded.trust_class,
+                    max_concurrency = excluded.max_concurrency,
+                    metadata_json = excluded.metadata_json,
+                    revision = excluded.revision,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile.profile_id,
+                    profile.display_name,
+                    profile.adapter,
+                    profile.base_url,
+                    profile.secret_ref,
+                    1 if profile.enabled else 0,
+                    profile.locality,
+                    profile.trust_class,
+                    profile.max_concurrency,
+                    _json(profile.metadata),
+                    profile_revision,
+                    profile_created_at,
+                    now,
+                ),
+            )
+            for target, target_revision, target_created_at in planned_targets:
+                conn.execute(
+                    """
+                    INSERT INTO routing_model_targets (
+                        target_id, provider_profile_id, provider, model, enabled, locality,
+                        trust_class, capability_tags_json, role_affinities_json,
+                        task_family_affinities_json, max_context_tokens, supports_tools,
+                        supports_json, supports_vision, supports_reasoning, supports_streaming,
+                        quality_tier, latency_tier, operator_priority, estimated_cost_usd,
+                        input_cost_per_million_usd, output_cost_per_million_usd, health,
+                        recent_failure_rate, predicted_success, metadata_json, revision,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(target_id) DO UPDATE SET
+                        provider_profile_id = excluded.provider_profile_id,
+                        provider = excluded.provider,
+                        model = excluded.model,
+                        enabled = excluded.enabled,
+                        locality = excluded.locality,
+                        trust_class = excluded.trust_class,
+                        capability_tags_json = excluded.capability_tags_json,
+                        role_affinities_json = excluded.role_affinities_json,
+                        task_family_affinities_json = excluded.task_family_affinities_json,
+                        max_context_tokens = excluded.max_context_tokens,
+                        supports_tools = excluded.supports_tools,
+                        supports_json = excluded.supports_json,
+                        supports_vision = excluded.supports_vision,
+                        supports_reasoning = excluded.supports_reasoning,
+                        supports_streaming = excluded.supports_streaming,
+                        quality_tier = excluded.quality_tier,
+                        latency_tier = excluded.latency_tier,
+                        operator_priority = excluded.operator_priority,
+                        estimated_cost_usd = excluded.estimated_cost_usd,
+                        input_cost_per_million_usd = excluded.input_cost_per_million_usd,
+                        output_cost_per_million_usd = excluded.output_cost_per_million_usd,
+                        health = excluded.health,
+                        recent_failure_rate = excluded.recent_failure_rate,
+                        predicted_success = excluded.predicted_success,
+                        metadata_json = excluded.metadata_json,
+                        revision = excluded.revision,
+                        updated_at = excluded.updated_at
+                    """,
+                    _target_values(
+                        target,
+                        revision=target_revision,
+                        created_at=target_created_at,
+                        updated_at=now,
+                    ),
+                )
+            _before_inventory_commit()
+            persisted_profile = conn.execute(
+                "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
+                (profile.profile_id,),
+            ).fetchone()
+            persisted_targets = [
+                conn.execute(
+                    "SELECT * FROM routing_model_targets WHERE target_id = ?",
+                    (target.target_id,),
+                ).fetchone()
+                for target, _revision in target_updates
+            ]
+
+        if persisted_profile is None:
+            raise RuntimeError("provider_inventory_profile_write_lost")
+        if any(row is None for row in persisted_targets):
+            raise RuntimeError("provider_inventory_target_write_lost")
+        return (
+            _profile_entry_from_row(persisted_profile),
+            tuple(
+                _target_entry_from_row(row)
+                for row in persisted_targets
+                if row is not None
+            ),
+        )
 
     def put_policy(
         self,
@@ -284,3 +455,7 @@ class RoutingRegistry:
         with self.state._connect() as conn:
             rows = conn.execute(sql).fetchall()
         return [_policy_entry_from_row(row) for row in rows]
+
+
+def _before_inventory_commit() -> None:
+    """Test seam immediately before the atomic inventory transaction commits."""

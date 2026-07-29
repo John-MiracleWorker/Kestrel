@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -9,13 +10,15 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 import pytest
 from pytest import MonkeyPatch
 
 import nested_memvid_agent.tools.command_tools as command_tools
+import nested_memvid_agent.tools.git_tools as git_tools
 import nested_memvid_agent.tools.process_tools as process_tools
 import nested_memvid_agent.tools.repair_tools as repair_tools
 from nested_memvid_agent.config import AgentConfig
@@ -2053,23 +2056,26 @@ def test_shell_run_file_commands_cannot_escape_or_read_sensitive_paths(
     assert result.error == "path_not_allowed"
 
 
-def test_remote_publishing_config_is_disabled_by_default_and_env_gated(
+def test_remote_publishing_and_browser_validation_are_default_off_and_env_gated(
     monkeypatch: MonkeyPatch,
 ) -> None:
     default_config = AgentConfig()
     assert default_config.allow_git_push is False
     assert default_config.allow_remote_mutation is False
+    assert default_config.allow_browser_validation is False
     assert default_config.git_write_mode == "local_branch"
     assert default_config.protected_branches == ("main", "master", "release/*")
 
     monkeypatch.setenv("NEST_AGENT_ALLOW_GIT_PUSH", "1")
     monkeypatch.setenv("NEST_AGENT_ALLOW_REMOTE_MUTATION", "true")
+    monkeypatch.setenv("NEST_AGENT_ALLOW_BROWSER_VALIDATION", "true")
     monkeypatch.setenv("NEST_AGENT_GIT_WRITE_MODE", "fork_pr")
     monkeypatch.setenv("NEST_AGENT_PROTECTED_BRANCHES", "main,stable/*")
 
     env_config = AgentConfig.from_env()
     assert env_config.allow_git_push is True
     assert env_config.allow_remote_mutation is True
+    assert env_config.allow_browser_validation is True
     assert env_config.git_write_mode == "fork_pr"
     assert env_config.protected_branches == ("main", "stable/*")
 
@@ -3730,6 +3736,28 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
     assert review.data["commit_gate"]["approval_required_before_commit"] is True
     assert (tmp_path / ".nest" / "repair_reviews" / f"{review.data['review_id']}.json").exists()
 
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "path": ".kestrel/improvements/calculator/diff.patch",
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_e2e",
+    )
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+    assert exported.success, exported.content
+    assert exported.data["exact_reviewed_candidate"] is True
+    assert exported.data["repair_review_id"] == review.data["review_id"]
+    exported_patch = (
+        tmp_path / ".kestrel" / "improvements" / "calculator" / "diff.patch"
+    ).read_text(encoding="utf-8")
+    assert "-    return a - b" in exported_patch
+    assert "+    return a + b" in exported_patch
+
     commit_call = ToolCall(
         name="git.commit",
         arguments={
@@ -3771,6 +3799,442 @@ def test_repair_e2e_smoke_reaches_reviewed_commit_gate_after_seeded_failure(tmp_
         text=True,
     )
     assert status.stdout.strip() == ""
+
+
+def test_reviewed_patch_export_captures_staged_unstaged_deleted_and_untracked_bytes(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "staged.txt").write_bytes(b"staged before\n")
+    (tmp_path / "unstaged.txt").write_bytes(b"unstaged before\n")
+    (tmp_path / "deleted.txt").write_bytes(b"delete me\n")
+    subprocess.run(
+        ["git", "add", "staged.txt", "unstaged.txt", "deleted.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "candidate fixture"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-complete-candidate"},
+        id="prepare_complete_export",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+
+    (tmp_path / "staged.txt").write_bytes(b"staged after\n")
+    subprocess.run(
+        ["git", "add", "staged.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "unstaged.txt").write_bytes(b"unstaged after\n")
+    (tmp_path / "deleted.txt").unlink()
+    (tmp_path / "new.txt").write_bytes(b"new untracked text\n")
+    (tmp_path / "blob.bin").write_bytes(b"\x00reviewed\xffbinary\n")
+    (tmp_path / "foo bar.txt").write_bytes(b"reviewed spaced path\n")
+    (tmp_path / "café.txt").write_bytes(b"reviewed unicode path\n")
+
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_complete_export",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={
+            "validation_id": validation_id,
+            "summary": "Complete candidate export review.",
+        },
+        id="review_complete_export",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success, review.content
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_complete_candidate",
+    )
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+    assert exported.success, exported.content
+    patch_path = tmp_path / str(exported.data["path"])
+    patch_bytes = patch_path.read_bytes()
+    for expected_path in (
+        b"staged.txt",
+        b"unstaged.txt",
+        b"deleted.txt",
+        b"new.txt",
+        b"blob.bin",
+        b"foo bar.txt",
+    ):
+        assert expected_path in patch_bytes
+    assert b"caf" in patch_bytes
+    assert b"GIT binary patch" in patch_bytes
+
+    application = tmp_path.parent / f"{tmp_path.name}-patch-application"
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.autocrlf=false",
+            "clone",
+            "--no-hardlinks",
+            str(tmp_path),
+            str(application),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=application,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--detach", base_sha],
+        cwd=application,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "apply", "--binary", str(patch_path)],
+        cwd=application,
+        check=True,
+        capture_output=True,
+    )
+    assert (application / "staged.txt").read_bytes() == b"staged after\n"
+    assert (application / "unstaged.txt").read_bytes() == b"unstaged after\n"
+    assert not (application / "deleted.txt").exists()
+    assert (application / "new.txt").read_bytes() == b"new untracked text\n"
+    assert (application / "blob.bin").read_bytes() == b"\x00reviewed\xffbinary\n"
+    assert (application / "foo bar.txt").read_bytes() == b"reviewed spaced path\n"
+    assert (application / "café.txt").read_bytes() == b"reviewed unicode path\n"
+
+
+def test_exact_patch_renderer_enforces_disk_backed_output_cap(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "large.bin").write_bytes(b"x" * (128 * 1024))
+    subprocess.run(
+        ["git", "add", "large.bin"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "large output fixture"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(ValueError, match="exceeds 1024 bytes"):
+        git_tools._run_bounded_git_output(
+            tmp_path,
+            ["show", "HEAD:large.bin"],
+            environment=git_tools._sanitized_git_environment(None),
+            deadline=monotonic() + 5.0,
+            maximum_stdout_bytes=1024,
+            maximum_stderr_bytes=1024,
+        )
+
+
+@pytest.mark.parametrize(
+    ("assigns", "resumes", "expected_error"),
+    (
+        (False, False, "could not attach"),
+        (True, False, "could not resume"),
+    ),
+)
+def test_windows_exact_patch_setup_failure_reaps_suspended_git_leader(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    assigns: bool,
+    resumes: bool,
+    expected_error: str,
+) -> None:
+    events: list[str] = []
+
+    class FakeProcess:
+        pid = 4242
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("parent-kill")
+            self.returncode = 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            events.append(f"parent-wait:{timeout}")
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(["git"], timeout)
+            return self.returncode
+
+    class FakeJob:
+        def assign(self, process_id: int) -> bool:
+            events.append(f"assign:{process_id}")
+            return assigns
+
+        def resume(self, process_id: int) -> bool:
+            events.append(f"resume:{process_id}")
+            return resumes
+
+        def terminate_and_wait(self, *, timeout_seconds: float) -> bool:
+            events.append(f"terminate:{timeout_seconds}")
+            return False
+
+        def close(self) -> bool:
+            events.append("close")
+            return True
+
+    def fake_popen(*_args: object, **kwargs: object) -> FakeProcess:
+        events.append(f"launch:{kwargs['creationflags']}")
+        return FakeProcess()
+
+    monkeypatch.setattr(git_tools.sys, "platform", "win32")
+    monkeypatch.setattr(git_tools, "create_windows_process_job", FakeJob)
+    monkeypatch.setattr(
+        git_tools,
+        "_hardened_git_command",
+        lambda arguments, *, workspace: ["git", *arguments],
+    )
+    monkeypatch.setattr(git_tools.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        git_tools._run_bounded_git_output(
+            tmp_path,
+            ["status", "--porcelain"],
+            environment={},
+            deadline=monotonic() + 5.0,
+            maximum_stdout_bytes=1024,
+            maximum_stderr_bytes=1024,
+        )
+
+    assert int(events[0].partition(":")[2]) & 0x00000004
+    assert events[1] == "assign:4242"
+    if assigns:
+        assert events[2] == "resume:4242"
+        assert any(event.startswith("terminate:") for event in events)
+    else:
+        assert not any(event.startswith("resume:") for event in events)
+        assert not any(event.startswith("terminate:") for event in events)
+    assert "parent-kill" in events
+    assert any(event.startswith("parent-wait:") for event in events)
+    assert events[-1] == "close"
+
+
+def test_reviewed_patch_export_rejects_post_review_drift(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-drift"},
+        id="prepare_export_drift",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+    (tmp_path / "README.md").write_text("reviewed\n", encoding="utf-8")
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_export_drift",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation_id": validation_id},
+        id="review_export_drift",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success
+    (tmp_path / "README.md").write_text("changed after review\n", encoding="utf-8")
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_drifted_candidate",
+    )
+
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+
+    assert exported.success is False
+    assert exported.error == "repair_review_stale"
+    assert not (tmp_path / ".kestrel").exists()
+
+
+def test_reviewed_patch_export_respects_project_artifact_scope(
+    tmp_path: Path,
+) -> None:
+    _init_git_repo(tmp_path)
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    source = source_dir / "module.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "src/module.py"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add scoped source"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-scoped"},
+        id="prepare_scoped_export",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_scoped_export",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation_id": validation_id},
+        id="review_scoped_export",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_scoped_candidate",
+    )
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(allow_file_write=True),
+        workspace=tmp_path,
+        allowed_paths=("src",),
+        approved_tool_call_ids=frozenset({export_call.id}),
+        approved_tool_call_arguments={export_call.id: export_call.arguments},
+    )
+
+    exported = registry.execute(export_call, context)
+
+    assert exported.success is False
+    assert exported.error == "git_export_path_blocked"
+    assert not (tmp_path / ".kestrel").exists()
+
+
+def test_reviewed_patch_export_refuses_to_persist_registered_secret(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _init_git_repo(tmp_path)
+    secret = "opaque-reviewed-export-secret-123456"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    prepare = ToolCall(
+        name="repair.prepare",
+        arguments={"branch": "codex/export-sensitive"},
+        id="prepare_sensitive_export",
+    )
+    assert registry.execute(
+        prepare,
+        _approved_context(memory, tmp_path, prepare),
+    ).success
+    (tmp_path / "README.md").write_text(
+        f"accidental token: {secret}\n",
+        encoding="utf-8",
+    )
+    validation_id = _successful_repair_validation_id(
+        registry,
+        memory,
+        tmp_path,
+        call_id="validate_sensitive_export",
+    )
+    review_call = ToolCall(
+        name="repair.review",
+        arguments={"validation_id": validation_id},
+        id="review_sensitive_export",
+    )
+    review = registry.execute(
+        review_call,
+        _approved_context(memory, tmp_path, review_call),
+    )
+    assert review.success
+    export_call = ToolCall(
+        name="git.export_patch",
+        arguments={
+            "repair_review_id": review.data["review_id"],
+            "expected_current_diff_digest": review.data["diff_digest"],
+        },
+        id="export_sensitive_candidate",
+    )
+
+    exported = registry.execute(
+        export_call,
+        _approved_context(memory, tmp_path, export_call),
+    )
+
+    assert exported.success is False
+    assert exported.error == "git_export_sensitive_content"
+    assert secret not in exported.content
+    assert not (tmp_path / ".kestrel").exists()
 
 
 def test_stale_repair_review_blocks_commit_and_rollback_preserves_artifact(tmp_path: Path) -> None:
@@ -3879,7 +4343,27 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
         capture_output=True,
         text=True,
     )
+    (tmp_path / "removed.txt").write_text("remove me\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "removed.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "test fixture"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "removed.txt").unlink()
     (tmp_path / "README.md").write_text("patched\n")
+    (tmp_path / "new_module.py").write_text(
+        "def newly_added() -> bool:\n    return True\n",
+        encoding="utf-8",
+    )
     subprocess.run(
         ["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True
     )
@@ -3905,9 +4389,23 @@ def test_repair_review_creates_commit_gate_after_successful_validation(tmp_path:
     assert result.success
     assert result.data["commit_gate"]["commit_allowed"] is True
     assert result.data["commit_gate"]["approval_required_before_commit"] is True
+    assert result.data["diff_preview"]["format"] == "unified"
+    assert result.data["diff_preview"]["bound_diff_digest"] == result.data["diff_digest"]
+    assert result.data["diff_preview"]["redacted"] is True
+    assert result.data["diff_preview"]["authoritative"] is False
+    assert "--- a/README.md" in result.data["diff_preview"]["content"]
+    assert "+++ b/README.md" in result.data["diff_preview"]["content"]
+    assert "+patched" in result.data["diff_preview"]["content"]
+    assert "+++ b/new_module.py" in result.data["diff_preview"]["content"]
+    assert "+def newly_added() -> bool:" in result.data["diff_preview"]["content"]
+    assert "--- a/removed.txt" in result.data["diff_preview"]["content"]
+    assert "+++ /dev/null" in result.data["diff_preview"]["content"]
+    assert "-remove me" in result.data["diff_preview"]["content"]
     review_path = tmp_path / ".nest" / "repair_reviews" / f"{result.data['review_id']}.json"
     assert review_path.exists()
-    assert json.loads(review_path.read_text())["diff_hash"] == result.data["diff_hash"]
+    stored_review = json.loads(review_path.read_text())
+    assert stored_review["diff_hash"] == result.data["diff_hash"]
+    assert stored_review["diff_preview"] == result.data["diff_preview"]
 
 
 def test_git_commit_blocks_repair_branch_without_reviewer_gate(tmp_path: Path) -> None:
@@ -3940,6 +4438,35 @@ def test_git_commit_blocks_repair_branch_without_reviewer_gate(tmp_path: Path) -
     assert not result.success
     assert result.error == "repair_review_required"
     assert after == before
+
+
+def test_windows_reviewed_regular_mode_uses_canonical_git_mode(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "reviewed.txt"
+    content = b"reviewed\n"
+    candidate.write_bytes(content)
+    candidate.chmod(0o666)
+    monkeypatch.setattr(git_tools, "_PLATFORM_OS", SimpleNamespace(name="nt"))
+
+    path, entry_type, mode, observed = git_tools._read_reviewed_manifest_entry(  # noqa: SLF001
+        tmp_path,
+        {
+            "path": candidate.name,
+            "type": "regular",
+            "mode": 0o644,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        },
+    )
+
+    assert (path, entry_type, mode, observed) == (
+        candidate.name,
+        "regular",
+        "100644",
+        content,
+    )
 
 
 def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Path) -> None:
@@ -4138,53 +4665,48 @@ def test_git_create_local_branch_is_local_only_and_approval_gated(
     assert all("push" not in command for command in calls)
 
 
-def test_git_export_patch_writes_local_improvement_patch(
-    tmp_path: Path, monkeypatch: MonkeyPatch
-) -> None:
+def test_git_export_patch_requires_a_current_review_binding(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
-    patch_text = "diff --git a/a.txt b/a.txt\n+hello\n"
     call = ToolCall(
         name="git.export_patch",
         arguments={"path": ".kestrel/improvements/demo/diff.patch"},
         id="export_patch",
     )
 
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[Any]:
-        del kwargs
-        if "config" in command and "--get-regexp" in command:
-            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
-        if command[-7:] == [
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--ignore-cr-at-eol",
-            "--numstat",
-            "-z",
-        ]:
-            return subprocess.CompletedProcess(command, 0, stdout=b"1\t0\ta.txt\0", stderr=b"")
-        raise AssertionError(f"unexpected direct Git command: {command}")
-
-    def fake_supervised(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del kwargs
-        assert command[-4:] == [
-            "diff",
-            "--ignore-cr-at-eol",
-            "--no-ext-diff",
-            "--no-textconv",
-        ]
-        return subprocess.CompletedProcess(command, 0, stdout=patch_text, stderr="")
-
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools.subprocess.run", fake_run)
-    monkeypatch.setattr("nested_memvid_agent.tools.git_tools._run_subprocess", fake_supervised)
     result = registry.execute(call, _approved_context(memory, tmp_path, call))
 
-    assert result.success
-    assert result.data["path"] == ".kestrel/improvements/demo/diff.patch"
-    assert (
-        tmp_path / ".kestrel" / "improvements" / "demo" / "diff.patch"
-    ).read_text() == patch_text
+    assert result.success is False
+    assert result.error == "repair_review_required"
+    assert not (tmp_path / ".kestrel" / "improvements" / "demo" / "diff.patch").exists()
+
+
+def test_git_export_patch_default_destination_respects_project_allowed_paths(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src").mkdir()
+    memory = build_memory_system("memory", tmp_path / "memory")
+    registry = build_default_tools()
+    call = ToolCall(
+        name="git.export_patch",
+        arguments={},
+        id="export_default_scoped_patch",
+    )
+
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(allow_file_write=True),
+        workspace=tmp_path,
+        allowed_paths=("src",),
+        approved_tool_call_ids=frozenset({call.id}),
+        approved_tool_call_arguments={call.id: call.arguments},
+    )
+
+    result = registry.execute(call, context)
+
+    assert result.success is False
+    assert result.error == "repair_review_required"
+    assert not (tmp_path / ".kestrel").exists()
 
 
 def test_git_commit_refuses_protected_branches(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

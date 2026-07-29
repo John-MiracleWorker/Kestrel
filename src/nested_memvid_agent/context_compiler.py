@@ -40,6 +40,7 @@ class ContextCompiler:
         excluded_record_ids: frozenset[str] = frozenset(),
         include_objective: bool = True,
         include_telemetry: bool = True,
+        project_id: str | None = None,
     ) -> CompiledContext:
         packed = self.packer.pack(
             ContextPackRequest(
@@ -52,6 +53,7 @@ class ContextCompiler:
                 include_telemetry=include_telemetry,
                 k_per_layer=self.config.max_hits_per_layer,
                 excluded_record_ids=excluded_record_ids,
+                project_id=project_id,
             )
         )
         selected = list(packed.hits)

@@ -272,7 +272,13 @@ def verify_release_payload(
     if not root.is_dir():
         raise ValueError(f"release payload is not a directory: {root}")
     files = _regular_files(root)
-    required = {"SHA256SUMS", "install.sh", "requirements-release.txt", "sbom.cdx.json"}
+    required = {
+        "SHA256SUMS",
+        "install.ps1",
+        "install.sh",
+        "requirements-release.txt",
+        "sbom.cdx.json",
+    }
     missing = sorted(required - files.keys())
     if missing:
         raise ValueError(f"release payload is missing required files: {missing}")

@@ -18,6 +18,8 @@ Kestrel is a **memory-native AI engineering agent runtime** for developers who w
 It combines:
 
 - a conversational CLI and local web workbench;
+- task-first Mission Control with local project profiles and repository preflight;
+- a rebuildable structural repository index with freshness-bound code intelligence;
 - structured, layered Memvid v2 memory;
 - durable runs, task graphs, approvals, and proactive routines;
 - built-in tools, MCP servers, skills, plugins, and channels;
@@ -30,6 +32,50 @@ It combines:
 Kestrel is currently designed for **one trusted user running one local or privately networked node**. It is not yet a hosted, multi-user, or multi-tenant agent platform.
 
 `v0.4.11` is the current stable release for that supported profile: one trusted user, one Kestrel server or worker process, and one local or privately networked node. This source tree contains tag-ready release metadata; the installer and exact-tag artifacts become available once the `v0.4.11` release workflow publishes them.
+
+---
+
+## Install and Open Kestrel
+
+Once the matching `v0.4.11` tag and exact-tag assets have been published, the everyday install-and-open path is:
+
+```bash
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.11/install.sh \
+  | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
+```
+
+That explicit opt-in installs Kestrel, starts one verified loopback-only service, and opens the local Workbench. Returning users can launch or safely reuse that same service with:
+
+```bash
+kestrel open
+```
+
+The installer installs a `kestrel` command shim in an existing safe writable directory already on `PATH` when one is available. Otherwise, it uses `~/.local/bin` and prints the exact `export PATH=...` step for the current shell. On macOS, it also creates `Kestrel.app` in `~/Applications`. Once the command directory is on `PATH`, either entry point works from any directory. `kestrel status`, `kestrel chat`, `kestrel doctor`, and `kestrel stop` provide the same small everyday surface without requiring the operator to reconstruct server arguments.
+
+Kestrel reports its model state explicitly:
+
+- **Demo** — `Demo uses deterministic responses; no live model connected.` No model credential is required.
+- **Model not connected** — a non-mock provider is configured but has not completed a successful response in this server process.
+- **Ready** — the configured non-mock provider has completed a successful response in the current server process.
+
+`kestrel` is the everyday command. `nest-agent` remains the advanced operator and automation CLI, `nested-memvid` remains the compatibility CLI, and `nested-memvid-agent` remains the Python distribution name.
+
+On native Windows, download the checksummed `install.ps1` release asset and run its non-mutating
+doctor first:
+
+```powershell
+.\install.ps1 -Action Doctor
+.\install.ps1 -Action Bootstrap -Path Auto
+```
+
+`Bootstrap` prints reviewed next-step commands; it does not enable WSL2, install Docker Desktop,
+Python, Git, or Kestrel. The report distinguishes the native Python, x86_64 WSL2, and Docker
+Desktop paths. The native command is explicitly labeled as a version-pinned package-index install,
+not a hash-bound local-wheel install. See the
+[deployment guide](docs/DEPLOYMENT.md#windows-diagnostic-and-bootstrap-plan) for checksum
+verification and path requirements.
+
+Prefer a checkout? Use the [source quick start](#quick-start-from-source). Need full runtime controls? See [advanced `nest-agent` operation](#advanced-nest-agent-operation).
 
 ---
 
@@ -186,38 +232,13 @@ npm ci --prefix web
 npm run build --prefix web
 ```
 
-### Initialize Memory and Verify the Runtime
+### Open Kestrel
 
 ```bash
-nest-agent init --backend memvid --memory-dir .nest/memory
-
-nest-agent doctor \
-  --backend memvid \
-  --memory-dir .nest/memory \
-  --provider mock
-
-nest-agent chat \
-  --backend memvid \
-  --memory-dir .nest/memory \
-  --provider mock \
-  --message "hello"
+kestrel open
 ```
 
-The `mock` provider is deterministic and requires no credentials. It is intended for health checks, tests, and evaluation—not normal engineering work.
-
-### Start the Workbench
-
-```bash
-nest-agent server \
-  --backend memvid \
-  --memory-dir .nest/memory \
-  --provider mock \
-  --model mock \
-  --host 127.0.0.1 \
-  --port 8765
-```
-
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765).
+This initializes the local runtime as needed, starts it in deterministic Demo mode, and opens the Workbench. Run `kestrel chat "hello"` for the same authoritative server-backed conversation from the terminal.
 
 ---
 
@@ -278,7 +299,46 @@ nest-agent product provider-certification \
 
 ---
 
-## Published Release Installation
+## Advanced `nest-agent` Operation
+
+The `kestrel` facade is the recommended launch path. Use `nest-agent` when you need to select memory, provider, model, or server options directly.
+
+### Initialize Memory and Verify the Runtime
+
+```bash
+nest-agent init --backend memvid --memory-dir .nest/memory
+
+nest-agent doctor \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --provider mock
+
+nest-agent chat \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --provider mock \
+  --message "hello"
+```
+
+The `mock` provider is deterministic and requires no credentials. It is intended for health checks, tests, and evaluation—not normal engineering work.
+
+### Start the Server Directly
+
+```bash
+nest-agent server \
+  --backend memvid \
+  --memory-dir .nest/memory \
+  --provider mock \
+  --model mock \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765).
+
+---
+
+## Advanced Installer Controls
 
 The repository contains `v0.4.11` release metadata, but release commands should only be used after the matching Git tag and exact-tag artifacts have been published.
 
@@ -297,8 +357,6 @@ curl -fsSL \
   https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.11/install.sh \
   | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
-
-The product is named **Kestrel**, the CLI is `nest-agent`, and the Python distribution remains `nested-memvid-agent` for compatibility.
 
 ---
 
@@ -442,11 +500,20 @@ When enabled, they require a preloaded, digest-pinned validation image and run w
 
 A repair commit requires a current review artifact tied to the successful validation result and current diff. Committing does not imply pushing, and protected branches are refused by default.
 
+Mission Control presents the bounded validation receipt, review summary, risk notes, rollback state, and redacted diff preview together. Patch export is not a snapshot of an arbitrary live `git diff`: it requires the signed review ID and exact candidate digest, revalidates the review, and renders the complete reviewed staged, unstaged, deleted, untracked, and binary candidate into a local `.kestrel/improvements` artifact.
+
+Contained browser proof is separately default-off. It requires
+`NEST_AGENT_ALLOW_BROWSER_VALIDATION=true`, a preloaded digest-pinned image
+containing `/opt/kestrel/browser-validate`, and exact-call approval for
+`browser.validate`; the API route enters that same approval path and has no
+direct-execution shortcut.
+
 ---
 
 ## Proactive Routines Without a Safety Back Door
 
-Kestrel can persist one-shot or fixed-interval UTC routines.
+Kestrel can persist one-shot, fixed-interval, or five-field cron routines in a
+named IANA timezone.
 
 Routines:
 
@@ -457,9 +524,15 @@ Routines:
 - use leased occurrences and overlap suppression;
 - bound how much work can be claimed per tick;
 - preserve exact-call approvals for dangerous tools; and
-- expose history and manual run-now controls in the workbench.
+- expose history and manual run-now controls in the workbench;
+- bind optional channel delivery to a durable destination-specific idempotency
+  key and receipt; and
+- leave ambiguous delivery in an explicit `uncertain` state until the owner
+  reconciles it.
 
-Cron expressions, named-timezone calendar rules, and automatic connector delivery are not yet part of the supported routine contract.
+UTC scanning handles daylight-saving gaps and repeated local instants
+deterministically. Kestrel does not claim that an arbitrary third-party channel
+provides exactly-once effects.
 
 ---
 
@@ -467,6 +540,10 @@ Cron expressions, named-timezone calendar rules, and automatic connector deliver
 
 The FastAPI-based workbench provides a single place to inspect and control the runtime:
 
+- task-first projects, objective templates, preflight, editable plans, and mission timelines;
+- repository index freshness, intent-aware structural code evidence, and navigation benchmark state;
+- graph amendments, candidate comparison, browser evidence, and GitHub change requests;
+- outcome analytics and private benchmark replay;
 - runs and live event streams;
 - plans, task nodes, subagents, and scheduler state;
 - pending and historical approvals;
@@ -581,8 +658,11 @@ Important unfinished areas include:
 
 - hosted and multi-user authorization;
 - tenant isolation and role-scoped permissions;
+- learned Adaptive Flock production routing with complete usage/cost attribution;
 - fully dynamic provider-written task graphs;
 - autonomous patch synthesis and worker-branch fan-out/merge;
+- contained browser/visual project validation;
+- project-aware GitHub PR/CI feedback;
 - production-soaked MCP network transports;
 - managed plugin dependency installation;
 - broader portable container-engine support;

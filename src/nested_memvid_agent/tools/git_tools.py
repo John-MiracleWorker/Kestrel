@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+import signal
 import stat
 import subprocess  # nosec B404
+import sys
 import tempfile
 import time
 from fnmatch import fnmatchcase
@@ -22,6 +25,7 @@ from ..repair_integrity import (
 )
 from ..runtime_models import ToolCall, ToolExecution, ToolSpec
 from ..security_boundary import redact_text
+from ..windows_process_job import create_windows_process_job
 from .base import AgentTool, ToolContext
 from .patch_helpers import _validate_patch_paths
 from .process_tools import (
@@ -32,7 +36,16 @@ from .process_tools import (
     _SubprocessToolOutcomeIndeterminate,
     _SubprocessToolTimeout,
 )
-from .workspace_tools import _assert_workspace_path_allowed, _safe_path
+from .workspace_tools import (
+    _assert_workspace_path_allowed,
+    _atomic_workspace_write_bytes,
+    _safe_path,
+)
+
+_MAX_EXACT_PATCH_BYTES = 16 * 1024 * 1024
+_PLATFORM_OS: Any = os
+_PLATFORM_SIGNAL: Any = signal
+_MAX_EXACT_PATCH_STDERR_BYTES = 64 * 1024
 
 
 def _safe_branch_name(name: str) -> bool:
@@ -509,13 +522,24 @@ class GitExportPatchTool(AgentTool):
     wait_for_completion_on_timeout = True
     spec = ToolSpec(
         name="git.export_patch",
-        description="Export the current git diff to a local .kestrel/improvements patch file. Never pushes.",
+        description=(
+            "Export the exact current reviewed repair candidate to a local "
+            ".kestrel/improvements patch file. Never pushes."
+        ),
         parameters={
             "type": "object",
             "properties": {
-                "staged": {"type": "boolean"},
                 "path": {"type": "string"},
+                "repair_review_id": {
+                    "type": "string",
+                    "pattern": "^repair_review_[0-9a-f]{24}$",
+                },
+                "expected_current_diff_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                },
             },
+            "required": ["repair_review_id", "expected_current_diff_digest"],
         },
         risk="high",
         requires_approval=True,
@@ -523,111 +547,212 @@ class GitExportPatchTool(AgentTool):
 
     def run(self, arguments: dict[str, Any], context: ToolContext) -> ToolExecution:
         call = ToolCall(name=self.spec.name, arguments=arguments)
-        staged = bool(arguments.get("staged", False))
-        ignore_cr_at_eol = not staged
-        try:
-            _assert_git_paths_allowed(
-                context,
-                _diff_git_paths(
-                    context.workspace,
-                    staged=staged,
-                    ignore_cr_at_eol=ignore_cr_at_eol,
-                ),
-            )
-        except (OSError, RuntimeError, ValueError):
+        if "staged" in arguments:
             return self._result(
                 call,
                 success=False,
-                content="Git patch export includes a protected workspace path; nothing was written.",
-                error="git_export_path_blocked",
+                content=(
+                    "Patch export no longer accepts a staged-only mode; export is "
+                    "bound to the complete reviewed candidate."
+                ),
+                error="unsupported_patch_mode",
             )
-        command = ["git", "diff"]
-        if ignore_cr_at_eol:
-            command.append("--ignore-cr-at-eol")
-        command.extend(("--no-ext-diff", "--no-textconv"))
-        if staged:
-            command.append("--cached")
+        review_id = str(arguments.get("repair_review_id", "")).strip()
+        expected_digest = str(
+            arguments.get("expected_current_diff_digest", "")
+        ).strip()
+        if not review_id:
+            return self._result(
+                call,
+                success=False,
+                content="Patch export requires a current repair_review_id.",
+                error="repair_review_required",
+            )
+        if len(expected_digest) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in expected_digest
+        ):
+            return self._result(
+                call,
+                success=False,
+                content="Patch export requires the reviewed candidate diff digest.",
+                error="repair_diff_digest_required",
+            )
         try:
-            completed = _run_subprocess(
-                _hardened_git_command(command[1:], workspace=context.workspace),
-                context=context,
-                arguments=arguments,
-                default_timeout=30,
-                environment=_sanitized_git_environment(None),
-            )
-            if completed.returncode != 0:
-                return self._result(
-                    call,
-                    success=False,
-                    content=redact_text(f"Unable to export patch. STDERR:\n{completed.stderr}"),
-                    error="git_export_patch_failed",
-                    data={"returncode": completed.returncode},
+            root = require_git_root(context.workspace)
+            with repair_action_lock(root):
+                _assert_repair_snapshot_workspace_safe(context)
+                branch = _git_output(root, ["git", "branch", "--show-current"])
+                review_check = _validate_repair_review_gate(
+                    root,
+                    branch,
+                    review_id,
                 )
-            try:
-                _validate_patch_paths(
-                    context.workspace,
-                    completed.stdout or "",
-                    context=context,
-                )
-            except (OSError, RuntimeError, ValueError):
-                return self._result(
-                    call,
-                    success=False,
-                    content=(
-                        "Git patch export includes a protected workspace path; nothing was written."
-                    ),
-                    error="git_export_path_blocked",
-                )
-            patch = redact_text(completed.stdout or "")
-            if not patch.strip():
-                return self._result(
-                    call, success=False, content="No diff to export.", error="empty_diff"
-                )
-            path_arg = str(arguments.get("path", "")).strip()
-            if path_arg:
-                patch_path = _safe_path(context.workspace, path_arg)
-                _assert_workspace_path_allowed(context, patch_path, requested_path=path_arg)
-                relpath = patch_path.relative_to(context.workspace.resolve())
-                if relpath.parts[:2] != (".kestrel", "improvements"):
+                if not review_check["ok"]:
                     return self._result(
                         call,
                         success=False,
-                        content="Patch exports must stay under .kestrel/improvements/.",
-                        error="invalid_patch_path",
+                        content=str(review_check["content"]),
+                        error=str(review_check["error"]),
+                        data={
+                            key: value
+                            for key, value in review_check.items()
+                            if key not in {"ok", "content", "error"}
+                        },
                     )
-            else:
-                patch_id = hashlib.sha256(patch.encode("utf-8")).hexdigest()[:16]
-                relpath = (
-                    Path(".kestrel") / "improvements" / f"improvement_{patch_id}" / "diff.patch"
+                if not hmac.compare_digest(
+                    str(review_check["diff_hash"]),
+                    expected_digest,
+                ):
+                    return self._result(
+                        call,
+                        success=False,
+                        content=(
+                            "The approved patch-export digest does not match the "
+                            "current reviewed candidate."
+                        ),
+                        error="repair_review_stale",
+                        data={
+                            "review_id": review_id,
+                            "expected_diff_hash": expected_digest,
+                            "actual_diff_hash": review_check["diff_hash"],
+                        },
+                    )
+                snapshot = review_check["repair_snapshot"]
+                if not isinstance(snapshot, dict):
+                    raise ValueError("Repair review snapshot is invalid.")
+                _assert_git_paths_allowed(
+                    context,
+                    _snapshot_changed_paths(snapshot),
                 )
-                patch_path = context.workspace.resolve() / relpath
-            patch_path.parent.mkdir(parents=True, exist_ok=True)
-            patch_path.write_text(patch, encoding="utf-8")
-            return self._result(
-                call,
-                success=True,
-                content=f"Exported patch to {relpath.as_posix()}",
-                data={
-                    "path": relpath.as_posix(),
-                    "chars": len(patch),
-                    "staged": staged,
-                },
-            )
-        except _SubprocessToolOutcomeIndeterminate as exc:
-            return _subprocess_outcome_unresolved(call, exc)
-        except _SubprocessToolTimeout as exc:
+                patch = _render_exact_reviewed_patch(
+                    root,
+                    expected_head=str(review_check["head_sha"]),
+                    snapshot=snapshot,
+                )
+                if not patch:
+                    return self._result(
+                        call,
+                        success=False,
+                        content="The reviewed candidate produced no patch.",
+                        error="empty_diff",
+                    )
+                patch_text = patch.decode("utf-8", errors="surrogateescape")
+                if redact_text(patch_text) != patch_text:
+                    return self._result(
+                        call,
+                        success=False,
+                        content=(
+                            "The exact reviewed patch contains registered credential "
+                            "material and was not written."
+                        ),
+                        error="git_export_sensitive_content",
+                    )
+                # This patch is rendered by Kestrel from the authenticated
+                # manifest above, rather than accepted as caller-controlled
+                # patch text. The manifest paths have already passed the
+                # project capability check and are re-read without symlink
+                # traversal by `_render_exact_reviewed_patch`. Re-parsing
+                # Git's human-oriented diff headers here is both redundant
+                # and incorrect for ordinary quoted Unicode or spaced paths.
+
+                final_check = _validate_repair_review_gate(
+                    root,
+                    branch,
+                    review_id,
+                )
+                if (
+                    not final_check["ok"]
+                    or not hmac.compare_digest(
+                        str(final_check.get("diff_hash", "")),
+                        expected_digest,
+                    )
+                ):
+                    return self._result(
+                        call,
+                        success=False,
+                        content=(
+                            "The reviewed repair changed while its exact patch was "
+                            "being rendered; nothing was written."
+                        ),
+                        error=str(final_check.get("error", "repair_review_stale")),
+                    )
+
+                patch_digest = hashlib.sha256(patch).hexdigest()
+                path_arg = str(arguments.get("path", "")).strip()
+                if path_arg:
+                    patch_path = _safe_path(root, path_arg)
+                    relpath = patch_path.relative_to(root)
+                    if relpath.parts[:2] != (".kestrel", "improvements"):
+                        return self._result(
+                            call,
+                            success=False,
+                            content=(
+                                "Patch exports must stay under "
+                                ".kestrel/improvements/."
+                            ),
+                            error="invalid_patch_path",
+                        )
+                else:
+                    relpath = (
+                        Path(".kestrel")
+                        / "improvements"
+                        / f"improvement_{patch_digest[:16]}"
+                        / "diff.patch"
+                    )
+                    patch_path = root / relpath
+                _assert_workspace_path_allowed(
+                    context,
+                    patch_path,
+                    requested_path=relpath.as_posix(),
+                )
+                try:
+                    os.lstat(patch_path)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return self._result(
+                        call,
+                        success=False,
+                        content=(
+                            "The patch destination already exists; choose a new "
+                            "exact-call destination."
+                        ),
+                        error="patch_destination_exists",
+                    )
+                _atomic_workspace_write_bytes(root, patch_path, patch)
+                return self._result(
+                    call,
+                    success=True,
+                    content=f"Exported exact reviewed patch to {relpath.as_posix()}",
+                    data={
+                        "path": relpath.as_posix(),
+                        "bytes": len(patch),
+                        "patch_sha256": patch_digest,
+                        "repair_review_id": review_id,
+                        "diff_digest": expected_digest,
+                        "exact_reviewed_candidate": True,
+                    },
+                )
+        except WorkspaceSecretIsolationError as exc:
             return self._result(
                 call,
                 success=False,
                 content=redact_text(str(exc)),
-                error="tool_timeout",
+                error=exc.code,
             )
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, RuntimeError, ValueError) as exc:
+            message = redact_text(str(exc))
+            error = (
+                "git_export_path_blocked"
+                if "allowed paths" in message
+                else "git_export_patch_failed"
+            )
             return self._result(
                 call,
                 success=False,
-                content=redact_text(str(exc)),
-                error="git_export_patch_failed",
+                content=message,
+                error=error,
             )
 
 
@@ -1255,6 +1380,330 @@ def _run_exact_index_commit(
     )
 
 
+def _render_exact_reviewed_patch(
+    workspace: Path,
+    *,
+    expected_head: str,
+    snapshot: dict[str, Any],
+) -> bytes:
+    """Render the literal reviewed tree as a bounded binary Git patch."""
+
+    root = require_git_root(workspace)
+    manifest = snapshot.get("changed_manifest")
+    if not isinstance(manifest, list) or not manifest:
+        raise ValueError("Reviewed repair manifest is empty.")
+    if snapshot.get("head_sha") != expected_head or not _valid_git_object_id(
+        expected_head
+    ):
+        raise ValueError("Reviewed repair HEAD identity is invalid.")
+
+    deadline = time.monotonic() + 30.0
+    base_environment = _sanitized_git_environment(None)
+    common_dir_result = _run_repair_git(
+        root,
+        ["rev-parse", "--git-common-dir"],
+        environment=base_environment,
+        deadline=deadline,
+    )
+    if common_dir_result.returncode != 0:
+        raise RuntimeError(
+            _decoded_git_error(
+                common_dir_result,
+                "Unable to locate repository objects for patch export.",
+            )
+        )
+    common_dir = Path(
+        common_dir_result.stdout.decode("utf-8", errors="surrogateescape").strip()
+    )
+    if not common_dir.is_absolute():
+        common_dir = root / common_dir
+    object_directory = common_dir.resolve(strict=True) / "objects"
+    if not object_directory.is_dir():
+        raise ValueError("Repository object directory is unavailable.")
+
+    with tempfile.TemporaryDirectory(prefix="kestrel-repair-export-") as temporary:
+        temporary_root = Path(temporary)
+        temporary_index = temporary_root / "index"
+        temporary_objects = temporary_root / "objects"
+        temporary_objects.mkdir(mode=0o700)
+        environment = _sanitized_git_environment(temporary_index)
+        environment["GIT_OBJECT_DIRECTORY"] = str(temporary_objects)
+        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = (
+            _git_alternate_object_path(object_directory)
+        )
+
+        read_tree = _run_repair_git(
+            root,
+            ["read-tree", expected_head],
+            environment=environment,
+            deadline=deadline,
+        )
+        if read_tree.returncode != 0:
+            raise RuntimeError(
+                _decoded_git_error(
+                    read_tree,
+                    "Unable to initialize the private reviewed-patch index.",
+                )
+            )
+
+        index_records = bytearray()
+        zero_oid = "0" * len(expected_head)
+        for raw_entry in manifest:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Exact reviewed patch export timed out.")
+            if not isinstance(raw_entry, dict):
+                raise ValueError("Reviewed repair manifest entry is invalid.")
+            path, entry_type, mode, content = _read_reviewed_manifest_entry(
+                root,
+                raw_entry,
+            )
+            encoded_path = os.fsencode(path)
+            if entry_type == "deleted":
+                index_records.extend(f"0 {zero_oid}\t".encode("ascii"))
+                index_records.extend(encoded_path)
+                index_records.append(0)
+                continue
+            hashed = _run_repair_git(
+                root,
+                ["hash-object", "-w", "--stdin"],
+                environment=environment,
+                deadline=deadline,
+                input_bytes=content,
+            )
+            if hashed.returncode != 0:
+                raise RuntimeError(
+                    _decoded_git_error(
+                        hashed,
+                        f"Unable to hash reviewed repair path: {path}",
+                    )
+                )
+            object_id = hashed.stdout.decode("ascii", errors="strict").strip()
+            if not _valid_git_object_id(object_id):
+                raise ValueError(f"Git returned an invalid object for reviewed path: {path}")
+            index_records.extend(f"{mode} {object_id}\t".encode("ascii"))
+            index_records.extend(encoded_path)
+            index_records.append(0)
+
+        indexed = _run_repair_git(
+            root,
+            ["update-index", "-z", "--index-info"],
+            environment=environment,
+            deadline=deadline,
+            input_bytes=bytes(index_records),
+        )
+        if indexed.returncode != 0:
+            raise RuntimeError(
+                _decoded_git_error(
+                    indexed,
+                    "Unable to build the private reviewed-patch index.",
+                )
+            )
+        rendered = _run_bounded_git_output(
+            root,
+            [
+                "diff",
+                "--cached",
+                "--binary",
+                "--full-index",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                expected_head,
+                "--",
+            ],
+            environment=environment,
+            deadline=deadline,
+            maximum_stdout_bytes=_MAX_EXACT_PATCH_BYTES,
+            maximum_stderr_bytes=_MAX_EXACT_PATCH_STDERR_BYTES,
+        )
+        if rendered.returncode != 0:
+            raise RuntimeError(
+                _decoded_git_error(
+                    rendered,
+                    "Unable to render the exact reviewed patch.",
+                )
+            )
+        return rendered.stdout
+
+
+def _run_bounded_git_output(
+    workspace: Path,
+    arguments: list[str],
+    *,
+    environment: dict[str, str],
+    deadline: float,
+    maximum_stdout_bytes: int,
+    maximum_stderr_bytes: int,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run inert Git with disk-backed, actively enforced output ceilings."""
+
+    command = _hardened_git_command(arguments, workspace=workspace)
+    windows_job = create_windows_process_job() if sys.platform == "win32" else None
+    windows_job_assigned = False
+    process: subprocess.Popen[bytes] | None = None
+    failure: BaseException | None = None
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            common: dict[str, Any] = {
+                "cwd": workspace,
+                "env": environment,
+                "stdin": subprocess.DEVNULL,
+                "stdout": stdout_file,
+                "stderr": stderr_file,
+            }
+            if sys.platform == "win32":
+                common["creationflags"] = (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                    | 0x00000004
+                )
+            else:
+                common["start_new_session"] = True
+            process = subprocess.Popen(  # noqa: S603 - verified Git and structured argv  # nosec
+                command,
+                **common,
+            )
+            if windows_job is not None:
+                if not windows_job.assign(process.pid):
+                    raise RuntimeError(
+                        "Windows patch-export containment could not attach the Git process."
+                    )
+                windows_job_assigned = True
+                if not windows_job.resume(process.pid):
+                    raise RuntimeError(
+                        "Windows patch-export containment could not resume the Git process."
+                    )
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Exact reviewed patch export timed out.")
+                if os.fstat(stdout_file.fileno()).st_size > maximum_stdout_bytes:
+                    raise ValueError(
+                        f"Exact reviewed patch exceeds {maximum_stdout_bytes} bytes."
+                    )
+                if os.fstat(stderr_file.fileno()).st_size > maximum_stderr_bytes:
+                    raise ValueError(
+                        "Exact reviewed patch diagnostics exceeded their bounded envelope."
+                    )
+                time.sleep(0.01)
+            if os.fstat(stdout_file.fileno()).st_size > maximum_stdout_bytes:
+                raise ValueError(
+                    f"Exact reviewed patch exceeds {maximum_stdout_bytes} bytes."
+                )
+            if os.fstat(stderr_file.fileno()).st_size > maximum_stderr_bytes:
+                raise ValueError(
+                    "Exact reviewed patch diagnostics exceeded their bounded envelope."
+                )
+        except BaseException as exc:
+            failure = exc
+        finally:
+            if process is not None:
+                settled = _settle_git_process_tree(
+                    process,
+                    windows_job=windows_job,
+                    windows_job_assigned=windows_job_assigned,
+                )
+                if not settled and failure is None:
+                    failure = RuntimeError(
+                        "Patch-export process completion could not be proven."
+                    )
+            if windows_job is not None and not windows_job.close() and failure is None:
+                failure = RuntimeError(
+                    "Patch-export process containment could not be closed."
+                )
+        if failure is not None:
+            raise failure
+        assert process is not None
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        return subprocess.CompletedProcess(
+            command,
+            int(process.returncode),
+            stdout=stdout_file.read(maximum_stdout_bytes + 1),
+            stderr=stderr_file.read(maximum_stderr_bytes + 1),
+        )
+
+
+def _settle_git_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    windows_job: Any,
+    windows_job_assigned: bool = False,
+) -> bool:
+    if windows_job is not None:
+        if not windows_job_assigned:
+            return _kill_git_parent_and_wait(process)
+        settled = bool(windows_job.terminate_and_wait(timeout_seconds=2.0))
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            parent_settled = _kill_git_parent_and_wait(process)
+            return settled and parent_settled
+        if settled:
+            return True
+        # A failed Job Object proof must still reap the leader so assignment or
+        # resume failures cannot strand a suspended process.
+        _kill_git_parent_and_wait(process)
+        return False
+    deadline = time.monotonic() + 2.0
+    try:
+        _PLATFORM_OS.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    while time.monotonic() < deadline:
+        try:
+            _PLATFORM_OS.killpg(process.pid, 0)
+        except ProcessLookupError:
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                return False
+            return True
+        except OSError:
+            return False
+        time.sleep(0.01)
+    try:
+        _PLATFORM_OS.killpg(process.pid, _PLATFORM_SIGNAL.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _kill_git_parent_and_wait(process: subprocess.Popen[bytes]) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        return False
+    return process.poll() is not None
+
+
+def _git_alternate_object_path(path: Path) -> str:
+    rendered = str(path)
+    return json.dumps(rendered) if os.pathsep in rendered else rendered
+
+
+def _decoded_git_error(
+    completed: subprocess.CompletedProcess[bytes],
+    prefix: str,
+) -> str:
+    detail = completed.stderr.decode("utf-8", errors="replace").strip()
+    return redact_text(f"{prefix}{f' {detail}' if detail else ''}")
+
+
 def _run_exact_repair_commit(
     workspace: Path,
     *,
@@ -1539,8 +1988,19 @@ def _read_reviewed_manifest_entry(
     ):
         raise ValueError(f"Reviewed repair path changed while committing: {path}")
     content = b"".join(chunks)
-    _verify_manifest_content(entry, before, after, content, path)
-    mode = "100755" if stat.S_IMODE(after.st_mode) & 0o111 else "100644"
+    reviewed_mode = int(entry.get("mode", -1))
+    if reviewed_mode not in {0o644, 0o755}:
+        raise ValueError(f"Reviewed repair path has an invalid mode: {path}")
+    verify_filesystem_mode = getattr(_PLATFORM_OS, "name", os.name) != "nt"
+    _verify_manifest_content(
+        entry,
+        before,
+        after,
+        content,
+        path,
+        verify_mode=verify_filesystem_mode,
+    )
+    mode = "100755" if reviewed_mode == 0o755 else "100644"
     return path, entry_type, mode, content
 
 
@@ -1550,10 +2010,15 @@ def _verify_manifest_content(
     after: os.stat_result,
     content: bytes,
     path: str,
+    *,
+    verify_mode: bool = True,
 ) -> None:
     if (
         not os.path.samestat(before, after)
-        or int(entry.get("mode", -1)) != stat.S_IMODE(after.st_mode)
+        or (
+            verify_mode
+            and int(entry.get("mode", -1)) != stat.S_IMODE(after.st_mode)
+        )
         or int(entry.get("size", -1)) != len(content)
         or str(entry.get("sha256", "")) != hashlib.sha256(content).hexdigest()
     ):

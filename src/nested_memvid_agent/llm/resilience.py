@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -201,19 +202,122 @@ def classify_provider_error(exc: Exception) -> ProviderError:
     lowered = message.lower()
     code = exc.code if isinstance(exc, ProviderError) else type(exc).__name__
     normalized_code = str(code).lower()
-    if any(marker in lowered or marker in normalized_code for marker in ("401", "403", "unauthor", "forbidden", "api key", "authentication")):
-        return ProviderError("Provider authentication failed.", code="authentication", retryable=False)
+    missing_credential_markers = (
+        "api key is required",
+        "api_key is required",
+        "api-key is required",
+        "missing api key",
+        "missing api_key",
+        "missing api-key",
+        "api key not set",
+        "api_key not set",
+        "api-key not set",
+        "missing provider key",
+        "missing credential",
+        "missingcredential",
+    )
+    named_missing_credential = bool(
+        re.search(
+            r"(?:\b[a-z][a-z0-9_]*_api[_-]?key\s+is\s+missing\b|"
+            r"\bmissing\s+[a-z][a-z0-9_]*_api[_-]?key\b|"
+            r"\bapi[_-]?key\s+is\s+missing\b)",
+            lowered,
+        )
+    )
+    if named_missing_credential or any(
+        marker in lowered or marker in normalized_code
+        for marker in missing_credential_markers
+    ):
+        return ProviderError(
+            "Provider credential is missing. Store the named secret in Settings "
+            "or set the configured environment variable.",
+            code="missing_credential",
+            retryable=False,
+        )
+    if any(
+        marker in lowered or marker in normalized_code
+        for marker in (
+            "401",
+            "403",
+            "unauthor",
+            "forbidden",
+            "authentication",
+            "invalid api key",
+            "invalid api_key",
+            "incorrect api key",
+        )
+    ):
+        return ProviderError(
+            "Provider authentication failed. Replace or correct the configured "
+            "credential.",
+            code="authentication",
+            retryable=False,
+        )
     if any(marker in lowered or marker in normalized_code for marker in ("429", "rate limit", "ratelimit")):
-        return ProviderError("Provider rate limit exceeded.", code="rate_limit", retryable=True)
+        return ProviderError(
+            "Provider rate limit reached. Wait, reduce concurrency, or choose "
+            "another configured provider.",
+            code="rate_limit",
+            retryable=True,
+        )
     if any(marker in lowered or marker in normalized_code for marker in ("timeout", "timed out")):
-        return ProviderError("Provider request timed out.", code="timeout", retryable=True)
+        return ProviderError(
+            "Provider request timed out. Check the endpoint and retry.",
+            code="timeout",
+            retryable=True,
+        )
+    if any(
+        marker in lowered or marker in normalized_code
+        for marker in (
+            "connection refused",
+            "connection reset",
+            "connection error",
+            "connectionerror",
+            "connecterror",
+            "dns",
+            "name resolution",
+            "name or service not known",
+            "nodename nor servname",
+            "endpoint unreachable",
+        )
+    ):
+        return ProviderError(
+            "Provider endpoint is unreachable. Start or correct the endpoint or "
+            "base URL, then retry.",
+            code="endpoint_unreachable",
+            retryable=True,
+        )
+    model_missing = "model" in lowered and any(
+        marker in lowered
+        for marker in (
+            "not found",
+            "does not exist",
+            "unavailable",
+            "unknown",
+            "not installed",
+        )
+    )
+    if model_missing or any(
+        marker in normalized_code
+        for marker in ("modelnotfound", "model_not_found", "modelunavailable")
+    ):
+        return ProviderError(
+            "Configured model is unavailable. Select or install a valid model, "
+            "then retry.",
+            code="model_unavailable",
+            retryable=False,
+        )
     if any(
         marker in lowered or marker in normalized_code
         for marker in ("400", "404", "invalid request", "not found", "context length", "badrequest", "notfound")
     ):
         return ProviderError("Provider rejected the request.", code="invalid_request", retryable=False)
     if any(marker in lowered or marker in normalized_code for marker in ("500", "502", "503", "504", "unavailable", "connection")):
-        return ProviderError("Provider is unavailable.", code="unavailable", retryable=True)
+        return ProviderError(
+            "Provider is unavailable. Check provider status and retry.",
+            code="unavailable",
+            retryable=True,
+        )
     if isinstance(exc, ProviderError):
         return ProviderError("Provider request failed.", code=exc.code, retryable=exc.retryable)
     return ProviderError("Provider request failed.", code=type(exc).__name__, retryable=False)

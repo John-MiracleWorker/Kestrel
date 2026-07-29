@@ -334,8 +334,15 @@ def test_mock_run_persists_honest_deterministic_plan_and_review_evidence(tmp_pat
     assert root["status"] == "completed"
     assert {child["status"] for child in children} == {"skipped"}
     graph_contract = root["plan"]["graph_runtime"]
-    assert graph_contract["can_revise_plan"] is False
-    assert graph_contract["can_rewrite_task_dag"] is False
+    assert graph_contract["can_revise_plan"] is True
+    assert graph_contract["can_rewrite_task_dag"] is True
+    assert graph_contract["graph_amendments"]["cycle_validation"] is True
+    assert (
+        graph_contract["graph_amendments"][
+            "risk_permission_cost_scope_expansion_requires_approval"
+        ]
+        is True
+    )
     assert graph_contract["execution_model"] == "single_chat_turn_then_optional_task_scheduler"
     assert root["plan"]["semantic_plan"]["source"] == "deterministic_task_graph"
     review = root["result"]["orchestration_review"]
@@ -405,7 +412,7 @@ def test_json_capable_provider_refines_plan_and_semantically_accepts_evidence(
     root = tasks[0]
     assert root["plan"]["semantic_plan"]["source"] == "provider_structured"
     assert root["plan"]["graph_runtime"]["provider_plan_status"] == "accepted"
-    assert root["plan"]["graph_runtime"]["can_rewrite_task_dag"] is False
+    assert root["plan"]["graph_runtime"]["can_rewrite_task_dag"] is True
     assert tasks[1]["plan"]["semantic_guidance"]["advisory_only"] is True
     artifact = root["result"]["orchestration_review"]["artifact"]
     assert artifact["evaluator"] == "provider_semantic_review"

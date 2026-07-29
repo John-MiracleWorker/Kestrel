@@ -71,6 +71,10 @@ def test_recursive_redaction_preserves_public_secret_metadata() -> None:
         "secret_ref": "secret://provider_token",
         "api_key_env": "OPENAI_API_KEY",
         "fallback_api_key_env": {"name": "ANTHROPIC_API_KEY", "present": False},
+        "secret_env": {
+            "API_TOKEN": "secret://provider_token",
+            "LOCAL_TOKEN": "LOCAL_PROVIDER_TOKEN",
+        },
         "token_configured": True,
         "secret_backend": "json",
         "password_ref": "correct-horse-battery-staple",
@@ -87,6 +91,10 @@ def test_recursive_redaction_preserves_public_secret_metadata() -> None:
     assert redacted["fallback_api_key_env"] == {
         "name": "ANTHROPIC_API_KEY",
         "present": False,
+    }
+    assert redacted["secret_env"] == {
+        "API_TOKEN": "secret://provider_token",
+        "LOCAL_TOKEN": "LOCAL_PROVIDER_TOKEN",
     }
     assert redacted["token_configured"] is True
     assert redacted["secret_backend"] == "json"

@@ -9,6 +9,7 @@ DEFAULT_WHEEL_URL=""
 DEFAULT_CHECKSUMS_URL=""
 DEFAULT_RELEASE_SHA=""
 DEFAULT_RELEASE_VERSION=""
+DEFAULT_LAUNCHER_HELPER_SHA256="5df4ff02daca15c12c16a2f2f2d8587004ee97d21192873a6ce05774f302d9dd"
 DEFAULT_PORT="8765"
 DEFAULT_START_SERVER="0"
 DEFAULT_OPEN_BROWSER="0"
@@ -49,6 +50,13 @@ STARTED_SERVER_PID=""
 STARTED_SUPERVISOR_PID=""
 STARTED_SERVER_PGID=""
 SERVER_LAUNCH_ATTEMPTED=0
+RELEASE_USER_LAUNCHERS_PREPARED=0
+RELEASE_USER_LAUNCHER_MANIFEST=""
+RELEASE_USER_LAUNCHER_MANAGER=""
+RELEASE_USER_LAUNCHER_PLAN=""
+INSTALLED_KESTREL_SHIM=""
+INSTALLED_KESTREL_BIN_DIR=""
+INSTALLED_KESTREL_BIN_ON_PATH=1
 
 usage() {
   cat <<'EOF'
@@ -73,6 +81,8 @@ Environment options:
   KESTREL_SKIP_SMOKE    Set to 1/true to skip doctor/chat smoke checks.
   KESTREL_START_SERVER  Set to 1/true to launch the local server and web UI. Defaults to 0.
   KESTREL_OPEN_BROWSER  Set to 1/true to open the web UI in your browser (when server launch is enabled). Defaults to 0.
+  KESTREL_BIN_DIR       Optional absolute directory for the user-facing kestrel command.
+                        Defaults to a safe writable PATH directory, then $HOME/.local/bin.
   KESTREL_SERVER_SESSION Detached screen/tmux session name. Defaults to kestrel-agent.
   KESTREL_SERVER_LOG    Server log path. Defaults to $KESTREL_HOME/.nest/server.log.
   KESTREL_SERVER_PID    Server PID file path. Defaults to $KESTREL_HOME/.nest/server.pid.
@@ -142,6 +152,21 @@ release_install_exit_trap() {
       exit "$status"
     fi
     MAINTENANCE_LOCK_RELEASED_FOR_SERVER=0
+  fi
+
+  if [[ "$RELEASE_USER_LAUNCHERS_PREPARED" -eq 1 ]]; then
+    set +e
+    rollback_user_launchers
+    local launcher_rollback_status=$?
+    set -e
+    if [[ "$launcher_rollback_status" -ne 0 ]]; then
+      log "ERROR: Kestrel user launchers could not be proven restored. Automatic checkout, environment, memory, and state rollback is unsafe; recovery material has been preserved for manual recovery."
+      cleanup_install_canary
+      cleanup_staged_state
+      cleanup_staged_web_assets
+      release_maintenance_lock
+      exit "$status"
+    fi
   fi
 
   log "Kestrel install failed before acceptance; restoring the previous checkout and Python environment, plus runtime state."
@@ -217,6 +242,10 @@ start_release_install_transaction() {
   RELEASE_MEMORY_PREVIOUS_PATH="${KESTREL_HOME}/.nest/.memory.release-previous"
   RELEASE_STATE_PATH="$KESTREL_STATE_PATH"
   RELEASE_STATE_PREVIOUS_PATH="${KESTREL_STATE_PATH}.release-previous"
+  RELEASE_USER_LAUNCHER_MANIFEST="${KESTREL_HOME}/.nest/user-launchers.install.json"
+  RELEASE_USER_LAUNCHERS_PREPARED=0
+  RELEASE_USER_LAUNCHER_MANAGER=""
+  RELEASE_USER_LAUNCHER_PLAN=""
   trap 'release_install_exit_trap "$?"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -236,9 +265,249 @@ prepare_release_venv_replacement() {
   RELEASE_VENV_NEW_STARTED=1
 }
 
+launcher_helper_source_url() {
+  local repository="${KESTREL_REPO%.git}"
+  local prefix="https://github.com/"
+  [[ "$repository" == "${prefix}"* ]] || return 1
+  local relative="${repository#"$prefix"}"
+  local owner="${relative%%/*}"
+  local name="${relative#*/}"
+  [[ -n "$owner" && -n "$name" && "$name" != */* ]] || return 1
+  [[ "$owner" =~ ^[A-Za-z0-9_.-]+$ && "$name" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+    return 1
+  local revision="${DEFAULT_RELEASE_SHA:-${KESTREL_REF:-}}"
+  [[ -n "$revision" && "$revision" != *..* ]] || return 1
+  [[ "$revision" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+  printf 'https://raw.githubusercontent.com/%s/%s/%s/scripts/manage_user_launchers.py\n' \
+    "$owner" "$name" "$revision"
+}
+
+run_verified_in_memory_launcher_plan() {
+  local helper_url
+  if ! helper_url="$(launcher_helper_source_url)"; then
+    log "ERROR: cannot derive the checksum-bound launcher helper URL from ${KESTREL_REPO}."
+    return 1
+  fi
+  [[ "$DEFAULT_LAUNCHER_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+    log "ERROR: installer launcher-helper checksum is invalid."
+    return 1
+  }
+  command -v curl >/dev/null 2>&1 || {
+    log "ERROR: curl is required for checksum-bound stdin launcher planning."
+    return 1
+  }
+  log "+ fetch and verify in-memory launcher planner ${helper_url}" >&2
+  curl --disable --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' "$helper_url" |
+    "$PYTHON_BIN" -I -c '
+import hashlib
+import sys
+
+expected, source_url, *arguments = sys.argv[1:]
+source = sys.stdin.buffer.read()
+actual = hashlib.sha256(source).hexdigest()
+if actual != expected:
+    sys.stderr.write(
+        f"ERROR: launcher helper checksum mismatch: expected {expected}, got {actual}\n"
+    )
+    raise SystemExit(1)
+namespace = {
+    "__name__": "kestrel_verified_in_memory_launcher_planner",
+    "__file__": source_url,
+}
+exec(compile(source, source_url, "exec"), namespace)
+runner = namespace.get("run")
+if not callable(runner):
+    sys.stderr.write("ERROR: verified launcher helper has no callable planner\n")
+    raise SystemExit(1)
+raise SystemExit(runner(["plan", *arguments]))
+' "$DEFAULT_LAUNCHER_HELPER_SHA256" "$helper_url" "$@"
+}
+
+prepare_user_launchers() {
+  local requested_bin_dir="${KESTREL_BIN_DIR:-}"
+  local launcher_manager="${KESTREL_HOME}/scripts/manage_user_launchers.py"
+  local local_helper_available=1
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    # A dry run must use the helper belonging to this installer, not a
+    # potentially older helper in the target checkout.
+    local_helper_available=0
+    local installer_source="${BASH_SOURCE[0]:-}"
+    if [[
+      -n "$installer_source" &&
+      "$installer_source" != "/dev/stdin" &&
+      ! -L "$installer_source" &&
+      -f "$installer_source"
+    ]]; then
+      local source_launcher_manager
+      source_launcher_manager="$(dirname "$installer_source")/scripts/manage_user_launchers.py"
+      if [[ ! -L "$source_launcher_manager" && -f "$source_launcher_manager" ]]; then
+        launcher_manager="$source_launcher_manager"
+        local_helper_available=1
+      fi
+    fi
+  elif [[ -L "$launcher_manager" || ! -f "$launcher_manager" ]]; then
+    die "Kestrel user-launcher planning helper is unavailable or unsafe: ${launcher_manager}"
+  fi
+
+  local launcher_arguments=(
+    --kestrel-home
+    "$KESTREL_HOME"
+    --user-home
+    "$HOME"
+    --port
+    "$KESTREL_PORT"
+    --state-path
+    "$KESTREL_STATE_PATH"
+    --memory-dir
+    "${KESTREL_HOME}/.nest/memory"
+  )
+  if [[ -n "$requested_bin_dir" ]]; then
+    launcher_arguments+=(--bin-dir "$requested_bin_dir")
+  fi
+
+  local launcher_plan
+  if [[ "$local_helper_available" -eq 1 ]]; then
+    local plan_command=(
+      "$PYTHON_BIN" "$launcher_manager" plan "${launcher_arguments[@]}"
+    )
+    log "+ $(quote_cmd "${plan_command[@]}")"
+    if ! launcher_plan="$("${plan_command[@]}")"; then
+      die "Unable to plan the Kestrel user launchers."
+    fi
+  elif ! launcher_plan="$(
+    run_verified_in_memory_launcher_plan "${launcher_arguments[@]}"
+  )"; then
+    die "Unable to run the verified in-memory Kestrel launcher plan."
+  fi
+
+  if ! INSTALLED_KESTREL_SHIM="$(
+    "$PYTHON_BIN" -c \
+      'import json, sys; print(json.loads(sys.argv[1])["shim_path"])' \
+      "$launcher_plan"
+  )"; then
+    die "Kestrel user-launcher plan metadata was invalid."
+  fi
+  INSTALLED_KESTREL_BIN_DIR="$(dirname "$INSTALLED_KESTREL_SHIM")"
+  if ! INSTALLED_KESTREL_BIN_ON_PATH="$(
+    "$PYTHON_BIN" -c \
+      'import json, sys; print("1" if json.loads(sys.argv[1])["bin_on_path"] else "0")' \
+      "$launcher_plan"
+  )"; then
+    die "Kestrel user-launcher PATH plan metadata was invalid."
+  fi
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    log "DRY RUN: would install the Kestrel command shim at ${INSTALLED_KESTREL_SHIM}"
+    local planned_app
+    if ! planned_app="$(
+      "$PYTHON_BIN" -c \
+        'import json, sys; print(json.loads(sys.argv[1])["app_path"] or "")' \
+        "$launcher_plan"
+    )"; then
+      die "Kestrel app-launcher metadata was invalid during planning."
+    fi
+    if [[ -n "$planned_app" ]]; then
+      log "DRY RUN: would install the Kestrel app launcher at ${planned_app}"
+    fi
+    return 0
+  fi
+
+  RELEASE_USER_LAUNCHER_MANAGER="$launcher_manager"
+  RELEASE_USER_LAUNCHER_PLAN="$launcher_plan"
+  # Claim rollback responsibility before the first mutating helper call. The
+  # helper persists its manifest before any public launcher rename; if a
+  # signal lands earlier, rollback verifies this exact baseline stayed put.
+  RELEASE_USER_LAUNCHERS_PREPARED=1
+  local prepare_command=(
+    "$PYTHON_BIN" "$launcher_manager" prepare
+    "${launcher_arguments[@]}"
+    --manifest "$RELEASE_USER_LAUNCHER_MANIFEST"
+  )
+  log "+ $(quote_cmd "${prepare_command[@]}")"
+  local launcher_result
+  if ! launcher_result="$("${prepare_command[@]}")"; then
+    die "Unable to prepare the Kestrel user launchers."
+  fi
+  if ! "$PYTHON_BIN" -c '
+import json
+import sys
+
+planned = json.loads(sys.argv[1])
+prepared = json.loads(sys.argv[2])
+keys = ("shim_path", "app_path", "bin_on_path")
+raise SystemExit(0 if all(planned[key] == prepared[key] for key in keys) else 1)
+' "$launcher_plan" "$launcher_result"; then
+    die "Prepared Kestrel launcher targets differ from the approved plan."
+  fi
+  log "Prepared Kestrel command shim at ${INSTALLED_KESTREL_SHIM}"
+}
+
+commit_user_launchers() {
+  [[ "$RELEASE_USER_LAUNCHERS_PREPARED" -eq 1 ]] || return 0
+  if [[ ! -f "$RELEASE_USER_LAUNCHER_MANIFEST" || -L "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
+    log "ERROR: Kestrel user-launcher transaction metadata is missing or unsafe: ${RELEASE_USER_LAUNCHER_MANIFEST}"
+    return 1
+  fi
+  local launcher_manager="${KESTREL_HOME}/scripts/manage_user_launchers.py"
+  log "+ $(quote_cmd "$PYTHON_BIN" "$launcher_manager" commit --manifest "$RELEASE_USER_LAUNCHER_MANIFEST")"
+  if ! "$PYTHON_BIN" "$launcher_manager" commit \
+    --manifest "$RELEASE_USER_LAUNCHER_MANIFEST" >/dev/null; then
+    return 1
+  fi
+  RELEASE_USER_LAUNCHERS_PREPARED=0
+  RELEASE_USER_LAUNCHER_MANAGER=""
+  RELEASE_USER_LAUNCHER_PLAN=""
+  log "Committed Kestrel user launchers."
+}
+
+rollback_user_launchers() {
+  [[ "$RELEASE_USER_LAUNCHERS_PREPARED" -eq 1 ]] || return 0
+  if [[ -L "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
+    log "ERROR: Kestrel user-launcher rollback metadata is missing or unsafe: ${RELEASE_USER_LAUNCHER_MANIFEST}"
+    return 1
+  fi
+  local launcher_manager="${RELEASE_USER_LAUNCHER_MANAGER:-${KESTREL_HOME}/scripts/manage_user_launchers.py}"
+  if [[ -L "$launcher_manager" || ! -f "$launcher_manager" ]]; then
+    log "ERROR: Kestrel user-launcher manager is missing or unsafe: ${launcher_manager}"
+    return 1
+  fi
+  if [[ ! -e "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
+    if [[ -z "$RELEASE_USER_LAUNCHER_PLAN" ]]; then
+      log "ERROR: Kestrel launcher manifest and pre-mutation plan are both missing."
+      return 1
+    fi
+    log "+ verify no public launcher mutation occurred before durable metadata"
+    if ! "$PYTHON_BIN" "$launcher_manager" verify-plan \
+      --plan-json "$RELEASE_USER_LAUNCHER_PLAN" >/dev/null; then
+      return 1
+    fi
+    RELEASE_USER_LAUNCHERS_PREPARED=0
+    RELEASE_USER_LAUNCHER_MANAGER=""
+    RELEASE_USER_LAUNCHER_PLAN=""
+    log "Verified that no public Kestrel launcher mutation requires rollback."
+    return 0
+  fi
+  if [[ ! -f "$RELEASE_USER_LAUNCHER_MANIFEST" ]]; then
+    log "ERROR: Kestrel user-launcher rollback metadata is unsafe: ${RELEASE_USER_LAUNCHER_MANIFEST}"
+    return 1
+  fi
+  log "+ $(quote_cmd "$PYTHON_BIN" "$launcher_manager" rollback --manifest "$RELEASE_USER_LAUNCHER_MANIFEST")"
+  if ! "$PYTHON_BIN" "$launcher_manager" rollback \
+    --manifest "$RELEASE_USER_LAUNCHER_MANIFEST" >/dev/null; then
+    return 1
+  fi
+  RELEASE_USER_LAUNCHERS_PREPARED=0
+  RELEASE_USER_LAUNCHER_MANAGER=""
+  RELEASE_USER_LAUNCHER_PLAN=""
+  log "Rolled back Kestrel user launchers."
+}
+
 finalize_release_install_transaction() {
   if [[ "$RELEASE_TRANSACTION_ACTIVE" -ne 1 ]]; then
     return 0
+  fi
+  if ! commit_user_launchers; then
+    die "Unable to commit the Kestrel user launchers."
   fi
   RELEASE_TRANSACTION_ACTIVE=0
   if [[ "$RELEASE_STATE_BACKED_UP" -eq 1 ]]; then
@@ -1005,6 +1274,7 @@ verify_installed_runtime() {
       die "Installed checkout is missing the regular installer server supervisor script."
   fi
   run .venv/bin/nest-agent --help
+  run .venv/bin/kestrel --help
   run .venv/bin/python -c 'import importlib.util, nested_memvid_agent; required=("fastapi","keyring","mcp","memvid_sdk","uvicorn"); missing=[name for name in required if importlib.util.find_spec(name) is None]; assert not missing, f"missing runtime modules: {missing}"; assert nested_memvid_agent.__file__'
   if [[ -n "$KESTREL_WHEEL_URL" ]]; then
     run .venv/bin/python -c 'import importlib.metadata, sys; from importlib.resources import files; expected=sys.argv[1]; actual=importlib.metadata.version("nested-memvid-agent"); assert actual == expected, f"installed Kestrel version {actual!r} != release {expected!r}"; assert files("nested_memvid_agent").joinpath("web_dist/index.html").is_file(), "bundled workbench is missing"; import anthropic, fastapi, google.genai, keyring, mcp, memvid_sdk, openai, uvicorn' "$DEFAULT_RELEASE_VERSION"
@@ -1841,7 +2111,7 @@ process_working_directory() {
 
 process_is_expected_kestrel_server() {
   local pid="$1"
-  local expected_uid process_uid expected_cwd process_cwd process_command
+  local expected_uid process_uid expected_cwd process_cwd process_command expected_memory
   expected_uid="$(id -u)"
   process_uid="$(ps -p "$pid" -o uid= 2>/dev/null | tr -d '[:space:]')"
   [[ "$process_uid" == "$expected_uid" ]] || return 1
@@ -1853,7 +2123,17 @@ process_is_expected_kestrel_server() {
   process_command="$(ps -ww -p "$pid" -o command= 2>/dev/null)" || return 1
   [[ "$process_command" == *".venv/bin/nest-agent server"* ]] || return 1
   [[ " $process_command " == *" --backend memvid "* ]] || return 1
-  [[ " $process_command " == *" --memory-dir .nest/memory "* ]] || return 1
+  expected_memory="${KESTREL_HOME}/.nest/memory"
+  if [[ " $process_command " != *" --memory-dir .nest/memory "* ]] &&
+    [[ " $process_command " != *" --memory-dir ${expected_memory} "* ]]; then
+    return 1
+  fi
+  # Older standard launches may rely on the CLI's state-path default. Treat
+  # that shape conservatively as Kestrel so an upgrade never mutates beneath
+  # it; when the option is explicit, require the configured exact path.
+  if [[ " $process_command " == *" --state-path "* ]]; then
+    [[ " $process_command " == *" --state-path ${KESTREL_STATE_PATH} "* ]] || return 1
+  fi
   [[ " $process_command " == *" --provider mock "* ]] || return 1
   [[ " $process_command " == *" --model mock "* ]] || return 1
   [[ " $process_command " == *" --host 127.0.0.1 "* ]] || return 1
@@ -2484,6 +2764,62 @@ start_server_detached() {
   fi
 }
 
+uses_default_kestrel_lifecycle_paths() {
+  [[ "${KESTREL_SERVER_LOG:-}" == "${KESTREL_HOME}/.nest/server.log" ]] &&
+    [[ "${KESTREL_SERVER_PID:-}" == "${KESTREL_HOME}/.nest/server.pid" ]] &&
+    [[ "${KESTREL_SERVER_SUPERVISOR_PID:-}" == "${KESTREL_HOME}/.nest/server.supervisor.pid" ]] &&
+    [[ "${KESTREL_SERVER_PROCESS_GROUP:-}" == "${KESTREL_HOME}/.nest/server.pgid" ]]
+}
+
+launch_kestrel_facade() {
+  if ! is_true "$KESTREL_START_SERVER"; then
+    log "Skipping server launch because KESTREL_START_SERVER is disabled."
+    return 0
+  fi
+
+  # Preserve the documented advanced metadata overrides until the product
+  # facade exposes equivalent flags. The ordinary path owns the canonical
+  # .nest lifecycle files and uses the same safe controller as future launches.
+  if ! uses_default_kestrel_lifecycle_paths; then
+    log "Using the advanced installer launch path because custom server lifecycle paths are configured."
+    start_server_detached
+    open_web_ui_best_effort
+    return 0
+  fi
+
+  local facade_command=(
+    env
+    "NEST_AGENT_MEMORY_DIR=${KESTREL_HOME}/.nest/memory"
+    "NEST_AGENT_STATE_PATH=${KESTREL_STATE_PATH}"
+    "${KESTREL_HOME}/.venv/bin/kestrel"
+    --home
+    "$KESTREL_HOME"
+    --port
+    "$KESTREL_PORT"
+    open
+  )
+  if ! is_true "$KESTREL_OPEN_BROWSER"; then
+    facade_command+=(--no-browser)
+  fi
+
+  if ! is_true "${KESTREL_DRY_RUN:-}"; then
+    SERVER_LAUNCH_ATTEMPTED=1
+  fi
+  if ! run "${facade_command[@]}"; then
+    die "The Kestrel launch facade could not start a verified local service. The install transaction will be restored when safe."
+  fi
+  if is_true "${KESTREL_DRY_RUN:-}"; then
+    return 0
+  fi
+  wait_for_managed_supervisor_pid ||
+    die "Kestrel started without verifiable supervisor metadata; refusing to accept the install."
+  wait_for_managed_server_process_group ||
+    die "Kestrel started without a verifiable process group; refusing to accept the install."
+  wait_for_managed_server_pid ||
+    die "Kestrel started without verifiable server metadata; refusing to accept the install."
+  wait_for_server
+}
+
 open_web_ui() {
   if ! is_true "$KESTREL_START_SERVER" || ! is_true "$KESTREL_OPEN_BROWSER"; then
     return 0
@@ -2509,6 +2845,41 @@ open_web_ui_best_effort() {
 }
 
 print_next_steps() {
+  local command_bin="${INSTALLED_KESTREL_BIN_DIR:-${KESTREL_BIN_DIR:-${HOME}/.local/bin}}"
+  if [[ "$INSTALLED_KESTREL_BIN_ON_PATH" -ne 1 ]]; then
+    cat <<EOF
+
+Add the Kestrel command to this shell:
+  export PATH="${command_bin}:\$PATH"
+EOF
+  fi
+
+  local advanced_cli="${KESTREL_HOME}/.venv/bin/nest-agent"
+  local advanced_reference="${KESTREL_HOME}/README.md#advanced-nest-agent-operation"
+
+  if is_true "$KESTREL_START_SERVER" && ! uses_default_kestrel_lifecycle_paths; then
+    cat <<EOF
+
+Kestrel install complete.
+
+The local web workbench is running at:
+  $(server_url)
+
+This service uses custom lifecycle metadata, which the everyday kestrel
+status, stop, and open commands do not own:
+  server PID: ${KESTREL_SERVER_PID}
+  supervisor PID: ${KESTREL_SERVER_SUPERVISOR_PID}
+  process group: ${KESTREL_SERVER_PROCESS_GROUP}
+  server log: ${KESTREL_SERVER_LOG}
+
+Use the process supervisor and metadata policy that supplied those paths for
+lifecycle management. Kestrel's advanced operator reference is:
+  ${advanced_cli} --help
+  ${advanced_reference}
+EOF
+    return 0
+  fi
+
   if is_true "$KESTREL_START_SERVER"; then
     cat <<EOF
 
@@ -2517,16 +2888,16 @@ Kestrel install complete.
 The local web workbench is running at:
   $(server_url)
 
-Server log:
-  ${KESTREL_SERVER_LOG}
+Useful commands:
+  kestrel open
+  kestrel status
+  kestrel chat
+  kestrel doctor
+  kestrel stop
 
-Stop the detached server:
-  kill "\$(cat "${KESTREL_SERVER_SUPERVISOR_PID}")"
-  screen -S "${KESTREL_SERVER_SESSION}" -X quit 2>/dev/null || true
-
-Try CLI chat:
-  cd "${KESTREL_HOME}"
-  .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock
+Advanced operator reference:
+  ${advanced_cli} --help
+  ${advanced_reference}
 EOF
     return 0
   fi
@@ -2535,16 +2906,18 @@ EOF
 
 Kestrel install complete.
 
-Try CLI chat:
-  cd "${KESTREL_HOME}"
-  .venv/bin/nest-agent chat --backend memvid --memory-dir .nest/memory --provider mock --model mock
+Start and open Kestrel:
+  kestrel open
 
-Start the local web workbench:
-  cd "${KESTREL_HOME}"
-  .venv/bin/nest-agent server --backend memvid --memory-dir .nest/memory --state-path "${KESTREL_STATE_PATH}" --provider mock --model mock --host 127.0.0.1 --port ${KESTREL_PORT}
+Other useful commands:
+  kestrel status
+  kestrel chat
+  kestrel doctor
+  kestrel stop
 
-Open:
-  http://127.0.0.1:${KESTREL_PORT}/
+Advanced operator reference:
+  ${advanced_cli} --help
+  ${advanced_reference}
 EOF
 }
 
@@ -2589,6 +2962,7 @@ main() {
   KESTREL_WHEEL_URL="${KESTREL_WHEEL_URL-$DEFAULT_WHEEL_URL}"
   KESTREL_CHECKSUMS_URL="${KESTREL_CHECKSUMS_URL-$DEFAULT_CHECKSUMS_URL}"
   KESTREL_PORT="${KESTREL_PORT:-$DEFAULT_PORT}"
+  KESTREL_BIN_DIR="${KESTREL_BIN_DIR:-}"
   KESTREL_START_SERVER="${KESTREL_START_SERVER:-$DEFAULT_START_SERVER}"
   if is_true "$KESTREL_START_SERVER"; then
     KESTREL_OPEN_BROWSER="${KESTREL_OPEN_BROWSER:-$DEFAULT_OPEN_BROWSER}"
@@ -2612,12 +2986,15 @@ main() {
   unset PYTHONPATH
   PYTHON_BIN="$(detect_python)"
   KESTREL_HOME="$(absolute_path "$KESTREL_HOME")"
+  if [[ -n "$KESTREL_BIN_DIR" ]]; then
+    KESTREL_BIN_DIR="$(absolute_path "$KESTREL_BIN_DIR")"
+  fi
   KESTREL_STATE_PATH="$(resolve_runtime_state_path)"
   KESTREL_SERVER_LOG="$(absolute_path "$KESTREL_SERVER_LOG")"
   KESTREL_SERVER_PID="$(absolute_path "$KESTREL_SERVER_PID")"
   KESTREL_SERVER_SUPERVISOR_PID="$(absolute_path "$KESTREL_SERVER_SUPERVISOR_PID")"
   KESTREL_SERVER_PROCESS_GROUP="$(absolute_path "$KESTREL_SERVER_PROCESS_GROUP")"
-  readonly KESTREL_HOME KESTREL_STATE_PATH KESTREL_REPO KESTREL_REF KESTREL_REPO_OVERRIDE_SET KESTREL_REF_OVERRIDE_SET KESTREL_REQUIREMENTS_URL_OVERRIDE_SET KESTREL_WHEEL_URL_OVERRIDE_SET KESTREL_CHECKSUMS_URL_OVERRIDE_SET KESTREL_EXTRAS KESTREL_REQUIREMENTS_URL KESTREL_WHEEL_URL KESTREL_CHECKSUMS_URL KESTREL_PORT KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID KESTREL_SERVER_SUPERVISOR_PID KESTREL_SERVER_PROCESS_GROUP PYTHON_BIN
+  readonly KESTREL_HOME KESTREL_STATE_PATH KESTREL_REPO KESTREL_REF KESTREL_REPO_OVERRIDE_SET KESTREL_REF_OVERRIDE_SET KESTREL_REQUIREMENTS_URL_OVERRIDE_SET KESTREL_WHEEL_URL_OVERRIDE_SET KESTREL_CHECKSUMS_URL_OVERRIDE_SET KESTREL_EXTRAS KESTREL_REQUIREMENTS_URL KESTREL_WHEEL_URL KESTREL_CHECKSUMS_URL KESTREL_PORT KESTREL_BIN_DIR KESTREL_START_SERVER KESTREL_OPEN_BROWSER KESTREL_SERVER_SESSION KESTREL_SERVER_LOG KESTREL_SERVER_PID KESTREL_SERVER_SUPERVISOR_PID KESTREL_SERVER_PROCESS_GROUP PYTHON_BIN
   validate_release_artifact_config
   require_safe_install_paths
   # Source and staged-release upgrades both mutate the checkout, .venv, and
@@ -2655,11 +3032,12 @@ main() {
     SERVER_LABEL="enabled"
     HEALTH_CHECK_LABEL="$(health_url)"
     WEB_UI_LABEL="$(server_url)"
-    SERVER_COMMAND_LABEL="nest-agent server --backend memvid --memory-dir .nest/memory --state-path ${KESTREL_STATE_PATH} --provider mock --model mock --host 127.0.0.1 --port ${KESTREL_PORT}"
+    SERVER_COMMAND_LABEL="kestrel --home ${KESTREL_HOME} --port ${KESTREL_PORT} open"
     if is_true "$KESTREL_OPEN_BROWSER"; then
       BROWSER_LABEL="enabled"
     else
       BROWSER_LABEL="disabled"
+      SERVER_COMMAND_LABEL="${SERVER_COMMAND_LABEL} --no-browser"
     fi
   else
     SERVER_LABEL="disabled"
@@ -2700,6 +3078,7 @@ main() {
   commit_staged_web_assets
   commit_staged_memory
   commit_staged_state
+  prepare_user_launchers
   if is_true "$KESTREL_START_SERVER"; then
     # A real server may recover durable work as soon as it starts, so release
     # maintenance ownership only after every candidate artifact is committed.
@@ -2711,7 +3090,7 @@ main() {
     cleanup_staged_web_assets
     MAINTENANCE_LOCK_RELEASED_FOR_SERVER=1
     release_maintenance_lock
-    start_server_detached
+    launch_kestrel_facade
     finalize_release_install_transaction
     # finalize_release_install_transaction is the acceptance linearization
     # point.  Until it clears RELEASE_TRANSACTION_ACTIVE, the EXIT trap must
@@ -2722,9 +3101,7 @@ main() {
   else
     finalize_release_install_transaction
     finish_post_commit_maintenance
-    start_server_detached
   fi
-  open_web_ui_best_effort
   print_next_steps
 }
 

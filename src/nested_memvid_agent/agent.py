@@ -26,7 +26,12 @@ from .context_compiler import ContextCompiler, ContextCompilerConfig
 from .context_frames import MV2ContextFrame
 from .diagnosis import classify_failure
 from .event_log import AgentEvent, JsonlEventLog
-from .layers import LayeredMemorySystem, LayerSpec, memory_record_is_expired
+from .layers import (
+    LayeredMemorySystem,
+    LayerSpec,
+    memory_record_is_expired,
+    memory_record_matches_project_scope,
+)
 from .llm.base import LLMProvider, ProviderError
 from .llm.parser import ControlMessageError, validate_llm_response
 from .models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
@@ -177,6 +182,7 @@ class NestedMV2Agent:
         child_frame_ids = [user_frame_id]
         memory_writes: list[str] = []
         executions: list[ToolExecution] = []
+        provider_attempts: list[dict[str, Any]] = []
         tool_frame_index = 0
         error: dict[str, Any] | None = None
         lesson_manager = LessonManager(self.memory) if self.config.enable_agentic_cycle else None
@@ -256,6 +262,7 @@ class NestedMV2Agent:
             session_id=session,
             expected_turn_origin=resolved_turn_origin,
             expected_transcript_scope=resolved_transcript_scope,
+            project_id=self.config.project_id,
             excluded_frame_ids=frozenset(child_frame_ids),
         )
         policy_hits = _trusted_policy_candidates(
@@ -287,6 +294,7 @@ class NestedMV2Agent:
             ),
             include_objective=False,
             include_telemetry=False,
+            project_id=self.config.project_id,
         )
         if self.behavior_compiler is not None:
             if self.config.enable_auto_activate_low_risk_deltas:
@@ -469,6 +477,14 @@ class NestedMV2Agent:
                     response = self._generate_response(messages, round_tool_specs, stream_handler)
                 except ProviderError as exc:
                     error = _provider_error_payload(exc)
+                    provider_attempts.append(
+                        _provider_attempt_error_receipt(
+                            provider=self.config.provider,
+                            model=self.config.model,
+                            round_index=round_index,
+                            error=error,
+                        )
+                    )
                     self._event(
                         "llm.error", {"session_id": session, "run_id": active_run_id, **error}
                     )
@@ -517,6 +533,15 @@ class NestedMV2Agent:
                 if _tool_call_requires_sensitive_data_rejection(call)
             )
             response = _sanitize_llm_response(response)
+            if direct_tool_call is None or round_index > 0:
+                provider_attempts.append(
+                    _provider_attempt_receipt(
+                        response,
+                        provider=self.config.provider,
+                        model=self.config.model,
+                        round_index=round_index,
+                    )
+                )
             self._event(
                 "llm.response",
                 {
@@ -558,6 +583,10 @@ class NestedMV2Agent:
                 event_log=self.event_log,
                 session_id=session,
                 run_id=active_run_id,
+                project_id=self.config.project_id,
+                project_revision=self.config.project_revision,
+                project_baseline_index_digest=self.config.project_baseline_index_digest,
+                allowed_paths=self.config.project_allowed_paths,
                 execution_origin=resolved_execution_origin,
                 approval_handler=approval_handler,
                 approved_tool_call_ids=approved_tool_call_ids,
@@ -1070,6 +1099,8 @@ class NestedMV2Agent:
             run_id=active_run_id,
             error=safe_error if isinstance(safe_error, dict) else None,
             proof_of_work=proof_payload,
+            provider_usage=_aggregate_provider_usage(provider_attempts),
+            provider_attempts=tuple(provider_attempts),
         )
 
     def _generate_response(
@@ -1255,6 +1286,12 @@ class NestedMV2Agent:
             dict(safe_extra_metadata) if isinstance(safe_extra_metadata, dict) else {}
         )
         metadata["session_id"] = session_id
+        if (
+            self.config.project_id is not None
+            and layer not in {MemoryLayer.SELF, MemoryLayer.POLICY}
+        ):
+            metadata["project_id"] = self.config.project_id
+            metadata["project_revision"] = self.config.project_revision
         if turn_origin is not None:
             metadata["turn_origin"] = turn_origin
         if transcript_scope is not None:
@@ -1296,7 +1333,15 @@ class NestedMV2Agent:
             source_uri=redact_text(resolved_source_uri) if resolved_source_uri else None,
             source_span=redact_secrets(resolved_source_span),
             metadata=redact_secrets(metadata),
-            tags={"session_id": session_id},
+            tags={
+                "session_id": session_id,
+                **(
+                    {"project_id": self.config.project_id}
+                    if self.config.project_id is not None
+                    and layer not in {MemoryLayer.SELF, MemoryLayer.POLICY}
+                    else {}
+                ),
+            },
         )
         record_id = self.memory.put_frame(frame)
         self._event(
@@ -1394,6 +1439,7 @@ def _recent_session_transcript(
     session_id: str,
     expected_turn_origin: str,
     expected_transcript_scope: str,
+    project_id: str | None,
     excluded_frame_ids: frozenset[str] = frozenset(),
     max_turns: int = _RECENT_TRANSCRIPT_MAX_TURNS,
     max_chars: int = _RECENT_TRANSCRIPT_MAX_CHARS,
@@ -1423,7 +1469,13 @@ def _recent_session_transcript(
         key=lambda record: (record.created_at, record.id),
     )
     for record in records:
-        if memory_record_is_expired(record, now=now):
+        if memory_record_is_expired(
+            record,
+            now=now,
+        ) or not memory_record_matches_project_scope(
+            record,
+            project_id=project_id,
+        ):
             continue
         metadata = record.metadata
         if metadata.get("memory_imported") is True:
@@ -1879,6 +1931,10 @@ def _tool_context_with_preflight(
         event_log=tool_context.event_log,
         session_id=tool_context.session_id,
         run_id=tool_context.run_id,
+        project_id=tool_context.project_id,
+        project_revision=tool_context.project_revision,
+        project_baseline_index_digest=tool_context.project_baseline_index_digest,
+        allowed_paths=tool_context.allowed_paths,
         execution_origin=tool_context.execution_origin,
         approval_handler=tool_context.approval_handler,
         approved_tool_call_ids=tool_context.approved_tool_call_ids,
@@ -2195,6 +2251,143 @@ def _sanitize_llm_response(response: LLMResponse) -> LLMResponse:
         usage=redact_secrets(response.usage),
         finish_reason=response.finish_reason,
     )
+
+
+def _provider_attempt_receipt(
+    response: LLMResponse,
+    *,
+    provider: str,
+    model: str,
+    round_index: int,
+) -> dict[str, Any]:
+    usage = response.usage if isinstance(response.usage, dict) else {}
+    input_tokens = _usage_token_count(
+        usage,
+        "input_tokens",
+        "prompt_tokens",
+        "prompt_token_count",
+    )
+    output_tokens = _usage_token_count(
+        usage,
+        "output_tokens",
+        "completion_tokens",
+        "candidates_token_count",
+    )
+    total_tokens = _usage_token_count(usage, "total_tokens", "total_token_count")
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    raw = response.raw if isinstance(response.raw, dict) else {}
+    fallback = raw.get("provider_fallback")
+    safe_fallback = redact_secrets(fallback) if isinstance(fallback, dict) else None
+    receipt = {
+        "round_index": round_index,
+        "provider": redact_text(provider)[:128],
+        "model": redact_text(model)[:512],
+        "status": "completed",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "usage_reported": input_tokens is not None and output_tokens is not None,
+        "finish_reason": redact_text(response.finish_reason)[:128]
+        if response.finish_reason
+        else None,
+        "fallback": safe_fallback if isinstance(safe_fallback, dict) else None,
+    }
+    safe = redact_secrets(receipt)
+    return safe if isinstance(safe, dict) else {}
+
+
+def _provider_attempt_error_receipt(
+    *,
+    provider: str,
+    model: str,
+    round_index: int,
+    error: dict[str, Any],
+) -> dict[str, Any]:
+    receipt = {
+        "round_index": round_index,
+        "provider": redact_text(provider)[:128],
+        "model": redact_text(model)[:512],
+        "status": "provider_error",
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+        "usage_reported": False,
+        "provider_failure_code": redact_text(str(error.get("code", "provider_error")))[:128],
+        "retryable": bool(error.get("retryable")),
+        "fallback": None,
+    }
+    safe = redact_secrets(receipt)
+    return safe if isinstance(safe, dict) else {}
+
+
+def _aggregate_provider_usage(
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not attempts:
+        return None
+    completed = [item for item in attempts if item.get("status") == "completed"]
+    reported = [item for item in completed if item.get("usage_reported") is True]
+    input_tokens = (
+        sum(int(item["input_tokens"]) for item in reported)
+        if reported
+        else None
+    )
+    output_tokens = (
+        sum(int(item["output_tokens"]) for item in reported)
+        if reported
+        else None
+    )
+    total_tokens = (
+        sum(
+            int(item["total_tokens"])
+            if _non_negative_token_count(item.get("total_tokens")) is not None
+            else int(item["input_tokens"]) + int(item["output_tokens"])
+            for item in reported
+        )
+        if reported
+        else None
+    )
+    failure_codes = sorted(
+        {
+            str(item["provider_failure_code"])
+            for item in attempts
+            if item.get("provider_failure_code")
+        }
+    )
+    payload = {
+        "call_count": len(attempts),
+        "completed_call_count": len(completed),
+        "reported_call_count": len(reported),
+        "attribution_coverage": (
+            round(len(reported) / len(completed), 8) if completed else 0.0
+        ),
+        "complete": bool(completed) and len(reported) == len(completed),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "fallback_count": sum(1 for item in attempts if item.get("fallback")),
+        "provider_error_count": len(attempts) - len(completed),
+        "provider_failure_codes": failure_codes,
+        "providers": sorted({str(item.get("provider", "")) for item in attempts}),
+        "models": sorted({str(item.get("model", "")) for item in attempts}),
+    }
+    safe = redact_secrets(payload)
+    return safe if isinstance(safe, dict) else None
+
+
+def _usage_token_count(usage: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        value = _non_negative_token_count(usage.get(name))
+        if value is not None:
+            return value
+    return None
+
+
+def _non_negative_token_count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _emit_sanitized_stream(

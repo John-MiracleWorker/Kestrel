@@ -24,12 +24,15 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     assert project["version"] == "0.4.11"
     assert "pip>=26.1.2" in project["dependencies"]
     assert "setuptools>=83.0.0" in project["dependencies"]
+    assert "tzdata>=2026.3" in project["dependencies"]
     assert locked_versions["pip"] == "26.1.2"
     assert locked_versions["setuptools"] == "83.0.0"
+    assert locked_versions["tzdata"] == "2026.3"
     assert locked_versions["build"] == "1.5.0"
     assert locked_versions["keyring"] == "25.7.0"
     keyring_deps = project["optional-dependencies"]["keyring"]
     assert any(str(dep).startswith("keyring>=25.6.0") for dep in keyring_deps)
+    assert "mcp>=1.0,<2" in project["optional-dependencies"]["mcp"]
     assert project["description"].startswith("Kestrel:")
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
@@ -399,6 +402,38 @@ def test_one_shot_docs_match_safe_opt_in_server_defaults() -> None:
         assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash install.sh" in document
 
 
+def test_readme_leads_with_the_everyday_kestrel_launch_contract() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    expected_release_command = (
+        "curl -fsSL "
+        "https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.4.11/install.sh \\\n"
+        "  | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash"
+    )
+
+    install_index = readme.index("## Install and Open Kestrel")
+    why_index = readme.index("## Why Kestrel Exists")
+    source_index = readme.index("## Quick Start From Source")
+    connect_index = readme.index("## Connect a Real Model")
+    advanced_index = readme.index("## Advanced `nest-agent` Operation")
+    source_quick_start = readme[source_index:connect_index]
+
+    assert expected_release_command in readme
+    assert install_index < why_index
+    assert "kestrel open" in readme[install_index:why_index]
+    assert "from any directory" in readme[install_index:why_index]
+    assert "Demo uses deterministic responses; no live model connected." in readme
+    assert "Ready" in readme[install_index:why_index]
+    assert "`kestrel` is the everyday command" in readme
+    assert "`nested-memvid` remains the compatibility CLI" in readme
+    assert "`nested-memvid-agent` remains the Python distribution" in readme
+    assert "existing safe writable directory already on `PATH`" in readme
+    assert "`~/.local/bin`" in readme
+    assert "prints the exact `export PATH=...` step" in readme
+    assert "kestrel open" in source_quick_start
+    assert "nest-agent server" not in source_quick_start
+    assert advanced_index > connect_index
+
+
 def test_readme_behavior_delta_validation_fails_on_regression() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -481,7 +516,7 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "Validate staged release installer plan" in workflow
     assert "bash < dist/install.sh" in workflow
     assert "verify SHA256SUMS" in workflow
-    assert 'sha256sum install.sh requirements-release.txt "${wheels[@]}"' in workflow
+    assert 'sha256sum install.sh install.ps1 requirements-release.txt "${wheels[@]}"' in workflow
     assert '"repos/$GITHUB_REPOSITORY/immutable-releases"' in workflow
     assert 'test "$enabled" = "true"' in workflow
     assert 'gh release create "$GITHUB_REF_NAME"' in workflow

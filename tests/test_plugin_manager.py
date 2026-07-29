@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import shutil
@@ -20,6 +21,7 @@ from nested_memvid_agent.plugin_manager import (
     parse_github_plugin_source,
 )
 from nested_memvid_agent.run_manager import RunManager
+from nested_memvid_agent.security_boundary import register_secret_value
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
 
@@ -62,6 +64,10 @@ def test_plugin_manager_installs_disabled_and_enable_materializes_extensions(tmp
     assert installed["enabled"] is False
     assert installed["source_url"] == "https://github.com/owner/repo"
     assert installed["commit_sha"] == "a" * 40
+    receipt = installed["risk_report"]["install_receipt"]
+    assert receipt["provenance"]["status"] == "source_pinned"
+    assert receipt["reproducible"] is True
+    assert installed["risk_report"]["authority_delta"]["initial_install"] is True
     assert state.get_skill("plugin.demo.hello")["enabled"] is False
     assert state.get_mcp_server("plugin.demo.static")["enabled"] is False
 
@@ -105,6 +111,12 @@ def test_plugin_review_reports_dependency_and_isolation_blockers(tmp_path: Path)
     assert review["commit_sha"] == "a" * 40
     assert review["dependency_review"]["requires_install"] is True
     assert review["dependency_review"]["declared"]["python"] == ["requests>=2"]
+    assert review["dependency_review"]["lock_complete"] is False
+    assert review["dependency_review"]["missing_from_lock"] == {
+        "node": ["left-pad"],
+        "python": ["requests"],
+        "system": ["git"],
+    }
     assert review["isolation_review"] == {"mode": "container", "required": True, "available": False}
     assert review["enable_blockers"] == [
         "plugin_dependencies_unmanaged",
@@ -121,6 +133,135 @@ def test_plugin_review_reports_dependency_and_isolation_blockers(tmp_path: Path)
         manager.install("owner/repo", overwrite=True, enable=True)
     with pytest.raises(PluginError, match="enable blocked"):
         manager.set_enabled("blocked", True)
+
+
+def test_plugin_review_verifies_ed25519_manifest_signature(tmp_path: Path) -> None:
+    serialization = pytest.importorskip("cryptography.hazmat.primitives.serialization")
+    ed25519 = pytest.importorskip(
+        "cryptography.hazmat.primitives.asymmetric.ed25519"
+    )
+    repo = _kestrel_plugin_repo(tmp_path / "repo")
+    manifest_path = repo / "kestrel.plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    message = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    manifest["signature"] = {
+        "schema": "kestrel.plugin.signature.v1",
+        "algorithm": "ed25519",
+        "key_id": "test-publisher",
+        "public_key": base64.b64encode(public_key).decode("ascii"),
+        "signature": base64.b64encode(private_key.sign(message)).decode("ascii"),
+    }
+    _write_manifest(repo, manifest)
+    manager = PluginManager(
+        tmp_path / "plugins",
+        AgentStateStore(tmp_path / "state.db"),
+        fetcher=FakeFetcher(repo),
+    )
+
+    review = manager.review("owner/repo")
+
+    provenance = review["risk_report"]["provenance_review"]
+    assert provenance["verified"] is True
+    assert provenance["status"] == "verified"
+    assert provenance["algorithm"] == "ed25519"
+    assert provenance["key_id"] == "test-publisher"
+
+
+def test_plugin_review_records_complete_dependency_lock(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_manifest(
+        repo,
+        {
+            "id": "locked",
+            "name": "Locked Plugin",
+            "description": "Dependency metadata is reviewable and pinned.",
+            "dependencies": {"python": ["requests>=2"]},
+            "dependency_lock": {
+                "python": [
+                    {
+                        "name": "requests",
+                        "version": "2.33.0",
+                        "sha256": "a" * 64,
+                    }
+                ]
+            },
+        },
+    )
+    manager = PluginManager(
+        tmp_path / "plugins",
+        AgentStateStore(tmp_path / "state.db"),
+        fetcher=FakeFetcher(repo),
+    )
+
+    review = manager.review("owner/repo")
+
+    dependency_review = review["dependency_review"]
+    assert dependency_review["lock_complete"] is True
+    assert dependency_review["missing_from_lock"] == {}
+    assert len(dependency_review["lock_digest"]) == 64
+    receipt = review["risk_report"]["install_receipt"]
+    assert receipt["source_reproducible"] is True
+    assert receipt["runtime_reproducible"] is False
+    assert receipt["reproducible"] is False
+
+
+def test_plugin_manifest_rejects_registered_secret_material(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    secret = "plugin-manifest-sensitive-value-68314"  # gitleaks:allow
+    register_secret_value(secret)
+    _write_manifest(
+        repo,
+        {
+            "id": "sensitive",
+            "name": "Sensitive Plugin",
+            "description": "Must fail before persistence.",
+            "metadata": {"note": f"provider echoed {secret}"},
+        },
+    )
+
+    with pytest.raises(PluginError, match="not raw secret material"):
+        load_plugin_manifest(repo)
+
+
+def test_enabled_plugin_update_cannot_silently_expand_authority(tmp_path: Path) -> None:
+    repo = _kestrel_plugin_repo(tmp_path / "repo")
+    state = AgentStateStore(tmp_path / "state.db")
+    fetcher = FakeFetcher(repo)
+    manager = PluginManager(tmp_path / "plugins", state, fetcher=fetcher)
+    manager.install("owner/repo", enable=True)
+
+    updated_repo = _kestrel_plugin_repo(tmp_path / "updated-repo")
+    updated_manifest_path = updated_repo / "kestrel.plugin.json"
+    updated_manifest = json.loads(updated_manifest_path.read_text(encoding="utf-8"))
+    updated_manifest["permissions"].append("network")
+    _write_manifest(updated_repo, updated_manifest)
+    fetcher.source = updated_repo
+    fetcher.commit = "b" * 40
+
+    review = manager.review_update("demo")
+
+    assert "permission:network" in review["authority_delta"]["added"]
+    with pytest.raises(PluginError, match="expands authority"):
+        manager.update("demo")
+    assert state.get_plugin("demo")["commit_sha"] == "a" * 40
+
+    manager.set_enabled("demo", False)
+    updated = manager.update("demo")
+
+    assert updated["enabled"] is False
+    assert updated["commit_sha"] == "b" * 40
+    assert "permission:network" in updated["risk_report"]["authority_delta"]["added"]
 
 
 def test_plugin_manifest_rejects_malformed_dependency_and_isolation_metadata(tmp_path: Path) -> None:

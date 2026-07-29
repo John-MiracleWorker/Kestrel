@@ -227,8 +227,8 @@ def test_create_app_registers_default_off_routing_control_plane(
         response = client.get("/api/routing/status")
 
     assert response.status_code == 200
-    assert response.json()["runtime"] == {
-        "enabled": False,
-        "mode": "off",
-        "policy_id": "balanced",
-    }
+    runtime = response.json()["runtime"]
+    assert runtime["enabled"] is False
+    assert runtime["mode"] == "off"
+    assert runtime["policy_id"] == "balanced"
+    assert runtime["learned"]["activation_replay_verified"] is False

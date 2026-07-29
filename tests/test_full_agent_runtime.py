@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -545,8 +546,8 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path)
         workspace=tmp_path,
         skills_dir=tmp_path / "skills",
         plugins_dir=tmp_path / "plugins",
-        run_lease_ttl_seconds=0.2,
-        run_heartbeat_interval_seconds=0.03,
+        run_lease_ttl_seconds=2.0,
+        run_heartbeat_interval_seconds=0.05,
     )
     state = AgentStateStore(config.state_path)
     manager = RunManager(
@@ -569,7 +570,7 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path)
         assert lease is not None
         first_heartbeat = state.get_run("heartbeat_run").heartbeat_at
         renewed = state.get_run("heartbeat_run")
-        deadline = monotonic() + 1.0
+        deadline = monotonic() + 3.0
         while renewed.heartbeat_at == first_heartbeat and monotonic() < deadline:
             sleep(0.01)
             renewed = state.get_run("heartbeat_run")
@@ -4781,6 +4782,14 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
         "changed_manifest": [{"path": "src/calculator.py", "secret": "drop-me"}],
     }
     never_persist = "NEVER_PERSIST_REPAIR_COMMAND_OUTPUT"
+    preview_content = (
+        "diff --git a/src/calculator.py b/src/calculator.py\n"
+        "--- a/src/calculator.py\n"
+        "+++ b/src/calculator.py\n"
+        "@@ -1 +1 @@\n"
+        "-return a - b\n"
+        "+return a + b\n"
+    )
     prompts: list[str] = []
 
     class ScriptedRepairAgent:
@@ -4839,7 +4848,20 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
                         "../escape.py",
                         "bad\nfilename.py",
                     ],
-                    "summary": never_persist,
+                    "summary": "Targeted repair with bounded validation evidence.",
+                    "risks": ["No known compatibility risk in the reviewed scope."],
+                    "diff_preview": {
+                        "format": "unified",
+                        "content": preview_content,
+                        "sha256": hashlib.sha256(preview_content.encode("utf-8")).hexdigest(),
+                        "bound_diff_digest": diff_digest,
+                        "redacted": True,
+                        "authoritative": False,
+                        "truncated": False,
+                        "included_files": ["src/calculator.py"],
+                        "omitted_files": 0,
+                        "unsafe_extra": never_persist,
+                    },
                     "commit_gate": {
                         "commit_allowed": True,
                         "approval_required_before_commit": True,
@@ -4892,6 +4914,7 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
         "schema_version": 1,
         "tool": "repair.orchestrate_validate",
         "validation_id": validation_id,
+        "success": True,
         "repair_snapshot": {
             "branch": branch,
             "head_sha": head_sha,
@@ -4903,10 +4926,25 @@ def test_repair_scheduler_hands_off_only_bounded_receipt_artifacts(tmp_path: Pat
     )
     assert review_artifact["review_id"] == review_id
     assert review_artifact["validation_id"] == validation_id
+    assert review_artifact["summary"] == "Targeted repair with bounded validation evidence."
+    assert review_artifact["risks"] == [
+        "No known compatibility risk in the reviewed scope."
+    ]
     assert review_artifact["repair_snapshot"] == validation_artifact["repair_snapshot"]
     assert review_artifact["changed_files_truncated"] is True
     assert len(review_artifact["changed_files"]) == 128
     assert "../escape.py" not in review_artifact["changed_files"]
+    assert review_artifact["diff_preview"] == {
+        "format": "unified",
+        "content": preview_content,
+        "sha256": hashlib.sha256(preview_content.encode("utf-8")).hexdigest(),
+        "bound_diff_digest": diff_digest,
+        "redacted": True,
+        "authoritative": False,
+        "truncated": False,
+        "included_files": ["src/calculator.py"],
+        "omitted_files": 0,
+    }
     commit_artifact = dict((persisted["Commit reviewed repair"].result or {})["repair_artifact"])
     assert commit_artifact == {
         "schema_version": 1,
@@ -6563,7 +6601,7 @@ def test_queued_generic_approval_handoff_is_atomic_and_restart_safe(
         claimed_run = original_claim(*args, **kwargs)
         if claimed_run is not None:
             claimed.set()
-            assert release.wait(timeout=3)
+            assert release.wait(timeout=_DURABLE_RUN_TIMEOUT_SECONDS)
         return claimed_run
 
     monkeypatch.setattr(

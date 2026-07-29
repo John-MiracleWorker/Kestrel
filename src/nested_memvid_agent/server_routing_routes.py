@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .provider_probe import (
+    MAX_DISCOVERY_MODELS,
+    MAX_PROBE_TIMEOUT_SECONDS,
+    CapabilityEvidence,
+    DiscoveredModelProbe,
+    ProviderDiscoveryResult,
+    ProviderProbeService,
+    routing_constraint_presets,
+)
 from .routing.ledger import RoutingLedger
-from .routing.ledger_records import RoutingRevisionConflict
+from .routing.ledger_records import ModelTargetEntry, RoutingRevisionConflict
 from .routing.models import ModelTarget, ProviderProfile, RoutePolicy, RoutingMode
 from .routing.router import RoutingUnavailableError
 from .routing.runtime import AdaptiveFlockRuntimeConfig
@@ -56,6 +68,8 @@ class ModelTargetRequest(BaseModel):
     latency_tier: int = Field(default=3, ge=1, le=5)
     operator_priority: int = Field(default=0, ge=-10, le=10)
     estimated_cost_usd: float | None = Field(default=None, ge=0)
+    input_cost_per_million_usd: float | None = Field(default=None, ge=0)
+    output_cost_per_million_usd: float | None = Field(default=None, ge=0)
     health: RoutingHealth = "unknown"
     recent_failure_rate: float = Field(default=0.0, ge=0, le=1)
     predicted_success: float | None = Field(default=None, ge=0, le=1)
@@ -89,7 +103,7 @@ class RoutePolicyRequest(BaseModel):
 class RoutingPreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str = Field(min_length=1, max_length=240)
+    run_id: str | None = Field(default=None, min_length=1, max_length=240)
     task_id: str = Field(min_length=1, max_length=240)
     policy_id: str | None = Field(default=None, min_length=1, max_length=240)
     direct_target_id: str | None = Field(default=None, min_length=1, max_length=240)
@@ -99,13 +113,31 @@ class RoutingPreviewRequest(BaseModel):
     planner_guidance: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProviderDiscoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_profile_id: str = Field(min_length=1, max_length=240)
+    expected_profile_revision: int = Field(ge=1)
+    max_models: int = Field(default=4, ge=1, le=MAX_DISCOVERY_MODELS)
+    timeout_seconds: float = Field(
+        default=2.0,
+        ge=0.25,
+        le=MAX_PROBE_TIMEOUT_SECONDS,
+        allow_inf_nan=False,
+    )
+    probe_capabilities: bool = True
+
+
 def register_routing_routes(
     app: Any,
     *,
     ledger: RoutingLedger,
     runtime: AdaptiveFlockRuntimeConfig,
     http_exception: Callable[..., Exception],
+    provider_probe_service: ProviderProbeService | None = None,
 ) -> None:
+    discovery_service = provider_probe_service or ProviderProbeService()
+
     @app.get("/api/routing/status")  # type: ignore[untyped-decorator]
     def routing_status() -> dict[str, object]:
         profiles = ledger.list_provider_profiles()
@@ -122,6 +154,7 @@ def register_routing_routes(
                 "enabled_model_targets": sum(1 for item in targets if item.target.enabled),
                 "policies": len(policies),
                 "enabled_policies": sum(1 for item in policies if item.enabled),
+                "calibrations": len(ledger.list_calibrations()),
             },
         }
 
@@ -174,6 +207,23 @@ def register_routing_routes(
     @app.post("/api/routing/targets")  # type: ignore[untyped-decorator]
     def put_model_target(request: ModelTargetRequest) -> dict[str, Any]:
         try:
+            current = ledger.get_model_target(request.target_id)
+            base_metadata = request.metadata
+            if (
+                current is not None
+                and request.expected_revision is not None
+                and "metadata" not in request.model_fields_set
+            ):
+                base_metadata = current.target.metadata
+            if current is not None and _is_discovery_managed(current):
+                base_metadata = {
+                    **base_metadata,
+                    "discovery": current.target.metadata["discovery"],
+                }
+            metadata = _operator_capability_metadata(
+                request,
+                base_metadata=base_metadata,
+            )
             entry = ledger.put_model_target(
                 ModelTarget(
                     target_id=request.target_id,
@@ -196,10 +246,12 @@ def register_routing_routes(
                     latency_tier=request.latency_tier,
                     operator_priority=request.operator_priority,
                     estimated_cost_usd=request.estimated_cost_usd,
+                    input_cost_per_million_usd=request.input_cost_per_million_usd,
+                    output_cost_per_million_usd=request.output_cost_per_million_usd,
                     health=request.health,
                     recent_failure_rate=request.recent_failure_rate,
                     predicted_success=request.predicted_success,
-                    metadata=request.metadata,
+                    metadata=metadata,
                 ),
                 expected_revision=request.expected_revision,
             )
@@ -208,6 +260,104 @@ def register_routing_routes(
             raise http_exception(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/routing/discovery/presets")  # type: ignore[untyped-decorator]
+    def discovery_presets() -> dict[str, object]:
+        return {
+            "schema": "kestrel.routing.constraint_presets.v1",
+            "effect": "filter_or_rank_only",
+            "presets": [
+                preset.to_public_payload() for preset in routing_constraint_presets()
+            ],
+        }
+
+    @app.post("/api/routing/discovery")  # type: ignore[untyped-decorator]
+    def discover_provider_targets(
+        request: ProviderDiscoveryRequest,
+    ) -> dict[str, object]:
+        profile_entry = ledger.get_provider_profile(request.provider_profile_id)
+        if profile_entry is None:
+            raise http_exception(
+                status_code=404,
+                detail=f"unknown provider profile: {request.provider_profile_id}",
+            )
+        if profile_entry.revision != request.expected_profile_revision:
+            raise http_exception(
+                status_code=409,
+                detail=(
+                    "provider_profile_revision_conflict:"
+                    f"{request.provider_profile_id}:{profile_entry.revision}"
+                ),
+            )
+        try:
+            discovery = discovery_service.discover(
+                profile_entry.profile,
+                max_models=request.max_models,
+                timeout_seconds=request.timeout_seconds,
+                probe_capabilities=request.probe_capabilities,
+            )
+        except ValueError as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+        if not discovery.catalog_ok:
+            raise http_exception(
+                status_code=409,
+                detail={
+                    "code": "provider_catalog_unavailable",
+                    "message": discovery.catalog_error,
+                    "catalog": discovery.to_public_payload(),
+                },
+            )
+
+        # Revalidate after the bounded network phase before making safe,
+        # disabled-draft changes. This avoids applying results to an edited
+        # profile in the common concurrent-update case.
+        current_profile = ledger.get_provider_profile(request.provider_profile_id)
+        if (
+            current_profile is None
+            or current_profile.revision != request.expected_profile_revision
+        ):
+            current_revision = 0 if current_profile is None else current_profile.revision
+            raise http_exception(
+                status_code=409,
+                detail=(
+                    "provider_profile_revision_conflict:"
+                    f"{request.provider_profile_id}:{current_revision}"
+                ),
+            )
+        try:
+            (
+                target_updates,
+                visible_target_count,
+                stale_target_ids,
+                created_count,
+            ) = _plan_discovered_targets(
+                ledger,
+                profile=current_profile.profile,
+                discovery=discovery,
+            )
+            updated_profile, applied_targets = ledger.apply_provider_inventory(
+                replace(
+                    current_profile.profile,
+                    metadata=_provider_discovery_metadata(
+                        current_profile.profile,
+                        discovery,
+                    ),
+                ),
+                expected_profile_revision=current_profile.revision,
+                target_updates=target_updates,
+            )
+            targets = applied_targets[:visible_target_count]
+        except RoutingRevisionConflict as exc:
+            raise http_exception(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
+        return {
+            **discovery.to_public_payload(),
+            "provider_profile_revision": updated_profile.revision,
+            "created_draft_count": created_count,
+            "stale_target_ids": stale_target_ids,
+            "targets": [item.to_public_payload() for item in targets],
+        }
 
     @app.get("/api/routing/policies")  # type: ignore[untyped-decorator]
     def list_route_policies(enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -253,7 +403,7 @@ def register_routing_routes(
     def preview_route(request: RoutingPreviewRequest) -> dict[str, object]:
         try:
             task = ledger.state.get_task_node(request.task_id)
-            if task.run_id != request.run_id:
+            if request.run_id is not None and task.run_id != request.run_id:
                 raise ValueError("preview task does not belong to run")
             policy_id = request.policy_id or runtime.policy_id
             policy_entry = ledger.get_policy(policy_id)
@@ -281,7 +431,7 @@ def register_routing_routes(
             )
             return {
                 "schema": "kestrel.adaptive_flock.preview.v1",
-                "run_id": request.run_id,
+                "run_id": task.run_id,
                 "task_id": request.task_id,
                 "task": {
                     "task_id": task.task_id,
@@ -320,4 +470,292 @@ def register_routing_routes(
                 item.to_payload()
                 for item in ledger.list_outcomes(run_id=run_id, task_id=task_id)
             ],
+            "shadows": [
+                item.to_payload()
+                for item in ledger.list_shadows(run_id=run_id, task_id=task_id)
+            ],
+            "calibrations": [
+                item.to_payload()
+                for item in ledger.list_calibrations(
+                    project_id=ledger.state.get_run(run_id).project_id
+                )
+            ],
         }
+
+
+def _plan_discovered_targets(
+    ledger: RoutingLedger,
+    *,
+    profile: ProviderProfile,
+    discovery: ProviderDiscoveryResult,
+) -> tuple[tuple[tuple[ModelTarget, int], ...], int, list[str], int]:
+    entries = [
+        entry
+        for entry in ledger.list_model_targets()
+        if entry.target.provider_profile_id == profile.profile_id
+    ]
+    managed_by_model = {
+        entry.target.model: entry
+        for entry in entries
+        if _is_discovery_managed(entry)
+    }
+    updates: list[tuple[ModelTarget, int]] = []
+    created_count = 0
+    for model_probe in discovery.models:
+        existing = managed_by_model.get(model_probe.model)
+        metadata = _target_discovery_metadata(discovery, model_probe, stale=False)
+        if existing is None:
+            target = _new_discovered_target(profile, model_probe, metadata=metadata)
+            updates.append((target, 0))
+            created_count += 1
+            continue
+        target = existing.target
+        operator_confirmed = target.enabled or target.trust_class != "unconfirmed"
+        updated = replace(
+            target,
+            metadata={**target.metadata, "discovery": metadata},
+        )
+        if not operator_confirmed:
+            supported = _supported_capabilities(model_probe)
+            updated = replace(
+                updated,
+                enabled=False,
+                capability_tags=tuple(sorted(supported)),
+                supports_tools="tools" in supported,
+                supports_json="structured_output" in supported,
+                supports_vision="vision" in supported,
+                supports_streaming="streaming" in supported,
+                health="healthy" if _generation_observed(model_probe) else "unknown",
+            )
+        else:
+            updated = _apply_observed_probe_authority(updated, model_probe)
+        updates.append((updated, existing.revision))
+
+    available_models = set(discovery.catalog_models)
+    stale_target_ids: list[str] = []
+    if discovery.catalog_complete:
+        for entry in entries:
+            if (
+                not _is_discovery_managed(entry)
+                or entry.target.model in available_models
+            ):
+                continue
+            previous = entry.target.metadata.get("discovery")
+            previous_metadata = previous if isinstance(previous, dict) else {}
+            stale_metadata = {
+                **previous_metadata,
+                "schema": "kestrel.routing.target_discovery_evidence.v1",
+                "managed": True,
+                "stale": True,
+                "stale_at": discovery.probed_at,
+                "catalog_digest": discovery.catalog_digest,
+                "catalog_fetched_at": discovery.catalog_fetched_at,
+            }
+            updated = replace(
+                entry.target,
+                enabled=False,
+                health="unavailable",
+                metadata={**entry.target.metadata, "discovery": stale_metadata},
+            )
+            updates.append((updated, entry.revision))
+            stale_target_ids.append(entry.target.target_id)
+
+    return (
+        tuple(updates),
+        len(discovery.models),
+        sorted(stale_target_ids),
+        created_count,
+    )
+
+
+def _operator_capability_metadata(
+    request: ModelTargetRequest,
+    *,
+    base_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = dict(request.metadata if base_metadata is None else base_metadata)
+    evidence_payload = metadata.get("capability_evidence")
+    evidence = dict(evidence_payload) if isinstance(evidence_payload, dict) else {}
+    fields = (
+        ("supports_streaming", "streaming"),
+        ("supports_json", "structured_output"),
+        ("supports_tools", "tools"),
+        ("supports_vision", "vision"),
+    )
+    for field_name, capability in fields:
+        if field_name not in request.model_fields_set:
+            continue
+        item = CapabilityEvidence.operator_supplied(
+            capability,
+            supported=bool(getattr(request, field_name)),
+        )
+        evidence[capability] = item.to_public_payload()
+    if evidence:
+        metadata["capability_evidence"] = evidence
+    return metadata
+
+
+def _provider_discovery_metadata(
+    profile: ProviderProfile,
+    discovery: ProviderDiscoveryResult,
+) -> dict[str, Any]:
+    return {
+        **profile.metadata,
+        "discovery": {
+            "schema": "kestrel.routing.provider_catalog_evidence.v1",
+            "status": "complete",
+            "catalog_digest": discovery.catalog_digest,
+            "catalog_source": discovery.catalog_source,
+            "catalog_fetched_at": discovery.catalog_fetched_at,
+            "catalog_complete": discovery.catalog_complete,
+            "catalog_truncated": discovery.catalog_truncated,
+            "reported_model_count": discovery.reported_model_count,
+            "refreshed_at": discovery.probed_at,
+            "catalog_model_count": len(discovery.catalog_models),
+            "probed_model_count": len(discovery.models),
+        },
+    }
+
+
+def _new_discovered_target(
+    profile: ProviderProfile,
+    model_probe: DiscoveredModelProbe,
+    *,
+    metadata: dict[str, object],
+) -> ModelTarget:
+    supported = _supported_capabilities(model_probe)
+    return ModelTarget(
+        target_id=_draft_target_id(profile.profile_id, model_probe.model),
+        provider_profile_id=profile.profile_id,
+        provider=profile.adapter,
+        model=model_probe.model,
+        enabled=False,
+        locality=profile.locality,
+        trust_class="unconfirmed",
+        capability_tags=tuple(sorted(supported)),
+        role_affinities=(),
+        task_family_affinities=(),
+        supports_tools="tools" in supported,
+        supports_json="structured_output" in supported,
+        supports_vision="vision" in supported,
+        supports_streaming="streaming" in supported,
+        quality_tier=1,
+        latency_tier=3,
+        operator_priority=0,
+        estimated_cost_usd=None,
+        health="healthy" if _generation_observed(model_probe) else "unknown",
+        predicted_success=None,
+        metadata={"discovery": metadata},
+    )
+
+
+def _target_discovery_metadata(
+    discovery: ProviderDiscoveryResult,
+    model_probe: DiscoveredModelProbe,
+    *,
+    stale: bool,
+) -> dict[str, object]:
+    return {
+        "schema": "kestrel.routing.target_discovery_evidence.v1",
+        "managed": True,
+        "stale": stale,
+        "catalog_digest": discovery.catalog_digest,
+        "catalog_fetched_at": discovery.catalog_fetched_at,
+        "catalog_complete": discovery.catalog_complete,
+        "catalog_truncated": discovery.catalog_truncated,
+        "observed_at": discovery.probed_at,
+        "model_identity": model_probe.model_identity,
+        "identity_provenance": model_probe.identity_provenance,
+        "observed_latency_ms": model_probe.latency_ms,
+        "capabilities": {
+            evidence.capability: {
+                "supported": evidence.supported,
+                "provenance": evidence.provenance,
+                "status": evidence.status,
+                "detail": evidence.detail,
+            }
+            for evidence in model_probe.capabilities
+        },
+    }
+
+
+def _supported_capabilities(model_probe: DiscoveredModelProbe) -> set[str]:
+    return {
+        evidence.capability
+        for evidence in model_probe.capabilities
+        if evidence.supported is True and evidence.status == "pass"
+    }
+
+
+def _generation_observed(model_probe: DiscoveredModelProbe) -> bool:
+    return any(
+        evidence.capability == "generation"
+        and evidence.supported is True
+        and evidence.status == "pass"
+        and evidence.provenance == "observed"
+        for evidence in model_probe.capabilities
+    )
+
+
+def _apply_observed_probe_authority(
+    target: ModelTarget,
+    model_probe: DiscoveredModelProbe,
+) -> ModelTarget:
+    observed = {
+        evidence.capability: evidence
+        for evidence in model_probe.capabilities
+        if evidence.provenance == "observed" and evidence.status in {"pass", "fail"}
+    }
+    if not observed:
+        return target
+
+    capability_tags = set(target.capability_tags)
+    for capability, evidence in observed.items():
+        if evidence.status == "pass" and evidence.supported is True:
+            capability_tags.add(capability)
+        else:
+            capability_tags.discard(capability)
+
+    health = target.health
+    generation = observed.get("generation")
+    if generation is not None:
+        health = (
+            "healthy"
+            if generation.status == "pass" and generation.supported is True
+            else "unavailable"
+        )
+
+    def observed_support(capability: str, current: bool) -> bool:
+        evidence = observed.get(capability)
+        if evidence is None:
+            return current
+        return evidence.status == "pass" and evidence.supported is True
+
+    return replace(
+        target,
+        capability_tags=tuple(sorted(capability_tags)),
+        supports_tools=observed_support("tools", target.supports_tools),
+        supports_json=observed_support("structured_output", target.supports_json),
+        supports_vision=observed_support("vision", target.supports_vision),
+        supports_streaming=observed_support("streaming", target.supports_streaming),
+        health=health,
+    )
+
+
+def _is_discovery_managed(entry: ModelTargetEntry) -> bool:
+    discovery = entry.target.metadata.get("discovery")
+    return (
+        isinstance(discovery, dict)
+        and discovery.get("managed") is True
+        and entry.target.target_id
+        == _draft_target_id(
+            entry.target.provider_profile_id,
+            entry.target.model,
+        )
+    )
+
+
+def _draft_target_id(profile_id: str, model: str) -> str:
+    safe_profile = re.sub(r"[^A-Za-z0-9._-]+", "-", profile_id).strip("-")[:80]
+    digest = hashlib.sha256(f"{profile_id}\0{model}".encode()).hexdigest()[:16]
+    return f"draft-{safe_profile or 'provider'}-{digest}"
