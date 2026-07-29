@@ -99,7 +99,7 @@ def test_windows_candidate_identity_uses_open_descriptor_metadata(
         st_dev=7,
         st_ino=11,
         st_size=5,
-        st_mtime_ns=101,
+        st_mtime_ns=404,
         st_ctime_ns=303,
         st_file_attributes=0,
     )
@@ -119,7 +119,12 @@ def test_windows_candidate_identity_uses_open_descriptor_metadata(
     )
 
     assert candidate is not None
-    assert (candidate.device, candidate.inode, candidate.ctime_ns) == (7, 11, 303)
+    assert (
+        candidate.device,
+        candidate.inode,
+        candidate.mtime_ns,
+        candidate.ctime_ns,
+    ) == (7, 11, 404, 303)
     assert closed == [17]
 
 

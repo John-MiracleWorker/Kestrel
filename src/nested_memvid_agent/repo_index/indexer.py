@@ -775,7 +775,6 @@ def _candidate_from_stat(
                 info.st_ctime_ns,
             )
             or opened.st_size != info.st_size
-            or opened.st_mtime_ns != info.st_mtime_ns
         ):
             raise RepositoryChangedDuringIndexingError(
                 f"repository file changed during scan: {relative_path}"

@@ -35,6 +35,7 @@ def _fixture(tmp_path: Path) -> tuple[AgentStateStore, Path, str]:
     repo = tmp_path / "repository"
     repo.mkdir()
     _git(repo, "init", "-q")
+    _git(repo, "config", "core.autocrlf", "false")
     _git(repo, "config", "user.email", "kestrel@example.test")
     _git(repo, "config", "user.name", "Kestrel Test")
     (repo / "README.md").write_text("base\n", encoding="utf-8")

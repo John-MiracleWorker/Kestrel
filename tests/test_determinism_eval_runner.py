@@ -642,7 +642,7 @@ def test_windows_job_is_assigned_before_resume_and_quiesced_after_leader_exit(
         events.append(f"launch:{kwargs['creationflags']}")
         return FakeProcess()
 
-    monkeypatch.setattr(bounded_process.os, "name", "nt")
+    monkeypatch.setattr(bounded_process, "_PLATFORM_NAME", "nt")
     monkeypatch.setattr(bounded_process, "_create_windows_process_job", FakeJob)
     monkeypatch.setattr(bounded_process.subprocess, "Popen", fake_popen)
 
@@ -661,6 +661,80 @@ def test_windows_job_is_assigned_before_resume_and_quiesced_after_leader_exit(
     assert events[1:3] == ["assign:4242", "resume:4242"]
     assert "quiesce:3.0" in events
     assert events[-1] == "close"
+
+
+def test_windows_verified_job_and_parent_cleanup_reports_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeStream:
+        def read(self, _size: int = -1) -> bytes:
+            return b""
+
+    class FakeProcess:
+        pid = 4343
+        returncode: int | None = None
+        stdout = FakeStream()
+        stderr = FakeStream()
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self) -> int:
+            events.append("wait")
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("parent-kill")
+            self.returncode = 1
+
+    class FakeJob:
+        def assign(self, process_id: int) -> bool:
+            events.append(f"assign:{process_id}")
+            return True
+
+        def resume(self, process_id: int) -> bool:
+            events.append(f"resume:{process_id}")
+            return True
+
+        def terminate_and_wait(self, *, timeout_seconds: float) -> bool:
+            events.append(f"quiesce:{timeout_seconds}")
+            return True
+
+        def close(self) -> bool:
+            events.append("close")
+            return True
+
+    waits = iter((False, True))
+    monkeypatch.setattr(bounded_process, "_PLATFORM_NAME", "nt")
+    monkeypatch.setattr(bounded_process, "_create_windows_process_job", FakeJob)
+    monkeypatch.setattr(
+        bounded_process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: FakeProcess(),
+    )
+    monkeypatch.setattr(
+        bounded_process,
+        "_wait_until",
+        lambda *_args, **_kwargs: next(waits),
+    )
+
+    result = run_bounded_process(
+        ["example.exe"],
+        cwd=tmp_path,
+        environment={},
+        timeout_seconds=5,
+    )
+
+    assert result.returncode == 1
+    assert result.timed_out is True
+    assert result.cleanup_attempted is True
+    assert result.cleanup_succeeded is True
+    assert result.termination_method == "windows_job_object_terminated"
+    assert events[-3:] == ["parent-kill", "wait", "close"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object integration assertion")

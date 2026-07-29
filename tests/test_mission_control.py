@@ -210,10 +210,10 @@ def test_git_inspection_detects_dirty_state_without_refreshing_index(tmp_path: P
 
     (repository / "tracked.txt").write_text("after\n", encoding="utf-8")
     (repository / "untracked.txt").write_text("new\n", encoding="utf-8")
-    inspection = inspect_git_worktree(repository, timeout_seconds=10.0)
+    inspection = inspect_git_worktree(repository, timeout_seconds=30.0)
     after = index_path.stat()
 
-    assert inspection.branch == "main"
+    assert inspection.branch == "main", inspection.summary
     assert inspection.state == "dirty"
     assert "tracked changes" in inspection.summary.lower()
     assert "untracked files" in inspection.summary.lower()

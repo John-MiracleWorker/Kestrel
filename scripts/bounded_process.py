@@ -24,6 +24,7 @@ from nested_memvid_agent.windows_process_job import (
 DEFAULT_CAPTURE_LIMIT_BYTES = 256 * 1024
 _STREAM_READ_SIZE = 64 * 1024
 _create_windows_process_job = create_windows_process_job
+_PLATFORM_NAME = os.name
 
 
 @dataclass(frozen=True)
@@ -227,7 +228,7 @@ def run_bounded_process(
     creationflags = 0
     start_new_session = False
     windows_job: WindowsProcessJob | None = None
-    if os.name == "nt":
+    if _PLATFORM_NAME == "nt":
         windows_job = _create_windows_process_job()
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | 0x00000004
     else:
@@ -315,14 +316,15 @@ def run_bounded_process(
                 process,
                 grace_seconds=termination_grace_seconds,
             )
-            cleanup_succeeded = False
-            termination_method = (
-                f"{termination_method or 'fallback'}_"
-                f"{'parent_only' if parent_exited else 'parent_unverified'}"
-            )
+            cleanup_succeeded = cleanup_succeeded and parent_exited
+            if not cleanup_succeeded:
+                termination_method = (
+                    f"{termination_method or 'fallback'}_"
+                    f"{'parent_only' if parent_exited else 'parent_unverified'}"
+                )
         else:
             process.wait()
-        if not cleanup_attempted and os.name != "nt":
+        if not cleanup_attempted and _PLATFORM_NAME != "nt":
             try:
                 os.killpg(process.pid, 0)
             except ProcessLookupError:
