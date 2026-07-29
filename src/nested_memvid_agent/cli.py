@@ -776,7 +776,8 @@ def main() -> None:
 
     if args.cmd == "doctor":
         report = _doctor_runtime(config)
-        print(json.dumps(report, indent=2))
+        json.dump(report, sys.stdout, indent=2)
+        sys.stdout.write("\n")
         if report.get("ok") is not True:
             raise SystemExit(1)
         return
