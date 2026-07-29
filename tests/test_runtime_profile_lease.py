@@ -20,6 +20,7 @@ from nested_memvid_agent.runtime_profile_lease import (
     RuntimeLeaseConflict,
     RuntimeLeaseIdentity,
     RuntimeProfileLease,
+    resolve_runtime_profile_root,
     runtime_profile_lock_path,
     runtime_profile_metadata_path,
 )
@@ -272,3 +273,55 @@ def test_release_removes_only_its_metadata_and_makes_profile_available(
     assert state.status == "available"
     assert state.current is None
     assert state.can_terminate is False
+
+
+def test_profile_control_directory_supports_independent_writer_volumes(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state-volume" / "state" / "agent.db"
+    memory_dir = Path("/Volumes/independent-kestrel-memory") / tmp_path.name
+
+    control_directory = resolve_runtime_profile_root(
+        state_path,
+        memory_dir,
+        profile_id="default",
+    )
+
+    assert control_directory.parent == (
+        state_path.resolve(strict=False).parent / ".kestrel-runtime-profiles"
+    )
+    assert len(control_directory.name) == 64
+    assert all(character in "0123456789abcdef" for character in control_directory.name)
+
+
+def test_sibling_runtime_profiles_have_distinct_control_directories(
+    tmp_path: Path,
+) -> None:
+    state_directory = tmp_path / "state"
+
+    first = resolve_runtime_profile_root(
+        state_directory / "first.db",
+        tmp_path / "memory-first",
+        profile_id="default",
+    )
+    second = resolve_runtime_profile_root(
+        state_directory / "second.db",
+        tmp_path / "memory-second",
+        profile_id="default",
+    )
+    named = resolve_runtime_profile_root(
+        state_directory / "first.db",
+        tmp_path / "memory-first",
+        profile_id="other",
+    )
+
+    assert first != second
+    assert first != named
+    assert (
+        resolve_runtime_profile_root(
+            state_directory / "." / "first.db",
+            tmp_path / "." / "memory-first",
+            profile_id="default",
+        )
+        == first
+    )

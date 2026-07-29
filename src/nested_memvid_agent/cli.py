@@ -702,6 +702,7 @@ def main() -> None:
         profile_root = resolve_runtime_profile_root(
             config.state_path,
             config.memory_dir,
+            profile_id="default",
         )
         identity = current_runtime_lease_identity(
             profile_id="default",

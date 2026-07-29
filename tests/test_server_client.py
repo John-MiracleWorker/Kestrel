@@ -153,6 +153,7 @@ def test_desktop_compatibility_probe_checks_profile_and_version_without_exposing
         ).probe_desktop_compatibility(
             profile_id="default",
             version="0.5.0",
+            launch_nonce_digest="a" * 64,
         )
 
     assert result.disposition == "attach_desktop"
@@ -161,6 +162,88 @@ def test_desktop_compatibility_probe_checks_profile_and_version_without_exposing
     assert token not in repr(result)
     assert token not in str(result.detail)
     assert requests[0]["headers"]["authorization"] == f"Bearer {token}"
+
+
+def test_desktop_compatibility_probe_uses_the_lease_base_url() -> None:
+    readiness = {
+        "schema": "kestrel.desktop.readiness.v1",
+        "ready": True,
+        "profile_id": "default",
+        "launch_nonce_digest": "a" * 64,
+        "sidecar_version": "0.5.0",
+        "state_schema_version": 21,
+        "routing_schema_version": 2,
+        "memory_layers": [
+            "working",
+            "episodic",
+            "semantic",
+            "procedural",
+            "self",
+            "policy",
+        ],
+    }
+    configured_routes: dict[tuple[str, str], Route] = {
+        ("GET", "/api/desktop/readiness"): (200, readiness),
+    }
+    lease_routes: dict[tuple[str, str], Route] = {
+        ("GET", "/api/desktop/readiness"): (200, readiness),
+    }
+    with _http_server(configured_routes) as (configured_url, configured_requests):
+        with _http_server(lease_routes) as (lease_url, lease_requests):
+            result = KestrelServerClient(
+                configured_url,
+            ).probe_desktop_compatibility(
+                profile_id="default",
+                version="0.5.0",
+                launch_nonce_digest="a" * 64,
+                base_url=lease_url,
+            )
+
+    assert result.disposition == "attach_desktop"
+    assert configured_requests == []
+    assert [request["path"] for request in lease_requests] == [
+        "/api/desktop/readiness"
+    ]
+
+
+def test_desktop_compatibility_probe_rejects_a_nonce_mismatch_without_exposing_it() -> None:
+    expected_nonce_digest = "b" * 64
+    routes: dict[tuple[str, str], Route] = {
+        (
+            "GET",
+            "/api/desktop/readiness",
+        ): (
+            200,
+            {
+                "schema": "kestrel.desktop.readiness.v1",
+                "ready": True,
+                "profile_id": "default",
+                "launch_nonce_digest": "a" * 64,
+                "sidecar_version": "0.5.0",
+                "state_schema_version": 21,
+                "routing_schema_version": 2,
+                "memory_layers": [
+                    "working",
+                    "episodic",
+                    "semantic",
+                    "procedural",
+                    "self",
+                    "policy",
+                ],
+            },
+        ),
+    }
+    with _http_server(routes) as (base_url, _requests):
+        result = KestrelServerClient(base_url).probe_desktop_compatibility(
+            profile_id="default",
+            version="0.5.0",
+            launch_nonce_digest=expected_nonce_digest,
+        )
+
+    assert result.disposition == "foreign_or_unrelated"
+    assert result.detail == "desktop_nonce_mismatch"
+    assert expected_nonce_digest not in repr(result)
+    assert expected_nonce_digest not in str(result.detail)
 
 
 def test_desktop_compatibility_probe_rejects_wrong_profile_or_version() -> None:
@@ -194,10 +277,12 @@ def test_desktop_compatibility_probe_rejects_wrong_profile_or_version() -> None:
         version = client.probe_desktop_compatibility(
             profile_id="other",
             version="0.5.0",
+            launch_nonce_digest="a" * 64,
         )
         profile = client.probe_desktop_compatibility(
             profile_id="default",
             version="0.4.11",
+            launch_nonce_digest="a" * 64,
         )
 
     assert version.disposition == "version_conflict"

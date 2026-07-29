@@ -27,6 +27,7 @@ from nested_memvid_agent.runtime_profile_lease import (
     LeaseProcessSnapshot,
     RuntimeLeaseIdentity,
     RuntimeProfileLease,
+    resolve_runtime_profile_root,
 )
 from nested_memvid_agent.server_client import ServerCompatibility, ServerProbe
 from nested_memvid_agent.service_control import (
@@ -90,9 +91,13 @@ class FakeClient:
         self,
         probe: ServerProbe,
         compatibility: ServerCompatibility | None = None,
+        expected_compatibility_base_url: str | None = None,
+        expected_launch_nonce_digest: str | None = None,
     ) -> None:
         self._probe = probe
         self._compatibility = compatibility
+        self._expected_compatibility_base_url = expected_compatibility_base_url
+        self._expected_launch_nonce_digest = expected_launch_nonce_digest
         self.probe_count = 0
 
     def probe(self) -> ServerProbe:
@@ -104,8 +109,12 @@ class FakeClient:
         *,
         profile_id: str,
         version: str,
+        launch_nonce_digest: str,
+        base_url: str | None = None,
     ) -> ServerCompatibility:
         del profile_id, version
+        assert base_url == self._expected_compatibility_base_url
+        assert launch_nonce_digest == self._expected_launch_nonce_digest
         if self._compatibility is None:
             raise AssertionError("unexpected desktop compatibility probe")
         return self._compatibility
@@ -775,7 +784,11 @@ def test_start_attaches_only_to_a_verified_compatible_desktop_lease(
     tmp_path: Path,
 ) -> None:
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
-    profile_root = paths.state_path.parent.parent
+    profile_root = resolve_runtime_profile_root(
+        paths.state_path,
+        paths.memory_dir,
+        profile_id="default",
+    )
     identity = RuntimeLeaseIdentity(
         profile_id="default",
         management="desktop",
@@ -784,7 +797,7 @@ def test_start_attaches_only_to_a_verified_compatible_desktop_lease(
         process_birth_marker="desktop-process-birth",
         executable_digest="2" * 64,
         launch_nonce_digest="3" * 64,
-        base_url=paths.url,
+        base_url="http://127.0.0.1:27654/",
         version="0.5.0",
         created_at="2026-07-29T12:00:00+00:00",
     )
@@ -812,6 +825,8 @@ def test_start_attaches_only_to_a_verified_compatible_desktop_lease(
                     profile_id="default",
                     version="0.5.0",
                 ),
+                expected_compatibility_base_url=identity.base_url,
+                expected_launch_nonce_digest=identity.launch_nonce_digest,
             ),
             popen=lambda *_args, **_kwargs: popen_calls.append(object()),
         ).start()
@@ -825,11 +840,24 @@ def test_start_attaches_only_to_a_verified_compatible_desktop_lease(
     assert popen_calls == []
 
 
-def test_start_does_not_launch_when_desktop_lease_cannot_be_authenticated(
+@pytest.mark.parametrize(
+    ("disposition", "expected_code"),
+    [
+        ("version_conflict", "runtime_profile_version_conflict"),
+        ("foreign_or_unrelated", "runtime_profile_lease_conflict"),
+    ],
+)
+def test_start_preserves_desktop_compatibility_failure_disposition(
     tmp_path: Path,
+    disposition: str,
+    expected_code: str,
 ) -> None:
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
-    profile_root = paths.state_path.parent.parent
+    profile_root = resolve_runtime_profile_root(
+        paths.state_path,
+        paths.memory_dir,
+        profile_id="default",
+    )
     identity = RuntimeLeaseIdentity(
         profile_id="default",
         management="desktop",
@@ -858,18 +886,21 @@ def test_start_does_not_launch_when_desktop_lease_cannot_be_authenticated(
                 client=FakeClient(
                     ServerProbe(True, False, True),
                     ServerCompatibility(
-                        disposition="foreign_or_unrelated",
+                        disposition=disposition,  # type: ignore[arg-type]
                         profile_id=None,
                         version=None,
-                        detail="desktop readiness could not be authenticated",
+                        detail="injected desktop compatibility mismatch",
                     ),
+                    expected_compatibility_base_url=identity.base_url,
+                    expected_launch_nonce_digest=identity.launch_nonce_digest,
                 ),
                 popen=lambda *_args, **_kwargs: popen_calls.append(object()),
             ).start()
     finally:
         lease.release()
 
-    assert raised.value.code == "profile_owned_by_desktop"
+    assert raised.value.code == expected_code
+    assert "terminate" not in raised.value.recovery.lower()
     assert popen_calls == []
 
 
@@ -877,7 +908,11 @@ def test_start_does_not_race_a_cli_lease_before_its_listener_is_ready(
     tmp_path: Path,
 ) -> None:
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
-    profile_root = paths.state_path.parent.parent
+    profile_root = resolve_runtime_profile_root(
+        paths.state_path,
+        paths.memory_dir,
+        profile_id="default",
+    )
     identity = RuntimeLeaseIdentity(
         profile_id="default",
         management="cli",

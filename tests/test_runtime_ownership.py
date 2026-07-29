@@ -29,6 +29,7 @@ from nested_memvid_agent.runtime_ownership import (
 from nested_memvid_agent.runtime_profile_lease import (
     RuntimeProfileLease,
     current_runtime_lease_identity,
+    resolve_runtime_profile_root,
 )
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.skill_manager import SkillManager
@@ -61,8 +62,13 @@ def test_cli_server_exits_before_opening_writers_when_desktop_owns_profile(
     profile_root = tmp_path / "profile"
     state_path = profile_root / "state" / "agent.db"
     memory_dir = profile_root / "memory"
+    lease_root = resolve_runtime_profile_root(
+        state_path,
+        memory_dir,
+        profile_id="default",
+    )
     desktop = RuntimeProfileLease.acquire(
-        profile_root,
+        lease_root,
         current_runtime_lease_identity(
             profile_id="default",
             management="desktop",

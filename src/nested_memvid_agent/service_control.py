@@ -120,6 +120,8 @@ class ProbeClient(Protocol):
         *,
         profile_id: str,
         version: str,
+        launch_nonce_digest: str,
+        base_url: str | None = None,
     ) -> ServerCompatibility: ...
 
 
@@ -740,6 +742,7 @@ class ServiceController:
         profile_root = resolve_runtime_profile_root(
             self.paths.state_path,
             self.paths.memory_dir,
+            profile_id="default",
         )
         version = _package_version()
         lease = RuntimeProfileLease.inspect(
@@ -765,6 +768,8 @@ class ServiceController:
             compatibility = self.client.probe_desktop_compatibility(
                 profile_id="default",
                 version=version,
+                launch_nonce_digest=lease.current.launch_nonce_digest,
+                base_url=lease.current.base_url,
             )
             if compatibility.disposition == "attach_desktop":
                 return ServiceStatus(
@@ -776,10 +781,22 @@ class ServiceController:
                     pgid=None,
                     detail="profile_owned_by_desktop",
                 )
+            if compatibility.disposition == "version_conflict":
+                raise ServiceControlError(
+                    "Desktop readiness reported a different runtime version.",
+                    code="runtime_profile_version_conflict",
+                    recovery=(
+                        "Use the matching Kestrel Desktop and CLI versions "
+                        "before attaching."
+                    ),
+                )
             raise ServiceControlError(
-                "The Desktop-owned Kestrel runtime could not be authenticated.",
-                code="profile_owned_by_desktop",
-                recovery="Use the Kestrel Desktop window or stop it from Desktop before retrying.",
+                "Desktop readiness did not match the verified profile lease.",
+                code="runtime_profile_lease_conflict",
+                recovery=(
+                    "Inspect the Desktop runtime and profile lease, then retry "
+                    "only after their identity evidence agrees."
+                ),
             )
         code = (
             "runtime_profile_version_conflict"

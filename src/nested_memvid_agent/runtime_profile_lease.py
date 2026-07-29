@@ -38,6 +38,7 @@ LeaseDisposition = Literal[
 ]
 _LEASE_LOCK_NAME = "runtime-profile.lock"
 _LEASE_METADATA_NAME = "runtime-profile.json"
+_LEASE_CONTROL_DIRECTORY_NAME = ".kestrel-runtime-profiles"
 _LEASE_KEYS = frozenset(
     {
         "schema",
@@ -334,16 +335,30 @@ def runtime_profile_metadata_path(profile_root: Path) -> Path:
     return Path(profile_root) / _LEASE_METADATA_NAME
 
 
-def resolve_runtime_profile_root(state_path: Path, memory_dir: Path) -> Path:
-    state_parent = Path(state_path).expanduser().resolve(strict=False).parent
-    memory_root = Path(memory_dir).expanduser().resolve(strict=False)
-    try:
-        common = Path(os.path.commonpath((state_parent, memory_root)))
-    except ValueError as exc:
-        raise ValueError("state path and memory directory must share one profile root") from exc
-    if common == Path(common.anchor):
-        raise ValueError("runtime profile root must not be a filesystem root")
-    return common
+def resolve_runtime_profile_root(
+    state_path: Path,
+    memory_dir: Path,
+    *,
+    profile_id: str = "default",
+) -> Path:
+    canonical_state = Path(state_path).expanduser().resolve(strict=False)
+    canonical_memory = Path(memory_dir).expanduser().resolve(strict=False)
+    identity = json.dumps(
+        {
+            "schema": "kestrel.runtime_profile_control.v1",
+            "profile_id": _required_text(profile_id, "profile_id"),
+            "state_path": str(canonical_state),
+            "memory_dir": str(canonical_memory),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    identity_digest = sha256(identity.encode("utf-8")).hexdigest()
+    return (
+        canonical_state.parent
+        / _LEASE_CONTROL_DIRECTORY_NAME
+        / identity_digest
+    )
 
 
 def current_runtime_lease_identity(
