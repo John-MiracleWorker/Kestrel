@@ -4,13 +4,18 @@ import asyncio
 import json
 import os
 import socket
+from collections.abc import Callable
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
+import nested_memvid_agent.desktop_sidecar as desktop_sidecar_module
 import nested_memvid_agent.server as server_module
+from nested_memvid_agent.channels import ChannelManager
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
 from nested_memvid_agent.desktop_sidecar import (
@@ -28,6 +33,7 @@ from nested_memvid_agent.desktop_sidecar import (
 )
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS
 from nested_memvid_agent.models import MemoryLayer
+from nested_memvid_agent.routing.runtime import build_run_manager
 from nested_memvid_agent.runtime_profile_lease import (
     LeaseProcessSnapshot,
     RuntimeLeaseIdentity,
@@ -73,6 +79,93 @@ def test_sidecar_serves_on_the_same_os_assigned_socket() -> None:
     assert len(servers) == 1
     assert servers[0].app is app
     assert servers[0].socket_fileno == bound_socket_fileno
+
+
+def test_production_uvicorn_config_reuses_its_backlog_on_the_bound_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uvicorn
+
+    app = object()
+    captured_servers: list[Any] = []
+
+    class RecordingSocket:
+        def __init__(self) -> None:
+            self.listen_calls: list[int] = []
+
+        def listen(self, backlog: int) -> None:
+            self.listen_calls.append(backlog)
+
+    class RecordingServer:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            self.sockets: list[Any] = []
+            captured_servers.append(self)
+
+        async def serve(self, *, sockets: list[socket.socket]) -> None:
+            self.sockets = sockets
+
+    monkeypatch.setattr(uvicorn, "Server", RecordingServer)
+    recording_socket: Any = RecordingSocket()
+
+    asyncio.run(serve_desktop_app(app, recording_socket))
+
+    assert len(captured_servers) == 1
+    server = captured_servers[0]
+    assert server.config.app is app
+    assert server.config.access_log is False
+    assert server.config.lifespan == "on"
+    assert server.config.backlog == 2048
+    assert recording_socket.listen_calls == [2048]
+    assert server.sockets == [recording_socket]
+
+
+def test_cli_invokes_sidecar_with_exactly_one_bootstrap_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap = tmp_path / "bootstrap.json"
+    calls: list[Path] = []
+
+    async def record_run(path: Path) -> None:
+        calls.append(path)
+
+    monkeypatch.setattr(
+        desktop_sidecar_module,
+        "run_desktop_sidecar",
+        record_run,
+    )
+
+    desktop_sidecar_module.main([str(bootstrap)])
+
+    assert calls == [bootstrap]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["bootstrap.json", "unexpected-positional"],
+        ["bootstrap.json", "--token", "secret"],
+    ],
+)
+def test_cli_rejects_argument_shapes_other_than_one_positional_path(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_run(path: Path) -> None:
+        pytest.fail(f"sidecar invoked for invalid CLI arguments: {path}")
+
+    monkeypatch.setattr(
+        desktop_sidecar_module,
+        "run_desktop_sidecar",
+        unexpected_run,
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        desktop_sidecar_module.main(argv)
+
+    assert caught.value.code == 2
 
 
 class _RecordingBackend:
@@ -350,6 +443,51 @@ def _write_bootstrap(path: Path, launch: DesktopLaunchConfig) -> None:
     path.chmod(0o600)
 
 
+def _verified_sidecar_inputs(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    Path,
+    DesktopLaunchConfig,
+    dict[int, LeaseProcessSnapshot],
+    Callable[..., RuntimeLeaseIdentity],
+]:
+    manifest = tmp_path / "kestrel-resource-manifest.json"
+    manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1"}\n')
+    parent_pid = os.getppid()
+    current_pid = os.getpid()
+    launch = replace(
+        _launch(
+            tmp_path,
+            manifest_digest="sha256:" + sha256(manifest.read_bytes()).hexdigest(),
+        ),
+        parent_pid=parent_pid,
+        parent_birth_marker="verified-parent-birth",
+    )
+    bootstrap = tmp_path / "bootstrap.json"
+    _write_bootstrap(bootstrap, launch)
+    snapshots = {
+        parent_pid: _snapshot(parent_pid, birth_marker="verified-parent-birth"),
+        current_pid: _snapshot(current_pid, birth_marker="verified-sidecar-birth"),
+    }
+
+    def identity_factory(**kwargs: object) -> RuntimeLeaseIdentity:
+        return RuntimeLeaseIdentity(
+            profile_id="default",
+            management="desktop",
+            owner_digest="1" * 64,
+            pid=current_pid,
+            process_birth_marker="verified-sidecar-birth",
+            executable_digest="2" * 64,
+            launch_nonce_digest=sha256(b"launch-nonce").hexdigest(),
+            base_url=str(kwargs["base_url"]),
+            version="0.5.0",
+            created_at="2026-07-29T12:00:00+00:00",
+        )
+
+    return bootstrap, manifest, launch, snapshots, identity_factory
+
+
 def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
     tmp_path: Path,
 ) -> None:
@@ -560,6 +698,170 @@ def test_preflight_failure_closes_socket_before_releasing_lease(
     assert not bootstrap.exists()
 
 
+def test_post_publication_failure_removes_owned_readiness_before_lease_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap, manifest, launch, snapshots, identity_factory = (
+        _verified_sidecar_inputs(tmp_path)
+    )
+    readiness_path = desktop_readiness_path(launch)
+    sock = bind_desktop_socket()
+    events: list[str] = []
+    real_write = desktop_sidecar_module.write_desktop_readiness
+
+    def fail_after_publication(
+        path: Path,
+        readiness: DesktopSidecarReadiness,
+    ) -> None:
+        real_write(path, readiness)
+        assert path.exists()
+        events.append("published")
+        raise RuntimeError("sentinel_post_publication_failure")
+
+    monkeypatch.setattr(
+        desktop_sidecar_module,
+        "write_desktop_readiness",
+        fail_after_publication,
+    )
+
+    class FakeLease:
+        def release(self) -> None:
+            assert sock.fileno() == -1
+            events.append("release")
+
+    with pytest.raises(RuntimeError, match="sentinel_post_publication_failure"):
+        asyncio.run(
+            run_desktop_sidecar(
+                bootstrap,
+                manifest_path=manifest,
+                inspector=lambda pid: snapshots.get(pid),
+                socket_factory=lambda: sock,
+                identity_factory=identity_factory,
+                lease_acquirer=lambda profile_root, identity: FakeLease(),
+                preflight=lambda memory_dir: None,
+                app_factory=lambda config, *, desktop_context: object(),
+                server_factory=lambda app: pytest.fail(
+                    f"server started after readiness publication failed: {app}"
+                ),
+            )
+        )
+
+    assert events == ["published", "release"]
+    assert not readiness_path.exists()
+
+
+def test_readiness_removal_failure_still_closes_socket_and_releases_lease_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap, manifest, launch, snapshots, identity_factory = (
+        _verified_sidecar_inputs(tmp_path)
+    )
+    sock = bind_desktop_socket()
+    events: list[str] = []
+
+    def fail_removal(
+        path: Path,
+        readiness: DesktopSidecarReadiness,
+    ) -> bool:
+        del path, readiness
+        events.append("remove")
+        raise RuntimeError("sentinel_readiness_removal_failure")
+
+    monkeypatch.setattr(
+        desktop_sidecar_module,
+        "remove_owned_desktop_readiness",
+        fail_removal,
+    )
+
+    class FakeLease:
+        def release(self) -> None:
+            assert sock.fileno() == -1
+            events.append("release")
+
+    class ReturningServer:
+        async def serve(self, *, sockets: list[socket.socket]) -> None:
+            assert sockets == [sock]
+            events.append("serve")
+
+    with pytest.raises(RuntimeError, match="desktop_sidecar_cleanup_incomplete"):
+        asyncio.run(
+            run_desktop_sidecar(
+                bootstrap,
+                manifest_path=manifest,
+                inspector=lambda pid: snapshots.get(pid),
+                socket_factory=lambda: sock,
+                identity_factory=identity_factory,
+                lease_acquirer=lambda profile_root, identity: FakeLease(),
+                preflight=lambda memory_dir: None,
+                app_factory=lambda config, *, desktop_context: object(),
+                server_factory=lambda app: ReturningServer(),
+            )
+        )
+
+    assert events == ["serve", "remove", "release"]
+    assert sock.fileno() == -1
+
+
+def test_server_failure_remains_primary_when_readiness_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bootstrap, manifest, launch, snapshots, identity_factory = (
+        _verified_sidecar_inputs(tmp_path)
+    )
+    sock = bind_desktop_socket()
+    events: list[str] = []
+
+    def fail_removal(
+        path: Path,
+        readiness: DesktopSidecarReadiness,
+    ) -> bool:
+        del path, readiness
+        events.append("remove")
+        raise RuntimeError("sentinel_readiness_removal_failure")
+
+    monkeypatch.setattr(
+        desktop_sidecar_module,
+        "remove_owned_desktop_readiness",
+        fail_removal,
+    )
+
+    class FakeLease:
+        def release(self) -> None:
+            assert sock.fileno() == -1
+            events.append("release")
+
+    class FailingServer:
+        async def serve(self, *, sockets: list[socket.socket]) -> None:
+            assert sockets == [sock]
+            events.append("serve")
+            raise RuntimeError("sentinel_server_failure")
+
+    with pytest.raises(RuntimeError, match="sentinel_server_failure") as caught:
+        asyncio.run(
+            run_desktop_sidecar(
+                bootstrap,
+                manifest_path=manifest,
+                inspector=lambda pid: snapshots.get(pid),
+                socket_factory=lambda: sock,
+                identity_factory=identity_factory,
+                lease_acquirer=lambda profile_root, identity: FakeLease(),
+                preflight=lambda memory_dir: None,
+                app_factory=lambda config, *, desktop_context: object(),
+                server_factory=lambda app: FailingServer(),
+            )
+        )
+
+    assert events == ["serve", "remove", "release"]
+    assert sock.fileno() == -1
+    assert any(
+        "readiness" in note and "cleanup" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
+
+
 def test_desktop_server_uses_bootstrap_settings_and_locks_memvid_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -597,3 +899,112 @@ def test_desktop_server_uses_bootstrap_settings_and_locks_memvid_paths(
     assert captured[0].backend == "memvid"
     assert captured[0].memory_dir == launch.memory_dir
     assert captured[0].state_path == launch.state_path
+
+
+def test_desktop_runtime_update_canonicalizes_memory_authority_everywhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launch = _launch(tmp_path)
+    base = build_desktop_agent_config(launch)
+    outside_memory = tmp_path / "outside-memory"
+    store = RuntimeSettingsStore(launch.runtime_settings_path)
+    store.save(
+        RuntimeSettings.from_config(
+            replace(
+                base,
+                backend="memory",
+                memory_dir=outside_memory,
+            )
+        )
+    )
+    captured_runs: list[Any] = []
+    captured_channels: list[Any] = []
+    real_build_run_manager = build_run_manager
+    real_channel_manager = ChannelManager
+
+    def capture_run_manager(**kwargs: Any) -> Any:
+        result = real_build_run_manager(**kwargs)
+        captured_runs.append(result.runs)
+        return result
+
+    def capture_channel_manager(*args: Any, **kwargs: Any) -> Any:
+        manager = real_channel_manager(*args, **kwargs)
+        captured_channels.append(manager)
+        return manager
+
+    monkeypatch.setattr(server_module, "build_run_manager", capture_run_manager)
+    monkeypatch.setattr(server_module, "ChannelManager", capture_channel_manager)
+
+    app = server_module.create_app(base, desktop_context=launch)
+    headers = {"Authorization": f"Bearer {launch.api_token}"}
+    with TestClient(app, raise_server_exceptions=False) as client:
+        initial = client.get("/api/runtime/settings", headers=headers)
+        assert initial.status_code == 200
+        initial_settings = initial.json()["settings"]
+        assert initial_settings["backend"] == "memvid"
+        assert initial_settings["memory_dir"] == str(launch.memory_dir)
+        migrated = json.loads(
+            launch.runtime_settings_path.read_text(encoding="utf-8")
+        )
+        assert migrated["backend"] == "memvid"
+        assert migrated["memory_dir"] == str(launch.memory_dir)
+        updated = client.put(
+            "/api/runtime/settings",
+            headers=headers,
+            json={
+                "expected_revision": initial_settings["revision"],
+                "provider": "codex-cli",
+                "model": "gpt-5.4",
+                "max_tool_rounds": 9,
+                "backend": "memory",
+                "memory_dir": str(outside_memory),
+            },
+        )
+        settings = client.get("/api/runtime/settings", headers=headers)
+        runtime = client.get("/api/runtime/config", headers=headers)
+
+    assert updated.status_code == 200
+    updated_payload = updated.json()
+    assert updated_payload["settings"]["provider"] == "codex-cli"
+    assert updated_payload["settings"]["max_tool_rounds"] == 9
+    assert updated_payload["settings"]["backend"] == "memvid"
+    assert updated_payload["settings"]["memory_dir"] == str(launch.memory_dir)
+    assert updated_payload["runtime"]["backend"] == "memvid"
+    assert updated_payload["runtime"]["memory_dir"] == str(launch.memory_dir)
+
+    persisted = json.loads(launch.runtime_settings_path.read_text(encoding="utf-8"))
+    assert persisted["provider"] == "codex-cli"
+    assert persisted["max_tool_rounds"] == 9
+    assert persisted["backend"] == "memvid"
+    assert persisted["memory_dir"] == str(launch.memory_dir)
+    assert persisted["revision"] == updated_payload["settings"]["revision"]
+
+    assert settings.status_code == 200
+    saved_settings = settings.json()["settings"]
+    assert saved_settings["provider"] == "codex-cli"
+    assert saved_settings["max_tool_rounds"] == 9
+    assert saved_settings["backend"] == "memvid"
+    assert saved_settings["memory_dir"] == str(launch.memory_dir)
+
+    assert runtime.status_code == 200
+    runtime_payload = runtime.json()
+    assert runtime_payload["provider"]["name"] == "codex-cli"
+    assert runtime_payload["limits"]["max_tool_rounds"] == 9
+    assert runtime_payload["paths"]["memory_dir"] == str(launch.memory_dir)
+    assert runtime_payload["settings"]["runtime"]["backend"] == "memvid"
+    assert (
+        runtime_payload["settings"]["runtime"]["memory_dir"]
+        == str(launch.memory_dir)
+    )
+
+    assert len(captured_runs) == 1
+    assert captured_runs[0].config.provider == "codex-cli"
+    assert captured_runs[0].config.max_tool_rounds == 9
+    assert captured_runs[0].config.backend == "memvid"
+    assert captured_runs[0].config.memory_dir == launch.memory_dir
+    assert len(captured_channels) == 1
+    assert captured_channels[0].config.provider == "codex-cli"
+    assert captured_channels[0].config.max_tool_rounds == 9
+    assert captured_channels[0].config.backend == "memvid"
+    assert captured_channels[0].config.memory_dir == launch.memory_dir

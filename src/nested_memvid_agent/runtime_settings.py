@@ -145,9 +145,15 @@ class RuntimeSettingsUpdateResult:
 
 
 class RuntimeSettingsStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        canonicalize: Callable[[RuntimeSettings], RuntimeSettings] | None = None,
+    ) -> None:
         self.path = Path(path)
         self._thread_lock = _settings_thread_lock(self.path)
+        self._canonicalize = canonicalize or _identity_settings
 
     def exists(self) -> bool:
         with self._thread_lock:
@@ -171,7 +177,7 @@ class RuntimeSettingsStore:
                 and current_raw.get("revision") != expected_revision
             ):
                 raise RuntimeSettingsConflict("runtime_settings_revision_conflict")
-            rendered = _persisted_settings(settings)
+            rendered = _persisted_settings(self._canonicalize(settings))
             self._write_unlocked(rendered)
             return rendered
 
@@ -193,7 +199,9 @@ class RuntimeSettingsStore:
             current = self._load_unlocked(previous_config, migrate=True)
             if expected_revision is not None and current.revision != expected_revision:
                 raise RuntimeSettingsConflict("runtime_settings_revision_conflict")
-            merged = merge_runtime_settings(previous_config, current, changes)
+            merged = self._canonicalize(
+                merge_runtime_settings(previous_config, current, changes)
+            )
             candidate_config = apply_runtime_settings(previous_config, merged)
             if validate_config is not None:
                 validate_config(candidate_config)
@@ -235,7 +243,10 @@ class RuntimeSettingsStore:
     def _load_unlocked(self, fallback: AgentConfig, *, migrate: bool) -> RuntimeSettings:
         raw = self._read_raw_unlocked()
         if raw is None:
-            return _finalize_settings(RuntimeSettings.from_config(fallback), source="launch")
+            return _finalize_settings(
+                self._canonicalize(RuntimeSettings.from_config(fallback)),
+                source="launch",
+            )
         schema_version = raw.get("schema_version", RUNTIME_SETTINGS_SCHEMA_VERSION)
         if schema_version != RUNTIME_SETTINGS_SCHEMA_VERSION:
             raise ValueError(f"unsupported runtime settings schema: {schema_version}")
@@ -243,6 +254,7 @@ class RuntimeSettingsStore:
         # This policy is controlled only by launch configuration, even when an
         # older persisted file contains a different historical value.
         settings = replace(settings, require_api_auth=fallback.require_api_auth)
+        settings = self._canonicalize(settings)
         finalized = _finalize_settings(settings, source="persisted")
         stored_revision = raw.get("revision")
         if (
@@ -295,6 +307,10 @@ def default_runtime_settings_path(config: AgentConfig) -> Path:
     if state_parent.name == "state":
         return state_parent.parent / "config" / "runtime_settings.json"
     return state_parent / "runtime_settings.json"
+
+
+def _identity_settings(settings: RuntimeSettings) -> RuntimeSettings:
+    return settings
 
 
 def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> AgentConfig:

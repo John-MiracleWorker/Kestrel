@@ -300,9 +300,8 @@ async def run_desktop_sidecar(
     lease: _RuntimeLease | None = None
     readiness: DesktopSidecarReadiness | None = None
     readiness_path = desktop_readiness_path(launch)
-    readiness_published = False
-    failed = False
-    cleanup_incomplete = False
+    readiness_cleanup_eligible = False
+    primary_error: BaseException | None = None
     try:
         sock = socket_factory()
         host, raw_port = sock.getsockname()
@@ -341,28 +340,54 @@ async def run_desktop_sidecar(
             port=port,
             resource_manifest_digest=verified_manifest_digest,
         )
+        readiness_cleanup_eligible = True
         write_desktop_readiness(readiness_path, readiness)
-        readiness_published = True
         await serve_desktop_app(
             app,
             sock,
             server_factory=server_factory,
         )
-    except BaseException:
-        failed = True
+    except BaseException as exc:
+        primary_error = exc
         raise
     finally:
-        if readiness_published and readiness is not None:
-            cleanup_incomplete = not remove_owned_desktop_readiness(
-                readiness_path,
-                readiness,
-            )
-        if sock is not None:
-            sock.close()
-        if lease is not None:
-            lease.release()
-        if cleanup_incomplete and not failed:
-            raise RuntimeError("desktop_readiness_cleanup_incomplete")
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        try:
+            if readiness_cleanup_eligible and readiness is not None:
+                try:
+                    removed = remove_owned_desktop_readiness(
+                        readiness_path,
+                        readiness,
+                    )
+                    if not removed:
+                        cleanup_failures.append(
+                            (
+                                "readiness",
+                                RuntimeError("owned_desktop_readiness_not_removed"),
+                            )
+                        )
+                except BaseException as exc:  # noqa: BLE001 - continue ownership cleanup
+                    cleanup_failures.append(("readiness", exc))
+        finally:
+            try:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except BaseException as exc:  # noqa: BLE001 - lease release must follow
+                        cleanup_failures.append(("socket", exc))
+            finally:
+                if lease is not None:
+                    try:
+                        lease.release()
+                    except BaseException as exc:  # noqa: BLE001 - report after all attempts
+                        cleanup_failures.append(("lease", exc))
+        if cleanup_failures:
+            stages = ",".join(stage for stage, _error in cleanup_failures)
+            detail = f"desktop_sidecar_cleanup_incomplete:{stages}"
+            if primary_error is not None:
+                primary_error.add_note(detail)
+            else:
+                raise RuntimeError(detail) from cleanup_failures[0][1]
 
 
 def resolve_resource_manifest_path() -> Path:

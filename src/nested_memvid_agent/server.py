@@ -2,6 +2,7 @@ import json
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from threading import Thread
@@ -29,6 +30,7 @@ from .routines import RoutineService
 from .routing.runtime import build_run_manager
 from .run_manager import RunCapacityError
 from .runtime_settings import (
+    RuntimeSettings,
     RuntimeSettingsStore,
     apply_runtime_settings,
     default_runtime_settings_path,
@@ -222,7 +224,16 @@ def _create_app(
         if desktop_context is not None
         else default_runtime_settings_path(base_config)
     )
-    runtime_settings_store = RuntimeSettingsStore(runtime_settings_path)
+    settings_canonicalizer: Callable[[RuntimeSettings], RuntimeSettings] | None = None
+    if desktop_context is not None:
+        settings_canonicalizer = partial(
+            _apply_desktop_settings_authority,
+            launch=desktop_context,
+        )
+    runtime_settings_store = RuntimeSettingsStore(
+        runtime_settings_path,
+        canonicalize=settings_canonicalizer,
+    )
     active_config = apply_runtime_settings(base_config, runtime_settings_store.load(base_config))
     if desktop_context is not None:
         active_config = _apply_desktop_runtime_authority(
@@ -1436,6 +1447,20 @@ def _apply_desktop_runtime_authority(
         backend="memvid",
         memory_dir=launch.memory_dir,
         state_path=launch.state_path,
+        require_api_auth=True,
+    )
+
+
+def _apply_desktop_settings_authority(
+    settings: RuntimeSettings,
+    launch: DesktopLaunchConfig,
+) -> RuntimeSettings:
+    """Canonicalize persisted settings that are owned by the Desktop launch."""
+
+    return replace(
+        settings,
+        backend="memvid",
+        memory_dir=str(launch.memory_dir),
         require_api_auth=True,
     )
 
