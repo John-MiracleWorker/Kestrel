@@ -1760,9 +1760,12 @@ def _doctor_provider(
     key_env = config.api_key_env
     if key_env is None and config.provider == "openai":
         key_env = "OPENAI_API_KEY"
-    api_key_present = bool(
-        key_env and _env_has_value(key_env, environ=environ)
-    )
+    credential_env_configured = False
+    api_key_present = False
+    if key_env:
+        credential_env_configured = True
+        if _env_has_value(key_env, environ=environ):
+            api_key_present = True
     needs_key = config.provider == "openai"
     needs_base_url = config.provider == "openai-compatible"
     return {
@@ -1770,7 +1773,7 @@ def _doctor_provider(
         "provider": config.provider,
         "model": config.model,
         "base_url_configured": bool(config.base_url),
-        "credential_env_configured": bool(key_env),
+        "credential_env_configured": credential_env_configured,
         "api_key_present": api_key_present,
         "timeout_seconds": config.timeout_seconds,
         "max_retries": config.max_retries,
@@ -1788,6 +1791,12 @@ def _doctor_workspace(config: AgentConfig) -> dict[str, Any]:
 
 
 def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
+    secret_store_keyring = False
+    secret_store_file_backed = False
+    if config.secret_backend == "keyring":
+        secret_store_keyring = True
+    elif config.secret_backend == "json":
+        secret_store_file_backed = True
     return {
         "ok": True,
         "allow_shell": config.allow_shell,
@@ -1800,8 +1809,8 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_remote_mutation": config.allow_remote_mutation,
         "git_write_mode": config.git_write_mode,
         "protected_branches": list(config.protected_branches),
-        "secret_store_keyring": config.secret_backend == "keyring",
-        "secret_store_file_backed": config.secret_backend == "json",
+        "secret_store_keyring": secret_store_keyring,
+        "secret_store_file_backed": secret_store_file_backed,
         "allow_memory_import": config.allow_memory_import,
         "allow_executable_skills": config.allow_executable_skills,
         "allow_browser_validation": config.allow_browser_validation,
