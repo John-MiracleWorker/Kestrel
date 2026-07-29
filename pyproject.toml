@@ -45,6 +45,7 @@ release = ["cyclonedx-bom==7.3.0", "pip-audit==2.10.1", "twine==6.2.0"]
 nested-memvid = "nested_memvid_agent.cli:main"
 nest-agent = "nested_memvid_agent.cli:main"
 kestrel = "nested_memvid_agent.launcher:main"
+kestrel-desktop-sidecar = "nested_memvid_agent.desktop_sidecar:main"
 
 [project.urls]
 Homepage = "https://github.com/John-MiracleWorker/Kestrel"

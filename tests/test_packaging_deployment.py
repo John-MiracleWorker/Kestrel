@@ -35,6 +35,9 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     assert any(str(dep).startswith("keyring>=25.6.0") for dep in keyring_deps)
     assert "mcp>=1.0,<2" in project["optional-dependencies"]["mcp"]
     assert project["description"].startswith("Kestrel:")
+    assert project["scripts"]["kestrel-desktop-sidecar"] == (
+        "nested_memvid_agent.desktop_sidecar:main"
+    )
     assert project["urls"]["Repository"] == "https://github.com/John-MiracleWorker/Kestrel"
     assert project["urls"]["Issues"] == "https://github.com/John-MiracleWorker/Kestrel/issues"
 

@@ -1,7 +1,7 @@
 import json
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from importlib import import_module
 from pathlib import Path
 from threading import Thread
@@ -215,8 +215,20 @@ def _create_app(
     CORSMiddleware = cors_module.CORSMiddleware
 
     base_config = config or AgentConfig.from_env()
-    runtime_settings_store = RuntimeSettingsStore(default_runtime_settings_path(base_config))
+    if desktop_context is not None:
+        base_config = _apply_desktop_runtime_authority(base_config, desktop_context)
+    runtime_settings_path = (
+        desktop_context.runtime_settings_path
+        if desktop_context is not None
+        else default_runtime_settings_path(base_config)
+    )
+    runtime_settings_store = RuntimeSettingsStore(runtime_settings_path)
     active_config = apply_runtime_settings(base_config, runtime_settings_store.load(base_config))
+    if desktop_context is not None:
+        active_config = _apply_desktop_runtime_authority(
+            active_config,
+            desktop_context,
+        )
     _prepare_private_runtime_artifacts(active_config)
     workspace = active_config.workspace.expanduser().resolve()
     secret_store_path = active_config.secret_store_path.expanduser()
@@ -285,10 +297,23 @@ def _create_app(
 
     def update_active_config(next_config: AgentConfig) -> None:
         nonlocal active_config
+        if desktop_context is not None:
+            next_config = _apply_desktop_runtime_authority(
+                next_config,
+                desktop_context,
+            )
         active_config = next_config
         runs.config = next_config
         channels.config = next_config
         secret_broker.register_allowed_env_names(_provider_secret_env_names(next_config))
+
+    def validate_runtime_config(next_config: AgentConfig) -> None:
+        if desktop_context is not None:
+            next_config = _apply_desktop_runtime_authority(
+                next_config,
+                desktop_context,
+            )
+        _prepare_private_runtime_artifacts(next_config)
 
     channels.configure_runtime_settings(
         settings_store=runtime_settings_store,
@@ -502,7 +527,7 @@ def _create_app(
         active_config=lambda: active_config,
         state=state,
         settings_store=runtime_settings_store,
-        validate_config_update=_prepare_private_runtime_artifacts,
+        validate_config_update=validate_runtime_config,
         on_config_update=update_active_config,
         secret_broker=secret_broker,
         http_exception=HTTPException,
@@ -1398,6 +1423,21 @@ def _prepare_private_runtime_artifacts(config: AgentConfig) -> None:
     specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
     prepare_private_memory_artifacts(config.memory_dir, specs=specs)
     prepare_private_runs_root(config.memory_dir.parent / "runs")
+
+
+def _apply_desktop_runtime_authority(
+    config: AgentConfig,
+    launch: DesktopLaunchConfig,
+) -> AgentConfig:
+    """Keep canonical Desktop writer paths and Memvid backend launch-controlled."""
+
+    return replace(
+        config,
+        backend="memvid",
+        memory_dir=launch.memory_dir,
+        state_path=launch.state_path,
+        require_api_auth=True,
+    )
 
 
 def _resolve_web_dist() -> Path | None:
