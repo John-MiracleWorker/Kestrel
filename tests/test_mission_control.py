@@ -34,10 +34,10 @@ from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.runtime_models import ToolSpec
 
 
-def test_mission_binding_digest_uses_sha3_for_credential_references() -> None:
+def test_mission_binding_digest_uses_sha3_for_public_payloads() -> None:
     payload = {
         "provider": "openai",
-        "credential_env_ref": "OPENAI_API_KEY",
+        "model": "gpt-test",
     }
     encoded = json.dumps(
         payload,
@@ -50,6 +50,26 @@ def test_mission_binding_digest_uses_sha3_for_credential_references() -> None:
     assert mission_control_module._payload_digest(payload) == hashlib.sha3_256(
         encoded
     ).hexdigest()
+
+
+def test_mission_binding_hardens_credential_references_before_payload_digest() -> None:
+    primary = mission_control_module._credential_reference_digest(
+        "OPENAI_API_KEY",
+        purpose="primary",
+    )
+    same = mission_control_module._credential_reference_digest(
+        "OPENAI_API_KEY",
+        purpose="primary",
+    )
+    fallback = mission_control_module._credential_reference_digest(
+        "OPENAI_API_KEY",
+        purpose="fallback",
+    )
+
+    assert primary == same
+    assert len(primary) == 64
+    assert primary != fallback
+    assert "OPENAI_API_KEY" not in primary
 
 
 def test_preflight_is_deterministic_and_truthful_about_warnings() -> None:

@@ -1026,6 +1026,7 @@ def test_doctor_reports_credential_readiness_without_raw_descriptors() -> None:
     config = AgentConfig(
         provider="openai",
         api_key_env=key_env,
+        secret_store_path=Path("/private/opaque-doctor-vault.json"),
         secret_backend="keyring",
     )
 
@@ -1036,6 +1037,7 @@ def test_doctor_reports_credential_readiness_without_raw_descriptors() -> None:
     assert provider["credential_env_configured"] is True
     assert provider["api_key_present"] is True
     assert "secret_backend" not in tools
+    assert "secret_store_path" not in tools
     assert tools["secret_store_keyring"] is True
 
 

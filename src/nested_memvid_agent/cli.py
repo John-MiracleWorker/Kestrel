@@ -1800,7 +1800,6 @@ def _doctor_tool_config(config: AgentConfig) -> dict[str, Any]:
         "allow_remote_mutation": config.allow_remote_mutation,
         "git_write_mode": config.git_write_mode,
         "protected_branches": list(config.protected_branches),
-        "secret_store_path": str(config.secret_store_path),
         "secret_store_keyring": config.secret_backend == "keyring",
         "secret_store_file_backed": config.secret_backend == "json",
         "allow_memory_import": config.allow_memory_import,

@@ -428,7 +428,10 @@ def build_mission_launch_binding(
             "provider": str(getattr(config, "provider", "")),
             "model": str(getattr(config, "model", "")),
             "base_url": str(getattr(config, "base_url", "") or ""),
-            "api_key_env": str(getattr(config, "api_key_env", "") or ""),
+            "api_key_env_digest": _credential_reference_digest(
+                str(getattr(config, "api_key_env", "") or ""),
+                purpose="primary",
+            ),
             "fallback_provider": str(
                 getattr(config, "fallback_provider", "") or ""
             ),
@@ -436,8 +439,9 @@ def build_mission_launch_binding(
             "fallback_base_url": str(
                 getattr(config, "fallback_base_url", "") or ""
             ),
-            "fallback_api_key_env": str(
-                getattr(config, "fallback_api_key_env", "") or ""
+            "fallback_api_key_env_digest": _credential_reference_digest(
+                str(getattr(config, "fallback_api_key_env", "") or ""),
+                purpose="fallback",
             ),
             "timeout_seconds": int(getattr(config, "timeout_seconds", 0)),
             "max_retries": int(getattr(config, "max_retries", 0)),
@@ -1620,6 +1624,21 @@ def _mission_task_profile(source_task_id: str) -> str:
 
 def _deduplicate(items: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(items))
+
+
+def _credential_reference_digest(reference: str, *, purpose: str) -> str:
+    normalized = reference.strip()
+    if not normalized:
+        return ""
+    salt = f"kestrel:mission-launch:{purpose}:credential-reference:v1".encode()
+    return hashlib.scrypt(
+        normalized.encode("utf-8"),
+        salt=salt,
+        n=2**14,
+        r=8,
+        p=1,
+        dklen=32,
+    ).hex()
 
 
 def _payload_digest(payload: Mapping[str, Any]) -> str:
