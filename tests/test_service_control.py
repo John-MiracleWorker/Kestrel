@@ -1646,12 +1646,14 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
     paths.server_executable.write_text(
         "#!/usr/bin/env python3\n"
         "import signal, socket, sys\n"
+        "print('fixture: argv accepted', file=sys.stderr, flush=True)\n"
         "host = sys.argv[sys.argv.index('--host') + 1]\n"
         "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
         "listener = socket.socket()\n"
         "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
         "listener.bind((host, port))\n"
         "listener.listen()\n"
+        "print(f'fixture: listening on {host}:{port}', file=sys.stderr, flush=True)\n"
         "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
         "while True:\n"
         "    connection, _address = listener.accept()\n"
@@ -1685,7 +1687,38 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         client=FakeClient(ServerProbe(True, True, False)),
     )
     try:
-        started = controller.start(poll_interval=0.05)
+        try:
+            started = controller.start(poll_interval=0.05)
+        except ServiceControlError as exc:
+            lifecycle_log = (
+                paths.log_path.read_text(encoding="utf-8", errors="replace")
+                if paths.log_path.exists()
+                else "<missing>"
+            )
+            metadata = {
+                "pid": (
+                    paths.pid_path.read_text(encoding="ascii", errors="replace")
+                    if paths.pid_path.exists()
+                    else "<missing>"
+                ),
+                "supervisor_pid": (
+                    paths.supervisor_pid_path.read_text(
+                        encoding="ascii",
+                        errors="replace",
+                    )
+                    if paths.supervisor_pid_path.exists()
+                    else "<missing>"
+                ),
+                "pgid": (
+                    paths.pgid_path.read_text(encoding="ascii", errors="replace")
+                    if paths.pgid_path.exists()
+                    else "<missing>"
+                ),
+            }
+            raise AssertionError(
+                f"service fixture failed: {exc}; log={lifecycle_log!r}; "
+                f"metadata={metadata!r}"
+            ) from exc
         assert started.state == ServiceState.RUNNING
         assert started.management == ServiceManagement.MANAGED
         assert paths.pid_path.exists()
