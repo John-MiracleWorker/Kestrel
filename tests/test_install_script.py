@@ -97,6 +97,14 @@ def _run_install(
         # test interpreter. Give installer tests a fresh user boundary so
         # PATH discovery cannot collide with or mutate that runner-owned file.
         install_env["HOME"] = str(Path(requested_env["KESTREL_HOME"]).parent)
+    if "KESTREL_BIN_DIR" not in requested_env and requested_env.get("KESTREL_HOME"):
+        # Hosted Python toolcache directories are valid writable PATH entries,
+        # but their editable-install console scripts belong to the runner.
+        # Installer tests always target a disposable launcher directory unless
+        # a case explicitly supplies its own selection contract.
+        install_env["KESTREL_BIN_DIR"] = str(
+            Path(install_env["HOME"]) / ".local" / "bin"
+        )
     return subprocess.run(
         ["bash", str(install), *(args or [])],
         cwd=cwd,
