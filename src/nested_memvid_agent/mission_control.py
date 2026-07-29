@@ -1341,7 +1341,11 @@ def _untracked_content_manifest(
         total_bytes += metadata.st_size
         if total_bytes > _MAX_GIT_PREFLIGHT_UNTRACKED_BYTES:
             raise OSError("Untracked content exceeds the Git preflight envelope")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = _PLATFORM_OS.open(candidate, flags)
         try:

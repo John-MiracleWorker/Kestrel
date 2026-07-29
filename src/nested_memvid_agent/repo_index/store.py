@@ -2965,13 +2965,67 @@ class RepoIndexStore:
         os.replace(self.path.parent / source, self.path.parent / destination)
 
     def _unlink_relative(self, name: str, *, parent_descriptor: int | None) -> None:
+        target: str | Path = (
+            name if parent_descriptor is not None else self.path.parent / name
+        )
         try:
             if parent_descriptor is not None:
-                os.unlink(name, dir_fd=parent_descriptor)
+                _PLATFORM_OS.unlink(name, dir_fd=parent_descriptor)
             else:
-                os.unlink(self.path.parent / name)
+                _PLATFORM_OS.unlink(target)
         except FileNotFoundError:
             pass
+        except PermissionError as unlink_permission:
+            if (
+                getattr(_PLATFORM_OS, "name", os.name) != "nt"
+                or parent_descriptor is not None
+            ):
+                raise
+            before = _PLATFORM_OS.lstat(target)
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or int(getattr(before, "st_nlink", 1)) != 1
+                or int(getattr(before, "st_file_attributes", 0)) & 0x400
+            ):
+                raise RepositoryIndexError(
+                    "repository index cleanup target is not a trusted regular file"
+                ) from unlink_permission
+            _PLATFORM_OS.chmod(target, stat.S_IWRITE)
+            after = _PLATFORM_OS.lstat(target)
+            if (
+                stat.S_ISLNK(after.st_mode)
+                or not stat.S_ISREG(after.st_mode)
+                or int(getattr(after, "st_nlink", 1)) != 1
+                or int(getattr(after, "st_file_attributes", 0)) & 0x400
+                or (
+                int(before.st_dev),
+                int(before.st_ino),
+                int(before.st_size),
+                int(before.st_mtime_ns),
+                    int(before.st_ctime_ns),
+                )
+                != (
+                    int(after.st_dev),
+                    int(after.st_ino),
+                    int(after.st_size),
+                    int(after.st_mtime_ns),
+                    int(after.st_ctime_ns),
+                )
+            ):
+                raise RepositoryIndexError(
+                    "repository index cleanup target changed before deletion"
+                ) from unlink_permission
+            try:
+                _PLATFORM_OS.unlink(target)
+            except OSError:
+                try:
+                    _PLATFORM_OS.chmod(target, stat.S_IREAD)
+                except OSError as restore_error:
+                    raise RepositoryIndexError(
+                        "repository index cleanup target permissions could not be restored"
+                    ) from restore_error
+                raise
 
     @contextmanager
     def _read_connection(self) -> Iterator[sqlite3.Connection]:

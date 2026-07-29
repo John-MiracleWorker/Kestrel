@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -10,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic, sleep
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 import pytest
@@ -4436,6 +4438,35 @@ def test_git_commit_blocks_repair_branch_without_reviewer_gate(tmp_path: Path) -
     assert not result.success
     assert result.error == "repair_review_required"
     assert after == before
+
+
+def test_windows_reviewed_regular_mode_uses_canonical_git_mode(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "reviewed.txt"
+    content = b"reviewed\n"
+    candidate.write_bytes(content)
+    candidate.chmod(0o666)
+    monkeypatch.setattr(git_tools, "_PLATFORM_OS", SimpleNamespace(name="nt"))
+
+    path, entry_type, mode, observed = git_tools._read_reviewed_manifest_entry(  # noqa: SLF001
+        tmp_path,
+        {
+            "path": candidate.name,
+            "type": "regular",
+            "mode": 0o644,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        },
+    )
+
+    assert (path, entry_type, mode, observed) == (
+        candidate.name,
+        "regular",
+        "100644",
+        content,
+    )
 
 
 def test_git_commit_allows_repair_branch_with_current_reviewer_gate(tmp_path: Path) -> None:

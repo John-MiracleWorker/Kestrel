@@ -130,9 +130,13 @@ class _GitHubRunner:
         del cwd, timeout
         self.commands.append(command)
         names = [Path(item).name if index == 0 else item for index, item in enumerate(command)]
-        if names[0] == "git" and names[1:4] == ["remote", "get-url", "origin"]:
+        if Path(names[0]).stem.casefold() == "git" and names[1:4] == [
+            "remote",
+            "get-url",
+            "origin",
+        ]:
             return subprocess.CompletedProcess(command, 0, "https://github.com/acme/repo.git\n", "")
-        if names[0] == "git" and names[1] == "push":
+        if Path(names[0]).stem.casefold() == "git" and names[1] == "push":
             return subprocess.CompletedProcess(command, 0, "pushed\n", "")
         if names[0] == "gh" and "statusCheckRollup" in names[-1]:
             payload: dict[str, Any] = {

@@ -176,6 +176,47 @@ def test_windows_candidate_rejects_same_api_path_mutation(
         )
 
 
+def test_windows_unlink_clears_readonly_attribute_after_identity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = repo_store.RepoIndexStore(tmp_path / "index.sqlite")
+    metadata = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o400,
+        st_dev=7,
+        st_ino=11,
+        st_size=5,
+        st_mtime_ns=101,
+        st_ctime_ns=202,
+        st_nlink=1,
+        st_file_attributes=1,
+    )
+    unlinks: list[Path] = []
+    chmods: list[tuple[Path, int]] = []
+
+    def unlink(path: Path, **_kwargs: object) -> None:
+        unlinks.append(Path(path))
+        if len(unlinks) == 1:
+            raise PermissionError("read-only")
+
+    monkeypatch.setattr(
+        repo_store,
+        "_PLATFORM_OS",
+        SimpleNamespace(
+            name="nt",
+            unlink=unlink,
+            lstat=lambda _path: metadata,
+            chmod=lambda path, mode: chmods.append((Path(path), mode)),
+        ),
+    )
+
+    store._unlink_relative("old-generation", parent_descriptor=None)
+
+    expected = tmp_path / "old-generation"
+    assert unlinks == [expected, expected]
+    assert chmods == [(expected, stat.S_IWRITE)]
+
+
 def _git(repository: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments],

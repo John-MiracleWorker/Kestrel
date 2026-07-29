@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -276,6 +277,56 @@ def test_windows_untracked_read_uses_same_api_snapshots(
         )
         is True
     )
+
+
+def test_untracked_manifest_opens_literal_bytes_in_binary_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "untracked.txt"
+    candidate.write_bytes(b"new\r\n")
+    binary_flag = 1 << 29
+    platform_binary_flag = getattr(os, "O_BINARY", 0)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def open_without_synthetic_flag(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        observed_flags.append(flags)
+        platform_flags = flags & ~binary_flag
+        if flags & binary_flag:
+            platform_flags |= platform_binary_flag
+        return real_open(path, platform_flags, mode)
+
+    monkeypatch.setattr(
+        mission_control_module.os,
+        "O_BINARY",
+        binary_flag,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mission_control_module,
+        "_PLATFORM_OS",
+        SimpleNamespace(
+            name=os.name,
+            open=open_without_synthetic_flag,
+            fstat=os.fstat,
+            read=os.read,
+            close=os.close,
+        ),
+    )
+
+    manifest = mission_control_module._untracked_content_manifest(  # noqa: SLF001
+        tmp_path,
+        b"untracked.txt\0",
+        deadline=mission_control_module.monotonic() + 1,
+    )
+
+    assert observed_flags and observed_flags[0] & binary_flag
+    assert manifest[0]["size"] == len(candidate.read_bytes())
 
 
 def test_clean_head_change_invalidates_mission_binding_without_index(

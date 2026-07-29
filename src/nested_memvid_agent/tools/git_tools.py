@@ -1988,8 +1988,19 @@ def _read_reviewed_manifest_entry(
     ):
         raise ValueError(f"Reviewed repair path changed while committing: {path}")
     content = b"".join(chunks)
-    _verify_manifest_content(entry, before, after, content, path)
-    mode = "100755" if stat.S_IMODE(after.st_mode) & 0o111 else "100644"
+    reviewed_mode = int(entry.get("mode", -1))
+    if reviewed_mode not in {0o644, 0o755}:
+        raise ValueError(f"Reviewed repair path has an invalid mode: {path}")
+    verify_filesystem_mode = getattr(_PLATFORM_OS, "name", os.name) != "nt"
+    _verify_manifest_content(
+        entry,
+        before,
+        after,
+        content,
+        path,
+        verify_mode=verify_filesystem_mode,
+    )
+    mode = "100755" if reviewed_mode == 0o755 else "100644"
     return path, entry_type, mode, content
 
 
@@ -1999,10 +2010,15 @@ def _verify_manifest_content(
     after: os.stat_result,
     content: bytes,
     path: str,
+    *,
+    verify_mode: bool = True,
 ) -> None:
     if (
         not os.path.samestat(before, after)
-        or int(entry.get("mode", -1)) != stat.S_IMODE(after.st_mode)
+        or (
+            verify_mode
+            and int(entry.get("mode", -1)) != stat.S_IMODE(after.st_mode)
+        )
         or int(entry.get("size", -1)) != len(content)
         or str(entry.get("sha256", "")) != hashlib.sha256(content).hexdigest()
     ):
