@@ -1636,7 +1636,11 @@ def test_unsupported_platform_birth_marker_fails_closed_without_proc(
     assert exc_info.value.code == "process_inspection_failed"
 
 
-def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None:
+@pytest.mark.parametrize("lifecycle_attempt", range(10))
+def test_service_controller_real_process_lifecycle_smoke(
+    tmp_path: Path,
+    lifecycle_attempt: int,
+) -> None:
     if os.name == "nt" or shutil.which("lsof") is None:
         pytest.skip("requires POSIX process inspection with lsof")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
@@ -1716,7 +1720,8 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
                 ),
             }
             raise AssertionError(
-                f"service fixture failed: {exc}; log={lifecycle_log!r}; "
+                f"service fixture attempt {lifecycle_attempt} failed: {exc}; "
+                f"log={lifecycle_log!r}; "
                 f"metadata={metadata!r}"
             ) from exc
         assert started.state == ServiceState.RUNNING
