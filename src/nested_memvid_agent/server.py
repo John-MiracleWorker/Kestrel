@@ -12,6 +12,7 @@ from .behavior_delta_ledger import BehaviorDeltaLedger
 from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
 from .config import AgentConfig
+from .desktop_bootstrap import DesktopLaunchConfig
 from .event_bus import RunEventBus
 from .layers import (
     load_layer_specs,
@@ -114,12 +115,20 @@ def _apply_browser_security_headers(response: Any) -> None:
             response.headers[name] = value
 
 
-def create_app(config: AgentConfig | None = None) -> Any:
+def create_app(
+    config: AgentConfig | None = None,
+    *,
+    desktop_context: DesktopLaunchConfig | None = None,
+) -> Any:
     """Create the local Kestrel web/API app."""
 
     construction_cleanup: list[Callable[[], None]] = []
     try:
-        return _create_app(config, construction_cleanup=construction_cleanup)
+        return _create_app(
+            config,
+            desktop_context=desktop_context,
+            construction_cleanup=construction_cleanup,
+        )
     except BaseException:
         for cleanup in reversed(construction_cleanup):
             try:
@@ -132,6 +141,7 @@ def create_app(config: AgentConfig | None = None) -> Any:
 def _create_app(
     config: AgentConfig | None,
     *,
+    desktop_context: DesktopLaunchConfig | None,
     construction_cleanup: list[Callable[[], None]],
 ) -> Any:
     """Assemble an app while exposing acquired resources to the factory guard."""
@@ -150,6 +160,7 @@ def _create_app(
         from .server_behavior_delta_routes import register_behavior_delta_routes
         from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
+        from .server_desktop_routes import desktop_auth_error, register_desktop_routes
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_engineering_routes import register_engineering_routes
         from .server_mcp_routes import register_mcp_routes
@@ -288,9 +299,14 @@ def _create_app(
         authorization: str | None = Header(default=None),
         x_kestrel_api_key: str | None = Header(default=None),
     ) -> bool:
-        auth_error = _api_auth_error(
-            active_config,
-            {"authorization": authorization or "", "x-kestrel-api-key": x_kestrel_api_key or ""},
+        headers = {
+            "authorization": authorization or "",
+            "x-kestrel-api-key": x_kestrel_api_key or "",
+        }
+        auth_error = (
+            desktop_auth_error(desktop_context, headers)
+            if desktop_context is not None
+            else _api_auth_error(active_config, headers)
         )
         if auth_error is not None:
             status_code, detail = auth_error
@@ -428,7 +444,11 @@ def _create_app(
         )
         if guarded_path:
             if not public_telegram_webhook and not cors_preflight:
-                auth_error = _api_auth_error(active_config, headers)
+                auth_error = (
+                    desktop_auth_error(desktop_context, headers)
+                    if desktop_context is not None
+                    else _api_auth_error(active_config, headers)
+                )
                 if auth_error is not None:
                     status_code, detail = auth_error
                     return responses_module.JSONResponse({"detail": detail}, status_code=status_code)
@@ -493,6 +513,8 @@ def _create_app(
             secret_resolver=secret_broker.resolve,
         ),
     )
+    if desktop_context is not None:
+        register_desktop_routes(app, launch=desktop_context)
     register_routing_routes(
         app,
         ledger=routing_ledger,

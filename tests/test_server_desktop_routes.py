@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import json
+from hashlib import sha256
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
+from nested_memvid_agent.server import create_app
+
+_MEMORY_LAYERS = [
+    "working",
+    "episodic",
+    "semantic",
+    "procedural",
+    "self",
+    "policy",
+]
+
+
+def _config(profile_root: Path) -> AgentConfig:
+    workspace = profile_root / "workspace"
+    workspace.mkdir(parents=True)
+    return AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=profile_root / "memory",
+        log_dir=profile_root / "logs",
+        state_path=profile_root / "state" / "agent.db",
+        secret_store_path=profile_root / "secrets" / "vault.json",
+        workspace=workspace,
+        skills_dir=profile_root / "skills",
+        plugins_dir=profile_root / "plugins",
+        mcp_config_path=profile_root / "config" / "mcp.json",
+        channel_config_path=profile_root / "config" / "channels.json",
+        worker_worktree_dir=profile_root / "worktrees",
+        require_api_auth=False,
+    )
+
+
+def _desktop_context(profile_root: Path) -> DesktopLaunchConfig:
+    return DesktopLaunchConfig(
+        profile_id="default",
+        profile_root=profile_root,
+        state_path=profile_root / "state" / "agent.db",
+        memory_dir=profile_root / "memory",
+        runtime_settings_path=profile_root / "config" / "runtime_settings.json",
+        launch_nonce="launch-nonce",
+        api_token="desktop-token",
+        parent_pid=4242,
+        parent_birth_marker="desktop-parent-birth-marker",
+        resource_manifest_digest="sha256:" + ("a" * 64),
+    )
+
+
+def test_desktop_readiness_is_auth_and_nonce_digest_bound(tmp_path: Path) -> None:
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    app = create_app(_config(profile_root), desktop_context=_desktop_context(profile_root))
+
+    with TestClient(app) as client:
+        unauthorized = client.get("/api/desktop/readiness")
+        wrong_token = client.get(
+            "/api/desktop/readiness",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        response = client.get(
+            "/api/desktop/readiness",
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert wrong_token.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema": "kestrel.desktop.readiness.v1",
+        "ready": True,
+        "profile_id": "default",
+        "launch_nonce_digest": sha256(b"launch-nonce").hexdigest(),
+        "sidecar_version": "0.5.0",
+        "state_schema_version": 21,
+        "routing_schema_version": 2,
+        "memory_layers": list(_MEMORY_LAYERS),
+    }
+    assert "desktop-token" not in response.text
+    assert "launch-nonce" not in response.text
+    serialized = json.dumps(response.json(), sort_keys=True)
+    assert "desktop-token" not in serialized
+    assert "launch-nonce" not in serialized
+
+
+def test_browser_server_does_not_expose_desktop_readiness(tmp_path: Path) -> None:
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+
+    with TestClient(create_app(_config(profile_root))) as client:
+        health = client.get("/api/health")
+        response = client.get("/api/desktop/readiness")
+
+    assert health.status_code == 200
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
