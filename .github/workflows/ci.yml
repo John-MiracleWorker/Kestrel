@@ -241,6 +241,36 @@ jobs:
         run: npm run build
         working-directory: web
 
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+      - name: Typecheck desktop
+        run: npm run test:typecheck
+        working-directory: desktop
+      - name: Test desktop
+        run: npm test
+        working-directory: desktop
+      - name: Audit desktop dependencies
+        run: npm audit --audit-level=high
+        working-directory: desktop
+      - name: Check desktop dependency licenses
+        run: npm run licenses:check
+        working-directory: desktop
+      - name: Build desktop contracts
+        run: npm run build
+        working-directory: desktop
+
   codeql:
     name: CodeQL
     runs-on: ubuntu-latest

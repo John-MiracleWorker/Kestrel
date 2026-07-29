@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -600,3 +601,18 @@ def test_runtime_artifacts_are_not_tracked() -> None:
     ).stdout.splitlines()
 
     assert tracked == []
+
+
+def test_desktop_workspace_is_exact_pinned_and_renderer_is_external() -> None:
+    package = json.loads((ROOT / "desktop" / "package.json").read_text())
+
+    assert package["private"] is True
+    assert package["main"] == "dist/main.js"
+    assert package["dependencies"] == {
+        "electron-updater": "6.8.9",
+        "zod": "4.4.3",
+    }
+    assert package["devDependencies"]["electron"] == "43.2.0"
+    assert package["devDependencies"]["@electron/fuses"] == "2.1.3"
+    assert package["devDependencies"]["vitest"] == "4.1.6"
+    assert "react" not in package["dependencies"]

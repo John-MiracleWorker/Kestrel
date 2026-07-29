@@ -1,0 +1,24 @@
+{
+  "name": "kestrel-desktop",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc --project tsconfig.json --noEmit --pretty false",
+    "test": "vitest run",
+    "test:typecheck": "tsc --project tsconfig.json --noEmit --pretty false",
+    "licenses:check": "node -e 'const { readFileSync } = require(\"node:fs\"); const { join } = require(\"node:path\"); for (const name of [\"electron-updater\", \"zod\"]) { const pkg = JSON.parse(readFileSync(join(\"node_modules\", name, \"package.json\"))); if (typeof pkg.license !== \"string\" || !pkg.license.trim()) throw new Error(`missing license for ${name}`); }'"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@electron/fuses": "2.1.3",
+    "@types/node": "25.8.0",
+    "electron": "43.2.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.6"
+  }
+}
