@@ -156,6 +156,8 @@ class SystemProcessInspector:
                 recovery="Run `kestrel doctor` and inspect the process manually.",
             )
         uid_text, pgid_text, state, command_text = parts
+        if state.startswith("Z"):
+            return None
         birth_marker = self._birth_marker(pid)
         if birth_marker is None:
             return None
@@ -692,6 +694,7 @@ class ServiceController:
                     clock=clock,
                     sleep=sleep,
                     existing_startup=False,
+                    expected_supervisor_pid=launched_pid,
                 )
             except ServiceControlError as startup_error:
                 cleanup_error = self._cleanup_failed_start(
@@ -808,13 +811,20 @@ class ServiceController:
         clock: Callable[[], float],
         sleep: Callable[[float], None],
         existing_startup: bool,
+        expected_supervisor_pid: int | None = None,
     ) -> ServiceStatus:
         deadline = clock() + timeout_seconds
         while True:
             status = self._locked_status()
             if status.state == ServiceState.RUNNING:
                 return status
-            if status.state == ServiceState.CONFLICT:
+            if (
+                status.state == ServiceState.CONFLICT
+                and not self._is_verified_startup_transition(
+                    status,
+                    expected_supervisor_pid,
+                )
+            ):
                 raise _status_conflict(status)
             remaining = deadline - clock()
             if remaining <= 0:
@@ -827,6 +837,25 @@ class ServiceController:
                     ),
                 )
             sleep(min(poll_interval, remaining))
+
+    def _is_verified_startup_transition(
+        self,
+        status: ServiceStatus,
+        expected_supervisor_pid: int | None,
+    ) -> bool:
+        if (
+            expected_supervisor_pid is None
+            or not status.detail.startswith(
+                "The configured loopback port is occupied by an "
+                "unidentifiable listener."
+            )
+        ):
+            return False
+        supervisor = self.inspector.process(expected_supervisor_pid)
+        return supervisor is not None and _supervisor_identity_matches(
+            supervisor,
+            self.paths,
+        )
 
     def _prepare_service_artifacts(self) -> None:
         if not self.paths.supervisor_script.is_file():

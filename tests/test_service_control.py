@@ -794,6 +794,42 @@ def test_start_launches_the_existing_supervisor_with_safe_absolute_arguments(
     assert kwargs["shell"] is False
 
 
+def test_start_retries_transient_port_conflict_while_launched_supervisor_is_verified(
+    tmp_path: Path,
+) -> None:
+    paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
+    inspector = FakeInspector()
+    server = _server_snapshot(paths)
+    supervisor = _supervisor_snapshot(paths, server)
+
+    def launch(_command: list[str], **_kwargs: object) -> object:
+        inspector.processes = {supervisor.pid: supervisor}
+        inspector.bindable = False
+        return SimpleNamespace(pid=supervisor.pid, poll=lambda: None)
+
+    def finish_startup(_seconds: float) -> None:
+        _managed_metadata(paths)
+        inspector.processes[server.pid] = server
+        inspector.bound_listeners = (_listener(paths, server.pid),)
+        inspector.live_groups = frozenset({server.pgid})
+
+    status = ServiceController(
+        paths,
+        inspector=inspector,
+        client=FakeClient(ServerProbe(True, True, False)),
+        popen=launch,
+    ).start(
+        readiness_timeout=1,
+        poll_interval=0.05,
+        sleep=finish_startup,
+    )
+
+    assert status.state == ServiceState.RUNNING
+    assert status.management == ServiceManagement.MANAGED
+    assert status.pid == server.pid
+    assert status.supervisor_pid == supervisor.pid
+
+
 def test_artifact_preparation_repairs_existing_sensitive_directories_to_owner_only(
     tmp_path: Path,
 ) -> None:
@@ -1430,6 +1466,36 @@ def test_system_process_inspector_treats_a_process_that_vanishes_during_cwd_look
         "_process_cwd",
         lambda _pid: (_ for _ in ()).throw(
             ServiceControlError("vanished", code="process_inspection_failed", recovery="retry")
+        ),
+    )
+
+    assert inspector.process(200) is None
+
+
+def test_system_process_inspector_treats_zombie_as_absent_before_identity_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspector = SystemProcessInspector()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"{_current_uid()} 200 Z [bash] <defunct>\n",
+        ),
+    )
+    monkeypatch.setattr(
+        inspector,
+        "_birth_marker",
+        lambda *_args, **_kwargs: pytest.fail(
+            "zombie identity must not require a birth marker"
+        ),
+    )
+    monkeypatch.setattr(
+        inspector,
+        "_process_cwd",
+        lambda *_args, **_kwargs: pytest.fail(
+            "zombie identity must not require a working directory"
         ),
     )
 
