@@ -38,6 +38,11 @@ from nested_memvid_agent.service_control import (
 )
 
 
+def _current_uid() -> int:
+    getuid = getattr(os, "getuid", None)
+    return int(getuid()) if callable(getuid) else 0
+
+
 class FakeInspector:
     def __init__(
         self,
@@ -139,7 +144,7 @@ def _server_snapshot(paths: Any, *, pid: int = 201, **changes: object) -> Proces
     )
     snapshot = ProcessSnapshot(
         pid=pid,
-        uid=os.getuid(),
+        uid=_current_uid(),
         cwd=paths.home,
         command=command,
         pgid=pid,
@@ -157,7 +162,7 @@ def _supervisor_snapshot(
 ) -> ProcessSnapshot:
     return ProcessSnapshot(
         pid=pid,
-        uid=os.getuid(),
+        uid=_current_uid(),
         cwd=paths.home,
         command=(
             "bash",
@@ -605,7 +610,7 @@ def test_status_refuses_unsafe_lifecycle_metadata(
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
-        ("uid", os.getuid() + 1),
+        ("uid", _current_uid() + 1),
         ("cwd", Path("/tmp/not-kestrel-home")),
         ("command", ("python", "-m", "http.server", "18765")),
     ],
@@ -640,7 +645,7 @@ def test_status_refuses_a_healthy_api_with_unverified_listener_identity(
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
     unknown = ProcessSnapshot(
         pid=909,
-        uid=os.getuid(),
+        uid=_current_uid(),
         cwd=tmp_path,
         command=("python", "-m", "http.server", "18765"),
         pgid=909,
@@ -963,7 +968,7 @@ def test_start_refuses_unknown_listener_without_launching(
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
     unknown = ProcessSnapshot(
         pid=909,
-        uid=os.getuid(),
+        uid=_current_uid(),
         cwd=tmp_path,
         command=("python", "-m", "http.server", "18765"),
         pgid=909,
@@ -995,7 +1000,7 @@ def test_start_rechecks_listener_ownership_after_artifact_preparation(
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=18765)
     unknown = ProcessSnapshot(
         pid=909,
-        uid=os.getuid(),
+        uid=_current_uid(),
         cwd=tmp_path,
         command=("python", "-m", "http.server", "18765"),
         pgid=909,
@@ -1384,7 +1389,7 @@ def test_system_process_inspector_and_signaler_touch_only_test_owned_process(
         snapshot = SystemProcessInspector().process(process.pid)
         assert snapshot is not None
         assert snapshot.pid == process.pid
-        assert snapshot.uid == os.getuid()
+        assert snapshot.uid == _current_uid()
         assert snapshot.cwd == tmp_path.resolve()
         assert snapshot.birth_marker
 
@@ -1404,7 +1409,7 @@ def test_system_process_inspector_treats_a_process_that_vanishes_during_cwd_look
         (
             SimpleNamespace(
                 returncode=0,
-                stdout=f"{os.getuid()} 200 S Mon Jul 28 10:10:10 2026 /bin/sleep 30\n",
+                stdout=f"{_current_uid()} 200 S Mon Jul 28 10:10:10 2026 /bin/sleep 30\n",
             ),
             SimpleNamespace(returncode=1, stdout=""),
         )
@@ -1438,7 +1443,7 @@ def test_darwin_birth_marker_uses_microseconds_to_reject_same_second_reuse(
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
-            stdout=f"{os.getuid()} 200 S Mon Jul 28 10:10:10 2026 /bin/sleep 30\n",
+            stdout=f"{_current_uid()} 200 S Mon Jul 28 10:10:10 2026 /bin/sleep 30\n",
         ),
     )
     monkeypatch.setattr(inspector, "_process_cwd", lambda _pid: Path("/tmp"))
