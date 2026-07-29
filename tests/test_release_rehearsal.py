@@ -48,6 +48,10 @@ where = ["src"]
         ["git", "-C", source, "config", "user.name", "Kestrel Rehearsal"],
         check=True,
     )
+    subprocess.run(
+        ["git", "-C", source, "config", "core.autocrlf", "false"],
+        check=True,
+    )
     subprocess.run(["git", "-C", source, "add", "."], check=True)
     subprocess.run(
         ["git", "-C", source, "commit", "-q", "-m", "fixture"],

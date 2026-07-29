@@ -659,7 +659,7 @@ def test_windows_job_is_assigned_before_resume_and_quiesced_after_leader_exit(
     assert result.termination_method == "windows_job_object_quiesced"
     assert int(events[0].partition(":")[2]) & 0x00000004
     assert events[1:3] == ["assign:4242", "resume:4242"]
-    assert any(event.startswith("quiesce:") for event in events)
+    assert "quiesce:3.0" in events
     assert events[-1] == "close"
 
 

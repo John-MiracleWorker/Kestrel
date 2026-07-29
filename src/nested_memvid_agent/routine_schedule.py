@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -12,6 +13,9 @@ _CRON_FIELDS = (
     ("day_of_week", 0, 7),
 )
 _MAX_CRON_SEARCH_MINUTES = 60 * 24 * 366 * 8
+_TIMEZONE_NAME = re.compile(
+    r"\A[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -49,7 +53,12 @@ def normalize_timezone(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("timezone must be an IANA timezone name")
     normalized = value.strip()
-    if not normalized or len(normalized) > 128:
+    if (
+        not normalized
+        or len(normalized) > 128
+        or _TIMEZONE_NAME.fullmatch(normalized) is None
+        or any(part in {".", ".."} for part in normalized.split("/"))
+    ):
         raise ValueError("timezone must be an IANA timezone name")
     try:
         ZoneInfo(normalized)

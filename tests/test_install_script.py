@@ -679,8 +679,11 @@ def test_install_help_documents_github_curl_and_options() -> None:
 
 
 def test_installer_embeds_the_exact_launcher_helper_checksum() -> None:
+    canonical_helper = (
+        ROOT / "scripts" / "manage_user_launchers.py"
+    ).read_bytes().replace(b"\r\n", b"\n")
     helper_digest = hashlib.sha256(
-        (ROOT / "scripts" / "manage_user_launchers.py").read_bytes()
+        canonical_helper
     ).hexdigest()
     text = INSTALL.read_text(encoding="utf-8")
 

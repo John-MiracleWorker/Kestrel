@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
+from ..platform_primitives import is_link_or_reparse_point
 from .models import (
     DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
@@ -588,6 +589,9 @@ def _scan_candidates_from_descriptor(
                     skipped += 1
                     coverage_complete = False
                     continue
+                if is_link_or_reparse_point(info):
+                    skipped += 1
+                    continue
                 if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                     if name.casefold() in _IGNORED_DIRECTORIES:
                         continue
@@ -677,6 +681,9 @@ def _scan_candidates_from_path(
                     skipped += 1
                     coverage_complete = False
                     continue
+                if is_link_or_reparse_point(info):
+                    skipped += 1
+                    continue
                 if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                     if name.casefold() not in _IGNORED_DIRECTORIES:
                         visit(path, relative_path)
@@ -720,19 +727,68 @@ def _candidate_from_stat(
     candidate_count: int,
 ) -> CandidateFile | None:
     if (
-        not stat.S_ISREG(info.st_mode)
+        is_link_or_reparse_point(info)
+        or not stat.S_ISREG(info.st_mode)
         or info.st_size > limits.max_file_bytes
         or candidate_count >= limits.max_files
     ):
         return None
+    stable_info = info
+    if getattr(_PLATFORM_OS, "name", os.name) == "nt":
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0)
+        )
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise RepositoryChangedDuringIndexingError(
+                f"repository file could not be pinned during scan: {relative_path}"
+            ) from exc
+        try:
+            opened = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            visible = os.lstat(path)
+        except OSError as exc:
+            raise RepositoryChangedDuringIndexingError(
+                f"repository file changed during scan: {relative_path}"
+            ) from exc
+        if (
+            is_link_or_reparse_point(visible)
+            or not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(visible.st_mode)
+            or (
+                visible.st_dev,
+                visible.st_ino,
+                visible.st_size,
+                visible.st_mtime_ns,
+                visible.st_ctime_ns,
+            )
+            != (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+            or opened.st_size != info.st_size
+            or opened.st_mtime_ns != info.st_mtime_ns
+        ):
+            raise RepositoryChangedDuringIndexingError(
+                f"repository file changed during scan: {relative_path}"
+            )
+        stable_info = opened
     return CandidateFile(
         path=path,
         relative_path=relative_path,
-        device=int(info.st_dev),
-        inode=int(info.st_ino),
-        size=int(info.st_size),
-        mtime_ns=int(info.st_mtime_ns),
-        ctime_ns=int(info.st_ctime_ns),
+        device=int(stable_info.st_dev),
+        inode=int(stable_info.st_ino),
+        size=int(stable_info.st_size),
+        mtime_ns=int(stable_info.st_mtime_ns),
+        ctime_ns=int(stable_info.st_ctime_ns),
     )
 
 
@@ -749,7 +805,11 @@ def _read_stable_text(
     *,
     root_descriptor: int | None,
 ) -> str | None:
-    flags = os.O_RDONLY
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+    )
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:

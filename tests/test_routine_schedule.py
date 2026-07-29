@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+import nested_memvid_agent.routine_schedule as routine_schedule
 from nested_memvid_agent.routine_schedule import (
     next_cron_instant,
     normalize_timezone,
@@ -52,6 +53,19 @@ def test_cron_search_represents_both_fall_back_instants() -> None:
 def test_timezone_validation_rejects_unknown_or_unsafe_names(value: str) -> None:
     with pytest.raises(ValueError):
         normalize_timezone(value)
+
+
+def test_timezone_validation_rejects_control_characters_before_zone_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        routine_schedule,
+        "ZoneInfo",
+        lambda _value: pytest.fail("unsafe timezone must not reach zone lookup"),
+    )
+
+    with pytest.raises(ValueError):
+        normalize_timezone("UTC\nignored")
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,7 @@ def test_mission_preflight_is_read_only_and_plan_becomes_project_bound_graph(
     repository = tmp_path / "repository"
     repository.mkdir()
     _git(repository, "init", "-b", "main")
+    _git(repository, "config", "core.autocrlf", "false")
     (repository / "README.md").write_text("# Repository\n", encoding="utf-8")
     _git(repository, "add", "README.md")
     _git(repository, "-c", "user.name=Kestrel", "-c", "user.email=k@example.invalid", "commit", "-m", "baseline")

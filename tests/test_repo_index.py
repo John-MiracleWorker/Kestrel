@@ -4,9 +4,11 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -75,6 +77,50 @@ def test_repository_index_opens_artifacts_in_binary_mode(
         == 17
     )
     assert int(observed["flags"]) & binary_flag
+
+
+def test_windows_candidate_identity_uses_open_descriptor_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "candidate.py"
+    path.write_text("pass\n", encoding="utf-8")
+    visible = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o600,
+        st_dev=0,
+        st_ino=0,
+        st_size=5,
+        st_mtime_ns=101,
+        st_ctime_ns=202,
+        st_file_attributes=0,
+    )
+    opened = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o600,
+        st_dev=7,
+        st_ino=11,
+        st_size=5,
+        st_mtime_ns=101,
+        st_ctime_ns=303,
+        st_file_attributes=0,
+    )
+    closed: list[int] = []
+    monkeypatch.setattr(repo_indexer, "_PLATFORM_OS", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(repo_indexer.os, "open", lambda *_args, **_kwargs: 17)
+    monkeypatch.setattr(repo_indexer.os, "fstat", lambda _descriptor: opened)
+    monkeypatch.setattr(repo_indexer.os, "lstat", lambda _path: visible)
+    monkeypatch.setattr(repo_indexer.os, "close", closed.append)
+
+    candidate = repo_indexer._candidate_from_stat(
+        path=path,
+        relative_path="candidate.py",
+        info=visible,
+        limits=IndexLimits(),
+        candidate_count=0,
+    )
+
+    assert candidate is not None
+    assert (candidate.device, candidate.inode, candidate.ctime_ns) == (7, 11, 303)
+    assert closed == [17]
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -1070,21 +1116,22 @@ def test_exact_max_files_keeps_complete_coverage_for_both_scanners(
     assert skipped == 0
     assert complete is True
 
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(repository, flags)
-    try:
-        candidates, skipped, complete = (
-            repo_indexer._scan_candidates_from_descriptor(
-                repository,
-                limits,
-                root_descriptor=descriptor,
+    if hasattr(os, "O_DIRECTORY"):
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        descriptor = os.open(repository, flags)
+        try:
+            candidates, skipped, complete = (
+                repo_indexer._scan_candidates_from_descriptor(
+                    repository,
+                    limits,
+                    root_descriptor=descriptor,
+                )
             )
-        )
-    finally:
-        os.close(descriptor)
-    assert [candidate.relative_path for candidate in candidates] == ["only.py"]
-    assert skipped == 0
-    assert complete is True
+        finally:
+            os.close(descriptor)
+        assert [candidate.relative_path for candidate in candidates] == ["only.py"]
+        assert skipped == 0
+        assert complete is True
 
     index = RepositoryIndex(
         project_id="project-1",

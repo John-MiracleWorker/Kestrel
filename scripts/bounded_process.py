@@ -210,7 +210,7 @@ def run_bounded_process(
     cwd: Path,
     environment: Mapping[str, str],
     timeout_seconds: float,
-    termination_grace_seconds: float = 1.0,
+    termination_grace_seconds: float = 3.0,
     capture_limit_bytes: int = DEFAULT_CAPTURE_LIMIT_BYTES,
 ) -> BoundedProcessResult:
     """Run ``command`` and terminate its complete process tree at the deadline."""

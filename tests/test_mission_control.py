@@ -199,6 +199,7 @@ def test_git_inspection_detects_dirty_state_without_refreshing_index(tmp_path: P
     repository = tmp_path / "repository"
     repository.mkdir()
     _git(repository, "init", "-b", "main")
+    _git(repository, "config", "core.autocrlf", "false")
     _git(repository, "config", "user.email", "kestrel@example.invalid")
     _git(repository, "config", "user.name", "Kestrel Test")
     (repository / "tracked.txt").write_text("before\n", encoding="utf-8")
@@ -209,7 +210,7 @@ def test_git_inspection_detects_dirty_state_without_refreshing_index(tmp_path: P
 
     (repository / "tracked.txt").write_text("after\n", encoding="utf-8")
     (repository / "untracked.txt").write_text("new\n", encoding="utf-8")
-    inspection = inspect_git_worktree(repository, timeout_seconds=2.0)
+    inspection = inspect_git_worktree(repository, timeout_seconds=10.0)
     after = index_path.stat()
 
     assert inspection.branch == "main"

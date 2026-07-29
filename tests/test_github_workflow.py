@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -167,9 +168,11 @@ def test_pr_workflow_binds_reviewed_commit_and_ingests_failed_ci(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    git_executable = shutil.which("git")
+    assert git_executable is not None
     monkeypatch.setattr(
         "nested_memvid_agent.engineering.github_workflow.shutil.which",
-        lambda name: "/usr/bin/git" if name == "git" else "/usr/bin/gh",
+        lambda name: git_executable if name == "git" else "/usr/bin/gh",
     )
     state, repo, review_id = _fixture(tmp_path)
     service = GitHubWorkflowService(state)
@@ -251,9 +254,11 @@ def test_pr_preparation_rejects_a_commit_that_expands_reviewed_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    git_executable = shutil.which("git")
+    assert git_executable is not None
     monkeypatch.setattr(
         "nested_memvid_agent.engineering.github_workflow.shutil.which",
-        lambda name: "/usr/bin/git" if name == "git" else "/usr/bin/gh",
+        lambda name: git_executable if name == "git" else "/usr/bin/gh",
     )
     state, repo, review_id = _fixture(tmp_path)
     (repo / "extra.txt").write_text("scope expansion\n", encoding="utf-8")
