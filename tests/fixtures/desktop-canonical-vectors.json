@@ -24,6 +24,13 @@
       }
     }
   },
+  "credential_capability": {
+    "schema": "kestrel.desktop.credential-capability-vector.v1",
+    "api_token": "desktop-test-token-花",
+    "launch_nonce": "nonce-😀-é",
+    "message_utf8_hex": "6b65737472656c2e6465736b746f702e63726564656e7469616c2e77726974652e7631006e6f6e63652df09f98802d65cc81",
+    "hmac_sha256_hex": "2ece138f47fcec072005ad2011c4d0df78671e90c438249cfc7f0355c241f2af"
+  },
   "runtime_profile_identities": [
     {
       "name": "unicode_nfc",

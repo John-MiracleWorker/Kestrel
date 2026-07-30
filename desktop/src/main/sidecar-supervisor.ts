@@ -14,6 +14,7 @@ import type {
   DesktopApiSessionActivation,
   DesktopApiSessionAuthority
 } from "./api-session.js";
+import { deriveDesktopCredentialCapability } from "./credential-api.js";
 import {
   createNodePrivateFileAdapter,
   createPrivateLaunchFiles,
@@ -31,11 +32,18 @@ import {
 } from "./private-files.js";
 import {
   verifyResourceManifest,
+  type VerifiedCredentialAssets,
   type VerifiedRendererAssets,
   type VerifiedResourceFile,
   type VerifiedResourceSet,
   type VerifyResourceManifestInput
 } from "./resource-manifest.js";
+
+export interface VerifiedDesktopSessionResources {
+  readonly rendererAssets: VerifiedRendererAssets;
+  readonly credentialAssets: VerifiedCredentialAssets;
+  readonly credentialPreloadPath: string;
+}
 
 const MEMORY_LAYERS = [
   "working",
@@ -480,7 +488,8 @@ export class SidecarSupervisor {
   private starting = false;
   private stopping = false;
   private generation = 0;
-  private startPromise: Promise<VerifiedRendererAssets> | null = null;
+  private startPromise: Promise<VerifiedDesktopSessionResources> | null =
+    null;
   private stopPromise: Promise<void> | null = null;
   private launchAbort: AbortController | null = null;
 
@@ -507,6 +516,29 @@ export class SidecarSupervisor {
     };
   }
 
+  enterReconciliationRequired(): void {
+    if (
+      this.currentState.kind === "recovery" &&
+      this.currentState.reason === "reconciliation_required"
+    ) {
+      return;
+    }
+    if (
+      this.currentState.kind !== "ready" ||
+      this.active === null ||
+      !this.active.verified ||
+      this.stopping
+    ) {
+      return;
+    }
+    this.dependencies.apiSession.deactivate(this.generation);
+    this.transition({
+      kind: "recovery",
+      reason: "reconciliation_required",
+      detail: "credential_mutation_reconciliation_required"
+    });
+  }
+
   private transition(state: SidecarSupervisorState): void {
     const snapshot = Object.freeze({ ...state }) as SidecarSupervisorState;
     this.currentState = snapshot;
@@ -519,7 +551,7 @@ export class SidecarSupervisor {
     }
   }
 
-  async start(): Promise<VerifiedRendererAssets> {
+  async start(): Promise<VerifiedDesktopSessionResources> {
     if (this.startPromise !== null || this.active !== null) {
       throw new SidecarSupervisorError(
         "sidecar_already_started",
@@ -574,7 +606,7 @@ export class SidecarSupervisor {
   private async launch(
     generation: number,
     signal: AbortSignal
-  ): Promise<VerifiedRendererAssets> {
+  ): Promise<VerifiedDesktopSessionResources> {
     this.starting = true;
     this.transition({ kind: "verifying" });
     let launch: PrivateLaunchFiles | null = null;
@@ -622,6 +654,11 @@ export class SidecarSupervisor {
         parentBirthMarker: parent.processBirthMarker,
         resourceManifestDigest: resources.manifestDigest
       });
+      const credentialCapability =
+        deriveDesktopCredentialCapability(
+          launch.apiToken,
+          launch.launchNonce
+        );
       this.throwIfLaunchCancelled(generation, signal);
       expectedExecutableDigest = sidecar.sha256;
       this.transition({ kind: "starting" });
@@ -681,13 +718,21 @@ export class SidecarSupervisor {
       installBoundedLogReader(
         child.stdout,
         "stdout",
-        [launch.apiToken, launch.launchNonce],
+        [
+          launch.apiToken,
+          launch.launchNonce,
+          credentialCapability
+        ],
         this.dependencies.log
       );
       installBoundedLogReader(
         child.stderr,
         "stderr",
-        [launch.apiToken, launch.launchNonce],
+        [
+          launch.apiToken,
+          launch.launchNonce,
+          credentialCapability
+        ],
         this.dependencies.log
       );
       const active: ActiveSidecar = {
@@ -783,10 +828,20 @@ export class SidecarSupervisor {
         apiReadiness,
         this.config.sidecarVersion
       );
+      const credentialPreload = resources.files.get(
+        "desktop/dist/credential/preload.js"
+      );
+      if (credentialPreload === undefined) {
+        throw new SidecarSupervisorError(
+          "verified_credential_preload_missing",
+          "sidecar_unverified"
+        );
+      }
       active.verified = true;
       const apiSessionActivation: DesktopApiSessionActivation = {
         baseUrl: active.baseUrl,
         apiToken: launch.apiToken,
+        credentialCapability,
         generation
       };
       this.dependencies.apiSession.activate(apiSessionActivation);
@@ -796,7 +851,11 @@ export class SidecarSupervisor {
         baseUrl: active.baseUrl,
         sidecarVersion: this.config.sidecarVersion
       });
-      return resources.rendererAssets;
+      return Object.freeze({
+        rendererAssets: resources.rendererAssets,
+        credentialAssets: resources.credentialAssets,
+        credentialPreloadPath: credentialPreload.path
+      });
     } catch (error) {
       this.dependencies.apiSession.deactivate(generation);
       let surfacedError: unknown =
@@ -937,7 +996,7 @@ export class SidecarSupervisor {
   }
 
   private async stopAfterStartSettles(
-    start: Promise<VerifiedRendererAssets> | null
+    start: Promise<VerifiedDesktopSessionResources> | null
   ): Promise<void> {
     await start?.catch(() => undefined);
     const active = this.active;

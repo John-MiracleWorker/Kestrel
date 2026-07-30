@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -53,9 +53,10 @@ class SetupReadinessReport:
     fail_count: int
     checks: tuple[SetupReadinessCheck, ...]
     next_action: str
+    credential_storage: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema": self.schema,
             "ready": self.ready,
             "experience_mode": self.experience_mode.value,
@@ -65,15 +66,23 @@ class SetupReadinessReport:
             "checks": [check.to_dict() for check in self.checks],
             "next_action": self.next_action,
         }
+        if self.credential_storage is not None:
+            payload["credential_storage"] = dict(
+                self.credential_storage
+            )
+        return payload
 
 
 SecretResolver = Callable[[str | None], str | None]
+SecretStatus = Callable[[str | None], Mapping[str, object]]
 
 
 def build_setup_readiness_report(
     config: AgentConfig,
     *,
     secret_resolver: SecretResolver | None = None,
+    secret_status: SecretStatus | None = None,
+    credential_storage: Mapping[str, object] | None = None,
 ) -> SetupReadinessReport:
     """Inspect non-secret first-run prerequisites for the local product surface.
 
@@ -81,36 +90,50 @@ def build_setup_readiness_report(
     provider metadata, environment-variable presence, and safety-gate flags. It
     never returns secret values and never creates or mutates files/directories.
     """
-    checks = (
-        _provider_check(config, secret_resolver=secret_resolver),
+    storage_payload = _credential_storage_payload(credential_storage)
+    checks_list = [
+        _provider_check(
+            config,
+            secret_resolver=secret_resolver,
+            secret_status=secret_status,
+        ),
         _provider_operational_check(config),
-        _workspace_check(config.workspace),
-        _directory_check(
-            "memory_storage",
-            "Memory storage",
-            config.memory_dir,
-            missing_detail="Memory directory is not present yet.",
-            missing_recovery="Run `nest-agent init` or start a local run so Kestrel can initialize memory layers.",
-        ),
-        _parent_path_check(
-            "state_storage",
-            "State database path",
-            config.state_path,
-            missing_recovery="Create the state parent directory or choose a writable `--state-path`.",
-        ),
-        _parent_path_check(
-            "log_storage",
-            "Log directory path",
-            config.log_dir,
-            missing_recovery="Create the log directory or choose a writable `--log-dir` before relying on diagnostics.",
-            allow_directory_target=True,
-        ),
-        _permission_gate_check(config),
-        _validation_container_check(config),
-        _repair_isolation_check(config),
-        _proactive_routines_check(config),
-        _api_auth_check(config),
+    ]
+    if storage_payload is not None:
+        checks_list.append(
+            _credential_storage_check(storage_payload)
+        )
+    checks_list.extend(
+        [
+            _workspace_check(config.workspace),
+            _directory_check(
+                "memory_storage",
+                "Memory storage",
+                config.memory_dir,
+                missing_detail="Memory directory is not present yet.",
+                missing_recovery="Run `nest-agent init` or start a local run so Kestrel can initialize memory layers.",
+            ),
+            _parent_path_check(
+                "state_storage",
+                "State database path",
+                config.state_path,
+                missing_recovery="Create the state parent directory or choose a writable `--state-path`.",
+            ),
+            _parent_path_check(
+                "log_storage",
+                "Log directory path",
+                config.log_dir,
+                missing_recovery="Create the log directory or choose a writable `--log-dir` before relying on diagnostics.",
+                allow_directory_target=True,
+            ),
+            _permission_gate_check(config),
+            _validation_container_check(config),
+            _repair_isolation_check(config),
+            _proactive_routines_check(config),
+            _api_auth_check(config),
+        ]
     )
+    checks = tuple(checks_list)
     pass_count = sum(1 for check in checks if check.status == SetupReadinessStatus.PASS)
     warn_count = sum(1 for check in checks if check.status == SetupReadinessStatus.WARN)
     fail_count = sum(1 for check in checks if check.status == SetupReadinessStatus.FAIL)
@@ -126,6 +149,7 @@ def build_setup_readiness_report(
         fail_count=fail_count,
         checks=checks,
         next_action=next_action,
+        credential_storage=storage_payload,
     )
 
 
@@ -177,7 +201,12 @@ def _next_action(
     return "Provider and setup prerequisites are ready. Run `kestrel chat`."
 
 
-def _provider_check(config: AgentConfig, *, secret_resolver: SecretResolver | None = None) -> SetupReadinessCheck:
+def _provider_check(
+    config: AgentConfig,
+    *,
+    secret_resolver: SecretResolver | None = None,
+    secret_status: SecretStatus | None = None,
+) -> SetupReadinessCheck:
     provider = config.provider.strip() or "mock"
     if provider == "mock":
         return SetupReadinessCheck(
@@ -195,7 +224,11 @@ def _provider_check(config: AgentConfig, *, secret_resolver: SecretResolver | No
             f"{provider} has a configured base URL and model `{config.model}`.",
             "If the provider requires credentials, store the provider key in Settings or set the configured environment variable before live validation.",
         )
-    if config.api_key_env and _secret_configured(config.api_key_env, secret_resolver=secret_resolver):
+    if config.api_key_env and _secret_configured(
+        config.api_key_env,
+        secret_resolver=secret_resolver,
+        secret_status=secret_status,
+    ):
         return SetupReadinessCheck(
             "provider_configuration",
             "Provider configuration",
@@ -257,14 +290,101 @@ def _provider_operational_check(config: AgentConfig) -> SetupReadinessCheck:
     )
 
 
-def _secret_configured(name_or_ref: str | None, *, secret_resolver: SecretResolver | None = None) -> bool:
+def _secret_configured(
+    name_or_ref: str | None,
+    *,
+    secret_resolver: SecretResolver | None = None,
+    secret_status: SecretStatus | None = None,
+) -> bool:
     if not name_or_ref:
         return False
+    if secret_status is not None:
+        status = secret_status(name_or_ref)
+        return status.get("configured") is True
     if secret_resolver is not None:
         resolved = secret_resolver(name_or_ref)
         if resolved:
             return True
     return bool(os.getenv(name_or_ref))
+
+
+def _credential_storage_payload(
+    raw: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if raw is None:
+        return None
+    state = raw.get("state")
+    backend = raw.get("backend")
+    persistence = raw.get("persistence")
+    reason = raw.get("reason")
+    remediation = raw.get("remediation")
+    if (
+        raw.get("schema")
+        != "kestrel.desktop_credential_readiness.v1"
+        or state
+        not in {
+            "available",
+            "session_only",
+            "locked_vault_required",
+            "unavailable",
+        }
+        or persistence not in {"persistent", "session", "none"}
+        or not isinstance(reason, str)
+        or not reason
+        or len(reason) > 128
+        or not isinstance(remediation, str)
+        or not remediation
+        or len(remediation) > 1024
+        or (
+            backend is not None
+            and (
+                not isinstance(backend, str)
+                or not backend
+                or len(backend) > 128
+            )
+        )
+    ):
+        return {
+            "schema": "kestrel.desktop_credential_readiness.v1",
+            "state": "unavailable",
+            "backend": None,
+            "persistence": "none",
+            "reason": "metadata_invalid",
+            "remediation": (
+                "Repair the Desktop credential readiness metadata "
+                "and retry."
+            ),
+        }
+    return {
+        "schema": "kestrel.desktop_credential_readiness.v1",
+        "state": state,
+        "backend": backend,
+        "persistence": persistence,
+        "reason": reason,
+        "remediation": remediation,
+    }
+
+
+def _credential_storage_check(
+    storage: Mapping[str, object],
+) -> SetupReadinessCheck:
+    state = str(storage["state"])
+    persistence = str(storage["persistence"])
+    status = (
+        SetupReadinessStatus.PASS
+        if state == "available" and persistence == "persistent"
+        else SetupReadinessStatus.WARN
+    )
+    return SetupReadinessCheck(
+        "credential_storage",
+        "Credential storage",
+        status,
+        (
+            f"Credential storage state is {state}; "
+            f"persistence is {persistence}."
+        ),
+        str(storage["remediation"]),
+    )
 
 
 def _workspace_check(path: Path) -> SetupReadinessCheck:

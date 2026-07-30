@@ -191,9 +191,51 @@ describe("sandboxed Desktop preload", () => {
       preload.bridge.openCredentialDialog({
         providerId: "x".repeat(500),
         purpose: "provider_api_key"
-      })
+      } as never)
     ).rejects.toMatchObject({ code: "invalid_desktop_request" });
     expect(ipc.invoke).not.toHaveBeenCalled();
+  });
+
+  it("allows only canonical provider credential intents and normal cancellation", async () => {
+    const { preload, ipc } = harness((channel, request) => {
+      if (channel === DESKTOP_IPC_CHANNELS.credentialDialog) {
+        expect(request).toEqual({
+          schema:
+            "kestrel.desktop.credential-dialog.request.v1",
+          intent: {
+            providerId: "openai",
+            purpose: "provider_api_key"
+          }
+        });
+        return success({ status: "cancelled" });
+      }
+      return success(readyConnection);
+    });
+
+    await expect(
+      preload.bridge.openCredentialDialog({
+        providerId: "openai",
+        purpose: "provider_api_key"
+      })
+    ).resolves.toEqual({ status: "cancelled" });
+
+    for (const providerId of [
+      "mock",
+      "openai-compatible",
+      "OPENAI",
+      " openai",
+      "openai "
+    ]) {
+      await expect(
+        preload.bridge.openCredentialDialog({
+          providerId: providerId as never,
+          purpose: "provider_api_key"
+        })
+      ).rejects.toMatchObject({
+        code: "invalid_desktop_request"
+      });
+    }
+    expect(ipc.invoke).toHaveBeenCalledTimes(1);
   });
 
   it("maps malformed, oversized, and rejected IPC results to fixed local errors", async () => {

@@ -89,6 +89,8 @@ class SecretBroker:
     adapters.
     """
 
+    desktop_readiness: Any | None = None
+
     def __init__(self, vault_path: Path, *, allowed_env_names: set[str] | None = None) -> None:
         self.vault_path = Path(vault_path)
         self.allowed_env_names = {name.strip() for name in (allowed_env_names or set()) if name.strip()}
@@ -225,6 +227,51 @@ class SecretBroker:
             return {"source_env": ref, "configured": False, "validated": False, "source": "unregistered"}
         env_configured = bool(os.getenv(ref, "").strip())
         return {"source_env": ref, "configured": env_configured, "validated": False, "source": "env" if env_configured else "missing"}
+
+    def metadata_status(self, name_or_ref: str | None) -> dict[str, Any]:
+        """Project configuration metadata without routing through `resolve()`."""
+
+        ref = (name_or_ref or "").strip()
+        if not ref:
+            return {"configured": False}
+        data = self._read()
+        record: dict[str, Any] | None = None
+        if is_secret_ref(ref):
+            record = self._record_from_data(
+                data,
+                ref.removeprefix(_SECRET_REF_PREFIX),
+            )
+        else:
+            record = next(
+                (
+                    candidate
+                    for candidate in self._records_from_data(data)
+                    if str(candidate.get("name", "")).strip() == ref
+                ),
+                None,
+            )
+        if record is not None:
+            sid = str(record.get("id", ""))
+            return {
+                "id": sid,
+                "name": str(record.get("name", "")),
+                "secret_ref": f"{_SECRET_REF_PREFIX}{sid}",
+                "configured": bool(
+                    str(record.get("value", "")).strip()
+                ),
+                "validated": bool(record.get("validated", False)),
+                "source": "broker",
+            }
+        configured = (
+            ref in self.allowed_env_names
+            and bool(os.getenv(ref, "").strip())
+        )
+        return {
+            "source_env": ref,
+            "configured": configured,
+            "validated": False,
+            "source": "env" if configured else "missing",
+        }
 
     def _record(self, secret_id: str) -> dict[str, Any] | None:
         return self._record_from_data(self._read(), secret_id)
@@ -530,6 +577,53 @@ class KeyringSecretBroker(SecretBroker):
             if str(record.get("name", "")).strip() == ref:
                 return self._record_keyring_value(record)
         return None
+
+    def metadata_status(self, name_or_ref: str | None) -> dict[str, Any]:
+        """Inspect only durable keyring pointers; never retrieve a value."""
+
+        ref = (name_or_ref or "").strip()
+        if not ref:
+            return {"configured": False}
+        data = self._read()
+        record: dict[str, Any] | None = None
+        if is_secret_ref(ref):
+            record = self._record_from_data(
+                data,
+                ref.removeprefix(_SECRET_REF_PREFIX),
+            )
+        else:
+            record = next(
+                (
+                    candidate
+                    for candidate in self._records_from_data(data)
+                    if str(candidate.get("name", "")).strip() == ref
+                ),
+                None,
+            )
+        if record is not None:
+            sid = str(record.get("id", ""))
+            configured = (
+                self._record_state(record)
+                == _KEYRING_STATE_ACTIVE
+            )
+            return {
+                "id": sid,
+                "name": str(record.get("name", "")),
+                "secret_ref": f"{_SECRET_REF_PREFIX}{sid}",
+                "configured": configured,
+                "validated": bool(record.get("validated", False)),
+                "source": "keyring",
+            }
+        configured = (
+            ref in self.allowed_env_names
+            and bool(os.getenv(ref, "").strip())
+        )
+        return {
+            "source_env": ref,
+            "configured": configured,
+            "validated": False,
+            "source": "env" if configured else "missing",
+        }
 
     def _public(self, record: dict[str, Any], *, salt: str | None = None) -> dict[str, Any]:
         secret_id = str(record.get("id", ""))
@@ -1010,6 +1104,12 @@ def build_secret_broker(
 ) -> SecretBroker:
     env_backend = os.getenv("NEST_AGENT_SECRET_BACKEND") or "json"
     selected = (backend or env_backend).strip().lower()
+    if selected == "desktop":
+        from .desktop_credentials import build_desktop_secret_broker
+
+        return build_desktop_secret_broker(
+            Path(vault_path).parent.parent
+        )
     if selected in {"", "json", "file", "local"}:
         return SecretBroker(vault_path, allowed_env_names=allowed_env_names)
     if selected == "keyring":

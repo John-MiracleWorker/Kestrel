@@ -89,12 +89,59 @@ function harness(): {
 }
 
 describe("Desktop API session authority", () => {
+  it("keeps the credential authority main-only and notifies exact deactivation once", () => {
+    const { authority } = harness();
+    const deactivated: number[] = [];
+    const unsubscribe = authority.subscribeDeactivation((generation) => {
+      deactivated.push(generation);
+    });
+
+    authority.activate({
+      baseUrl: "http://127.0.0.1:43123/",
+      apiToken: "must-never-cross",
+      credentialCapability: "ab".repeat(32),
+      generation: 5
+    });
+
+    const first = authority.credentialAuthority();
+    const second = authority.credentialAuthority();
+    expect(first).toEqual({
+      baseUrl: "http://127.0.0.1:43123/",
+      apiToken: "must-never-cross",
+      credentialCapability: "ab".repeat(32),
+      generation: 5
+    });
+    expect(first).not.toBe(second);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(authority.runtimeMarker()).not.toHaveProperty(
+      "credentialCapability"
+    );
+
+    authority.deactivate(4);
+    expect(deactivated).toEqual([]);
+    authority.deactivate(5);
+    authority.deactivate(5);
+    expect(deactivated).toEqual([5]);
+    expect(authority.credentialAuthority()).toBeNull();
+
+    unsubscribe();
+    authority.activate({
+      baseUrl: "http://127.0.0.1:43124/",
+      apiToken: "replacement",
+      credentialCapability: "cd".repeat(32),
+      generation: 6
+    });
+    authority.deactivate();
+    expect(deactivated).toEqual([5]);
+  });
+
   it("returns only a fresh frozen metadata marker while authority is active", () => {
     const { authority } = harness();
     expect(authority.runtimeMarker()).toBeNull();
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "must-never-cross",
+      credentialCapability: "ab".repeat(32),
       generation: 5
     });
 
@@ -119,6 +166,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
       generation: 1
     });
     authority.bindRenderer(renderer);
@@ -127,12 +175,49 @@ describe("Desktop API session authority", () => {
       requestHeaders: {
         Accept: "application/json",
         aUtHoRiZaTiOn: "Bearer renderer-controlled",
-        "X-kEsTrEl-ApI-kEy": "renderer-controlled"
+        "X-kEsTrEl-ApI-kEy": "renderer-controlled",
+        "x-KESTREL-desktop-CREDENTIAL-capability":
+          "renderer-controlled"
       }
     });
 
     expect(filter).toEqual({ urls: ["<all_urls>"] });
     expect(headers).toEqual({
+      Accept: "application/json",
+      Authorization: "Bearer main-process-token"
+    });
+  });
+
+  it("always strips a renderer-supplied credential capability before authority checks", () => {
+    const { authority, send } = harness();
+    const renderer = new FakeWebContents(18);
+    const headerName =
+      "X-Kestrel-Desktop-Credential-Capability";
+
+    expect(
+      send(renderer, {
+        requestHeaders: {
+          Accept: "application/json",
+          [headerName]: "renderer-controlled"
+        }
+      })
+    ).toEqual({ Accept: "application/json" });
+
+    authority.activate({
+      baseUrl: "http://127.0.0.1:43123/",
+      apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
+      generation: 1
+    });
+    authority.bindRenderer(renderer);
+    expect(
+      send(renderer, {
+        requestHeaders: {
+          Accept: "application/json",
+          [headerName.toLowerCase()]: "renderer-controlled"
+        }
+      })
+    ).toEqual({
       Accept: "application/json",
       Authorization: "Bearer main-process-token"
     });
@@ -188,6 +273,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
       generation: 7
     });
     authority.bindRenderer(renderer);
@@ -211,6 +297,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
       generation: 1
     });
     authority.bindRenderer(registered);
@@ -243,6 +330,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
       generation: 1
     });
     authority.bindRenderer(oldRenderer);
@@ -263,6 +351,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "generation-one-token",
+      credentialCapability: "ab".repeat(32),
       generation: 1
     });
     authority.bindRenderer(renderer);
@@ -275,6 +364,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43124/",
       apiToken: "generation-two-token",
+      credentialCapability: "cd".repeat(32),
       generation: 2
     });
     expect(send(renderer, {
@@ -303,6 +393,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
       generation: 1
     });
     authority.bindRenderer(renderer);
@@ -322,6 +413,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
       generation: 1
     });
     authority.bindRenderer(renderer);
@@ -349,6 +441,7 @@ describe("Desktop API session authority", () => {
     authority.activate({
       baseUrl: "http://127.0.0.1:43123/",
       apiToken: "main-process-token",
+      credentialCapability: "ab".repeat(32),
       generation: 1
     });
     authority.bindRenderer(renderer);
@@ -384,6 +477,7 @@ describe("Desktop API session authority", () => {
       authority.activate({
         baseUrl,
         apiToken: secret,
+        credentialCapability: "ab".repeat(32),
         generation: 1
       })
     ).toThrow("desktop_api_session_activation_invalid");

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  DESKTOP_CREDENTIAL_IPC_CHANNELS,
   desktopConnectionSchema,
+  desktopCredentialIntentSchema,
+  desktopCredentialProviderIdSchema,
+  desktopCredentialResultSchema,
+  desktopErrorCodeSchema,
   desktopLifecycleStateSchema,
   desktopRecoveryReasonSchema,
   desktopRuntimeMarkerSchema,
@@ -118,5 +123,101 @@ describe("desktopConnectionSchema", () => {
     expect(
       desktopRecoveryReasonSchema.parse("reconciliation_required")
     ).toBe("reconciliation_required");
+  });
+});
+
+describe("Desktop credential contracts", () => {
+  const providerIds = [
+    "openai",
+    "openrouter",
+    "deepseek",
+    "kimi",
+    "ollama-cloud",
+    "anthropic",
+    "grok",
+    "gemini"
+  ] as const;
+
+  it("owns the exact provider and purpose allowlist without normalization", () => {
+    expect(desktopCredentialProviderIdSchema.options).toEqual(
+      providerIds
+    );
+    for (const providerId of providerIds) {
+      expect(
+        desktopCredentialIntentSchema.parse({
+          providerId,
+          purpose: "provider_api_key"
+        })
+      ).toEqual({ providerId, purpose: "provider_api_key" });
+    }
+    for (const providerId of [
+      "mock",
+      "ollama",
+      "lm-studio",
+      "codex-cli",
+      "openai-compatible",
+      "OPENAI",
+      " openai",
+      "openai ",
+      "custom"
+    ]) {
+      expect(() =>
+        desktopCredentialIntentSchema.parse({
+          providerId,
+          purpose: "provider_api_key"
+        })
+      ).toThrow();
+    }
+    expect(() =>
+      desktopCredentialIntentSchema.parse({
+        providerId: "openai",
+        purpose: "custom-purpose"
+      })
+    ).toThrow();
+  });
+
+  it("projects only stored metadata or normal cancellation", () => {
+    expect(
+      desktopCredentialResultSchema.parse({
+        status: "stored",
+        secretRef: "secret://openai_api_key",
+        validation: "unverified",
+        fingerprint: "sha256:0123456789ab"
+      })
+    ).toEqual({
+      status: "stored",
+      secretRef: "secret://openai_api_key",
+      validation: "unverified",
+      fingerprint: "sha256:0123456789ab"
+    });
+    expect(
+      desktopCredentialResultSchema.parse({ status: "cancelled" })
+    ).toEqual({ status: "cancelled" });
+    expect(() =>
+      desktopCredentialResultSchema.parse({
+        status: "stored",
+        secretRef: "secret://openai_api_key",
+        validation: "valid",
+        fingerprint: "sha256:0123456789ab",
+        value: "credential-must-not-cross"
+      })
+    ).toThrow();
+  });
+
+  it("uses only the three private credential channels and stable race errors", () => {
+    expect(DESKTOP_CREDENTIAL_IPC_CHANNELS).toEqual({
+      bootstrap: "kestrel:credential:bootstrap",
+      submit: "kestrel:credential:submit",
+      cancel: "kestrel:credential:cancel"
+    });
+    expect(desktopErrorCodeSchema.options).toEqual([
+      "invalid_desktop_request",
+      "invalid_desktop_response",
+      "desktop_sender_untrusted",
+      "desktop_feature_unavailable",
+      "desktop_operation_failed",
+      "desktop_operation_in_progress",
+      "desktop_operation_ambiguous"
+    ]);
   });
 });

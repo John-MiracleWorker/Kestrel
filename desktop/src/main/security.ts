@@ -2,13 +2,18 @@ import type {
   Event as ElectronEvent,
   WebContentsWillFrameNavigateEventParams
 } from "electron";
-import { DESKTOP_APP_HOST, DESKTOP_APP_SCHEME } from "../contracts.js";
+import {
+  DESKTOP_APP_HOST,
+  DESKTOP_APP_SCHEME,
+  DESKTOP_CREDENTIAL_ENTRY_URL
+} from "../contracts.js";
 
 export type NavigationDecision = "allow" | "deny";
 
 export interface PreventableEvent {
   preventDefault(): void;
   url?: string;
+  isMainFrame?: boolean;
 }
 
 export interface RestrictedWebContents {
@@ -59,6 +64,22 @@ export function windowOpenDecision(_value: string): { action: "deny" } {
   return { action: "deny" };
 }
 
+export function credentialNavigationDecision(
+  value: string
+): NavigationDecision {
+  if (value !== DESKTOP_CREDENTIAL_ENTRY_URL) {
+    return "deny";
+  }
+  try {
+    const url = new URL(value);
+    return url.href === DESKTOP_CREDENTIAL_ENTRY_URL
+      ? "allow"
+      : "deny";
+  } catch {
+    return "deny";
+  }
+}
+
 type NavigationListener = {
   (
     event: ElectronEvent<WebContentsWillFrameNavigateEventParams>
@@ -95,4 +116,45 @@ export function installSessionBoundary(session: RestrictedSession): void {
     }
   );
   session.setPermissionCheckHandler(() => false);
+}
+
+export function installCredentialWebContentsBoundary(
+  webContents: RestrictedWebContents
+): void {
+  webContents.on(
+    "will-navigate",
+    (event, deprecatedUrl) => {
+      const target = event.url ?? deprecatedUrl ?? "";
+      if (credentialNavigationDecision(target) === "deny") {
+        event.preventDefault();
+      }
+    }
+  );
+  webContents.on("will-redirect", (event) => {
+    event.preventDefault();
+  });
+  webContents.on(
+    "will-frame-navigate",
+    (event, deprecatedUrl) => {
+      const target = event.url ?? deprecatedUrl ?? "";
+      if (
+        event.isMainFrame !== true ||
+        credentialNavigationDecision(target) === "deny"
+      ) {
+        event.preventDefault();
+      }
+    }
+  );
+  webContents.on("will-attach-webview", (event) => {
+    event.preventDefault();
+  });
+  webContents.setWindowOpenHandler(({ url }) =>
+    windowOpenDecision(url)
+  );
+}
+
+export function installCredentialSessionBoundary(
+  session: RestrictedSession
+): void {
+  installSessionBoundary(session);
 }

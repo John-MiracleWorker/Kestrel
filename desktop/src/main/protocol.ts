@@ -2,13 +2,23 @@ import { extname, posix } from "node:path";
 import {
   DESKTOP_APP_HOST,
   DESKTOP_APP_ORIGIN,
-  DESKTOP_APP_SCHEME
+  DESKTOP_APP_SCHEME,
+  DESKTOP_CREDENTIAL_HOST,
+  DESKTOP_CREDENTIAL_ORIGIN
 } from "../contracts.js";
-import type { VerifiedRendererAssets } from "./resource-manifest.js";
+import type {
+  VerifiedCredentialAssets,
+  VerifiedRendererAssets
+} from "./resource-manifest.js";
 
 export const APP_CONTENT_SECURITY_POLICY =
   "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; " +
   "img-src 'self' data: blob:; connect-src http://127.0.0.1:*; object-src 'none'; " +
+  "base-uri 'none'; form-action 'none'; frame-ancestors 'none';";
+
+export const CREDENTIAL_CONTENT_SECURITY_POLICY =
+  "default-src 'none'; script-src 'self'; style-src 'self'; " +
+  "img-src 'none'; connect-src 'none'; object-src 'none'; " +
   "base-uri 'none'; form-action 'none'; frame-ancestors 'none';";
 
 const allowedAssetTypes = new Set([
@@ -132,18 +142,28 @@ function reviewedRelativeAsset(rawPath: string): string {
   return normalized;
 }
 
-function responseHeaders(contentType: string): HeadersInit {
+function responseHeaders(
+  contentType: string,
+  contentSecurityPolicy = APP_CONTENT_SECURITY_POLICY
+): HeadersInit {
   return {
-    "Content-Security-Policy": APP_CONTENT_SECURITY_POLICY,
+    "Content-Security-Policy": contentSecurityPolicy,
     "Content-Type": contentType,
     "X-Content-Type-Options": "nosniff"
   };
 }
 
-function textResponse(body: string, status: number): Response {
+function textResponse(
+  body: string,
+  status: number,
+  contentSecurityPolicy = APP_CONTENT_SECURITY_POLICY
+): Response {
   return new Response(body, {
     status,
-    headers: responseHeaders("text/plain; charset=utf-8")
+    headers: responseHeaders(
+      "text/plain; charset=utf-8",
+      contentSecurityPolicy
+    )
   });
 }
 
@@ -209,6 +229,79 @@ export async function appProtocolResponse(
   }
 }
 
+const credentialContentTypes = new Map([
+  ["index.html", "text/html; charset=utf-8"],
+  ["form.js", "text/javascript; charset=utf-8"],
+  ["styles.css", "text/css; charset=utf-8"]
+]);
+
+export async function credentialProtocolResponse(
+  request: ProtocolRequest,
+  credentialAssets: VerifiedCredentialAssets
+): Promise<Response> {
+  if (request.method !== "GET") {
+    return textResponse(
+      "Method not allowed",
+      405,
+      CREDENTIAL_CONTENT_SECURITY_POLICY
+    );
+  }
+  let url: URL;
+  try {
+    url = new URL(request.url);
+  } catch {
+    return textResponse(
+      "Bad request",
+      400,
+      CREDENTIAL_CONTENT_SECURITY_POLICY
+    );
+  }
+  if (
+    url.protocol !== `${DESKTOP_APP_SCHEME}:` ||
+    url.hostname !== DESKTOP_CREDENTIAL_HOST ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.port !== "" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    return textResponse(
+      "Bad request",
+      400,
+      CREDENTIAL_CONTENT_SECURITY_POLICY
+    );
+  }
+  const relativePath = [...credentialContentTypes.keys()].find(
+    (candidate) =>
+      request.url ===
+      `${DESKTOP_CREDENTIAL_ORIGIN}/${candidate}`
+  );
+  if (relativePath === undefined) {
+    return textResponse(
+      "Not found",
+      404,
+      CREDENTIAL_CONTENT_SECURITY_POLICY
+    );
+  }
+  const body = credentialAssets.read(relativePath);
+  if (body === undefined) {
+    return textResponse(
+      "Not found",
+      404,
+      CREDENTIAL_CONTENT_SECURITY_POLICY
+    );
+  }
+  const responseBody = Uint8Array.from(body);
+  return new Response(responseBody.buffer, {
+    status: 200,
+    headers: responseHeaders(
+      credentialContentTypes.get(relativePath) ??
+        "application/octet-stream",
+      CREDENTIAL_CONTENT_SECURITY_POLICY
+    )
+  });
+}
+
 export function registerKestrelScheme(registrar: SchemeRegistrar): void {
   registrar.registerSchemesAsPrivileged([
     {
@@ -230,4 +323,34 @@ export function registerAppProtocol(
   registrar.handle(DESKTOP_APP_SCHEME, (request) =>
     appProtocolResponse(request, rendererAssets)
   );
+}
+
+export function registerKestrelProtocol(
+  registrar: ProtocolHandlerRegistrar,
+  assets: {
+    rendererAssets: VerifiedRendererAssets;
+    credentialAssets: VerifiedCredentialAssets;
+  }
+): void {
+  registrar.handle(DESKTOP_APP_SCHEME, async (request) => {
+    let url: URL;
+    try {
+      url = new URL(request.url);
+    } catch {
+      return textResponse("Bad request", 400);
+    }
+    if (url.hostname === DESKTOP_APP_HOST) {
+      return appProtocolResponse(
+        request,
+        assets.rendererAssets
+      );
+    }
+    if (url.hostname === DESKTOP_CREDENTIAL_HOST) {
+      return credentialProtocolResponse(
+        request,
+        assets.credentialAssets
+      );
+    }
+    return textResponse("Bad request", 400);
+  });
 }

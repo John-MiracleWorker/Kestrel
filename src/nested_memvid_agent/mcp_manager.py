@@ -822,7 +822,7 @@ class MCPManager:
                 "use a remote authenticated MCP endpoint or a contained runtime.",
             )
         if (
-            self.secret_backend == "keyring"
+            self.secret_backend in {"keyring", "desktop"}
             and self.secret_store_path is not None
             and _keyring_metadata_has_material(self.secret_store_path)
         ):

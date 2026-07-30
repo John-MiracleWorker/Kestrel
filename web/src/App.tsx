@@ -44,6 +44,7 @@ import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./
 import { MissionControl } from "./mission/MissionControl";
 import type { MissionLaunch } from "./mission/types";
 import { OutcomesDashboard } from "./outcomes/OutcomesDashboard";
+import { readDesktopBridge } from "./platform/desktopBridge";
 import { isDesktopRuntime } from "./platform/runtimeTransport";
 import { RepairReviewPanel } from "./repair/RepairReviewPanel";
 import { RoutingCenter } from "./routing/RoutingCenter";
@@ -171,6 +172,16 @@ const providerOptions: ProviderOption[] = [
   { value: "mock", label: "Mock test mode", group: "Advanced" }
 ];
 const providerOptionMap = Object.fromEntries(providerOptions.map((item) => [item.value, item]));
+const desktopCredentialProviders = new Set([
+  "openai",
+  "openrouter",
+  "deepseek",
+  "kimi",
+  "ollama-cloud",
+  "anthropic",
+  "grok",
+  "gemini"
+]);
 const providerGroups: Array<ProviderOption["group"]> = ["Local", "Cloud", "Advanced"];
 const deterministicModelDefaults: Record<string, string[]> = { mock: ["mock"] };
 const autonomyOptions = [
@@ -374,6 +385,289 @@ const emptySetupDraft: SetupDraft = {
 const DESKTOP_AUTH_RECOVERY_MESSAGE =
   "The Desktop connection needs to be restored. Retry, or restart Kestrel if its local runtime has stopped.";
 
+type StoredDesktopCredential = {
+  status: "stored";
+  secretRef: string;
+  validation: "unverified" | "valid" | "invalid";
+  fingerprint: string;
+};
+
+type DesktopCredentialDialogResult =
+  | StoredDesktopCredential
+  | { status: "cancelled" };
+
+function desktopCredentialDialogResult(
+  value: unknown
+): DesktopCredentialDialogResult {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      ![Object.prototype, null].includes(
+        Object.getPrototypeOf(value)
+      )
+    ) {
+      throw new Error("invalid");
+    }
+    const keys = Reflect.ownKeys(value);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (
+      keys.some((key) => typeof key !== "string") ||
+      Object.values(descriptors).some(
+        (descriptor) => !("value" in descriptor)
+      )
+    ) {
+      throw new Error("invalid");
+    }
+    const status = descriptors.status?.value;
+    if (
+      status === "cancelled" &&
+      keys.length === 1 &&
+      keys[0] === "status"
+    ) {
+      return { status };
+    }
+    const expectedKeys = new Set([
+      "status",
+      "secretRef",
+      "validation",
+      "fingerprint"
+    ]);
+    const secretRef = descriptors.secretRef?.value;
+    const validation = descriptors.validation?.value;
+    const fingerprint = descriptors.fingerprint?.value;
+    if (
+      status !== "stored" ||
+      keys.length !== expectedKeys.size ||
+      keys.some(
+        (key) =>
+          typeof key !== "string" || !expectedKeys.has(key)
+      ) ||
+      typeof secretRef !== "string" ||
+      secretRef.length > 256 ||
+      !/^secret:\/\/[A-Za-z0-9._/-]+$/.test(secretRef) ||
+      !["unverified", "valid", "invalid"].includes(
+        validation
+      ) ||
+      typeof fingerprint !== "string" ||
+      fingerprint.length < 1 ||
+      fingerprint.length > 256
+    ) {
+      throw new Error("invalid");
+    }
+    return {
+      status,
+      secretRef,
+      validation,
+      fingerprint
+    } as StoredDesktopCredential;
+  } catch {
+    throw new Error("desktop_credential_result_invalid");
+  }
+}
+
+function BrowserProviderCredentialForm({
+  apiKeyEnv,
+  providerDisplayName,
+  providerRequiresKey,
+  providerSecretResult,
+  onStored,
+  onError
+}: {
+  apiKeyEnv: string;
+  providerDisplayName: string;
+  providerRequiresKey: boolean;
+  providerSecretResult: SecretRef | null;
+  onStored: (result: SecretRef) => Promise<void>;
+  onError: (error: unknown) => void;
+}) {
+  const [credentialValue, setCredentialValue] =
+    useState("");
+
+  async function storeCredential() {
+    const targetEnv = apiKeyEnv.trim();
+    if (!targetEnv || !credentialValue.trim()) return;
+    try {
+      const result = await postJson<SecretRef>("/api/secrets", {
+        name: targetEnv,
+        purpose: `Enable ${providerDisplayName} as an LLM provider.`,
+        value: credentialValue,
+        validate: true
+      });
+      setCredentialValue("");
+      await onStored(result);
+    } catch (error) {
+      onError(error);
+    }
+  }
+
+  return (
+    <label>
+      Provider API key
+      <div className="model-picker">
+        <input
+          className="input mono"
+          type="password"
+          aria-label="Provider API key"
+          value={credentialValue}
+          placeholder={
+            providerRequiresKey
+              ? `Paste ${apiKeyEnv || "provider key"}`
+              : "No key needed"
+          }
+          disabled={!apiKeyEnv.trim()}
+          autoComplete="off"
+          onChange={(event) =>
+            setCredentialValue(event.target.value)}
+        />
+        <button
+          type="button"
+          className="btn"
+          disabled={
+            !apiKeyEnv.trim() || !credentialValue.trim()
+          }
+          onClick={() => {
+            void storeCredential();
+          }}
+        >
+          Store provider key
+        </button>
+      </div>
+      <span className="model-picker-meta">
+        {providerRequiresKey
+          ? providerSecretResult?.secret_ref ??
+            "Stored in secret broker"
+          : "No key needed"}
+      </span>
+    </label>
+  );
+}
+
+function BrowserSecretMutationForm({
+  variant,
+  onStored,
+  onError
+}: {
+  variant: "advanced" | "settings";
+  onStored: (result: SecretRef) => Promise<void>;
+  onError: (error: unknown) => void;
+}) {
+  const [name, setName] = useState("TELEGRAM_BOT_TOKEN");
+  const [purpose, setPurpose] = useState(
+    "Enable Telegram channel delivery."
+  );
+  const [value, setValue] = useState("");
+  const [validate, setValidate] = useState(true);
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    if (!name.trim() || !value.trim()) return;
+    try {
+      const stored = await postJson<SecretRef>("/api/secrets", {
+        name,
+        purpose,
+        value,
+        validate
+      });
+      setValue("");
+      await onStored(stored);
+    } catch (error) {
+      onError(error);
+    }
+  }
+
+  if (variant === "advanced") {
+    return (
+      <form onSubmit={save} className="stack-form">
+        <div className="field-row">
+          <Field label="Secret name">
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              autoComplete="off"
+            />
+          </Field>
+          <Field label="Purpose">
+            <input
+              value={purpose}
+              onChange={(event) =>
+                setPurpose(event.target.value)}
+            />
+          </Field>
+        </div>
+        <Field
+          label="Secret value"
+          hint="Value is stored by the backend and never returned in API payloads."
+        >
+          <input
+            type="password"
+            value={value}
+            onChange={(event) => setValue(event.target.value)}
+            autoComplete="new-password"
+          />
+        </Field>
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={validate}
+            onChange={(event) =>
+              setValidate(event.target.checked)}
+          />
+          <span>Validate after save</span>
+        </label>
+        <button
+          type="submit"
+          disabled={!name.trim() || !value.trim()}
+        >
+          <KeyRound size={15} /> Store Secret
+        </button>
+      </form>
+    );
+  }
+
+  return (
+    <form className="section-row-group" onSubmit={save}>
+      <label>
+        Secret name
+        <input
+          className="input mono"
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          autoComplete="off"
+        />
+      </label>
+      <label>
+        Purpose
+        <input
+          className="input"
+          value={purpose}
+          onChange={(event) => setPurpose(event.target.value)}
+        />
+      </label>
+      <label>
+        Secret value
+        <input
+          className="input"
+          type="password"
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          autoComplete="new-password"
+        />
+      </label>
+      <label className="settings-inline-action">
+        <span>Broker action</span>
+        <button
+          className="btn primary"
+          type="submit"
+          disabled={!name.trim() || !value.trim()}
+        >
+          Store secret
+        </button>
+      </label>
+    </form>
+  );
+}
+
 export function App() {
   const desktopRuntime = isDesktopRuntime();
   const [error, setError] = useState<string | null>(null);
@@ -440,7 +734,6 @@ export function App() {
   const [model, setModel] = useState("mock");
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKeyEnv, setApiKeyEnv] = useState("");
-  const [providerKeyValue, setProviderKeyValue] = useState("");
   const [providerSecretResult, setProviderSecretResult] = useState<SecretRef | null>(null);
   const [temperature, setTemperature] = useState("0.2");
   const [maxToolRounds, setMaxToolRounds] = useState("6");
@@ -529,10 +822,6 @@ export function App() {
   const [channelResult, setChannelResult] = useState<Record<string, unknown> | null>(null);
   const [telegramWebhookUrl, setTelegramWebhookUrl] = useState("");
   const [telegramActionResult, setTelegramActionResult] = useState<Record<string, unknown> | null>(null);
-  const [secretName, setSecretName] = useState("TELEGRAM_BOT_TOKEN");
-  const [secretPurpose, setSecretPurpose] = useState("Enable Telegram channel delivery.");
-  const [secretValue, setSecretValue] = useState("");
-  const [secretValidate, setSecretValidate] = useState(true);
   const [secretResult, setSecretResult] = useState<SecretRef | null>(null);
 
   const [diagnosisText, setDiagnosisText] = useState("");
@@ -747,7 +1036,6 @@ export function App() {
     setProvider(nextProvider);
     setBaseUrl(nextOption?.baseUrl ?? "");
     setApiKeyEnv(nextOption?.apiKeyEnv ?? "");
-    setProviderKeyValue("");
     setProviderSecretResult(null);
     const suggestions = modelsForProvider(nextProvider, modelCatalogs);
     setModel((current) => {
@@ -1075,7 +1363,6 @@ export function App() {
     setBaseUrl(String(savedSettings.base_url ?? nextProviderOption?.baseUrl ?? ""));
     setApiKeyEnv(String(savedSettings.api_key_env ?? runtimeConfig.provider?.api_key_env ?? nextProviderOption?.apiKeyEnv ?? ""));
     setProviderSecretResult(null);
-    setProviderKeyValue("");
     setTemperature(formatTemperature(savedSettings.temperature ?? runtimeConfig.provider?.temperature ?? 0.2));
     setMaxToolRounds(formatToolRounds(savedSettings.max_tool_rounds ?? runtimeConfig.limits?.max_tool_rounds ?? 6));
     setWorkspace(String(savedSettings.workspace ?? runtimeConfig.paths?.workspace ?? ""));
@@ -1167,7 +1454,7 @@ export function App() {
         provider,
         model: model.trim() || "mock",
         base_url: baseUrl.trim() || null,
-        api_key_env: apiKeyEnv.trim() || null,
+        api_key_env: effectiveApiKeyEnv.trim() || null,
         temperature: coerceTemperature(temperature),
         max_tool_rounds: coerceToolRounds(maxToolRounds),
         backend: memoryBackendDraft === "Memvid" ? "memvid" : "memory",
@@ -1182,21 +1469,44 @@ export function App() {
     }, "Settings saved and applied to new runs.");
   }
 
-  async function storeProviderKey() {
-    const targetEnv = apiKeyEnv.trim();
-    if (!targetEnv || !providerKeyValue.trim()) return;
+  async function storeDesktopProviderKey() {
+    if (
+      !desktopRuntime ||
+      !desktopCredentialProviders.has(provider)
+    ) {
+      return;
+    }
     await guarded(async () => {
-      const result = await postJson<SecretRef>("/api/secrets", {
-        name: targetEnv,
-        purpose: `Enable ${providerDisplayName} as an LLM provider.`,
-        value: providerKeyValue,
-        validate: true
+      const bridge = readDesktopBridge();
+      if (bridge === null) {
+        throw new Error("desktop_bridge_unavailable");
+      }
+      const result = desktopCredentialDialogResult(
+        await bridge.openCredentialDialog({
+          providerId: provider,
+          purpose: "provider_api_key"
+        })
+      );
+      if (result.status === "cancelled") {
+        setNotice("Credential entry cancelled.");
+        return;
+      }
+      const canonicalName =
+        providerOptionMap[provider]?.apiKeyEnv ?? "";
+      setProviderSecretResult({
+        id: result.secretRef.slice("secret://".length),
+        name: canonicalName,
+        purpose: "Provider API key",
+        secret_ref: result.secretRef,
+        configured: true,
+        validated: result.validation === "valid",
+        fingerprint: result.fingerprint,
+        source: "desktop_keyring"
       });
-      setProviderSecretResult(result);
-      setProviderKeyValue("");
+      setNotice("Provider key stored.");
       await refreshProviderModels(provider);
       await refreshSummary();
-    }, "Provider key stored.");
+    });
   }
 
   async function guarded(action: () => Promise<void>, success?: string) {
@@ -1804,22 +2114,18 @@ export function App() {
     return Boolean((status as Record<string, unknown>)[key]);
   }
 
-  async function saveSecret(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const saved = await postJson<SecretRef>("/api/secrets", {
-        name: secretName,
-        purpose: secretPurpose,
-        value: secretValue,
-        validate: secretValidate
-      });
-      setSecretResult(saved);
-      setSecretValue("");
-      await refreshSummary();
-    }, "Secret stored.");
+  async function acceptBrowserSecret(saved: SecretRef) {
+    setSecretResult(saved);
+    setNotice("Secret stored.");
+    await refreshSummary();
   }
 
   async function validateSecret(secret: SecretRef) {
+    if (desktopRuntime) {
+      throw new Error(
+        "desktop_generic_secret_mutation_unavailable"
+      );
+    }
     await guarded(async () => {
       const result = await postJson<SecretRef>(`/api/secrets/${encodeURIComponent(secret.id)}/validate`);
       setSecretResult(result);
@@ -1828,6 +2134,11 @@ export function App() {
   }
 
   async function deleteSecret(secret: SecretRef) {
+    if (desktopRuntime) {
+      throw new Error(
+        "desktop_generic_secret_mutation_unavailable"
+      );
+    }
     await guarded(async () => {
       await deleteJson(`/api/secrets/${encodeURIComponent(secret.id)}`);
       setSecretResult(null);
@@ -1917,12 +2228,28 @@ export function App() {
   const featureFlags = runtimeConfig?.feature_flags ?? {};
   const selectedProviderOption = providerOptionMap[provider] ?? null;
   const providerDisplayName = selectedProviderOption?.label ?? provider;
+  const canonicalDesktopApiKeyEnv =
+    selectedProviderOption?.apiKeyEnv ?? "";
+  const effectiveApiKeyEnv = desktopRuntime
+    ? canonicalDesktopApiKeyEnv
+    : apiKeyEnv;
   const selectedProviderCatalog = providerCatalog?.provider === provider ? providerCatalog : null;
-  const providerRequiresKey = Boolean(selectedProviderOption?.requiresKey || apiKeyEnv.trim());
+  const providerRequiresKey = Boolean(
+    selectedProviderOption?.requiresKey ||
+      effectiveApiKeyEnv.trim()
+  );
   const providerKeyConfigured =
     selectedProviderCatalog?.api_key_configured ??
     (String(runtimeProvider.name ?? "") === provider ? Boolean(runtimeProvider.api_key_configured) : false);
   const providerKeyStatus = providerRequiresKey ? (providerKeyConfigured ? "configured" : "missing") : "not needed";
+  const desktopCredentialStorageHint =
+    setupReadiness?.credential_storage?.state ===
+    "session_only"
+      ? "Credentials are stored for this session only."
+      : setupReadiness?.credential_storage?.state ===
+          "available"
+        ? "Credentials use persistent platform storage."
+        : "Credential storage needs attention.";
   const activeDeltaCount = behaviorDeltaReport?.summary.active_deltas ?? 0;
   const totalDeltaCount = behaviorDeltaReport?.summary.total_deltas ?? 0;
   const pendingApprovalCount = approvals.filter((approval) => approval.status === "pending").length;
@@ -2868,31 +3195,18 @@ export function App() {
             {toolResult ? <JsonBlock value={toolResult} maxHeight="520px" /> : <EmptyState>No tool invoked from the UI yet.</EmptyState>}
           </Panel>
           <Panel title="Secret Broker" icon={<KeyRound size={19} />}>
-            <form onSubmit={saveSecret} className="stack-form">
-              <div className="field-row">
-                <Field label="Secret name">
-                  <input value={secretName} onChange={(event) => setSecretName(event.target.value)} autoComplete="off" />
-                </Field>
-                <Field label="Purpose">
-                  <input value={secretPurpose} onChange={(event) => setSecretPurpose(event.target.value)} />
-                </Field>
-              </div>
-              <Field label="Secret value" hint="Value is stored by the backend and never returned in API payloads.">
-                <input
-                  type="password"
-                  value={secretValue}
-                  onChange={(event) => setSecretValue(event.target.value)}
-                  autoComplete="new-password"
-                />
-              </Field>
-              <label className="check-row">
-                <input type="checkbox" checked={secretValidate} onChange={(event) => setSecretValidate(event.target.checked)} />
-                <span>Validate after save</span>
-              </label>
-              <button type="submit" disabled={!secretName.trim() || !secretValue.trim()}>
-                <KeyRound size={15} /> Store Secret
-              </button>
-            </form>
+            {desktopRuntime ? (
+              <EmptyState>
+                Provider credentials are added from Provider
+                settings through the isolated Desktop dialog.
+              </EmptyState>
+            ) : (
+              <BrowserSecretMutationForm
+                variant="advanced"
+                onStored={acceptBrowserSecret}
+                onError={reportError}
+              />
+            )}
             <div className="list separated">
               {secrets.length === 0 ? (
                 <EmptyState>No brokered secrets configured.</EmptyState>
@@ -2902,10 +3216,12 @@ export function App() {
                     <strong>{secret.name}</strong>
                     <InlineMeta items={[secret.secret_ref, secret.configured ? "configured" : "missing", secret.validated ? "validated" : "unvalidated"]} />
                     {secret.purpose && <p>{secret.purpose}</p>}
-                    <div className="page-actions">
-                      <button type="button" onClick={() => validateSecret(secret)}>Validate</button>
-                      <button type="button" className="btn danger" onClick={() => deleteSecret(secret)}>Delete</button>
-                    </div>
+                    {!desktopRuntime && (
+                      <div className="page-actions">
+                        <button type="button" onClick={() => validateSecret(secret)}>Validate</button>
+                        <button type="button" className="btn danger" onClick={() => deleteSecret(secret)}>Delete</button>
+                      </div>
+                    )}
                   </div>
                 ))
               )}
@@ -3385,37 +3701,58 @@ export function App() {
                     <input
                       className="input mono"
                       type="text"
-                      value={apiKeyEnv}
+                      value={effectiveApiKeyEnv}
                       placeholder={providerRequiresKey ? "API_KEY_ENV" : "not required"}
-                      onChange={(event) => setApiKeyEnv(event.target.value)}
+                      readOnly={desktopRuntime}
+                      onChange={(event) => {
+                        if (!desktopRuntime) {
+                          setApiKeyEnv(event.target.value);
+                        }
+                      }}
                     />
                   </label>
-                  <label>
-                    Provider API key
-                    <div className="model-picker">
-                      <input
-                        className="input mono"
-                        type="password"
-                        aria-label="Provider API key"
-                        value={providerKeyValue}
-                        placeholder={providerRequiresKey ? `Paste ${apiKeyEnv || "provider key"}` : "No key needed"}
-                        disabled={!apiKeyEnv.trim()}
-                        autoComplete="off"
-                        onChange={(event) => setProviderKeyValue(event.target.value)}
-                      />
-                      <button
-                        type="button"
-                        className="btn"
-                        disabled={!apiKeyEnv.trim() || !providerKeyValue.trim()}
-                        onClick={() => storeProviderKey().catch(reportError)}
-                      >
-                        Store provider key
-                      </button>
+                  {desktopRuntime ? (
+                    <div>
+                      <span>Provider credential</span>
+                      <div className="model-picker">
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={
+                            !desktopCredentialProviders.has(
+                              provider
+                            )
+                          }
+                          onClick={() => {
+                            void storeDesktopProviderKey();
+                          }}
+                        >
+                          Store provider key
+                        </button>
+                      </div>
+                      <span className="model-picker-meta">
+                        {desktopCredentialProviders.has(provider)
+                          ? providerSecretResult?.secret_ref ??
+                            desktopCredentialStorageHint
+                          : "Credential entry is unavailable for this provider"}
+                      </span>
                     </div>
-                    <span className="model-picker-meta">
-                      {providerRequiresKey ? (providerSecretResult?.secret_ref ?? "Stored in secret broker") : "No key needed"}
-                    </span>
-                  </label>
+                  ) : (
+                    <BrowserProviderCredentialForm
+                      key={`${provider}:${effectiveApiKeyEnv}`}
+                      apiKeyEnv={effectiveApiKeyEnv}
+                      providerDisplayName={providerDisplayName}
+                      providerRequiresKey={providerRequiresKey}
+                      providerSecretResult={providerSecretResult}
+                      onStored={async (result) => {
+                        setProviderSecretResult(result);
+                        setNotice("Provider key stored.");
+                        await refreshProviderModels(provider);
+                        await refreshSummary();
+                      }}
+                      onError={reportError}
+                    />
+                  )}
                   <label>
                     Temperature
                     <input
@@ -3447,6 +3784,34 @@ export function App() {
                     <span className="settings-status"><StatusBadge value={providerKeyStatus} /></span>
                   </label>
                 </div>
+                {desktopRuntime && (
+                  <div className="row">
+                    <div className="row-label">
+                      <strong>Credential storage</strong>
+                      <p>
+                        {setupReadiness?.credential_storage
+                          ?.remediation ??
+                          "Credential storage readiness is unavailable. Refresh Settings or restart Kestrel."}
+                      </p>
+                    </div>
+                    <div className="row-control">
+                      <StatusBadge
+                        value={
+                          setupReadiness?.credential_storage
+                            ?.state ?? "unavailable"
+                        }
+                      />
+                      <InlineMeta
+                        items={[
+                          setupReadiness?.credential_storage
+                            ?.backend,
+                          setupReadiness?.credential_storage
+                            ?.persistence
+                        ]}
+                      />
+                    </div>
+                  </div>
+                )}
                 <div className="row">
                   <div className="row-label">
                     <strong>Stream responses</strong>
@@ -3731,24 +4096,27 @@ export function App() {
                 <span className="anchor">/api/secrets</span>
               </div>
               <div className="section-body">
-                <form className="section-row-group" onSubmit={saveSecret}>
-                  <label>
-                    Secret name
-                    <input className="input mono" value={secretName} onChange={(event) => setSecretName(event.target.value)} autoComplete="off" />
-                  </label>
-                  <label>
-                    Purpose
-                    <input className="input" value={secretPurpose} onChange={(event) => setSecretPurpose(event.target.value)} />
-                  </label>
-                  <label>
-                    Secret value
-                    <input className="input" type="password" value={secretValue} onChange={(event) => setSecretValue(event.target.value)} autoComplete="new-password" />
-                  </label>
-                  <label className="settings-inline-action">
-                    <span>Broker action</span>
-                    <button className="btn primary" type="submit" disabled={!secretName.trim() || !secretValue.trim()}>Store secret</button>
-                  </label>
-                </form>
+                {desktopRuntime ? (
+                  <div className="row">
+                    <div className="row-label">
+                      <strong>
+                        Provider credentials are added from
+                        Provider settings.
+                      </strong>
+                      <p>
+                        Desktop uses an isolated credential
+                        dialog and does not expose generic secret
+                        mutation in this renderer.
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <BrowserSecretMutationForm
+                    variant="settings"
+                    onStored={acceptBrowserSecret}
+                    onError={reportError}
+                  />
+                )}
                 {secrets.length === 0 ? (
                   <div className="row"><div className="row-label"><strong>No brokered secrets configured.</strong><p>Values saved here are stored by the backend and never echoed back.</p></div></div>
                 ) : (
@@ -3760,7 +4128,9 @@ export function App() {
                       </div>
                       <div className="row-control">
                         <StatusBadge value={secret.validated ? "validated" : secret.configured ? "stored" : "missing"} />
-                        <button className="btn" type="button" onClick={() => validateSecret(secret)}>Validate</button>
+                        {!desktopRuntime && (
+                          <button className="btn" type="button" onClick={() => validateSecret(secret)}>Validate</button>
+                        )}
                       </div>
                     </div>
                   ))

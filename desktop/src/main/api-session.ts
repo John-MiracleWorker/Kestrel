@@ -32,13 +32,25 @@ export interface ApiSessionWebRequest {
 export interface DesktopApiSessionActivation {
   baseUrl: string;
   apiToken: string;
+  credentialCapability: string;
   generation: number;
+}
+
+export interface DesktopCredentialSessionAuthority {
+  readonly baseUrl: string;
+  readonly apiToken: string;
+  readonly credentialCapability: string;
+  readonly generation: number;
 }
 
 export interface DesktopApiSessionAuthority {
   activate(activation: DesktopApiSessionActivation): void;
   deactivate(generation?: number): void;
   bindRenderer(webContents: ApiSessionWebContents): () => void;
+  credentialAuthority(): DesktopCredentialSessionAuthority | null;
+  subscribeDeactivation(
+    listener: (generation: number) => void
+  ): () => void;
   runtimeMarker(): DesktopRuntimeMarker | null;
 }
 
@@ -46,6 +58,7 @@ interface ActiveAuthority {
   baseUrl: string;
   origin: string;
   apiToken: string;
+  credentialCapability: string;
   generation: number;
 }
 
@@ -56,7 +69,8 @@ interface RendererBinding {
 
 const AUTHORITY_HEADER_NAMES = new Set([
   "authorization",
-  "x-kestrel-api-key"
+  "x-kestrel-api-key",
+  "x-kestrel-desktop-credential-capability"
 ]);
 
 function invalidActivation(): Error {
@@ -71,12 +85,14 @@ function parseActivation(
     activation === null ||
     typeof activation.baseUrl !== "string" ||
     typeof activation.apiToken !== "string" ||
+    typeof activation.credentialCapability !== "string" ||
     !Number.isSafeInteger(activation.generation) ||
     activation.generation <= 0 ||
     activation.apiToken.length === 0 ||
     activation.apiToken.length > 4_096 ||
     activation.apiToken.trim() !== activation.apiToken ||
-    /[\r\n]/.test(activation.apiToken)
+    /[\r\n]/.test(activation.apiToken) ||
+    !/^[0-9a-f]{64}$/.test(activation.credentialCapability)
   ) {
     throw invalidActivation();
   }
@@ -103,6 +119,7 @@ function parseActivation(
     baseUrl: activation.baseUrl,
     origin: parsed.origin,
     apiToken: activation.apiToken,
+    credentialCapability: activation.credentialCapability,
     generation: activation.generation
   };
 }
@@ -162,6 +179,19 @@ export function installDesktopApiSession(
   let active: ActiveAuthority | null = null;
   let highestGeneration = 0;
   const bindings = new Map<number, RendererBinding>();
+  const deactivationListeners = new Set<
+    (generation: number) => void
+  >();
+
+  const notifyDeactivation = (generation: number): void => {
+    for (const listener of [...deactivationListeners]) {
+      try {
+        listener(generation);
+      } catch {
+        // A lifecycle observer cannot retain API authority.
+      }
+    }
+  };
 
   webRequest.onBeforeSendHeaders(
     { urls: ["<all_urls>"] },
@@ -197,7 +227,11 @@ export function installDesktopApiSession(
 
   const authority: DesktopApiSessionAuthority = {
     activate(activation): void {
+      const previous = active;
       active = null;
+      if (previous !== null) {
+        notifyDeactivation(previous.generation);
+      }
       const next = parseActivation(activation);
       if (next.generation <= highestGeneration) {
         throw invalidActivation();
@@ -210,7 +244,9 @@ export function installDesktopApiSession(
         active !== null &&
         (generation === undefined || generation === active.generation)
       ) {
+        const deactivatedGeneration = active.generation;
         active = null;
+        notifyDeactivation(deactivatedGeneration);
       }
     },
     bindRenderer(webContents): () => void {
@@ -240,6 +276,28 @@ export function installDesktopApiSession(
       };
       webContents.once("destroyed", unbind);
       return unbind;
+    },
+    credentialAuthority(): DesktopCredentialSessionAuthority | null {
+      if (active === null) {
+        return null;
+      }
+      return Object.freeze({
+        baseUrl: active.baseUrl,
+        apiToken: active.apiToken,
+        credentialCapability: active.credentialCapability,
+        generation: active.generation
+      });
+    },
+    subscribeDeactivation(listener): () => void {
+      deactivationListeners.add(listener);
+      let subscribed = true;
+      return (): void => {
+        if (!subscribed) {
+          return;
+        }
+        subscribed = false;
+        deactivationListeners.delete(listener);
+      };
     },
     runtimeMarker(): DesktopRuntimeMarker | null {
       if (active === null) {

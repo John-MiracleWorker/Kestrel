@@ -10,12 +10,20 @@ import {
   session,
   shell
 } from "electron";
-import type { DesktopUpdateStatus } from "./contracts.js";
+import type {
+  BrowserWindowConstructorOptions,
+  Event as ElectronEvent
+} from "electron";
 import {
-  registerAppProtocol,
+  DESKTOP_CREDENTIAL_VALUE_BYTES,
+  type DesktopUpdateStatus
+} from "./contracts.js";
+import {
+  registerKestrelProtocol,
   registerKestrelScheme
 } from "./main/protocol.js";
 import {
+  installCredentialWebContentsBoundary,
   installSessionBoundary,
   installWebContentsBoundary,
   type RestrictedSession,
@@ -43,10 +51,24 @@ import {
   openReviewedExternalUrl,
   projectDesktopConnection,
   unavailableDesktopFeature,
+  installCredentialIpc,
+  type CredentialIpcBinding,
+  type CredentialIpcMain,
+  type CredentialIpcWebContents,
   type DesktopIpcAuthority,
   type DesktopIpcMain,
   type DesktopIpcWebContents
 } from "./main/ipc.js";
+import {
+  createDesktopCredentialApiClient,
+  credentialProviderAuthority
+} from "./main/credential-api.js";
+import {
+  createCredentialDialogController,
+  createCredentialWindow,
+  type CredentialDialogController
+} from "./main/credential-window.js";
+import type { VerifiedDesktopSessionResources } from "./main/sidecar-supervisor.js";
 
 const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
 const RELEASE_MANIFEST_KEY_ID = "release";
@@ -84,7 +106,14 @@ async function createPackagedSidecarSupervisor(
       manifestPath: join(resourceRoot, "kestrel-resource-manifest.json"),
       signaturePath: join(resourceRoot, "kestrel-resource-manifest.sig"),
       trustedKeys: new Map([[RELEASE_MANIFEST_KEY_ID, publicKey]]),
-      requiredFiles: [sidecarRelativePath, "web/dist/index.html"]
+      requiredFiles: [
+        sidecarRelativePath,
+        "web/dist/index.html",
+        "desktop/dist/credential/index.html",
+        "desktop/dist/credential/form.js",
+        "desktop/dist/credential/styles.css",
+        "desktop/dist/credential/preload.js"
+      ]
     },
     profile: {
       profileId: "default",
@@ -119,6 +148,9 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   let apiSession: DesktopApiSessionAuthority | null = null;
   let desktopIpc: DesktopIpcAuthority | null = null;
+  let credentialDialog: CredentialDialogController | null = null;
+  let verifiedDesktopResources: VerifiedDesktopSessionResources | null =
+    null;
   const windows = createSingleWindowController(() => {
     const created = createAppWindow({
       createWindow: (options) =>
@@ -177,6 +209,7 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.on("before-quit", (event) => {
+    credentialDialog?.abort();
     if (quitAfterStop || supervisor === null) {
       return;
     }
@@ -207,6 +240,126 @@ if (!app.requestSingleInstanceLock()) {
         defaultSession.webRequest as unknown as ApiSessionWebRequest
       );
       supervisor = await createPackagedSidecarSupervisor(apiSession);
+      const credentialClient = createDesktopCredentialApiClient({
+        readAuthority: () =>
+          apiSession?.credentialAuthority() ?? null,
+        fetch: (url, init) => fetch(url, init)
+      });
+      credentialDialog = createCredentialDialogController({
+        currentGeneration: () =>
+          apiSession?.runtimeMarker()?.generation ?? null,
+        openModal(intent, callbacks) {
+          const parent = windows.current();
+          const resources = verifiedDesktopResources;
+          if (
+            parent === null ||
+            parent.isDestroyed() ||
+            resources === null
+          ) {
+            throw new Error("credential_window_unavailable");
+          }
+          const provider = credentialProviderAuthority(
+            intent.providerId
+          );
+          let credentialBinding: CredentialIpcBinding | null =
+            null;
+          let ownerCloseBlocked = false;
+          let cleaned = false;
+          const preventOwnerClose = (
+            event: ElectronEvent
+          ): void => {
+            event.preventDefault();
+          };
+          const ownerClosed = (): void => {
+            credentialDialog?.abort();
+          };
+          const cleanup = (): void => {
+            if (cleaned) {
+              return;
+            }
+            cleaned = true;
+            credentialBinding?.dispose();
+            credentialBinding = null;
+            if (ownerCloseBlocked) {
+              parent.removeListener(
+                "close",
+                preventOwnerClose
+              );
+              ownerCloseBlocked = false;
+            }
+            parent.removeListener("closed", ownerClosed);
+          };
+          const opened = createCredentialWindow({
+            parent,
+            preloadPath: resources.credentialPreloadPath,
+            createWindow: (options) => {
+              const created = new BrowserWindow(
+                options as BrowserWindowConstructorOptions
+              );
+              return created;
+            },
+            installCredentialSecurity: (webContents) => {
+              installCredentialWebContentsBoundary(
+                webContents as RestrictedWebContents
+              );
+            },
+            bindCredentialIpc: (webContents) => {
+              credentialBinding = installCredentialIpc(
+                ipcMain as unknown as CredentialIpcMain,
+                {
+                  webContents:
+                    webContents as unknown as CredentialIpcWebContents,
+                  context: Object.freeze({
+                    schema: "kestrel.credential.context.v1",
+                    providerId: provider.providerId,
+                    providerLabel: provider.label,
+                    inputLabel: `${provider.label} API key`,
+                    maxUtf8Bytes:
+                      DESKTOP_CREDENTIAL_VALUE_BYTES
+                  }),
+                  submit: callbacks.onSubmit,
+                  cancel: callbacks.onCancel
+                }
+              );
+              return () => {
+                credentialBinding?.dispose();
+              };
+            },
+            onFailure: callbacks.onFailure
+          });
+          const modal =
+            opened.window as unknown as BrowserWindow;
+          parent.once("closed", ownerClosed);
+          modal.once("closed", () => {
+            cleanup();
+            callbacks.onClose();
+          });
+          void opened.loaded.catch(() => undefined);
+          return Object.freeze({
+            close(): void {
+              cleanup();
+              if (!modal.isDestroyed()) {
+                modal.close();
+              }
+            },
+            preventOwnerClose(): void {
+              if (ownerCloseBlocked) {
+                return;
+              }
+              ownerCloseBlocked = true;
+              parent.on("close", preventOwnerClose);
+            }
+          });
+        },
+        storeProviderCredential: (request) =>
+          credentialClient.storeProviderCredential(request),
+        enterReconciliationRequired: () => {
+          supervisor?.enterReconciliationRequired();
+        },
+        subscribeDeactivation: (listener) =>
+          apiSession?.subscribeDeactivation(listener) ??
+          (() => undefined)
+      });
       desktopIpc = installDesktopIpc(
         ipcMain as unknown as DesktopIpcMain,
         {
@@ -273,8 +426,14 @@ if (!app.requestSingleInstanceLock()) {
           exportSupportBundle: async () =>
             unavailableDesktopFeature(),
           getAppVersion: () => app.getVersion(),
-          openCredentialDialog: async () =>
-            unavailableDesktopFeature(),
+          openCredentialDialog: (intent) => {
+            if (credentialDialog === null) {
+              return Promise.reject(
+                new Error("credential_dialog_unavailable")
+              );
+            }
+            return credentialDialog.open(intent);
+          },
           openExternalUrl: async (request) => {
             await openReviewedExternalUrl(
               request,
@@ -295,8 +454,9 @@ if (!app.requestSingleInstanceLock()) {
           }
           return supervisor.start();
         },
-        registerVerifiedProtocol(rendererAssets) {
-          registerAppProtocol(protocol, rendererAssets);
+        registerVerifiedProtocol(resources) {
+          verifiedDesktopResources = resources;
+          registerKestrelProtocol(protocol, resources);
         },
         openWindow() {
           desktopReady = true;

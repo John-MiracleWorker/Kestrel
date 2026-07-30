@@ -978,6 +978,12 @@ def test_desktop_server_uses_bootstrap_settings_and_locks_memvid_paths(
 ) -> None:
     launch = _launch(tmp_path)
     base = build_desktop_agent_config(launch)
+    assert base.secret_backend == "desktop"
+    assert base.secret_store_path == (
+        launch.profile_root
+        / "secrets"
+        / "desktop-keyring-metadata.json"
+    )
     outside_memory = tmp_path / "outside-memory"
     configured = replace(
         base,
@@ -1009,6 +1015,12 @@ def test_desktop_server_uses_bootstrap_settings_and_locks_memvid_paths(
     assert captured[0].backend == "memvid"
     assert captured[0].memory_dir == launch.memory_dir
     assert captured[0].state_path == launch.state_path
+    assert captured[0].secret_backend == "desktop"
+    assert captured[0].secret_store_path == (
+        launch.profile_root
+        / "secrets"
+        / "desktop-keyring-metadata.json"
+    )
 
 
 def test_desktop_runtime_update_canonicalizes_memory_authority_everywhere(

@@ -1,0 +1,410 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  DESKTOP_CREDENTIAL_IPC_CHANNELS,
+  type DesktopCredentialContext
+} from "../contracts";
+import {
+  installCredentialIpc,
+  type CredentialIpcEvent,
+  type CredentialIpcMain,
+  type CredentialIpcWebContents
+} from "./credential-ipc";
+
+const context: DesktopCredentialContext = {
+  schema: "kestrel.credential.context.v1",
+  providerId: "openai",
+  providerLabel: "OpenAI",
+  inputLabel: "OpenAI API key",
+  maxUtf8Bytes: 16_384
+};
+
+class FakeWebContents implements CredentialIpcWebContents {
+  destroyed = false;
+  mainFrame: {
+    url: string;
+    processId: number;
+    routingId: number;
+    isMainFrame: boolean;
+  };
+
+  constructor(readonly id: number) {
+    this.mainFrame = {
+      url: "kestrel://credential/index.html",
+      processId: 1_000 + id,
+      routingId: 2_000 + id,
+      isMainFrame: true
+    };
+  }
+
+  isDestroyed(): boolean {
+    return this.destroyed;
+  }
+}
+
+function eventFor(
+  webContents: FakeWebContents,
+  overrides: Partial<CredentialIpcEvent> = {}
+): CredentialIpcEvent {
+  return {
+    sender: webContents,
+    senderFrame: { ...webContents.mainFrame },
+    ...overrides
+  };
+}
+
+function harness(
+  overrides: Partial<{
+    submit(valueBytes: Uint8Array): Promise<void>;
+    cancel(): void;
+  }> = {}
+): {
+  webContents: FakeWebContents;
+  handlers: Map<
+    string,
+    (
+      event: CredentialIpcEvent,
+      request: unknown
+    ) => Promise<unknown>
+  >;
+  removed: string[];
+  submit: ReturnType<typeof vi.fn>;
+  cancel: ReturnType<typeof vi.fn>;
+  dispose(): void;
+} {
+  const handlers = new Map<
+    string,
+    (
+      event: CredentialIpcEvent,
+      request: unknown
+    ) => Promise<unknown>
+  >();
+  const removed: string[] = [];
+  const ipcMain: CredentialIpcMain = {
+    handle(
+      channel: string,
+      listener: (
+        event: CredentialIpcEvent,
+        request: unknown
+      ) => Promise<unknown>
+    ) {
+      handlers.set(channel, listener);
+    },
+    removeHandler(channel: string) {
+      removed.push(channel);
+      handlers.delete(channel);
+    }
+  };
+  const webContents = new FakeWebContents(71);
+  const submit = vi.fn(
+    overrides.submit ?? (async () => undefined)
+  );
+  const cancel = vi.fn(overrides.cancel ?? (() => undefined));
+  const authority = installCredentialIpc(ipcMain, {
+    webContents,
+    context,
+    submit,
+    cancel
+  });
+  return {
+    webContents,
+    handlers,
+    removed,
+    submit,
+    cancel,
+    dispose: authority.dispose
+  };
+}
+
+describe("credential-only main IPC", () => {
+  it("registers and disposes only the exact three private channels", () => {
+    const { handlers, removed, dispose } = harness();
+
+    expect([...handlers.keys()].sort()).toEqual(
+      Object.values(DESKTOP_CREDENTIAL_IPC_CHANNELS).sort()
+    );
+    expect(handlers).not.toHaveProperty(
+      "kestrel:desktop:credential-dialog"
+    );
+
+    dispose();
+    dispose();
+    expect(removed.sort()).toEqual(
+      Object.values(DESKTOP_CREDENTIAL_IPC_CHANNELS).sort()
+    );
+    expect(handlers.size).toBe(0);
+  });
+
+  it("returns only bounded metadata and normal cancel acknowledgement to the exact live main frame", async () => {
+    const {
+      webContents,
+      handlers,
+      cancel
+    } = harness();
+
+    await expect(
+      handlers.get(DESKTOP_CREDENTIAL_IPC_CHANNELS.bootstrap)!(
+        eventFor(webContents),
+        { schema: "kestrel.credential.bootstrap.v1" }
+      )
+    ).resolves.toEqual({
+      ok: true,
+      value: context
+    });
+    await expect(
+      handlers.get(DESKTOP_CREDENTIAL_IPC_CHANNELS.cancel)!(
+        eventFor(webContents),
+        { schema: "kestrel.credential.cancel.v1" }
+      )
+    ).resolves.toEqual({
+      ok: true,
+      value: { status: "cancelled" }
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(JSON.stringify(context)).not.toMatch(
+      /token|capability|secretRef|value/i
+    );
+  });
+
+  it("rejects substituted, subframe, stale, non-credential, and destroyed senders", async () => {
+    const { webContents, handlers } = harness();
+    const handler = handlers.get(
+      DESKTOP_CREDENTIAL_IPC_CHANNELS.bootstrap
+    )!;
+    const substituted = new FakeWebContents(webContents.id);
+    const staleFrame = { ...webContents.mainFrame };
+    webContents.mainFrame = {
+      ...webContents.mainFrame,
+      routingId: webContents.mainFrame.routingId + 1
+    };
+    const events = [
+      eventFor(substituted),
+      eventFor(webContents, {
+        senderFrame: {
+          ...webContents.mainFrame,
+          processId: webContents.mainFrame.processId + 1
+        }
+      }),
+      eventFor(webContents, {
+        senderFrame: {
+          ...webContents.mainFrame,
+          routingId: webContents.mainFrame.routingId + 1
+        }
+      }),
+      eventFor(webContents, {
+        senderFrame: {
+          ...webContents.mainFrame,
+          isMainFrame: false
+        }
+      }),
+      eventFor(webContents, {
+        senderFrame: {
+          ...webContents.mainFrame,
+          url: "kestrel://app/index.html"
+        }
+      }),
+      eventFor(webContents, {
+        senderFrame: {
+          ...webContents.mainFrame,
+          url: "kestrel://credential.evil/index.html"
+        }
+      }),
+      eventFor(webContents, { senderFrame: staleFrame }),
+      eventFor(webContents, { senderFrame: null })
+    ];
+
+    for (const event of events) {
+      await expect(
+        handler(event, {
+          schema: "kestrel.credential.bootstrap.v1"
+        })
+      ).resolves.toEqual({
+        ok: false,
+        error: { code: "desktop_sender_untrusted" }
+      });
+    }
+
+    webContents.destroyed = true;
+    await expect(
+      handler(eventFor(webContents), {
+        schema: "kestrel.credential.bootstrap.v1"
+      })
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "desktop_sender_untrusted" }
+    });
+  });
+
+  it("rejects an in-place mutation of the bound main-frame identity", async () => {
+    const { webContents, handlers } = harness();
+    const handler = handlers.get(
+      DESKTOP_CREDENTIAL_IPC_CHANNELS.bootstrap
+    )!;
+
+    await expect(
+      handler(eventFor(webContents), {
+        schema: "kestrel.credential.bootstrap.v1"
+      })
+    ).resolves.toEqual({
+      ok: true,
+      value: context
+    });
+    webContents.mainFrame.routingId += 1;
+
+    await expect(
+      handler(eventFor(webContents), {
+        schema: "kestrel.credential.bootstrap.v1"
+      })
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "desktop_sender_untrusted" }
+    });
+  });
+
+  it("accepts only an exact plain submit object with an exact Uint8Array", async () => {
+    const {
+      webContents,
+      handlers,
+      submit
+    } = harness();
+    const handler = handlers.get(
+      DESKTOP_CREDENTIAL_IPC_CHANNELS.submit
+    )!;
+    const accessor = Object.defineProperty(
+      {
+        schema: "kestrel.credential.submit.v1"
+      },
+      "valueBytes",
+      {
+        enumerable: true,
+        get: () => new Uint8Array([1])
+      }
+    );
+    const customPrototype = Object.assign(
+      Object.create({ inherited: true }),
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: new Uint8Array([1])
+      }
+    );
+    const invalid = [
+      null,
+      [],
+      {
+        schema: "kestrel.credential.submit.v0",
+        valueBytes: new Uint8Array([1])
+      },
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: []
+      },
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: Buffer.from("buffer-subclass")
+      },
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: new DataView(new ArrayBuffer(1))
+      },
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: new Uint8Array()
+      },
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: new Uint8Array(16_385)
+      },
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: new Uint8Array([1]),
+        extra: true
+      },
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: new Uint8Array([1]),
+        [Symbol("extra")]: true
+      },
+      accessor,
+      customPrototype
+    ];
+
+    for (const request of invalid) {
+      await expect(
+        handler(eventFor(webContents), request)
+      ).resolves.toEqual({
+        ok: false,
+        error: { code: "invalid_desktop_request" }
+      });
+    }
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("passes a distinct main-owned byte copy and clears both copies after success", async () => {
+    let received: Uint8Array | undefined;
+    const {
+      webContents,
+      handlers,
+      submit
+    } = harness({
+      submit: async (valueBytes) => {
+        received = valueBytes;
+        expect(
+          new TextDecoder().decode(valueBytes)
+        ).toBe("ipc-private-sentinel");
+      }
+    });
+    const sent = new TextEncoder().encode(
+      "ipc-private-sentinel"
+    );
+
+    await expect(
+      handlers.get(DESKTOP_CREDENTIAL_IPC_CHANNELS.submit)!(
+        eventFor(webContents),
+        {
+          schema: "kestrel.credential.submit.v1",
+          valueBytes: sent
+        }
+      )
+    ).resolves.toEqual({
+      ok: true,
+      value: { status: "stored" }
+    });
+
+    expect(submit).toHaveBeenCalledOnce();
+    expect(received).toBeDefined();
+    expect(received).not.toBe(sent);
+    expect([...sent].every((value) => value === 0)).toBe(true);
+    expect(
+      [...received!].every((value) => value === 0)
+    ).toBe(true);
+  });
+
+  it("clears both byte copies and returns a fixed error after submit failure", async () => {
+    let received: Uint8Array | undefined;
+    const { webContents, handlers } = harness({
+      submit: async (valueBytes) => {
+        received = valueBytes;
+        throw new Error("native-ipc-private-sentinel");
+      }
+    });
+    const sent = new TextEncoder().encode(
+      "ipc-failure-private-sentinel"
+    );
+
+    const response = await handlers.get(
+      DESKTOP_CREDENTIAL_IPC_CHANNELS.submit
+    )!(eventFor(webContents), {
+      schema: "kestrel.credential.submit.v1",
+      valueBytes: sent
+    });
+
+    expect(response).toEqual({
+      ok: false,
+      error: { code: "desktop_operation_failed" }
+    });
+    expect(JSON.stringify(response)).not.toContain("sentinel");
+    expect([...sent].every((value) => value === 0)).toBe(true);
+    expect(
+      [...(received ?? [])].every((value) => value === 0)
+    ).toBe(true);
+  });
+});

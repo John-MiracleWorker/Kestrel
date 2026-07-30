@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { VerifiedResourceSet } from "./resource-manifest";
@@ -69,6 +69,22 @@ function verifiedResources(): VerifiedResourceSet {
         "web/dist/index.html": {
           size: 16,
           sha256: "c".repeat(64)
+        },
+        "desktop/dist/credential/index.html": {
+          size: 8,
+          sha256: "d".repeat(64)
+        },
+        "desktop/dist/credential/form.js": {
+          size: 8,
+          sha256: "e".repeat(64)
+        },
+        "desktop/dist/credential/styles.css": {
+          size: 8,
+          sha256: "f".repeat(64)
+        },
+        "desktop/dist/credential/preload.js": {
+          size: 8,
+          sha256: "1".repeat(64)
         }
       }
     },
@@ -88,6 +104,38 @@ function verifiedResources(): VerifiedResourceSet {
           size: 16,
           sha256: "c".repeat(64)
         }
+      ],
+      [
+        "desktop/dist/credential/index.html",
+        {
+          path: "/bundle/resources/desktop/dist/credential/index.html",
+          size: 8,
+          sha256: "d".repeat(64)
+        }
+      ],
+      [
+        "desktop/dist/credential/form.js",
+        {
+          path: "/bundle/resources/desktop/dist/credential/form.js",
+          size: 8,
+          sha256: "e".repeat(64)
+        }
+      ],
+      [
+        "desktop/dist/credential/styles.css",
+        {
+          path: "/bundle/resources/desktop/dist/credential/styles.css",
+          size: 8,
+          sha256: "f".repeat(64)
+        }
+      ],
+      [
+        "desktop/dist/credential/preload.js",
+        {
+          path: "/bundle/resources/desktop/dist/credential/preload.js",
+          size: 8,
+          sha256: "1".repeat(64)
+        }
       ]
     ]),
     rendererAssets: {
@@ -95,6 +143,18 @@ function verifiedResources(): VerifiedResourceSet {
       read: (relativePath) =>
         relativePath === "index.html"
           ? Buffer.from("<h1>Kestrel</h1>")
+          : undefined
+    },
+    credentialAssets: {
+      totalBytes: 32,
+      read: (relativePath) =>
+        [
+          "index.html",
+          "form.js",
+          "styles.css",
+          "preload.js"
+        ].includes(relativePath)
+          ? Buffer.from(relativePath)
           : undefined
     }
   };
@@ -146,6 +206,7 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
         kind: "activate";
         baseUrl: string;
         apiToken: string;
+        credentialCapability: string;
         generation: number;
       }
     | { kind: "deactivate"; generation?: number }
@@ -159,6 +220,7 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
         kind: "activate";
         baseUrl: string;
         apiToken: string;
+        credentialCapability: string;
         generation: number;
       }
     | { kind: "deactivate"; generation?: number }
@@ -169,6 +231,7 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
       activate(input: {
         baseUrl: string;
         apiToken: string;
+        credentialCapability: string;
         generation: number;
       }): void {
         apiSessionEvents.push({ kind: "activate", ...input });
@@ -460,12 +523,22 @@ describe("verified sidecar supervisor", () => {
   it("uses the exact executable and sole bootstrap argv with a secret-free environment", async () => {
     const { supervisor, spawner } = harness();
 
-    await supervisor.start();
+    const verified = await supervisor.start();
 
     expect(supervisor.state).toMatchObject({
       kind: "ready",
       profileId: "default"
     });
+    expect(verified.rendererAssets.read("index.html")).toEqual(
+      Buffer.from("<h1>Kestrel</h1>")
+    );
+    expect(verified.credentialAssets.read("form.js")).toEqual(
+      Buffer.from("form.js")
+    );
+    expect(verified.credentialPreloadPath).toBe(
+      "/bundle/resources/desktop/dist/credential/preload.js"
+    );
+    expect(Object.isFrozen(verified)).toBe(true);
     expect(spawner.requests).toEqual([
       {
         executable: "/bundle/resources/sidecar/kestrel-desktop-sidecar",
@@ -486,9 +559,24 @@ describe("verified sidecar supervisor", () => {
     const lifecycle: string[] = [];
     const { supervisor } = harness({
       apiSession: {
-        activate({ baseUrl, apiToken: receivedToken, generation }): void {
+        activate({
+          baseUrl,
+          apiToken: receivedToken,
+          credentialCapability,
+          generation
+        }): void {
           expect(baseUrl).toBe(`http://127.0.0.1:${43000 + 9100}/`);
           expect(receivedToken).toBe(apiToken);
+          expect(credentialCapability).toBe(
+            createHmac("sha256", Buffer.from(apiToken, "utf8"))
+              .update(
+                Buffer.from(
+                  `kestrel.desktop.credential.write.v1\0${launchNonce}`,
+                  "utf8"
+                )
+              )
+              .digest("hex")
+          );
           expect(generation).toBe(1);
           lifecycle.push("activate");
         },
@@ -536,6 +624,26 @@ describe("verified sidecar supervisor", () => {
     expect(authorityActive).toBe(false);
     shutdownGate.resolve();
     await stopping;
+  });
+
+  it("enters conservative reconciliation without retrying or terminating the retained sidecar", async () => {
+    const { supervisor, spawner, apiSessionEvents } = harness();
+    await supervisor.start();
+
+    supervisor.enterReconciliationRequired();
+    supervisor.enterReconciliationRequired();
+
+    expect(supervisor.state).toEqual({
+      kind: "recovery",
+      reason: "reconciliation_required",
+      detail: "credential_mutation_reconciliation_required"
+    });
+    expect(apiSessionEvents.filter((event) => event.kind === "deactivate"))
+      .toContainEqual({
+        kind: "deactivate",
+        generation: 1
+      });
+    expect(spawner.children.at(-1)?.killSignals).toEqual([]);
   });
 
   it("deactivates immediately on confirmed unexpected exit before cleanup settles", async () => {

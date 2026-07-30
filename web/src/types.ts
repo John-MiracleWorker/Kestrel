@@ -624,6 +624,19 @@ export type SetupReadinessCheck = {
   recovery: string;
 };
 
+export type DesktopCredentialStorageReadiness = {
+  schema: "kestrel.desktop_credential_readiness.v1";
+  state:
+    | "available"
+    | "session_only"
+    | "locked_vault_required"
+    | "unavailable";
+  backend: string | null;
+  persistence: "persistent" | "session" | "none";
+  reason: string;
+  remediation: string;
+};
+
 export type SetupReadinessReport = {
   schema: string;
   ready: boolean;
@@ -633,6 +646,7 @@ export type SetupReadinessReport = {
   fail_count: number;
   checks: SetupReadinessCheck[];
   next_action: string;
+  credential_storage?: DesktopCredentialStorageReadiness;
 };
 
 export type ApiResult = Record<string, unknown>;

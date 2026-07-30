@@ -282,6 +282,50 @@ function installDesktopRuntimeMarker(): void {
   });
 }
 
+function installDesktopBridge(
+  openCredentialDialog = vi.fn(async () => ({
+    status: "stored",
+    secretRef: "secret://openai_api_key",
+    validation: "unverified",
+    fingerprint: "sha256:0123456789ab"
+  }))
+): {
+  openCredentialDialog: typeof openCredentialDialog;
+} {
+  const bridge = Object.freeze({
+    connection: async () => ({
+      schema: "kestrel.desktop.connection.v1",
+      state: "ready",
+      generation: 4,
+      baseUrl: "http://127.0.0.1:43123/",
+      profileId: "default",
+      sidecarVersion: "0.5.0",
+      recovery: null
+    }),
+    chooseProjectFolder: async () => ({ status: "cancelled" }),
+    chooseStorageFolder: async () => ({ status: "cancelled" }),
+    exportSupportBundle: async () => ({ status: "cancelled" }),
+    getAppVersion: async () => ({ version: "0.5.0" }),
+    getUpdateStatus: async () => ({
+      schema: "kestrel.desktop.update.v1",
+      state: "unavailable",
+      reason: "not_configured"
+    }),
+    openCredentialDialog,
+    openExternalUrl: async () => ({ opened: true }),
+    performRecoveryAction: async () => ({ accepted: true }),
+    subscribeLifecycle: () => () => undefined,
+    subscribeUpdateStatus: () => () => undefined
+  });
+  Object.defineProperty(globalThis, "kestrelDesktop", {
+    configurable: true,
+    enumerable: false,
+    writable: false,
+    value: bridge
+  });
+  return { openCredentialDialog };
+}
+
 describe("App", () => {
   beforeEach(() => {
     runs = [otherRun, secondRun, baseRun];
@@ -459,6 +503,7 @@ describe("App", () => {
     cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    Reflect.deleteProperty(globalThis, "kestrelDesktop");
     Reflect.deleteProperty(globalThis, "kestrelDesktopRuntime");
     sessionStorage.clear();
     localStorage.clear();
@@ -2247,6 +2292,149 @@ describe("App", () => {
         api_key_env: "XAI_API_KEY"
       });
     });
+  });
+
+  it("uses only the isolated credential dialog for provider keys in Desktop mode", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const rawSentinel =
+      "desktop-primary-renderer-must-never-see-7f2d";
+    const openCredentialDialog = vi.fn(async () => ({
+      status: "stored" as const,
+      secretRef: "secret://xai_api_key",
+      validation: "unverified" as const,
+      fingerprint: "sha256:0123456789ab"
+    }));
+    installDesktopRuntimeMarker();
+    installDesktopBridge(openCredentialDialog);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Ask Kestrel"
+    });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+    fireEvent.change(screen.getByLabelText("Provider"), {
+      target: { value: "grok" }
+    });
+    await waitFor(() => {
+      expect(
+        fetchSpy.mock.calls.some(
+          ([path]) =>
+            String(path).endsWith(
+              "/api/runtime/models?provider=grok"
+            )
+        )
+      ).toBe(true);
+    });
+
+    expect(
+      screen.queryByLabelText("Provider API key")
+    ).not.toBeInTheDocument();
+    const canonicalIdentity =
+      screen.getByLabelText("API key env");
+    expect(canonicalIdentity).toHaveValue("XAI_API_KEY");
+    expect(canonicalIdentity).toHaveAttribute("readonly");
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /store provider key/i
+      })
+    );
+    await waitFor(() => {
+      expect(openCredentialDialog).toHaveBeenCalledWith({
+        providerId: "grok",
+        purpose: "provider_api_key"
+      });
+    });
+    expect(
+      fetchSpy.mock.calls.some(
+        ([path, init]) =>
+          String(path).endsWith("/api/secrets") &&
+          init?.method === "POST"
+      )
+    ).toBe(false);
+    expect(
+      screen.getByText("secret://xai_api_key")
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(rawSentinel);
+    expect(localStorage.getItem(rawSentinel)).toBeNull();
+    expect(sessionStorage.getItem(rawSentinel)).toBeNull();
+  });
+
+  it("removes generic secret mutation controls from the Desktop primary renderer", async () => {
+    installDesktopRuntimeMarker();
+    installDesktopBridge();
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Ask Kestrel"
+    });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+
+    expect(
+      screen.queryByLabelText("Secret value")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /store secret/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /provider credentials are added from provider settings/i
+      )
+    ).toBeInTheDocument();
+    expect(
+      fetchSpy.mock.calls.some(
+        ([path, init]) =>
+          String(path).endsWith("/api/secrets") &&
+          ["POST", "DELETE"].includes(
+            String(init?.method ?? "")
+          )
+      )
+    ).toBe(false);
+  });
+
+  it("projects Desktop credential storage readiness and remediation in Settings", async () => {
+    setupReadinessPayload = {
+      ...readinessFixture(),
+      credential_storage: {
+        schema: "kestrel.desktop_credential_readiness.v1",
+        state: "session_only",
+        backend: "Session memory",
+        persistence: "session",
+        reason: "secret_service_missing",
+        remediation:
+          "Start an unlocked Linux Secret Service to keep credentials across restarts."
+      }
+    } as SetupReadinessReport;
+    installDesktopRuntimeMarker();
+    installDesktopBridge();
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Ask Kestrel"
+    });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+
+    expect(
+      screen.getByText("session_only")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Start an unlocked Linux Secret Service to keep credentials across restarts."
+      )
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Provider"), {
+      target: { value: "grok" }
+    });
+    expect(
+      await screen.findByText(
+        "Credentials are stored for this session only."
+      )
+    ).toBeInTheDocument();
   });
 
   it("replaces an incompatible model when switching friendly providers", async () => {

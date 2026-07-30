@@ -7,6 +7,9 @@ export const DESKTOP_RESPONSE_BYTES = 32 * 1024;
 export const DESKTOP_EVENT_BYTES = 16 * 1024;
 export const DESKTOP_PATH_CHARACTERS = 4_096;
 export const DESKTOP_URL_CHARACTERS = 2_048;
+export const DESKTOP_CREDENTIAL_CONTEXT_BYTES = 2 * 1024;
+export const DESKTOP_CREDENTIAL_REQUEST_BYTES = 20 * 1024;
+export const DESKTOP_CREDENTIAL_VALUE_BYTES = 16 * 1024;
 
 export const DESKTOP_APP_SCHEME = "kestrel";
 export const DESKTOP_APP_HOST = "app";
@@ -14,6 +17,11 @@ export const DESKTOP_APP_ORIGIN =
   `${DESKTOP_APP_SCHEME}://${DESKTOP_APP_HOST}` as const;
 export const DESKTOP_APP_ENTRY_URL =
   `${DESKTOP_APP_ORIGIN}/index.html` as const;
+export const DESKTOP_CREDENTIAL_HOST = "credential";
+export const DESKTOP_CREDENTIAL_ORIGIN =
+  `${DESKTOP_APP_SCHEME}://${DESKTOP_CREDENTIAL_HOST}` as const;
+export const DESKTOP_CREDENTIAL_ENTRY_URL =
+  `${DESKTOP_CREDENTIAL_ORIGIN}/index.html` as const;
 
 export const DESKTOP_IPC_CHANNELS = Object.freeze({
   runtimeBootstrap: "kestrel:desktop:runtime-bootstrap",
@@ -30,12 +38,20 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   updateStatusEvent: "kestrel:desktop:update-status-changed"
 } as const);
 
+export const DESKTOP_CREDENTIAL_IPC_CHANNELS = Object.freeze({
+  bootstrap: "kestrel:credential:bootstrap",
+  submit: "kestrel:credential:submit",
+  cancel: "kestrel:credential:cancel"
+} as const);
+
 export const desktopErrorCodeSchema = z.enum([
   "invalid_desktop_request",
   "invalid_desktop_response",
   "desktop_sender_untrusted",
   "desktop_feature_unavailable",
-  "desktop_operation_failed"
+  "desktop_operation_failed",
+  "desktop_operation_in_progress",
+  "desktop_operation_ambiguous"
 ]);
 
 export type DesktopErrorCode = z.infer<
@@ -369,14 +385,24 @@ export type DesktopUpdateStatus = Readonly<
   z.infer<typeof desktopUpdateStatusSchema>
 >;
 
+export const desktopCredentialProviderIdSchema = z.enum([
+  "openai",
+  "openrouter",
+  "deepseek",
+  "kimi",
+  "ollama-cloud",
+  "anthropic",
+  "grok",
+  "gemini"
+]);
+
+export type DesktopCredentialProviderId = z.infer<
+  typeof desktopCredentialProviderIdSchema
+>;
+
 export const desktopCredentialIntentSchema = z
   .object({
-    providerId: z
-      .string()
-      .trim()
-      .min(1)
-      .max(120)
-      .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
+    providerId: desktopCredentialProviderIdSchema,
     purpose: z.literal("provider_api_key")
   })
   .strict();
@@ -385,21 +411,77 @@ export type DesktopCredentialIntent = Readonly<
   z.infer<typeof desktopCredentialIntentSchema>
 >;
 
-export const desktopCredentialStateSchema = z
-  .object({
-    secretRef: z
-      .string()
-      .min(1)
-      .max(256)
-      .regex(/^secret:\/\/[A-Za-z0-9._/-]+$/),
-    validation: z.enum(["unverified", "valid", "invalid"]),
-    fingerprint: z.string().min(1).max(256).nullable()
-  })
-  .strict();
+export const desktopCredentialResultSchema =
+  z.discriminatedUnion("status", [
+    z
+      .object({
+        status: z.literal("stored"),
+        secretRef: z
+          .string()
+          .min(1)
+          .max(256)
+          .regex(/^secret:\/\/[A-Za-z0-9._/-]+$/),
+        validation: z.enum([
+          "unverified",
+          "valid",
+          "invalid"
+        ]),
+        fingerprint: z.string().min(1).max(256)
+      })
+      .strict(),
+    z.object({ status: z.literal("cancelled") }).strict()
+  ]);
 
+export type DesktopCredentialResult = Readonly<
+  z.infer<typeof desktopCredentialResultSchema>
+>;
+
+export const desktopCredentialStateSchema =
+  desktopCredentialResultSchema;
 export type DesktopCredentialState = Readonly<
   z.infer<typeof desktopCredentialStateSchema>
 >;
+
+export const desktopCredentialContextSchema = z
+  .object({
+    schema: z.literal("kestrel.credential.context.v1"),
+    providerId: desktopCredentialProviderIdSchema,
+    providerLabel: z.string().min(1).max(120),
+    inputLabel: z.string().min(1).max(160),
+    maxUtf8Bytes: z.literal(DESKTOP_CREDENTIAL_VALUE_BYTES)
+  })
+  .strict();
+
+export type DesktopCredentialContext = Readonly<
+  z.infer<typeof desktopCredentialContextSchema>
+>;
+
+export const desktopCredentialBootstrapRequestSchema = z
+  .object({
+    schema: z.literal("kestrel.credential.bootstrap.v1")
+  })
+  .strict();
+
+export const desktopCredentialSubmitRequestSchema = z
+  .object({
+    schema: z.literal("kestrel.credential.submit.v1"),
+    valueBytes: z.instanceof(Uint8Array)
+  })
+  .strict();
+
+export const desktopCredentialCancelRequestSchema = z
+  .object({
+    schema: z.literal("kestrel.credential.cancel.v1")
+  })
+  .strict();
+
+export const desktopCredentialStoredResultSchema = z
+  .object({ status: z.literal("stored") })
+  .strict();
+
+export const desktopCredentialCancelledResultSchema = z
+  .object({ status: z.literal("cancelled") })
+  .strict();
 
 export const desktopExternalUrlPurposeSchema = z.enum([
   "documentation",
@@ -549,7 +631,7 @@ export interface DesktopBridge {
   getUpdateStatus(): Promise<DesktopUpdateStatus>;
   openCredentialDialog(
     intent: DesktopCredentialIntent
-  ): Promise<DesktopCredentialState>;
+  ): Promise<DesktopCredentialResult>;
   openExternalUrl(
     request: DesktopExternalUrlRequest
   ): Promise<DesktopExternalUrlResult>;

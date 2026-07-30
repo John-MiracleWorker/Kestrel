@@ -171,7 +171,12 @@ def _create_app(
         from .server_behavior_delta_routes import register_behavior_delta_routes
         from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
-        from .server_desktop_routes import desktop_auth_error, register_desktop_routes
+        from .server_desktop_routes import (
+            desktop_auth_error,
+            desktop_credential_capability_error,
+            desktop_credential_mutation_request,
+            register_desktop_routes,
+        )
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_engineering_routes import register_engineering_routes
         from .server_mcp_routes import register_mcp_routes
@@ -358,6 +363,23 @@ def _create_app(
             raise HTTPException(status_code=status_code, detail=detail)
         return True
 
+    def require_desktop_credential_capability(
+        request: Request,  # type: ignore[valid-type]
+    ) -> bool:
+        if desktop_context is None:
+            return True
+        capability_error = desktop_credential_capability_error(
+            desktop_context,
+            request_headers(request),
+        )
+        if capability_error is not None:
+            status_code, detail = capability_error
+            raise HTTPException(
+                status_code=status_code,
+                detail=detail,
+            )
+        return True
+
     def audit_plugin(action: str, plugin: dict[str, Any]) -> None:
         agent = runs.build_runtime_agent(active_config)
         try:
@@ -504,6 +526,25 @@ def _create_app(
                 if auth_error is not None:
                     status_code, detail = auth_error
                     return responses_module.JSONResponse({"detail": detail}, status_code=status_code)
+            if (
+                desktop_context is not None
+                and desktop_credential_mutation_request(
+                    method,
+                    path,
+                )
+            ):
+                capability_error = (
+                    desktop_credential_capability_error(
+                        desktop_context,
+                        headers,
+                    )
+                )
+                if capability_error is not None:
+                    status_code, detail = capability_error
+                    return responses_module.JSONResponse(
+                        {"detail": detail},
+                        status_code=status_code,
+                    )
             content_length = str(headers.get("content-length", "")).strip()
             if content_length:
                 try:
@@ -570,6 +611,11 @@ def _create_app(
             app,
             launch=desktop_context,
             shutdown_controller=desktop_shutdown,
+            secret_broker=secret_broker,
+            http_exception=HTTPException,
+            sensitive_material_transition=(
+                mcp_sensitive_material_transition
+            ),
         )
     register_routing_routes(
         app,
@@ -594,8 +640,39 @@ def _create_app(
         http_exception=HTTPException,
         secret_broker=secret_broker,
         sensitive_material_transition=mcp_sensitive_material_transition,
+        mutation_dependency=(
+            require_desktop_credential_capability
+            if desktop_context is not None
+            else None
+        ),
     )
-    register_product_routes(app, active_config=lambda: active_config, secret_resolver=secret_broker.resolve)
+    desktop_storage_readiness = getattr(
+        secret_broker,
+        "desktop_readiness",
+        None,
+    )
+    register_product_routes(
+        app,
+        active_config=lambda: active_config,
+        secret_resolver=(
+            None
+            if desktop_context is not None
+            else secret_broker.resolve
+        ),
+        secret_status=(
+            secret_broker.metadata_status
+            if desktop_context is not None
+            else None
+        ),
+        credential_storage=(
+            (
+                lambda: desktop_storage_readiness.to_public_payload()
+            )
+            if desktop_context is not None
+            and desktop_storage_readiness is not None
+            else None
+        ),
+    )
     register_project_routes(
         app,
         active_config=lambda: active_config,
@@ -1484,6 +1561,12 @@ def _apply_desktop_runtime_authority(
         backend="memvid",
         memory_dir=launch.memory_dir,
         state_path=launch.state_path,
+        secret_store_path=(
+            launch.profile_root
+            / "secrets"
+            / "desktop-keyring-metadata.json"
+        ),
+        secret_backend="desktop",
         require_api_auth=True,
         cors_origins=(_DESKTOP_RENDERER_ORIGIN,),
     )

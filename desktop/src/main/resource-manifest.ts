@@ -26,6 +26,15 @@ const READ_CHUNK_BYTES = 1024 * 1024;
 const MAX_RENDERER_ASSET_BYTES = 16 * 1024 * 1024;
 const MAX_RENDERER_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 const RENDERER_PREFIX = "web/dist/";
+const MAX_CREDENTIAL_ASSET_BYTES = 4 * 1024 * 1024;
+const MAX_CREDENTIAL_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const CREDENTIAL_PREFIX = "desktop/dist/credential/";
+const CREDENTIAL_FILES = new Set([
+  "index.html",
+  "form.js",
+  "styles.css",
+  "preload.js"
+]);
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 const resourceFileSchema = z
   .object({
@@ -62,9 +71,15 @@ export interface VerifiedResourceSet {
   manifest: ResourceManifest;
   files: Map<string, VerifiedResourceFile>;
   rendererAssets: VerifiedRendererAssets;
+  credentialAssets: VerifiedCredentialAssets;
 }
 
 export interface VerifiedRendererAssets {
+  readonly totalBytes: number;
+  read(relativePath: string): Uint8Array | undefined;
+}
+
+export interface VerifiedCredentialAssets {
   readonly totalBytes: number;
   read(relativePath: string): Uint8Array | undefined;
 }
@@ -89,6 +104,8 @@ export class ResourceVerificationError extends Error {
       | "resource_signature_invalid"
       | "resource_signature_too_large"
       | "resource_signing_key_untrusted"
+      | "credential_asset_too_large"
+      | "credential_snapshot_too_large"
       | "renderer_asset_too_large"
       | "renderer_snapshot_too_large"
   ) {
@@ -453,33 +470,69 @@ export async function verifyResourceManifest(
   }
 
   let rendererSnapshotBytes = 0;
+  let credentialSnapshotBytes = 0;
   for (const [relativePath, expected] of Object.entries(manifest.files)) {
-    if (!relativePath.startsWith(RENDERER_PREFIX)) {
-      continue;
+    if (relativePath.startsWith(RENDERER_PREFIX)) {
+      if (expected.size > MAX_RENDERER_ASSET_BYTES) {
+        throw new ResourceVerificationError(
+          "renderer_asset_too_large"
+        );
+      }
+      rendererSnapshotBytes += expected.size;
+      if (
+        !Number.isSafeInteger(rendererSnapshotBytes) ||
+        rendererSnapshotBytes > MAX_RENDERER_SNAPSHOT_BYTES
+      ) {
+        throw new ResourceVerificationError(
+          "renderer_snapshot_too_large"
+        );
+      }
     }
-    if (expected.size > MAX_RENDERER_ASSET_BYTES) {
-      throw new ResourceVerificationError("renderer_asset_too_large");
-    }
-    rendererSnapshotBytes += expected.size;
-    if (
-      !Number.isSafeInteger(rendererSnapshotBytes) ||
-      rendererSnapshotBytes > MAX_RENDERER_SNAPSHOT_BYTES
-    ) {
-      throw new ResourceVerificationError("renderer_snapshot_too_large");
+    if (relativePath.startsWith(CREDENTIAL_PREFIX)) {
+      const credentialRelativePath = relativePath.slice(
+        CREDENTIAL_PREFIX.length
+      );
+      if (!CREDENTIAL_FILES.has(credentialRelativePath)) {
+        throw new ResourceVerificationError(
+          "resource_manifest_invalid"
+        );
+      }
+      if (expected.size > MAX_CREDENTIAL_ASSET_BYTES) {
+        throw new ResourceVerificationError(
+          "credential_asset_too_large"
+        );
+      }
+      credentialSnapshotBytes += expected.size;
+      if (
+        !Number.isSafeInteger(credentialSnapshotBytes) ||
+        credentialSnapshotBytes >
+          MAX_CREDENTIAL_SNAPSHOT_BYTES
+      ) {
+        throw new ResourceVerificationError(
+          "credential_snapshot_too_large"
+        );
+      }
     }
   }
 
   const verifiedFiles = new Map<string, VerifiedResourceFile>();
   const rendererAssets = new Map<string, Buffer>();
+  const credentialAssets = new Map<string, Buffer>();
   for (const [relativePath, expected] of Object.entries(manifest.files)) {
     const rendererRelativePath = relativePath.startsWith(RENDERER_PREFIX)
       ? relativePath.slice(RENDERER_PREFIX.length)
+      : undefined;
+    const credentialRelativePath = relativePath.startsWith(
+      CREDENTIAL_PREFIX
+    )
+      ? relativePath.slice(CREDENTIAL_PREFIX.length)
       : undefined;
     const verified = await verifyResourceFile(
       canonicalRoot,
       relativePath,
       expected,
-      rendererRelativePath !== undefined
+      rendererRelativePath !== undefined ||
+        credentialRelativePath !== undefined
     );
     verifiedFiles.set(
       relativePath,
@@ -492,6 +545,16 @@ export async function verifyResourceManifest(
     ) {
       rendererAssets.set(rendererRelativePath, verified.captured);
     }
+    if (
+      credentialRelativePath !== undefined &&
+      credentialRelativePath.length > 0 &&
+      verified.captured !== undefined
+    ) {
+      credentialAssets.set(
+        credentialRelativePath,
+        verified.captured
+      );
+    }
   }
   return {
     resourceRoot: canonicalRoot,
@@ -500,6 +563,9 @@ export async function verifyResourceManifest(
       .digest("hex")}`,
     manifest,
     files: verifiedFiles,
-    rendererAssets: new ImmutableRendererAssets(rendererAssets)
+    rendererAssets: new ImmutableRendererAssets(rendererAssets),
+    credentialAssets: new ImmutableRendererAssets(
+      credentialAssets
+    )
   };
 }

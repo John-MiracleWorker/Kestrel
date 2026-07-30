@@ -32,6 +32,7 @@ describe("signed desktop resource manifest", () => {
   let signaturePath: string;
   let sidecarPath: string;
   let rendererPath: string;
+  let credentialPaths: Record<string, string>;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "kestrel-resources-"));
@@ -39,10 +40,35 @@ describe("signed desktop resource manifest", () => {
     signaturePath = join(root, "kestrel-resource-manifest.sig");
     sidecarPath = join(root, "sidecar", "kestrel-desktop-sidecar");
     rendererPath = join(root, "web", "dist", "index.html");
+    credentialPaths = Object.fromEntries(
+      ["index.html", "form.js", "styles.css", "preload.js"].map(
+        (name) => [
+          name,
+          join(root, "desktop", "dist", "credential", name)
+        ]
+      )
+    );
     await mkdir(join(root, "sidecar"), { recursive: true });
     await mkdir(join(root, "web", "dist"), { recursive: true });
+    await mkdir(
+      join(root, "desktop", "dist", "credential"),
+      { recursive: true }
+    );
     await writeFile(sidecarPath, "verified-sidecar");
     await writeFile(rendererPath, "<h1>Kestrel</h1>");
+    await writeFile(
+      credentialPaths["index.html"]!,
+      "<form>Credential</form>"
+    );
+    await writeFile(credentialPaths["form.js"]!, "export {};");
+    await writeFile(
+      credentialPaths["styles.css"]!,
+      "body { color: #111; }"
+    );
+    await writeFile(
+      credentialPaths["preload.js"]!,
+      "require(\"electron\");"
+    );
   });
 
   afterEach(async () => {
@@ -55,6 +81,12 @@ describe("signed desktop resource manifest", () => {
   }> {
     const sidecar = Buffer.from("verified-sidecar");
     const renderer = Buffer.from("<h1>Kestrel</h1>");
+    const credentials = {
+      "index.html": Buffer.from("<form>Credential</form>"),
+      "form.js": Buffer.from("export {};"),
+      "styles.css": Buffer.from("body { color: #111; }"),
+      "preload.js": Buffer.from('require("electron");')
+    };
     const manifest: ResourceManifest = {
       schema: "kestrel.desktop.resources.v1",
       key_id: "ephemeral-test",
@@ -66,7 +98,16 @@ describe("signed desktop resource manifest", () => {
         "web/dist/index.html": {
           size: renderer.byteLength,
           sha256: sha256(renderer)
-        }
+        },
+        ...Object.fromEntries(
+          Object.entries(credentials).map(([name, bytes]) => [
+            `desktop/dist/credential/${name}`,
+            {
+              size: bytes.byteLength,
+              sha256: sha256(bytes)
+            }
+          ])
+        )
       }
     };
     const bytes = canonicalResourceManifestBytes(manifest);
@@ -122,6 +163,49 @@ describe("signed desktop resource manifest", () => {
     );
     expect(rendererAssets.read("../sidecar/kestrel-desktop-sidecar")).toBeUndefined();
     expect(rendererAssets.read("missing.js")).toBeUndefined();
+  });
+
+  it("captures a separate immutable credential snapshot from only the exact manifest prefix", async () => {
+    const { publicKey } = await signedFixture();
+    const requiredCredentials = [
+      "desktop/dist/credential/index.html",
+      "desktop/dist/credential/form.js",
+      "desktop/dist/credential/styles.css",
+      "desktop/dist/credential/preload.js"
+    ];
+    const verified = await verifyResourceManifest({
+      resourceRoot: root,
+      manifestPath,
+      signaturePath,
+      trustedKeys: new Map([["ephemeral-test", publicKey]]),
+      requiredFiles: [
+        "sidecar/kestrel-desktop-sidecar",
+        "web/dist/index.html",
+        ...requiredCredentials
+      ]
+    });
+
+    const credentials = verified.credentialAssets;
+    const first = credentials.read("index.html");
+    expect(Buffer.from(first ?? [])).toEqual(
+      Buffer.from("<form>Credential</form>")
+    );
+    first?.fill(0);
+    await writeFile(
+      credentialPaths["index.html"]!,
+      "<form>Tampered after verification</form>"
+    );
+
+    expect(
+      Buffer.from(credentials.read("index.html") ?? [])
+    ).toEqual(Buffer.from("<form>Credential</form>"));
+    expect(credentials.read("../preload.js")).toBeUndefined();
+    expect(credentials.read("web/dist/index.html")).toBeUndefined();
+    expect(
+      verified.rendererAssets.read(
+        "../desktop/dist/credential/index.html"
+      )
+    ).toBeUndefined();
   });
 
   it("rejects signed renderer declarations that exceed per-file or aggregate snapshot bounds", async () => {

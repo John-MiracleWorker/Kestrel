@@ -2,6 +2,10 @@ import type { Stats } from "node:fs";
 import { isAbsolute, normalize } from "node:path";
 import type { z } from "zod";
 import {
+  DESKTOP_CREDENTIAL_CONTEXT_BYTES,
+  DESKTOP_CREDENTIAL_IPC_CHANNELS,
+  DESKTOP_CREDENTIAL_REQUEST_BYTES,
+  DESKTOP_CREDENTIAL_VALUE_BYTES,
   DESKTOP_EVENT_BYTES,
   DESKTOP_IPC_CHANNELS,
   DESKTOP_PATH_CHARACTERS,
@@ -14,7 +18,12 @@ import {
   desktopChooseStorageFolderRequestSchema,
   desktopConnectionRequestSchema,
   desktopConnectionSchema,
+  desktopCredentialBootstrapRequestSchema,
+  desktopCredentialCancelRequestSchema,
+  desktopCredentialCancelledResultSchema,
+  desktopCredentialContextSchema,
   desktopCredentialDialogRequestSchema,
+  desktopCredentialStoredResultSchema,
   desktopCredentialStateSchema,
   desktopEnvelopeSchema,
   desktopExportSupportBundleRequestSchema,
@@ -31,6 +40,7 @@ import {
   desktopUpdateStatusRequestSchema,
   desktopUpdateStatusSchema,
   type DesktopConnection,
+  type DesktopCredentialContext,
   type DesktopCredentialIntent,
   type DesktopCredentialState,
   type DesktopErrorCode,
@@ -105,6 +115,39 @@ export interface DesktopIpcAdapters {
 
 export interface DesktopIpcAuthority {
   bindRenderer(webContents: DesktopIpcWebContents): () => void;
+}
+
+export interface CredentialIpcFrame {
+  readonly url: string;
+  readonly processId: number;
+  readonly routingId: number;
+  readonly isMainFrame: boolean;
+}
+
+export interface CredentialIpcWebContents {
+  readonly id: number;
+  readonly mainFrame: CredentialIpcFrame;
+  isDestroyed(): boolean;
+}
+
+export interface CredentialIpcEvent {
+  readonly sender: CredentialIpcWebContents;
+  readonly senderFrame: CredentialIpcFrame | null;
+}
+
+export interface CredentialIpcMain {
+  handle(
+    channel: string,
+    listener: (
+      event: CredentialIpcEvent,
+      request: unknown
+    ) => Promise<unknown>
+  ): void;
+  removeHandler(channel: string): void;
+}
+
+export interface CredentialIpcBinding {
+  dispose(): void;
 }
 
 interface RendererBinding {
@@ -574,6 +617,221 @@ export function installDesktopIpc(
     }
   };
   return Object.freeze(authority);
+}
+
+function exactCredentialFrame(
+  frame: CredentialIpcFrame | null | undefined
+): frame is CredentialIpcFrame {
+  return (
+    frame !== null &&
+    frame !== undefined &&
+    frame.isMainFrame === true &&
+    validFrameId(frame.processId) &&
+    validFrameId(frame.routingId) &&
+    frame.url === "kestrel://credential/index.html"
+  );
+}
+
+function exactCredentialSubmitBytes(
+  rawRequest: unknown
+): Uint8Array | null {
+  if (
+    typeof rawRequest !== "object" ||
+    rawRequest === null ||
+    Array.isArray(rawRequest) ||
+    Object.getPrototypeOf(rawRequest) !== Object.prototype
+  ) {
+    return null;
+  }
+  const keys = Reflect.ownKeys(rawRequest);
+  if (
+    keys.length !== 2 ||
+    !keys.includes("schema") ||
+    !keys.includes("valueBytes") ||
+    keys.some((key) => typeof key !== "string")
+  ) {
+    return null;
+  }
+  const descriptors =
+    Object.getOwnPropertyDescriptors(rawRequest);
+  const schemaDescriptor = descriptors.schema;
+  const valueDescriptor = descriptors.valueBytes;
+  if (
+    schemaDescriptor === undefined ||
+    valueDescriptor === undefined ||
+    !("value" in schemaDescriptor) ||
+    !("value" in valueDescriptor) ||
+    schemaDescriptor.value !==
+      "kestrel.credential.submit.v1"
+  ) {
+    return null;
+  }
+  const valueBytes = valueDescriptor.value;
+  if (
+    !(valueBytes instanceof Uint8Array) ||
+    Buffer.isBuffer(valueBytes) ||
+    Object.getPrototypeOf(valueBytes) !==
+      Uint8Array.prototype ||
+    !(valueBytes.buffer instanceof ArrayBuffer) ||
+    Object.getPrototypeOf(valueBytes.buffer) !==
+      ArrayBuffer.prototype ||
+    valueBytes.byteOffset !== 0 ||
+    valueBytes.byteLength !== valueBytes.buffer.byteLength ||
+    valueBytes.byteLength === 0 ||
+    valueBytes.byteLength > DESKTOP_CREDENTIAL_VALUE_BYTES
+  ) {
+    if (
+      valueBytes instanceof Uint8Array &&
+      !Buffer.isBuffer(valueBytes)
+    ) {
+      valueBytes.fill(0);
+    }
+    return null;
+  }
+  return valueBytes;
+}
+
+export function installCredentialIpc(
+  ipcMain: CredentialIpcMain,
+  options: {
+    webContents: CredentialIpcWebContents;
+    context: DesktopCredentialContext;
+    submit(valueBytes: Uint8Array): Promise<void>;
+    cancel(): void;
+  }
+): CredentialIpcBinding {
+  let initialFrame:
+    | Readonly<{
+        processId: number;
+        routingId: number;
+        url: string;
+      }>
+    | null = null;
+  const trustedSender = (event: CredentialIpcEvent): boolean => {
+    const liveFrame = options.webContents.mainFrame;
+    const senderFrame = event.senderFrame;
+    const exactCurrent =
+      event.sender === options.webContents &&
+      event.sender.id === options.webContents.id &&
+      !options.webContents.isDestroyed() &&
+      exactCredentialFrame(liveFrame) &&
+      exactCredentialFrame(senderFrame) &&
+      senderFrame.processId === liveFrame.processId &&
+      senderFrame.routingId === liveFrame.routingId &&
+      senderFrame.url === liveFrame.url;
+    if (!exactCurrent) {
+      return false;
+    }
+    if (initialFrame === null) {
+      initialFrame = Object.freeze({
+        processId: liveFrame.processId,
+        routingId: liveFrame.routingId,
+        url: liveFrame.url
+      });
+      return true;
+    }
+    return (
+      initialFrame.processId === liveFrame.processId &&
+      initialFrame.routingId === liveFrame.routingId &&
+      initialFrame.url === liveFrame.url
+    );
+  };
+
+  ipcMain.handle(
+    DESKTOP_CREDENTIAL_IPC_CHANNELS.bootstrap,
+    async (event, rawRequest) => {
+      if (!trustedSender(event)) {
+        return errorEnvelope("desktop_sender_untrusted");
+      }
+      try {
+        parseWithin(
+          desktopCredentialBootstrapRequestSchema,
+          rawRequest,
+          DESKTOP_CREDENTIAL_REQUEST_BYTES
+        );
+      } catch {
+        return errorEnvelope("invalid_desktop_request");
+      }
+      try {
+        return successfulEnvelope(
+          desktopCredentialContextSchema,
+          options.context,
+          DESKTOP_CREDENTIAL_CONTEXT_BYTES
+        );
+      } catch {
+        return errorEnvelope("invalid_desktop_response");
+      }
+    }
+  );
+  ipcMain.handle(
+    DESKTOP_CREDENTIAL_IPC_CHANNELS.submit,
+    async (event, rawRequest) => {
+      if (!trustedSender(event)) {
+        return errorEnvelope("desktop_sender_untrusted");
+      }
+      const rendererBytes =
+        exactCredentialSubmitBytes(rawRequest);
+      if (rendererBytes === null) {
+        return errorEnvelope("invalid_desktop_request");
+      }
+      const ownedBytes = Uint8Array.from(rendererBytes);
+      try {
+        await options.submit(ownedBytes);
+        return successfulEnvelope(
+          desktopCredentialStoredResultSchema,
+          { status: "stored" },
+          DESKTOP_CREDENTIAL_CONTEXT_BYTES
+        );
+      } catch {
+        return errorEnvelope("desktop_operation_failed");
+      } finally {
+        ownedBytes.fill(0);
+        rendererBytes.fill(0);
+      }
+    }
+  );
+  ipcMain.handle(
+    DESKTOP_CREDENTIAL_IPC_CHANNELS.cancel,
+    async (event, rawRequest) => {
+      if (!trustedSender(event)) {
+        return errorEnvelope("desktop_sender_untrusted");
+      }
+      try {
+        parseWithin(
+          desktopCredentialCancelRequestSchema,
+          rawRequest,
+          DESKTOP_CREDENTIAL_REQUEST_BYTES
+        );
+      } catch {
+        return errorEnvelope("invalid_desktop_request");
+      }
+      try {
+        options.cancel();
+        return successfulEnvelope(
+          desktopCredentialCancelledResultSchema,
+          { status: "cancelled" },
+          DESKTOP_CREDENTIAL_CONTEXT_BYTES
+        );
+      } catch {
+        return errorEnvelope("desktop_operation_failed");
+      }
+    }
+  );
+
+  let disposed = false;
+  return Object.freeze({
+    dispose(): void {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      for (const channel of Object.values(
+        DESKTOP_CREDENTIAL_IPC_CHANNELS
+      )) {
+        ipcMain.removeHandler(channel);
+      }
+    }
+  });
 }
 
 export interface DirectoryPickerDependencies {

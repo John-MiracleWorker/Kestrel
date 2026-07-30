@@ -8,7 +8,7 @@ const workspace = fileURLToPath(new URL("..", import.meta.url));
 const dist = fileURLToPath(new URL("../dist", import.meta.url));
 
 describe("desktop build boundary", () => {
-  it("emits one sandbox-compatible preload and reviewed main modules only", () => {
+  it("emits separate sandbox-compatible primary and credential bundles with reviewed main modules only", () => {
     rmSync(dist, { force: true, recursive: true });
 
     const build = spawnSync("npm", ["run", "build"], {
@@ -21,11 +21,20 @@ describe("desktop build boundary", () => {
     expect(readdirSync(dist, { recursive: true }).sort()).toEqual([
       "contracts.d.ts",
       "contracts.js",
+      "credential",
+      "credential/form.js",
+      "credential/index.html",
+      "credential/preload.js",
+      "credential/styles.css",
       "main",
       "main.d.ts",
       "main.js",
       "main/api-session.d.ts",
       "main/api-session.js",
+      "main/credential-api.d.ts",
+      "main/credential-api.js",
+      "main/credential-window.d.ts",
+      "main/credential-window.js",
       "main/ipc.d.ts",
       "main/ipc.js",
       "main/private-files.d.ts",
@@ -64,6 +73,106 @@ describe("desktop build boundary", () => {
     expect(preload).not.toContain("sourceMappingURL");
     expect(preload).not.toContain("ipcRenderer:");
     expect(preload).not.toContain("apiToken");
+
+    const credentialPreload = readFileSync(
+      fileURLToPath(
+        new URL(
+          "../dist/credential/preload.js",
+          import.meta.url
+        )
+      ),
+      "utf8"
+    );
+    expect(credentialPreload).not.toMatch(/\bimport\s/);
+    expect([
+      ...credentialPreload.matchAll(/\brequire\(/g)
+    ]).toHaveLength(1);
+    expect([
+      ...credentialPreload.matchAll(
+        /\brequire\((["'][^"']+["'])\)/g
+      )
+    ].map((match) => match[1])).toEqual(['"electron"']);
+    expect(credentialPreload).not.toContain(
+      "sourceMappingURL"
+    );
+    expect(credentialPreload).not.toContain("kestrelDesktop");
+    expect(credentialPreload).not.toContain("apiToken");
+    expect(credentialPreload).not.toContain(
+      "X-Kestrel-Desktop-Credential-Capability"
+    );
+    expect(credentialPreload).not.toContain("localStorage");
+    expect(credentialPreload).not.toContain("sessionStorage");
+    expect(credentialPreload).not.toMatch(/\bfetch\s*\(/);
+    expect(credentialPreload).not.toContain("XMLHttpRequest");
+
+    const credentialHtml = readFileSync(
+      fileURLToPath(
+        new URL(
+          "../dist/credential/index.html",
+          import.meta.url
+        )
+      ),
+      "utf8"
+    );
+    const credentialForm = readFileSync(
+      fileURLToPath(
+        new URL("../dist/credential/form.js", import.meta.url)
+      ),
+      "utf8"
+    );
+    const credentialStyles = readFileSync(
+      fileURLToPath(
+        new URL("../dist/credential/styles.css", import.meta.url)
+      ),
+      "utf8"
+    );
+    const credentialInput = credentialHtml.match(
+      /<input\b(?=[^>]*\bid=["']credential-value["'])(?=[^>]*\btype=["']password["'])(?=[^>]*\bautocomplete=["']off["'])[^>]*>/i
+    );
+    expect(credentialInput).not.toBeNull();
+    expect(credentialInput?.[0]).not.toMatch(/\bvalue\s*=/i);
+    const scripts = [
+      ...credentialHtml.matchAll(
+        /<script\b([^>]*)>([\s\S]*?)<\/script>/gi
+      )
+    ];
+    expect(scripts).toHaveLength(1);
+    expect(scripts[0]?.[1]).toMatch(
+      /\bsrc=["']\.\/form\.js["']/
+    );
+    expect(scripts[0]?.[2]?.trim()).toBe("");
+    expect(credentialHtml).toMatch(
+      /<link\b(?=[^>]*\brel=["']stylesheet["'])(?=[^>]*\bhref=["']\.\/styles\.css["'])[^>]*>/i
+    );
+
+    for (const artifact of [
+      credentialHtml,
+      credentialForm,
+      credentialStyles,
+      credentialPreload
+    ]) {
+      expect(artifact).not.toContain("sourceMappingURL");
+      expect(artifact).not.toContain(
+        "credential-dist-private-sentinel"
+      );
+      expect(artifact).not.toContain("desktop-test-token-花");
+      expect(artifact).not.toContain(
+        "X-Kestrel-Desktop-Credential-Capability"
+      );
+    }
+    for (const forbidden of [
+      /\bfetch\s*\(/,
+      /\bXMLHttpRequest\b/,
+      /\bWebSocket\b/,
+      /\blocalStorage\b/,
+      /\bsessionStorage\b/,
+      /\bindexedDB\b/,
+      /\bconsole\./,
+      /\brequire\s*\(/,
+      /\bprocess\./
+    ]) {
+      expect(credentialForm).not.toMatch(forbidden);
+    }
 
     const sandbox: {
       module: { exports: Record<string, unknown> };
@@ -151,6 +260,67 @@ describe("desktop build boundary", () => {
     });
     expect(Object.isFrozen(exposed.get("kestrelDesktopRuntime"))).toBe(
       true
+    );
+
+    const credentialSandbox: {
+      module: { exports: Record<string, unknown> };
+      exports: Record<string, unknown>;
+      TextEncoder: typeof TextEncoder;
+      __required?: string[];
+      __exposed?: Array<[string, unknown]>;
+    } = {
+      module: { exports: {} },
+      exports: {},
+      TextEncoder
+    };
+    runInNewContext(
+      `
+        globalThis.__required = [];
+        globalThis.__exposed = [];
+        globalThis.require = (name) => {
+          globalThis.__required.push(name);
+          if (name !== "electron") {
+            throw new Error("unsupported credential preload require");
+          }
+          return {
+            contextBridge: {
+              exposeInMainWorld(name, value) {
+                globalThis.__exposed.push([name, value]);
+              }
+            },
+            ipcRenderer: {
+              invoke: async () => ({
+                ok: false,
+                error: { code: "desktop_feature_unavailable" }
+              })
+            }
+          };
+        };
+        ${credentialPreload}
+      `,
+      credentialSandbox,
+      { timeout: 5_000 }
+    );
+    const credentialExposed = new Map(
+      credentialSandbox.__exposed
+    );
+    expect(credentialSandbox.__required).toEqual(["electron"]);
+    expect([...credentialExposed.keys()]).toEqual([
+      "kestrelCredential"
+    ]);
+    const credentialBridge = credentialExposed.get(
+      "kestrelCredential"
+    ) as Record<string, unknown>;
+    expect(Reflect.ownKeys(credentialBridge).sort()).toEqual([
+      "cancel",
+      "getContext",
+      "submit"
+    ]);
+    expect(Object.isFrozen(credentialBridge)).toBe(true);
+    expect(credentialBridge).not.toHaveProperty("invoke");
+    expect(credentialBridge).not.toHaveProperty("ipcRenderer");
+    expect(credentialBridge).not.toHaveProperty(
+      "openCredentialDialog"
     );
   });
 });

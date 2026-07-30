@@ -619,13 +619,20 @@ def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
     assert package["devDependencies"]["esbuild"] == "0.28.1"
     assert package["devDependencies"]["@electron/fuses"] == "2.1.3"
     assert package["devDependencies"]["vitest"] == "4.1.6"
-    assert (
-        "esbuild src/preload.ts --bundle --format=cjs --platform=browser"
-        in package["scripts"]["build"]
-    )
-    assert "--external:electron" in package["scripts"]["build"]
-    assert "--outfile=dist/preload.js" in package["scripts"]["build"]
+    assert package["scripts"]["build"] == "node scripts/build.mjs"
     assert "react" not in package["dependencies"]
+
+    build_script = (
+        ROOT / "desktop" / "scripts" / "build.mjs"
+    ).read_text(encoding="utf-8")
+    assert 'external: ["electron"]' in build_script
+    assert 'format: "cjs"' in build_script
+    assert 'platform: "browser"' in build_script
+    assert 'sourcemap: false' in build_script
+    assert '"src", "preload.ts"' in build_script
+    assert '"credential", "preload.ts"' in build_script
+    assert '"credential", "form.ts"' in build_script
+    assert '["index.html", "styles.css"]' in build_script
 
     build_config = json.loads((ROOT / "desktop" / "tsconfig.build.json").read_text())
 
@@ -642,4 +649,7 @@ def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
         "src/main.ts",
         "src/main/**/*.ts",
     ]
-    assert build_config["exclude"] == ["src/**/*.test.ts"]
+    assert build_config["exclude"] == [
+        "src/**/*.test.ts",
+        "src/main/credential-ipc.ts",
+    ]

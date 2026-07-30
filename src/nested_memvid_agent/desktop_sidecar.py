@@ -261,7 +261,12 @@ def build_desktop_agent_config(launch: DesktopLaunchConfig) -> AgentConfig:
         workspace=root / "workspace",
         log_dir=root / "logs",
         state_path=launch.state_path,
-        secret_store_path=root / "secrets" / "local_vault.json",
+        secret_store_path=(
+            root
+            / "secrets"
+            / "desktop-keyring-metadata.json"
+        ),
+        secret_backend="desktop",
         skills_dir=root / "skills",
         plugins_dir=root / "plugins",
         mcp_config_path=root / "config" / "mcp_servers.json",
