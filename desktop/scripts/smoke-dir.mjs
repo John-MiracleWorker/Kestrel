@@ -40,6 +40,8 @@ const BUILD_RECEIPT_SCHEMA =
 const SMOKE_RECEIPT_SCHEMA =
   "kestrel.desktop.directory-smoke.v1";
 const RESOURCE_SCHEMA = "kestrel.desktop.resources.v1";
+const DIRECTORY_INVENTORY_SCHEMA =
+  "kestrel.desktop.directory-inventory.v1";
 const PACKAGED_BUILD_SCHEMA =
   "kestrel.desktop.packaged-build.v1";
 const READY_SCHEMA =
@@ -118,6 +120,10 @@ const BUILD_RECEIPT_KEYS = new Set([
   "manifest_sha256",
   "packaged_package_json_path",
   "packaged_package_json_sha256",
+  "packaged_dist_file_count",
+  "packaged_dist_inventory_sha256",
+  "packaged_dist_path",
+  "packaged_dist_total_bytes",
   "packaged_public_key_path",
   "packaged_public_key_sha256",
   "platform",
@@ -150,6 +156,7 @@ const SMOKE_RECEIPT_KEYS = new Set([
   "mission_command_loaded",
   "native_keyring",
   "owner_data_removed",
+  "packaged_dist_inventory_sha256",
   "platform",
   "processes_exited",
   "publishable",
@@ -332,6 +339,7 @@ export function parseDirectoryBuildReceipt(
     "executable_path",
     "stage_receipt_path",
     "packaged_package_json_path",
+    "packaged_dist_path",
     "packaged_public_key_path",
     "manifest_path",
     "signature_path",
@@ -342,6 +350,7 @@ export function parseDirectoryBuildReceipt(
     "executable_sha256",
     "stage_receipt_sha256",
     "packaged_package_json_sha256",
+    "packaged_dist_inventory_sha256",
     "packaged_public_key_sha256",
     "manifest_sha256",
     "signature_sha256",
@@ -394,6 +403,8 @@ export function parseDirectoryBuildReceipt(
     !SOURCE_COMMIT_PATTERN.test(value.source_commit) ||
     !validCount(value.production_dependency_count) ||
     !validCount(value.executable_size, 1) ||
+    !validCount(value.packaged_dist_file_count, 1) ||
+    !validCount(value.packaged_dist_total_bytes, 1) ||
     pathNames.some(
       (name) => !isCanonicalAbsolutePath(value[name]),
     ) ||
@@ -402,6 +413,8 @@ export function parseDirectoryBuildReceipt(
     value.executable_path !== expectedExecutablePath ||
     value.packaged_package_json_path !==
       join(packagedApplicationRoot, "package.json") ||
+    value.packaged_dist_path !==
+      join(packagedApplicationRoot, "dist") ||
     value.packaged_public_key_path !==
       join(
         packagedApplicationRoot,
@@ -423,6 +436,10 @@ export function parseDirectoryBuildReceipt(
     !isContained(
       value.application_root,
       value.packaged_package_json_path,
+    ) ||
+    !isContained(
+      value.application_root,
+      value.packaged_dist_path,
     ) ||
     !isContained(
       value.application_root,
@@ -481,6 +498,7 @@ export function validateDirectorySmokeReceipt(bytes) {
     "executable_sha256",
     "manifest_sha256",
     "memory_identity_sha256",
+    "packaged_dist_inventory_sha256",
   ];
   if (
     !exactKeys(value, SMOKE_RECEIPT_KEYS) ||
@@ -925,17 +943,265 @@ export function assertExecutableEvidence(
   return true;
 }
 
-async function verifyExecutableForLaunch(receipt) {
-  const executable = await inspectRegularFile(
-    receipt.executable_path,
-    1024 * 1024 * 1024,
+function sameObjectIdentity(left, right) {
+  return (
+    left !== null &&
+    left !== undefined &&
+    right !== null &&
+    right !== undefined &&
+    left.dev === right.dev &&
+    left.ino === right.ino
   );
-  const metadata = await lstat(receipt.executable_path);
-  assertExecutableEvidence(
-    receipt,
-    executable,
-    metadata,
-  );
+}
+
+export async function verifyExecutableForLaunch(
+  receipt,
+  expected = {},
+) {
+  try {
+    const application = await qualifyDirectory(
+      receipt.application_root,
+    );
+    if (
+      expected.applicationIdentity !== undefined &&
+      !sameObjectIdentity(
+        application.identity,
+        expected.applicationIdentity,
+      )
+    ) {
+      throw new Error("application identity changed");
+    }
+    const executableParent = await qualifyDirectory(
+      dirname(receipt.executable_path),
+    );
+    if (
+      !isContained(application.path, executableParent.path) ||
+      (await realpath(receipt.executable_path)) !==
+        receipt.executable_path
+    ) {
+      throw new Error("executable path escaped");
+    }
+    const executable = await inspectRegularFile(
+      receipt.executable_path,
+      1024 * 1024 * 1024,
+    );
+    const metadata = await lstat(receipt.executable_path);
+    assertExecutableEvidence(
+      receipt,
+      executable,
+      metadata,
+    );
+    if (
+      expected.executableIdentity !== undefined &&
+      !sameObjectIdentity(
+        executable.identity,
+        expected.executableIdentity,
+      )
+    ) {
+      throw new Error("executable identity changed");
+    }
+    const finalApplication = await qualifyDirectory(
+      receipt.application_root,
+    );
+    const finalParent = await qualifyDirectory(
+      dirname(receipt.executable_path),
+    );
+    if (
+      !sameObjectIdentity(
+        application.identity,
+        finalApplication.identity,
+      ) ||
+      !sameObjectIdentity(
+        executableParent.identity,
+        finalParent.identity,
+      ) ||
+      !isContained(finalApplication.path, finalParent.path) ||
+      (await realpath(receipt.executable_path)) !==
+        receipt.executable_path
+    ) {
+      throw new Error("executable path changed");
+    }
+    return {
+      applicationIdentity: application.identity,
+      executableIdentity: executable.identity,
+      path: receipt.executable_path,
+      sha256: executable.sha256,
+      size: executable.size,
+    };
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "directory_smoke_executable_invalid"
+    ) {
+      throw error;
+    }
+    throw new Error("directory_smoke_executable_invalid");
+  }
+}
+
+async function inventoryPackagedApplicationDist(root) {
+  const canonicalRoot = (await qualifyDirectory(root)).path;
+  const files = {};
+  const portablePaths = new Map();
+  let fileCount = 0;
+  let totalBytes = 0;
+
+  async function walk(directory, segments) {
+    const entries = await readdir(directory, {
+      withFileTypes: true,
+    });
+    entries.sort((left, right) =>
+      compareStrings(left.name, right.name),
+    );
+    for (const entry of entries) {
+      const relativePath = normalizeResourceRelativePath(
+        [...segments, entry.name].join("/"),
+      );
+      registerPortableResourcePath(
+        portablePaths,
+        relativePath,
+      );
+      const pathValue = join(directory, entry.name);
+      const metadata = await lstat(pathValue);
+      if (
+        entry.isSymbolicLink() ||
+        metadata.isSymbolicLink() ||
+        (!entry.isDirectory() && !entry.isFile())
+      ) {
+        throw new Error("packaged dist path is untrusted");
+      }
+      const canonical = await realpath(pathValue);
+      if (!isContained(canonicalRoot, canonical)) {
+        throw new Error("packaged dist path escaped");
+      }
+      if (entry.isDirectory()) {
+        await walk(pathValue, [...segments, entry.name]);
+        continue;
+      }
+      if (
+        metadata.nlink !== 1 ||
+        fileCount >= MAX_INVENTORY_FILES
+      ) {
+        throw new Error("packaged dist file is untrusted");
+      }
+      const availableBytes =
+        MAX_INVENTORY_BYTES - totalBytes;
+      if (availableBytes < 0) {
+        throw new Error("packaged dist exceeds its bound");
+      }
+      const inspected = await inspectRegularFile(
+        pathValue,
+        availableBytes,
+        false,
+        0,
+      );
+      fileCount += 1;
+      totalBytes += inspected.size;
+      if (
+        !Number.isSafeInteger(totalBytes) ||
+        totalBytes > MAX_INVENTORY_BYTES
+      ) {
+        throw new Error("packaged dist exceeds its bound");
+      }
+      files[relativePath] = {
+        sha256: inspected.sha256,
+        size: inspected.size,
+      };
+    }
+  }
+
+  await walk(canonicalRoot, []);
+  if (
+    fileCount === 0 ||
+    files["main.js"] === undefined
+  ) {
+    throw new Error("packaged dist is incomplete");
+  }
+  const inventoryBytes = canonicalSmokeJson({
+    schema: DIRECTORY_INVENTORY_SCHEMA,
+    files,
+  });
+  return {
+    fileCount,
+    inventorySha256: sha256Bytes(inventoryBytes),
+    root: canonicalRoot,
+    totalBytes,
+  };
+}
+
+function assertPackagedDistEvidence(receipt, evidence) {
+  if (
+    evidence.root !== receipt.packaged_dist_path ||
+    evidence.fileCount !==
+      receipt.packaged_dist_file_count ||
+    evidence.totalBytes !==
+      receipt.packaged_dist_total_bytes ||
+    evidence.inventorySha256 !==
+      receipt.packaged_dist_inventory_sha256
+  ) {
+    throw new Error(
+      "directory_smoke_packaged_dist_invalid",
+    );
+  }
+}
+
+export async function verifyPackagedApplicationDist(
+  receipt,
+  expectedApplicationIdentity = undefined,
+) {
+  try {
+    const application = await qualifyDirectory(
+      receipt.application_root,
+    );
+    if (
+      expectedApplicationIdentity !== undefined &&
+      !sameObjectIdentity(
+        application.identity,
+        expectedApplicationIdentity,
+      )
+    ) {
+      throw new Error("application identity changed");
+    }
+    const first = await inventoryPackagedApplicationDist(
+      receipt.packaged_dist_path,
+    );
+    assertPackagedDistEvidence(receipt, first);
+    const finalApplication = await qualifyDirectory(
+      receipt.application_root,
+    );
+    const final = await inventoryPackagedApplicationDist(
+      receipt.packaged_dist_path,
+    );
+    if (
+      !sameObjectIdentity(
+        application.identity,
+        finalApplication.identity,
+      ) ||
+      first.inventorySha256 !== final.inventorySha256 ||
+      first.fileCount !== final.fileCount ||
+      first.totalBytes !== final.totalBytes
+    ) {
+      throw new Error("packaged dist changed");
+    }
+    assertPackagedDistEvidence(receipt, final);
+    return {
+      applicationIdentity: application.identity,
+      fileCount: final.fileCount,
+      inventorySha256: final.inventorySha256,
+      totalBytes: final.totalBytes,
+    };
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message ===
+        "directory_smoke_packaged_dist_invalid"
+    ) {
+      throw error;
+    }
+    throw new Error(
+      "directory_smoke_packaged_dist_invalid",
+    );
+  }
 }
 
 async function verifyPackagedEvidence(
@@ -959,7 +1225,17 @@ async function verifyPackagedEvidence(
     throw new Error("directory_smoke_resource_root_invalid");
   }
 
-  await verifyExecutableForLaunch(receipt);
+  const executable = await verifyExecutableForLaunch(
+    receipt,
+    {
+      applicationIdentity: application.identity,
+    },
+  );
+  const packagedDist =
+    await verifyPackagedApplicationDist(
+      receipt,
+      application.identity,
+    );
 
   const packageRecord = await inspectRegularFile(
     receipt.packaged_package_json_path,
@@ -1093,8 +1369,12 @@ async function verifyPackagedEvidence(
     throw new Error("directory_smoke_source_mismatch");
   }
   return {
+    applicationIdentity: application.identity,
     buildReceiptSha256: buildRecord.sha256,
+    executableIdentity: executable.executableIdentity,
     manifest: manifestValue,
+    packagedDistInventorySha256:
+      packagedDist.inventorySha256,
     receipt,
     sidecar,
   };
@@ -1759,9 +2039,28 @@ async function runCycle(
     "runtime",
     "desktop-readiness.json",
   );
-  await verifyExecutableForLaunch(evidence.receipt);
+  const packagedDist =
+    await verifyPackagedApplicationDist(
+      evidence.receipt,
+      evidence.applicationIdentity,
+    );
+  if (
+    packagedDist.inventorySha256 !==
+      evidence.packagedDistInventorySha256
+  ) {
+    throw new Error(
+      "directory_smoke_packaged_dist_invalid",
+    );
+  }
+  const executable = await verifyExecutableForLaunch(
+    evidence.receipt,
+    {
+      applicationIdentity: evidence.applicationIdentity,
+      executableIdentity: evidence.executableIdentity,
+    },
+  );
   const child = spawn(
-    evidence.receipt.executable_path,
+    executable.path,
     [
       DIRECTORY_SMOKE_ARGUMENT,
       `--user-data-dir=${userDataPath}`,
@@ -2060,6 +2359,8 @@ export async function runDeveloperDirectorySmoke(input) {
         evidence.receipt.executable_sha256,
       manifest_sha256:
         evidence.receipt.manifest_sha256,
+      packaged_dist_inventory_sha256:
+        evidence.packagedDistInventorySha256,
       memory_identity_sha256:
         memorySnapshotDigest(second.snapshot),
     };

@@ -29,7 +29,9 @@ import {
   validateDirectorySmokeReceipt,
   validateMemorySnapshotEntries,
   validateSmokePlatform,
+  verifyExecutableForLaunch,
   verifyManifestInventory,
+  verifyPackagedApplicationDist,
 } from "./smoke-dir.mjs";
 
 const sha256 = (character) => character.repeat(64);
@@ -101,6 +103,13 @@ function buildReceipt(overrides = {}) {
       "package.json",
     ),
     packaged_package_json_sha256: sha256("5"),
+    packaged_dist_path: join(
+      packagedApplicationRoot,
+      "dist",
+    ),
+    packaged_dist_inventory_sha256: sha256("b"),
+    packaged_dist_file_count: 2,
+    packaged_dist_total_bytes: 2048,
     packaged_public_key_path: join(
       packagedApplicationRoot,
       "config",
@@ -146,6 +155,7 @@ function smokeReceipt(overrides = {}) {
     build_receipt_sha256: sha256("9"),
     executable_sha256: sha256("4"),
     manifest_sha256: sha256("7"),
+    packaged_dist_inventory_sha256: sha256("b"),
     memory_identity_sha256: sha256("a"),
     ...overrides,
   };
@@ -231,6 +241,13 @@ describe("external developer directory smoke contracts", () => {
           applicationRoot,
           "other",
           "package.json",
+        ),
+      },
+      {
+        packaged_dist_path: join(
+          applicationRoot,
+          "other",
+          "dist",
         ),
       },
       {
@@ -503,6 +520,138 @@ describe("external developer directory smoke contracts", () => {
         trustedMetadata,
       ),
     ).toThrow("directory_smoke_executable_invalid");
+  });
+
+  it.runIf(process.platform === "darwin")(
+    "rejects executable ancestor-link drift immediately before launch",
+    async () => {
+      const root = await realpath(
+        await mkdtemp(
+          join(tmpdir(), "kestrel-smoke-executable-"),
+        ),
+      );
+      const applicationRoot = join(
+        root,
+        "Kestrel Developer.app",
+      );
+      const macOsRoot = join(
+        applicationRoot,
+        "Contents",
+        "MacOS",
+      );
+      const executablePath = join(
+        macOsRoot,
+        "Kestrel Developer",
+      );
+      const outsideMacOsRoot = join(root, "outside-macos");
+      await mkdir(macOsRoot, { recursive: true });
+      await writeFile(executablePath, "trusted executable");
+      await chmod(executablePath, 0o755);
+      const executableBytes = await readFile(executablePath);
+      const receipt = buildReceipt({
+        application_root: applicationRoot,
+        executable_path: executablePath,
+        executable_sha256: createHash("sha256")
+          .update(executableBytes)
+          .digest("hex"),
+        executable_size: executableBytes.byteLength,
+      });
+      try {
+        await expect(
+          verifyExecutableForLaunch(receipt),
+        ).resolves.toMatchObject({
+          path: executablePath,
+        });
+        await rename(macOsRoot, outsideMacOsRoot);
+        await symlink(outsideMacOsRoot, macOsRoot);
+        await expect(
+          verifyExecutableForLaunch(receipt),
+        ).rejects.toThrow(
+          "directory_smoke_executable_invalid",
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects packaged main-code tampering before either launch", async () => {
+    const root = await realpath(
+      await mkdtemp(
+        join(tmpdir(), "kestrel-smoke-app-dist-"),
+      ),
+    );
+    const applicationRoot =
+      process.platform === "darwin"
+        ? join(root, "Kestrel Developer.app")
+        : join(root, "kestrel-desktop-dir");
+    const packagedApplicationRoot =
+      process.platform === "darwin"
+        ? join(
+            applicationRoot,
+            "Contents",
+            "Resources",
+            "app",
+          )
+        : join(applicationRoot, "resources", "app");
+    const distPath = join(packagedApplicationRoot, "dist");
+    const mainBytes = Buffer.from("export {};\n");
+    const declarationBytes = Buffer.from("export {};\n");
+    const files = {
+      "main.d.ts": {
+        sha256: createHash("sha256")
+          .update(declarationBytes)
+          .digest("hex"),
+        size: declarationBytes.byteLength,
+      },
+      "main.js": {
+        sha256: createHash("sha256")
+          .update(mainBytes)
+          .digest("hex"),
+        size: mainBytes.byteLength,
+      },
+    };
+    const inventoryBytes = canonicalSmokeJson({
+      schema: "kestrel.desktop.directory-inventory.v1",
+      files,
+    });
+    await mkdir(distPath, { recursive: true });
+    await writeFile(join(distPath, "main.js"), mainBytes);
+    await writeFile(
+      join(distPath, "main.d.ts"),
+      declarationBytes,
+    );
+    const receipt = buildReceipt({
+      application_root: applicationRoot,
+      packaged_dist_path: distPath,
+      packaged_dist_inventory_sha256:
+        createHash("sha256")
+          .update(inventoryBytes)
+          .digest("hex"),
+      packaged_dist_file_count: 2,
+      packaged_dist_total_bytes:
+        mainBytes.byteLength + declarationBytes.byteLength,
+    });
+    try {
+      await expect(
+        verifyPackagedApplicationDist(receipt),
+      ).resolves.toMatchObject({
+        fileCount: 2,
+        totalBytes:
+          mainBytes.byteLength + declarationBytes.byteLength,
+      });
+      await writeFile(
+        join(distPath, "main.js"),
+        "throw new Error('tampered');\n",
+      );
+      await expect(
+        verifyPackagedApplicationDist(receipt),
+      ).rejects.toThrow(
+        "directory_smoke_packaged_dist_invalid",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects a second-cycle extra Memvid v2 file anywhere in the profile", () => {

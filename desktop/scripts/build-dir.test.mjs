@@ -9,6 +9,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -578,8 +579,19 @@ describe("developer directory bundle", () => {
     expect(receipt.executable_path.startsWith(receipt.application_root)).toBe(
       true,
     );
+    const packagedAppRoot = dirname(
+      dirname(receipt.packaged_public_key_path),
+    );
     expect(receipt.executable_sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(receipt.executable_size).toBeGreaterThan(0);
+    expect(receipt.packaged_dist_path).toBe(
+      join(packagedAppRoot, "dist"),
+    );
+    expect(receipt.packaged_dist_inventory_sha256).toMatch(
+      /^[0-9a-f]{64}$/,
+    );
+    expect(receipt.packaged_dist_file_count).toBe(2);
+    expect(receipt.packaged_dist_total_bytes).toBeGreaterThan(0);
     expect(receipt.stage_receipt_path).toBe(
       fixture.stageReceiptPath,
     );
@@ -594,9 +606,6 @@ describe("developer directory bundle", () => {
     expect(
       packagedPackage.kestrelDesktopBuild.smoke_authority,
     ).toBe("developer_directory_smoke_v1");
-    const packagedAppRoot = dirname(
-      dirname(receipt.packaged_public_key_path),
-    );
     await expect(
       lstat(
         join(
@@ -930,8 +939,8 @@ describe("developer directory bundle", () => {
     }
   });
 
-  it("rejects packaged metadata, key, and staged-resource identity drift", async () => {
-    for (const mutation of ["package", "key", "resource"]) {
+  it("rejects packaged metadata, compiled app, key, and staged-resource identity drift", async () => {
+    for (const mutation of ["package", "compiled-app", "key", "resource"]) {
       const fixture = await createFixture();
       await expect(
         buildDeveloperDirectory(
@@ -951,6 +960,16 @@ describe("developer directory bundle", () => {
                     await writeFile(
                       join(resourcesRoot, "app", "package.json"),
                       '{"version":"9.9.9"}\n',
+                    );
+                  } else if (mutation === "compiled-app") {
+                    await writeFile(
+                      join(
+                        resourcesRoot,
+                        "app",
+                        "dist",
+                        "main.js",
+                      ),
+                      "throw new Error('tampered');\n",
                     );
                   } else if (mutation === "key") {
                     await writeFile(
@@ -984,6 +1003,53 @@ describe("developer directory bundle", () => {
       });
     }
   });
+
+  it.runIf(process.platform === "darwin")(
+    "rejects an executable reached through a linked ancestor",
+    async () => {
+      const fixture = await createFixture();
+      const outsideMacOsRoot = join(
+        dirname(fixture.outputRoot),
+        "outside-macos",
+      );
+      await expect(
+        buildDeveloperDirectory(
+          {
+            stageReceiptPath: fixture.stageReceiptPath,
+            outputRoot: fixture.outputRoot,
+            receiptPath: fixture.buildReceiptPath,
+          },
+          {
+            repositoryRoot: fixture.repositoryRoot,
+            desktopRoot: fixture.desktopRoot,
+            executeBuilder: async (invocation) => {
+              await copyDirectorySourceToApplication(
+                invocation,
+                async ({ applicationRoot }) => {
+                  const macOsRoot = join(
+                    applicationRoot,
+                    "Contents",
+                    "MacOS",
+                  );
+                  await rename(macOsRoot, outsideMacOsRoot);
+                  await symlink(outsideMacOsRoot, macOsRoot);
+                },
+              );
+            },
+          },
+        ),
+      ).rejects.toThrow(/canonical|link|escape/i);
+      await expect(
+        readFile(
+          join(
+            outsideMacOsRoot,
+            "Kestrel Developer",
+          ),
+          "utf8",
+        ),
+      ).resolves.toContain("developer executable fixture");
+    },
+  );
 
   it("rejects a linked generated dependency root before replacement", async () => {
     const fixture = await createFixture();

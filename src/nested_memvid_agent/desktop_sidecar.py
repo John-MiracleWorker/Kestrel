@@ -91,6 +91,7 @@ ServerFactory = Callable[[Any], _DesktopServer]
 SocketFactory = Callable[[], socket.socket]
 Preflight = Callable[[Path], DesktopMemvidPreflightReceipt | None]
 DeveloperBirthMarkerReader = Callable[[int], str | None]
+DeveloperParentPidReader = Callable[[int], int | None]
 
 
 class IdentityFactory(Protocol):
@@ -618,15 +619,30 @@ def verify_desktop_parent_identity(
     current_pid: int | None = None,
     inspector: LeaseProcessInspector,
     developer_birth_marker_reader: DeveloperBirthMarkerReader | None = None,
+    developer_parent_pid_reader: DeveloperParentPidReader | None = None,
+    frozen_runtime: bool | None = None,
 ) -> LeaseProcessSnapshot:
     """Verify that the live parent matches the bootstrap's birth-bound identity."""
 
     observed_parent_pid = os.getppid() if actual_parent_pid is None else actual_parent_pid
-    if observed_parent_pid != launch.parent_pid:
-        raise RuntimeError("desktop_parent_pid_mismatch")
+    resolved_frozen_runtime = (
+        bool(getattr(sys, "frozen", False))
+        if frozen_runtime is None
+        else frozen_runtime
+    )
+    has_developer_bootloader = observed_parent_pid != launch.parent_pid
+    resolved_parent_pid_reader = (
+        developer_parent_pid_reader or read_developer_macos_process_parent_pid
+    )
+    if has_developer_bootloader:
+        if launch.assurance_mode != "developer" or not resolved_frozen_runtime:
+            raise RuntimeError("desktop_parent_pid_mismatch")
+        if resolved_parent_pid_reader(observed_parent_pid) != launch.parent_pid:
+            raise RuntimeError("desktop_parent_identity_unverified")
     own_pid = os.getpid() if current_pid is None else current_pid
     parent = inspector(launch.parent_pid)
     current = inspector(own_pid)
+    bootloader = inspector(observed_parent_pid) if has_developer_bootloader else None
     resolved_developer_birth_marker_reader = (
         developer_birth_marker_reader or read_developer_macos_process_birth_marker
     )
@@ -648,7 +664,70 @@ def verify_desktop_parent_identity(
         or not secrets.compare_digest(parent.owner_digest, current.owner_digest)
     ):
         raise RuntimeError("desktop_parent_identity_unverified")
+    if has_developer_bootloader:
+        if (
+            bootloader is None
+            or bootloader.pid != observed_parent_pid
+            or observed_parent_pid in {launch.parent_pid, own_pid}
+            or not secrets.compare_digest(
+                bootloader.owner_digest,
+                parent.owner_digest,
+            )
+            or not secrets.compare_digest(
+                bootloader.owner_digest,
+                current.owner_digest,
+            )
+            or not secrets.compare_digest(
+                bootloader.executable_digest,
+                current.executable_digest,
+            )
+            or resolved_parent_pid_reader(observed_parent_pid)
+            != launch.parent_pid
+            or inspector(launch.parent_pid) != parent
+            or inspector(observed_parent_pid) != bootloader
+            or inspector(own_pid) != current
+        ):
+            raise RuntimeError("desktop_parent_identity_unverified")
     return parent
+
+
+def read_developer_macos_process_parent_pid(pid: int) -> int | None:
+    """Read one developer-only macOS parent edge without walking arbitrary ancestry."""
+
+    if sys.platform != "darwin" or isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 - absolute trusted system binary
+            [
+                "/bin/ps",
+                "-ww",
+                "-p",
+                str(pid),
+                "-o",
+                "ppid=",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > 16 * 1024:
+        return None
+    try:
+        rendered = completed.stdout.decode("utf-8").strip()
+        parent_pid = int(rendered)
+    except (UnicodeDecodeError, ValueError, OverflowError):
+        return None
+    return parent_pid if parent_pid > 0 else None
 
 
 def read_developer_macos_process_birth_marker(pid: int) -> str | None:

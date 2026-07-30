@@ -453,6 +453,121 @@ def test_developer_parent_identity_uses_tagged_ps_birth_marker(
     assert verified == snapshots[4242]
 
 
+def test_frozen_developer_parent_identity_qualifies_one_exact_bootloader(
+    tmp_path: Path,
+) -> None:
+    launch = replace(
+        _launch(tmp_path, assurance_mode="developer"),
+        parent_birth_marker="developer-ps-lstart-ms:1753886400000",
+    )
+    snapshots = {
+        4242: _snapshot(
+            4242,
+            birth_marker="darwin-proc-start:10:20",
+            executable_digest="a" * 64,
+        ),
+        5151: _snapshot(
+            5151,
+            birth_marker="darwin-proc-start:30:40",
+            executable_digest="b" * 64,
+        ),
+        9001: _snapshot(
+            9001,
+            birth_marker="darwin-proc-start:30:40",
+            executable_digest="b" * 64,
+        ),
+    }
+
+    verified = verify_desktop_parent_identity(
+        launch,
+        actual_parent_pid=5151,
+        current_pid=9001,
+        inspector=lambda pid: snapshots.get(pid),
+        developer_birth_marker_reader=(
+            lambda pid: (
+                "developer-ps-lstart-ms:1753886400000"
+                if pid == 4242
+                else None
+            )
+        ),
+        developer_parent_pid_reader=(
+            lambda pid: 4242 if pid == 5151 else None
+        ),
+        frozen_runtime=True,
+    )
+
+    assert verified == snapshots[4242]
+
+
+@pytest.mark.parametrize(
+    ("assurance_mode", "bootloader_owner", "payload_digest", "bootloader_parent"),
+    [
+        ("release", "1" * 64, "b" * 64, 4242),
+        ("developer", "9" * 64, "b" * 64, 4242),
+        ("developer", "1" * 64, "c" * 64, 4242),
+        ("developer", "1" * 64, "b" * 64, 31337),
+    ],
+)
+def test_frozen_parent_chain_rejects_unqualified_intermediate(
+    tmp_path: Path,
+    assurance_mode: str,
+    bootloader_owner: str,
+    payload_digest: str,
+    bootloader_parent: int,
+) -> None:
+    launch = replace(
+        _launch(tmp_path, assurance_mode=assurance_mode),
+        parent_birth_marker=(
+            "developer-ps-lstart-ms:1753886400000"
+            if assurance_mode == "developer"
+            else "desktop-parent-birth-marker"
+        ),
+    )
+    snapshots = {
+        4242: _snapshot(
+            4242,
+            executable_digest="a" * 64,
+        ),
+        5151: _snapshot(
+            5151,
+            owner_digest=bootloader_owner,
+            birth_marker="darwin-proc-start:30:40",
+            executable_digest="b" * 64,
+        ),
+        9001: _snapshot(
+            9001,
+            birth_marker="darwin-proc-start:30:40",
+            executable_digest=payload_digest,
+        ),
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "desktop_parent_pid_mismatch"
+            if assurance_mode == "release"
+            else "desktop_parent_identity_unverified"
+        ),
+    ):
+        verify_desktop_parent_identity(
+            launch,
+            actual_parent_pid=5151,
+            current_pid=9001,
+            inspector=lambda pid: snapshots.get(pid),
+            developer_birth_marker_reader=(
+                lambda pid: (
+                    "developer-ps-lstart-ms:1753886400000"
+                    if pid == 4242
+                    else None
+                )
+            ),
+            developer_parent_pid_reader=(
+                lambda pid: bootloader_parent if pid == 5151 else None
+            ),
+            frozen_runtime=True,
+        )
+
+
 def test_developer_runtime_identity_reuses_tagged_ps_birth_marker(
     tmp_path: Path,
 ) -> None:

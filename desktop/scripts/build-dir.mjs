@@ -38,6 +38,8 @@ const SIGNATURE_NAME = "kestrel-resource-manifest.sig";
 const PUBLIC_KEY_NAME = "desktop-developer-public-key.pem";
 const STAGE_RECEIPT_SCHEMA = "kestrel.desktop.stage.v1";
 const BUILD_RECEIPT_SCHEMA = "kestrel.desktop.directory-build.v1";
+const DIRECTORY_INVENTORY_SCHEMA =
+  "kestrel.desktop.directory-inventory.v1";
 const RESOURCE_SCHEMA = "kestrel.desktop.resources.v1";
 const ELECTRON_VERSION = "43.2.0";
 const ELECTRON_BUILDER_VERSION = "26.15.3";
@@ -411,6 +413,37 @@ function inventoriesMatch(left, right) {
     }
   }
   return true;
+}
+
+function inventoryEvidence(inventory) {
+  const files = {};
+  let totalBytes = 0;
+  for (const name of [...inventory.keys()].sort(compareStrings)) {
+    const entry = inventory.get(name);
+    if (entry === undefined) {
+      throw new Error("directory inventory changed");
+    }
+    files[name] = {
+      sha256: entry.sha256,
+      size: entry.size,
+    };
+    totalBytes += entry.size;
+    if (
+      !Number.isSafeInteger(totalBytes) ||
+      totalBytes > MAX_INVENTORY_BYTES
+    ) {
+      throw new Error("directory inventory exceeds its byte bound");
+    }
+  }
+  const bytes = canonicalJsonBytes({
+    schema: DIRECTORY_INVENTORY_SCHEMA,
+    files,
+  });
+  return {
+    fileCount: inventory.size,
+    sha256: sha256Bytes(bytes),
+    totalBytes,
+  };
 }
 
 function inventoryDifference(left, right) {
@@ -1162,6 +1195,18 @@ async function locateApplicationExecutable(
   ) {
     throw new Error("packaged executable escapes application root");
   }
+  const executableParent = await qualifyDirectory(
+    dirname(executablePath),
+    "packaged application executable parent",
+  );
+  if (!isContained(applicationRoot, executableParent)) {
+    throw new Error("packaged executable parent escapes application root");
+  }
+  if (
+    (await realpath(executablePath)) !== executablePath
+  ) {
+    throw new Error("packaged executable path is not canonical");
+  }
   const executable = await inspectRegularFile(
     executablePath,
     "packaged application executable",
@@ -1173,6 +1218,12 @@ async function locateApplicationExecutable(
     (metadata.mode & 0o111) === 0
   ) {
     throw new Error("packaged application executable is not executable");
+  }
+  if (
+    (await realpath(executableParent)) !== executableParent ||
+    (await realpath(executablePath)) !== executablePath
+  ) {
+    throw new Error("packaged executable path changed");
   }
   return {
     path: executablePath,
@@ -1483,6 +1534,7 @@ export async function buildDeveloperDirectory(
       );
     }
     const packagedPackagePath = join(appRoot, "package.json");
+    const packagedDistPath = join(appRoot, "dist");
     const packagedPublicKeyPath = join(
       appRoot,
       "config",
@@ -1524,6 +1576,21 @@ export async function buildDeveloperDirectory(
           ),
       );
     }
+    const packagedDist = await inventoryDirectory(
+      packagedDistPath,
+      "packaged compiled application",
+    );
+    if (
+      !packagedDist.files.has("main.js") ||
+      !inventoriesMatch(dist.files, packagedDist.files)
+    ) {
+      throw new Error(
+        "packaged compiled application identity mismatch:" +
+          inventoryDifference(dist.files, packagedDist.files),
+      );
+    }
+    const packagedDistEvidence =
+      inventoryEvidence(packagedDist.files);
     const packagedManifestPath = join(
       layout.resourceRoot,
       MANIFEST_NAME,
@@ -1579,6 +1646,13 @@ export async function buildDeveloperDirectory(
       packaged_package_json_path: packagedPackagePath,
       packaged_package_json_sha256:
         packagedPackageRecord.sha256,
+      packaged_dist_path: packagedDist.root,
+      packaged_dist_inventory_sha256:
+        packagedDistEvidence.sha256,
+      packaged_dist_file_count:
+        packagedDistEvidence.fileCount,
+      packaged_dist_total_bytes:
+        packagedDistEvidence.totalBytes,
       packaged_public_key_path: packagedPublicKeyPath,
       packaged_public_key_sha256:
         packagedPublicKeyRecord.sha256,
