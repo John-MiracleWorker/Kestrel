@@ -54,6 +54,172 @@ import {
   type DesktopUpdateStatus
 } from "../contracts.js";
 
+type IntrinsicGetter = (this: unknown) => unknown;
+
+function captureIntrinsicGetter(
+  prototype: object,
+  property: "buffer" | "byteOffset" | "byteLength"
+): IntrinsicGetter {
+  const getter = Object.getOwnPropertyDescriptor(
+    prototype,
+    property
+  )?.get;
+  if (typeof getter !== "function") {
+    throw new Error("desktop_intrinsic_unavailable");
+  }
+  return getter;
+}
+
+const typedArrayPrototype = Object.getPrototypeOf(
+  Uint8Array.prototype
+) as object;
+const typedArrayBufferGetter = captureIntrinsicGetter(
+  typedArrayPrototype,
+  "buffer"
+);
+const typedArrayByteOffsetGetter = captureIntrinsicGetter(
+  typedArrayPrototype,
+  "byteOffset"
+);
+const typedArrayByteLengthGetter = captureIntrinsicGetter(
+  typedArrayPrototype,
+  "byteLength"
+);
+const dataViewBufferGetter = captureIntrinsicGetter(
+  DataView.prototype,
+  "buffer"
+);
+const dataViewByteOffsetGetter = captureIntrinsicGetter(
+  DataView.prototype,
+  "byteOffset"
+);
+const dataViewByteLengthGetter = captureIntrinsicGetter(
+  DataView.prototype,
+  "byteLength"
+);
+const arrayBufferByteLengthGetter =
+  captureIntrinsicGetter(
+    ArrayBuffer.prototype,
+    "byteLength"
+  );
+const intrinsicArrayBufferIsView = ArrayBuffer.isView;
+const intrinsicUint8ArrayFill = Uint8Array.prototype.fill;
+const intrinsicUint8ArraySet = Uint8Array.prototype.set;
+
+interface IntrinsicArrayBufferView {
+  readonly buffer: ArrayBufferLike;
+  readonly byteOffset: number;
+  readonly byteLength: number;
+}
+
+function readIntrinsicView(
+  value: unknown,
+  kind: "typed-array" | "data-view"
+): IntrinsicArrayBufferView | null {
+  const bufferGetter =
+    kind === "typed-array"
+      ? typedArrayBufferGetter
+      : dataViewBufferGetter;
+  const byteOffsetGetter =
+    kind === "typed-array"
+      ? typedArrayByteOffsetGetter
+      : dataViewByteOffsetGetter;
+  const byteLengthGetter =
+    kind === "typed-array"
+      ? typedArrayByteLengthGetter
+      : dataViewByteLengthGetter;
+  try {
+    return {
+      buffer: Reflect.apply(
+        bufferGetter,
+        value,
+        []
+      ) as ArrayBufferLike,
+      byteOffset: Reflect.apply(
+        byteOffsetGetter,
+        value,
+        []
+      ) as number,
+      byteLength: Reflect.apply(
+        byteLengthGetter,
+        value,
+        []
+      ) as number
+    };
+  } catch {
+    return null;
+  }
+}
+
+function intrinsicArrayBufferView(
+  value: unknown
+): IntrinsicArrayBufferView | null {
+  if (
+    !Reflect.apply(
+      intrinsicArrayBufferIsView,
+      ArrayBuffer,
+      [value]
+    )
+  ) {
+    return null;
+  }
+  return (
+    readIntrinsicView(value, "typed-array") ??
+    readIntrinsicView(value, "data-view")
+  );
+}
+
+function intrinsicArrayBufferByteLength(
+  value: ArrayBufferLike
+): number | null {
+  try {
+    return Reflect.apply(
+      arrayBufferByteLengthGetter,
+      value,
+      []
+    ) as number;
+  } catch {
+    return null;
+  }
+}
+
+function scrubIntrinsicView(value: unknown): void {
+  const view = intrinsicArrayBufferView(value);
+  if (view === null) {
+    return;
+  }
+  try {
+    const bytes = new Uint8Array(
+      view.buffer,
+      view.byteOffset,
+      view.byteLength
+    );
+    Reflect.apply(
+      intrinsicUint8ArrayFill,
+      bytes,
+      [0]
+    );
+  } catch {
+    // Detached or otherwise invalid backing stores remain rejected.
+  }
+}
+
+function copyIntrinsicUint8Array(
+  value: Uint8Array
+): Uint8Array {
+  const view = readIntrinsicView(value, "typed-array");
+  if (view === null) {
+    throw new Error("invalid_desktop_request");
+  }
+  const copy = new Uint8Array(view.byteLength);
+  Reflect.apply(
+    intrinsicUint8ArraySet,
+    copy,
+    [value, 0]
+  );
+  return copy;
+}
+
 export interface DesktopIpcFrame {
   readonly url: string;
   readonly processId: number;
@@ -667,25 +833,29 @@ function exactCredentialSubmitBytes(
     return null;
   }
   const valueBytes = valueDescriptor.value;
+  const view = readIntrinsicView(
+    valueBytes,
+    "typed-array"
+  );
+  const backingLength =
+    view === null
+      ? null
+      : intrinsicArrayBufferByteLength(view.buffer);
   if (
     !(valueBytes instanceof Uint8Array) ||
     Buffer.isBuffer(valueBytes) ||
     Object.getPrototypeOf(valueBytes) !==
       Uint8Array.prototype ||
-    !(valueBytes.buffer instanceof ArrayBuffer) ||
-    Object.getPrototypeOf(valueBytes.buffer) !==
+    view === null ||
+    !(view.buffer instanceof ArrayBuffer) ||
+    Object.getPrototypeOf(view.buffer) !==
       ArrayBuffer.prototype ||
-    valueBytes.byteOffset !== 0 ||
-    valueBytes.byteLength !== valueBytes.buffer.byteLength ||
-    valueBytes.byteLength === 0 ||
-    valueBytes.byteLength > DESKTOP_CREDENTIAL_VALUE_BYTES
+    backingLength === null ||
+    view.byteOffset !== 0 ||
+    view.byteLength !== backingLength ||
+    view.byteLength === 0 ||
+    view.byteLength > DESKTOP_CREDENTIAL_VALUE_BYTES
   ) {
-    if (
-      valueBytes instanceof Uint8Array &&
-      !Buffer.isBuffer(valueBytes)
-    ) {
-      valueBytes.fill(0);
-    }
     return null;
   }
   return valueBytes;
@@ -719,16 +889,7 @@ function scrubCredentialSubmitViews(
     ) {
       continue;
     }
-    const view = descriptor.value;
-    try {
-      new Uint8Array(
-        view.buffer,
-        view.byteOffset,
-        view.byteLength
-      ).fill(0);
-    } catch {
-      // Continue scrubbing other directly owned byte views.
-    }
+    scrubIntrinsicView(descriptor.value);
   }
 }
 
@@ -817,7 +978,9 @@ export function installCredentialIpc(
         if (rendererBytes === null) {
           return errorEnvelope("invalid_desktop_request");
         }
-        ownedBytes = Uint8Array.from(rendererBytes);
+        ownedBytes = copyIntrinsicUint8Array(
+          rendererBytes
+        );
         scrubCredentialSubmitViews(rawRequest);
         await options.submit(ownedBytes);
         return successfulEnvelope(
@@ -828,7 +991,7 @@ export function installCredentialIpc(
       } catch {
         return errorEnvelope("desktop_operation_failed");
       } finally {
-        ownedBytes?.fill(0);
+        scrubIntrinsicView(ownedBytes);
         scrubCredentialSubmitViews(rawRequest);
       }
     }

@@ -7,6 +7,7 @@ import {
   realpath
 } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { posix } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
 import { z } from "zod";
@@ -55,6 +56,8 @@ const MEMORY_LAYERS = [
 ] as const;
 const LOG_LINE_BYTES = 1_024;
 const HTTP_RESPONSE_BYTES = 16 * 1024;
+const DBUS_SESSION_ADDRESS_CHARACTERS = 2_048;
+const XDG_RUNTIME_DIRECTORY_CHARACTERS = 1_024;
 const safeEnvironmentNames = [
   "LANG",
   "LC_ALL",
@@ -242,6 +245,7 @@ export interface SidecarSupervisorConfig {
   sidecarVersion: string;
   readinessTimeoutMs: number;
   shutdownTimeoutMs: number;
+  platform: NodeJS.Platform;
   environment: Readonly<Record<string, string | undefined>>;
 }
 
@@ -305,14 +309,121 @@ function constantTimeEqual(left: string, right: string): boolean {
   );
 }
 
+function hasControlCharacters(value: string): boolean {
+  return /[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function validDbusAddressValue(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (/[A-Za-z0-9_./\\*-]/.test(character)) {
+      continue;
+    }
+    if (
+      character !== "%" ||
+      index + 2 >= value.length ||
+      !/^[0-9a-fA-F]{2}$/.test(value.slice(index + 1, index + 3))
+    ) {
+      return false;
+    }
+    const decoded = Number.parseInt(
+      value.slice(index + 1, index + 3),
+      16
+    );
+    if (decoded <= 0x1f || decoded === 0x7f) {
+      return false;
+    }
+    index += 2;
+  }
+  return true;
+}
+
+function validUnixDbusEntry(value: string): boolean {
+  if (!value.startsWith("unix:")) {
+    return false;
+  }
+  const parameters = value.slice("unix:".length).split(",");
+  if (parameters.length === 0) {
+    return false;
+  }
+  const parsed = new Map<string, string>();
+  for (const parameter of parameters) {
+    const separator = parameter.indexOf("=");
+    if (
+      separator <= 0 ||
+      separator === parameter.length - 1
+    ) {
+      return false;
+    }
+    const name = parameter.slice(0, separator);
+    const entryValue = parameter.slice(separator + 1);
+    if (
+      !["path", "abstract", "guid"].includes(name) ||
+      parsed.has(name)
+    ) {
+      return false;
+    }
+    parsed.set(name, entryValue);
+  }
+  const path = parsed.get("path");
+  const abstract = parsed.get("abstract");
+  if (
+    (path === undefined) === (abstract === undefined) ||
+    (path !== undefined &&
+      (!path.startsWith("/") || !validDbusAddressValue(path))) ||
+    (abstract !== undefined &&
+      !validDbusAddressValue(abstract))
+  ) {
+    return false;
+  }
+  const guid = parsed.get("guid");
+  return guid === undefined || /^[0-9a-fA-F]{32}$/.test(guid);
+}
+
+function validDbusSessionAddress(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= DBUS_SESSION_ADDRESS_CHARACTERS &&
+    !hasControlCharacters(value) &&
+    value.split(";").every(validUnixDbusEntry)
+  );
+}
+
+function validXdgRuntimeDirectory(value: string): boolean {
+  return (
+    value.length > 1 &&
+    value.length <= XDG_RUNTIME_DIRECTORY_CHARACTERS &&
+    !hasControlCharacters(value) &&
+    posix.isAbsolute(value) &&
+    posix.normalize(value) === value
+  );
+}
+
 function minimalEnvironment(
-  source: Readonly<Record<string, string | undefined>>
+  source: Readonly<Record<string, string | undefined>>,
+  platform: NodeJS.Platform
 ): Record<string, string> {
   const environment: Record<string, string> = {};
   for (const name of safeEnvironmentNames) {
     const value = source[name];
     if (value !== undefined && value.length > 0 && !value.includes("\0")) {
       environment[name] = value;
+    }
+  }
+  if (platform === "linux") {
+    const dbusAddress = source.DBUS_SESSION_BUS_ADDRESS;
+    if (
+      dbusAddress !== undefined &&
+      validDbusSessionAddress(dbusAddress)
+    ) {
+      environment.DBUS_SESSION_BUS_ADDRESS = dbusAddress;
+    }
+    const runtimeDirectory = source.XDG_RUNTIME_DIR;
+    if (
+      runtimeDirectory !== undefined &&
+      validXdgRuntimeDirectory(runtimeDirectory)
+    ) {
+      environment.XDG_RUNTIME_DIR = runtimeDirectory;
     }
   }
   return environment;
@@ -668,7 +779,10 @@ export class SidecarSupervisor {
           shell: false,
           detached: false,
           stdio: ["ignore", "pipe", "pipe"],
-          env: minimalEnvironment(this.config.environment)
+          env: minimalEnvironment(
+            this.config.environment,
+            this.config.platform
+          )
         }
       });
       let terminal: SidecarSupervisorError | null = null;

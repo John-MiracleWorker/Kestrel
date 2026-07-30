@@ -544,6 +544,273 @@ describe("credential-only main IPC", () => {
     ).toBe(true);
   });
 
+  it("copies and scrubs an accepted view without invoking own shadowed typed-array accessors, methods, or iterator", async () => {
+    let submittedText = "";
+    const { webContents, handlers } = harness({
+      submit: async (valueBytes) => {
+        submittedText = new TextDecoder().decode(valueBytes);
+      }
+    });
+    const backing = new ArrayBuffer(3);
+    const inspection = new Uint8Array(backing);
+    inspection.set([107, 101, 121]);
+    const rendererBytes = new Uint8Array(backing);
+    const shadowed = {
+      buffer: vi.fn(() => {
+        throw new Error("shadowed_buffer_called");
+      }),
+      byteOffset: vi.fn(() => {
+        throw new Error("shadowed_byte_offset_called");
+      }),
+      byteLength: vi.fn(() => {
+        throw new Error("shadowed_byte_length_called");
+      }),
+      iterator: vi.fn(() => {
+        throw new Error("shadowed_iterator_called");
+      }),
+      fill: vi.fn(() => {
+        throw new Error("shadowed_fill_called");
+      }),
+      set: vi.fn(() => {
+        throw new Error("shadowed_set_called");
+      })
+    };
+    Object.defineProperties(rendererBytes, {
+      buffer: { get: shadowed.buffer },
+      byteOffset: { get: shadowed.byteOffset },
+      byteLength: { get: shadowed.byteLength },
+      [Symbol.iterator]: { value: shadowed.iterator },
+      fill: { value: shadowed.fill },
+      set: { value: shadowed.set }
+    });
+
+    await expect(
+      handlers.get(DESKTOP_CREDENTIAL_IPC_CHANNELS.submit)!(
+        eventFor(webContents),
+        {
+          schema: "kestrel.credential.submit.v1",
+          valueBytes: rendererBytes
+        }
+      )
+    ).resolves.toEqual({
+      ok: true,
+      value: { status: "stored" }
+    });
+
+    expect(submittedText).toBe("key");
+    for (const shadow of Object.values(shadowed)) {
+      expect(shadow).not.toHaveBeenCalled();
+    }
+    expect(Array.from(inspection)).toEqual([0, 0, 0]);
+  });
+
+  it("uses module-captured typed-array intrinsics when the accepted view prototype is shadowed later", async () => {
+    const originalDescriptors = new Map<
+      PropertyKey,
+      PropertyDescriptor | undefined
+    >();
+    const prototype = Uint8Array.prototype;
+    const shadowed = new Map<PropertyKey, ReturnType<typeof vi.fn>>();
+    for (const key of [
+      "buffer",
+      "byteOffset",
+      "byteLength",
+      Symbol.iterator,
+      "fill",
+      "set"
+    ] as const) {
+      originalDescriptors.set(
+        key,
+        Object.getOwnPropertyDescriptor(prototype, key)
+      );
+      const spy = vi.fn(() => {
+        throw new Error(`shadowed_${String(key)}_called`);
+      });
+      shadowed.set(key, spy);
+      Object.defineProperty(
+        prototype,
+        key,
+        typeof key === "string" &&
+          ["buffer", "byteOffset", "byteLength"].includes(key)
+          ? { configurable: true, get: spy }
+          : { configurable: true, value: spy }
+      );
+    }
+    const backing = new ArrayBuffer(3);
+    const inspection = new Uint8Array(backing);
+    const rendererBytes = new Uint8Array(backing);
+    let submittedText = "";
+    const { webContents, handlers } = harness({
+      submit: async (valueBytes) => {
+        submittedText = new TextDecoder().decode(valueBytes);
+      }
+    });
+
+    try {
+      new DataView(backing).setUint8(0, 107);
+      new DataView(backing).setUint8(1, 101);
+      new DataView(backing).setUint8(2, 121);
+      await expect(
+        handlers.get(DESKTOP_CREDENTIAL_IPC_CHANNELS.submit)!(
+          eventFor(webContents),
+          {
+            schema: "kestrel.credential.submit.v1",
+            valueBytes: rendererBytes
+          }
+        )
+      ).resolves.toEqual({
+        ok: true,
+        value: { status: "stored" }
+      });
+    } finally {
+      for (const [key, descriptor] of originalDescriptors) {
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(prototype, key);
+        } else {
+          Object.defineProperty(prototype, key, descriptor);
+        }
+      }
+    }
+
+    expect(submittedText).toBe("key");
+    for (const spy of shadowed.values()) {
+      expect(spy).not.toHaveBeenCalled();
+    }
+    expect(Array.from(inspection)).toEqual([0, 0, 0]);
+  });
+
+  it("rejects and scrubs custom-prototype typed arrays without invoking their shadowed properties", async () => {
+    const backing = new ArrayBuffer(4);
+    const inspection = new Uint8Array(backing);
+    inspection.set([9, 8, 7, 6]);
+    const rendererBytes = new Uint8Array(backing);
+    const shadowed = {
+      buffer: vi.fn(() => {
+        throw new Error("prototype_buffer_called");
+      }),
+      byteOffset: vi.fn(() => {
+        throw new Error("prototype_byte_offset_called");
+      }),
+      byteLength: vi.fn(() => {
+        throw new Error("prototype_byte_length_called");
+      }),
+      iterator: vi.fn(() => {
+        throw new Error("prototype_iterator_called");
+      }),
+      fill: vi.fn(() => {
+        throw new Error("prototype_fill_called");
+      }),
+      set: vi.fn(() => {
+        throw new Error("prototype_set_called");
+      })
+    };
+    const poisonedPrototype = Object.create(
+      Uint8Array.prototype,
+      {
+        buffer: { get: shadowed.buffer },
+        byteOffset: { get: shadowed.byteOffset },
+        byteLength: { get: shadowed.byteLength },
+        [Symbol.iterator]: { value: shadowed.iterator },
+        fill: { value: shadowed.fill },
+        set: { value: shadowed.set }
+      }
+    );
+    Object.setPrototypeOf(rendererBytes, poisonedPrototype);
+    const { webContents, handlers, submit } = harness();
+
+    await expect(
+      handlers.get(DESKTOP_CREDENTIAL_IPC_CHANNELS.submit)!(
+        eventFor(webContents),
+        {
+          schema: "kestrel.credential.submit.v1",
+          valueBytes: rendererBytes
+        }
+      )
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "invalid_desktop_request" }
+    });
+
+    expect(submit).not.toHaveBeenCalled();
+    for (const shadow of Object.values(shadowed)) {
+      expect(shadow).not.toHaveBeenCalled();
+    }
+    expect(Array.from(inspection)).toEqual([0, 0, 0, 0]);
+  });
+
+  it("scrubs rejected DataView and non-byte typed arrays through captured view intrinsics", async () => {
+    const { webContents, handlers, submit } = harness();
+    const cases: Array<{
+      name: string;
+      view: ArrayBufferView;
+      inspection: Uint8Array;
+      shadows: Array<ReturnType<typeof vi.fn>>;
+    }> = [];
+    const addCase = (
+      name: string,
+      makeView: (backing: ArrayBuffer) => ArrayBufferView
+    ): void => {
+      const backing = new ArrayBuffer(4);
+      const inspection = new Uint8Array(backing);
+      inspection.set([5, 4, 3, 2]);
+      const view = makeView(backing);
+      const shadows = [
+        vi.fn(() => {
+          throw new Error(`${name}_buffer_called`);
+        }),
+        vi.fn(() => {
+          throw new Error(`${name}_byte_offset_called`);
+        }),
+        vi.fn(() => {
+          throw new Error(`${name}_byte_length_called`);
+        }),
+        vi.fn(() => {
+          throw new Error(`${name}_iterator_called`);
+        }),
+        vi.fn(() => {
+          throw new Error(`${name}_fill_called`);
+        })
+      ];
+      Object.defineProperties(view, {
+        buffer: { get: shadows[0] },
+        byteOffset: { get: shadows[1] },
+        byteLength: { get: shadows[2] },
+        [Symbol.iterator]: { value: shadows[3] },
+        fill: { value: shadows[4] }
+      });
+      cases.push({ name, view, inspection, shadows });
+    };
+    addCase("DataView", (backing) => new DataView(backing));
+    addCase("Int16Array", (backing) => new Int16Array(backing));
+
+    for (const testCase of cases) {
+      await expect(
+        handlers.get(DESKTOP_CREDENTIAL_IPC_CHANNELS.submit)!(
+          eventFor(webContents),
+          {
+            schema: "kestrel.credential.submit.v1",
+            valueBytes: testCase.view
+          }
+        ),
+        testCase.name
+      ).resolves.toEqual({
+        ok: false,
+        error: { code: "invalid_desktop_request" }
+      });
+      for (const shadow of testCase.shadows) {
+        expect(
+          shadow,
+          `${testCase.name} shadow`
+        ).not.toHaveBeenCalled();
+      }
+      expect(
+        Array.from(testCase.inspection),
+        testCase.name
+      ).toEqual([0, 0, 0, 0]);
+    }
+    expect(submit).not.toHaveBeenCalled();
+  });
+
   it("passes a distinct main-owned byte copy and clears both copies after success", async () => {
     let received: Uint8Array | undefined;
     const {

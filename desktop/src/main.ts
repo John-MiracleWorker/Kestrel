@@ -135,6 +135,7 @@ async function createPackagedSidecarSupervisor(
       sidecarVersion,
       readinessTimeoutMs: 15_000,
       shutdownTimeoutMs: 10_000,
+      platform: process.platform,
       environment: process.env
     },
     dependencies

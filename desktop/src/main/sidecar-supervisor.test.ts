@@ -1,4 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { VerifiedResourceSet } from "./resource-manifest";
@@ -7,6 +8,8 @@ import {
   SidecarSupervisorError,
   type AuthenticatedDesktopReadiness,
   type ProfileLeaseEvidence,
+  type SidecarSpawnRequest,
+  type SidecarSupervisorConfig,
   type SidecarSupervisorDependencies
 } from "./sidecar-supervisor";
 import {
@@ -196,7 +199,13 @@ function apiReadiness(): AuthenticatedDesktopReadiness {
   };
 }
 
-function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
+function harness(
+  overrides: Partial<SidecarSupervisorDependencies> = {},
+  configOverrides: Partial<SidecarSupervisorConfig> & {
+    platform?: NodeJS.Platform;
+  } = {},
+  observeSpawn?: (request: SidecarSpawnRequest) => void
+): {
   supervisor: SidecarSupervisor;
   spawner: FakeSidecarSpawner;
   logs: string[];
@@ -249,11 +258,16 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
       return {
         resource,
         mechanism: "test_verified_handle",
-        spawn: (request) =>
-          spawner.spawn({
+        spawn: (request) => {
+          observeSpawn?.({
             executable: resource.path,
             ...request
-          }),
+          });
+          return spawner.spawn({
+            executable: resource.path,
+            ...request
+          });
+        },
         close: async () => undefined
       };
     },
@@ -343,12 +357,14 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
         sidecarVersion: "0.5.0",
         readinessTimeoutMs: 1_000,
         shutdownTimeoutMs: 1_000,
+        platform: "darwin",
         environment: {
           PATH: "/safe/bin",
           AWS_SECRET_ACCESS_KEY: "must-not-inherit",
           KESTREL_API_TOKEN: "must-not-inherit"
-        }
-      },
+        },
+        ...configOverrides
+      } as SidecarSupervisorConfig & { platform: NodeJS.Platform },
       dependencies
     ),
     spawner,
@@ -356,6 +372,30 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
     shutdownRequests,
     apiSessionEvents
   };
+}
+
+function environmentObservedByActualChild(
+  request: SidecarSpawnRequest
+): Record<string, string> {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      "process.stdout.write(JSON.stringify(process.env))"
+    ],
+    {
+      encoding: "utf8",
+      env: request.options.env
+    }
+  );
+  if (
+    result.error !== undefined ||
+    result.status !== 0 ||
+    result.signal !== null
+  ) {
+    throw new Error("test_environment_probe_failed");
+  }
+  return JSON.parse(result.stdout) as Record<string, string>;
 }
 
 function failedStartHarness(
@@ -553,6 +593,230 @@ describe("verified sidecar supervisor", () => {
     ]);
     expect(JSON.stringify(spawner.requests)).not.toContain(apiToken);
     expect(JSON.stringify(supervisor.state)).not.toContain(apiToken);
+  });
+
+  it("passes only bounded local Secret Service environment through an actual Linux child spawn", async () => {
+    const dbusAddressAtLimit =
+      `unix:path=/${"d".repeat(2_037)}`;
+    const runtimeDirectoryAtLimit = `/${"x".repeat(1_023)}`;
+    let actualEnvironment: Record<string, string> | undefined;
+    const sourceEnvironment = {
+      PATH: "/safe/bin",
+      DBUS_SESSION_BUS_ADDRESS: dbusAddressAtLimit,
+      XDG_RUNTIME_DIR: runtimeDirectoryAtLimit,
+      AWS_SECRET_ACCESS_KEY: "must-not-inherit",
+      KESTREL_API_TOKEN: "must-not-inherit",
+      OPENAI_API_KEY: "must-not-inherit",
+      SSH_AUTH_SOCK: "/must/not/inherit"
+    };
+    const { supervisor, spawner } = harness(
+      {},
+      {
+        platform: "linux",
+        environment: sourceEnvironment
+      },
+      (request) => {
+        actualEnvironment =
+          environmentObservedByActualChild(request);
+      }
+    );
+
+    await supervisor.start();
+
+    expect(dbusAddressAtLimit).toHaveLength(2_048);
+    expect(runtimeDirectoryAtLimit).toHaveLength(1_024);
+    expect(spawner.requests[0]?.options.env).toEqual({
+      PATH: "/safe/bin",
+      DBUS_SESSION_BUS_ADDRESS: dbusAddressAtLimit,
+      XDG_RUNTIME_DIR: runtimeDirectoryAtLimit
+    });
+    expect(actualEnvironment).toMatchObject({
+      PATH: "/safe/bin",
+      DBUS_SESSION_BUS_ADDRESS: dbusAddressAtLimit,
+      XDG_RUNTIME_DIR: runtimeDirectoryAtLimit
+    });
+    for (const forbidden of [
+      "AWS_SECRET_ACCESS_KEY",
+      "KESTREL_API_TOKEN",
+      "OPENAI_API_KEY",
+      "SSH_AUTH_SOCK"
+    ]) {
+      expect(spawner.requests[0]?.options.env).not.toHaveProperty(
+        forbidden
+      );
+      expect(actualEnvironment).not.toHaveProperty(forbidden);
+    }
+  });
+
+  it("accepts bounded path, abstract, and all-unix DBus session addresses", async () => {
+    const addresses = [
+      "unix:path=/run/user/1000/bus",
+      "unix:abstract=/tmp/dbus-kestrel",
+      `unix:path=/run/user/1000/dbus-%2Csocket,guid=${"a".repeat(32)}`,
+      "unix:path=/run/user/1000/bus;unix:abstract=/tmp/dbus-kestrel"
+    ];
+
+    for (const address of addresses) {
+      let actualEnvironment: Record<string, string> | undefined;
+      const { supervisor, spawner } = harness(
+        {},
+        {
+          platform: "linux",
+          environment: {
+            DBUS_SESSION_BUS_ADDRESS: address,
+            XDG_RUNTIME_DIR: "/run/user/1000"
+          }
+        },
+        (request) => {
+          actualEnvironment =
+            environmentObservedByActualChild(request);
+        }
+      );
+
+      await supervisor.start();
+
+      expect(
+        spawner.requests[0]?.options.env
+          .DBUS_SESSION_BUS_ADDRESS,
+        address
+      ).toBe(address);
+      expect(
+        actualEnvironment?.DBUS_SESSION_BUS_ADDRESS,
+        address
+      ).toBe(address);
+    }
+  });
+
+  it("omits malformed Linux Secret Service variables from the actual spawned environment", async () => {
+    const validDbus = "unix:path=/run/user/1000/bus";
+    const validRuntime = "/run/user/1000";
+    const cases = [
+      {
+        name: "non-unix transport",
+        variable: "DBUS_SESSION_BUS_ADDRESS",
+        value: "tcp:host=127.0.0.1,port=4444"
+      },
+      {
+        name: "relative unix path",
+        variable: "DBUS_SESSION_BUS_ADDRESS",
+        value: "unix:path=run/user/1000/bus"
+      },
+      {
+        name: "multiple transports",
+        variable: "DBUS_SESSION_BUS_ADDRESS",
+        value:
+          "unix:path=/run/user/1000/bus;tcp:host=127.0.0.1"
+      },
+      {
+        name: "malformed percent escape",
+        variable: "DBUS_SESSION_BUS_ADDRESS",
+        value: "unix:path=/run/user/1000/dbus-%zz"
+      },
+      {
+        name: "DBus control character",
+        variable: "DBUS_SESSION_BUS_ADDRESS",
+        value: "unix:path=/run/user/1000/\nbus"
+      },
+      {
+        name: "oversized DBus address",
+        variable: "DBUS_SESSION_BUS_ADDRESS",
+        value: `unix:path=/${"d".repeat(2_038)}`
+      },
+      {
+        name: "relative runtime directory",
+        variable: "XDG_RUNTIME_DIR",
+        value: "run/user/1000"
+      },
+      {
+        name: "non-normal runtime directory",
+        variable: "XDG_RUNTIME_DIR",
+        value: "/run/user/1000/../2000"
+      },
+      {
+        name: "runtime control character",
+        variable: "XDG_RUNTIME_DIR",
+        value: "/run/user/\u007f1000"
+      },
+      {
+        name: "oversized runtime directory",
+        variable: "XDG_RUNTIME_DIR",
+        value: `/${"x".repeat(1_024)}`
+      }
+    ] as const;
+
+    for (const testCase of cases) {
+      let actualEnvironment: Record<string, string> | undefined;
+      const environment = {
+        PATH: "/safe/bin",
+        DBUS_SESSION_BUS_ADDRESS: validDbus,
+        XDG_RUNTIME_DIR: validRuntime,
+        [testCase.variable]: testCase.value
+      };
+      const { supervisor, spawner } = harness(
+        {},
+        { platform: "linux", environment },
+        (request) => {
+          actualEnvironment =
+            environmentObservedByActualChild(request);
+        }
+      );
+
+      await supervisor.start();
+
+      expect(
+        spawner.requests[0]?.options.env,
+        testCase.name
+      ).not.toHaveProperty(testCase.variable);
+      expect(
+        actualEnvironment,
+        testCase.name
+      ).not.toHaveProperty(testCase.variable);
+      const retainedVariable =
+        testCase.variable === "DBUS_SESSION_BUS_ADDRESS"
+          ? "XDG_RUNTIME_DIR"
+          : "DBUS_SESSION_BUS_ADDRESS";
+      expect(
+        spawner.requests[0]?.options.env,
+        `${testCase.name} preserves the other bounded variable`
+      ).toHaveProperty(
+        retainedVariable,
+        environment[retainedVariable]
+      );
+    }
+  });
+
+  it("does not inherit Secret Service environment on non-Linux platforms", async () => {
+    for (const platform of ["darwin", "win32"] as const) {
+      let actualEnvironment: Record<string, string> | undefined;
+      const { supervisor, spawner } = harness(
+        {},
+        {
+          platform,
+          environment: {
+            PATH: "/safe/bin",
+            DBUS_SESSION_BUS_ADDRESS:
+              "unix:path=/run/user/1000/bus",
+            XDG_RUNTIME_DIR: "/run/user/1000"
+          }
+        },
+        (request) => {
+          actualEnvironment =
+            environmentObservedByActualChild(request);
+        }
+      );
+
+      await supervisor.start();
+
+      expect(spawner.requests[0]?.options.env).toEqual({
+        PATH: "/safe/bin"
+      });
+      expect(actualEnvironment).not.toHaveProperty(
+        "DBUS_SESSION_BUS_ADDRESS"
+      );
+      expect(actualEnvironment).not.toHaveProperty(
+        "XDG_RUNTIME_DIR"
+      );
+    }
   });
 
   it("activates the main-process API authority only after authenticated readiness", async () => {
