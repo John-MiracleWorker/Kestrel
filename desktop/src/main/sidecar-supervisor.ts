@@ -468,11 +468,14 @@ function validateAuthenticatedReadiness(
 }
 
 export class SidecarSupervisor {
-  state: SidecarSupervisorState = {
+  private currentState: SidecarSupervisorState = Object.freeze({
     kind: "recovery",
     reason: "sidecar_unavailable",
     detail: "not_started"
-  };
+  });
+  private readonly stateListeners = new Set<
+    (state: SidecarSupervisorState) => void
+  >();
   private active: ActiveSidecar | null = null;
   private starting = false;
   private stopping = false;
@@ -485,6 +488,36 @@ export class SidecarSupervisor {
     private readonly config: SidecarSupervisorConfig,
     private readonly dependencies: SidecarSupervisorDependencies
   ) {}
+
+  get state(): SidecarSupervisorState {
+    return this.currentState;
+  }
+
+  subscribe(
+    listener: (state: SidecarSupervisorState) => void
+  ): () => void {
+    this.stateListeners.add(listener);
+    let subscribed = true;
+    return (): void => {
+      if (!subscribed) {
+        return;
+      }
+      subscribed = false;
+      this.stateListeners.delete(listener);
+    };
+  }
+
+  private transition(state: SidecarSupervisorState): void {
+    const snapshot = Object.freeze({ ...state }) as SidecarSupervisorState;
+    this.currentState = snapshot;
+    for (const listener of [...this.stateListeners]) {
+      try {
+        listener(snapshot);
+      } catch {
+        // A projection observer cannot damage lifecycle authority.
+      }
+    }
+  }
 
   async start(): Promise<VerifiedRendererAssets> {
     if (this.startPromise !== null || this.active !== null) {
@@ -543,7 +576,7 @@ export class SidecarSupervisor {
     signal: AbortSignal
   ): Promise<VerifiedRendererAssets> {
     this.starting = true;
-    this.state = { kind: "verifying" };
+    this.transition({ kind: "verifying" });
     let launch: PrivateLaunchFiles | null = null;
     let child: RetainedSidecarChild | null = null;
     let executable: VerifiedExecutableLaunchCapability | null = null;
@@ -591,7 +624,7 @@ export class SidecarSupervisor {
       });
       this.throwIfLaunchCancelled(generation, signal);
       expectedExecutableDigest = sidecar.sha256;
-      this.state = { kind: "starting" };
+      this.transition({ kind: "starting" });
       child = executable.spawn({
         args: [launch.bootstrapPath],
         options: {
@@ -757,12 +790,12 @@ export class SidecarSupervisor {
         generation
       };
       this.dependencies.apiSession.activate(apiSessionActivation);
-      this.state = {
+      this.transition({
         kind: "ready",
         profileId: profile.profileId,
         baseUrl: active.baseUrl,
         sidecarVersion: this.config.sidecarVersion
-      };
+      });
       return resources.rendererAssets;
     } catch (error) {
       this.dependencies.apiSession.deactivate(generation);
@@ -820,11 +853,11 @@ export class SidecarSupervisor {
             ? "sidecar_unverified"
             : "sidecar_unavailable";
       if (!this.stopping) {
-        this.state = {
+        this.transition({
           kind: "recovery",
           reason: recoveryReason,
           detail: fixedErrorCode(surfacedError)
-        };
+        });
       }
       throw surfacedError;
     } finally {
@@ -841,19 +874,23 @@ export class SidecarSupervisor {
     }
     this.dependencies.apiSession.deactivate(generation);
     const wasVerified = active.verified;
+    if (
+      wasVerified &&
+      generation === this.generation &&
+      !this.stopping
+    ) {
+      this.transition({
+        kind: "recovery",
+        reason: "reconciliation_required",
+        detail: "unexpected_exit_reconciliation_required"
+      });
+    }
     const finalization = this.finalizeExitedActive(active);
-    void this.completeConfirmedExit(
-      active,
-      generation,
-      wasVerified,
-      finalization
-    );
+    void this.completeConfirmedExit(active, finalization);
   }
 
   private async completeConfirmedExit(
     active: ActiveSidecar,
-    generation: number,
-    wasVerified: boolean,
     finalization: Promise<void>
   ): Promise<void> {
     try {
@@ -870,18 +907,6 @@ export class SidecarSupervisor {
       return;
     }
     this.releaseFinalizedActive(active);
-    if (
-      !wasVerified ||
-      generation !== this.generation ||
-      this.stopping
-    ) {
-      return;
-    }
-    this.state = {
-      kind: "recovery",
-      reason: "reconciliation_required",
-      detail: "unexpected_exit_reconciliation_required"
-    };
   }
 
   async stop(): Promise<void> {
@@ -892,7 +917,7 @@ export class SidecarSupervisor {
     this.stopping = true;
     this.generation += 1;
     this.launchAbort?.abort();
-    this.state = { kind: "stopping" };
+    this.transition({ kind: "stopping" });
     const start = this.startPromise;
     const operation = this.stopAfterStartSettles(start);
     this.stopPromise = operation;
@@ -927,11 +952,11 @@ export class SidecarSupervisor {
   }
 
   private terminationError(code: string): SidecarSupervisorError {
-    this.state = {
+    this.transition({
       kind: "recovery",
       reason: "sidecar_unavailable",
       detail: code
-    };
+    });
     return new SidecarSupervisorError(code, "sidecar_unavailable");
   }
 

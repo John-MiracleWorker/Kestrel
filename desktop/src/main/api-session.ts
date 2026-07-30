@@ -1,3 +1,5 @@
+import type { DesktopRuntimeMarker } from "../contracts.js";
+
 export interface ApiSessionWebContents {
   readonly id: number;
   isDestroyed(): boolean;
@@ -37,9 +39,11 @@ export interface DesktopApiSessionAuthority {
   activate(activation: DesktopApiSessionActivation): void;
   deactivate(generation?: number): void;
   bindRenderer(webContents: ApiSessionWebContents): () => void;
+  runtimeMarker(): DesktopRuntimeMarker | null;
 }
 
 interface ActiveAuthority {
+  baseUrl: string;
   origin: string;
   apiToken: string;
   generation: number;
@@ -96,6 +100,7 @@ function parseActivation(
     throw invalidActivation();
   }
   return {
+    baseUrl: activation.baseUrl,
     origin: parsed.origin,
     apiToken: activation.apiToken,
     generation: activation.generation
@@ -235,6 +240,16 @@ export function installDesktopApiSession(
       };
       webContents.once("destroyed", unbind);
       return unbind;
+    },
+    runtimeMarker(): DesktopRuntimeMarker | null {
+      if (active === null) {
+        return null;
+      }
+      return Object.freeze({
+        schema: "kestrel.desktop.runtime.v1",
+        baseUrl: active.baseUrl,
+        generation: active.generation
+      });
     }
   };
   return Object.freeze(authority);

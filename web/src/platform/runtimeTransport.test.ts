@@ -13,6 +13,7 @@ import {
   runtimeTransport,
   type DesktopRuntimeMarker
 } from "./runtimeTransport";
+import { DESKTOP_BRIDGE_KEY } from "./desktopBridge";
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -38,6 +39,7 @@ function installDesktopMarker(
 
 function removeDesktopMarker(): void {
   Reflect.deleteProperty(globalThis, DESKTOP_RUNTIME_MARKER_KEY);
+  Reflect.deleteProperty(globalThis, DESKTOP_BRIDGE_KEY);
 }
 
 function headersFromCall(call: unknown[]): Headers {
@@ -58,6 +60,35 @@ describe("runtime transport", () => {
     vi.unstubAllGlobals();
     sessionStorage.clear();
     localStorage.clear();
+  });
+
+  it("fails closed as Desktop when the bridge exists without a runtime marker", async () => {
+    Object.defineProperty(globalThis, DESKTOP_BRIDGE_KEY, {
+      configurable: true,
+      value: Object.freeze({
+        chooseProjectFolder: vi.fn(),
+        chooseStorageFolder: vi.fn(),
+        connection: vi.fn(),
+        exportSupportBundle: vi.fn(),
+        getAppVersion: vi.fn(),
+        getUpdateStatus: vi.fn(),
+        openCredentialDialog: vi.fn(),
+        openExternalUrl: vi.fn(),
+        performRecoveryAction: vi.fn(),
+        subscribeLifecycle: vi.fn(),
+        subscribeUpdateStatus: vi.fn()
+      })
+    });
+    sessionStorage.setItem("kestrel.apiToken", "must-not-be-read");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(() => runtimeTransport()).toThrow(
+      "desktop_runtime_marker_unavailable"
+    );
+    expect(getItem).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("routes Desktop verbs and SSE to the exact origin without token storage or auth headers", async () => {

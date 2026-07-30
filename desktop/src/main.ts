@@ -1,7 +1,16 @@
 import { createPublicKey } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { app, BrowserWindow, protocol, session } from "electron";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { basename, isAbsolute, join } from "node:path";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  protocol,
+  session,
+  shell
+} from "electron";
+import type { DesktopUpdateStatus } from "./contracts.js";
 import {
   registerAppProtocol,
   registerKestrelScheme
@@ -28,9 +37,24 @@ import {
   type ApiSessionWebRequest,
   type DesktopApiSessionAuthority
 } from "./main/api-session.js";
+import {
+  chooseCanonicalDirectory,
+  installDesktopIpc,
+  openReviewedExternalUrl,
+  projectDesktopConnection,
+  unavailableDesktopFeature,
+  type DesktopIpcAuthority,
+  type DesktopIpcMain,
+  type DesktopIpcWebContents
+} from "./main/ipc.js";
 
 const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
 const RELEASE_MANIFEST_KEY_ID = "release";
+const unavailableUpdateStatus = Object.freeze({
+  schema: "kestrel.desktop.update.v1",
+  state: "unavailable",
+  reason: "not_configured"
+} satisfies DesktopUpdateStatus);
 
 async function createPackagedSidecarSupervisor(
   apiSession: DesktopApiSessionAuthority
@@ -94,6 +118,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   let apiSession: DesktopApiSessionAuthority | null = null;
+  let desktopIpc: DesktopIpcAuthority | null = null;
   const windows = createSingleWindowController(() => {
     const created = createAppWindow({
       createWindow: (options) =>
@@ -109,6 +134,14 @@ if (!app.requestSingleInstanceLock()) {
         }
         apiSession.bindRenderer(
           webContents as ApiSessionWebContents
+        );
+      },
+      bindDesktopIpc: (webContents) => {
+        if (desktopIpc === null) {
+          throw new Error("desktop_ipc_unavailable");
+        }
+        desktopIpc.bindRenderer(
+          webContents as DesktopIpcWebContents
         );
       }
     });
@@ -173,12 +206,93 @@ if (!app.requestSingleInstanceLock()) {
       apiSession = installDesktopApiSession(
         defaultSession.webRequest as unknown as ApiSessionWebRequest
       );
+      supervisor = await createPackagedSidecarSupervisor(apiSession);
+      desktopIpc = installDesktopIpc(
+        ipcMain as unknown as DesktopIpcMain,
+        {
+          readConnection: () => {
+            if (supervisor === null || apiSession === null) {
+              throw new Error("desktop_connection_unavailable");
+            }
+            return projectDesktopConnection(
+              supervisor.state,
+              apiSession.runtimeMarker()
+            );
+          },
+          subscribeLifecycle(listener) {
+            if (supervisor === null || apiSession === null) {
+              return () => undefined;
+            }
+            return supervisor.subscribe(() => {
+              if (supervisor !== null && apiSession !== null) {
+                listener(
+                  projectDesktopConnection(
+                    supervisor.state,
+                    apiSession.runtimeMarker()
+                  )
+                );
+              }
+            });
+          },
+          readUpdateStatus: () => unavailableUpdateStatus,
+          subscribeUpdateStatus: () => () => undefined,
+          chooseProjectFolder: () =>
+            chooseCanonicalDirectory({
+              showOpenDialog: async () => {
+                const result = await dialog.showOpenDialog({
+                  title: "Choose a Kestrel project folder",
+                  properties: ["openDirectory"]
+                });
+                return {
+                  canceled: result.canceled,
+                  filePaths: result.filePaths
+                };
+              },
+              realpath,
+              stat,
+              isAbsolute,
+              basename
+            }),
+          chooseStorageFolder: () =>
+            chooseCanonicalDirectory({
+              showOpenDialog: async () => {
+                const result = await dialog.showOpenDialog({
+                  title: "Choose Kestrel storage",
+                  properties: ["openDirectory", "createDirectory"]
+                });
+                return {
+                  canceled: result.canceled,
+                  filePaths: result.filePaths
+                };
+              },
+              realpath,
+              stat,
+              isAbsolute,
+              basename
+            }),
+          exportSupportBundle: async () =>
+            unavailableDesktopFeature(),
+          getAppVersion: () => app.getVersion(),
+          openCredentialDialog: async () =>
+            unavailableDesktopFeature(),
+          openExternalUrl: async (request) => {
+            await openReviewedExternalUrl(
+              request,
+              async (url) => {
+                await shell.openExternal(url);
+              }
+            );
+          },
+          performRecoveryAction: async () =>
+            unavailableDesktopFeature(),
+          runtimeMarker: () => apiSession?.runtimeMarker() ?? null
+        }
+      );
       await startVerifiedDesktopSession({
         async startSupervisor() {
-          if (apiSession === null) {
-            throw new Error("desktop_api_session_unavailable");
+          if (supervisor === null) {
+            throw new Error("desktop_supervisor_unavailable");
           }
-          supervisor = await createPackagedSidecarSupervisor(apiSession);
           return supervisor.start();
         },
         registerVerifiedProtocol(rendererAssets) {

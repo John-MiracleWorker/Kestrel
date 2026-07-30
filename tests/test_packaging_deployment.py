@@ -616,8 +616,15 @@ def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
         "zod": "4.4.3",
     }
     assert package["devDependencies"]["electron"] == "43.2.0"
+    assert package["devDependencies"]["esbuild"] == "0.28.1"
     assert package["devDependencies"]["@electron/fuses"] == "2.1.3"
     assert package["devDependencies"]["vitest"] == "4.1.6"
+    assert (
+        "esbuild src/preload.ts --bundle --format=cjs --platform=browser"
+        in package["scripts"]["build"]
+    )
+    assert "--external:electron" in package["scripts"]["build"]
+    assert "--outfile=dist/preload.js" in package["scripts"]["build"]
     assert "react" not in package["dependencies"]
 
     build_config = json.loads((ROOT / "desktop" / "tsconfig.build.json").read_text())
@@ -631,6 +638,7 @@ def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
     }
     assert build_config["include"] == [
         "src/contracts.ts",
+        "src/preload.ts",
         "src/main.ts",
         "src/main/**/*.ts",
     ]

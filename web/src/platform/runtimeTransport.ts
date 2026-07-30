@@ -1,4 +1,8 @@
 import type { DesktopRuntimeMarker } from "../types";
+import {
+  hasDesktopBridge,
+  readDesktopBridge
+} from "./desktopBridge";
 
 export type { DesktopRuntimeMarker } from "../types";
 
@@ -30,6 +34,10 @@ function hasOwnDesktopMarker(): boolean {
 }
 
 export function isDesktopRuntime(): boolean {
+  if (hasDesktopBridge()) {
+    readDesktopBridge();
+    return true;
+  }
   return hasOwnDesktopMarker();
 }
 
@@ -239,7 +247,14 @@ export function runtimeTransport(
   readBrowserAuthHeaders: BrowserAuthHeaders = () => ({})
 ): RuntimeTransport {
   if (!hasOwnDesktopMarker()) {
+    if (hasDesktopBridge()) {
+      readDesktopBridge();
+      throw fixedError("desktop_runtime_marker_unavailable");
+    }
     return new BrowserRuntimeTransport(readBrowserAuthHeaders);
+  }
+  if (hasDesktopBridge()) {
+    readDesktopBridge();
   }
   return new DesktopRuntimeTransport(readDesktopMarkerValue());
 }

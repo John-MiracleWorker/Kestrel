@@ -1,4 +1,5 @@
 import type { BrowserWindowConstructorOptions } from "electron";
+import { fileURLToPath } from "node:url";
 import { DESKTOP_APP_ENTRY_URL } from "../contracts.js";
 
 export interface AppWindow {
@@ -45,6 +46,9 @@ export function windowOptions(): BrowserWindowConstructorOptions {
     show: false,
     backgroundColor: "#fffaf0",
     webPreferences: {
+      preload: fileURLToPath(
+        new URL("../../dist/preload.js", import.meta.url)
+      ),
       nodeIntegration: false,
       nodeIntegrationInWorker: false,
       nodeIntegrationInSubFrames: false,
@@ -61,10 +65,12 @@ export function createAppWindow<TWindow extends AppWindow>(dependencies: {
   createWindow(options: BrowserWindowConstructorOptions): TWindow;
   installSecurity(webContents: unknown): void;
   bindApiSession(webContents: unknown): void;
+  bindDesktopIpc(webContents: unknown): void;
 }): AppWindowResult<TWindow> {
   const window = dependencies.createWindow(windowOptions());
   dependencies.installSecurity(window.webContents);
   dependencies.bindApiSession(window.webContents);
+  dependencies.bindDesktopIpc(window.webContents);
   window.once("ready-to-show", () => {
     if (!window.isDestroyed()) {
       window.show();

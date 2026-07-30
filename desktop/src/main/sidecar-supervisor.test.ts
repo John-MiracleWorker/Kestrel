@@ -376,6 +376,36 @@ function failedStartHarness(
 }
 
 describe("verified sidecar supervisor", () => {
+  it("pushes frozen lifecycle transitions and isolates observer failures", async () => {
+    const { supervisor } = harness();
+    const received: unknown[] = [];
+    const unsubscribeThrowing = supervisor.subscribe(() => {
+      throw new Error("observer-secret");
+    });
+    const unsubscribe = supervisor.subscribe((state) => {
+      received.push(state);
+    });
+
+    await supervisor.start();
+
+    expect(received).toEqual([
+      { kind: "verifying" },
+      { kind: "starting" },
+      {
+        kind: "ready",
+        profileId: "default",
+        baseUrl: "http://127.0.0.1:52100/",
+        sidecarVersion: "0.5.0"
+      }
+    ]);
+    expect(received.every(Object.isFrozen)).toBe(true);
+    unsubscribeThrowing();
+    unsubscribeThrowing();
+    unsubscribe();
+    await supervisor.stop();
+    expect(received).toHaveLength(3);
+  });
+
   it("fails before spawn when resource verification rejects tampering", async () => {
     const error = Object.assign(new Error("resource_digest_mismatch"), {
       code: "resource_digest_mismatch"
@@ -510,6 +540,7 @@ describe("verified sidecar supervisor", () => {
 
   it("deactivates immediately on confirmed unexpected exit before cleanup settles", async () => {
     let authorityActive = false;
+    const projected: unknown[] = [];
     const cleanupGate = deferred<void>();
     const { supervisor, spawner } = harness({
       apiSession: {
@@ -530,11 +561,16 @@ describe("verified sidecar supervisor", () => {
         cleanup: () => cleanupGate.promise
       })
     });
+    supervisor.subscribe((state) => projected.push(state));
     await supervisor.start();
     expect(authorityActive).toBe(true);
 
     spawner.children[0]?.exit(17);
     expect(authorityActive).toBe(false);
+    expect(projected.at(-1)).toMatchObject({
+      kind: "recovery",
+      reason: "reconciliation_required"
+    });
 
     cleanupGate.resolve();
     await eventually(() => {

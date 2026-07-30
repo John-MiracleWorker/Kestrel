@@ -89,6 +89,30 @@ function harness(): {
 }
 
 describe("Desktop API session authority", () => {
+  it("returns only a fresh frozen metadata marker while authority is active", () => {
+    const { authority } = harness();
+    expect(authority.runtimeMarker()).toBeNull();
+    authority.activate({
+      baseUrl: "http://127.0.0.1:43123/",
+      apiToken: "must-never-cross",
+      generation: 5
+    });
+
+    const first = authority.runtimeMarker();
+    const second = authority.runtimeMarker();
+    expect(first).toEqual({
+      schema: "kestrel.desktop.runtime.v1",
+      baseUrl: "http://127.0.0.1:43123/",
+      generation: 5
+    });
+    expect(first).not.toBe(second);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(JSON.stringify(first)).not.toContain("must-never-cross");
+
+    authority.deactivate(5);
+    expect(authority.runtimeMarker()).toBeNull();
+  });
+
   it("installs one all-request hook and injects only after stripping renderer auth", () => {
     const { authority, filter, send } = harness();
     const renderer = new FakeWebContents(17);

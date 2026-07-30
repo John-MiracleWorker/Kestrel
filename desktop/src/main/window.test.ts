@@ -62,7 +62,9 @@ describe("desktop renderer window", () => {
       sandbox: true,
       webSecurity: true
     });
-    expect(windowOptions().webPreferences).not.toHaveProperty("preload");
+    expect(windowOptions().webPreferences?.preload).toMatch(
+      /[/\\]desktop[/\\]dist[/\\]preload\.js$/
+    );
     expect(windowOptions().webPreferences).not.toHaveProperty("webviewTag", true);
   });
 
@@ -70,6 +72,7 @@ describe("desktop renderer window", () => {
     const windows: FakeWindow[] = [];
     const installSecurity = vi.fn();
     const bindApiSession = vi.fn();
+    const bindDesktopIpc = vi.fn();
 
     const created = createAppWindow({
       createWindow: (options) => {
@@ -78,7 +81,8 @@ describe("desktop renderer window", () => {
         return window;
       },
       installSecurity,
-      bindApiSession
+      bindApiSession,
+      bindDesktopIpc
     });
 
     await created.loaded;
@@ -89,6 +93,13 @@ describe("desktop renderer window", () => {
     expect(windows[0]?.options.show).toBe(false);
     expect(installSecurity).toHaveBeenCalledWith(windows[0]?.webContents);
     expect(bindApiSession).toHaveBeenCalledWith(windows[0]?.webContents);
+    expect(bindDesktopIpc).toHaveBeenCalledWith(windows[0]?.webContents);
+    expect(installSecurity.mock.invocationCallOrder[0]).toBeLessThan(
+      bindApiSession.mock.invocationCallOrder[0]!
+    );
+    expect(bindApiSession.mock.invocationCallOrder[0]).toBeLessThan(
+      bindDesktopIpc.mock.invocationCallOrder[0]!
+    );
     expect(windows[0]?.showCount).toBe(0);
 
     windows[0]?.emit("ready-to-show");
