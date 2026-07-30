@@ -49,6 +49,8 @@ def test_developer_builder_config_has_no_release_or_publication_targets() -> Non
         "productName": "Kestrel Developer",
         "asar": False,
         "npmRebuild": False,
+        "removePackageKeywords": False,
+        "removePackageScripts": False,
         "directories": {
             "output": "__VERIFIED_DIRECTORY_OUTPUT__",
         },
@@ -62,7 +64,7 @@ def test_developer_builder_config_has_no_release_or_publication_targets() -> Non
             {
                 "from": "__VERIFIED_STAGE_RESOURCE_ROOT__",
                 "to": "kestrel",
-            }
+            },
         ],
         "mac": {
             "target": ["dir"],

@@ -79,6 +79,8 @@ const EXPECTED_DEVELOPER_CONFIG = {
   productName: "Kestrel Developer",
   asar: false,
   npmRebuild: false,
+  removePackageKeywords: false,
+  removePackageScripts: false,
   directories: {
     output: "__VERIFIED_DIRECTORY_OUTPUT__",
   },
@@ -1372,7 +1374,7 @@ export async function buildDeveloperDirectory(
     if (!inventoriesMatch(stage.inventory, packagedResources.files)) {
       throw new Error("packaged staged resource identity mismatch");
     }
-    const appRoot =
+    const requestedAppRoot =
       process.platform === "darwin"
         ? join(
             layout.applicationRoot,
@@ -1381,6 +1383,52 @@ export async function buildDeveloperDirectory(
             "app",
           )
         : join(layout.applicationRoot, "resources", "app");
+    const appRoot = await qualifyDirectory(
+      requestedAppRoot,
+      "packaged application source root",
+    );
+    if (!isContained(layout.applicationRoot, appRoot)) {
+      throw new Error("packaged application source escapes output");
+    }
+    const generatedDependencyRoot = await qualifyDirectory(
+      join(appRoot, "node_modules"),
+      "generated packaged dependencies",
+    );
+    if (!isContained(appRoot, generatedDependencyRoot)) {
+      throw new Error("generated packaged dependencies escape app root");
+    }
+    await inventoryDirectory(
+      generatedDependencyRoot,
+      "generated packaged dependencies before replacement",
+      { omitDependencyBins: true },
+    );
+    await rm(generatedDependencyRoot, {
+      recursive: true,
+      force: false,
+    });
+    await copyInventory(
+      join(appSource, "node_modules"),
+      generatedDependencyRoot,
+      productionDependencies.inventory,
+    );
+    const restoredDependencies = await inventoryDirectory(
+      generatedDependencyRoot,
+      "restored packaged production dependencies",
+    );
+    if (
+      !inventoriesMatch(
+        productionDependencies.inventory,
+        restoredDependencies.files,
+      )
+    ) {
+      throw new Error(
+        "restored production dependency closure mismatch:" +
+          inventoryDifference(
+            productionDependencies.inventory,
+            restoredDependencies.files,
+          ),
+      );
+    }
     const packagedPackagePath = join(appRoot, "package.json");
     const packagedPublicKeyPath = join(
       appRoot,

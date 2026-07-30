@@ -60,6 +60,14 @@ The local directory builder does not accept arbitrary brace patterns from a
 user: its config and input paths are generated from the fixed reviewed contract
 after exact-clean and bounded-input checks.
 
+Electron Builder's package-metadata cleanup is explicitly disabled for scripts
+and keywords. The builder can still filter other dependency metadata or add a
+dependency selected from the development tree, so Kestrel does not trust its
+generated `app/node_modules`: after qualifying that directory beneath the new
+application output, Kestrel replaces it with the already inventoried temporary
+production closure and re-inventories every resulting byte. A linked or escaping
+generated dependency root fails closed before replacement.
+
 CI runs `npm run audit:reviewed`, which requires the production audit to contain
 zero vulnerabilities and separately parses the complete all-dependency audit.
 The reviewed exception accepts only the exact advisory source, name, URL,

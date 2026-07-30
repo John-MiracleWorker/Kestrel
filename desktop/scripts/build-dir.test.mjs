@@ -23,6 +23,9 @@ import {
 } from "./build-dir.mjs";
 
 const roots = [];
+const actualDesktopRoot = fileURLToPath(
+  new URL("..", import.meta.url),
+);
 
 function canonicalJsonBytes(value) {
   function serialize(current) {
@@ -65,7 +68,7 @@ async function initializeGitRepository(root) {
       },
     });
   expect(run("init", "-q").status).toBe(0);
-  expect(run("add", ".").status).toBe(0);
+  expect(run("add", "-f", ".").status).toBe(0);
   expect(run("commit", "-qm", "fixture").status).toBe(0);
   const head = run("rev-parse", "HEAD");
   expect(head.status).toBe(0);
@@ -86,7 +89,34 @@ function runGit(root, ...args) {
   });
 }
 
-async function createFixture() {
+function productionPackageRoots(lockMetadata) {
+  const candidates = Object.entries(lockMetadata.packages)
+    .filter(
+      ([pathValue, metadata]) =>
+        pathValue.startsWith("node_modules/") &&
+        metadata !== null &&
+        typeof metadata === "object" &&
+        metadata.dev !== true &&
+        metadata.link !== true,
+    )
+    .map(([pathValue]) => pathValue)
+    .sort((left, right) => left.length - right.length);
+  const selected = [];
+  for (const pathValue of candidates) {
+    if (
+      !selected.some((ancestor) =>
+        pathValue.startsWith(`${ancestor}/node_modules/`),
+      )
+    ) {
+      selected.push(pathValue);
+    }
+  }
+  return selected;
+}
+
+async function createFixture(
+  { useActualProductionClosure = false } = {},
+) {
   const root = await realpath(
     await mkdtemp(join(tmpdir(), "kestrel-build-dir-test-")),
   );
@@ -201,7 +231,16 @@ async function createFixture() {
       "electron-updater",
       "package.json",
     ),
-    '{"version":"6.8.9"}\n',
+    JSON.stringify({
+      version: "6.8.9",
+      scripts: {
+        test: "node test.js",
+      },
+      keywords: ["electron", "updates"],
+      bugs: {
+        url: "https://example.invalid/electron-updater/issues",
+      },
+    }) + "\n",
   );
   await symlink(
     "../semver/bin/semver.js",
@@ -216,13 +255,62 @@ async function createFixture() {
   );
   await writeFile(
     join(desktopRoot, "node_modules", "zod", "package.json"),
-    '{"version":"4.4.3"}\n',
+    JSON.stringify({
+      version: "4.4.3",
+      scripts: {
+        test: "node test.js",
+      },
+      keywords: ["schema", "validation"],
+      contributors: ["Kestrel fixture"],
+    }) + "\n",
   );
+  let productionPackagePaths = [
+    "node_modules/electron-updater",
+    "node_modules/zod",
+  ];
+  if (useActualProductionClosure) {
+    const actualPackage = await readFile(
+      join(actualDesktopRoot, "package.json"),
+    );
+    const actualLock = await readFile(
+      join(actualDesktopRoot, "package-lock.json"),
+    );
+    const lockMetadata = JSON.parse(actualLock.toString("utf8"));
+    productionPackagePaths = productionPackageRoots(lockMetadata);
+    await writeFile(
+      join(desktopRoot, "package.json"),
+      actualPackage,
+    );
+    await writeFile(
+      join(desktopRoot, "package-lock.json"),
+      actualLock,
+    );
+    await rm(
+      join(desktopRoot, "node_modules", "electron-updater"),
+      { recursive: true, force: true },
+    );
+    await rm(
+      join(desktopRoot, "node_modules", "zod"),
+      { recursive: true, force: true },
+    );
+    for (const packagePath of productionPackagePaths) {
+      await cp(
+        join(
+          actualDesktopRoot,
+          ...packagePath.split("/"),
+        ),
+        join(desktopRoot, ...packagePath.split("/")),
+        { recursive: true },
+      );
+    }
+  }
   const config = {
     appId: "dev.kestrel.desktop",
     productName: "Kestrel Developer",
     asar: false,
     npmRebuild: false,
+    removePackageKeywords: false,
+    removePackageScripts: false,
     directories: {
       output: "__VERIFIED_DIRECTORY_OUTPUT__",
     },
@@ -341,6 +429,7 @@ async function createFixture() {
     stageReceiptPath,
     outputRoot,
     buildReceiptPath,
+    productionPackagePaths,
   };
 }
 
@@ -366,6 +455,34 @@ async function copyDirectorySourceToApplication(invocation, mutate) {
   }
 }
 
+async function runPinnedRealBuilder(invocation, builderOutput) {
+  const completed = spawnSync(
+    process.execPath,
+    [
+      join(
+        actualDesktopRoot,
+        "node_modules",
+        "electron-builder",
+        "out",
+        "cli",
+        "cli.js",
+      ),
+      ...invocation.arguments,
+    ],
+    {
+      cwd: invocation.cwd,
+      env: invocation.environment,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  builderOutput.push(completed.stdout, completed.stderr);
+  expect(
+    completed.status,
+    builderOutput.join("\n").slice(-16 * 1024),
+  ).toBe(0);
+}
+
 describe("developer directory bundle", () => {
   beforeEach(() => {
     delete process.env.KESTREL_DESKTOP_BUILD_MODE;
@@ -383,6 +500,7 @@ describe("developer directory bundle", () => {
   it("emits exact receipt roots and only a current-platform dir invocation", async () => {
     const fixture = await createFixture();
     let capturedInvocation;
+    let capturedEffectiveConfig;
     const receipt = await buildDeveloperDirectory(
       {
         stageReceiptPath: fixture.stageReceiptPath,
@@ -394,6 +512,9 @@ describe("developer directory bundle", () => {
         desktopRoot: fixture.desktopRoot,
         executeBuilder: async (invocation) => {
           capturedInvocation = invocation;
+          capturedEffectiveConfig = JSON.parse(
+            await readFile(invocation.effectiveConfigPath, "utf8"),
+          );
           await copyDirectorySourceToApplication(invocation);
         },
       },
@@ -410,6 +531,14 @@ describe("developer directory bundle", () => {
     expect(capturedInvocation.arguments.join(" ")).not.toMatch(
       /publish|dmg|zip|nsis|appimage|notar|sign/i,
     );
+    expect(capturedEffectiveConfig.removePackageScripts).toBe(false);
+    expect(capturedEffectiveConfig.removePackageKeywords).toBe(false);
+    expect(capturedEffectiveConfig.extraResources).toEqual([
+      {
+        from: fixture.stageRoot,
+        to: "kestrel",
+      },
+    ]);
     expect(receipt.schema).toBe(
       "kestrel.desktop.directory-build.v1",
     );
@@ -489,9 +618,6 @@ describe("developer directory bundle", () => {
     process.env.RUN_DESKTOP_BUILDER_INTEGRATION === "1",
   )("runs the pinned real electron-builder directory target", async () => {
     const fixture = await createFixture();
-    const actualDesktopRoot = fileURLToPath(
-      new URL("..", import.meta.url),
-    );
     const builderOutput = [];
     const receipt = await buildDeveloperDirectory(
       {
@@ -503,39 +629,7 @@ describe("developer directory bundle", () => {
         repositoryRoot: fixture.repositoryRoot,
         desktopRoot: fixture.desktopRoot,
         executeBuilder: async (invocation) => {
-          const completed = spawnSync(
-            process.execPath,
-            [
-              join(
-                actualDesktopRoot,
-                "node_modules",
-                "electron-builder",
-                "out",
-                "cli",
-                "cli.js",
-              ),
-              ...invocation.arguments,
-            ],
-            {
-              cwd: invocation.cwd,
-              env: {
-                ...invocation.environment,
-                ELECTRON_OVERRIDE_DIST_PATH: join(
-                  actualDesktopRoot,
-                  "node_modules",
-                  "electron",
-                  "dist",
-                ),
-              },
-              encoding: "utf8",
-              maxBuffer: 1024 * 1024,
-            },
-          );
-          builderOutput.push(completed.stdout, completed.stderr);
-          expect(
-            completed.status,
-            builderOutput.join("\n").slice(-16 * 1024),
-          ).toBe(0);
+          await runPinnedRealBuilder(invocation, builderOutput);
         },
       },
     );
@@ -545,7 +639,83 @@ describe("developer directory bundle", () => {
     expect(builderOutput.join("\n")).not.toMatch(
       /publishing|notarizing|signing identity/i,
     );
+    const packagedAppRoot = dirname(
+      dirname(receipt.packaged_public_key_path),
+    );
+    for (const dependency of ["electron-updater", "zod"]) {
+      const sourcePackage = await readFile(
+        join(
+          fixture.desktopRoot,
+          "node_modules",
+          dependency,
+          "package.json",
+        ),
+      );
+      const packagedDependency = await readFile(
+        join(
+          packagedAppRoot,
+          "node_modules",
+          dependency,
+          "package.json",
+        ),
+      );
+      expect(packagedDependency.equals(sourcePackage)).toBe(true);
+    }
   });
+
+  it.runIf(
+    process.env.RUN_DESKTOP_BUILDER_INTEGRATION === "1",
+  )(
+    "preserves the complete installed production dependency closure",
+    async () => {
+      const fixture = await createFixture({
+        useActualProductionClosure: true,
+      });
+      const builderOutput = [];
+      const receipt = await buildDeveloperDirectory(
+        {
+          stageReceiptPath: fixture.stageReceiptPath,
+          outputRoot: fixture.outputRoot,
+          receiptPath: fixture.buildReceiptPath,
+        },
+        {
+          repositoryRoot: fixture.repositoryRoot,
+          desktopRoot: fixture.desktopRoot,
+          executeBuilder: async (invocation) => {
+            await runPinnedRealBuilder(invocation, builderOutput);
+          },
+        },
+      );
+
+      expect(receipt.production_dependency_count).toBe(
+        fixture.productionPackagePaths.length,
+      );
+      const packagedAppRoot = dirname(
+        dirname(receipt.packaged_public_key_path),
+      );
+      for (const packagePath of fixture.productionPackagePaths) {
+        const sourcePackage = await readFile(
+          join(
+            fixture.desktopRoot,
+            ...packagePath.split("/"),
+            "package.json",
+          ),
+        );
+        const packagedPackage = await readFile(
+          join(
+            packagedAppRoot,
+            ...packagePath.split("/"),
+            "package.json",
+          ),
+        );
+        expect(
+          packagedPackage.equals(sourcePackage),
+          packagePath,
+        ).toBe(true);
+      }
+    },
+    30_000,
+  );
 
   it("ignores environment hints, rejects release identity and unknown identity argv", async () => {
     const fixture = await createFixture();
@@ -789,5 +959,53 @@ describe("developer directory bundle", () => {
         code: "ENOENT",
       });
     }
+  });
+
+  it("rejects a linked generated dependency root before replacement", async () => {
+    const fixture = await createFixture();
+    const externalDependencies = join(
+      dirname(fixture.repositoryRoot),
+      "external-dependencies",
+    );
+    await mkdir(externalDependencies);
+    const markerPath = join(externalDependencies, "marker.txt");
+    await writeFile(markerPath, "preserve\n");
+
+    await expect(
+      buildDeveloperDirectory(
+        {
+          stageReceiptPath: fixture.stageReceiptPath,
+          outputRoot: fixture.outputRoot,
+          receiptPath: fixture.buildReceiptPath,
+        },
+        {
+          repositoryRoot: fixture.repositoryRoot,
+          desktopRoot: fixture.desktopRoot,
+          executeBuilder: async (invocation) => {
+            await copyDirectorySourceToApplication(
+              invocation,
+              async ({ resourcesRoot }) => {
+                const dependencyRoot = join(
+                  resourcesRoot,
+                  "app",
+                  "node_modules",
+                );
+                await rm(dependencyRoot, {
+                  recursive: true,
+                  force: true,
+                });
+                await symlink(externalDependencies, dependencyRoot);
+              },
+            );
+          },
+        },
+      ),
+    ).rejects.toThrow(/linked directory|canonical/i);
+    await expect(readFile(markerPath, "utf8")).resolves.toBe(
+      "preserve\n",
+    );
+    await expect(lstat(fixture.outputRoot)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 });
