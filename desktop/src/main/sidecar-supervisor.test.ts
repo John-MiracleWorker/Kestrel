@@ -221,6 +221,7 @@ function frozenDeveloperHarness(options: {
     parentPid: number;
     ownerDigest: string;
     processBirthMarker: string;
+    executablePath: string;
     executableDigest: string;
   }>;
   processModel?: "direct" | "pyinstaller_onefile";
@@ -316,6 +317,8 @@ function frozenDeveloperHarness(options: {
           parentPid: process.pid,
           ownerDigest: launcherOwnerDigest,
           processBirthMarker: `bootloader-birth-${pid}`,
+          executablePath:
+            "/bundle/resources/sidecar/kestrel-desktop-sidecar",
           executableDigest
         };
       },
@@ -328,6 +331,9 @@ function frozenDeveloperHarness(options: {
         processBirthMarker:
           options.payloadIdentity?.processBirthMarker ??
           "payload-birth-9001",
+        executablePath:
+          options.payloadIdentity?.executablePath ??
+          "/bundle/resources/sidecar/kestrel-desktop-sidecar",
         executableDigest:
           options.payloadIdentity?.executableDigest ??
           executableDigest
@@ -346,6 +352,9 @@ function frozenDeveloperHarness(options: {
           processBirthMarker:
             options.payloadIdentity?.processBirthMarker ??
             "payload-birth-9001",
+          executablePath:
+            options.payloadIdentity?.executablePath ??
+            "/bundle/resources/sidecar/kestrel-desktop-sidecar",
           executableDigest:
             options.payloadIdentity?.executableDigest ??
             executableDigest
@@ -2224,6 +2233,14 @@ describe("verified sidecar supervisor", () => {
       name: "a different payload executable",
       options: {
         payloadIdentity: { executableDigest: "9".repeat(64) }
+      }
+    },
+    {
+      name: "a different payload executable path",
+      options: {
+        payloadIdentity: {
+          executablePath: "/bundle/resources/sidecar/substitute"
+        }
       }
     }
   ])("rejects $name before API authentication", async ({ options }) => {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import {
   chmod,
   copyFile,
@@ -21,6 +22,7 @@ import {
   createDeveloperRuntimeSupervisorDependencies,
   createDeveloperRuntimePrivateFileAdapter,
   createMacOSDeveloperRetainedChildQualifier,
+  readMacOSDeveloperProcess,
   selectPackagedSupervisorRuntime
 } from "./developer-runtime";
 import { resolvePrivateProfile } from "./private-files";
@@ -341,6 +343,31 @@ describe("developer-runtime private profile mutation", () => {
 });
 
 describe("macOS developer retained-child qualification", () => {
+  it.skipIf(process.platform !== "darwin")(
+    "observes the canonical mapped executable and hashes its exact backing file",
+    async () => {
+      const child = spawn("/bin/sleep", ["5"], {
+        stdio: "ignore"
+      });
+      try {
+        const pid = child.pid;
+        if (pid === undefined) {
+          throw new Error("test_child_pid_missing");
+        }
+        const evidence = await readMacOSDeveloperProcess(pid);
+        const executable = await realpath("/bin/sleep");
+        expect(evidence).toMatchObject({
+          pid,
+          parentPid: process.pid,
+          executablePath: executable,
+          executableDigest: await sha256File(executable)
+        });
+      } finally {
+        child.kill("SIGKILL");
+      }
+    }
+  );
+
   it("binds tagged ps birth milliseconds only to the retained child object and PID", async () => {
     const child = new FakeSidecarChild(41001);
     const qualifier = createMacOSDeveloperRetainedChildQualifier({
@@ -348,7 +375,9 @@ describe("macOS developer retained-child qualification", () => {
       readProcess: async (pid) => ({
         pid,
         uid: 501,
-        birthMilliseconds: 1_753_886_400_000
+        birthMilliseconds: 1_753_886_400_000,
+        executablePath: "/bundle/sidecar",
+        executableDigest: "b".repeat(64)
       })
     });
 
@@ -361,6 +390,7 @@ describe("macOS developer retained-child qualification", () => {
       pid: 41001,
       ownerDigest: createHash("sha256").update("uid:501").digest("hex"),
       processBirthMarker: "developer-ps-lstart-ms:1753886400000",
+      executablePath: "/bundle/sidecar",
       executableDigest: "b".repeat(64)
     });
     expect(await qualifier.inspectProcess(41002)).toBeNull();
@@ -376,6 +406,7 @@ describe("macOS developer retained-child qualification", () => {
 
   it("qualifies exactly one same-owner onefile payload directly below the retained bootloader", async () => {
     const child = new FakeSidecarChild(5151);
+    const digest = "b".repeat(64);
     const evidence = new Map([
       [
         5151,
@@ -383,7 +414,9 @@ describe("macOS developer retained-child qualification", () => {
           pid: 5151,
           parentPid: 4242,
           uid: 501,
-          birthMilliseconds: 1_753_886_400_000
+          birthMilliseconds: 1_753_886_400_000,
+          executablePath: "/bundle/sidecar",
+          executableDigest: digest
         }
       ],
       [
@@ -392,7 +425,9 @@ describe("macOS developer retained-child qualification", () => {
           pid: 9001,
           parentPid: 5151,
           uid: 501,
-          birthMilliseconds: 1_753_886_401_000
+          birthMilliseconds: 1_753_886_401_000,
+          executablePath: "/bundle/sidecar",
+          executableDigest: digest
         }
       ]
     ]);
@@ -400,8 +435,6 @@ describe("macOS developer retained-child qualification", () => {
       platform: "darwin",
       readProcess: async (pid) => evidence.get(pid) ?? null
     });
-    const digest = "b".repeat(64);
-
     await qualifier.inspectRetainedChild(child, digest);
     await expect(
       qualifier.qualifyDeveloperOneFilePayload(
@@ -426,7 +459,9 @@ describe("macOS developer retained-child qualification", () => {
       pid: 9001,
       parentPid: 1,
       uid: 501,
-      birthMilliseconds: 1_753_886_401_000
+      birthMilliseconds: 1_753_886_401_000,
+      executablePath: "/bundle/sidecar",
+      executableDigest: digest
     });
     expect(await qualifier.inspectProcess(9001)).toMatchObject({
       pid: 9001,
@@ -457,13 +492,17 @@ describe("macOS developer retained-child qualification", () => {
               pid,
               parentPid: 4242,
               uid: 501,
-              birthMilliseconds: 1_753_886_400_000
+              birthMilliseconds: 1_753_886_400_000,
+              executablePath: "/bundle/sidecar",
+              executableDigest: "b".repeat(64)
             }
           : {
               pid,
               parentPid,
               uid,
-              birthMilliseconds: 1_753_886_401_000
+              birthMilliseconds: 1_753_886_401_000,
+              executablePath: "/bundle/sidecar",
+              executableDigest: "b".repeat(64)
             }
     });
     const digest = "b".repeat(64);
@@ -474,6 +513,37 @@ describe("macOS developer retained-child qualification", () => {
         child,
         9001,
         digest
+      )
+    ).rejects.toThrow(
+      "developer_onefile_payload_identity_unavailable"
+    );
+  });
+
+  it("rejects a payload whose independently observed executable digest differs from the retained bootloader", async () => {
+    const child = new FakeSidecarChild(5151);
+    const expectedDigest = "b".repeat(64);
+    const qualifier = createMacOSDeveloperRetainedChildQualifier({
+      platform: "darwin",
+      readProcess: async (pid) => ({
+        pid,
+        parentPid: pid === 5151 ? 4242 : 5151,
+        uid: 501,
+        birthMilliseconds:
+          pid === 5151
+            ? 1_753_886_400_000
+            : 1_753_886_401_000,
+        executablePath: "/bundle/sidecar",
+        executableDigest:
+          pid === 5151 ? expectedDigest : "c".repeat(64)
+      })
+    });
+
+    await qualifier.inspectRetainedChild(child, expectedDigest);
+    await expect(
+      qualifier.qualifyDeveloperOneFilePayload(
+        child,
+        9001,
+        expectedDigest
       )
     ).rejects.toThrow(
       "developer_onefile_payload_identity_unavailable"
@@ -545,7 +615,9 @@ describe("immutable packaged runtime selection", () => {
             readProcess: async (pid) => ({
               pid,
               uid: 501,
-              birthMilliseconds: 1_753_886_400_000
+              birthMilliseconds: 1_753_886_400_000,
+              executablePath: "/bundle/electron",
+              executableDigest: "a".repeat(64)
             }),
             resourceVerification: {
               resourceRoot: userData,

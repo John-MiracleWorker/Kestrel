@@ -522,6 +522,8 @@ export interface DeveloperMacProcessEvidence {
   parentPid?: number;
   uid: number;
   birthMilliseconds: number;
+  executablePath: string;
+  executableDigest: string;
 }
 
 export type DeveloperMacProcessReader = (
@@ -548,6 +550,201 @@ export interface MacOSDeveloperRetainedChildOptions {
   readProcess?: DeveloperMacProcessReader;
 }
 
+interface MacOSExecutableMapping {
+  path: string;
+  device: bigint;
+  inode: bigint;
+  size: bigint;
+}
+
+const MAX_PROCESS_EVIDENCE_BYTES = 64 * 1024;
+const MAX_PROCESS_PATH_BYTES = 4 * 1024;
+
+function processPathTrusted(path: string): boolean {
+  return (
+    isAbsolute(path) &&
+    Buffer.byteLength(path, "utf8") > 0 &&
+    Buffer.byteLength(path, "utf8") <= MAX_PROCESS_PATH_BYTES &&
+    !/[\u0000-\u001f\u007f]/u.test(path)
+  );
+}
+
+function parseMacOSExecutableMappings(
+  stdout: string,
+  pid: number
+): MacOSExecutableMapping[] | null {
+  if (
+    Buffer.byteLength(stdout, "utf8") > MAX_PROCESS_EVIDENCE_BYTES
+  ) {
+    return null;
+  }
+  const lines = stdout.split(/\r?\n/).filter((line) => line !== "");
+  if (lines.shift() !== `p${pid}` || lines.length > 128) {
+    return null;
+  }
+  const mappings: MacOSExecutableMapping[] = [];
+  let descriptor = "";
+  let type = "";
+  let path = "";
+  let device = "";
+  let inode = "";
+  let size = "";
+  const flush = (): boolean => {
+    if (descriptor === "") {
+      return true;
+    }
+    if (
+      descriptor === "txt" &&
+      type === "REG" &&
+      processPathTrusted(path) &&
+      /^0x[0-9a-f]+$/i.test(device) &&
+      /^\d+$/.test(inode) &&
+      /^\d+$/.test(size)
+    ) {
+      mappings.push({
+        path,
+        device: BigInt(device),
+        inode: BigInt(inode),
+        size: BigInt(size)
+      });
+    }
+    descriptor = "";
+    type = "";
+    path = "";
+    device = "";
+    inode = "";
+    size = "";
+    return mappings.length <= 32;
+  };
+  for (const line of lines) {
+    const field = line.slice(0, 1);
+    const value = line.slice(1);
+    if (field === "f") {
+      if (!flush()) {
+        return null;
+      }
+      descriptor = value;
+    } else if (field === "t") {
+      type = value;
+    } else if (field === "n") {
+      path = value;
+    } else if (field === "D") {
+      device = value;
+    } else if (field === "i") {
+      inode = value;
+    } else if (field === "s") {
+      size = value;
+    }
+  }
+  return flush() && mappings.length > 0 ? mappings : null;
+}
+
+function sameMappedFileIdentity(
+  metadata: {
+    dev: bigint;
+    ino: bigint;
+    size: bigint;
+    mode: bigint;
+    nlink: bigint;
+    mtimeNs: bigint;
+    ctimeNs: bigint;
+  },
+  expected: {
+    dev: bigint;
+    ino: bigint;
+    size: bigint;
+    mode: bigint;
+    nlink: bigint;
+    mtimeNs: bigint;
+    ctimeNs: bigint;
+  }
+): boolean {
+  return (
+    metadata.dev === expected.dev &&
+    metadata.ino === expected.ino &&
+    metadata.size === expected.size &&
+    metadata.mode === expected.mode &&
+    metadata.nlink === expected.nlink &&
+    metadata.mtimeNs === expected.mtimeNs &&
+    metadata.ctimeNs === expected.ctimeNs
+  );
+}
+
+async function inspectMappedMacOSExecutable(
+  commandPath: string,
+  mappings: readonly MacOSExecutableMapping[]
+): Promise<{ path: string; digest: string } | null> {
+  if (!processPathTrusted(commandPath)) {
+    return null;
+  }
+  const canonicalCommand = await realpath(resolve(commandPath));
+  const matching: MacOSExecutableMapping[] = [];
+  for (const mapping of mappings) {
+    try {
+      if (
+        (await realpath(resolve(mapping.path))) === canonicalCommand
+      ) {
+        matching.push(mapping);
+      }
+    } catch {
+      // A deleted or replaced mapped pathname cannot qualify.
+    }
+  }
+  if (matching.length !== 1) {
+    return null;
+  }
+  const mapping = matching[0]!;
+  const before = await lstat(canonicalCommand, { bigint: true });
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.nlink !== 1n ||
+    (before.mode & 0o111n) === 0n ||
+    before.dev !== mapping.device ||
+    before.ino !== mapping.inode ||
+    before.size !== mapping.size ||
+    before.size <= 0n ||
+    before.size > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    return null;
+  }
+  const handle = await open(
+    canonicalCommand,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
+  );
+  try {
+    const opened = await handle.stat({ bigint: true });
+    const pathAfterOpen = await lstat(canonicalCommand, {
+      bigint: true
+    });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !sameMappedFileIdentity(opened, before) ||
+      !sameMappedFileIdentity(pathAfterOpen, before)
+    ) {
+      return null;
+    }
+    const digest = await digestOpenedFile(
+      handle,
+      Number(opened.size)
+    );
+    const afterDigest = await handle.stat({ bigint: true });
+    const pathAfterDigest = await lstat(canonicalCommand, {
+      bigint: true
+    });
+    if (
+      !sameMappedFileIdentity(afterDigest, before) ||
+      !sameMappedFileIdentity(pathAfterDigest, before)
+    ) {
+      return null;
+    }
+    return { path: canonicalCommand, digest };
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function readMacOSDeveloperProcess(
   pid: number
 ): Promise<DeveloperMacProcessEvidence | null> {
@@ -555,53 +752,86 @@ export async function readMacOSDeveloperProcess(
     return null;
   }
   try {
-    const { stdout } = await execFileAsync(
-      "/bin/ps",
-      [
-        "-ww",
-        "-p",
-        String(pid),
-        "-o",
-        "uid=",
-        "-o",
-        "ppid=",
-        "-o",
-        "lstart="
-      ],
-      {
-        encoding: "utf8",
-        env: {
-          LANG: "C",
-          LC_ALL: "C",
-          PATH: "/usr/bin:/bin"
-        },
-        maxBuffer: 16 * 1024,
-        timeout: 2_000
-      }
+    const commandOptions = {
+      encoding: "utf8" as const,
+      env: {
+        LANG: "C",
+        LC_ALL: "C",
+        PATH: "/usr/bin:/bin"
+      },
+      maxBuffer: MAX_PROCESS_EVIDENCE_BYTES,
+      timeout: 2_000
+    };
+    const [processResult, mappingResult] = await Promise.all([
+      execFileAsync(
+        "/bin/ps",
+        [
+          "-ww",
+          "-p",
+          String(pid),
+          "-o",
+          "uid=",
+          "-o",
+          "ppid=",
+          "-o",
+          "lstart=",
+          "-o",
+          "comm="
+        ],
+        commandOptions
+      ),
+      execFileAsync(
+        "/usr/sbin/lsof",
+        [
+          "-a",
+          "-p",
+          String(pid),
+          "-d",
+          "txt",
+          "-F",
+          "pftnDsi"
+        ],
+        commandOptions
+      )
+    ]);
+    const match =
+      /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})\s+(.+?)\s*$/u.exec(
+        processResult.stdout
+      );
+    const mappings = parseMacOSExecutableMappings(
+      mappingResult.stdout,
+      pid
     );
-    const parts = stdout.trim().split(/\s+/);
-    if (
-      parts.length !== 7 ||
-      !/^\d+$/.test(parts[0]!) ||
-      !/^\d+$/.test(parts[1]!)
-    ) {
+    if (match === null || mappings === null) {
       return null;
     }
-    const birthMilliseconds = Date.parse(parts.slice(2).join(" "));
-    const parentPid = Number(parts[1]);
+    const birthMilliseconds = Date.parse(
+      `${match[3]} ${match[4]} ${match[5]} ${match[6]} ${match[7]}`
+    );
+    const parentPid = Number(match[2]);
+    const uid = Number(match[1]);
+    const executable = await inspectMappedMacOSExecutable(
+      match[8]!,
+      mappings
+    );
     if (
       !Number.isSafeInteger(parentPid) ||
       parentPid < 0 ||
+      !Number.isSafeInteger(uid) ||
+      uid < 0 ||
       !Number.isSafeInteger(birthMilliseconds) ||
-      birthMilliseconds <= 0
+      birthMilliseconds <= 0 ||
+      executable === null
     ) {
       return null;
     }
     return {
       pid,
       parentPid,
-      uid: Number(parts[0]),
-      birthMilliseconds
+      uid,
+      birthMilliseconds,
+      executablePath: executable.path,
+      executableDigest: executable.digest
     };
   } catch {
     return null;
@@ -609,8 +839,7 @@ export async function readMacOSDeveloperProcess(
 }
 
 function developerMacProcessIdentity(
-  evidence: DeveloperMacProcessEvidence,
-  executableDigest: string
+  evidence: DeveloperMacProcessEvidence
 ): SidecarProcessIdentity | null {
   if (
     evidence.pid <= 0 ||
@@ -622,7 +851,8 @@ function developerMacProcessIdentity(
         evidence.parentPid < 0)) ||
     !Number.isSafeInteger(evidence.birthMilliseconds) ||
     evidence.birthMilliseconds <= 0 ||
-    !SHA256_PATTERN.test(executableDigest)
+    !processPathTrusted(evidence.executablePath) ||
+    !SHA256_PATTERN.test(evidence.executableDigest)
   ) {
     return null;
   }
@@ -636,7 +866,8 @@ function developerMacProcessIdentity(
       .digest("hex"),
     processBirthMarker:
       `developer-ps-lstart-ms:${evidence.birthMilliseconds}`,
-    executableDigest
+    executablePath: evidence.executablePath,
+    executableDigest: evidence.executableDigest
   };
 }
 
@@ -663,6 +894,7 @@ export function createMacOSDeveloperRetainedChildQualifier(
       left.pid === right.pid &&
       left.ownerDigest === right.ownerDigest &&
       left.processBirthMarker === right.processBirthMarker &&
+      left.executablePath === right.executablePath &&
       left.executableDigest === right.executableDigest
     );
   }
@@ -678,14 +910,13 @@ export function createMacOSDeveloperRetainedChildQualifier(
   }
 
   async function observedIdentity(
-    pid: number,
-    executableDigest: string
+    pid: number
   ): Promise<SidecarProcessIdentity | null> {
     const evidence = await readProcess(pid);
     if (evidence === null || evidence.pid !== pid) {
       return null;
     }
-    return developerMacProcessIdentity(evidence, executableDigest);
+    return developerMacProcessIdentity(evidence);
   }
 
   return {
@@ -707,11 +938,11 @@ export function createMacOSDeveloperRetainedChildQualifier(
       if (retained !== null && retained.child !== child) {
         throw new Error("developer_existing_process_attach_forbidden");
       }
-      const observed = await observedIdentity(
-        child.pid,
-        executableDigest
-      );
-      if (observed === null) {
+      const observed = await observedIdentity(child.pid);
+      if (
+        observed === null ||
+        observed.executableDigest !== executableDigest
+      ) {
         throw new Error("developer_retained_child_identity_unavailable");
       }
       if (
@@ -751,8 +982,8 @@ export function createMacOSDeveloperRetainedChildQualifier(
         );
       }
       const [launcherBefore, payloadBefore] = await Promise.all([
-        observedIdentity(child.pid, executableDigest),
-        observedIdentity(payloadPid, executableDigest)
+        observedIdentity(child.pid),
+        observedIdentity(payloadPid)
       ]);
       if (
         launcherBefore === null ||
@@ -767,6 +998,9 @@ export function createMacOSDeveloperRetainedChildQualifier(
         launcherBefore.ownerDigest !== payloadBefore.ownerDigest ||
         launcherBefore.executableDigest !== executableDigest ||
         payloadBefore.executableDigest !== executableDigest ||
+        launcherBefore.executablePath === undefined ||
+        payloadBefore.executablePath === undefined ||
+        launcherBefore.executablePath !== payloadBefore.executablePath ||
         (retained.payload !== null &&
           !sameQualifiedIdentity(retained.payload, payloadBefore))
       ) {
@@ -775,8 +1009,8 @@ export function createMacOSDeveloperRetainedChildQualifier(
         );
       }
       const [launcherAfter, payloadAfter] = await Promise.all([
-        observedIdentity(child.pid, executableDigest),
-        observedIdentity(payloadPid, executableDigest)
+        observedIdentity(child.pid),
+        observedIdentity(payloadPid)
       ]);
       if (
         launcherAfter === null ||
@@ -805,10 +1039,7 @@ export function createMacOSDeveloperRetainedChildQualifier(
         ) {
           return null;
         }
-        const observed = await observedIdentity(
-          pid,
-          retained.identity.executableDigest
-        );
+        const observed = await observedIdentity(pid);
         return observed !== null &&
           sameQualifiedIdentity(observed, retained.identity)
           ? observed
@@ -818,10 +1049,7 @@ export function createMacOSDeveloperRetainedChildQualifier(
       if (payload === null || pid !== payload.pid) {
         return null;
       }
-      const observed = await observedIdentity(
-        pid,
-        payload.executableDigest
-      );
+      const observed = await observedIdentity(pid);
       return observed !== null &&
         sameStableIdentity(observed, payload)
         ? observed
@@ -902,7 +1130,7 @@ export async function createDeveloperRuntimeSupervisorDependencies(
     if (evidence === null || evidence.pid !== pid) {
       return null;
     }
-    return developerMacProcessIdentity(evidence, "0".repeat(64));
+    return developerMacProcessIdentity(evidence);
   };
   const base = createNodeSupervisorDependencies({
     ...input,

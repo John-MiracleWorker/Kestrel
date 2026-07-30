@@ -326,6 +326,7 @@ export interface SidecarProcessIdentity {
   parentPid?: number;
   ownerDigest?: string;
   processBirthMarker: string;
+  executablePath?: string;
   executableDigest: string;
 }
 
@@ -751,6 +752,7 @@ function sameStableProcessIdentity(
     left.pid === right.pid &&
     left.ownerDigest === right.ownerDigest &&
     left.processBirthMarker === right.processBirthMarker &&
+    left.executablePath === right.executablePath &&
     left.executableDigest === right.executableDigest
   );
 }
@@ -812,6 +814,10 @@ function validateLocalReadinessEvidence(
         launcherIdentity.ownerDigest === undefined ||
         processIdentity.ownerDigest === undefined ||
         launcherIdentity.ownerDigest !== processIdentity.ownerDigest ||
+        launcherIdentity.executablePath !==
+          active.executable.resource.path ||
+        processIdentity.executablePath !==
+          launcherIdentity.executablePath ||
         launcherIdentity.executableDigest !==
           expectedExecutableDigest
       : readiness.pid !== childPid ||
@@ -1341,7 +1347,9 @@ export class SidecarSupervisor {
       if (
         spawnedIdentity === null ||
         spawnedIdentity.pid !== child.pid ||
-        spawnedIdentity.executableDigest !== expectedExecutableDigest
+        spawnedIdentity.executableDigest !== expectedExecutableDigest ||
+        (executable.mechanism === "developer_reverified_path" &&
+          spawnedIdentity.executablePath !== sidecar.path)
       ) {
         throw new SidecarSupervisorError(
           "sidecar_process_identity_unverified",
@@ -2235,6 +2243,7 @@ export async function inspectNodeProcess(
         .update(`uid:${Number(uid)}`)
         .digest("hex"),
       processBirthMarker: `proc-start-ticks:${startTicks}`,
+      executablePath: executable,
       executableDigest: await sha256File(executable)
     };
   } catch {
