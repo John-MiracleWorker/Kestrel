@@ -24,6 +24,9 @@ RECEIPT_SCHEMA = "kestrel.desktop.sidecar-build.v1"
 MAX_RECEIPT_BYTES = 64 * 1024
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_DISTRIBUTION_METADATA_RE = re.compile(
+    r"nested_memvid_agent-[^/]+\.dist-info/METADATA"
+)
 
 REQUIRED_RUNTIME_ROOTS = (
     "packaging/kestrel-sidecar-entry.py",
@@ -67,6 +70,20 @@ REQUIRED_BUNDLED_DISTRIBUTIONS = (
     "pyyaml",
     "starlette",
     "tzdata",
+    "uvicorn",
+)
+REQUIRED_FROZEN_ARCHIVE_MEMBERS = (
+    "anthropic",
+    "fastapi",
+    "google.genai",
+    "keyring.backends",
+    "mcp.client",
+    "memvid_sdk",
+    "nested_memvid_agent.desktop_sidecar",
+    "nested_memvid_agent.llm.provider_http_worker",
+    "nested_memvid_agent/prompts/system_prompt.md",
+    "nested_memvid_agent/web_dist/index.html",
+    "openai",
     "uvicorn",
 )
 _WEB_RECEIPT_KEYS = frozenset(
@@ -170,6 +187,97 @@ def validate_packaging_runtime_roots(source_root: Path) -> None:
         candidate = root / relative
         if candidate.exists() or candidate.is_symlink():
             raise ValueError(f"forbidden runtime root: {relative}")
+
+
+def _forbidden_frozen_archive_member(name: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", name).casefold().replace("\\", "/")
+    path_components = normalized.split("/")
+    module_components = [
+        component
+        for path_component in path_components
+        for component in path_component.split(".")
+        if component
+    ]
+    return (
+        normalized.endswith(".map")
+        or any(
+            component in {
+                ".cache",
+                ".nest",
+                "__pycache__",
+                "benchmark",
+                "benchmarks",
+                "credentials.json",
+                "memvid_v1",
+                "pytest",
+                "qr",
+                "qrcode",
+                "test",
+                "tests",
+                "video_frames",
+            }
+            or component == ".env"
+            or component.startswith(".env.")
+            for component in path_components
+        )
+        or any(
+            component in {"benchmark", "benchmarks", "test", "tests"}
+            or component.startswith("test_")
+            or component.startswith("_test_")
+            for component in module_components
+        )
+    )
+
+
+def validate_frozen_archive_listing(listing: str) -> tuple[str, ...]:
+    """Require the frozen core and reject development or private payload roots."""
+
+    members = tuple(
+        line.strip()
+        for line in listing.splitlines()
+        if line.strip()
+        and not line.startswith("Options in ")
+        and not line.startswith("Contents of ")
+    )
+    if not members:
+        raise ValueError("frozen archive inventory is empty")
+    for member in members:
+        if _forbidden_frozen_archive_member(member):
+            raise ValueError(f"forbidden frozen archive member: {member}")
+    if not any(_DISTRIBUTION_METADATA_RE.fullmatch(member) for member in members):
+        raise ValueError(
+            "frozen archive is missing Kestrel distribution metadata"
+        )
+    missing = sorted(set(REQUIRED_FROZEN_ARCHIVE_MEMBERS).difference(members))
+    if missing:
+        raise ValueError(
+            "frozen archive is missing required runtime members: "
+            + ", ".join(missing)
+        )
+    return members
+
+
+def validate_frozen_binary_inventory(binary_path: Path) -> tuple[str, ...]:
+    """Inspect the exact PyInstaller archive before issuing its build receipt."""
+
+    binary = binary_path.resolve(strict=True)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "PyInstaller.utils.cliutils.archive_viewer",
+            "--recursive",
+            "--brief",
+            str(binary),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise ValueError(f"could not inspect frozen archive: {detail}")
+    return validate_frozen_archive_listing(completed.stdout)
 
 
 def _sha256_file(path: Path) -> str:
@@ -646,10 +754,12 @@ def build_sidecar(
         != web_receipt_sha256
     ):
         raise ValueError("web build receipt changed during sidecar build")
+    binary = _resolve_output_binary(dist_root)
+    validate_frozen_binary_inventory(binary)
     receipt = create_sidecar_build_receipt(
         source_commit=commit,
         app_version=_read_app_version(source / "pyproject.toml"),
-        binary_path=_resolve_output_binary(dist_root),
+        binary_path=binary,
         entrypoint_path=source / "packaging" / "kestrel-sidecar-entry.py",
         spec_path=source / "packaging" / "kestrel-sidecar.spec",
         python_lock_path=source / "uv.lock",

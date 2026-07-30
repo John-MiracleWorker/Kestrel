@@ -29,6 +29,41 @@ def _exclude_mcp_cli(module_name):
     return module_name != "mcp.cli" and not module_name.startswith("mcp.cli.")
 
 
+def _exclude_test_modules(module_name):
+    components = module_name.split(".")
+    return not any(
+        component in {"test", "tests", "benchmark", "benchmarks"}
+        or component.startswith("test_")
+        or component.startswith("_test_")
+        for component in components
+    )
+
+
+def _include_runtime_data(toc_entry):
+    destination = str(toc_entry[0]).replace("\\", "/")
+    components = destination.split("/")
+    return not (
+        destination.endswith(".map")
+        or any(
+            component in {
+                ".cache",
+                ".nest",
+                "__pycache__",
+                "benchmark",
+                "benchmarks",
+                "credentials.json",
+                "qrcode",
+                "test",
+                "tests",
+                "video_frames",
+            }
+            or component == ".env"
+            or component.startswith(".env.")
+            for component in components
+        )
+    )
+
+
 web_datas = [
     (
         str(path),
@@ -47,7 +82,7 @@ web_datas = [
 hiddenimports = sorted(
     {
         *collect_submodules("anthropic"),
-        *collect_submodules("google.genai"),
+        *collect_submodules("google.genai", filter=_exclude_test_modules),
         *collect_submodules("mcp", filter=_exclude_mcp_cli),
         *collect_submodules("nested_memvid_agent"),
         *collect_submodules("openai"),
@@ -79,6 +114,9 @@ excludes = [
     ".env",
     ".nest",
     "benchmark",
+    "google.genai._test_api_client",
+    "google.genai.tests",
+    "jsonschema.benchmarks",
     "pytest",
     "qrcode",
     "tests",
@@ -96,6 +134,7 @@ analysis = Analysis(
     excludes=excludes,
     noarchive=False,
 )
+analysis.datas = [entry for entry in analysis.datas if _include_runtime_data(entry)]
 pyz = PYZ(analysis.pure)
 
 # UPX is disabled in the spec because PyInstaller rejects makespec-only switches

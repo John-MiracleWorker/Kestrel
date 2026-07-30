@@ -146,7 +146,7 @@ def test_entrypoint_and_spec_cover_runtime_without_legacy_or_development_roots()
         'collect_submodules("nested_memvid_agent")',
         'collect_all("memvid_sdk")',
         'collect_submodules("anthropic")',
-        'collect_submodules("google.genai")',
+        'collect_submodules("google.genai", filter=_exclude_test_modules)',
         'collect_submodules("keyring.backends")',
         'collect_submodules("mcp", filter=_exclude_mcp_cli)',
         'collect_submodules("openai")',
@@ -237,10 +237,21 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
         name: str,
         **kwargs: object,
     ) -> list[str]:
-        if name != "mcp":
+        if name not in {"google.genai", "mcp"}:
             return [f"{name}.fixture"]
         module_filter = kwargs.get("filter")
         assert callable(module_filter)
+        if name == "google.genai":
+            return [
+                module
+                for module in (
+                    "google.genai.runtime",
+                    "google.genai.tests",
+                    "google.genai.tests.test_client",
+                    "google.genai._test_api_client",
+                )
+                if module_filter(module)
+            ]
         return [
             module
             for module in ("mcp.client", "mcp.cli", "mcp.cli.cli")
@@ -284,6 +295,10 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
     )
     assert observed["datas"]
     assert observed["entrypoints"] == [str(ENTRYPOINT)]
+    assert "google.genai.runtime" in observed["hiddenimports"]
+    assert "google.genai.tests" not in observed["hiddenimports"]
+    assert "google.genai.tests.test_client" not in observed["hiddenimports"]
+    assert "google.genai._test_api_client" not in observed["hiddenimports"]
     assert "mcp.client" in observed["hiddenimports"]
     assert "mcp.cli" not in observed["hiddenimports"]
     assert "mcp.cli.cli" not in observed["hiddenimports"]
@@ -335,6 +350,42 @@ def test_packaging_runtime_roots_fail_closed_when_missing_or_legacy(
     legacy.mkdir(parents=True)
     with pytest.raises(ValueError, match="forbidden runtime root"):
         build.validate_packaging_runtime_roots(tmp_path)
+
+
+def test_frozen_archive_inventory_requires_core_and_rejects_development_roots() -> None:
+    build = _load_python_script(BUILD_SCRIPT, "task11b_frozen_inventory")
+    valid_members = {
+        member
+        for member in build.REQUIRED_FROZEN_ARCHIVE_MEMBERS
+        if ".dist-info/" not in member
+    }
+    valid_members.add("nested_memvid_agent-9.9.9.dist-info/METADATA")
+    valid = "\n".join(sorted(valid_members))
+
+    assert set(build.validate_frozen_archive_listing(valid)) == valid_members
+    without_metadata = "\n".join(
+        sorted(
+            member
+            for member in valid_members
+            if ".dist-info/" not in member
+        )
+    )
+    with pytest.raises(ValueError, match="distribution metadata"):
+        build.validate_frozen_archive_listing(without_metadata)
+    for forbidden in (
+        "google.genai.tests.test_client",
+        "google.genai._test_api_client",
+        "jsonschema/benchmarks/issue.json",
+        "nested_memvid_agent/qrcode/legacy.py",
+        "nested_memvid_agent/video_frames/frame.bin",
+        "nested_memvid_agent/web_dist/assets/app.js.map",
+        "nested_memvid_agent/__pycache__/agent.pyc",
+        ".env.production",
+        ".nest/state.json",
+        "credentials.json",
+    ):
+        with pytest.raises(ValueError, match="forbidden frozen archive member"):
+            build.validate_frozen_archive_listing(f"{valid}\n{forbidden}\n")
 
 
 def test_bundled_runtime_distributions_must_match_the_python_lock(
