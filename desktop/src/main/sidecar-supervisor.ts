@@ -539,6 +539,7 @@ export class SidecarSupervisor {
     let child: RetainedSidecarChild | null = null;
     let executable: VerifiedExecutableLaunchCapability | null = null;
     let expectedExecutableDigest: string | null = null;
+    let retainedActive: ActiveSidecar | null = null;
     try {
       const resources = await this.dependencies.verifyResources();
       this.throwIfLaunchCancelled(generation, signal);
@@ -597,18 +598,17 @@ export class SidecarSupervisor {
         rejectTerminal = reject;
       });
       const reportTerminal = (error: SidecarSupervisorError): void => {
-        if (terminal !== null) {
-          return;
+        if (terminal === null) {
+          terminal = error;
+          rejectTerminal(error);
         }
-        terminal = error;
-        rejectTerminal(error);
         const current = this.active;
-        if (current !== null && current.child === child && current.verified) {
-          void this.handleUnexpectedExit(
-            generation,
-            child?.exitCode ?? null,
-            child?.signalCode ?? null
-          );
+        if (
+          current !== null &&
+          current.child === child &&
+          this.childHasExited(current.child)
+        ) {
+          this.armConfirmedExit(current, generation);
         }
       };
       child.once("error", () => {
@@ -662,6 +662,7 @@ export class SidecarSupervisor {
         verified: false,
         finalization: null
       };
+      retainedActive = active;
       this.active = active;
       const spawnedIdentity = await Promise.race([
         this.dependencies.inspectProcess(child.pid),
@@ -756,7 +757,8 @@ export class SidecarSupervisor {
               "sidecar_unavailable"
             )
           : error;
-      const active = this.active?.child === child ? this.active : null;
+      const active =
+        retainedActive?.child === child ? retainedActive : null;
       if (active !== null) {
         try {
           await this.terminateActive(active, false);
@@ -814,20 +816,31 @@ export class SidecarSupervisor {
     }
   }
 
-  private async handleUnexpectedExit(
+  private armConfirmedExit(
+    active: ActiveSidecar,
+    generation: number
+  ): void {
+    if (active.finalization !== null) {
+      return;
+    }
+    const wasVerified = active.verified;
+    const finalization = this.finalizeExitedActive(active);
+    void this.completeConfirmedExit(
+      active,
+      generation,
+      wasVerified,
+      finalization
+    );
+  }
+
+  private async completeConfirmedExit(
+    active: ActiveSidecar,
     generation: number,
-    _exitCode: number | null,
-    _signal: NodeJS.Signals | null
+    wasVerified: boolean,
+    finalization: Promise<void>
   ): Promise<void> {
-    const active = this.active;
-    if (active === null || generation !== this.generation) {
-      return;
-    }
-    if (this.stopping) {
-      return;
-    }
     try {
-      await this.finalizeExitedActive(active);
+      await finalization;
     } catch (error) {
       this.dependencies.log(
         `[sidecar:supervisor] ${fixedErrorCode(error)}`
@@ -835,14 +848,18 @@ export class SidecarSupervisor {
       return;
     }
     if (
-      generation !== this.generation ||
-      this.stopping ||
       this.active !== active
     ) {
-      this.releaseFinalizedActive(active);
       return;
     }
     this.releaseFinalizedActive(active);
+    if (
+      !wasVerified ||
+      generation !== this.generation ||
+      this.stopping
+    ) {
+      return;
+    }
     this.state = {
       kind: "recovery",
       reason: "reconciliation_required",

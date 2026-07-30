@@ -268,7 +268,11 @@ function failedStartHarness(
   termination:
     | "unconfirmed"
     | "identity_unverified"
-    | "signal_rejected"
+    | "signal_rejected",
+  lifecycle: {
+    cleanup?: () => Promise<void>;
+    close?: () => Promise<void>;
+  } = {}
 ): ReturnType<typeof harness> & {
   counts: { cleanup: number; close: number };
 } {
@@ -298,6 +302,7 @@ function failedStartHarness(
         },
         close: async () => {
           counts.close += 1;
+          await lifecycle.close?.();
         }
       };
     },
@@ -310,6 +315,7 @@ function failedStartHarness(
       profile: input.profile,
       cleanup: async () => {
         counts.cleanup += 1;
+        await lifecycle.cleanup?.();
       }
     }),
     waitForReadiness: async () => {
@@ -332,6 +338,7 @@ function failedStartHarness(
         executableDigest
       };
     },
+    inspectLease: async () => ({ status: "available" }),
     waitForExit: async () => false
   });
   return { ...context, counts };
@@ -588,7 +595,35 @@ describe("verified sidecar supervisor", () => {
   it("buffers an exit before readiness and rejects without authenticating", async () => {
     const readiness = deferred<never>();
     let authenticated = false;
+    let cleanupCalls = 0;
+    let closeCalls = 0;
     const { supervisor, spawner } = harness({
+      acquireVerifiedExecutable: async (resources, relativePath) => {
+        const resource = resources.files.get(relativePath);
+        if (resource === undefined) {
+          throw new Error("missing verified executable");
+        }
+        return {
+          resource,
+          mechanism: "test_verified_handle",
+          spawn: (request) =>
+            spawner.spawn({ executable: resource.path, ...request }),
+          close: async () => {
+            closeCalls += 1;
+          }
+        };
+      },
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: async () => {
+          cleanupCalls += 1;
+        }
+      }),
       waitForReadiness: () => readiness.promise,
       requestReadiness: async () => {
         authenticated = true;
@@ -602,6 +637,8 @@ describe("verified sidecar supervisor", () => {
 
     await expect(start).rejects.toThrow("sidecar_exited_before_readiness");
     expect(authenticated).toBe(false);
+    expect(cleanupCalls).toBe(1);
+    expect(closeCalls).toBe(1);
   });
 
   it("aborts readiness and awaits launch cleanup before stop resolves", async () => {
@@ -695,6 +732,96 @@ describe("verified sidecar supervisor", () => {
       expect(spawner.children).toHaveLength(1);
     }
   );
+
+  it("finalizes and releases a retained failed-start child only after confirmed exit", async () => {
+    const { supervisor, spawner, counts } =
+      failedStartHarness("unconfirmed");
+
+    await expect(supervisor.start()).rejects.toThrow(
+      "sidecar_termination_unconfirmed"
+    );
+    const retainedRecovery = supervisor.state;
+    const child = spawner.children[0];
+    if (child === undefined) {
+      throw new Error("missing retained child");
+    }
+
+    child.fail(new Error("process_error_without_exit"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(counts).toEqual({ cleanup: 0, close: 0 });
+
+    child.exit(0);
+    await eventually(() => {
+      expect(counts).toEqual({ cleanup: 1, close: 1 });
+    });
+    expect(supervisor.state).toEqual(retainedRecovery);
+
+    await expect(supervisor.start()).rejects.toThrow(
+      "sidecar_termination_unconfirmed"
+    );
+    expect(spawner.children).toHaveLength(2);
+  });
+
+  it("shares retained failed-start exit finalization with a racing stop", async () => {
+    const cleanupGate = deferred<void>();
+    const { supervisor, spawner, counts } = failedStartHarness(
+      "unconfirmed",
+      { cleanup: () => cleanupGate.promise }
+    );
+    await expect(supervisor.start()).rejects.toThrow(
+      "sidecar_termination_unconfirmed"
+    );
+    const child = spawner.children[0];
+    if (child === undefined) {
+      throw new Error("missing retained child");
+    }
+
+    child.exit(0);
+    await eventually(() => expect(counts.cleanup).toBe(1));
+    const stop = supervisor.stop();
+    let stopSettled = false;
+    void stop.finally(() => {
+      stopSettled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopSettled).toBe(false);
+
+    cleanupGate.resolve();
+    await expect(stop).resolves.toBeUndefined();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(counts).toEqual({ cleanup: 1, close: 1 });
+    expect(supervisor.state).toEqual({ kind: "stopping" });
+  });
+
+  it("retains failed-start ownership when confirmed-exit cleanup fails", async () => {
+    const { supervisor, spawner, counts, logs } = failedStartHarness(
+      "unconfirmed",
+      {
+        cleanup: async () => {
+          throw new Error("cleanup_io_failure");
+        }
+      }
+    );
+    await expect(supervisor.start()).rejects.toThrow(
+      "sidecar_termination_unconfirmed"
+    );
+
+    spawner.children[0]?.exit(0);
+    await eventually(() => {
+      expect(supervisor.state).toMatchObject({
+        kind: "recovery",
+        reason: "sidecar_unavailable",
+        detail: "sidecar_cleanup_failed"
+      });
+    });
+    expect(counts).toEqual({ cleanup: 1, close: 1 });
+    expect(logs).toContain(
+      "[sidecar:supervisor] sidecar_cleanup_failed"
+    );
+    await expect(supervisor.start()).rejects.toThrow(
+      "sidecar_already_started"
+    );
+  });
 
   it("never kills a conflicting listener it did not spawn", async () => {
     const { supervisor, spawner } = harness({
