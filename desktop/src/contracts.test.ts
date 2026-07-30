@@ -21,20 +21,21 @@ describe("desktopConnectionSchema", () => {
 
   it("represents every supervisor transition without exposing authority", () => {
     expect(
-      [
-        "verifying",
-        "starting",
-        "ready",
-        "stopping",
-        "restarting",
-        "recovery"
-      ].map((state) => desktopLifecycleStateSchema.parse(state))
+      ["verifying", "starting", "ready", "stopping", "recovery"].map(
+        (state) => desktopLifecycleStateSchema.parse(state)
+      )
     ).toEqual([
       "verifying",
       "starting",
       "ready",
       "stopping",
-      "restarting",
+      "recovery"
+    ]);
+    expect(desktopLifecycleStateSchema.options).toEqual([
+      "verifying",
+      "starting",
+      "ready",
+      "stopping",
       "recovery"
     ]);
     expect(

@@ -262,6 +262,7 @@ interface ActiveSidecar {
   readiness: SidecarReadiness | null;
   readinessIdentity: CapturedPrivateFileIdentity | null;
   verified: boolean;
+  finalization: Promise<void> | null;
 }
 
 export class SidecarSupervisorError extends Error {
@@ -658,7 +659,8 @@ export class SidecarSupervisor {
         processIdentity: null,
         readiness: null,
         readinessIdentity: null,
-        verified: false
+        verified: false,
+        finalization: null
       };
       this.active = active;
       const spawnedIdentity = await Promise.race([
@@ -677,14 +679,6 @@ export class SidecarSupervisor {
         );
       }
       active.processIdentity = spawnedIdentity;
-      try {
-        await this.closeActiveExecutable(active);
-      } catch {
-        throw new SidecarSupervisorError(
-          "verified_executable_close_failed",
-          "sidecar_unverified"
-        );
-      }
       this.throwIfLaunchCancelled(generation, signal);
       const capturedReadiness = await Promise.race([
         this.dependencies.waitForReadiness({
@@ -764,30 +758,13 @@ export class SidecarSupervisor {
           : error;
       const active = this.active?.child === child ? this.active : null;
       if (active !== null) {
-        let terminationFailure: unknown = null;
         try {
           await this.terminateActive(active, false);
         } catch (terminationError) {
-          terminationFailure = terminationError;
           this.dependencies.log(
             `[sidecar:supervisor] ${fixedErrorCode(terminationError)}`
           );
-        }
-        try {
-          await this.closeActiveExecutable(active);
-        } catch {
-          surfacedError = new SidecarSupervisorError(
-            "verified_executable_close_failed",
-            "sidecar_unverified"
-          );
-        }
-        if (
-          terminationFailure instanceof SidecarSupervisorError &&
-          (terminationFailure.code === "sidecar_cleanup_failed" ||
-            terminationFailure.code ===
-              "verified_executable_close_failed")
-        ) {
-          surfacedError = terminationFailure;
+          surfacedError = terminationError;
         }
       } else {
         let cleanupFailed = false;
@@ -857,6 +834,15 @@ export class SidecarSupervisor {
       );
       return;
     }
+    if (
+      generation !== this.generation ||
+      this.stopping ||
+      this.active !== active
+    ) {
+      this.releaseFinalizedActive(active);
+      return;
+    }
+    this.releaseFinalizedActive(active);
     this.state = {
       kind: "recovery",
       reason: "reconciliation_required",
@@ -981,7 +967,14 @@ export class SidecarSupervisor {
     );
   }
 
-  private async finalizeExitedActive(active: ActiveSidecar): Promise<void> {
+  private finalizeExitedActive(active: ActiveSidecar): Promise<void> {
+    if (active.finalization === null) {
+      active.finalization = this.performFinalization(active);
+    }
+    return active.finalization;
+  }
+
+  private async performFinalization(active: ActiveSidecar): Promise<void> {
     let cleanupFailed = false;
     let closeFailed = false;
     try {
@@ -994,9 +987,6 @@ export class SidecarSupervisor {
     } catch {
       closeFailed = true;
     }
-    if (this.active === active) {
-      this.active = null;
-    }
     if (cleanupFailed) {
       throw this.terminationError("sidecar_cleanup_failed");
     }
@@ -1004,6 +994,12 @@ export class SidecarSupervisor {
       throw this.terminationError(
         "verified_executable_close_failed"
       );
+    }
+  }
+
+  private releaseFinalizedActive(active: ActiveSidecar): void {
+    if (this.active === active) {
+      this.active = null;
     }
   }
 
@@ -1023,6 +1019,7 @@ export class SidecarSupervisor {
   ): Promise<void> {
     if (this.childHasExited(active.child)) {
       await this.finalizeExitedActive(active);
+      this.releaseFinalizedActive(active);
       return;
     }
 
@@ -1040,6 +1037,7 @@ export class SidecarSupervisor {
       }
       if (await this.waitForTerminationStage(active.child)) {
         await this.finalizeExitedActive(active);
+        this.releaseFinalizedActive(active);
         return;
       }
     }
@@ -1052,6 +1050,7 @@ export class SidecarSupervisor {
     const termAccepted = active.child.kill("SIGTERM");
     if (await this.waitForTerminationStage(active.child)) {
       await this.finalizeExitedActive(active);
+      this.releaseFinalizedActive(active);
       return;
     }
     if (!termAccepted) {
@@ -1068,6 +1067,7 @@ export class SidecarSupervisor {
     const killAccepted = active.child.kill("SIGKILL");
     if (await this.waitForTerminationStage(active.child)) {
       await this.finalizeExitedActive(active);
+      this.releaseFinalizedActive(active);
       return;
     }
     if (!killAccepted) {

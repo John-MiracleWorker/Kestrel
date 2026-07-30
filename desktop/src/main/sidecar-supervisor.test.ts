@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { VerifiedResourceSet } from "./resource-manifest";
 import {
   SidecarSupervisor,
+  SidecarSupervisorError,
   type AuthenticatedDesktopReadiness,
   type ProfileLeaseEvidence,
   type SidecarSupervisorDependencies
@@ -228,7 +229,17 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
       shutdownRequests.push(request);
       spawner.children.at(-1)?.exit(0);
     },
-    waitForExit: async (child) => child.exitCode !== null,
+    waitForExit: async (child) => {
+      const fake = child as FakeSidecarChild;
+      if (fake.exitCode !== null || fake.signalCode !== null) {
+        return true;
+      }
+      if (fake.killSignals.length > 0) {
+        fake.exit(0, "SIGTERM");
+        return true;
+      }
+      return false;
+    },
     log: (line) => logs.push(line),
     ...overrides
   };
@@ -251,6 +262,79 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
     logs,
     shutdownRequests
   };
+}
+
+function failedStartHarness(
+  termination:
+    | "unconfirmed"
+    | "identity_unverified"
+    | "signal_rejected"
+): ReturnType<typeof harness> & {
+  counts: { cleanup: number; close: number };
+} {
+  const counts = { cleanup: 0, close: 0 };
+  let processInspections = 0;
+  const context = harness({
+    acquireVerifiedExecutable: async (resources, relativePath) => {
+      const resource = resources.files.get(relativePath);
+      if (resource === undefined) {
+        throw new Error("missing verified executable");
+      }
+      return {
+        resource,
+        mechanism: "test_verified_handle",
+        spawn: (request) => {
+          const child = context.spawner.spawn({
+            executable: resource.path,
+            ...request
+          });
+          if (termination === "signal_rejected") {
+            child.kill = (signal?: NodeJS.Signals | number): boolean => {
+              child.killSignals.push(signal);
+              return false;
+            };
+          }
+          return child;
+        },
+        close: async () => {
+          counts.close += 1;
+        }
+      };
+    },
+    createLaunchFiles: async (input) => ({
+      bootstrapPath: "/profile/runtime/bootstrap.json",
+      readinessPath: "/profile/runtime/desktop-readiness.json",
+      launchNonce,
+      launchNonceDigest,
+      apiToken,
+      profile: input.profile,
+      cleanup: async () => {
+        counts.cleanup += 1;
+      }
+    }),
+    waitForReadiness: async () => {
+      throw new SidecarSupervisorError(
+        "startup_probe_failed",
+        "sidecar_unverified"
+      );
+    },
+    inspectProcess: async (pid) => {
+      processInspections += 1;
+      if (
+        termination === "identity_unverified" &&
+        processInspections > 1
+      ) {
+        return null;
+      }
+      return {
+        pid,
+        processBirthMarker: `birth-${pid}`,
+        executableDigest
+      };
+    },
+    waitForExit: async () => false
+  });
+  return { ...context, counts };
 }
 
 describe("verified sidecar supervisor", () => {
@@ -339,7 +423,7 @@ describe("verified sidecar supervisor", () => {
     );
   });
 
-  it("closes the exact executable capability as soon as the spawned identity is retained", async () => {
+  it("retains the exact executable capability until confirmed child exit", async () => {
     let closeCalls = 0;
     const { supervisor, spawner } = harness({
       acquireVerifiedExecutable: async (resources, relativePath) => {
@@ -361,7 +445,7 @@ describe("verified sidecar supervisor", () => {
 
     await supervisor.start();
 
-    expect(closeCalls).toBe(1);
+    expect(closeCalls).toBe(0);
     await supervisor.stop();
     expect(closeCalls).toBe(1);
   });
@@ -379,6 +463,56 @@ describe("verified sidecar supervisor", () => {
       });
     });
     expect(spawner.children).toHaveLength(1);
+  });
+
+  it("shares one exit finalization with stop and never projects stale reconciliation", async () => {
+    const cleanupGate = deferred<void>();
+    let cleanupCalls = 0;
+    let closeCalls = 0;
+    const { supervisor, spawner } = harness({
+      acquireVerifiedExecutable: async (resources, relativePath) => {
+        const resource = resources.files.get(relativePath);
+        if (resource === undefined) {
+          throw new Error("missing verified executable");
+        }
+        return {
+          resource,
+          mechanism: "test_verified_handle",
+          spawn: (request) =>
+            spawner.spawn({ executable: resource.path, ...request }),
+          close: async () => {
+            closeCalls += 1;
+          }
+        };
+      },
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: async () => {
+          cleanupCalls += 1;
+          await cleanupGate.promise;
+        }
+      })
+    });
+    await supervisor.start();
+
+    spawner.children[0]?.exit(17);
+    await eventually(() => expect(cleanupCalls).toBe(1));
+    const stop = supervisor.stop();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const cleanupCallsBeforeRelease = cleanupCalls;
+    cleanupGate.resolve();
+    await stop;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(cleanupCallsBeforeRelease).toBe(1);
+    expect(cleanupCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+    expect(supervisor.state).toEqual({ kind: "stopping" });
   });
 
   it("serializes stop against in-flight verification and prevents later profile or bootstrap mutation", async () => {
@@ -521,6 +655,46 @@ describe("verified sidecar supervisor", () => {
     expect(cleanupFinished).toBe(true);
     expect(supervisor.state.kind).toBe("stopping");
   });
+
+  it.each([
+    {
+      termination: "unconfirmed" as const,
+      expected: "sidecar_termination_unconfirmed",
+      signals: ["SIGTERM", "SIGKILL"]
+    },
+    {
+      termination: "identity_unverified" as const,
+      expected: "sidecar_termination_identity_unverified",
+      signals: []
+    },
+    {
+      termination: "signal_rejected" as const,
+      expected: "sidecar_termination_signal_rejected",
+      signals: ["SIGTERM"]
+    }
+  ])(
+    "surfaces and retains failed-start $termination authority",
+    async ({ termination, expected, signals }) => {
+      const { supervisor, spawner, counts } =
+        failedStartHarness(termination);
+
+      await expect(supervisor.start()).rejects.toThrow(expected);
+
+      expect(supervisor.state).toMatchObject({
+        kind: "recovery",
+        reason: "sidecar_unavailable",
+        detail: expected
+      });
+      expect(spawner.children).toHaveLength(1);
+      expect(spawner.children[0]?.exitCode).toBeNull();
+      expect(spawner.children[0]?.killSignals).toEqual(signals);
+      expect(counts).toEqual({ cleanup: 0, close: 0 });
+      await expect(supervisor.start()).rejects.toThrow(
+        "sidecar_already_started"
+      );
+      expect(spawner.children).toHaveLength(1);
+    }
+  );
 
   it("never kills a conflicting listener it did not spawn", async () => {
     const { supervisor, spawner } = harness({

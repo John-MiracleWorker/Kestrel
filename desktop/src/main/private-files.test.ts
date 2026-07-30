@@ -9,6 +9,7 @@ import {
   rename,
   rm,
   symlink,
+  unlink,
   writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -76,6 +77,29 @@ function qualifiedTestDirectoryAdapter(): PrivateFilePlatformAdapter {
         await base.qualifyOwnerOnly(current, "directory");
       }
       return realpath(current);
+    },
+    async deleteCapturedFile(
+      path: string,
+      identity: { dev: number; ino: number }
+    ): Promise<void> {
+      let metadata;
+      try {
+        metadata = await lstat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return;
+        }
+        throw error;
+      }
+      if (
+        metadata.isSymbolicLink() ||
+        !metadata.isFile() ||
+        metadata.dev !== identity.dev ||
+        metadata.ino !== identity.ino
+      ) {
+        return;
+      }
+      await unlink(path);
     }
   };
 }
@@ -236,7 +260,8 @@ describe("private desktop launch files", () => {
       parentPid: process.pid,
       parentBirthMarker: "parent-birth-marker",
       resourceManifestDigest: `sha256:${"a".repeat(64)}`,
-      randomBytes: () => secrets.shift() ?? Buffer.alloc(0)
+      randomBytes: () => secrets.shift() ?? Buffer.alloc(0),
+      platformAdapter: profileAdapter
     });
     const readiness = {
       schema: "kestrel.desktop.sidecar_readiness.v1",
@@ -273,6 +298,118 @@ describe("private desktop launch files", () => {
     ).resolves.toEqual(replacement);
   });
 
+  it("fails closed without unlinking when Node lacks exact-object deletion", async () => {
+    const profile = await resolvePrivateProfile({
+      profileId: "default",
+      trustedAnchor: testRoot,
+      profileRoot,
+      statePath: join(profileRoot, "state", "agent.db"),
+      memoryDir: join(profileRoot, "memory"),
+      runtimeSettingsPath: join(
+        profileRoot,
+        "config",
+        "runtime_settings.json"
+      )
+    }, profileAdapter);
+    const secrets = [Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)];
+    const launch = await createPrivateLaunchFiles({
+      profile,
+      parentPid: process.pid,
+      parentBirthMarker: "parent-birth-marker",
+      resourceManifestDigest: `sha256:${"a".repeat(64)}`,
+      randomBytes: () => secrets.shift() ?? Buffer.alloc(0)
+    });
+
+    await expect(launch.cleanup()).rejects.toThrow(
+      "private_exact_delete_unqualified"
+    );
+    await expect(readFile(launch.bootstrapPath, "utf8")).resolves.toContain(
+      "kestrel.desktop.bootstrap.v1"
+    );
+  });
+
+  it("never falls back to path unlink after an exact-delete identity swap", async () => {
+    const profile = await resolvePrivateProfile({
+      profileId: "default",
+      trustedAnchor: testRoot,
+      profileRoot,
+      statePath: join(profileRoot, "state", "agent.db"),
+      memoryDir: join(profileRoot, "memory"),
+      runtimeSettingsPath: join(
+        profileRoot,
+        "config",
+        "runtime_settings.json"
+      )
+    }, profileAdapter);
+    let deleteCalls = 0;
+    let replacementBytes = "";
+    const capturedOriginal = join(
+      profile.runtimeDirectory,
+      "captured-readiness.json"
+    );
+    const adversarialAdapter = {
+      ...profileAdapter,
+      async deleteCapturedFile(
+        path: string,
+        identity: { dev: number; ino: number }
+      ): Promise<void> {
+        deleteCalls += 1;
+        const metadata = await lstat(path);
+        if (
+          metadata.dev !== identity.dev ||
+          metadata.ino !== identity.ino
+        ) {
+          return;
+        }
+        if (deleteCalls === 1) {
+          await unlink(path);
+          return;
+        }
+        await rename(path, capturedOriginal);
+        await writeFile(path, replacementBytes, { mode: 0o600 });
+        await chmod(path, 0o600);
+        throw new Error("private_exact_delete_identity_changed");
+      }
+    };
+    const secrets = [Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)];
+    const launch = await createPrivateLaunchFiles({
+      profile,
+      parentPid: process.pid,
+      parentBirthMarker: "parent-birth-marker",
+      resourceManifestDigest: `sha256:${"a".repeat(64)}`,
+      randomBytes: () => secrets.shift() ?? Buffer.alloc(0),
+      platformAdapter: adversarialAdapter
+    });
+    const readiness = {
+      schema: "kestrel.desktop.sidecar_readiness.v1",
+      pid: process.pid,
+      process_birth_marker: "sidecar-birth",
+      port: 43123,
+      profile_id: "default",
+      sidecar_version: "0.5.0",
+      executable_digest: "b".repeat(64),
+      resource_manifest_digest: `sha256:${"a".repeat(64)}`,
+      launch_nonce_digest: launch.launchNonceDigest
+    };
+    await writeFile(profile.readinessPath, JSON.stringify(readiness), {
+      mode: 0o600
+    });
+    await chmod(profile.readinessPath, 0o600);
+    const captured = await readSidecarReadiness(
+      profile.readinessPath,
+      adversarialAdapter
+    );
+    replacementBytes = JSON.stringify({ ...readiness, port: 43124 });
+
+    await expect(launch.cleanup(captured.identity)).rejects.toThrow(
+      "private_exact_delete_identity_changed"
+    );
+    await expect(readFile(profile.readinessPath, "utf8")).resolves.toBe(
+      replacementBytes
+    );
+    expect(deleteCalls).toBe(2);
+  });
+
   it("fails closed instead of claiming chmod qualifies a Windows owner ACL", async () => {
     await mkdir(profileRoot);
     await expect(
@@ -296,6 +433,9 @@ describe("private desktop launch files", () => {
             throw new Error("windows_owner_acl_unqualified");
           },
           preparePrivateDirectory: async () => {
+            throw new Error("windows_owner_acl_unqualified");
+          },
+          deleteCapturedFile: async () => {
             throw new Error("windows_owner_acl_unqualified");
           }
         }

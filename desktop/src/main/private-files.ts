@@ -3,8 +3,7 @@ import { constants } from "node:fs";
 import {
   lstat,
   open,
-  realpath,
-  unlink
+  realpath
 } from "node:fs/promises";
 import {
   dirname,
@@ -81,6 +80,10 @@ export interface PrivateFilePlatformAdapter {
     trustedAnchor: string,
     path: string
   ): Promise<string>;
+  deleteCapturedFile(
+    path: string,
+    identity: CapturedPrivateFileIdentity
+  ): Promise<void>;
 }
 
 export interface PrivateLaunchFiles {
@@ -163,6 +166,11 @@ export function createNodePrivateFileAdapter(
       // Node does not expose mkdirat/openat2-style directory-relative mutation.
       // A platform implementation must prove its anchor and no-symlink walk.
       throw new Error("private_directory_mutation_unqualified");
+    },
+    async deleteCapturedFile(): Promise<void> {
+      // A pathname lstat followed by unlink has a substitution window. Native
+      // adapters must delete the captured object with unlinkat/handle semantics.
+      throw new Error("private_exact_delete_unqualified");
     }
   };
 }
@@ -372,36 +380,6 @@ async function openExclusivePrivateFile(path: string) {
   return open(path, flags, 0o600);
 }
 
-async function sameFile(path: string, dev: number, ino: number): Promise<boolean> {
-  try {
-    const metadata = await lstat(path);
-    return (
-      !metadata.isSymbolicLink() &&
-      metadata.isFile() &&
-      metadata.dev === dev &&
-      metadata.ino === ino
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function removeCapturedFile(
-  path: string,
-  identity: { dev: number; ino: number } | null
-): Promise<void> {
-  if (
-    identity !== null &&
-    (await sameFile(path, identity.dev, identity.ino))
-  ) {
-    await unlink(path).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") {
-        throw error;
-      }
-    });
-  }
-}
-
 async function readPrivateJsonArtifactWithIdentity(
   path: string,
   adapter: PrivateFilePlatformAdapter
@@ -567,10 +545,13 @@ export async function createPrivateLaunchFiles(
     handle = undefined;
     await adapter.qualifyOwnerOnly(bootstrapPath, "file");
   } catch (error) {
-    await handle?.close().catch(() => undefined);
-    await removeCapturedFile(bootstrapPath, bootstrapIdentity).catch(
-      () => undefined
-    );
+    await handle?.close();
+    if (bootstrapIdentity !== null) {
+      await adapter.deleteCapturedFile(
+        bootstrapPath,
+        bootstrapIdentity
+      );
+    }
     throw error;
   }
 
@@ -584,9 +565,14 @@ export async function createPrivateLaunchFiles(
     async cleanup(
       readinessIdentity?: CapturedPrivateFileIdentity
     ): Promise<void> {
-      await removeCapturedFile(bootstrapPath, bootstrapIdentity);
+      if (bootstrapIdentity !== null) {
+        await adapter.deleteCapturedFile(
+          bootstrapPath,
+          bootstrapIdentity
+        );
+      }
       if (readinessIdentity !== undefined) {
-        await removeCapturedFile(
+        await adapter.deleteCapturedFile(
           input.profile.readinessPath,
           readinessIdentity
         );

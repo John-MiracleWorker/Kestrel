@@ -14,7 +14,6 @@ export const desktopLifecycleStateSchema = z.enum([
   "starting",
   "ready",
   "stopping",
-  "restarting",
   "recovery"
 ]);
 
