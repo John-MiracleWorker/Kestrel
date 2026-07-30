@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import {
   isAbsolute,
+  join,
   posix,
   relative,
   resolve,
@@ -39,6 +40,13 @@ const CREDENTIAL_FILES = new Set([
   "styles.css",
   "preload.js"
 ]);
+
+export function resolvePackagedResourceRoot(
+  electronResourcesPath: string,
+  resourceRootRelative: "kestrel"
+): string {
+  return join(electronResourcesPath, resourceRootRelative);
+}
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 const sourceCommitSchema = z.string().regex(/^[0-9a-f]{40}$/);
 const buildModeSchema = z.enum(["developer", "release"]);

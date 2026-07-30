@@ -17,6 +17,7 @@ const packagedBuildSchema = z
     app_version: appVersionSchema,
     platform: z.enum(["darwin", "linux", "win32"]),
     architecture: z.enum(["arm64", "x64"]),
+    resource_root_relative: z.literal("kestrel"),
     python_lock_sha256: sha256Schema,
     desktop_npm_lock_sha256: sha256Schema,
     web_npm_lock_sha256: sha256Schema,
@@ -43,6 +44,7 @@ export interface PackagedBuildTrust {
   readonly appVersion: string;
   readonly platform: "darwin" | "linux" | "win32";
   readonly architecture: "arm64" | "x64";
+  readonly resourceRootRelative: "kestrel";
   readonly pythonLockSha256: string;
   readonly desktopNpmLockSha256: string;
   readonly webNpmLockSha256: string;
@@ -98,6 +100,7 @@ export function parsePackagedBuildTrust(
     appVersion: metadata.app_version,
     platform: metadata.platform,
     architecture: metadata.architecture,
+    resourceRootRelative: metadata.resource_root_relative,
     pythonLockSha256: metadata.python_lock_sha256,
     desktopNpmLockSha256: metadata.desktop_npm_lock_sha256,
     webNpmLockSha256: metadata.web_npm_lock_sha256,

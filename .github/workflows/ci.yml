@@ -261,8 +261,11 @@ jobs:
       - name: Test desktop
         run: npm test
         working-directory: desktop
+      - name: Validate developer directory bundle contracts
+        run: npm run test:build-dir
+        working-directory: desktop
       - name: Audit desktop dependencies
-        run: npm audit --audit-level=high
+        run: npm run audit:reviewed
         working-directory: desktop
       - name: Check desktop dependency licenses
         run: npm run licenses:check

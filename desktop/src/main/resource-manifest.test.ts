@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   canonicalResourceManifestBytes,
+  resolvePackagedResourceRoot,
   validatePortableResourcePaths,
   verifyDeveloperResourceManifest,
   verifyResourceManifest,
@@ -69,6 +70,17 @@ const releaseManifestMetadata = Object.freeze({
   web_npm_lock_sha256: releaseIdentity.webNpmLockSha256,
   sbom_sha256: releaseIdentity.sbomSha256
 } satisfies Omit<ResourceManifest, "files">);
+
+describe("packaged resource root", () => {
+  it("keeps the exact signed payload separate from Electron app resources", () => {
+    expect(
+      resolvePackagedResourceRoot(
+        "/Applications/Kestrel/Resources",
+        "kestrel"
+      )
+    ).toBe("/Applications/Kestrel/Resources/kestrel");
+  });
+});
 
 describe("portable resource paths", () => {
   it.each([

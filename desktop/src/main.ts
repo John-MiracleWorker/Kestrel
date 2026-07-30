@@ -75,6 +75,7 @@ import {
   type CredentialDialogController
 } from "./main/credential-window.js";
 import type { VerifiedDesktopSessionResources } from "./main/sidecar-supervisor.js";
+import { resolvePackagedResourceRoot } from "./main/resource-manifest.js";
 
 const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
 const unavailableUpdateStatus = Object.freeze({
@@ -86,7 +87,6 @@ const unavailableUpdateStatus = Object.freeze({
 async function createPackagedSidecarSupervisor(
   apiSession: DesktopApiSessionAuthority
 ): Promise<SidecarSupervisor> {
-  const resourceRoot = process.resourcesPath;
   const packageBytes = await readFile(
     join(app.getAppPath(), "package.json")
   );
@@ -95,6 +95,10 @@ async function createPackagedSidecarSupervisor(
     platform: process.platform,
     architecture: process.arch
   });
+  const resourceRoot = resolvePackagedResourceRoot(
+    process.resourcesPath,
+    buildTrust.resourceRootRelative
+  );
   const sidecarName =
     process.platform === "win32"
       ? "kestrel-desktop-sidecar.exe"

@@ -40,6 +40,37 @@ NEST_AGENT_CORS_ORIGINS=
 
 Do not loosen these in shared deployments without a separate approval and audit story. The local web server also rejects untrusted `Host` headers and cross-site `Origin` hosts by default; set `NEST_AGENT_TRUSTED_HOSTS` and `NEST_AGENT_CORS_ORIGINS` deliberately when running a split frontend or a non-loopback deployment.
 
+## Desktop Developer Directory Build
+
+The unsigned current-platform developer directory build is local-only and
+non-publishable. It accepts an exact clean Git commit, the literal reviewed
+`electron-builder.developer.yml` configuration, and a bounded local resource
+stage whose canonical receipt, manifest, signature, paths, digests, and complete
+file inventory are revalidated without following links. It builds only the
+current platform's `dir` target into a new output outside the source repository.
+The workflow tests this contract but does not upload the resulting directory.
+
+`electron-builder` is pinned exactly to `26.15.3` as a development dependency.
+Its current development-only dependency closure reports
+GHSA-mh99-v99m-4gvg / CVE-2026-14257, a high-severity unbounded
+`brace-expansion` denial-of-service advisory. A global resolution override is
+not acceptable because the builder closure contains older `minimatch` consumers
+whose CommonJS expectations are incompatible with the newer package export.
+The local directory builder does not accept arbitrary brace patterns from a
+user: its config and input paths are generated from the fixed reviewed contract
+after exact-clean and bounded-input checks.
+
+CI runs `npm run audit:reviewed`, which requires the production audit to contain
+zero vulnerabilities and separately parses the complete all-dependency audit.
+The reviewed exception accepts only the exact advisory source, name, URL,
+severity, title, range, CWE/CVSS metadata, and propagation paths. Every affected
+lock node must be marked development-only, reachable exclusively from the exact
+`electron-builder@26.15.3` direct root, and unreachable from every other direct
+dependency. Any new advisory, changed metadata, production path, second direct
+root, package override, or builder version fails the gate and requires explicit
+re-review. This exception does not authorize an installer, archive, signature,
+notarization, update feed, publication target, or uploaded artifact.
+
 ## Network Binding
 
 Bind the web/API server to `127.0.0.1` by default:
