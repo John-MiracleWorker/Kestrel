@@ -1,4 +1,5 @@
 import type { Stats } from "node:fs";
+import { isAbsolute, normalize } from "node:path";
 import type { z } from "zod";
 import {
   DESKTOP_EVENT_BYTES,
@@ -45,6 +46,8 @@ import {
 
 export interface DesktopIpcFrame {
   readonly url: string;
+  readonly processId: number;
+  readonly routingId: number;
 }
 
 export interface DesktopIpcWebContents {
@@ -225,11 +228,27 @@ function parseWithin<T>(
   return deepFreeze(parsed);
 }
 
+const APP_FRAME_PATHS = new Set(["/", "/index.html"]);
+const APP_FRAME_HASHES = new Set([
+  "",
+  "#mission",
+  "#chat",
+  "#outcomes",
+  "#routines",
+  "#routing",
+  "#advanced",
+  "#settings",
+  "#workspace",
+  "#tools"
+]);
+const MAX_APP_FRAME_URL_CHARACTERS = 256;
+
 function validAppFrameUrl(value: string): boolean {
   if (
+    value.length > MAX_APP_FRAME_URL_CHARACTERS ||
     value.includes("\\") ||
-    value.includes("\0") ||
-    /%(?:00|2e|2f|5c)/i.test(value)
+    value.includes("%") ||
+    /[\u0000-\u001f\u007f]/.test(value)
   ) {
     return false;
   }
@@ -242,14 +261,27 @@ function validAppFrameUrl(value: string): boolean {
       parsed.password === "" &&
       parsed.port === "" &&
       parsed.search === "" &&
-      parsed.hash === "" &&
-      parsed.pathname.startsWith("/") &&
+      !(value.includes("#") && parsed.hash === "") &&
+      APP_FRAME_HASHES.has(parsed.hash) &&
+      APP_FRAME_PATHS.has(parsed.pathname) &&
       parsed.href === value
     );
   } catch {
     return false;
   }
 }
+
+function validFrameId(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+const mainProcessFolderChoiceSchema =
+  desktopFolderChoiceSchema.refine(
+    (choice) =>
+      choice.status === "cancelled" ||
+      (isAbsolute(choice.path) &&
+        normalize(choice.path) === choice.path)
+  );
 
 function successfulEnvelope<T>(
   valueSchema: z.ZodType<T>,
@@ -297,13 +329,24 @@ export function installDesktopIpc(
 
   const trustedSender = (event: DesktopIpcEvent): boolean => {
     const binding = bindings.get(event.sender.id);
+    const eventFrame = event.senderFrame;
+    const liveMainFrame = binding?.webContents.mainFrame;
     return (
       binding !== undefined &&
       binding.webContents === event.sender &&
+      binding.webContents.id === event.sender.id &&
       !binding.webContents.isDestroyed() &&
-      event.senderFrame !== null &&
-      event.senderFrame === event.sender.mainFrame &&
-      validAppFrameUrl(event.senderFrame.url)
+      eventFrame !== null &&
+      liveMainFrame !== undefined &&
+      validFrameId(eventFrame.processId) &&
+      validFrameId(eventFrame.routingId) &&
+      validFrameId(liveMainFrame.processId) &&
+      validFrameId(liveMainFrame.routingId) &&
+      eventFrame.processId === liveMainFrame.processId &&
+      eventFrame.routingId === liveMainFrame.routingId &&
+      eventFrame.url === liveMainFrame.url &&
+      validAppFrameUrl(eventFrame.url) &&
+      validAppFrameUrl(liveMainFrame.url)
     );
   };
 
@@ -354,13 +397,13 @@ export function installDesktopIpc(
   register(
     DESKTOP_IPC_CHANNELS.chooseProjectFolder,
     desktopChooseProjectFolderRequestSchema,
-    desktopFolderChoiceSchema,
+    mainProcessFolderChoiceSchema,
     () => adapters.chooseProjectFolder()
   );
   register(
     DESKTOP_IPC_CHANNELS.chooseStorageFolder,
     desktopChooseStorageFolderRequestSchema,
-    desktopFolderChoiceSchema,
+    mainProcessFolderChoiceSchema,
     () => adapters.chooseStorageFolder()
   );
   register(

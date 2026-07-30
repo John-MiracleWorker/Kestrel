@@ -1,3 +1,4 @@
+import { basename, resolve, sep } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   DESKTOP_IPC_CHANNELS,
@@ -34,9 +35,19 @@ class FakeWebContents implements DesktopIpcWebContents {
   destroyed = false;
   readonly sent: Array<{ channel: string; payload: unknown }> = [];
   readonly destroyedListeners: Array<() => void> = [];
-  readonly mainFrame = { url: "kestrel://app/index.html" };
+  mainFrame: {
+    url: string;
+    processId: number;
+    routingId: number;
+  };
 
-  constructor(readonly id: number) {}
+  constructor(readonly id: number) {
+    this.mainFrame = {
+      url: "kestrel://app/index.html",
+      processId: 1_000 + id,
+      routingId: 2_000 + id
+    };
+  }
 
   isDestroyed(): boolean {
     return this.destroyed;
@@ -132,6 +143,16 @@ function eventFor(
   };
 }
 
+function frameFor(
+  webContents: FakeWebContents,
+  overrides: Partial<FakeWebContents["mainFrame"]> = {}
+): FakeWebContents["mainFrame"] {
+  return {
+    ...webContents.mainFrame,
+    ...overrides
+  };
+}
+
 const connectionRequest = {
   schema: "kestrel.desktop.connection.request.v1"
 };
@@ -218,12 +239,20 @@ describe("Desktop main IPC authority", () => {
 
     for (const event of [
       eventFor(substituted),
-      eventFor(registered, { senderFrame: { url: "https://evil.test/" } }),
       eventFor(registered, {
-        senderFrame: { url: "kestrel://app.evil/index.html" }
+        senderFrame: frameFor(registered, {
+          url: "https://evil.test/"
+        })
       }),
       eventFor(registered, {
-        senderFrame: { url: "kestrel://app/%2e%2e/secret" }
+        senderFrame: frameFor(registered, {
+          url: "kestrel://app.evil/index.html"
+        })
+      }),
+      eventFor(registered, {
+        senderFrame: frameFor(registered, {
+          url: "kestrel://app/%2e%2e/secret"
+        })
       }),
       eventFor(registered, { senderFrame: null })
     ]) {
@@ -236,6 +265,151 @@ describe("Desktop main IPC authority", () => {
     registered.destroyed = true;
     await expect(
       handler(eventFor(registered), connectionRequest)
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "desktop_sender_untrusted" }
+    });
+  });
+
+  it("accepts a distinct Electron frame wrapper with the live main-frame identity", async () => {
+    const { authority, handlers } = harness();
+    const registered = new FakeWebContents(19);
+    authority.bindRenderer(registered);
+    const eventFrame = frameFor(registered);
+
+    expect(eventFrame).not.toBe(registered.mainFrame);
+    await expect(
+      handlers.get(DESKTOP_IPC_CHANNELS.connection)!(
+        eventFor(registered, { senderFrame: eventFrame }),
+        connectionRequest
+      )
+    ).resolves.toEqual({ ok: true, value: readyConnection });
+  });
+
+  it("rejects mismatched, subframe, and stale Electron frame identities", async () => {
+    const { authority, handlers } = harness();
+    const registered = new FakeWebContents(21);
+    authority.bindRenderer(registered);
+    const handler = handlers.get(DESKTOP_IPC_CHANNELS.connection)!;
+
+    for (const senderFrame of [
+      frameFor(registered, {
+        processId: registered.mainFrame.processId + 1
+      }),
+      frameFor(registered, {
+        routingId: registered.mainFrame.routingId + 1
+      })
+    ]) {
+      await expect(
+        handler(
+          eventFor(registered, { senderFrame }),
+          connectionRequest
+        )
+      ).resolves.toEqual({
+        ok: false,
+        error: { code: "desktop_sender_untrusted" }
+      });
+    }
+
+    const staleNavigationFrame = frameFor(registered);
+    registered.mainFrame = frameFor(registered, {
+      url: "kestrel://app/index.html#mission"
+    });
+    await expect(
+      handler(
+        eventFor(registered, {
+          senderFrame: staleNavigationFrame
+        }),
+        connectionRequest
+      )
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "desktop_sender_untrusted" }
+    });
+
+    const staleIdentityFrame = frameFor(registered);
+    registered.mainFrame = frameFor(registered, {
+      routingId: registered.mainFrame.routingId + 2
+    });
+    await expect(
+      handler(
+        eventFor(registered, {
+          senderFrame: staleIdentityFrame
+        }),
+        connectionRequest
+      )
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "desktop_sender_untrusted" }
+    });
+  });
+
+  it("accepts the canonical root and production hash routes on reviewed app paths", async () => {
+    const { authority, handlers } = harness();
+    const registered = new FakeWebContents(22);
+    authority.bindRenderer(registered);
+    const handler = handlers.get(DESKTOP_IPC_CHANNELS.connection)!;
+
+    const urls = [
+      "kestrel://app/",
+      ...["", "index.html"].flatMap((path) =>
+        [
+          "mission",
+          "chat",
+          "outcomes",
+          "routines",
+          "routing",
+          "advanced",
+          "settings",
+          "workspace",
+          "tools"
+        ].map(
+          (route) => `kestrel://app/${path}#${route}`
+        )
+      )
+    ];
+    for (const url of urls) {
+      registered.mainFrame = frameFor(registered, {
+        url
+      });
+      await expect(
+        handler(eventFor(registered), connectionRequest),
+        url
+      ).resolves.toEqual({ ok: true, value: readyConnection });
+    }
+  });
+
+  it.each([
+    "kestrel://app/mission#mission",
+    "kestrel://app/index.html?route=mission",
+    "kestrel://app/index.html?route=mission#mission",
+    "kestrel://user@app/index.html#mission",
+    "kestrel://app:444/index.html#mission",
+    "kestrel://app.evil/index.html#mission",
+    "kestrel://app/index.html#",
+    "kestrel://app/index.html#Mission",
+    "kestrel://app/index.html#%6dission",
+    "kestrel://app/index.html#mission/extra",
+    "kestrel://app/index.html#unknown",
+    `kestrel://app/index.html#${"x".repeat(300)}`,
+    "kestrel://app\\index.html#mission",
+    "kestrel://app/index.html#mission\0hidden",
+    "kestrel://app/index.html#mission\nhidden",
+    "kestrel://app/%2e%2e/index.html#mission",
+    "kestrel://app/index.html#mission%00hidden",
+    "kestrel://app/index.html#mission%2fhidden",
+    "kestrel://app/index.html#mission%5chidden"
+  ])("rejects an unreviewed app frame URL %s", async (url) => {
+    const { authority, handlers } = harness();
+    const registered = new FakeWebContents(24);
+    registered.mainFrame = frameFor(registered, { url });
+    authority.bindRenderer(registered);
+
+    await expect(
+      handlers.get(DESKTOP_IPC_CHANNELS.connection)!(
+        eventFor(registered),
+        connectionRequest
+      )
     ).resolves.toEqual({
       ok: false,
       error: { code: "desktop_sender_untrusted" }
@@ -411,6 +585,103 @@ describe("Desktop main IPC authority", () => {
     renderer.destroy();
     lifecycleListener?.(readyConnection);
     expect(renderer.sent).toHaveLength(1);
+  });
+
+  it.each([
+    DESKTOP_IPC_CHANNELS.chooseProjectFolder,
+    DESKTOP_IPC_CHANNELS.chooseStorageFolder
+  ])("accepts canonical absolute and cancelled folder results on %s", async (channel) => {
+    const canonicalPath = resolve("canonical", "project");
+    const selected = {
+      status: "selected" as const,
+      path: canonicalPath,
+      displayLabel: basename(canonicalPath)
+    };
+    const selectedHarness = harness({
+      chooseProjectFolder: async () => selected,
+      chooseStorageFolder: async () => selected
+    });
+    const selectedRenderer = new FakeWebContents(43);
+    selectedHarness.authority.bindRenderer(selectedRenderer);
+
+    await expect(
+      selectedHarness.handlers.get(channel)!(
+        eventFor(selectedRenderer),
+        {
+          schema:
+            channel === DESKTOP_IPC_CHANNELS.chooseProjectFolder
+              ? "kestrel.desktop.choose-project-folder.request.v1"
+              : "kestrel.desktop.choose-storage-folder.request.v1"
+        }
+      )
+    ).resolves.toEqual({ ok: true, value: selected });
+
+    const cancelledHarness = harness();
+    const cancelledRenderer = new FakeWebContents(45);
+    cancelledHarness.authority.bindRenderer(cancelledRenderer);
+    await expect(
+      cancelledHarness.handlers.get(channel)!(
+        eventFor(cancelledRenderer),
+        {
+          schema:
+            channel === DESKTOP_IPC_CHANNELS.chooseProjectFolder
+              ? "kestrel.desktop.choose-project-folder.request.v1"
+              : "kestrel.desktop.choose-storage-folder.request.v1"
+        }
+      )
+    ).resolves.toEqual({
+      ok: true,
+      value: { status: "cancelled" }
+    });
+  });
+
+  it.each([
+    {
+      name: "relative path",
+      path: ["relative", "project"].join(sep)
+    },
+    {
+      name: "dot-segment path",
+      path: `${resolve("canonical", "parent")}${sep}..${sep}project`
+    },
+    {
+      name: "NUL path",
+      path: `${resolve("canonical")}${sep}project\0hidden`
+    },
+    {
+      name: "oversized path",
+      path: `${resolve("canonical")}${sep}${"x".repeat(5_000)}`
+    }
+  ])("rejects an injected adapter folder result with a $name", async ({ path }) => {
+    const malformed = {
+      status: "selected" as const,
+      path,
+      displayLabel: "project"
+    };
+    const { authority, handlers } = harness({
+      chooseProjectFolder: async () => malformed,
+      chooseStorageFolder: async () => malformed
+    });
+    const renderer = new FakeWebContents(47);
+    authority.bindRenderer(renderer);
+
+    for (const [channel, schema] of [
+      [
+        DESKTOP_IPC_CHANNELS.chooseProjectFolder,
+        "kestrel.desktop.choose-project-folder.request.v1"
+      ],
+      [
+        DESKTOP_IPC_CHANNELS.chooseStorageFolder,
+        "kestrel.desktop.choose-storage-folder.request.v1"
+      ]
+    ] as const) {
+      await expect(
+        handlers.get(channel)!(eventFor(renderer), { schema })
+      ).resolves.toEqual({
+        ok: false,
+        error: { code: "invalid_desktop_response" }
+      });
+    }
   });
 });
 
