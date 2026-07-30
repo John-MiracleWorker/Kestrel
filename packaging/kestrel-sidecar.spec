@@ -92,7 +92,8 @@ analysis = Analysis(
 )
 pyz = PYZ(analysis.pure)
 
-# The build wrapper also supplies --noupx as an independent fail-closed control.
+# UPX is disabled in the spec because PyInstaller rejects makespec-only switches
+# when it receives a pre-existing spec file.
 executable = EXE(
     pyz,
     analysis.scripts,

@@ -137,6 +137,7 @@ def test_task_11b_files_and_exact_pyinstaller_pin_exist() -> None:
 def test_entrypoint_and_spec_cover_runtime_without_legacy_or_development_roots() -> None:
     entrypoint = ENTRYPOINT.read_text(encoding="utf-8")
     spec = SPEC.read_text(encoding="utf-8")
+    build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
 
     assert "from nested_memvid_agent.desktop_sidecar import main" in entrypoint
     assert "main()" in entrypoint
@@ -164,9 +165,9 @@ def test_entrypoint_and_spec_cover_runtime_without_legacy_or_development_roots()
         "THIRD_PARTY_NOTICES.txt",
         "LICENSE",
         "upx=False",
-        "--noupx",
     ):
         assert required in spec
+    assert '"--noupx"' not in build_script
     for forbidden in (
         '"qrcode"',
         '"pytest"',

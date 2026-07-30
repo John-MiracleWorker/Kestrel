@@ -621,7 +621,6 @@ def build_sidecar(
         "PyInstaller",
         "--clean",
         "--noconfirm",
-        "--noupx",
         "--distpath",
         str(dist_root),
         "--workpath",
