@@ -713,6 +713,11 @@ describe("verified sidecar supervisor", () => {
         value: "unix:path=/run/user/1000/dbus-%zz"
       },
       {
+        name: "unescaped backslash",
+        variable: "DBUS_SESSION_BUS_ADDRESS",
+        value: "unix:path=/run/user/1000/dbus\\socket"
+      },
+      {
         name: "DBus control character",
         variable: "DBUS_SESSION_BUS_ADDRESS",
         value: "unix:path=/run/user/1000/\nbus"

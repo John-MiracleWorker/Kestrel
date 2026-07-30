@@ -316,7 +316,7 @@ function hasControlCharacters(value: string): boolean {
 function validDbusAddressValue(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index]!;
-    if (/[A-Za-z0-9_./\\*-]/.test(character)) {
+    if (/[A-Za-z0-9_./*-]/.test(character)) {
       continue;
     }
     if (
