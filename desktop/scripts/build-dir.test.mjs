@@ -450,6 +450,22 @@ async function copyDirectorySourceToApplication(invocation, mutate) {
   await cp(stageRoot, join(resourcesRoot, "kestrel"), {
     recursive: true,
   });
+  const executablePath =
+    process.platform === "darwin"
+      ? join(
+          applicationRoot,
+          "Contents",
+          "MacOS",
+          "Kestrel Developer",
+        )
+      : process.platform === "win32"
+        ? join(applicationRoot, "Kestrel Developer.exe")
+        : join(applicationRoot, "kestrel-desktop");
+  await mkdir(dirname(executablePath), { recursive: true });
+  await writeFile(executablePath, "developer executable fixture\n");
+  if (process.platform !== "win32") {
+    await chmod(executablePath, 0o755);
+  }
   if (mutate !== undefined) {
     await mutate({ applicationRoot, resourcesRoot });
   }
@@ -559,6 +575,11 @@ describe("developer directory bundle", () => {
           )
         : join(receipt.application_root, "resources", "kestrel"),
     );
+    expect(receipt.executable_path.startsWith(receipt.application_root)).toBe(
+      true,
+    );
+    expect(receipt.executable_sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(receipt.executable_size).toBeGreaterThan(0);
     expect(receipt.stage_receipt_path).toBe(
       fixture.stageReceiptPath,
     );

@@ -7,6 +7,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:dir": "node scripts/build-dir.mjs",
+    "smoke:dir": "node scripts/smoke-dir.mjs",
     "audit:reviewed": "node scripts/audit-reviewed.mjs",
     "test": "vitest run",
     "test:build-dir": "vitest run --config vitest.build-dir.config.ts",

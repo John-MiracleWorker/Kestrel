@@ -16,6 +16,7 @@ def test_developer_directory_builder_is_exactly_pinned_and_source_gated() -> Non
     assert package["scripts"]["test:build-dir"] == (
         "vitest run --config vitest.build-dir.config.ts"
     )
+    assert package["scripts"]["smoke:dir"] == "node scripts/smoke-dir.mjs"
     assert package["scripts"]["audit:reviewed"] == (
         "node scripts/audit-reviewed.mjs"
     )
@@ -24,6 +25,8 @@ def test_developer_directory_builder_is_exactly_pinned_and_source_gated() -> Non
     assert lock["packages"]["node_modules/electron-builder"]["version"] == "26.15.3"
     assert (DESKTOP / "scripts" / "build-dir.mjs").is_file()
     assert (DESKTOP / "scripts" / "build-dir.test.mjs").is_file()
+    assert (DESKTOP / "scripts" / "smoke-dir.mjs").is_file()
+    assert (DESKTOP / "scripts" / "smoke-dir.test.mjs").is_file()
     assert (DESKTOP / "scripts" / "audit-reviewed.mjs").is_file()
     assert (DESKTOP / "scripts" / "audit-reviewed.test.mjs").is_file()
     assert (DESKTOP / "electron-builder.developer.yml").is_file()

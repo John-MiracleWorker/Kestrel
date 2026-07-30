@@ -1135,6 +1135,52 @@ async function locateApplicationRoot(
   return { applicationRoot, resourceRoot };
 }
 
+async function locateApplicationExecutable(
+  applicationRoot,
+  platform,
+  packageName,
+  productName,
+) {
+  const executableName =
+    platform === "darwin"
+      ? productName
+      : platform === "win32"
+        ? `${productName}.exe`
+        : packageName;
+  const executablePath =
+    platform === "darwin"
+      ? join(
+          applicationRoot,
+          "Contents",
+          "MacOS",
+          executableName,
+        )
+      : join(applicationRoot, executableName);
+  if (
+    !isContained(applicationRoot, executablePath) ||
+    resolve(executablePath) !== executablePath
+  ) {
+    throw new Error("packaged executable escapes application root");
+  }
+  const executable = await inspectRegularFile(
+    executablePath,
+    "packaged application executable",
+    null,
+  );
+  const metadata = await lstat(executablePath);
+  if (
+    platform !== "win32" &&
+    (metadata.mode & 0o111) === 0
+  ) {
+    throw new Error("packaged application executable is not executable");
+  }
+  return {
+    path: executablePath,
+    sha256: executable.sha256,
+    size: executable.size,
+  };
+}
+
 function parseArguments(argumentsValue) {
   if (argumentsValue.length % 2 !== 0) {
     throw new Error("every build-dir option requires one value");
@@ -1368,6 +1414,12 @@ export async function buildDeveloperDirectory(
       ),
       process.platform,
     );
+    const packagedExecutable = await locateApplicationExecutable(
+      layout.applicationRoot,
+      process.platform,
+      toolchain.packageMetadata.name,
+      config.value.productName,
+    );
     const packagedResources = await inventoryDirectory(
       layout.resourceRoot,
       "packaged staged resources",
@@ -1521,6 +1573,9 @@ export async function buildDeveloperDirectory(
       stage_receipt_sha256: stage.receiptRecord.sha256,
       application_root: layout.applicationRoot,
       resource_root: layout.resourceRoot,
+      executable_path: packagedExecutable.path,
+      executable_sha256: packagedExecutable.sha256,
+      executable_size: packagedExecutable.size,
       packaged_package_json_path: packagedPackagePath,
       packaged_package_json_sha256:
         packagedPackageRecord.sha256,
