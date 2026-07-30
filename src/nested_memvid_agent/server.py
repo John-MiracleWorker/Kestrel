@@ -14,6 +14,7 @@ from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
 from .config import AgentConfig
 from .desktop_bootstrap import DesktopLaunchConfig
+from .desktop_memory_health import inspect_desktop_memvid_readiness
 from .event_bus import RunEventBus
 from .layers import (
     load_layer_specs,
@@ -704,7 +705,9 @@ def _create_app(
                 credential_readiness=(
                     current_desktop_storage_readiness
                 ),
-                memory_ready=lambda: True,
+                memory_ready=lambda: inspect_desktop_memvid_readiness(
+                    active_config.memory_dir
+                ),
             ),
             http_exception=HTTPException,
         )

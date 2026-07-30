@@ -151,7 +151,7 @@ def test_shadow_coordinator_persists_decision_without_switching_provider(tmp_pat
     assert len(ledger.list_decisions(run_id=task.run_id)) == 1
 
 
-def test_unsettled_decision_projection_is_bounded_and_excludes_terminal_rows(
+def test_running_decision_count_is_bounded_and_does_not_decode_snapshots(
     tmp_path: Path,
 ) -> None:
     state, task = _state_and_task(tmp_path)
@@ -169,17 +169,22 @@ def test_unsettled_decision_projection_is_bounded_and_excludes_terminal_rows(
         validation_passed=True,
     )
 
-    unsettled = ledger.list_unsettled_decisions(limit=100)
+    with state._connect() as connection:
+        connection.execute(
+            """
+            UPDATE routing_decisions
+            SET candidate_snapshot_json = ?
+            WHERE decision_id IN (?, ?)
+            """,
+            (
+                "{invalid-and-intentionally-large:" + ("x" * 8_192),
+                running.record.decision_id,
+                selected.record.decision_id,
+            ),
+        )
 
-    assert [entry.decision_id for entry in unsettled] == [
-        running.record.decision_id,
-        selected.record.decision_id,
-    ]
-    assert [entry.status for entry in unsettled] == [
-        "running",
-        "selected",
-    ]
-    assert ledger.list_unsettled_decisions(limit=1) == [unsettled[0]]
+    assert ledger.count_running_decisions(limit=100) == 1
+    assert ledger.count_running_decisions(limit=1) == 1
 
 
 def test_constrained_coordinator_switches_only_provider_connection_fields(tmp_path: Path) -> None:

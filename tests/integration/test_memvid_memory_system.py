@@ -10,6 +10,12 @@ import pytest
 
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.desktop_memory_health import (
+    inspect_desktop_memvid_readiness,
+)
+from nested_memvid_agent.desktop_sidecar import (
+    run_desktop_sidecar_preflight,
+)
 from nested_memvid_agent.event_bus import RunEventBus
 from nested_memvid_agent.layers import LayeredMemorySystem, load_layer_specs
 from nested_memvid_agent.mcp_manager import MCPManager
@@ -89,6 +95,31 @@ def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_fi
         assert inactive_hits
     finally:
         final.close_all()
+
+
+def test_desktop_recovery_probe_reopens_exactly_six_memvid_v2_layers(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    run_desktop_sidecar_preflight(memory_dir)
+    before = {
+        path.name: path.read_bytes()
+        for path in memory_dir.glob("*.mv2")
+    }
+
+    assert inspect_desktop_memvid_readiness(memory_dir) is True
+    assert {
+        path.name: path.read_bytes()
+        for path in memory_dir.glob("*.mv2")
+    } == before
+    assert set(before) == {
+        "working.mv2",
+        "episodic.mv2",
+        "semantic.mv2",
+        "procedural.mv2",
+        "self.mv2",
+        "policy.mv2",
+    }
 
 
 def test_memvid_run_manager_serializes_two_runs_and_reopens_each_layer(tmp_path: Path) -> None:

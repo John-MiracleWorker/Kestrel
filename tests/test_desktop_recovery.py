@@ -1,26 +1,20 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
 
 from nested_memvid_agent.desktop_recovery import DesktopRecoveryService
-from nested_memvid_agent.state_store import SCHEMA_VERSION
-
-
-@dataclass(frozen=True)
-class _Decision:
-    status: str
+from nested_memvid_agent.state_store import SCHEMA_VERSION, AgentStateStore
 
 
 class _State:
     def __init__(
         self,
         *,
-        approvals: tuple[dict[str, object], ...] = (),
+        pending_high_risk: int = 0,
         health: dict[str, object] | None = None,
     ) -> None:
-        self.approvals = approvals
+        self.pending_high_risk = pending_high_risk
         self.health = health or {
             "ok": True,
             "integrity": "ok",
@@ -34,27 +28,27 @@ class _State:
         self.calls.append(("health_snapshot", None))
         return dict(self.health)
 
-    def list_approvals(
-        self,
-        status: str | None = None,
-        *,
-        expire: bool = True,
-    ) -> list[dict[str, object]]:
-        self.calls.append(("list_approvals", (status, expire)))
-        assert status == "pending"
-        assert expire is False
-        return [dict(item) for item in self.approvals]
+    def count_pending_high_risk_approvals(self, *, limit: int) -> int:
+        self.calls.append(("count_pending_high_risk_approvals", limit))
+        assert limit == 1_000
+        return min(limit, self.pending_high_risk)
+
+    def list_approvals(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("recovery must not load raw approval rows")
 
 
 class _Routing:
-    def __init__(self, decisions: tuple[_Decision, ...] = ()) -> None:
-        self.decisions = decisions
+    def __init__(self, running: int = 0) -> None:
+        self.running = running
         self.calls = 0
 
-    def list_unsettled_decisions(self, *, limit: int) -> list[_Decision]:
+    def count_running_decisions(self, *, limit: int) -> int:
         self.calls += 1
         assert limit == 1_000
-        return list(self.decisions)
+        return min(limit, self.running)
+
+    def list_unsettled_decisions(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("recovery must not load raw routing rows")
 
 
 def _credential_readiness(
@@ -88,23 +82,8 @@ def _service(
 
 
 def test_crash_recovery_never_replays_high_risk_or_ambiguous_attempts() -> None:
-    state = _State(
-        approvals=(
-            {"approval_id": "a-high", "status": "pending", "risk": "high"},
-            {
-                "approval_id": "a-critical",
-                "status": "pending",
-                "risk": "critical",
-            },
-            {"approval_id": "a-low", "status": "pending", "risk": "low"},
-        )
-    )
-    routing = _Routing(
-        (
-            _Decision(status="running"),
-            _Decision(status="selected"),
-        )
-    )
+    state = _State(pending_high_risk=2)
+    routing = _Routing(running=1)
     recovery_service = _service(state=state, routing=routing)
 
     report = recovery_service.inspect()
@@ -123,7 +102,7 @@ def test_crash_recovery_never_replays_high_risk_or_ambiguous_attempts() -> None:
     assert report.ambiguous_provider_attempts == 1
     assert state.calls == [
         ("health_snapshot", None),
-        ("list_approvals", ("pending", False)),
+        ("count_pending_high_risk_approvals", 1_000),
     ]
     assert routing.calls == 1
 
@@ -140,9 +119,9 @@ def test_retry_readiness_is_a_read_only_reinspection() -> None:
     assert retried.can_auto_resume is True
     assert state.calls == [
         ("health_snapshot", None),
-        ("list_approvals", ("pending", False)),
+        ("count_pending_high_risk_approvals", 1_000),
         ("health_snapshot", None),
-        ("list_approvals", ("pending", False)),
+        ("count_pending_high_risk_approvals", 1_000),
     ]
     assert routing.calls == 2
 
@@ -241,20 +220,43 @@ def test_support_bundle_preview_is_bounded_metadata_without_paths_or_text() -> N
 
 
 def test_counts_are_bounded_even_if_authority_returns_excess_rows() -> None:
-    approvals: tuple[dict[str, Any], ...] = tuple(
-        {
-            "approval_id": f"a-{index}",
-            "status": "pending",
-            "risk": "high",
-        }
-        for index in range(1_100)
-    )
-    decisions = tuple(_Decision(status="running") for _ in range(1_100))
-
     report = _service(
-        state=_State(approvals=approvals),
-        routing=_Routing(decisions),
+        state=_State(pending_high_risk=1_100),
+        routing=_Routing(running=1_100),
     ).inspect()
 
     assert report.pending_high_risk_approvals == 1_000
     assert report.ambiguous_provider_attempts == 1_000
+
+
+def test_pending_high_risk_count_is_bounded_and_never_decodes_arguments(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state.db")
+    rows = [
+        (
+            f"approval-{index}",
+            f"run-{index}",
+            f"call-{index}",
+            "shell.run",
+            "{invalid-and-intentionally-large:" + ("x" * 8_192),
+            "critical" if index % 2 else "high",
+            "pending",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+        )
+        for index in range(1_025)
+    ]
+    with state._connect() as connection:
+        connection.executemany(
+            """
+            INSERT INTO approval_requests (
+                approval_id, run_id, tool_call_id, tool_name,
+                arguments_json, risk, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    assert state.count_pending_high_risk_approvals(limit=1_000) == 1_000
+    assert state.count_pending_high_risk_approvals(limit=7) == 7

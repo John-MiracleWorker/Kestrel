@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from nested_memvid_agent import server as server_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
 from nested_memvid_agent.server import create_app
@@ -91,9 +93,15 @@ def test_recovery_routes_are_desktop_only_and_authenticated(
 
 def test_recovery_retry_is_strict_bounded_and_read_only(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "profile"
     root.mkdir()
+    monkeypatch.setattr(
+        server_module,
+        "inspect_desktop_memvid_readiness",
+        lambda _memory_dir: True,
+    )
     app = create_app(
         _config(root),
         desktop_context=_desktop_context(root),
@@ -178,3 +186,37 @@ def test_support_preview_is_metadata_only_and_bounded(
     assert str(root) not in rendered
     assert "desktop-token" not in rendered
     assert "launch-nonce" not in rendered
+
+
+def test_desktop_recovery_uses_live_memvid_readiness_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "profile"
+    root.mkdir()
+    inspected: list[Path] = []
+
+    def unavailable(memory_dir: Path) -> bool:
+        inspected.append(memory_dir)
+        return False
+
+    monkeypatch.setattr(
+        server_module,
+        "inspect_desktop_memvid_readiness",
+        unavailable,
+    )
+    app = create_app(
+        _config(root),
+        desktop_context=_desktop_context(root),
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/desktop/recovery",
+            headers=_headers(),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["memory"] == {"ready": False}
+    assert "memvid_reopen_failed" in response.json()["blockers"]
+    assert inspected == [root / "memory"]

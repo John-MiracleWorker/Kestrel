@@ -2434,6 +2434,30 @@ class AgentStateStore:
             rows = conn.execute(sql, params).fetchall()
         return [_approval_from_row(row) for row in rows]
 
+    def count_pending_high_risk_approvals(
+        self,
+        *,
+        limit: int = 1_000,
+    ) -> int:
+        """Count only bounded recovery metadata without decoding arguments."""
+
+        bounded_limit = max(1, min(int(limit), 1_000))
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS item_count
+                FROM (
+                    SELECT 1
+                    FROM approval_requests
+                    WHERE status = 'pending'
+                      AND lower(risk) IN ('high', 'critical')
+                    LIMIT ?
+                )
+                """,
+                (bounded_limit,),
+            ).fetchone()
+        return 0 if row is None else int(row["item_count"])
+
     def expire_pending_approvals(
         self,
         *,

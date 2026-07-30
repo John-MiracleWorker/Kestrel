@@ -286,31 +286,28 @@ class RoutingLedger(RoutingRegistry):
             rows = conn.execute(sql, params).fetchall()
         return [_decision_entry_from_row(row) for row in rows]
 
-    def list_unsettled_decisions(
+    def count_running_decisions(
         self,
         *,
         limit: int = 1_000,
-    ) -> list[RouteDecisionEntry]:
-        """Read a bounded projection of decisions without a terminal outcome."""
+    ) -> int:
+        """Count bounded in-flight attempts without loading route snapshots."""
 
         bounded_limit = max(1, min(int(limit), 1_000))
         with self.state._connect() as conn:
-            rows = conn.execute(
+            row = conn.execute(
                 """
-                SELECT * FROM routing_decisions
-                WHERE status IN ('selected', 'running')
-                ORDER BY
-                    CASE status
-                        WHEN 'running' THEN 0
-                        ELSE 1
-                    END ASC,
-                    created_at ASC,
-                    decision_id ASC
-                LIMIT ?
+                SELECT COUNT(*) AS item_count
+                FROM (
+                    SELECT 1
+                    FROM routing_decisions
+                    WHERE status = 'running'
+                    LIMIT ?
+                )
                 """,
                 (bounded_limit,),
-            ).fetchall()
-        return [_decision_entry_from_row(row) for row in rows]
+            ).fetchone()
+        return 0 if row is None else int(row["item_count"])
 
     def record_outcome(
         self,

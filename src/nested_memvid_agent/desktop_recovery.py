@@ -34,20 +34,19 @@ _BLOCKING_REASONS = frozenset(
 class _RecoveryState(Protocol):
     def health_snapshot(self) -> Mapping[str, object]: ...
 
-    def list_approvals(
-        self,
-        status: str | None = None,
-        *,
-        expire: bool = True,
-    ) -> Sequence[Mapping[str, object]]: ...
-
-
-class _RecoveryRouting(Protocol):
-    def list_unsettled_decisions(
+    def count_pending_high_risk_approvals(
         self,
         *,
         limit: int,
-    ) -> Sequence[Any]: ...
+    ) -> int: ...
+
+
+class _RecoveryRouting(Protocol):
+    def count_running_decisions(
+        self,
+        *,
+        limit: int,
+    ) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -136,19 +135,10 @@ class DesktopRecoveryService:
             reasons.append("memvid_reopen_failed")
 
         try:
-            approvals = self._state.list_approvals(
-                status="pending",
-                expire=False,
-            )
-            pending_high_risk = min(
-                _MAX_RECOVERY_ITEMS,
-                sum(
-                    1
-                    for approval in approvals
-                    if str(approval.get("status", "")) == "pending"
-                    and str(approval.get("risk", "")).lower()
-                    in {"high", "critical"}
-                ),
+            pending_high_risk = _bounded_count(
+                self._state.count_pending_high_risk_approvals(
+                    limit=_MAX_RECOVERY_ITEMS
+                )
             )
         except Exception:
             pending_high_risk = 0
@@ -157,16 +147,10 @@ class DesktopRecoveryService:
             reasons.append("pending_high_risk_approval")
 
         try:
-            unsettled = self._routing.list_unsettled_decisions(
-                limit=_MAX_RECOVERY_ITEMS
-            )
-            ambiguous_provider_attempts = min(
-                _MAX_RECOVERY_ITEMS,
-                sum(
-                    1
-                    for decision in unsettled
-                    if str(getattr(decision, "status", "")) == "running"
-                ),
+            ambiguous_provider_attempts = _bounded_count(
+                self._routing.count_running_decisions(
+                    limit=_MAX_RECOVERY_ITEMS
+                )
             )
         except Exception:
             ambiguous_provider_attempts = 0
@@ -270,3 +254,9 @@ def _credential_state(
 
 def _unique(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _bounded_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("recovery count must be a non-negative integer")
+    return min(value, _MAX_RECOVERY_ITEMS)
