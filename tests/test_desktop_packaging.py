@@ -148,7 +148,7 @@ def test_entrypoint_and_spec_cover_runtime_without_legacy_or_development_roots()
         'collect_submodules("anthropic")',
         'collect_submodules("google.genai")',
         'collect_submodules("keyring.backends")',
-        'collect_submodules("mcp")',
+        'collect_submodules("mcp", filter=_exclude_mcp_cli)',
         'collect_submodules("openai")',
         'collect_submodules("starlette")',
         'collect_submodules("yaml")',
@@ -233,7 +233,21 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
     hooks.copy_metadata = lambda _name: [  # type: ignore[attr-defined]
         ("/source/nested_memvid_agent.dist-info", "nested_memvid_agent.dist-info")
     ]
-    hooks.collect_submodules = lambda name: [f"{name}.fixture"]  # type: ignore[attr-defined]
+    def collect_submodules(
+        name: str,
+        **kwargs: object,
+    ) -> list[str]:
+        if name != "mcp":
+            return [f"{name}.fixture"]
+        module_filter = kwargs.get("filter")
+        assert callable(module_filter)
+        return [
+            module
+            for module in ("mcp.client", "mcp.cli", "mcp.cli.cli")
+            if module_filter(module)
+        ]
+
+    hooks.collect_submodules = collect_submodules  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "PyInstaller", pyinstaller)
     monkeypatch.setitem(sys.modules, "PyInstaller.utils", utils)
     monkeypatch.setitem(sys.modules, "PyInstaller.utils.hooks", hooks)
@@ -249,6 +263,7 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
             for item in datas
         )
         observed["datas"] = datas
+        observed["hiddenimports"] = kwargs["hiddenimports"]
         return SimpleNamespace(
             pure=[],
             scripts=[],
@@ -266,6 +281,9 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
         },
     )
     assert observed["datas"]
+    assert "mcp.client" in observed["hiddenimports"]
+    assert "mcp.cli" not in observed["hiddenimports"]
+    assert "mcp.cli.cli" not in observed["hiddenimports"]
 
 
 def test_build_guard_rejects_dirty_or_wrong_source_and_upx(

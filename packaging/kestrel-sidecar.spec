@@ -23,6 +23,12 @@ agent_datas = collect_data_files(
     includes=["prompts/*.md"],
 )
 agent_metadata = copy_metadata("nested-memvid-agent")
+
+
+def _exclude_mcp_cli(module_name):
+    return module_name != "mcp.cli" and not module_name.startswith("mcp.cli.")
+
+
 web_datas = [
     (
         str(path),
@@ -42,7 +48,7 @@ hiddenimports = sorted(
     {
         *collect_submodules("anthropic"),
         *collect_submodules("google.genai"),
-        *collect_submodules("mcp"),
+        *collect_submodules("mcp", filter=_exclude_mcp_cli),
         *collect_submodules("nested_memvid_agent"),
         *collect_submodules("openai"),
         *collect_submodules("starlette"),
