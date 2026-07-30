@@ -85,6 +85,7 @@ _PROVIDER_HTTP_WORKER_SLOTS = BoundedSemaphore(MAX_CONCURRENT_PROVIDER_HTTP_EXCH
 _PROVIDER_HTTP_REQUEST_SCHEMA = "kestrel.provider_http_request.v1"
 _PROVIDER_HTTP_RESPONSE_SCHEMA = "kestrel.provider_http_response.v1"
 _PROVIDER_HTTP_WORKER = Path(__file__).with_name("provider_http_worker.py")
+PROVIDER_HTTP_WORKER_ARGUMENT = "--kestrel-provider-http-worker-v1"
 _PROVIDER_HTTP_TERMINATION_GRACE_SECONDS = 1.0
 _SENSITIVE_QUERY_VALUE = re.compile(
     r"([?&](?:api[_-]?key|key|token|access[_-]?token)=)[^&\s]+",
@@ -556,6 +557,8 @@ def _encode_provider_http_request(
 
 def _provider_http_worker_command() -> list[str]:
     interpreter = Path(sys.executable).resolve(strict=True)
+    if bool(getattr(sys, "frozen", False)):
+        return [str(interpreter), PROVIDER_HTTP_WORKER_ARGUMENT]
     worker = _PROVIDER_HTTP_WORKER.resolve(strict=True)
     module_parent = Path(__file__).resolve(strict=True).parent
     if not worker.is_file() or worker.parent != module_parent:

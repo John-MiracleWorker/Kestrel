@@ -1,0 +1,113 @@
+# -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller recipe for the fully bundled Kestrel desktop sidecar."""
+
+from pathlib import Path
+
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_submodules,
+    copy_metadata,
+)
+
+
+project_root = Path(SPECPATH).resolve().parent.parent
+source_root = project_root / "src"
+web_dist = project_root / "web" / "dist"
+# Source payload root: web/dist (staged under nested_memvid_agent/web_dist).
+
+memvid_datas, memvid_binaries, memvid_hiddenimports = collect_all("memvid_sdk")
+tzdata_datas = collect_data_files("tzdata")
+agent_datas = collect_data_files(
+    "nested_memvid_agent",
+    includes=["prompts/*.md"],
+)
+agent_metadata = copy_metadata("nested-memvid-agent")
+web_datas = [
+    (
+        str(path),
+        (
+            "nested_memvid_agent/web_dist"
+            if path.relative_to(web_dist).parent.as_posix() == "."
+            else (
+                "nested_memvid_agent/web_dist/"
+                f"{path.relative_to(web_dist).parent.as_posix()}"
+            )
+        ),
+    )
+    for path in sorted(web_dist.rglob("*"))
+    if path.is_file() and not path.is_symlink()
+]
+hiddenimports = sorted(
+    {
+        *collect_submodules("anthropic"),
+        *collect_submodules("google.genai"),
+        *collect_submodules("mcp"),
+        *collect_submodules("nested_memvid_agent"),
+        *collect_submodules("openai"),
+        *collect_submodules("starlette"),
+        *collect_submodules("yaml"),
+        *collect_submodules("keyring.backends"),
+        *memvid_hiddenimports,
+        "fastapi",
+        "nested_memvid_agent.llm.mock",
+        "nested_memvid_agent.server",
+        "pydantic",
+        "pydantic_settings",
+        "uvicorn",
+    }
+)
+datas = [
+    *agent_datas,
+    *agent_metadata,
+    *memvid_datas,
+    *tzdata_datas,
+    *web_datas,
+    (str(project_root / "LICENSE"), "licenses"),
+    (
+        str(project_root / "web" / "public" / "THIRD_PARTY_NOTICES.txt"),
+        "licenses",
+    ),
+]
+excludes = [
+    ".env",
+    ".nest",
+    "benchmark",
+    "pytest",
+    "qrcode",
+    "tests",
+]
+
+analysis = Analysis(
+    [str(project_root / "packaging" / "kestrel-sidecar-entry.py")],
+    pathex=[str(source_root)],
+    binaries=memvid_binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=excludes,
+    noarchive=False,
+)
+pyz = PYZ(analysis.pure)
+
+# The build wrapper also supplies --noupx as an independent fail-closed control.
+executable = EXE(
+    pyz,
+    analysis.scripts,
+    analysis.binaries,
+    analysis.datas,
+    [],
+    name="kestrel-desktop-sidecar",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
