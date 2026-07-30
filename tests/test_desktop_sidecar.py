@@ -31,6 +31,7 @@ from nested_memvid_agent.desktop_sidecar import (
     DesktopStateCorruptError,
     DesktopStateIncompatibleError,
     bind_desktop_socket,
+    bind_developer_runtime_identity,
     build_desktop_agent_config,
     classify_desktop_startup_failure,
     desktop_failure_path,
@@ -372,6 +373,7 @@ def _launch(
     tmp_path: Path,
     *,
     manifest_digest: str = "sha256:" + ("a" * 64),
+    assurance_mode: str = "release",
 ) -> DesktopLaunchConfig:
     profile_root = tmp_path / "profile"
     profile_root.mkdir(exist_ok=True)
@@ -386,6 +388,7 @@ def _launch(
         parent_pid=4242,
         parent_birth_marker="desktop-parent-birth-marker",
         resource_manifest_digest=manifest_digest,
+        assurance_mode=assurance_mode,
     )
 
 
@@ -419,6 +422,59 @@ def test_parent_identity_requires_actual_parent_birth_and_owner(tmp_path: Path) 
     )
 
     assert verified == snapshots[4242]
+
+
+def test_developer_parent_identity_uses_tagged_ps_birth_marker(
+    tmp_path: Path,
+) -> None:
+    launch = replace(
+        _launch(tmp_path, assurance_mode="developer"),
+        parent_birth_marker="developer-ps-lstart-ms:1753886400000",
+    )
+    snapshots = {
+        4242: _snapshot(4242, birth_marker="darwin-proc-start:10:20"),
+        9001: _snapshot(9001, birth_marker="darwin-proc-start:30:40"),
+    }
+
+    verified = verify_desktop_parent_identity(
+        launch,
+        actual_parent_pid=4242,
+        current_pid=9001,
+        inspector=lambda pid: snapshots.get(pid),
+        developer_birth_marker_reader=(
+            lambda pid: (
+                "developer-ps-lstart-ms:1753886400000"
+                if pid == 4242
+                else None
+            )
+        ),
+    )
+
+    assert verified == snapshots[4242]
+
+
+def test_developer_runtime_identity_reuses_tagged_ps_birth_marker(
+    tmp_path: Path,
+) -> None:
+    identity = _lease_identity()
+    launch = _launch(tmp_path, assurance_mode="developer")
+
+    bound = bind_developer_runtime_identity(
+        launch,
+        identity,
+        developer_birth_marker_reader=(
+            lambda pid: (
+                "developer-ps-lstart-ms:1753886400000"
+                if pid == identity.pid
+                else None
+            )
+        ),
+    )
+
+    assert bound == replace(
+        identity,
+        process_birth_marker="developer-ps-lstart-ms:1753886400000",
+    )
 
 
 @pytest.mark.parametrize(
@@ -460,7 +516,9 @@ def test_parent_identity_mismatch_fails_closed(
 
 def test_resource_manifest_binding_rejects_tampering(tmp_path: Path) -> None:
     manifest = tmp_path / "kestrel-resource-manifest.json"
-    manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1"}\n')
+    manifest.write_bytes(
+        b'{"build_mode":"release","schema":"kestrel.desktop.resources.v1"}\n'
+    )
     expected = "sha256:" + sha256(manifest.read_bytes()).hexdigest()
     launch = _launch(tmp_path, manifest_digest=expected)
 
@@ -468,6 +526,23 @@ def test_resource_manifest_binding_rejects_tampering(tmp_path: Path) -> None:
 
     manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1","tampered":true}\n')
     with pytest.raises(RuntimeError, match="resource_manifest_digest_mismatch"):
+        verify_resource_manifest_binding(launch, manifest_path=manifest)
+
+
+def test_resource_manifest_binding_rejects_bootstrap_assurance_mode_mismatch(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "kestrel-resource-manifest.json"
+    manifest.write_bytes(
+        b'{"build_mode":"release","schema":"kestrel.desktop.resources.v1"}\n'
+    )
+    launch = _launch(
+        tmp_path,
+        manifest_digest="sha256:" + sha256(manifest.read_bytes()).hexdigest(),
+        assurance_mode="developer",
+    )
+
+    with pytest.raises(RuntimeError, match="assurance_mode_mismatch"):
         verify_resource_manifest_binding(launch, manifest_path=manifest)
 
 
@@ -573,6 +648,7 @@ def _write_bootstrap(path: Path, launch: DesktopLaunchConfig) -> None:
                 "parent_pid": launch.parent_pid,
                 "parent_birth_marker": launch.parent_birth_marker,
                 "resource_manifest_digest": launch.resource_manifest_digest,
+                "assurance_mode": launch.assurance_mode,
                 "memory_layers": [layer.value for layer in DEFAULT_LAYER_SPECS],
             }
         ),
@@ -591,7 +667,9 @@ def _verified_sidecar_inputs(
     Callable[..., RuntimeLeaseIdentity],
 ]:
     manifest = tmp_path / "kestrel-resource-manifest.json"
-    manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1"}\n')
+    manifest.write_bytes(
+        b'{"build_mode":"release","schema":"kestrel.desktop.resources.v1"}\n'
+    )
     parent_pid = os.getppid()
     current_pid = os.getpid()
     launch = replace(
@@ -630,7 +708,9 @@ def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
     tmp_path: Path,
 ) -> None:
     manifest = tmp_path / "kestrel-resource-manifest.json"
-    manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1"}\n')
+    manifest.write_bytes(
+        b'{"build_mode":"release","schema":"kestrel.desktop.resources.v1"}\n'
+    )
     manifest_digest = "sha256:" + sha256(manifest.read_bytes()).hexdigest()
     parent_pid = os.getppid()
     current_pid = os.getpid()
@@ -873,7 +953,9 @@ def test_prelease_identity_failure_does_not_claim_profile_conflict(
     tmp_path: Path,
 ) -> None:
     manifest = tmp_path / "kestrel-resource-manifest.json"
-    manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1"}\n')
+    manifest.write_bytes(
+        b'{"build_mode":"release","schema":"kestrel.desktop.resources.v1"}\n'
+    )
     parent_pid = os.getppid()
     current_pid = os.getpid()
     launch = replace(
@@ -937,7 +1019,9 @@ def test_preflight_failure_closes_socket_before_releasing_lease(
     tmp_path: Path,
 ) -> None:
     manifest = tmp_path / "kestrel-resource-manifest.json"
-    manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1"}\n')
+    manifest.write_bytes(
+        b'{"build_mode":"release","schema":"kestrel.desktop.resources.v1"}\n'
+    )
     parent_pid = os.getppid()
     current_pid = os.getpid()
     launch = replace(

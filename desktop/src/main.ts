@@ -37,8 +37,13 @@ import {
 } from "./main/window.js";
 import {
   createNodeSupervisorDependencies,
-  SidecarSupervisor
+  SidecarSupervisor,
+  type NodeSupervisorDependencyInput
 } from "./main/sidecar-supervisor.js";
+import {
+  createDeveloperRuntimeSupervisorDependencies,
+  selectPackagedSupervisorRuntime
+} from "./main/developer-runtime.js";
 import {
   installDesktopApiSession,
   type ApiSessionWebContents,
@@ -70,10 +75,6 @@ import {
   type CredentialDialogController
 } from "./main/credential-window.js";
 import type { VerifiedDesktopSessionResources } from "./main/sidecar-supervisor.js";
-import {
-  verifyDeveloperResourceManifest,
-  verifyResourceManifest
-} from "./main/resource-manifest.js";
 
 const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
 const unavailableUpdateStatus = Object.freeze({
@@ -113,9 +114,10 @@ async function createPackagedSidecarSupervisor(
     throw new Error("desktop_resource_key_unavailable");
   }
   const publicKey = createPublicKey(publicKeyBytes);
-  const profileRoot = join(app.getPath("userData"), "profiles", "default");
+  const userDataPath = app.getPath("userData");
+  const profileRoot = join(userDataPath, "profiles", "default");
   const sidecarVersion = app.getVersion();
-  const dependencies = createNodeSupervisorDependencies({
+  const dependencyInput: NodeSupervisorDependencyInput = {
     apiSession,
     resourceVerification: {
       resourceRoot,
@@ -133,13 +135,9 @@ async function createPackagedSidecarSupervisor(
       ],
       expectedIdentity: buildTrust
     },
-    resourceVerifier:
-      buildTrust.buildMode === "developer"
-        ? verifyDeveloperResourceManifest
-        : verifyResourceManifest,
     profile: {
       profileId: "default",
-      trustedAnchor: app.getPath("userData"),
+      trustedAnchor: userDataPath,
       profileRoot,
       statePath: join(profileRoot, "state", "agent.db"),
       memoryDir: join(profileRoot, "memory"),
@@ -150,7 +148,16 @@ async function createPackagedSidecarSupervisor(
       )
     },
     sidecarVersion
-  });
+  };
+  const dependencies =
+    selectPackagedSupervisorRuntime(buildTrust) ===
+    "developer-runtime"
+      ? await createDeveloperRuntimeSupervisorDependencies({
+          ...dependencyInput,
+          userDataPath,
+          platform: process.platform
+        })
+      : createNodeSupervisorDependencies(dependencyInput);
   return new SidecarSupervisor(
     {
       sidecarRelativePath,

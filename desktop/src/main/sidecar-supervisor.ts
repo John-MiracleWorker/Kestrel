@@ -366,6 +366,7 @@ export interface VerifiedExecutableLaunchCapability {
   readonly mechanism:
     | "linux_openat2_fexecve"
     | "sealed_verified_native"
+    | "developer_reverified_path"
     | "test_verified_handle";
   spawn(request: VerifiedExecutableSpawnRequest): RetainedSidecarChild;
   close(): Promise<void>;
@@ -404,6 +405,10 @@ export interface SidecarSupervisorDependencies {
     sidecarVersion: string;
   }): Promise<CapturedSidecarFailure | null>;
   inspectProcess(pid: number): Promise<SidecarProcessIdentity | null>;
+  inspectRetainedChild?(
+    child: RetainedSidecarChild,
+    expectedExecutableDigest: string
+  ): Promise<SidecarProcessIdentity | null>;
   requestReadiness(input: {
     baseUrl: string;
     apiToken: string;
@@ -1154,6 +1159,7 @@ export class SidecarSupervisor {
       this.throwIfLaunchCancelled(generation, signal);
       launch = await this.dependencies.createLaunchFiles({
         profile,
+        assuranceMode: resources.manifest.build_mode,
         parentPid: parent.pid,
         parentBirthMarker: parent.processBirthMarker,
         resourceManifestDigest: resources.manifestDigest
@@ -1262,7 +1268,10 @@ export class SidecarSupervisor {
       retainedActive = active;
       this.active = active;
       const spawnedIdentity = await Promise.race([
-        this.dependencies.inspectProcess(child.pid),
+        this.inspectRetainedChildOrProcess(
+          child,
+          expectedExecutableDigest
+        ),
         terminalPromise
       ]);
       this.throwIfLaunchCancelled(generation, signal);
@@ -1292,8 +1301,9 @@ export class SidecarSupervisor {
       if (terminal !== null) {
         throw terminal;
       }
-      const processIdentity = await this.dependencies.inspectProcess(
-        child.pid
+      const processIdentity = await this.inspectRetainedChildOrProcess(
+        child,
+        expectedExecutableDigest
       );
       this.throwIfLaunchCancelled(generation, signal);
       if (terminal !== null) {
@@ -1610,7 +1620,10 @@ export class SidecarSupervisor {
     }
     let current: SidecarProcessIdentity | null;
     try {
-      current = await this.dependencies.inspectProcess(pid);
+      current = await this.inspectRetainedChildOrProcess(
+        active.child,
+        expected.executableDigest
+      );
     } catch {
       return false;
     }
@@ -1648,6 +1661,22 @@ export class SidecarSupervisor {
       leaseCurrent.baseUrl === active.baseUrl &&
       leaseCurrent.version === this.config.sidecarVersion
     );
+  }
+
+  private inspectRetainedChildOrProcess(
+    child: RetainedSidecarChild,
+    expectedExecutableDigest: string
+  ): Promise<SidecarProcessIdentity | null> {
+    const pid = child.pid;
+    if (pid === undefined || pid <= 0) {
+      return Promise.resolve(null);
+    }
+    return this.dependencies.inspectRetainedChild !== undefined
+      ? this.dependencies.inspectRetainedChild(
+          child,
+          expectedExecutableDigest
+        )
+      : this.dependencies.inspectProcess(pid);
   }
 
   private finalizeExitedActive(active: ActiveSidecar): Promise<void> {

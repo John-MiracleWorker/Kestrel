@@ -33,6 +33,7 @@ _BOOTSTRAP_KEYS = frozenset(
         "parent_pid",
         "parent_birth_marker",
         "resource_manifest_digest",
+        "assurance_mode",
         "memory_layers",
     }
 )
@@ -75,6 +76,7 @@ class DesktopLaunchConfig:
     parent_pid: int
     parent_birth_marker: str
     resource_manifest_digest: str
+    assurance_mode: str = "release"
     memory_preflight_receipt: DesktopMemvidPreflightReceipt | None = field(
         default=None,
         repr=False,
@@ -93,6 +95,9 @@ class DesktopLaunchConfig:
             self.resource_manifest_digest,
             "resource_manifest_digest",
         )
+        assurance_mode = _required_string(self.assurance_mode, "assurance_mode")
+        if assurance_mode not in {"developer", "release"}:
+            raise ValueError("assurance_mode must be developer or release")
         if isinstance(self.parent_pid, bool) or not isinstance(self.parent_pid, int):
             raise ValueError("parent_pid must be an integer")
         if self.parent_pid <= 0:
@@ -114,6 +119,7 @@ class DesktopLaunchConfig:
         object.__setattr__(self, "api_token", api_token)
         object.__setattr__(self, "parent_birth_marker", parent_birth_marker)
         object.__setattr__(self, "resource_manifest_digest", resource_manifest_digest)
+        object.__setattr__(self, "assurance_mode", assurance_mode)
         for name, path in normalized_paths.items():
             object.__setattr__(self, name, path)
 
@@ -220,6 +226,7 @@ def _parse_bootstrap(text: str) -> DesktopLaunchConfig:
             payload["resource_manifest_digest"],
             "resource_manifest_digest",
         ),
+        assurance_mode=_required_string(payload["assurance_mode"], "assurance_mode"),
     )
 
 

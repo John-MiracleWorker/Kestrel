@@ -871,7 +871,8 @@ def test_stage_consumes_exact_receipts_signs_manifest_and_persists_no_private_ke
         trusted_public_keys={"developer": public_key},
     )
     main_source = (ROOT / "desktop" / "src" / "main.ts").read_text(encoding="utf-8")
-    assert 'buildTrust.buildMode === "developer"' in main_source
+    assert "selectPackagedSupervisorRuntime(buildTrust)" in main_source
+    assert "createDeveloperRuntimeSupervisorDependencies" in main_source
     public_key_start = main_source.index("const publicKeyBytes")
     key_lookup = main_source[
         public_key_start:

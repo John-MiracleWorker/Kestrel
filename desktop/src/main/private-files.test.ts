@@ -132,6 +132,7 @@ describe("private desktop launch files", () => {
     const bytes = [Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)];
     const launch = await createPrivateLaunchFiles({
       profile,
+      assuranceMode: "developer",
       parentPid: process.pid,
       parentBirthMarker: "parent-birth-marker",
       resourceManifestDigest: `sha256:${"a".repeat(64)}`,
@@ -159,6 +160,7 @@ describe("private desktop launch files", () => {
       parent_pid: process.pid,
       parent_birth_marker: "parent-birth-marker",
       resource_manifest_digest: `sha256:${"a".repeat(64)}`,
+      assurance_mode: "developer",
       memory_layers: memoryLayers
     });
     expect(launch.launchNonceDigest).toBe(

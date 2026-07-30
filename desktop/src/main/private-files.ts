@@ -137,6 +137,7 @@ export interface PrivateLaunchFiles {
 
 export interface CreatePrivateLaunchFilesInput {
   profile: ResolvedPrivateProfile;
+  assuranceMode?: "developer" | "release";
   parentPid: number;
   parentBirthMarker: string;
   resourceManifestDigest: string;
@@ -626,6 +627,7 @@ export async function createPrivateLaunchFiles(
   );
   const payload = {
     schema: "kestrel.desktop.bootstrap.v1",
+    assurance_mode: input.assuranceMode ?? "release",
     profile_id: input.profile.profileId,
     profile_root: input.profile.profileRoot,
     state_path: input.profile.statePath,

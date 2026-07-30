@@ -9,9 +9,11 @@ import secrets
 import socket
 import sqlite3
 import stat
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
@@ -56,6 +58,7 @@ _SIDECAR_FAILURE_SCHEMA = "kestrel.desktop.sidecar-failure.v1"
 _SIDECAR_FAILURE_PREFIX = "desktop-failure-"
 _SIDECAR_FAILURE_CONTEXT = b"kestrel.desktop.sidecar-failure.v1\0"
 _MAX_SIDECAR_FAILURE_BYTES = 16 * 1024
+_MAX_RESOURCE_MANIFEST_BYTES = 1024 * 1024
 _RESOURCE_MANIFEST_NAME = "kestrel-resource-manifest.json"
 _DESKTOP_STARTUP_FAILURE_REASONS = frozenset(
     {
@@ -87,6 +90,7 @@ BackendFactory = Callable[[Path], _PreflightBackend]
 ServerFactory = Callable[[Any], _DesktopServer]
 SocketFactory = Callable[[], socket.socket]
 Preflight = Callable[[Path], DesktopMemvidPreflightReceipt | None]
+DeveloperBirthMarkerReader = Callable[[int], str | None]
 
 
 class IdentityFactory(Protocol):
@@ -421,11 +425,19 @@ async def run_desktop_sidecar(
     preflight: Preflight = run_desktop_sidecar_preflight,
     app_factory: AppFactory = create_app,
     server_factory: ServerFactory | None = None,
+    developer_birth_marker_reader: DeveloperBirthMarkerReader | None = None,
 ) -> None:
     """Run one authenticated Desktop-owned Kestrel authority."""
 
     launch = consume_desktop_bootstrap(Path(bootstrap_path))
-    verify_desktop_parent_identity(launch, inspector=inspector)
+    resolved_developer_birth_marker_reader = (
+        developer_birth_marker_reader or read_developer_macos_process_birth_marker
+    )
+    verify_desktop_parent_identity(
+        launch,
+        inspector=inspector,
+        developer_birth_marker_reader=resolved_developer_birth_marker_reader,
+    )
     verified_manifest_digest = verify_resource_manifest_binding(
         launch,
         manifest_path=manifest_path or resolve_resource_manifest_path(),
@@ -450,6 +462,11 @@ async def run_desktop_sidecar(
             management="desktop",
             base_url=base_url,
             launch_nonce=launch.launch_nonce,
+        )
+        identity = bind_developer_runtime_identity(
+            launch,
+            identity,
+            developer_birth_marker_reader=resolved_developer_birth_marker_reader,
         )
         if (
             identity.profile_id != launch.profile_id
@@ -600,6 +617,7 @@ def verify_desktop_parent_identity(
     actual_parent_pid: int | None = None,
     current_pid: int | None = None,
     inspector: LeaseProcessInspector,
+    developer_birth_marker_reader: DeveloperBirthMarkerReader | None = None,
 ) -> LeaseProcessSnapshot:
     """Verify that the live parent matches the bootstrap's birth-bound identity."""
 
@@ -609,19 +627,102 @@ def verify_desktop_parent_identity(
     own_pid = os.getpid() if current_pid is None else current_pid
     parent = inspector(launch.parent_pid)
     current = inspector(own_pid)
+    resolved_developer_birth_marker_reader = (
+        developer_birth_marker_reader or read_developer_macos_process_birth_marker
+    )
+    observed_parent_birth_marker = (
+        resolved_developer_birth_marker_reader(launch.parent_pid)
+        if launch.assurance_mode == "developer"
+        else (parent.process_birth_marker if parent is not None else None)
+    )
     if (
         parent is None
         or current is None
         or parent.pid != launch.parent_pid
         or current.pid != own_pid
+        or observed_parent_birth_marker is None
         or not secrets.compare_digest(
-            parent.process_birth_marker,
+            observed_parent_birth_marker,
             launch.parent_birth_marker,
         )
         or not secrets.compare_digest(parent.owner_digest, current.owner_digest)
     ):
         raise RuntimeError("desktop_parent_identity_unverified")
     return parent
+
+
+def read_developer_macos_process_birth_marker(pid: int) -> str | None:
+    """Read the developer-only, ps-derived macOS birth marker used by Electron."""
+
+    if sys.platform != "darwin" or isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 - absolute trusted system binary
+            [
+                "/bin/ps",
+                "-ww",
+                "-p",
+                str(pid),
+                "-o",
+                "uid=",
+                "-o",
+                "lstart=",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > 16 * 1024:
+        return None
+    try:
+        parts = completed.stdout.decode("utf-8").strip().split()
+        if len(parts) != 6 or not parts[0].isdigit():
+            return None
+        birth = datetime.strptime(
+            " ".join(parts[1:]),
+            "%a %b %d %H:%M:%S %Y",
+        )
+        birth_milliseconds = int(birth.timestamp() * 1000)
+    except (UnicodeDecodeError, ValueError, OverflowError, OSError):
+        return None
+    if birth_milliseconds <= 0:
+        return None
+    return f"developer-ps-lstart-ms:{birth_milliseconds}"
+
+
+def bind_developer_runtime_identity(
+    launch: DesktopLaunchConfig,
+    identity: RuntimeLeaseIdentity,
+    *,
+    developer_birth_marker_reader: DeveloperBirthMarkerReader = (
+        read_developer_macos_process_birth_marker
+    ),
+) -> RuntimeLeaseIdentity:
+    """Use the shared developer marker without weakening release identities."""
+
+    if launch.assurance_mode == "release":
+        return identity
+    marker = developer_birth_marker_reader(identity.pid)
+    prefix = "developer-ps-lstart-ms:"
+    marker_value = marker.removeprefix(prefix) if marker is not None else ""
+    if (
+        marker is None
+        or not marker.startswith(prefix)
+        or not marker_value.isdigit()
+        or int(marker_value) <= 0
+    ):
+        raise RuntimeError("developer_runtime_identity_unverified")
+    return replace(identity, process_birth_marker=marker)
 
 
 def verify_resource_manifest_binding(
@@ -635,9 +736,21 @@ def verify_resource_manifest_binding(
         launch.resource_manifest_digest,
         "resource_manifest_digest",
     )
-    actual = f"sha256:{_verified_file_digest(manifest_path)}"
+    manifest_bytes = _verified_file_bytes(manifest_path)
+    actual = f"sha256:{sha256(manifest_bytes).hexdigest()}"
     if not secrets.compare_digest(actual, expected):
         raise RuntimeError("resource_manifest_digest_mismatch")
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("resource_manifest_identity_invalid") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("resource_manifest_identity_invalid")
+    build_mode = manifest.get("build_mode")
+    if build_mode not in {"developer", "release"}:
+        raise RuntimeError("resource_manifest_identity_invalid")
+    if not secrets.compare_digest(build_mode, launch.assurance_mode):
+        raise RuntimeError("resource_manifest_assurance_mode_mismatch")
     return actual
 
 
@@ -772,11 +885,13 @@ def remove_owned_desktop_readiness(
     return True
 
 
-def _verified_file_digest(path: Path) -> str:
+def _verified_file_bytes(path: Path) -> bytes:
     target = Path(path)
     before_open = os.lstat(target)
     if is_link_or_reparse_point(before_open) or not stat.S_ISREG(before_open.st_mode):
         raise RuntimeError("resource_manifest_must_be_a_regular_file")
+    if before_open.st_size > _MAX_RESOURCE_MANIFEST_BYTES:
+        raise RuntimeError("resource_manifest_too_large")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(target, flags)
     try:
@@ -791,15 +906,21 @@ def _verified_file_digest(path: Path) -> str:
             or not os.path.samestat(opened, after_open)
         ):
             raise RuntimeError("resource_manifest_changed_during_verification")
-        digest = sha256()
+        if opened.st_size > _MAX_RESOURCE_MANIFEST_BYTES:
+            raise RuntimeError("resource_manifest_too_large")
+        chunks: list[bytes] = []
+        byte_count = 0
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+                byte_count += len(chunk)
+                if byte_count > _MAX_RESOURCE_MANIFEST_BYTES:
+                    raise RuntimeError("resource_manifest_too_large")
+                chunks.append(chunk)
         final = os.lstat(target)
         if is_link_or_reparse_point(final) or not os.path.samestat(after_open, final):
             raise RuntimeError("resource_manifest_changed_during_verification")
-        return digest.hexdigest()
+        return b"".join(chunks)
     finally:
         if descriptor >= 0:
             os.close(descriptor)

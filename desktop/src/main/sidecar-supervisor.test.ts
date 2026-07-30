@@ -744,6 +744,83 @@ describe("verified sidecar supervisor", () => {
     expect(spawner.children).toHaveLength(0);
   });
 
+  it("binds developer bootstrap mode to immutable manifest metadata and uses only retained-child inspection", async () => {
+    const developerResources = verifiedResources();
+    developerResources.manifest.build_mode = "developer";
+    developerResources.manifest.key_id = "developer";
+    const assuranceModes: string[] = [];
+    const retainedPids: number[] = [];
+    const { supervisor } = harness({
+      verifyResources: async () => developerResources,
+      createLaunchFiles: async (input) => {
+        assuranceModes.push(input.assuranceMode ?? "missing");
+        return {
+          bootstrapPath: "/profile/runtime/bootstrap.json",
+          readinessPath: "/profile/runtime/desktop-readiness.json",
+          failurePath: "/profile/runtime/desktop-failure.json",
+          launchNonce,
+          launchNonceDigest,
+          apiToken,
+          profile: input.profile,
+          cleanup: async () => undefined
+        };
+      },
+      inspectRetainedChild: async (child, expectedDigest) => {
+        const pid = child.pid;
+        if (pid === undefined) {
+          throw new Error("missing child PID");
+        }
+        retainedPids.push(pid);
+        return {
+          pid,
+          processBirthMarker: `birth-${pid}`,
+          executableDigest: expectedDigest
+        };
+      },
+      inspectProcess: async () => {
+        throw new Error("PID-only child inspection must not run");
+      }
+    });
+
+    await supervisor.start();
+
+    expect(assuranceModes).toEqual(["developer"]);
+    expect(retainedPids).toEqual([9100, 9100]);
+  });
+
+  it("never falls back to PID-only termination evidence for a developer retained child", async () => {
+    let retainedIdentityAvailable = true;
+    const { supervisor, spawner } = harness({
+      inspectRetainedChild: async (child, expectedDigest) => {
+        const pid = child.pid;
+        if (!retainedIdentityAvailable || pid === undefined) {
+          return null;
+        }
+        return {
+          pid,
+          processBirthMarker: `birth-${pid}`,
+          executableDigest: expectedDigest
+        };
+      },
+      inspectProcess: async (pid) => ({
+        pid,
+        processBirthMarker: `birth-${pid}`,
+        executableDigest
+      }),
+      requestShutdown: async () => {
+        retainedIdentityAvailable = false;
+        throw new Error("shutdown_unavailable");
+      },
+      waitForExit: async () => false
+    });
+    await supervisor.start();
+
+    await expect(supervisor.stop()).rejects.toThrow(
+      "sidecar_termination_identity_unverified"
+    );
+    expect(spawner.children[0]?.killSignals).toEqual([]);
+  });
+
   it("uses the exact executable and sole bootstrap argv with a secret-free environment", async () => {
     const { supervisor, spawner } = harness();
 

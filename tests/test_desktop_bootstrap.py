@@ -39,6 +39,7 @@ def _bootstrap_payload(
         "parent_pid": 4242,
         "parent_birth_marker": "desktop-parent-birth-marker",
         "resource_manifest_digest": "sha256:" + ("a" * 64),
+        "assurance_mode": "release",
         "memory_layers": list(_MEMORY_LAYERS),
     }
 
@@ -56,6 +57,7 @@ def test_bootstrap_consumes_private_file_without_leaking_secrets(tmp_path: Path)
 
     assert launch.api_token == "desktop-secret-token"
     assert launch.launch_nonce_matches("launch-nonce")
+    assert launch.assurance_mode == "release"
     assert not launch.launch_nonce_matches("wrong-nonce")
     assert not path.exists()
     assert "desktop-secret-token" not in repr(launch)
@@ -116,6 +118,7 @@ def test_bootstrap_rejects_non_owner_only_permissions(tmp_path: Path) -> None:
         ),
         ({"memory_layers": _MEMORY_LAYERS[:-1]}, "six default"),
         ({"parent_pid": True}, "parent_pid"),
+        ({"assurance_mode": "test"}, "assurance_mode"),
     ],
 )
 def test_bootstrap_rejects_non_strict_schema(
