@@ -52,6 +52,17 @@ function eventFor(
   };
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
+
 function harness(
   overrides: Partial<{
     submit(valueBytes: Uint8Array): Promise<void>;
@@ -336,6 +347,201 @@ describe("credential-only main IPC", () => {
       });
     }
     expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("scrubs accessible rejected submit views without getters or recursive mutation", async () => {
+    const { webContents, handlers, submit } = harness();
+    const handler = handlers.get(
+      DESKTOP_CREDENTIAL_IPC_CHANNELS.submit
+    )!;
+    const cases: Array<{
+      name: string;
+      event: CredentialIpcEvent;
+      request: unknown;
+      scrubbed: Uint8Array;
+      untouched?: Uint8Array;
+      getter?: ReturnType<typeof vi.fn>;
+    }> = [];
+    const add = (
+      name: string,
+      request: unknown,
+      scrubbed: Uint8Array,
+      event = eventFor(webContents),
+      untouched?: Uint8Array
+    ): void => {
+      cases.push({
+        name,
+        event,
+        request,
+        scrubbed,
+        untouched
+      });
+    };
+
+    const wrongSenderBytes = new Uint8Array([11, 12]);
+    add(
+      "wrong sender",
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: wrongSenderBytes
+      },
+      wrongSenderBytes,
+      eventFor(new FakeWebContents(webContents.id))
+    );
+    const wrongSchemaBytes = new Uint8Array([21, 22]);
+    add(
+      "wrong schema",
+      {
+        schema: "kestrel.credential.submit.v0",
+        valueBytes: wrongSchemaBytes
+      },
+      wrongSchemaBytes
+    );
+    const unrelated = new Uint8Array([31, 32]);
+    const extraBytes = new Uint8Array([33, 34]);
+    add(
+      "extra key",
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: extraBytes,
+        extra: { nested: unrelated }
+      },
+      extraBytes,
+      eventFor(webContents),
+      unrelated
+    );
+    const symbolBytes = new Uint8Array([41, 42]);
+    add(
+      "symbol key",
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: symbolBytes,
+        [Symbol("extra")]: true
+      },
+      symbolBytes
+    );
+    const prototypeBytes = new Uint8Array([51, 52]);
+    add(
+      "custom prototype",
+      Object.assign(Object.create({ inherited: true }), {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: prototypeBytes
+      }),
+      prototypeBytes
+    );
+    const oversizedBytes = new Uint8Array(16_385);
+    oversizedBytes.fill(61);
+    add(
+      "oversized",
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: oversizedBytes
+      },
+      oversizedBytes
+    );
+    const buffer = Buffer.from([71, 72]);
+    add(
+      "Buffer",
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: buffer
+      },
+      buffer
+    );
+    const dataViewBacking = new Uint8Array([81, 82]);
+    add(
+      "DataView",
+      {
+        schema: "kestrel.credential.submit.v1",
+        valueBytes: new DataView(dataViewBacking.buffer)
+      },
+      dataViewBacking
+    );
+    const getterBytes = new Uint8Array([91, 92]);
+    const getter = vi.fn(() => getterBytes);
+    const accessor = Object.defineProperty(
+      {
+        schema: "kestrel.credential.submit.v1"
+      },
+      "valueBytes",
+      {
+        enumerable: true,
+        get: getter
+      }
+    );
+    cases.push({
+      name: "accessor",
+      event: eventFor(webContents),
+      request: accessor,
+      scrubbed: getterBytes,
+      untouched: getterBytes,
+      getter
+    });
+
+    for (const rejected of cases) {
+      const response = await handler(
+        rejected.event,
+        rejected.request
+      );
+      expect(
+        response,
+        rejected.name
+      ).toMatchObject({ ok: false });
+      if (rejected.name === "accessor") {
+        expect(rejected.getter).not.toHaveBeenCalled();
+      } else {
+        expect(
+          [...rejected.scrubbed].every(
+            (value) => value === 0
+          ),
+          rejected.name
+        ).toBe(true);
+      }
+      if (rejected.untouched !== undefined) {
+        expect(
+          [...rejected.untouched].some(
+            (value) => value !== 0
+          ),
+          `${rejected.name} unrelated data`
+        ).toBe(true);
+      }
+    }
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("scrubs the structured-clone input immediately after making the owned copy", async () => {
+    const pending = deferred<void>();
+    let received: Uint8Array | undefined;
+    const { webContents, handlers } = harness({
+      submit: async (valueBytes) => {
+        received = valueBytes;
+        await pending.promise;
+      }
+    });
+    const sent = new TextEncoder().encode(
+      "ipc-immediate-private"
+    );
+    const response = handlers.get(
+      DESKTOP_CREDENTIAL_IPC_CHANNELS.submit
+    )!(eventFor(webContents), {
+      schema: "kestrel.credential.submit.v1",
+      valueBytes: sent
+    });
+
+    await Promise.resolve();
+    expect([...sent].every((value) => value === 0)).toBe(true);
+    expect(new TextDecoder().decode(received)).toBe(
+      "ipc-immediate-private"
+    );
+
+    pending.resolve();
+    await expect(response).resolves.toEqual({
+      ok: true,
+      value: { status: "stored" }
+    });
+    expect(
+      [...(received ?? [])].every((value) => value === 0)
+    ).toBe(true);
   });
 
   it("passes a distinct main-owned byte copy and clears both copies after success", async () => {

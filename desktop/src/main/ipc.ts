@@ -691,6 +691,47 @@ function exactCredentialSubmitBytes(
   return valueBytes;
 }
 
+function scrubCredentialSubmitViews(
+  rawRequest: unknown
+): void {
+  if (
+    typeof rawRequest !== "object" ||
+    rawRequest === null
+  ) {
+    return;
+  }
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors =
+      Object.getOwnPropertyDescriptors(rawRequest);
+  } catch {
+    return;
+  }
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = Reflect.get(
+      descriptors,
+      key
+    ) as PropertyDescriptor | undefined;
+    if (
+      descriptor === undefined ||
+      !("value" in descriptor) ||
+      !ArrayBuffer.isView(descriptor.value)
+    ) {
+      continue;
+    }
+    const view = descriptor.value;
+    try {
+      new Uint8Array(
+        view.buffer,
+        view.byteOffset,
+        view.byteLength
+      ).fill(0);
+    } catch {
+      // Continue scrubbing other directly owned byte views.
+    }
+  }
+}
+
 export function installCredentialIpc(
   ipcMain: CredentialIpcMain,
   options: {
@@ -766,16 +807,18 @@ export function installCredentialIpc(
   ipcMain.handle(
     DESKTOP_CREDENTIAL_IPC_CHANNELS.submit,
     async (event, rawRequest) => {
-      if (!trustedSender(event)) {
-        return errorEnvelope("desktop_sender_untrusted");
-      }
-      const rendererBytes =
-        exactCredentialSubmitBytes(rawRequest);
-      if (rendererBytes === null) {
-        return errorEnvelope("invalid_desktop_request");
-      }
-      const ownedBytes = Uint8Array.from(rendererBytes);
+      let ownedBytes: Uint8Array | undefined;
       try {
+        if (!trustedSender(event)) {
+          return errorEnvelope("desktop_sender_untrusted");
+        }
+        const rendererBytes =
+          exactCredentialSubmitBytes(rawRequest);
+        if (rendererBytes === null) {
+          return errorEnvelope("invalid_desktop_request");
+        }
+        ownedBytes = Uint8Array.from(rendererBytes);
+        scrubCredentialSubmitViews(rawRequest);
         await options.submit(ownedBytes);
         return successfulEnvelope(
           desktopCredentialStoredResultSchema,
@@ -785,8 +828,8 @@ export function installCredentialIpc(
       } catch {
         return errorEnvelope("desktop_operation_failed");
       } finally {
-        ownedBytes.fill(0);
-        rendererBytes.fill(0);
+        ownedBytes?.fill(0);
+        scrubCredentialSubmitViews(rawRequest);
       }
     }
   );

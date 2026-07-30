@@ -244,6 +244,278 @@ def test_desktop_accepts_only_the_expected_native_backend_class(
     assert keyring.get_calls == []
 
 
+def test_native_backend_stays_unverified_until_an_authorized_store_succeeds(
+    tmp_path: Path,
+) -> None:
+    module = _desktop_credentials()
+    profile = tmp_path / "profile"
+    backend = _MacBackend()
+
+    selected = module.select_desktop_credentials(
+        profile,
+        platform_name="darwin",
+        load_keyring=lambda: _FakeKeyringModule(backend),
+    )
+
+    assert selected.broker is not None
+    assert selected.readiness.to_public_payload() == {
+        "schema": "kestrel.desktop_credential_readiness.v1",
+        "state": "unavailable",
+        "backend": "macOS Keychain",
+        "persistence": "none",
+        "reason": "backend_unverified",
+        "remediation": (
+            "Complete an authorized credential operation to verify "
+            "the operating system credential backend."
+        ),
+    }
+    assert backend.get_calls == []
+    assert backend.values == {}
+
+    selected.broker.store_secret(
+        name="OPENAI_API_KEY",
+        purpose="Desktop provider API key for OpenAI.",
+        value="authorized-readiness-private",
+        secret_id="openai_api_key",
+        validate=False,
+    )
+
+    assert (
+        selected.broker.desktop_readiness.to_public_payload()
+        == _readiness(
+            state="available",
+            backend="macOS Keychain",
+            persistence="persistent",
+            reason="ready",
+            remediation="No recovery needed.",
+        )
+    )
+
+
+def test_native_selection_does_not_reconcile_keyring_material_at_startup(
+    tmp_path: Path,
+) -> None:
+    module = _desktop_credentials()
+    profile = tmp_path / "profile"
+    metadata = (
+        profile
+        / "secrets"
+        / "desktop-keyring-metadata.json"
+    )
+    metadata.parent.mkdir(parents=True)
+    pending_username = "openai_api_key.v2.pending"
+    metadata.write_text(
+        json.dumps(
+            {
+                "backend": "keyring",
+                "keyring_metadata_version": 2,
+                "fingerprint_salt": "metadata-salt",
+                "keyring_pending_cleanup": {
+                    pending_username: {
+                        "secret_id": "openai_api_key",
+                        "reason": "uncommitted_version",
+                    }
+                },
+                "secrets": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = metadata.read_bytes()
+    operations: list[str] = []
+
+    def set_password(
+        _self: object,
+        _service_name: str,
+        _username: str,
+        _password: str,
+    ) -> None:
+        operations.append("set")
+
+    def get_password(
+        _self: object,
+        _service_name: str,
+        _username: str,
+    ) -> str | None:
+        operations.append("get")
+        return "startup-must-not-read-private"
+
+    def delete_password(
+        _self: object,
+        _service_name: str,
+        _username: str,
+    ) -> None:
+        operations.append("delete")
+
+    backend_type = type(
+        "Keyring",
+        (),
+        {
+            "__module__": "keyring.backends.macOS",
+            "priority": 5,
+            "set_password": set_password,
+            "get_password": get_password,
+            "delete_password": delete_password,
+        },
+    )
+
+    selected = module.select_desktop_credentials(
+        profile,
+        platform_name="darwin",
+        load_keyring=lambda: _FakeKeyringModule(
+            backend_type()
+        ),
+    )
+
+    assert selected.broker is not None
+    assert selected.readiness.reason == "backend_unverified"
+    assert operations == []
+    assert metadata.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("probe", "expected_state"),
+    [
+        (lambda: False, "session_only"),
+        (lambda: True, "unavailable"),
+        (
+            lambda: (_ for _ in ()).throw(
+                RuntimeError("availability-private-detail")
+            ),
+            "unavailable",
+        ),
+        (
+            lambda: (_ for _ in ()).throw(
+                ModuleNotFoundError("support-private-detail")
+            ),
+            "unavailable",
+        ),
+    ],
+    ids=[
+        "genuinely-absent",
+        "present-but-failing",
+        "probe-failed",
+        "probe-support-missing",
+    ],
+)
+def test_linux_session_fallback_requires_safe_absence_probe(
+    tmp_path: Path,
+    probe: Any,
+    expected_state: str,
+) -> None:
+    module = _desktop_credentials()
+
+    selected = module.select_desktop_credentials(
+        tmp_path / "profile",
+        platform_name="linux",
+        load_keyring=lambda: _FakeKeyringModule(
+            _FailBackend()
+        ),
+        linux_secret_service_probe=probe,
+        fingerprint_salt=lambda: "session-test-salt",
+    )
+
+    payload = selected.readiness.to_public_payload()
+    assert payload["state"] == expected_state
+    assert (
+        selected.broker is not None
+    ) is (expected_state == "session_only")
+    assert "private-detail" not in json.dumps(payload)
+
+
+def test_explicit_fail_backend_configuration_never_uses_session_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _desktop_credentials()
+    monkeypatch.setenv(
+        "PYTHON_KEYRING_BACKEND",
+        "keyring.backends.fail.Keyring",
+    )
+
+    selected = module.select_desktop_credentials(
+        tmp_path / "profile",
+        platform_name="linux",
+        load_keyring=lambda: _FakeKeyringModule(
+            _FailBackend()
+        ),
+        linux_secret_service_probe=lambda: False,
+    )
+
+    assert selected.broker is None
+    assert selected.readiness.state == "unavailable"
+
+
+def test_linux_secret_service_probe_only_lists_dbus_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _desktop_credentials()
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        module.Path,
+        "is_file",
+        lambda path: str(path) == "/usr/bin/gdbus",
+    )
+    monkeypatch.setattr(
+        module.os,
+        "access",
+        lambda path, mode: (
+            str(path) == "/usr/bin/gdbus"
+            and mode == module.os.X_OK
+        ),
+    )
+
+    def run(
+        command: list[str],
+        **options: object,
+    ) -> object:
+        calls.append((command, options))
+        return module.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="(['org.freedesktop.secrets'],)",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    assert module._probe_linux_secret_service() is True
+    assert [command for command, _options in calls] == [
+        [
+            "/usr/bin/gdbus",
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.DBus",
+            "--object-path",
+            "/org/freedesktop/DBus",
+            "--method",
+            method,
+        ]
+        for method in (
+            "org.freedesktop.DBus.ListNames",
+            "org.freedesktop.DBus.ListActivatableNames",
+        )
+    ]
+    assert all(
+        "org.freedesktop.secrets" not in command
+        for command, _options in calls
+    )
+    assert all(
+        options
+        == {
+            "check": False,
+            "stdout": module.subprocess.PIPE,
+            "stderr": module.subprocess.DEVNULL,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 2,
+        }
+        for _command, options in calls
+    )
+
+
 @pytest.mark.parametrize(
     ("platform_name", "expected_backend", "label"),
     [
@@ -480,6 +752,7 @@ def test_linux_without_secret_service_uses_nonpersistent_session_broker(
         profile,
         platform_name="linux",
         load_keyring=lambda: keyring,
+        linux_secret_service_probe=lambda: False,
         fingerprint_salt=lambda: "session-test-salt",
         clock=lambda: "2026-07-30T00:00:00+00:00",
     )
@@ -519,6 +792,7 @@ def test_linux_without_secret_service_uses_nonpersistent_session_broker(
         profile,
         platform_name="linux",
         load_keyring=lambda: keyring,
+        linux_secret_service_probe=lambda: False,
         fingerprint_salt=lambda: "new-session-salt",
         clock=lambda: "2026-07-30T00:01:00+00:00",
     )
@@ -626,7 +900,7 @@ def test_locked_native_vault_has_an_exact_locked_readiness(
         ("linux", _LinuxBackend(), "Linux Secret Service"),
     ],
 )
-def test_present_native_backend_probe_failure_never_downgrades_to_session(
+def test_explicit_safe_native_backend_probe_failure_is_unavailable(
     tmp_path: Path,
     platform_name: str,
     backend: object,
@@ -689,6 +963,7 @@ def test_existing_keyring_metadata_prevents_linux_session_downgrade(
         load_keyring=lambda: _FakeKeyringModule(
             _FailBackend()
         ),
+        linux_secret_service_probe=lambda: False,
     )
 
     assert selected.broker is None
@@ -705,7 +980,7 @@ def test_existing_keyring_metadata_prevents_linux_session_downgrade(
     assert metadata.read_bytes() == before
 
 
-def test_empty_keyring_records_preserve_pending_cleanup_for_reconciliation(
+def test_authorized_store_reconciles_pending_keyring_cleanup(
     tmp_path: Path,
 ) -> None:
     module = _desktop_credentials()
@@ -716,7 +991,7 @@ def test_empty_keyring_records_preserve_pending_cleanup_for_reconciliation(
         / "desktop-keyring-metadata.json"
     )
     metadata.parent.mkdir(parents=True)
-    username = "openai_api_key.v2.pending"
+    username = "stale_secret.v2.pending"
     metadata.write_text(
         json.dumps(
             {
@@ -725,7 +1000,7 @@ def test_empty_keyring_records_preserve_pending_cleanup_for_reconciliation(
                 "fingerprint_salt": "metadata-salt",
                 "keyring_pending_cleanup": {
                     username: {
-                        "secret_id": "openai_api_key",
+                        "secret_id": "stale_secret",
                         "reason": "uncommitted_version",
                     }
                 },
@@ -744,11 +1019,38 @@ def test_empty_keyring_records_preserve_pending_cleanup_for_reconciliation(
         profile,
         platform_name="darwin",
         load_keyring=lambda: keyring,
-        probe_backend=lambda candidate: candidate,
     )
 
     assert selected.broker is not None
-    reconciled = json.loads(metadata.read_text(encoding="utf-8"))
+    untouched = json.loads(metadata.read_text(encoding="utf-8"))
+    assert username in untouched["keyring_pending_cleanup"]
+    assert (
+        "kestrel.secret_broker",
+        username,
+    ) in backend.values
+    assert selected.broker.resolve("") is None
+    assert selected.broker.metadata_status(
+        "OPENAI_API_KEY"
+    )["configured"] is False
+    assert json.loads(
+        metadata.read_text(encoding="utf-8")
+    ) == untouched
+    assert (
+        "kestrel.secret_broker",
+        username,
+    ) in backend.values
+
+    selected.broker.store_secret(
+        name="OPENAI_API_KEY",
+        purpose="Desktop provider API key for OpenAI.",
+        value="replacement-private-sentinel",
+        secret_id="openai_api_key",
+        validate=False,
+    )
+
+    reconciled = json.loads(
+        metadata.read_text(encoding="utf-8")
+    )
     assert reconciled["backend"] == "keyring"
     assert reconciled["keyring_metadata_version"] == 2
     assert reconciled["keyring_pending_cleanup"] == {}
@@ -850,7 +1152,7 @@ def test_invalid_or_raw_desktop_metadata_locks_without_probe_or_mutation(
         "empty-json-backend",
     ],
 )
-def test_empty_desktop_metadata_is_safely_adopted_by_keyring(
+def test_empty_desktop_metadata_is_adopted_only_during_authorized_store(
     tmp_path: Path,
     raw_metadata: bytes,
 ) -> None:
@@ -869,21 +1171,34 @@ def test_empty_desktop_metadata_is_safely_adopted_by_keyring(
         profile,
         platform_name="darwin",
         load_keyring=lambda: keyring,
-        probe_backend=lambda candidate: candidate,
     )
 
     assert selected.readiness.to_public_payload() == _readiness(
-        state="available",
+        state="unavailable",
         backend="macOS Keychain",
-        persistence="persistent",
-        reason="ready",
-        remediation="No recovery needed.",
+        persistence="none",
+        reason="backend_unverified",
+        remediation=(
+            "Complete an authorized credential operation to verify "
+            "the operating system credential backend."
+        ),
     )
+    assert metadata.read_bytes() == raw_metadata
+    assert keyring.get_calls == []
+
+    selected.broker.store_secret(
+        name="OPENAI_API_KEY",
+        purpose="Desktop provider API key for OpenAI.",
+        value="adoption-private-sentinel",
+        secret_id="openai_api_key",
+        validate=False,
+    )
+
     adopted = json.loads(metadata.read_text(encoding="utf-8"))
     assert adopted["backend"] == "keyring"
     assert adopted["keyring_metadata_version"] == 2
-    assert adopted["secrets"] == {}
-    assert keyring.get_calls == []
+    assert set(adopted["secrets"]) == {"openai_api_key"}
+    assert selected.broker.desktop_readiness.reason == "ready"
 
 
 def test_exact_keyring_metadata_status_never_retrieves_a_value(

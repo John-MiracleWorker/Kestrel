@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -256,12 +257,70 @@ def _load_default_keyring() -> object:
     return import_module("keyring")
 
 
+def _probe_linux_secret_service() -> bool:
+    """Check D-Bus names without activating or unlocking Secret Service."""
+
+    executable = next(
+        (
+            candidate
+            for candidate in (
+                Path("/usr/bin/gdbus"),
+                Path("/bin/gdbus"),
+            )
+            if candidate.is_file()
+            and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if executable is None:
+        raise RuntimeError(
+            "linux_secret_service_probe_unavailable"
+        )
+    outputs: list[str] = []
+    for method in (
+        "org.freedesktop.DBus.ListNames",
+        "org.freedesktop.DBus.ListActivatableNames",
+    ):
+        completed = subprocess.run(  # noqa: S603
+            [
+                str(executable),
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.DBus",
+                "--object-path",
+                "/org/freedesktop/DBus",
+                "--method",
+                method,
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "linux_secret_service_probe_failed"
+            )
+        outputs.append(completed.stdout)
+    return any(
+        "org.freedesktop.secrets" in output
+        for output in outputs
+    )
+
+
 def select_desktop_credentials(
     profile_root: Path,
     *,
     platform_name: str | None = None,
     load_keyring: Callable[[], object] = _load_default_keyring,
     probe_backend: Callable[[object], object] | None = None,
+    linux_secret_service_probe: Callable[[], bool] | None = (
+        _probe_linux_secret_service
+    ),
     fingerprint_salt: Callable[[], str] | None = None,
     clock: Callable[[], str] = utc_now,
 ) -> DesktopCredentialSelection:
@@ -351,6 +410,34 @@ def select_desktop_credentials(
         platform == "linux"
         and _class_identity(backend) == _FAIL_IDENTITY
     ):
+        explicitly_configured = bool(
+            os.getenv("PYTHON_KEYRING_BACKEND", "").strip()
+        )
+        try:
+            service_present = (
+                linux_secret_service_probe()
+                if (
+                    linux_secret_service_probe is not None
+                    and not explicitly_configured
+                )
+                else None
+            )
+        except Exception:
+            service_present = None
+        if service_present is not False:
+            return DesktopCredentialSelection(
+                broker=None,
+                readiness=_readiness(
+                    "unavailable",
+                    backend="Linux Secret Service",
+                    persistence="none",
+                    reason="backend_probe_failed",
+                    remediation=(
+                        "Repair or unlock the operating system "
+                        "credential backend."
+                    ),
+                ),
+            )
         if metadata_state == "keyring":
             return DesktopCredentialSelection(
                 broker=None,
@@ -407,14 +494,70 @@ def select_desktop_credentials(
             ),
         )
 
-    try:
-        if probe_backend is not None:
+    unverified_readiness = _readiness(
+        "unavailable",
+        backend=expected_label,
+        persistence="none",
+        reason="backend_unverified",
+        remediation=(
+            "Complete an authorized credential operation to verify "
+            "the operating system credential backend."
+        ),
+    )
+    ready_readiness = _readiness(
+        "available",
+        backend=expected_label,
+        persistence="persistent",
+        reason="ready",
+        remediation="No recovery needed.",
+    )
+    initial_readiness = unverified_readiness
+    if probe_backend is not None:
+        try:
             probe_backend(selected_backend)
-        if metadata_state == "empty" and metadata_path.exists():
-            metadata_path.write_text("{}\n", encoding="utf-8")
+        except Exception as exc:
+            if _is_locked_error(exc):
+                return DesktopCredentialSelection(
+                    broker=None,
+                    readiness=_readiness(
+                        "locked_vault_required",
+                        backend=expected_label,
+                        persistence="none",
+                        reason="vault_locked",
+                        remediation=(
+                            "Unlock the operating system credential "
+                            "store and retry."
+                        ),
+                    ),
+                )
+            return DesktopCredentialSelection(
+                broker=None,
+                readiness=_readiness(
+                    "unavailable",
+                    backend=expected_label,
+                    persistence="none",
+                    reason="backend_probe_failed",
+                    remediation=(
+                        "Repair or unlock the operating system "
+                        "credential backend."
+                    ),
+                ),
+            )
+        initial_readiness = ready_readiness
+    keyring_broker: KeyringSecretBroker | None = None
+
+    def publish_ready() -> None:
+        if keyring_broker is not None:
+            keyring_broker.desktop_readiness = (
+                ready_readiness
+            )
+
+    try:
         keyring_broker = KeyringSecretBroker(
             metadata_path,
             keyring=cast(_KeyringBackend, selected_backend),
+            reconcile_on_init=False,
+            on_live_operation_success=publish_ready,
         )
     except Exception as exc:
         if _is_locked_error(exc):
@@ -443,17 +586,10 @@ def select_desktop_credentials(
             ),
         )
 
-    readiness = _readiness(
-        "available",
-        backend=expected_label,
-        persistence="persistent",
-        reason="ready",
-        remediation="No recovery needed.",
-    )
-    keyring_broker.desktop_readiness = readiness
+    keyring_broker.desktop_readiness = initial_readiness
     return DesktopCredentialSelection(
         broker=keyring_broker,
-        readiness=readiness,
+        readiness=initial_readiness,
     )
 
 

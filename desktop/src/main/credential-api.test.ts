@@ -79,6 +79,17 @@ function jsonResponse(
   });
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
+
 describe("main-owned Desktop credential API", () => {
   it("derives the exact cross-language HMAC capability vector", async () => {
     const fixture = JSON.parse(
@@ -261,6 +272,172 @@ describe("main-owned Desktop credential API", () => {
       ).toBe(true);
     }
   });
+
+  it("propagates abort to fetch and promptly scrubs bytes when fetch ignores abort", async () => {
+    const fetchResult = deferred<Response>();
+    const abortController = new AbortController();
+    const input = new TextEncoder().encode(
+      "abort-private-sentinel"
+    );
+    let capturedBody: Uint8Array | undefined;
+    let capturedSignal: AbortSignal | null | undefined;
+    const fetch = vi.fn(
+      async (_url: string, init: RequestInit) => {
+        capturedBody = init.body as Uint8Array;
+        capturedSignal = init.signal;
+        return fetchResult.promise;
+      }
+    );
+    const client = createDesktopCredentialApiClient({
+      readAuthority: () => authority(),
+      fetch
+    });
+    const request = {
+      providerId: "openai" as const,
+      expectedGeneration: 7,
+      valueBytes: input,
+      signal: abortController.signal
+    };
+    const stored = client.storeProviderCredential(request);
+    const outcome = stored.then(
+      () => "resolved",
+      () => "rejected"
+    );
+
+    await Promise.resolve();
+    abortController.abort();
+    const promptOutcome = await Promise.race([
+      outcome,
+      new Promise<"pending">((resolve) => {
+        setTimeout(() => resolve("pending"), 0);
+      })
+    ]);
+
+    try {
+      expect(capturedSignal).toBe(abortController.signal);
+      expect(promptOutcome).toBe("rejected");
+      expect(fetch).toHaveBeenCalledOnce();
+      expect([...input].every((value) => value === 0)).toBe(
+        true
+      );
+      expect(
+        [...(capturedBody ?? [])].every(
+          (value) => value === 0
+        )
+      ).toBe(true);
+    } finally {
+      fetchResult.resolve(jsonResponse(serverMetadata("openai")));
+      await stored.catch(() => undefined);
+    }
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["falsified-small", "1"]
+  ])(
+    "cancels an oversized streamed response with %s Content-Length",
+    async (_name, contentLength) => {
+      let streamController:
+        | ReadableStreamDefaultController<Uint8Array>
+        | undefined;
+      let cancelled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue(
+            new Uint8Array(32 * 1024 + 1).fill(32)
+          );
+        },
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const headers =
+        contentLength === undefined
+          ? undefined
+          : { "Content-Length": contentLength };
+      const fetch = vi.fn(
+        async () =>
+          new Response(stream, {
+            status: 200,
+            headers
+          })
+      );
+      const client = createDesktopCredentialApiClient({
+        readAuthority: () => authority(),
+        fetch
+      });
+      const stored = client.storeProviderCredential({
+        providerId: "openai",
+        expectedGeneration: 7,
+        valueBytes: new TextEncoder().encode(
+          `stream-${_name}-private`
+        )
+      });
+      const outcome = stored.then(
+        () => "resolved",
+        () => "rejected"
+      );
+
+      const promptOutcome = await Promise.race([
+        outcome,
+        new Promise<"pending">((resolve) => {
+          setTimeout(() => resolve("pending"), 0);
+        })
+      ]);
+
+      try {
+        expect(promptOutcome).toBe("rejected");
+        expect(cancelled).toBe(true);
+        expect(fetch).toHaveBeenCalledOnce();
+      } finally {
+        if (!cancelled) {
+          streamController?.close();
+        }
+        await stored.catch(() => undefined);
+      }
+    }
+  );
+
+  it.each([
+    ["invalid", "not-a-number"],
+    ["declared-oversize", String(32 * 1024 + 1)]
+  ])(
+    "cancels the response body for %s Content-Length without retry",
+    async (_name, contentLength) => {
+      let cancelled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        }
+      });
+      const fetch = vi.fn(
+        async () =>
+          new Response(stream, {
+            status: 200,
+            headers: { "Content-Length": contentLength }
+          })
+      );
+      const client = createDesktopCredentialApiClient({
+        readAuthority: () => authority(),
+        fetch
+      });
+
+      await expect(
+        client.storeProviderCredential({
+          providerId: "openai",
+          expectedGeneration: 7,
+          valueBytes: new TextEncoder().encode(
+            `header-${_name}-private`
+          )
+        })
+      ).rejects.toEqual({
+        code: "desktop_operation_ambiguous"
+      });
+      expect(cancelled).toBe(true);
+      expect(fetch).toHaveBeenCalledOnce();
+    }
+  );
 
   it("treats mismatched or secret-bearing post-dispatch metadata as ambiguous", async () => {
     const invalidResponses = [

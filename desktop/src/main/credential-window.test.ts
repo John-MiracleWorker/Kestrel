@@ -209,7 +209,8 @@ describe("one-shot credential dialog controller", () => {
     expect(storeProviderCredential).toHaveBeenCalledWith({
       providerId: "openai",
       expectedGeneration: 7,
-      valueBytes: firstBytes
+      valueBytes: firstBytes,
+      signal: expect.any(AbortSignal)
     });
     stored.resolve({
       status: "stored",
@@ -248,9 +249,13 @@ describe("one-shot credential dialog controller", () => {
     });
 
     const result = controller.open(intent);
-    await callbacks!.onSubmit(
-      new TextEncoder().encode("ambiguous-private")
-    );
+    await expect(
+      callbacks!.onSubmit(
+        new TextEncoder().encode("ambiguous-private")
+      )
+    ).rejects.toEqual({
+      code: "desktop_operation_ambiguous"
+    });
 
     await expect(result).rejects.toEqual({
       code: "desktop_operation_ambiguous"
@@ -338,7 +343,8 @@ describe("one-shot credential dialog controller", () => {
     expect(storeProviderCredential).toHaveBeenCalledWith({
       providerId: "openai",
       expectedGeneration: 7,
-      valueBytes: expect.any(Uint8Array)
+      valueBytes: expect.any(Uint8Array),
+      signal: expect.any(AbortSignal)
     });
     stored.resolve({
       status: "stored",
@@ -401,6 +407,98 @@ describe("one-shot credential dialog controller", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(cancelTimeout).toHaveBeenCalledWith(91);
   });
+
+  it.each(["timeout", "deactivation", "abort"] as const)(
+    "aborts and scrubs tracked request bytes before %s settlement",
+    async (terminal) => {
+    let callbacks: CredentialModalCallbacks | undefined;
+    let timeoutCallback: (() => void) | undefined;
+    let deactivationCallback:
+      | ((generation: number) => void)
+      | undefined;
+    let captured:
+      | {
+          valueBytes: Uint8Array;
+          signal?: AbortSignal;
+        }
+      | undefined;
+    const pending = deferred<{
+      status: "stored";
+      secretRef: string;
+      validation: "unverified";
+      fingerprint: string;
+    }>();
+    const controller = createCredentialDialogController({
+      currentGeneration: () => 7,
+      openModal: (
+        _intent: DesktopCredentialIntent,
+        nextCallbacks: CredentialModalCallbacks
+      ) => {
+        callbacks = nextCallbacks;
+        return {
+          close: vi.fn(),
+          preventOwnerClose: vi.fn()
+        };
+      },
+      storeProviderCredential: (request) => {
+        captured = {
+          valueBytes: request.valueBytes,
+          signal: (
+            request as typeof request & {
+              signal?: AbortSignal;
+            }
+          ).signal
+        };
+        return pending.promise;
+      },
+      enterReconciliationRequired: vi.fn(),
+      scheduleTimeout: (callback: () => void) => {
+        timeoutCallback = callback;
+        return 92;
+      },
+      subscribeDeactivation: (listener) => {
+        deactivationCallback = listener;
+        return vi.fn();
+      }
+    });
+    const result = controller.open(intent);
+    const submitted = new TextEncoder().encode(
+      "timeout-zeroize-private"
+    );
+    const submission = callbacks!.onSubmit(submitted);
+
+    if (terminal === "timeout") {
+      timeoutCallback?.();
+    } else if (terminal === "deactivation") {
+      deactivationCallback?.(7);
+    } else {
+      controller.abort();
+    }
+    await expect(result).rejects.toEqual({
+      code: "desktop_operation_ambiguous"
+    });
+
+    expect(captured?.signal?.aborted).toBe(true);
+    expect(
+      [...submitted].every((value) => value === 0)
+    ).toBe(true);
+    expect(
+      [...(captured?.valueBytes ?? [])].every(
+        (value) => value === 0
+      )
+    ).toBe(true);
+
+    pending.resolve({
+      status: "stored",
+      secretRef: "secret://openai_api_key",
+      validation: "unverified",
+      fingerprint: "sha256:0123456789ab"
+    });
+    await expect(submission).rejects.toEqual({
+      code: "desktop_operation_ambiguous"
+    });
+    }
+  );
 
   it("treats authority deactivation during dispatch as ambiguous and unsubscribes once", async () => {
     let callbacks: CredentialModalCallbacks | undefined;

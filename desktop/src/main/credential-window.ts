@@ -154,6 +154,7 @@ interface CredentialDialogDependencies {
     providerId: DesktopCredentialProviderId;
     expectedGeneration: number;
     valueBytes: Uint8Array;
+    signal: AbortSignal;
   }): Promise<StoredCredential>;
   enterReconciliationRequired(): void;
   scheduleTimeout?(
@@ -212,6 +213,8 @@ export function createCredentialDialogController(
         unsubscribe(): void;
         cleaned: boolean;
         recoveryEntered: boolean;
+        abortController: AbortController;
+        valueBytes?: Uint8Array;
       }
     | undefined;
 
@@ -232,6 +235,13 @@ export function createCredentialDialogController(
     } catch {
       // Cleanup remains terminal even if the native window already died.
     }
+  };
+
+  const scrubTrackedBytes = (
+    operation: NonNullable<typeof active>
+  ): void => {
+    operation.valueBytes?.fill(0);
+    operation.valueBytes = undefined;
   };
 
   const enterAmbiguousRecovery = (
@@ -260,6 +270,7 @@ export function createCredentialDialogController(
     }
     operation.state = "settled";
     active = undefined;
+    scrubTrackedBytes(operation);
     cleanup(operation);
     operation.resolve(Object.freeze(result));
   };
@@ -274,11 +285,17 @@ export function createCredentialDialogController(
     ) {
       return;
     }
+    const wasSubmitting =
+      operation.state === "submitting";
     operation.state = "settled";
     if (code === "desktop_operation_ambiguous") {
       enterAmbiguousRecovery(operation);
     }
+    if (wasSubmitting) {
+      operation.abortController.abort();
+    }
     active = undefined;
+    scrubTrackedBytes(operation);
     cleanup(operation);
     operation.reject(fixedError(code));
   };
@@ -322,7 +339,9 @@ export function createCredentialDialogController(
         timeout: undefined as unknown,
         unsubscribe: (() => undefined) as () => void,
         cleaned: false,
-        recoveryEntered: false
+        recoveryEntered: false,
+        abortController: new AbortController(),
+        valueBytes: undefined as Uint8Array | undefined
       };
       const callbacks: CredentialModalCallbacks = {
         onSubmit: async (valueBytes) => {
@@ -334,33 +353,55 @@ export function createCredentialDialogController(
             return;
           }
           operation.state = "submitting";
+          operation.valueBytes = valueBytes;
           try {
             operation.modal.preventOwnerClose();
           } catch {
-            valueBytes.fill(0);
             settleError(
               operation,
               "desktop_operation_failed"
             );
-            return;
+            throw fixedError("desktop_operation_failed");
           }
           try {
             const stored =
               await dependencies.storeProviderCredential({
                 providerId: intent.providerId,
                 expectedGeneration: operation.generation,
-                valueBytes
+                valueBytes,
+                signal: operation.abortController.signal
               });
+            if (
+              active !== operation ||
+              operation.state !== "submitting"
+            ) {
+              throw fixedError(
+                "desktop_operation_ambiguous"
+              );
+            }
             settleResult(operation, stored);
           } catch (error) {
+            const code = exactAmbiguousError(error)
+              ? "desktop_operation_ambiguous"
+              : "desktop_operation_failed";
+            const stillActive =
+              active === operation &&
+              operation.state === "submitting";
             settleError(
               operation,
-              exactAmbiguousError(error)
-                ? "desktop_operation_ambiguous"
-                : "desktop_operation_failed"
+              code
             );
+            if (!stillActive) {
+              throw fixedError(
+                "desktop_operation_ambiguous"
+              );
+            }
+            throw fixedError(code);
           } finally {
             valueBytes.fill(0);
+            if (operation.valueBytes === valueBytes) {
+              operation.valueBytes = undefined;
+            }
           }
         },
         onCancel: () => {

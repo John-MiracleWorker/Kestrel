@@ -40,6 +40,7 @@ export interface DesktopCredentialApiClient {
     providerId: DesktopCredentialProviderId;
     expectedGeneration: number;
     valueBytes: Uint8Array;
+    signal?: AbortSignal;
   }): Promise<Extract<DesktopCredentialResult, { status: "stored" }>>;
 }
 
@@ -207,26 +208,120 @@ function serverMetadataSchema(
     .strict();
 }
 
-async function boundedJson(response: Response): Promise<unknown> {
+function cancelResponseBody(response: Response): void {
+  try {
+    const cancellation = response.body?.cancel();
+    if (cancellation !== undefined) {
+      void cancellation.catch(() => undefined);
+    }
+  } catch {
+    // Invalid responses remain fixed even if stream cancellation fails.
+  }
+}
+
+function awaitWithAbort<T>(
+  pending: Promise<T>,
+  signal: AbortSignal | undefined
+): Promise<T> {
+  if (signal === undefined) {
+    return pending;
+  }
+  if (signal.aborted) {
+    return Promise.reject(
+      fixedError("desktop_operation_ambiguous")
+    );
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (
+      callback: () => void
+    ): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => {
+      finish(() => {
+        reject(fixedError("desktop_operation_ambiguous"));
+      });
+    };
+    signal.addEventListener("abort", onAbort, {
+      once: true
+    });
+    pending.then(
+      (value) => {
+        finish(() => {
+          resolve(value);
+        });
+      },
+      (error: unknown) => {
+        finish(() => {
+          reject(error);
+        });
+      }
+    );
+  });
+}
+
+async function boundedJson(
+  response: Response,
+  signal: AbortSignal | undefined
+): Promise<unknown> {
   const contentLength = response.headers.get("Content-Length");
   if (
     contentLength !== null &&
     (!/^\d+$/.test(contentLength) ||
       Number(contentLength) > CREDENTIAL_RESPONSE_BYTES)
   ) {
+    cancelResponseBody(response);
     throw fixedError("invalid_desktop_response");
   }
-  const text = await response.text();
-  if (
-    Buffer.byteLength(text, "utf8") >
-    CREDENTIAL_RESPONSE_BYTES
-  ) {
+  const body = response.body;
+  if (body === null) {
     throw fixedError("invalid_desktop_response");
   }
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8", {
+    fatal: true
+  });
+  let totalBytes = 0;
+  let text = "";
   try {
+    while (true) {
+      const part = await awaitWithAbort(
+        reader.read(),
+        signal
+      );
+      if (part.done) {
+        break;
+      }
+      if (!(part.value instanceof Uint8Array)) {
+        void reader.cancel().catch(() => undefined);
+        throw fixedError("invalid_desktop_response");
+      }
+      totalBytes += part.value.byteLength;
+      if (totalBytes > CREDENTIAL_RESPONSE_BYTES) {
+        void reader.cancel().catch(() => undefined);
+        throw fixedError("invalid_desktop_response");
+      }
+      text += decoder.decode(part.value, {
+        stream: true
+      });
+    }
+    text += decoder.decode();
     return JSON.parse(text);
   } catch {
+    try {
+      void reader.cancel().catch(() => undefined);
+    } catch {
+      // The fixed response error still wins.
+    }
     throw fixedError("invalid_desktop_response");
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -260,7 +355,18 @@ export function createDesktopCredentialApiClient(options: {
       }
       const body = Uint8Array.from(input);
       let dispatched = false;
+      const signal = request.signal;
+      const scrubOnAbort = (): void => {
+        body.fill(0);
+        input.fill(0);
+      };
+      signal?.addEventListener("abort", scrubOnAbort, {
+        once: true
+      });
       try {
+        if (signal?.aborted === true) {
+          throw fixedError("desktop_operation_failed");
+        }
         const initial = exactAuthority(
           options.readAuthority()
         );
@@ -275,20 +381,24 @@ export function createDesktopCredentialApiClient(options: {
         dispatched = true;
         let response: Response;
         try {
-          response = await options.fetch(
-            `${initial.baseUrl}api/desktop/credentials/providers/${provider.providerId}`,
-            {
-              method: "POST",
-              redirect: "error",
-              cache: "no-store",
-              headers: {
-                Authorization: `Bearer ${initial.apiToken}`,
-                "Content-Type": "application/octet-stream",
-                "X-Kestrel-Desktop-Credential-Capability":
-                  initial.credentialCapability
-              },
-              body
-            }
+          response = await awaitWithAbort(
+            options.fetch(
+              `${initial.baseUrl}api/desktop/credentials/providers/${provider.providerId}`,
+              {
+                method: "POST",
+                redirect: "error",
+                cache: "no-store",
+                signal,
+                headers: {
+                  Authorization: `Bearer ${initial.apiToken}`,
+                  "Content-Type": "application/octet-stream",
+                  "X-Kestrel-Desktop-Credential-Capability":
+                    initial.credentialCapability
+                },
+                body
+              }
+            ),
+            signal
           );
         } catch {
           throw fixedError("desktop_operation_ambiguous");
@@ -309,6 +419,7 @@ export function createDesktopCredentialApiClient(options: {
           throw fixedError("desktop_operation_ambiguous");
         }
         if (!response.ok) {
+          cancelResponseBody(response);
           throw fixedError(
             DETERMINISTIC_REJECTION_STATUSES.has(
               response.status
@@ -324,7 +435,7 @@ export function createDesktopCredentialApiClient(options: {
           | undefined;
         try {
           parsed = serverMetadataSchema(provider).safeParse(
-            await boundedJson(response)
+            await boundedJson(response, signal)
           );
         } catch {
           throw fixedError("desktop_operation_ambiguous");
@@ -352,6 +463,10 @@ export function createDesktopCredentialApiClient(options: {
             : "desktop_operation_failed"
         );
       } finally {
+        signal?.removeEventListener(
+          "abort",
+          scrubOnAbort
+        );
         body.fill(0);
         input.fill(0);
       }

@@ -651,6 +651,45 @@ def _create_app(
         "desktop_readiness",
         None,
     )
+
+    def current_desktop_storage_readiness() -> dict[str, object]:
+        current = getattr(
+            secret_broker,
+            "desktop_readiness",
+            None,
+        )
+        if current is None:
+            return {
+                "schema": (
+                    "kestrel.desktop_credential_readiness.v1"
+                ),
+                "state": "unavailable",
+                "backend": None,
+                "persistence": "none",
+                "reason": "metadata_invalid",
+                "remediation": (
+                    "Repair the Desktop credential readiness "
+                    "metadata and retry."
+                ),
+            }
+        try:
+            payload = current.to_public_payload()
+        except Exception:
+            return {
+                "schema": (
+                    "kestrel.desktop_credential_readiness.v1"
+                ),
+                "state": "unavailable",
+                "backend": None,
+                "persistence": "none",
+                "reason": "metadata_invalid",
+                "remediation": (
+                    "Repair the Desktop credential readiness "
+                    "metadata and retry."
+                ),
+            }
+        return dict(payload)
+
     register_product_routes(
         app,
         active_config=lambda: active_config,
@@ -665,9 +704,7 @@ def _create_app(
             else None
         ),
         credential_storage=(
-            (
-                lambda: desktop_storage_readiness.to_public_payload()
-            )
+            current_desktop_storage_readiness
             if desktop_context is not None
             and desktop_storage_readiness is not None
             else None

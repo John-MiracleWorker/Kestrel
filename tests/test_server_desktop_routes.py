@@ -12,6 +12,9 @@ import nested_memvid_agent.server as server_module
 import nested_memvid_agent.server_desktop_routes as desktop_routes
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
+from nested_memvid_agent.desktop_credentials import (
+    DesktopCredentialReadiness,
+)
 from nested_memvid_agent.secret_broker import (
     SecretBroker,
     SecretBrokerPartialCommitError,
@@ -169,6 +172,78 @@ def _credential_headers(
         ),
         "Content-Type": content_type,
     }
+
+
+def test_product_setup_reads_current_dynamic_credential_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    launch = _desktop_context(profile_root)
+    broker = _RecordingSecretBroker(
+        tmp_path / "dynamic-keyring-metadata.json"
+    )
+    broker.desktop_readiness = DesktopCredentialReadiness(
+        state="unavailable",
+        backend="macOS Keychain",
+        persistence="none",
+        reason="backend_unverified",
+        remediation=(
+            "Complete an authorized credential operation to verify "
+            "the operating system credential backend."
+        ),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "build_secret_broker",
+        lambda *_args, **_kwargs: broker,
+    )
+    app = create_app(
+        _config(profile_root),
+        desktop_context=launch,
+    )
+
+    with TestClient(app) as client:
+        initial = client.get(
+            "/api/product/setup",
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+        broker.desktop_readiness = DesktopCredentialReadiness(
+            state="available",
+            backend="macOS Keychain",
+            persistence="persistent",
+            reason="ready",
+            remediation="No recovery needed.",
+        )
+        updated = client.get(
+            "/api/product/setup",
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+        broker.desktop_readiness = None
+        missing = client.get(
+            "/api/product/setup",
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+
+    assert initial.status_code == 200
+    assert initial.json()["credential_storage"]["reason"] == (
+        "backend_unverified"
+    )
+    assert updated.status_code == 200
+    assert updated.json()["credential_storage"] == (
+        DesktopCredentialReadiness(
+            state="available",
+            backend="macOS Keychain",
+            persistence="persistent",
+            reason="ready",
+            remediation="No recovery needed.",
+        ).to_public_payload()
+    )
+    assert missing.status_code == 200
+    assert missing.json()["credential_storage"]["reason"] == (
+        "metadata_invalid"
+    )
 
 
 def test_desktop_credential_capability_matches_shared_vector() -> None:
