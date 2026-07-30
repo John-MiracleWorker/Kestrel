@@ -177,6 +177,29 @@ def test_publication_guard_categorically_rejects_developer_evidence(
         )
 
 
+def test_publication_guard_explicitly_rejects_developer_directory_smoke_receipt(
+    tmp_path: Path,
+) -> None:
+    identity, private_key, _manifest_digest = _desktop_publication_bundle(tmp_path)
+    smoke_receipt = {
+        "schema": "kestrel.desktop.directory-smoke.v1",
+        "build_mode": "developer",
+        "source_commit": "a" * 40,
+        "qualified": True,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="developer desktop directory smoke cannot be published",
+    ):
+        validate_desktop_publication_evidence(
+            tmp_path,
+            [(smoke_receipt, b"\0" * 64)],
+            expected_identity=identity,
+            trusted_public_keys={"release": private_key.public_key()},
+        )
+
+
 def test_publication_guard_accepts_only_cryptographically_bound_release_evidence(
     tmp_path: Path,
 ) -> None:

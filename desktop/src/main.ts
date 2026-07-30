@@ -68,7 +68,17 @@ import {
   createDesktopCredentialApiClient,
   credentialProviderAuthority
 } from "./main/credential-api.js";
-import { parsePackagedBuildTrust } from "./main/build-trust.js";
+import {
+  parsePackagedBuildTrust,
+  type PackagedBuildTrust
+} from "./main/build-trust.js";
+import {
+  createDirectorySmokeCycle,
+  selectDirectorySmokeRequest,
+  waitForDirectorySmokeMission,
+  type DirectorySmokeCycle,
+  type DirectorySmokeWebContents
+} from "./main/directory-smoke.js";
 import {
   createCredentialDialogController,
   createCredentialWindow,
@@ -85,16 +95,9 @@ const unavailableUpdateStatus = Object.freeze({
 } satisfies DesktopUpdateStatus);
 
 async function createPackagedSidecarSupervisor(
-  apiSession: DesktopApiSessionAuthority
+  apiSession: DesktopApiSessionAuthority,
+  buildTrust: PackagedBuildTrust
 ): Promise<SidecarSupervisor> {
-  const packageBytes = await readFile(
-    join(app.getAppPath(), "package.json")
-  );
-  const buildTrust = parsePackagedBuildTrust(packageBytes, {
-    appVersion: app.getVersion(),
-    platform: process.platform,
-    architecture: process.arch
-  });
   const resourceRoot = resolvePackagedResourceRoot(
     process.resourcesPath,
     buildTrust.resourceRootRelative
@@ -175,6 +178,17 @@ async function createPackagedSidecarSupervisor(
   );
 }
 
+async function readPackagedBuildTrust(): Promise<PackagedBuildTrust> {
+  const packageBytes = await readFile(
+    join(app.getAppPath(), "package.json")
+  );
+  return parsePackagedBuildTrust(packageBytes, {
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    architecture: process.arch
+  });
+}
+
 registerKestrelScheme(protocol);
 
 if (!app.requestSingleInstanceLock()) {
@@ -185,8 +199,12 @@ if (!app.requestSingleInstanceLock()) {
   let credentialDialog: CredentialDialogController | null = null;
   let verifiedDesktopResources: VerifiedDesktopSessionResources | null =
     null;
+  let directorySmokeRequested = false;
+  let directorySmokeCycle: DirectorySmokeCycle | null = null;
+  let directorySmokeMission: Promise<void> | null = null;
   const windows = createSingleWindowController(() => {
     const created = createAppWindow({
+      showWhenReady: !directorySmokeRequested,
       createWindow: (options) =>
         new BrowserWindow(options) as BrowserWindow & AppWindow,
       installSecurity: (webContents) => {
@@ -211,6 +229,14 @@ if (!app.requestSingleInstanceLock()) {
         );
       }
     });
+    if (directorySmokeRequested) {
+      directorySmokeMission = created.loaded.then(() =>
+        waitForDirectorySmokeMission(
+          created.window
+            .webContents as unknown as DirectorySmokeWebContents
+        )
+      );
+    }
     void created.loaded.catch(() => {
       if (!created.window.isDestroyed()) {
         created.window.destroy();
@@ -225,13 +251,13 @@ if (!app.requestSingleInstanceLock()) {
   let quitAfterStop = false;
 
   app.on("second-instance", () => {
-    if (desktopReady) {
+    if (desktopReady && !directorySmokeRequested) {
       windows.openOrFocus();
     }
   });
 
   app.on("activate", () => {
-    if (desktopReady) {
+    if (desktopReady && !directorySmokeRequested) {
       windows.openOrFocus();
     }
   });
@@ -273,7 +299,45 @@ if (!app.requestSingleInstanceLock()) {
       apiSession = installDesktopApiSession(
         defaultSession.webRequest as unknown as ApiSessionWebRequest
       );
-      supervisor = await createPackagedSidecarSupervisor(apiSession);
+      const buildTrust = await readPackagedBuildTrust();
+      directorySmokeRequested = selectDirectorySmokeRequest(
+        buildTrust,
+        process.argv
+      );
+      supervisor = await createPackagedSidecarSupervisor(
+        apiSession,
+        buildTrust
+      );
+      if (directorySmokeRequested) {
+        const userDataPath = app.getPath("userData");
+        directorySmokeCycle = createDirectorySmokeCycle({
+          userDataPath,
+          profileRoot: join(
+            userDataPath,
+            "profiles",
+            "default"
+          ),
+          sourceCommit: buildTrust.sourceCommit,
+          supervisorState: () => {
+            if (supervisor === null) {
+              throw new Error(
+                "desktop_directory_smoke_supervisor_unavailable"
+              );
+            }
+            return supervisor.state;
+          },
+          async stopSupervisor() {
+            if (supervisor === null) {
+              throw new Error(
+                "desktop_directory_smoke_supervisor_unavailable"
+              );
+            }
+            await supervisor.stopAfterAuthenticatedShutdown();
+            quitAfterStop = true;
+          },
+          quit: () => app.quit()
+        });
+      }
       const credentialClient = createDesktopCredentialApiClient({
         readAuthority: () =>
           apiSession?.credentialAuthority() ?? null,
@@ -485,7 +549,7 @@ if (!app.requestSingleInstanceLock()) {
           runtimeMarker: () => apiSession?.runtimeMarker() ?? null
         }
       );
-      await startVerifiedDesktopSession({
+      const started = await startVerifiedDesktopSession({
         async startSupervisor() {
           if (supervisor === null) {
             throw new Error("desktop_supervisor_unavailable");
@@ -504,6 +568,19 @@ if (!app.requestSingleInstanceLock()) {
           app.quit();
         }
       });
+      if (!started || !directorySmokeRequested) {
+        return;
+      }
+      if (
+        directorySmokeCycle === null ||
+        directorySmokeMission === null
+      ) {
+        throw new Error(
+          "desktop_directory_smoke_window_unavailable"
+        );
+      }
+      await directorySmokeMission;
+      await directorySmokeCycle.runAfterMissionCommandLoaded();
     })
     .catch(() => {
       app.quit();

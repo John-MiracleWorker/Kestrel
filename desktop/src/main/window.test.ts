@@ -106,6 +106,23 @@ describe("desktop renderer window", () => {
     expect(windows[0]?.showCount).toBe(1);
   });
 
+  it("loads Mission Command without ever showing it for developer directory smoke", async () => {
+    const created = createAppWindow({
+      showWhenReady: false,
+      createWindow: (options) => new FakeWindow(options),
+      installSecurity: () => undefined,
+      bindApiSession: () => undefined,
+      bindDesktopIpc: () => undefined
+    });
+
+    await created.loaded;
+    created.window.emit("ready-to-show");
+
+    expect(created.window.loadedUrls).toEqual([DESKTOP_APP_ENTRY_URL]);
+    expect(created.window.options.show).toBe(false);
+    expect(created.window.showCount).toBe(0);
+  });
+
   it("reuses and focuses the sole live window", () => {
     const windows: FakeWindow[] = [];
     const controller = createSingleWindowController(() => {

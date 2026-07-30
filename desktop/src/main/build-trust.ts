@@ -8,6 +8,10 @@ const appVersionSchema = z
   .string()
   .regex(/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/);
 const buildModeSchema = z.enum(["developer", "release"]);
+const smokeAuthoritySchema = z.enum([
+  "developer_directory_smoke_v1",
+  "disabled"
+]);
 const packagedBuildSchema = z
   .object({
     schema: z.literal("kestrel.desktop.packaged-build.v1"),
@@ -18,6 +22,7 @@ const packagedBuildSchema = z
     platform: z.enum(["darwin", "linux", "win32"]),
     architecture: z.enum(["arm64", "x64"]),
     resource_root_relative: z.literal("kestrel"),
+    smoke_authority: smokeAuthoritySchema,
     python_lock_sha256: sha256Schema,
     desktop_npm_lock_sha256: sha256Schema,
     web_npm_lock_sha256: sha256Schema,
@@ -45,6 +50,9 @@ export interface PackagedBuildTrust {
   readonly platform: "darwin" | "linux" | "win32";
   readonly architecture: "arm64" | "x64";
   readonly resourceRootRelative: "kestrel";
+  readonly smokeAuthority:
+    | "developer_directory_smoke_v1"
+    | "disabled";
   readonly pythonLockSha256: string;
   readonly desktopNpmLockSha256: string;
   readonly webNpmLockSha256: string;
@@ -86,6 +94,13 @@ export function parsePackagedBuildTrust(
     throw new Error("desktop_build_mode_key_mismatch");
   }
   if (
+    (metadata.build_mode === "developer") !==
+    (metadata.smoke_authority ===
+      "developer_directory_smoke_v1")
+  ) {
+    throw new Error("desktop_build_smoke_authority_mismatch");
+  }
+  if (
     result.data.version !== metadata.app_version ||
     runtime.appVersion !== metadata.app_version ||
     runtime.platform !== metadata.platform ||
@@ -101,6 +116,7 @@ export function parsePackagedBuildTrust(
     platform: metadata.platform,
     architecture: metadata.architecture,
     resourceRootRelative: metadata.resource_root_relative,
+    smokeAuthority: metadata.smoke_authority,
     pythonLockSha256: metadata.python_lock_sha256,
     desktopNpmLockSha256: metadata.desktop_npm_lock_sha256,
     webNpmLockSha256: metadata.web_npm_lock_sha256,

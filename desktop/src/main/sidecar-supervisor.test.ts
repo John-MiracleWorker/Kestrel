@@ -2008,6 +2008,32 @@ describe("verified sidecar supervisor", () => {
     expect(supervisor.state.kind).toBe("stopping");
   });
 
+  it("returns positive shutdown evidence only when the authenticated request was accepted", async () => {
+    const { supervisor, spawner, shutdownRequests } = harness();
+    await supervisor.start();
+
+    await supervisor.stopAfterAuthenticatedShutdown();
+
+    expect(shutdownRequests).toHaveLength(1);
+    expect(spawner.children[0]?.exitCode).toBe(0);
+  });
+
+  it("rejects qualification when the child exits but authenticated shutdown was not accepted", async () => {
+    let fixture: ReturnType<typeof harness>;
+    fixture = harness({
+      requestShutdown: async () => {
+        fixture.spawner.children.at(-1)?.exit(0);
+        throw new Error("shutdown_unavailable");
+      }
+    });
+    await fixture.supervisor.start();
+
+    await expect(
+      fixture.supervisor.stopAfterAuthenticatedShutdown()
+    ).rejects.toThrow("authenticated_shutdown_failed");
+    expect(fixture.spawner.children[0]?.exitCode).toBe(0);
+  });
+
   it("signals only its retained verified child and fails closed if termination stays unconfirmed", async () => {
     const { supervisor, spawner } = harness({
       requestShutdown: async () => {

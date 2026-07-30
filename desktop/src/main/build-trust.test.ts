@@ -12,7 +12,13 @@ const runtime: PackagedBuildRuntime = Object.freeze({
 
 function packageBytes(
   buildMode: "developer" | "release",
-  keyId: "developer" | "release" = buildMode
+  keyId: "developer" | "release" = buildMode,
+  smokeAuthority:
+    | "developer_directory_smoke_v1"
+    | "disabled" =
+    buildMode === "developer"
+      ? "developer_directory_smoke_v1"
+      : "disabled"
 ): Buffer {
   return Buffer.from(
     JSON.stringify({
@@ -27,6 +33,7 @@ function packageBytes(
         platform: "darwin",
         architecture: "arm64",
         resource_root_relative: "kestrel",
+        smoke_authority: smokeAuthority,
         python_lock_sha256: "1".repeat(64),
         desktop_npm_lock_sha256: "2".repeat(64),
         web_npm_lock_sha256: "3".repeat(64),
@@ -52,6 +59,7 @@ describe("immutable packaged build trust", () => {
       platform: "darwin",
       architecture: "arm64",
       resourceRootRelative: "kestrel",
+      smokeAuthority: "developer_directory_smoke_v1",
       pythonLockSha256: "1".repeat(64),
       desktopNpmLockSha256: "2".repeat(64),
       webNpmLockSha256: "3".repeat(64),
@@ -97,8 +105,19 @@ describe("immutable packaged build trust", () => {
         parsePackagedBuildTrust(packageBytes("release"), runtime)
       ).toMatchObject({
         buildMode: "release",
-        keyId: "release"
+        keyId: "release",
+        smokeAuthority: "disabled"
       });
+      expect(() =>
+        parsePackagedBuildTrust(
+          packageBytes(
+            "release",
+            "release",
+            "developer_directory_smoke_v1"
+          ),
+          runtime
+        )
+      ).toThrow("desktop_build_smoke_authority_mismatch");
     } finally {
       process.argv = previousArguments;
       if (previousEnvironment === undefined) {

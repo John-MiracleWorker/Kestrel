@@ -994,6 +994,7 @@ function packagedBuildMetadata(manifest) {
     platform: manifest.platform,
     architecture: manifest.architecture,
     resource_root_relative: "kestrel",
+    smoke_authority: "developer_directory_smoke_v1",
     python_lock_sha256: manifest.python_lock_sha256,
     desktop_npm_lock_sha256: manifest.desktop_npm_lock_sha256,
     web_npm_lock_sha256: manifest.web_npm_lock_sha256,

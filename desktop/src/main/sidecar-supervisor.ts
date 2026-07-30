@@ -824,6 +824,7 @@ export class SidecarSupervisor {
   private startPromise: Promise<VerifiedDesktopSessionResources> | null =
     null;
   private stopPromise: Promise<void> | null = null;
+  private authenticatedShutdownAccepted = false;
   private launchAbort: AbortController | null = null;
   private recoveryRetryPromise:
     | Promise<SidecarRecoveryRetryResult>
@@ -1068,6 +1069,7 @@ export class SidecarSupervisor {
       );
     }
     this.dependencies.apiSession.deactivate();
+    this.authenticatedShutdownAccepted = false;
     this.stopping = false;
     this.generation += 1;
     const generation = this.generation;
@@ -1546,6 +1548,7 @@ export class SidecarSupervisor {
     if (this.stopPromise !== null) {
       return this.stopPromise;
     }
+    this.authenticatedShutdownAccepted = false;
     this.dependencies.apiSession.deactivate(this.generation);
     this.stopping = true;
     this.generation += 1;
@@ -1567,6 +1570,16 @@ export class SidecarSupervisor {
       }
     );
     return operation;
+  }
+
+  async stopAfterAuthenticatedShutdown(): Promise<void> {
+    await this.stop();
+    if (!this.authenticatedShutdownAccepted) {
+      throw new SidecarSupervisorError(
+        "authenticated_shutdown_failed",
+        "sidecar_unavailable"
+      );
+    }
   }
 
   private async stopAfterStartSettles(
@@ -1744,6 +1757,7 @@ export class SidecarSupervisor {
           baseUrl: active.baseUrl,
           apiToken: active.launch.apiToken
         });
+        this.authenticatedShutdownAccepted = true;
       } catch {
         // The exit wait below is mandatory even when the request failed.
         this.dependencies.log(

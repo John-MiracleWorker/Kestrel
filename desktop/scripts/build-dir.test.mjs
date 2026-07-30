@@ -570,6 +570,9 @@ describe("developer directory bundle", () => {
     expect(
       packagedPackage.kestrelDesktopBuild.resource_root_relative,
     ).toBe("kestrel");
+    expect(
+      packagedPackage.kestrelDesktopBuild.smoke_authority,
+    ).toBe("developer_directory_smoke_v1");
     const packagedAppRoot = dirname(
       dirname(receipt.packaged_public_key_path),
     );

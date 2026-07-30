@@ -39,6 +39,8 @@ describe("desktop build boundary", () => {
       "main/credential-window.js",
       "main/developer-runtime.d.ts",
       "main/developer-runtime.js",
+      "main/directory-smoke.d.ts",
+      "main/directory-smoke.js",
       "main/ipc.d.ts",
       "main/ipc.js",
       "main/private-files.d.ts",

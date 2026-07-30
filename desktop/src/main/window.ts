@@ -62,6 +62,7 @@ export function windowOptions(): BrowserWindowConstructorOptions {
 }
 
 export function createAppWindow<TWindow extends AppWindow>(dependencies: {
+  showWhenReady?: boolean;
   createWindow(options: BrowserWindowConstructorOptions): TWindow;
   installSecurity(webContents: unknown): void;
   bindApiSession(webContents: unknown): void;
@@ -71,11 +72,13 @@ export function createAppWindow<TWindow extends AppWindow>(dependencies: {
   dependencies.installSecurity(window.webContents);
   dependencies.bindApiSession(window.webContents);
   dependencies.bindDesktopIpc(window.webContents);
-  window.once("ready-to-show", () => {
-    if (!window.isDestroyed()) {
-      window.show();
-    }
-  });
+  if (dependencies.showWhenReady !== false) {
+    window.once("ready-to-show", () => {
+      if (!window.isDestroyed()) {
+        window.show();
+      }
+    });
+  }
 
   return {
     window,

@@ -39,6 +39,7 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DESKTOP_MANIFEST_SCHEMA = "kestrel.desktop.resources.v1"
 _DESKTOP_QUALIFICATION_SCHEMA = "kestrel.desktop.qualification.v1"
+_DESKTOP_DIRECTORY_SMOKE_SCHEMA = "kestrel.desktop.directory-smoke.v1"
 _DESKTOP_QUALIFICATION_SIGNATURE_PREFIX = (
     b"kestrel.desktop.qualification.signature.v1\0"
 )
@@ -130,6 +131,13 @@ def validate_desktop_publication_evidence(
     if not isinstance(public_key, Ed25519PublicKey):
         raise ValueError("desktop qualification signing key is untrusted")
     for receipt, signature in qualification_evidence:
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("schema") == _DESKTOP_DIRECTORY_SMOKE_SCHEMA
+        ):
+            raise ValueError(
+                "developer desktop directory smoke cannot be published"
+            )
         if not isinstance(receipt, dict) or set(receipt) != _DESKTOP_QUALIFICATION_KEYS:
             raise ValueError("desktop qualification receipt must be an object")
         if receipt.get("schema") != _DESKTOP_QUALIFICATION_SCHEMA:
