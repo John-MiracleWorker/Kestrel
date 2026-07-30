@@ -2034,6 +2034,29 @@ describe("verified sidecar supervisor", () => {
     expect(fixture.spawner.children[0]?.exitCode).toBe(0);
   });
 
+  it("rejects qualification when an accepted shutdown still requires a signal", async () => {
+    let fixture: ReturnType<typeof harness>;
+    fixture = harness({
+      requestShutdown: async () => undefined,
+      waitForExit: async (child) => {
+        const retained = child as FakeSidecarChild;
+        if (retained.killSignals.length === 0) {
+          return false;
+        }
+        retained.exit(0, "SIGTERM");
+        return true;
+      }
+    });
+    await fixture.supervisor.start();
+
+    await expect(
+      fixture.supervisor.stopAfterAuthenticatedShutdown()
+    ).rejects.toThrow("authenticated_shutdown_failed");
+    expect(fixture.spawner.children[0]?.killSignals).toEqual([
+      "SIGTERM"
+    ]);
+  });
+
   it("signals only its retained verified child and fails closed if termination stays unconfirmed", async () => {
     const { supervisor, spawner } = harness({
       requestShutdown: async () => {

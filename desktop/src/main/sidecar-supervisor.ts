@@ -824,7 +824,7 @@ export class SidecarSupervisor {
   private startPromise: Promise<VerifiedDesktopSessionResources> | null =
     null;
   private stopPromise: Promise<void> | null = null;
-  private authenticatedShutdownAccepted = false;
+  private authenticatedGracefulShutdownCompleted = false;
   private launchAbort: AbortController | null = null;
   private recoveryRetryPromise:
     | Promise<SidecarRecoveryRetryResult>
@@ -1069,7 +1069,7 @@ export class SidecarSupervisor {
       );
     }
     this.dependencies.apiSession.deactivate();
-    this.authenticatedShutdownAccepted = false;
+    this.authenticatedGracefulShutdownCompleted = false;
     this.stopping = false;
     this.generation += 1;
     const generation = this.generation;
@@ -1548,7 +1548,7 @@ export class SidecarSupervisor {
     if (this.stopPromise !== null) {
       return this.stopPromise;
     }
-    this.authenticatedShutdownAccepted = false;
+    this.authenticatedGracefulShutdownCompleted = false;
     this.dependencies.apiSession.deactivate(this.generation);
     this.stopping = true;
     this.generation += 1;
@@ -1574,7 +1574,7 @@ export class SidecarSupervisor {
 
   async stopAfterAuthenticatedShutdown(): Promise<void> {
     await this.stop();
-    if (!this.authenticatedShutdownAccepted) {
+    if (!this.authenticatedGracefulShutdownCompleted) {
       throw new SidecarSupervisorError(
         "authenticated_shutdown_failed",
         "sidecar_unavailable"
@@ -1752,12 +1752,13 @@ export class SidecarSupervisor {
     }
 
     if (requestGraceful) {
+      let authenticatedRequestAccepted = false;
       try {
         await this.dependencies.requestShutdown({
           baseUrl: active.baseUrl,
           apiToken: active.launch.apiToken
         });
-        this.authenticatedShutdownAccepted = true;
+        authenticatedRequestAccepted = true;
       } catch {
         // The exit wait below is mandatory even when the request failed.
         this.dependencies.log(
@@ -1765,6 +1766,8 @@ export class SidecarSupervisor {
         );
       }
       if (await this.waitForTerminationStage(active.child)) {
+        this.authenticatedGracefulShutdownCompleted =
+          authenticatedRequestAccepted;
         await this.finalizeExitedActive(active);
         this.releaseFinalizedActive(active);
         return;
