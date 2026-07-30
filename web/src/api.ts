@@ -1,4 +1,8 @@
 import { apiAuthHeaders, getApiToken } from "./auth";
+import {
+  runtimeTransport,
+  type RuntimeTransport
+} from "./platform/runtimeTransport";
 
 export class ApiResponseError extends Error {
   constructor(
@@ -19,30 +23,34 @@ export class ApiAuthError extends ApiResponseError {
 }
 
 export async function getJson<T>(path: string, options: { signal?: AbortSignal } = {}): Promise<T> {
-  const response = await fetch(path, { headers: apiAuthHeaders(), signal: options.signal });
+  const response = await runtimeTransport(apiAuthHeaders).fetch(path, {
+    signal: options.signal
+  });
   return parseResponse<T>(response);
 }
 
 export async function postJson<T>(path: string, body: unknown = {}): Promise<T> {
-  const response = await fetch(path, {
+  const response = await runtimeTransport(apiAuthHeaders).fetch(path, {
     method: "POST",
-    headers: { ...apiAuthHeaders(), "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
   return parseResponse<T>(response);
 }
 
 export async function putJson<T>(path: string, body: unknown = {}): Promise<T> {
-  const response = await fetch(path, {
+  const response = await runtimeTransport(apiAuthHeaders).fetch(path, {
     method: "PUT",
-    headers: { ...apiAuthHeaders(), "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
   return parseResponse<T>(response);
 }
 
 export async function deleteJson<T>(path: string): Promise<T> {
-  const response = await fetch(path, { method: "DELETE", headers: apiAuthHeaders() });
+  const response = await runtimeTransport(apiAuthHeaders).fetch(path, {
+    method: "DELETE"
+  });
   return parseResponse<T>(response);
 }
 
@@ -95,8 +103,15 @@ export function subscribeJsonEvents<T>(
   onEvent: (event: T) => void,
   onError: (error: unknown) => void
 ): () => void {
-  if (!getApiToken() && typeof EventSource !== "undefined") {
-    const source = new EventSource(path);
+  const transport = runtimeTransport(apiAuthHeaders);
+  const eventSourceUrl = transport.eventSourceUrl(path);
+  if (
+    transport.mode === "browser" &&
+    !getApiToken() &&
+    eventSourceUrl !== null &&
+    typeof EventSource !== "undefined"
+  ) {
+    const source = new EventSource(eventSourceUrl);
     const handleEvent = (event: MessageEvent) => onEvent(JSON.parse(event.data) as T);
     source.onmessage = handleEvent;
     eventTypes.forEach((type) => source.addEventListener(type, handleEvent));
@@ -104,14 +119,24 @@ export function subscribeJsonEvents<T>(
   }
 
   const controller = new AbortController();
-  void readEventStream<T>(path, controller.signal, onEvent).catch((error) => {
+  void readEventStream<T>(
+    transport,
+    path,
+    controller.signal,
+    onEvent
+  ).catch((error) => {
     if (!controller.signal.aborted) onError(error);
   });
   return () => controller.abort();
 }
 
-async function readEventStream<T>(path: string, signal: AbortSignal, onEvent: (event: T) => void): Promise<void> {
-  const response = await fetch(path, { headers: apiAuthHeaders(), signal });
+async function readEventStream<T>(
+  transport: RuntimeTransport,
+  path: string,
+  signal: AbortSignal,
+  onEvent: (event: T) => void
+): Promise<void> {
+  const response = await transport.fetch(path, { signal });
   if (!response.ok) {
     await parseResponse<unknown>(response);
     return;

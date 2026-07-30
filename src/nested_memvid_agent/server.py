@@ -112,6 +112,7 @@ _BROWSER_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+_DESKTOP_RENDERER_ORIGIN = "kestrel://app"
 
 
 def _apply_browser_security_headers(response: Any) -> None:
@@ -467,8 +468,15 @@ def _create_app(
             return responses_module.JSONResponse({"detail": "untrusted_host"}, status_code=400)
         origin = str(headers.get("origin", "")).strip()
         if origin:
-            origin_host = _hostname_from_url(origin)
-            if not origin_host or not _host_is_trusted(origin_host, trusted_hosts):  # nosec
+            if desktop_context is not None:
+                origin_is_trusted = origin == _DESKTOP_RENDERER_ORIGIN
+            else:
+                origin_host = _hostname_from_url(origin)
+                origin_is_trusted = bool(origin_host) and _host_is_trusted(  # nosec
+                    origin_host,
+                    trusted_hosts,
+                )
+            if not origin_is_trusted:
                 return responses_module.JSONResponse(
                     {"detail": "untrusted_origin"}, status_code=403
                 )
@@ -1426,14 +1434,36 @@ def _create_app(
         if assets.exists():
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
+        api_fallthrough_methods = [
+            "CONNECT",
+            "DELETE",
+            "GET",
+            "HEAD",
+            "OPTIONS",
+            "PATCH",
+            "POST",
+            "PUT",
+            "TRACE",
+        ]
+
+        @app.api_route(  # type: ignore[untyped-decorator]
+            "/api",
+            methods=api_fallthrough_methods,
+        )
+        @app.api_route(  # type: ignore[untyped-decorator]
+            "/api/{path:path}",
+            methods=api_fallthrough_methods,
+        )
+        def api_not_found(path: str = "") -> Any:
+            del path
+            raise HTTPException(status_code=404, detail="Not Found")
+
         @app.get("/")  # type: ignore[untyped-decorator]
         def index() -> Any:
             return FileResponse(web_dist / "index.html")
 
         @app.get("/{path:path}")  # type: ignore[untyped-decorator]
         def spa_fallback(path: str) -> Any:
-            if path == "api" or path.startswith("api/"):
-                raise HTTPException(status_code=404, detail="not_found")
             return FileResponse(web_dist / "index.html")
 
     construction_cleanup.clear()
@@ -1458,6 +1488,7 @@ def _apply_desktop_runtime_authority(
         memory_dir=launch.memory_dir,
         state_path=launch.state_path,
         require_api_auth=True,
+        cors_origins=(_DESKTOP_RENDERER_ORIGIN,),
     )
 
 

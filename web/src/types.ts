@@ -1,3 +1,9 @@
+export type DesktopRuntimeMarker = Readonly<{
+  schema: "kestrel.desktop.runtime.v1";
+  baseUrl: string;
+  generation: number;
+}>;
+
 export type Run = {
   run_id: string;
   project_id?: string | null;

@@ -141,12 +141,42 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
   spawner: FakeSidecarSpawner;
   logs: string[];
   shutdownRequests: Array<{ baseUrl: string; apiToken: string }>;
+  apiSessionEvents: Array<
+    | {
+        kind: "activate";
+        baseUrl: string;
+        apiToken: string;
+        generation: number;
+      }
+    | { kind: "deactivate"; generation?: number }
+  >;
 } {
   const spawner = new FakeSidecarSpawner();
   const logs: string[] = [];
   const shutdownRequests: Array<{ baseUrl: string; apiToken: string }> = [];
+  const apiSessionEvents: Array<
+    | {
+        kind: "activate";
+        baseUrl: string;
+        apiToken: string;
+        generation: number;
+      }
+    | { kind: "deactivate"; generation?: number }
+  > = [];
   let leaseInspection = 0;
   const dependencies: SidecarSupervisorDependencies = {
+    apiSession: {
+      activate(input: {
+        baseUrl: string;
+        apiToken: string;
+        generation: number;
+      }): void {
+        apiSessionEvents.push({ kind: "activate", ...input });
+      },
+      deactivate(generation?: number): void {
+        apiSessionEvents.push({ kind: "deactivate", generation });
+      }
+    },
     verifyResources: async () => verifiedResources(),
     acquireVerifiedExecutable: async (resources, relativePath) => {
       const resource = resources.files.get(relativePath);
@@ -260,7 +290,8 @@ function harness(overrides: Partial<SidecarSupervisorDependencies> = {}): {
     ),
     spawner,
     logs,
-    shutdownRequests
+    shutdownRequests,
+    apiSessionEvents
   };
 }
 
@@ -419,6 +450,122 @@ describe("verified sidecar supervisor", () => {
     ]);
     expect(JSON.stringify(spawner.requests)).not.toContain(apiToken);
     expect(JSON.stringify(supervisor.state)).not.toContain(apiToken);
+  });
+
+  it("activates the main-process API authority only after authenticated readiness", async () => {
+    const lifecycle: string[] = [];
+    const { supervisor } = harness({
+      apiSession: {
+        activate({ baseUrl, apiToken: receivedToken, generation }): void {
+          expect(baseUrl).toBe(`http://127.0.0.1:${43000 + 9100}/`);
+          expect(receivedToken).toBe(apiToken);
+          expect(generation).toBe(1);
+          lifecycle.push("activate");
+        },
+        deactivate(generation?: number): void {
+          lifecycle.push(`deactivate:${generation ?? "all"}`);
+        }
+      },
+      requestReadiness: async () => {
+        expect(lifecycle).toEqual(["deactivate:all"]);
+        lifecycle.push("authenticated-readiness");
+        return apiReadiness();
+      }
+    });
+
+    await supervisor.start();
+
+    expect(lifecycle).toEqual([
+      "deactivate:all",
+      "authenticated-readiness",
+      "activate"
+    ]);
+  });
+
+  it("deactivates synchronously before stop waits for sidecar shutdown", async () => {
+    let authorityActive = false;
+    const shutdownGate = deferred<void>();
+    const { supervisor, spawner } = harness({
+      apiSession: {
+        activate(): void {
+          authorityActive = true;
+        },
+        deactivate(): void {
+          authorityActive = false;
+        }
+      },
+      requestShutdown: async () => {
+        await shutdownGate.promise;
+        spawner.children.at(-1)?.exit(0);
+      }
+    });
+    await supervisor.start();
+    expect(authorityActive).toBe(true);
+
+    const stopping = supervisor.stop();
+    expect(authorityActive).toBe(false);
+    shutdownGate.resolve();
+    await stopping;
+  });
+
+  it("deactivates immediately on confirmed unexpected exit before cleanup settles", async () => {
+    let authorityActive = false;
+    const cleanupGate = deferred<void>();
+    const { supervisor, spawner } = harness({
+      apiSession: {
+        activate(): void {
+          authorityActive = true;
+        },
+        deactivate(): void {
+          authorityActive = false;
+        }
+      },
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: () => cleanupGate.promise
+      })
+    });
+    await supervisor.start();
+    expect(authorityActive).toBe(true);
+
+    spawner.children[0]?.exit(17);
+    expect(authorityActive).toBe(false);
+
+    cleanupGate.resolve();
+    await eventually(() => {
+      expect(supervisor.state).toMatchObject({
+        kind: "recovery",
+        reason: "reconciliation_required"
+      });
+    });
+  });
+
+  it("keeps authority inactive when a start fails after generation rotation", async () => {
+    const { supervisor, apiSessionEvents } = harness({
+      requestReadiness: async () => {
+        throw new SidecarSupervisorError(
+          "authenticated_readiness_invalid",
+          "sidecar_unverified"
+        );
+      }
+    });
+
+    await expect(supervisor.start()).rejects.toThrow(
+      "authenticated_readiness_invalid"
+    );
+
+    expect(
+      apiSessionEvents.some((event) => event.kind === "activate")
+    ).toBe(false);
+    expect(apiSessionEvents).toContainEqual({
+      kind: "deactivate",
+      generation: 1
+    });
   });
 
   it("preserves the asynchronous rejection contract for duplicate start", async () => {

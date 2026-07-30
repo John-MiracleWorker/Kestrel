@@ -69,6 +69,7 @@ describe("desktop renderer window", () => {
   it("loads only the private app entry URL and waits to show", async () => {
     const windows: FakeWindow[] = [];
     const installSecurity = vi.fn();
+    const bindApiSession = vi.fn();
 
     const created = createAppWindow({
       createWindow: (options) => {
@@ -76,7 +77,8 @@ describe("desktop renderer window", () => {
         windows.push(window);
         return window;
       },
-      installSecurity
+      installSecurity,
+      bindApiSession
     });
 
     await created.loaded;
@@ -86,6 +88,7 @@ describe("desktop renderer window", () => {
     expect(windows[0]?.loadedUrls).toEqual([DESKTOP_APP_ENTRY_URL]);
     expect(windows[0]?.options.show).toBe(false);
     expect(installSecurity).toHaveBeenCalledWith(windows[0]?.webContents);
+    expect(bindApiSession).toHaveBeenCalledWith(windows[0]?.webContents);
     expect(windows[0]?.showCount).toBe(0);
 
     windows[0]?.emit("ready-to-show");

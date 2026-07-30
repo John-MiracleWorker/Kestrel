@@ -23,6 +23,8 @@ describe("desktop build boundary", () => {
       "main",
       "main.d.ts",
       "main.js",
+      "main/api-session.d.ts",
+      "main/api-session.js",
       "main/private-files.d.ts",
       "main/private-files.js",
       "main/protocol.d.ts",

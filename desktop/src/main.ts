@@ -22,11 +22,19 @@ import {
   createNodeSupervisorDependencies,
   SidecarSupervisor
 } from "./main/sidecar-supervisor.js";
+import {
+  installDesktopApiSession,
+  type ApiSessionWebContents,
+  type ApiSessionWebRequest,
+  type DesktopApiSessionAuthority
+} from "./main/api-session.js";
 
 const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
 const RELEASE_MANIFEST_KEY_ID = "release";
 
-async function createPackagedSidecarSupervisor(): Promise<SidecarSupervisor> {
+async function createPackagedSidecarSupervisor(
+  apiSession: DesktopApiSessionAuthority
+): Promise<SidecarSupervisor> {
   const resourceRoot = process.resourcesPath;
   const sidecarName =
     process.platform === "win32"
@@ -46,6 +54,7 @@ async function createPackagedSidecarSupervisor(): Promise<SidecarSupervisor> {
   const profileRoot = join(app.getPath("userData"), "profiles", "default");
   const sidecarVersion = app.getVersion();
   const dependencies = createNodeSupervisorDependencies({
+    apiSession,
     resourceVerification: {
       resourceRoot,
       manifestPath: join(resourceRoot, "kestrel-resource-manifest.json"),
@@ -84,6 +93,7 @@ registerKestrelScheme(protocol);
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
+  let apiSession: DesktopApiSessionAuthority | null = null;
   const windows = createSingleWindowController(() => {
     const created = createAppWindow({
       createWindow: (options) =>
@@ -91,6 +101,14 @@ if (!app.requestSingleInstanceLock()) {
       installSecurity: (webContents) => {
         installWebContentsBoundary(
           webContents as RestrictedWebContents
+        );
+      },
+      bindApiSession: (webContents) => {
+        if (apiSession === null) {
+          throw new Error("desktop_api_session_unavailable");
+        }
+        apiSession.bindRenderer(
+          webContents as ApiSessionWebContents
         );
       }
     });
@@ -148,12 +166,19 @@ if (!app.requestSingleInstanceLock()) {
   void app
     .whenReady()
     .then(async () => {
+      const defaultSession = session.defaultSession;
       installSessionBoundary(
-        session.defaultSession as unknown as RestrictedSession
+        defaultSession as unknown as RestrictedSession
+      );
+      apiSession = installDesktopApiSession(
+        defaultSession.webRequest as unknown as ApiSessionWebRequest
       );
       await startVerifiedDesktopSession({
         async startSupervisor() {
-          supervisor = await createPackagedSidecarSupervisor();
+          if (apiSession === null) {
+            throw new Error("desktop_api_session_unavailable");
+          }
+          supervisor = await createPackagedSidecarSupervisor(apiSession);
           return supervisor.start();
         },
         registerVerifiedProtocol(rendererAssets) {

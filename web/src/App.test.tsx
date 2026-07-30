@@ -269,6 +269,19 @@ function openAdvancedWorkspace(name: "Routines" | "Routing" | "Settings") {
   fireEvent.click(within(workspaceNav).getByRole("button", { name }));
 }
 
+function installDesktopRuntimeMarker(): void {
+  Object.defineProperty(globalThis, "kestrelDesktopRuntime", {
+    configurable: true,
+    enumerable: false,
+    writable: false,
+    value: Object.freeze({
+      schema: "kestrel.desktop.runtime.v1",
+      baseUrl: "http://127.0.0.1:43123/",
+      generation: 4
+    })
+  });
+}
+
 describe("App", () => {
   beforeEach(() => {
     runs = [otherRun, secondRun, baseRun];
@@ -446,6 +459,7 @@ describe("App", () => {
     cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    Reflect.deleteProperty(globalThis, "kestrelDesktopRuntime");
     sessionStorage.clear();
     localStorage.clear();
   });
@@ -2590,6 +2604,58 @@ describe("App", () => {
         })
       ).toBe(true);
     });
+  });
+
+  it("shows Desktop connection recovery after a 401 without surfacing a token form", async () => {
+    installDesktopRuntimeMarker();
+    sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementationOnce(async () =>
+      jsonResponse({ detail: "Invalid or missing Kestrel API token." }, 401)
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connecting to Kestrel" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Desktop connection needs to be restored/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Kestrel API token" })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API token")).not.toBeInTheDocument();
+    expect(
+      getItem.mock.calls.filter(([key]) => key === "kestrel.apiToken")
+    ).toEqual([]);
+    expect(fetchSpy.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:43123/api/health"
+    ]);
+  });
+
+  it("replaces browser token controls with main-managed status in Desktop mode", async () => {
+    installDesktopRuntimeMarker();
+    sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    openAdvancedWorkspace("Settings");
+
+    expect(
+      await screen.findByText("Desktop API authentication")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/managed by the Kestrel Desktop main process/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Browser API token")).not.toBeInTheDocument();
+    expect(
+      getItem.mock.calls.filter(([key]) => key === "kestrel.apiToken")
+    ).toEqual([]);
   });
 });
 

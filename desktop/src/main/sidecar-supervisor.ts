@@ -10,6 +10,10 @@ import { request as httpRequest } from "node:http";
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
 import { z } from "zod";
+import type {
+  DesktopApiSessionActivation,
+  DesktopApiSessionAuthority
+} from "./api-session.js";
 import {
   createNodePrivateFileAdapter,
   createPrivateLaunchFiles,
@@ -186,6 +190,10 @@ export interface VerifiedExecutableLaunchCapability {
 }
 
 export interface SidecarSupervisorDependencies {
+  apiSession: Pick<
+    DesktopApiSessionAuthority,
+    "activate" | "deactivate"
+  >;
   verifyResources(): Promise<VerifiedResourceSet>;
   acquireVerifiedExecutable(
     resources: VerifiedResourceSet,
@@ -485,6 +493,7 @@ export class SidecarSupervisor {
         "sidecar_unavailable"
       );
     }
+    this.dependencies.apiSession.deactivate();
     this.stopping = false;
     this.generation += 1;
     const generation = this.generation;
@@ -742,6 +751,12 @@ export class SidecarSupervisor {
         this.config.sidecarVersion
       );
       active.verified = true;
+      const apiSessionActivation: DesktopApiSessionActivation = {
+        baseUrl: active.baseUrl,
+        apiToken: launch.apiToken,
+        generation
+      };
+      this.dependencies.apiSession.activate(apiSessionActivation);
       this.state = {
         kind: "ready",
         profileId: profile.profileId,
@@ -750,6 +765,7 @@ export class SidecarSupervisor {
       };
       return resources.rendererAssets;
     } catch (error) {
+      this.dependencies.apiSession.deactivate(generation);
       let surfacedError: unknown =
         this.stopping || signal.aborted || generation !== this.generation
           ? new SidecarSupervisorError(
@@ -823,6 +839,7 @@ export class SidecarSupervisor {
     if (active.finalization !== null) {
       return;
     }
+    this.dependencies.apiSession.deactivate(generation);
     const wasVerified = active.verified;
     const finalization = this.finalizeExitedActive(active);
     void this.completeConfirmedExit(
@@ -871,6 +888,7 @@ export class SidecarSupervisor {
     if (this.stopPromise !== null) {
       return this.stopPromise;
     }
+    this.dependencies.apiSession.deactivate(this.generation);
     this.stopping = true;
     this.generation += 1;
     this.launchAbort?.abort();
@@ -1346,6 +1364,10 @@ export async function inspectProfileLeaseMetadata(
 }
 
 export interface NodeSupervisorDependencyInput {
+  apiSession: Pick<
+    DesktopApiSessionAuthority,
+    "activate" | "deactivate"
+  >;
   resourceVerification: VerifyResourceManifestInput;
   profile: PrivateProfileInput;
   sidecarVersion: string;
@@ -1364,6 +1386,7 @@ export function createNodeSupervisorDependencies(
     input.privateFileAdapter ?? createNodePrivateFileAdapter();
   const inspectProcess = input.processInspector ?? inspectNodeProcess;
   return {
+    apiSession: input.apiSession,
     verifyResources: () =>
       verifyResourceManifest(input.resourceVerification),
     async acquireVerifiedExecutable() {

@@ -44,6 +44,7 @@ import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./
 import { MissionControl } from "./mission/MissionControl";
 import type { MissionLaunch } from "./mission/types";
 import { OutcomesDashboard } from "./outcomes/OutcomesDashboard";
+import { isDesktopRuntime } from "./platform/runtimeTransport";
 import { RepairReviewPanel } from "./repair/RepairReviewPanel";
 import { RoutingCenter } from "./routing/RoutingCenter";
 import {
@@ -371,6 +372,7 @@ const emptySetupDraft: SetupDraft = {
 };
 
 export function App() {
+  const desktopRuntime = isDesktopRuntime();
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [authPromptOpen, setAuthPromptOpen] = useState(false);
@@ -1118,6 +1120,14 @@ export function App() {
   function reportError(value: unknown) {
     if (value instanceof ApiAuthError) {
       setApiReady(false);
+      if (desktopRuntime) {
+        setAuthPromptOpen(false);
+        setApiTokenDraft("");
+        setError(
+          "The Desktop connection needs to be restored. Retry, or restart Kestrel if its local runtime has stopped."
+        );
+        return;
+      }
       setAuthPromptOpen(true);
       setApiTokenDraft(getApiToken());
       setError(null);
@@ -3779,16 +3789,30 @@ export function App() {
                     <span className="muted">Restart required to change</span>
                   </div>
                 </div>
-                <form className="row" onSubmit={saveToken}>
-                  <div className="row-label">
-                    <strong>Browser API token</strong>
-                    <p>Stored only in this browser client and used for authenticated routes.</p>
+                {desktopRuntime ? (
+                  <div className="row">
+                    <div className="row-label">
+                      <strong>Desktop API authentication</strong>
+                      <p>
+                        Authentication is managed by the Kestrel Desktop main process. No API token is available to this page.
+                      </p>
+                    </div>
+                    <div className="row-control">
+                      <StatusBadge value="main-managed" />
+                    </div>
                   </div>
-                  <div className="row-control">
-                    <input className="input mono short" type="password" value={apiTokenDraft} onChange={(event) => setApiTokenDraft(event.target.value)} autoComplete="off" />
-                    <button className="btn" type="submit">Save</button>
-                  </div>
-                </form>
+                ) : (
+                  <form className="row" onSubmit={saveToken}>
+                    <div className="row-label">
+                      <strong>Browser API token</strong>
+                      <p>Stored only in this browser client and used for authenticated routes.</p>
+                    </div>
+                    <div className="row-control">
+                      <input className="input mono short" type="password" value={apiTokenDraft} onChange={(event) => setApiTokenDraft(event.target.value)} autoComplete="off" />
+                      <button className="btn" type="submit">Save</button>
+                    </div>
+                  </form>
+                )}
               </div>
             </section>
 

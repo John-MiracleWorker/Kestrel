@@ -60,9 +60,11 @@ export function windowOptions(): BrowserWindowConstructorOptions {
 export function createAppWindow<TWindow extends AppWindow>(dependencies: {
   createWindow(options: BrowserWindowConstructorOptions): TWindow;
   installSecurity(webContents: unknown): void;
+  bindApiSession(webContents: unknown): void;
 }): AppWindowResult<TWindow> {
   const window = dependencies.createWindow(windowOptions());
   dependencies.installSecurity(window.webContents);
+  dependencies.bindApiSession(window.webContents);
   window.once("ready-to-show", () => {
     if (!window.isDestroyed()) {
       window.show();

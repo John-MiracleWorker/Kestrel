@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import nested_memvid_agent.server as server_module
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
 from nested_memvid_agent.server import create_app
@@ -21,7 +22,11 @@ _MEMORY_LAYERS = [
 ]
 
 
-def _config(profile_root: Path) -> AgentConfig:
+def _config(
+    profile_root: Path,
+    *,
+    cors_origins: tuple[str, ...] = (),
+) -> AgentConfig:
     workspace = profile_root / "workspace"
     workspace.mkdir(parents=True)
     return AgentConfig(
@@ -39,6 +44,7 @@ def _config(profile_root: Path) -> AgentConfig:
         channel_config_path=profile_root / "config" / "channels.json",
         worker_worktree_dir=profile_root / "worktrees",
         require_api_auth=False,
+        cors_origins=cors_origins,
     )
 
 
@@ -104,6 +110,132 @@ def test_browser_server_does_not_expose_desktop_readiness(tmp_path: Path) -> Non
     assert health.status_code == 200
     assert response.status_code == 404
     assert response.json() == {"detail": "Not Found"}
+
+
+def test_desktop_cors_replaces_runtime_origins_and_keeps_preflight_tokenless(
+    tmp_path: Path,
+) -> None:
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    app = create_app(
+        _config(
+            profile_root,
+            cors_origins=(
+                "http://127.0.0.1:5173",
+                "https://configured.example",
+            ),
+        ),
+        desktop_context=_desktop_context(profile_root),
+    )
+
+    with TestClient(app) as client:
+        preflight = client.options(
+            "/api/health",
+            headers={
+                "Origin": "kestrel://app",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+        unauthenticated = client.get(
+            "/api/health",
+            headers={"Origin": "kestrel://app"},
+        )
+        authenticated = client.get(
+            "/api/health",
+            headers={
+                "Origin": "kestrel://app",
+                "Authorization": "Bearer desktop-token",
+            },
+        )
+        configured_origin = client.get(
+            "/api/health",
+            headers={
+                "Origin": "http://127.0.0.1:5173",
+                "Authorization": "Bearer desktop-token",
+            },
+        )
+        lookalike_origin = client.get(
+            "/api/health",
+            headers={
+                "Origin": "kestrel://app.evil",
+                "Authorization": "Bearer desktop-token",
+            },
+        )
+
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "kestrel://app"
+    assert unauthenticated.status_code == 401
+    assert authenticated.status_code == 200
+    assert authenticated.headers["access-control-allow-origin"] == "kestrel://app"
+    assert configured_origin.status_code == 403
+    assert "access-control-allow-origin" not in configured_origin.headers
+    assert lookalike_origin.status_code == 403
+    assert "access-control-allow-origin" not in lookalike_origin.headers
+
+
+def test_browser_server_retains_its_configured_cors_origin(tmp_path: Path) -> None:
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    app = create_app(
+        _config(
+            profile_root,
+            cors_origins=("http://127.0.0.1:5173",),
+        )
+    )
+
+    with TestClient(app) as client:
+        preflight = client.options(
+            "/api/health",
+            headers={
+                "Origin": "http://127.0.0.1:5173",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+
+    assert preflight.status_code == 200
+    assert (
+        preflight.headers["access-control-allow-origin"]
+        == "http://127.0.0.1:5173"
+    )
+
+
+def test_built_spa_reserves_unknown_api_paths_for_exact_404s(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    web_dist = tmp_path / "web-dist"
+    web_dist.mkdir()
+    (web_dist / "index.html").write_text(
+        "<!doctype html><title>Kestrel SPA</title>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server_module, "_resolve_web_dist", lambda: web_dist)
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+
+    with TestClient(create_app(_config(profile_root))) as client:
+        api_responses = [
+            client.get("/api/desktop/readiness"),
+            client.post("/api/desktop/shutdown"),
+            client.put("/api/not-registered"),
+            client.patch("/api/not-registered"),
+            client.delete("/api/not-registered"),
+            client.options("/api/not-registered"),
+            client.request("TRACE", "/api/not-registered"),
+            client.request("CONNECT", "/api/not-registered"),
+        ]
+        api_head = client.head("/api/not-registered")
+        spa = client.get("/settings/deep-link")
+
+    assert all(response.status_code == 404 for response in api_responses)
+    assert all(
+        response.json() == {"detail": "Not Found"}
+        for response in api_responses
+    )
+    assert api_head.status_code == 404
+    assert spa.status_code == 200
+    assert "Kestrel SPA" in spa.text
 
 
 def test_desktop_shutdown_is_authenticated_idempotent_and_desktop_only(
