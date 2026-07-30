@@ -10,23 +10,276 @@ import sys
 import tarfile
 import tomllib
 import zipfile
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import scripts.verify_exact_wheel_install as exact_wheel_install
+from scripts.generate_desktop_resource_manifest import (
+    canonical_manifest_bytes,
+    generate_resource_manifest,
+)
 from scripts.release_publication_guard import (
     OCI_RECORD_NAME,
     build_oci_record,
+    desktop_qualification_signature_bytes,
     plan_pypi_files,
+    validate_desktop_publication_evidence,
     validate_oci_index,
     validate_oci_record,
     validate_release_assets,
     write_oci_record,
 )
+from scripts.verify_desktop_resource_manifest import DesktopManifestIdentity
 from scripts.verify_release_payload import verify_release_payload
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _desktop_identity(
+    *,
+    build_mode: str = "release",
+    key_id: str = "release",
+) -> DesktopManifestIdentity:
+    return DesktopManifestIdentity(
+        build_mode=build_mode,
+        key_id=key_id,
+        source_commit="a" * 40,
+        app_version="0.5.0",
+        platform="darwin",
+        architecture="arm64",
+        python_lock_sha256="1" * 64,
+        desktop_npm_lock_sha256="2" * 64,
+        web_npm_lock_sha256="3" * 64,
+        sbom_sha256="",
+    )
+
+
+def _desktop_qualification_receipt(
+    *,
+    resource_manifest_digest: str,
+    build_mode: str = "release",
+    key_id: str = "release",
+    signed: bool = True,
+) -> dict[str, object]:
+    return {
+        "schema": "kestrel.desktop.qualification.v1",
+        "build_mode": build_mode,
+        "key_id": key_id,
+        "signed": signed,
+        "source_commit": "a" * 40,
+        "qualified": True,
+        "resource_manifest_digest": resource_manifest_digest,
+    }
+
+
+def _desktop_publication_bundle(
+    root: Path,
+    *,
+    build_mode: str = "release",
+    key_id: str = "release",
+) -> tuple[DesktopManifestIdentity, Ed25519PrivateKey, str]:
+    (root / "sidecar").mkdir()
+    (root / "sidecar/kestrel-desktop-sidecar").write_bytes(b"sidecar")
+    (root / "sbom.cdx.json").write_bytes(b'{"bomFormat":"CycloneDX"}\n')
+    private_key = Ed25519PrivateKey.generate()
+    manifest = generate_resource_manifest(
+        root,
+        identity=_desktop_identity(build_mode=build_mode, key_id=key_id),
+    )
+    manifest_bytes = canonical_manifest_bytes(manifest)
+    (root / "kestrel-resource-manifest.json").write_bytes(manifest_bytes)
+    (root / "kestrel-resource-manifest.sig").write_bytes(
+        private_key.sign(manifest_bytes)
+    )
+    identity = replace(
+        _desktop_identity(build_mode=build_mode, key_id=key_id),
+        sbom_sha256=str(manifest["sbom_sha256"]),
+    )
+    return (
+        identity,
+        private_key,
+        f"sha256:{hashlib.sha256(manifest_bytes).hexdigest()}",
+    )
+
+
+def _signed_qualification(
+    private_key: Ed25519PrivateKey,
+    receipt: dict[str, object],
+) -> tuple[dict[str, object], bytes]:
+    return receipt, private_key.sign(
+        desktop_qualification_signature_bytes(receipt)
+    )
+
+
+def test_publication_guard_rejects_unsigned_bundle_and_claim_only_receipt(
+    tmp_path: Path,
+) -> None:
+    identity, private_key, manifest_digest = _desktop_publication_bundle(tmp_path)
+    receipt = _desktop_qualification_receipt(
+        resource_manifest_digest=manifest_digest
+    )
+    public_keys = {"release": private_key.public_key()}
+
+    (tmp_path / "kestrel-resource-manifest.sig").write_bytes(b"\0" * 64)
+    with pytest.raises(ValueError, match="resource signature"):
+        validate_desktop_publication_evidence(
+            tmp_path,
+            [_signed_qualification(private_key, receipt)],
+            expected_identity=identity,
+            trusted_public_keys=public_keys,
+        )
+
+    manifest_bytes = (tmp_path / "kestrel-resource-manifest.json").read_bytes()
+    (tmp_path / "kestrel-resource-manifest.sig").write_bytes(
+        private_key.sign(manifest_bytes)
+    )
+    with pytest.raises(ValueError, match="unsigned desktop qualification"):
+        validate_desktop_publication_evidence(
+            tmp_path,
+            [(receipt, b"")],
+            expected_identity=identity,
+            trusted_public_keys=public_keys,
+        )
+    with pytest.raises(ValueError, match="signature is invalid"):
+        validate_desktop_publication_evidence(
+            tmp_path,
+            [(receipt, b"\0" * 64)],
+            expected_identity=identity,
+            trusted_public_keys=public_keys,
+        )
+
+
+def test_publication_guard_categorically_rejects_developer_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity, private_key, manifest_digest = _desktop_publication_bundle(
+        tmp_path,
+        build_mode="developer",
+        key_id="developer",
+    )
+    receipt = _desktop_qualification_receipt(
+        resource_manifest_digest=manifest_digest,
+        build_mode="developer",
+        key_id="developer",
+    )
+    monkeypatch.setenv("KESTREL_ALLOW_DEVELOPER_DESKTOP", "1")
+    with pytest.raises(ValueError, match="developer desktop manifest"):
+        validate_desktop_publication_evidence(
+            tmp_path,
+            [_signed_qualification(private_key, receipt)],
+            expected_identity=identity,
+            trusted_public_keys={"developer": private_key.public_key()},
+        )
+
+
+def test_publication_guard_accepts_only_cryptographically_bound_release_evidence(
+    tmp_path: Path,
+) -> None:
+    identity, private_key, manifest_digest = _desktop_publication_bundle(tmp_path)
+    receipt = _desktop_qualification_receipt(
+        resource_manifest_digest=manifest_digest
+    )
+    public_keys = {"release": private_key.public_key()}
+
+    assert validate_desktop_publication_evidence(
+        tmp_path,
+        [_signed_qualification(private_key, receipt)],
+        expected_identity=identity,
+        trusted_public_keys=public_keys,
+    ) == {
+        "source_commit": "a" * 40,
+        "qualification_count": 1,
+        "resource_manifest_digest": manifest_digest,
+    }
+
+    drifted_receipt = {
+        **receipt,
+        "resource_manifest_digest": f"sha256:{'9' * 64}",
+    }
+    with pytest.raises(ValueError, match="resource manifest digest mismatch"):
+        validate_desktop_publication_evidence(
+            tmp_path,
+            [_signed_qualification(private_key, drifted_receipt)],
+            expected_identity=identity,
+            trusted_public_keys=public_keys,
+        )
+
+
+def test_desktop_publication_guard_cli_verifies_direct_and_module_evidence(
+    tmp_path: Path,
+) -> None:
+    stage = tmp_path / "stage"
+    evidence = tmp_path / "evidence"
+    stage.mkdir()
+    evidence.mkdir()
+    identity, private_key, manifest_digest = _desktop_publication_bundle(stage)
+    receipt = _desktop_qualification_receipt(
+        resource_manifest_digest=manifest_digest
+    )
+    _, receipt_signature = _signed_qualification(private_key, receipt)
+    identity_path = evidence / "identity.json"
+    public_key_path = evidence / "release-public-key.pem"
+    receipt_path = evidence / "qualification.json"
+    receipt_signature_path = evidence / "qualification.sig"
+    identity_path.write_text(json.dumps(asdict(identity)), encoding="utf-8")
+    public_key_path.write_bytes(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    receipt_signature_path.write_bytes(receipt_signature)
+    arguments = [
+        "verify-desktop-evidence",
+        str(stage),
+        "--identity",
+        str(identity_path),
+        "--public-key",
+        str(public_key_path),
+        "--qualification-receipt",
+        str(receipt_path),
+        "--qualification-signature",
+        str(receipt_signature_path),
+    ]
+
+    for entrypoint in (
+        [sys.executable, "scripts/release_publication_guard.py"],
+        [sys.executable, "-m", "scripts.release_publication_guard"],
+    ):
+        completed = subprocess.run(
+            [*entrypoint, *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout)["resource_manifest_digest"] == (
+            manifest_digest
+        )
+
+    mismatched = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.release_publication_guard",
+            *arguments,
+            "--qualification-receipt",
+            str(receipt_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert mismatched.returncode != 0
+    assert "receipt/signature count mismatch" in mismatched.stderr
 
 
 def test_exact_wheel_verifier_supports_direct_and_module_entrypoints() -> None:

@@ -660,6 +660,10 @@ const payloadVerificationErrorCodes = new Set([
   "resource_manifest_too_large",
   "resource_missing",
   "resource_path_untrusted",
+  "resource_build_mode_untrusted",
+  "resource_identity_mismatch",
+  "resource_payload_coverage_mismatch",
+  "resource_sbom_mismatch",
   "resource_signature_invalid",
   "resource_signature_too_large",
   "resource_signing_key_untrusted"
@@ -2058,6 +2062,9 @@ export interface NodeSupervisorDependencyInput {
     "activate" | "deactivate"
   >;
   resourceVerification: VerifyResourceManifestInput;
+  resourceVerifier?: (
+    input: VerifyResourceManifestInput
+  ) => Promise<VerifiedResourceSet>;
   profile: PrivateProfileInput;
   sidecarVersion: string;
   readinessPollMs?: number;
@@ -2077,7 +2084,9 @@ export function createNodeSupervisorDependencies(
   return {
     apiSession: input.apiSession,
     verifyResources: () =>
-      verifyResourceManifest(input.resourceVerification),
+      (input.resourceVerifier ?? verifyResourceManifest)(
+        input.resourceVerification
+      ),
     async acquireVerifiedExecutable() {
       throw new SidecarSupervisorError(
         "verified_executable_launch_unqualified",

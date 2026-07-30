@@ -66,7 +66,16 @@ function verifiedResources(): VerifiedResourceSet {
     manifestDigest,
     manifest: {
       schema: "kestrel.desktop.resources.v1",
-      key_id: "ephemeral-test",
+      build_mode: "release",
+      key_id: "release",
+      source_commit: "a".repeat(40),
+      app_version: "0.5.0",
+      platform: "darwin",
+      architecture: "arm64",
+      python_lock_sha256: "2".repeat(64),
+      desktop_npm_lock_sha256: "3".repeat(64),
+      web_npm_lock_sha256: "4".repeat(64),
+      sbom_sha256: "5".repeat(64),
       files: {
         "sidecar/kestrel-desktop-sidecar": {
           size: 16,
@@ -91,6 +100,10 @@ function verifiedResources(): VerifiedResourceSet {
         "desktop/dist/credential/preload.js": {
           size: 8,
           sha256: "1".repeat(64)
+        },
+        "sbom.cdx.json": {
+          size: 8,
+          sha256: "5".repeat(64)
         }
       }
     },
@@ -141,6 +154,14 @@ function verifiedResources(): VerifiedResourceSet {
           path: "/bundle/resources/desktop/dist/credential/preload.js",
           size: 8,
           sha256: "1".repeat(64)
+        }
+      ],
+      [
+        "sbom.cdx.json",
+        {
+          path: "/bundle/resources/sbom.cdx.json",
+          size: 8,
+          sha256: "5".repeat(64)
         }
       ]
     ]),
@@ -628,7 +649,19 @@ describe("verified sidecar supervisor", () => {
         manifestPath: "/unused/manifest.json",
         signaturePath: "/unused/manifest.sig",
         trustedKeys: new Map(),
-        requiredFiles: []
+        requiredFiles: [],
+        expectedIdentity: {
+          buildMode: "release",
+          keyId: "release",
+          sourceCommit: "a".repeat(40),
+          appVersion: "0.5.0",
+          platform: "darwin",
+          architecture: "arm64",
+          pythonLockSha256: "2".repeat(64),
+          desktopNpmLockSha256: "3".repeat(64),
+          webNpmLockSha256: "4".repeat(64),
+          sbomSha256: "5".repeat(64)
+        }
       },
       profile: {
         profileId: "default",

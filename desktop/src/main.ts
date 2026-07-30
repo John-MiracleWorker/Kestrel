@@ -63,15 +63,19 @@ import {
   createDesktopCredentialApiClient,
   credentialProviderAuthority
 } from "./main/credential-api.js";
+import { parsePackagedBuildTrust } from "./main/build-trust.js";
 import {
   createCredentialDialogController,
   createCredentialWindow,
   type CredentialDialogController
 } from "./main/credential-window.js";
 import type { VerifiedDesktopSessionResources } from "./main/sidecar-supervisor.js";
+import {
+  verifyDeveloperResourceManifest,
+  verifyResourceManifest
+} from "./main/resource-manifest.js";
 
 const MAX_PUBLIC_KEY_BYTES = 16 * 1024;
-const RELEASE_MANIFEST_KEY_ID = "release";
 const unavailableUpdateStatus = Object.freeze({
   schema: "kestrel.desktop.update.v1",
   state: "unavailable",
@@ -82,13 +86,25 @@ async function createPackagedSidecarSupervisor(
   apiSession: DesktopApiSessionAuthority
 ): Promise<SidecarSupervisor> {
   const resourceRoot = process.resourcesPath;
+  const packageBytes = await readFile(
+    join(app.getAppPath(), "package.json")
+  );
+  const buildTrust = parsePackagedBuildTrust(packageBytes, {
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    architecture: process.arch
+  });
   const sidecarName =
     process.platform === "win32"
       ? "kestrel-desktop-sidecar.exe"
       : "kestrel-desktop-sidecar";
   const sidecarRelativePath = `sidecar/${sidecarName}`;
   const publicKeyBytes = await readFile(
-    join(app.getAppPath(), "config", "desktop-release-public-key.pem")
+    join(
+      app.getAppPath(),
+      "config",
+      `desktop-${buildTrust.keyId}-public-key.pem`
+    )
   );
   if (
     publicKeyBytes.byteLength === 0 ||
@@ -105,16 +121,22 @@ async function createPackagedSidecarSupervisor(
       resourceRoot,
       manifestPath: join(resourceRoot, "kestrel-resource-manifest.json"),
       signaturePath: join(resourceRoot, "kestrel-resource-manifest.sig"),
-      trustedKeys: new Map([[RELEASE_MANIFEST_KEY_ID, publicKey]]),
+      trustedKeys: new Map([[buildTrust.keyId, publicKey]]),
       requiredFiles: [
         sidecarRelativePath,
+        "sbom.cdx.json",
         "web/dist/index.html",
         "desktop/dist/credential/index.html",
         "desktop/dist/credential/form.js",
         "desktop/dist/credential/styles.css",
         "desktop/dist/credential/preload.js"
-      ]
+      ],
+      expectedIdentity: buildTrust
     },
+    resourceVerifier:
+      buildTrust.buildMode === "developer"
+        ? verifyDeveloperResourceManifest
+        : verifyResourceManifest,
     profile: {
       profileId: "default",
       trustedAnchor: app.getPath("userData"),
