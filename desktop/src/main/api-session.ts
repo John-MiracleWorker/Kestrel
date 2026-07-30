@@ -170,10 +170,9 @@ export function installDesktopApiSession(
           ? undefined
           : bindings.get(details.webContents.id);
       const binding = bindingById ?? bindingByObject;
-      const requestHeaders =
-        binding === undefined
-          ? { ...details.requestHeaders }
-          : stripAuthorityHeaders(details.requestHeaders);
+      const requestHeaders = stripAuthorityHeaders(
+        details.requestHeaders
+      );
       if (
         active !== null &&
         binding !== undefined &&

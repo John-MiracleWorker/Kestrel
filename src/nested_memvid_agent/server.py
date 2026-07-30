@@ -1,5 +1,5 @@
 import json
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from functools import partial
@@ -160,6 +160,8 @@ def _create_app(
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
+        from starlette.routing import Match, Route
+
         from .mission_control import (
             mission_launch_binding_matches,
             mission_plan_scope_matches,
@@ -1434,37 +1436,32 @@ def _create_app(
         if assets.exists():
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
-        api_fallthrough_methods = [
-            "CONNECT",
-            "DELETE",
-            "GET",
-            "HEAD",
-            "OPTIONS",
-            "PATCH",
-            "POST",
-            "PUT",
-            "TRACE",
-        ]
-
-        @app.api_route(  # type: ignore[untyped-decorator]
-            "/api",
-            methods=api_fallthrough_methods,
-        )
-        @app.api_route(  # type: ignore[untyped-decorator]
-            "/api/{path:path}",
-            methods=api_fallthrough_methods,
-        )
-        def api_not_found(path: str = "") -> Any:
-            del path
-            raise HTTPException(status_code=404, detail="Not Found")
-
         @app.get("/")  # type: ignore[untyped-decorator]
         def index() -> Any:
             return FileResponse(web_dist / "index.html")
 
-        @app.get("/{path:path}")  # type: ignore[untyped-decorator]
-        def spa_fallback(path: str) -> Any:
+        class _NonApiSpaFallbackRoute(Route):
+            def matches(
+                self,
+                scope: Any,
+            ) -> tuple[Any, MutableMapping[str, Any]]:
+                path = str(scope.get("path", ""))
+                if path == "/api" or path.startswith("/api/"):
+                    return Match.NONE, {}
+                return super().matches(scope)
+
+        def spa_fallback(request: Any) -> Any:
+            del request
             return FileResponse(web_dist / "index.html")
+
+        app.router.routes.append(
+            _NonApiSpaFallbackRoute(
+                "/{path:path}",
+                endpoint=spa_fallback,
+                methods=["GET"],
+                name="spa_fallback",
+            )
+        )
 
     construction_cleanup.clear()
     return app

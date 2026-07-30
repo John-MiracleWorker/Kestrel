@@ -4,6 +4,7 @@ import json
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 import nested_memvid_agent.server as server_module
@@ -200,42 +201,78 @@ def test_browser_server_retains_its_configured_cors_origin(tmp_path: Path) -> No
     )
 
 
-def test_built_spa_reserves_unknown_api_paths_for_exact_404s(
+@pytest.mark.parametrize(
+    ("web_dist_enabled", "deep_link_status"),
+    [(False, 404), (True, 200)],
+    ids=["without-built-spa", "with-built-spa"],
+)
+def test_spa_fallback_preserves_api_router_semantics(
     tmp_path: Path,
     monkeypatch,
+    web_dist_enabled: bool,
+    deep_link_status: int,
 ) -> None:
-    web_dist = tmp_path / "web-dist"
-    web_dist.mkdir()
-    (web_dist / "index.html").write_text(
-        "<!doctype html><title>Kestrel SPA</title>",
-        encoding="utf-8",
+    web_dist: Path | None = None
+    if web_dist_enabled:
+        web_dist = tmp_path / "web-dist"
+        web_dist.mkdir()
+        (web_dist / "index.html").write_text(
+            "<!doctype html><title>Kestrel SPA</title>",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        server_module,
+        "_resolve_web_dist",
+        lambda: web_dist,
     )
-    monkeypatch.setattr(server_module, "_resolve_web_dist", lambda: web_dist)
     profile_root = tmp_path / "profile"
     profile_root.mkdir()
 
     with TestClient(create_app(_config(profile_root))) as client:
-        api_responses = [
+        known_wrong_method = client.post("/api/health")
+        known_trailing_slash = client.get(
+            "/api/health/",
+            follow_redirects=False,
+        )
+        known_head = client.head("/api/health")
+        unknown_responses = [
             client.get("/api/desktop/readiness"),
             client.post("/api/desktop/shutdown"),
+            client.get("/api/not-registered"),
+            client.post("/api/not-registered"),
             client.put("/api/not-registered"),
             client.patch("/api/not-registered"),
             client.delete("/api/not-registered"),
             client.options("/api/not-registered"),
             client.request("TRACE", "/api/not-registered"),
             client.request("CONNECT", "/api/not-registered"),
+            client.request("PROPFIND", "/api/not-registered"),
         ]
-        api_head = client.head("/api/not-registered")
+        unknown_head = client.head("/api/not-registered")
         spa = client.get("/settings/deep-link")
 
-    assert all(response.status_code == 404 for response in api_responses)
+    assert known_wrong_method.status_code == 405
+    assert known_wrong_method.headers["allow"] == "GET"
+    assert known_wrong_method.json() == {"detail": "Method Not Allowed"}
+    assert known_trailing_slash.status_code == 307
+    assert (
+        known_trailing_slash.headers["location"]
+        == "http://testserver/api/health"
+    )
+    assert known_head.status_code == 405
+    assert known_head.headers["allow"] == "GET"
+    assert known_head.content == b""
+    assert all(response.status_code == 404 for response in unknown_responses)
     assert all(
         response.json() == {"detail": "Not Found"}
-        for response in api_responses
+        for response in unknown_responses
     )
-    assert api_head.status_code == 404
-    assert spa.status_code == 200
-    assert "Kestrel SPA" in spa.text
+    assert unknown_head.status_code == 404
+    assert spa.status_code == deep_link_status
+    if web_dist_enabled:
+        assert "Kestrel SPA" in spa.text
+    else:
+        assert spa.json() == {"detail": "Not Found"}
 
 
 def test_desktop_shutdown_is_authenticated_idempotent_and_desktop_only(

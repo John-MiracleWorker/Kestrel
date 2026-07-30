@@ -371,6 +371,9 @@ const emptySetupDraft: SetupDraft = {
   continuous_learning: true
 };
 
+const DESKTOP_AUTH_RECOVERY_MESSAGE =
+  "The Desktop connection needs to be restored. Retry, or restart Kestrel if its local runtime has stopped.";
+
 export function App() {
   const desktopRuntime = isDesktopRuntime();
   const [error, setError] = useState<string | null>(null);
@@ -540,6 +543,19 @@ export function App() {
   const [selfRememberResult, setSelfRememberResult] = useState<Record<string, unknown> | null>(null);
   const [webQuery, setWebQuery] = useState("");
   const [webResult, setWebResult] = useState<Record<string, unknown> | null>(null);
+
+  const handleAuthRequired = useCallback(() => {
+    setApiReady(false);
+    setAuthPromptOpen(false);
+    setApiTokenDraft("");
+    if (desktopRuntime) {
+      setError(DESKTOP_AUTH_RECOVERY_MESSAGE);
+      return;
+    }
+    setAuthPromptOpen(true);
+    setApiTokenDraft(getApiToken());
+    setError(null);
+  }, [desktopRuntime]);
 
   const sortedThreadRuns = useMemo(
     () => [...threadRuns].sort((left, right) => left.created_at.localeCompare(right.created_at)),
@@ -1119,18 +1135,7 @@ export function App() {
 
   function reportError(value: unknown) {
     if (value instanceof ApiAuthError) {
-      setApiReady(false);
-      if (desktopRuntime) {
-        setAuthPromptOpen(false);
-        setApiTokenDraft("");
-        setError(
-          "The Desktop connection needs to be restored. Retry, or restart Kestrel if its local runtime has stopped."
-        );
-        return;
-      }
-      setAuthPromptOpen(true);
-      setApiTokenDraft(getApiToken());
-      setError(null);
+      handleAuthRequired();
       return;
     }
     setError(value instanceof Error ? value.message : String(value));
@@ -1926,7 +1931,8 @@ export function App() {
   const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
   const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
-  const simpleStatus: SimpleChatStatus = authPromptOpen
+  const browserAuthPromptOpen = authPromptOpen && !desktopRuntime;
+  const simpleStatus: SimpleChatStatus = browserAuthPromptOpen
     ? {
         label: "Locked",
         detail: "Enter the local API token before using this Kestrel."
@@ -1978,7 +1984,7 @@ export function App() {
           </div>
         </div>
       </header>
-      {authPromptOpen ? (
+      {browserAuthPromptOpen ? (
         <main className="conversation" id="workspace">
           <section className="settings-grid" aria-label="API authentication">
             <Panel title={`${agentDisplayName} API token`} icon={<KeyRound size={19} />}>
@@ -2043,10 +2049,7 @@ export function App() {
             setPreparedToolPreview({ name, args });
             jumpToAdvanced("tools");
           }}
-          onAuthRequired={() => {
-            setAuthPromptOpen(true);
-            setApiTokenDraft(getApiToken());
-          }}
+          onAuthRequired={handleAuthRequired}
         />
       ) : activeSection === "outcomes" ? (
         <OutcomesDashboard onBack={() => routeToSection("mission")} />
@@ -2198,10 +2201,7 @@ export function App() {
           </>
         )}
         {activeSection === "routines" && (
-          <RoutineWorkbench onAuthRequired={() => {
-            setAuthPromptOpen(true);
-            setApiTokenDraft(getApiToken());
-          }} />
+          <RoutineWorkbench onAuthRequired={handleAuthRequired} />
         )}
         {activeSection === "routing" && (
           <section

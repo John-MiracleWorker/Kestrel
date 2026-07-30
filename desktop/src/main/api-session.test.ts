@@ -292,6 +292,58 @@ describe("Desktop API session authority", () => {
     expect(redirected).toEqual({ Accept: "application/json" });
   });
 
+  it("scrubs a prior injected token after the bound renderer is actually destroyed", () => {
+    const { authority, send } = harness();
+    const renderer = new FakeWebContents(67);
+    authority.activate({
+      baseUrl: "http://127.0.0.1:43123/",
+      apiToken: "main-process-token",
+      generation: 1
+    });
+    authority.bindRenderer(renderer);
+    const injected = send(renderer);
+    expect(injected.Authorization).toBe("Bearer main-process-token");
+
+    renderer.destroy();
+    const replayed = send(renderer, {
+      url: "http://127.0.0.1:43124/redirected",
+      frame: null,
+      webContentsId: undefined,
+      webContents: undefined,
+      requestHeaders: {
+        ...injected,
+        "x-KESTREL-api-KEY": "renderer-controlled"
+      }
+    });
+
+    expect(replayed).toEqual({ Accept: "application/json" });
+  });
+
+  it("scrubs prior authority headers when request provenance is absent", () => {
+    const { authority, send } = harness();
+    const renderer = new FakeWebContents(71);
+    authority.activate({
+      baseUrl: "http://127.0.0.1:43123/",
+      apiToken: "main-process-token",
+      generation: 1
+    });
+    authority.bindRenderer(renderer);
+    const injected = send(renderer);
+    expect(injected.Authorization).toBe("Bearer main-process-token");
+
+    const replayed = send(renderer, {
+      frame: null,
+      webContentsId: undefined,
+      webContents: undefined,
+      requestHeaders: {
+        ...injected,
+        "X-Kestrel-API-Key": "renderer-controlled"
+      }
+    });
+
+    expect(replayed).toEqual({ Accept: "application/json" });
+  });
+
   it.each([
     "https://127.0.0.1:43123/",
     "http://localhost:43123/",

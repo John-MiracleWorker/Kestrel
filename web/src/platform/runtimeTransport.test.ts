@@ -8,6 +8,7 @@ import {
 } from "../api";
 import { apiAuthHeaders, getApiToken, setApiToken } from "../auth";
 import {
+  DesktopRuntimeTransport,
   DESKTOP_RUNTIME_MARKER_KEY,
   runtimeTransport,
   type DesktopRuntimeMarker
@@ -167,6 +168,180 @@ describe("runtime transport", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("copies accessor-backed marker scalars once and never retains the source object", async () => {
+    const reads = {
+      schema: 0,
+      baseUrl: 0,
+      generation: 0
+    };
+    const marker = Object.freeze(
+      Object.defineProperties(
+        {},
+        {
+          schema: {
+            enumerable: true,
+            get() {
+              reads.schema += 1;
+              if (reads.schema > 1) throw new Error("schema-getter-secret");
+              return "kestrel.desktop.runtime.v1";
+            }
+          },
+          baseUrl: {
+            enumerable: true,
+            get() {
+              reads.baseUrl += 1;
+              if (reads.baseUrl > 1) throw new Error("base-url-getter-secret");
+              return "http://127.0.0.1:43123/";
+            }
+          },
+          generation: {
+            enumerable: true,
+            get() {
+              reads.generation += 1;
+              if (reads.generation > 1) throw new Error("generation-getter-secret");
+              return 9;
+            }
+          }
+        }
+      )
+    ) as DesktopRuntimeMarker;
+    installDesktopMarker(marker);
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = runtimeTransport();
+    await expect(transport.fetch("/api/health")).resolves.toBeInstanceOf(Response);
+
+    expect(reads).toEqual({
+      schema: 1,
+      baseUrl: 1,
+      generation: 1
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://127.0.0.1:43123/api/health"
+    );
+  });
+
+  it.each([
+    {
+      label: "throwing getter",
+      secret: "getter-secret-must-not-leak",
+      marker: Object.freeze(
+        Object.defineProperties(
+          {},
+          {
+            schema: {
+              enumerable: true,
+              get() {
+                throw new Error("getter-secret-must-not-leak");
+              }
+            },
+            baseUrl: {
+              enumerable: true,
+              value: "http://127.0.0.1:43123/"
+            },
+            generation: {
+              enumerable: true,
+              value: 1
+            }
+          }
+        )
+      )
+    },
+    {
+      label: "throwing proxy",
+      secret: "proxy-secret-must-not-leak",
+      marker: new Proxy(
+        Object.freeze({
+          schema: "kestrel.desktop.runtime.v1",
+          baseUrl: "http://127.0.0.1:43123/",
+          generation: 1
+        }),
+        {
+          ownKeys() {
+            throw new Error("proxy-secret-must-not-leak");
+          }
+        }
+      )
+    }
+  ])("fails closed with a fixed error for a $label", ({ marker, secret }) => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    vi.stubGlobal("fetch", fetchMock);
+    installDesktopMarker(marker);
+
+    let caught: unknown;
+    try {
+      runtimeTransport();
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toBe("desktop_runtime_marker_invalid");
+    expect((caught as Error).message).not.toContain(secret);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getItem).not.toHaveBeenCalled();
+  });
+
+  it("validates and snapshots marker primitives when constructed directly", async () => {
+    let baseUrlReads = 0;
+    const marker = Object.freeze(
+      Object.defineProperties(
+        {},
+        {
+          schema: {
+            enumerable: true,
+            value: "kestrel.desktop.runtime.v1"
+          },
+          baseUrl: {
+            enumerable: true,
+            get() {
+              baseUrlReads += 1;
+              if (baseUrlReads > 1) {
+                throw new Error("direct-constructor-secret");
+              }
+              return "http://127.0.0.1:43123/";
+            }
+          },
+          generation: {
+            enumerable: true,
+            value: 11
+          }
+        }
+      )
+    ) as DesktopRuntimeMarker;
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new DesktopRuntimeTransport(marker);
+    await expect(transport.fetch("/api/health")).resolves.toBeInstanceOf(Response);
+
+    expect(baseUrlReads).toBe(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://127.0.0.1:43123/api/health"
+    );
+  });
+
+  it("rejects an invalid direct-constructor marker before fetch or storage access", () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(
+      () =>
+        new DesktopRuntimeTransport(
+          Object.freeze({
+            schema: "kestrel.desktop.runtime.v1",
+            baseUrl: "http://localhost:43123/",
+            generation: 1
+          }) as DesktopRuntimeMarker
+        )
+    ).toThrow("desktop_runtime_marker_invalid");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getItem).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       label: "unfrozen",
@@ -236,6 +411,30 @@ describe("runtime transport", () => {
     {
       label: "non-object",
       marker: "desktop"
+    },
+    {
+      label: "non-enumerable extra key",
+      marker: (() => {
+        const marker = {
+          schema: "kestrel.desktop.runtime.v1",
+          baseUrl: "http://127.0.0.1:43123/",
+          generation: 1
+        };
+        Object.defineProperty(marker, "hiddenAuthority", {
+          enumerable: false,
+          value: "hidden-secret"
+        });
+        return Object.freeze(marker);
+      })()
+    },
+    {
+      label: "symbol extra key",
+      marker: Object.freeze({
+        schema: "kestrel.desktop.runtime.v1",
+        baseUrl: "http://127.0.0.1:43123/",
+        generation: 1,
+        [Symbol("hiddenAuthority")]: "hidden-secret"
+      })
     }
   ])("fails closed for a $label Desktop marker", async ({ marker }) => {
     sessionStorage.setItem("kestrel.apiToken", "browser-token-must-not-leak");

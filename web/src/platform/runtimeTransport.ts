@@ -59,28 +59,60 @@ function exactDesktopBaseUrl(value: unknown): string | null {
   return value;
 }
 
-function readDesktopMarker(): DesktopRuntimeMarker {
-  const marker = Reflect.get(globalThis, DESKTOP_RUNTIME_MARKER_KEY);
-  if (
-    typeof marker !== "object" ||
-    marker === null ||
-    !Object.isFrozen(marker) ||
-    Object.keys(marker).sort().join(",") !==
-      "baseUrl,generation,schema" ||
-    Reflect.get(marker, "schema") !== "kestrel.desktop.runtime.v1"
-  ) {
+const DESKTOP_MARKER_KEYS = new Set([
+  "schema",
+  "baseUrl",
+  "generation"
+]);
+
+function validatedDesktopMarker(value: unknown): DesktopRuntimeMarker {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !Object.isFrozen(value)
+    ) {
+      throw fixedError("desktop_runtime_marker_invalid");
+    }
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== DESKTOP_MARKER_KEYS.size ||
+      keys.some(
+        (key) =>
+          typeof key !== "string" ||
+          !DESKTOP_MARKER_KEYS.has(key)
+      )
+    ) {
+      throw fixedError("desktop_runtime_marker_invalid");
+    }
+    const schema = Reflect.get(value, "schema");
+    const baseUrlValue = Reflect.get(value, "baseUrl");
+    const generation = Reflect.get(value, "generation");
+    const baseUrl = exactDesktopBaseUrl(baseUrlValue);
+    if (
+      schema !== "kestrel.desktop.runtime.v1" ||
+      baseUrl === null ||
+      !Number.isSafeInteger(generation) ||
+      generation <= 0
+    ) {
+      throw fixedError("desktop_runtime_marker_invalid");
+    }
+    return Object.freeze({
+      schema: "kestrel.desktop.runtime.v1",
+      baseUrl,
+      generation
+    });
+  } catch {
     throw fixedError("desktop_runtime_marker_invalid");
   }
-  const baseUrl = exactDesktopBaseUrl(Reflect.get(marker, "baseUrl"));
-  const generation = Reflect.get(marker, "generation");
-  if (
-    baseUrl === null ||
-    !Number.isSafeInteger(generation) ||
-    generation <= 0
-  ) {
+}
+
+function readDesktopMarkerValue(): unknown {
+  try {
+    return Reflect.get(globalThis, DESKTOP_RUNTIME_MARKER_KEY);
+  } catch {
     throw fixedError("desktop_runtime_marker_invalid");
   }
-  return marker as DesktopRuntimeMarker;
 }
 
 function headerRecord(headers?: HeadersInit): Record<string, string> {
@@ -128,10 +160,13 @@ export class BrowserRuntimeTransport implements RuntimeTransport {
 
 export class DesktopRuntimeTransport implements RuntimeTransport {
   readonly mode = "desktop" as const;
+  private readonly baseUrl: string;
   private readonly origin: string;
 
-  constructor(private readonly marker: DesktopRuntimeMarker) {
-    this.origin = new URL(marker.baseUrl).origin;
+  constructor(marker: unknown) {
+    const snapshot = validatedDesktopMarker(marker);
+    this.baseUrl = snapshot.baseUrl;
+    this.origin = new URL(snapshot.baseUrl).origin;
   }
 
   private requestUrl(path: string): string {
@@ -153,7 +188,7 @@ export class DesktopRuntimeTransport implements RuntimeTransport {
     }
     let parsed: URL;
     try {
-      parsed = new URL(path, this.marker.baseUrl);
+      parsed = new URL(path, this.baseUrl);
     } catch {
       throw fixedError("desktop_runtime_request_invalid");
     }
@@ -206,5 +241,5 @@ export function runtimeTransport(
   if (!hasOwnDesktopMarker()) {
     return new BrowserRuntimeTransport(readBrowserAuthHeaders);
   }
-  return new DesktopRuntimeTransport(readDesktopMarker());
+  return new DesktopRuntimeTransport(readDesktopMarkerValue());
 }
