@@ -172,25 +172,42 @@ function compareUnicodeCodePoints(left: string, right: string): number {
   return leftPoints.length - rightPoints.length;
 }
 
-function canonicalValue(value: unknown): unknown {
+function canonicalJson(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
   if (Array.isArray(value)) {
-    return value.map(canonicalValue);
+    return `[${value.map(canonicalJson).join(",")}]`;
   }
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value)
-        .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
-        .map(([key, child]) => [key, canonicalValue(child)])
+  if (typeof value === "object") {
+    const entries = Object.entries(value).sort(([left], [right]) =>
+      compareUnicodeCodePoints(left, right)
     );
+    return `{${entries
+      .map(
+        ([key, child]) =>
+          `${JSON.stringify(key)}:${canonicalJson(child)}`
+      )
+      .join(",")}}`;
   }
-  return value;
+  if (
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    const encoded = JSON.stringify(value);
+    if (encoded !== undefined) {
+      return encoded;
+    }
+  }
+  throw new ResourceVerificationError("resource_manifest_invalid");
 }
 
 export function canonicalResourceManifestBytes(
   manifest: ResourceManifest
 ): Buffer {
   return Buffer.from(
-    `${JSON.stringify(canonicalValue(manifest))}\n`,
+    `${canonicalJson(manifest)}\n`,
     "utf8"
   );
 }
