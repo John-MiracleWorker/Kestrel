@@ -8,6 +8,7 @@ import {
   desktopErrorCodeSchema,
   desktopLifecycleStateSchema,
   desktopRecoveryReasonSchema,
+  desktopRecoveryActionResultSchema,
   desktopRuntimeMarkerSchema,
   desktopUpdateStatusSchema
 } from "./contracts";
@@ -123,6 +124,31 @@ describe("desktopConnectionSchema", () => {
     expect(
       desktopRecoveryReasonSchema.parse("reconciliation_required")
     ).toBe("reconciliation_required");
+    expect(desktopRecoveryReasonSchema.options).toContain(
+      "state_corrupt"
+    );
+    expect(desktopRecoveryReasonSchema.options).toContain(
+      "memvid_reopen_failed"
+    );
+  });
+
+  it("projects bounded retry rejection without authority or free text", () => {
+    expect(
+      desktopRecoveryActionResultSchema.parse({
+        accepted: false,
+        reason: "retry_rate_limited"
+      })
+    ).toEqual({
+      accepted: false,
+      reason: "retry_rate_limited"
+    });
+    expect(() =>
+      desktopRecoveryActionResultSchema.parse({
+        accepted: false,
+        reason: "retry_rate_limited",
+        detail: "must not cross"
+      })
+    ).toThrow();
   });
 });
 

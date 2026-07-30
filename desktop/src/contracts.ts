@@ -147,8 +147,14 @@ export const desktopLifecycleStateSchema = z.enum([
 export const desktopRecoveryReasonSchema = z.enum([
   "sidecar_unavailable",
   "sidecar_unverified",
+  "payload_verification_failed",
   "profile_conflict",
   "version_incompatible",
+  "state_incompatible",
+  "state_corrupt",
+  "memvid_reopen_failed",
+  "sidecar_crash_loop",
+  "credential_backend_unavailable",
   "reconciliation_required"
 ]);
 
@@ -540,9 +546,21 @@ export type DesktopRecoveryActionRequest = Readonly<
   z.infer<typeof desktopRecoveryActionRequestSchema>
 >;
 
-export const desktopRecoveryActionResultSchema = z
-  .object({ accepted: z.literal(true) })
-  .strict();
+export const desktopRecoveryActionResultSchema =
+  z.discriminatedUnion("accepted", [
+    z.object({ accepted: z.literal(true) }).strict(),
+    z
+      .object({
+        accepted: z.literal(false),
+        reason: z.enum([
+          "not_in_recovery",
+          "recovery_blocked",
+          "retry_rate_limited",
+          "retry_failed"
+        ])
+      })
+      .strict()
+  ]);
 
 export type DesktopRecoveryActionResult = Readonly<
   z.infer<typeof desktopRecoveryActionResultSchema>

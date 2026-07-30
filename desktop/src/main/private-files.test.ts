@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createPrivateLaunchFiles,
   createNodePrivateFileAdapter,
+  readSidecarFailure,
   readSidecarReadiness,
   resolvePrivateProfile,
   runtimeProfileControlIdentityBytes,
@@ -239,6 +240,138 @@ describe("private desktop launch files", () => {
     await expect(readSidecarReadiness(profile.readinessPath)).rejects.toThrow(
       "16 KiB"
     );
+  });
+
+  it("authenticates one bounded generation-bound sidecar failure", async () => {
+    const profile = await resolvePrivateProfile({
+      profileId: "default",
+      trustedAnchor: testRoot,
+      profileRoot,
+      statePath: join(profileRoot, "state", "agent.db"),
+      memoryDir: join(profileRoot, "memory"),
+      runtimeSettingsPath: join(
+        profileRoot,
+        "config",
+        "runtime_settings.json"
+      )
+    }, profileAdapter);
+    const secrets = [Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)];
+    const launch = await createPrivateLaunchFiles({
+      profile,
+      parentPid: process.pid,
+      parentBirthMarker: "parent-birth-marker",
+      resourceManifestDigest: `sha256:${"a".repeat(64)}`,
+      randomBytes: () => secrets.shift() ?? Buffer.alloc(0),
+      platformAdapter: profileAdapter
+    });
+    const unsigned = {
+      launch_nonce_digest: launch.launchNonceDigest,
+      profile_id: profile.profileId,
+      reason: "state_corrupt",
+      resource_manifest_digest: `sha256:${"a".repeat(64)}`,
+      schema: "kestrel.desktop.sidecar-failure.v1",
+      sidecar_version: "0.5.0"
+    };
+    const authenticationTag = createHmac(
+      "sha256",
+      launch.apiToken
+    )
+      .update("kestrel.desktop.sidecar-failure.v1\0")
+      .update(JSON.stringify(unsigned))
+      .digest("hex");
+    const failure = {
+      ...unsigned,
+      authentication_tag: authenticationTag
+    };
+    await writeFile(launch.failurePath, JSON.stringify(failure), {
+      mode: 0o600
+    });
+    await chmod(launch.failurePath, 0o600);
+
+    const captured = await readSidecarFailure(
+      launch.failurePath,
+      {
+        apiToken: launch.apiToken,
+        launchNonceDigest: launch.launchNonceDigest,
+        profileId: profile.profileId,
+        resourceManifestDigest: `sha256:${"a".repeat(64)}`,
+        sidecarVersion: "0.5.0"
+      },
+      profileAdapter
+    );
+
+    expect(captured.failure).toEqual(failure);
+    expect(captured.identity).toEqual(
+      expect.objectContaining({
+        dev: expect.any(Number),
+        ino: expect.any(Number)
+      })
+    );
+  });
+
+  it("rejects tampered, stale, symlinked, and oversized sidecar failures", async () => {
+    const profile = await resolvePrivateProfile({
+      profileId: "default",
+      trustedAnchor: testRoot,
+      profileRoot,
+      statePath: join(profileRoot, "state", "agent.db"),
+      memoryDir: join(profileRoot, "memory"),
+      runtimeSettingsPath: join(
+        profileRoot,
+        "config",
+        "runtime_settings.json"
+      )
+    }, profileAdapter);
+    const secrets = [Buffer.alloc(32, 0x11), Buffer.alloc(32, 0x22)];
+    const launch = await createPrivateLaunchFiles({
+      profile,
+      parentPid: process.pid,
+      parentBirthMarker: "parent-birth-marker",
+      resourceManifestDigest: `sha256:${"a".repeat(64)}`,
+      randomBytes: () => secrets.shift() ?? Buffer.alloc(0),
+      platformAdapter: profileAdapter
+    });
+    const expected = {
+      apiToken: launch.apiToken,
+      launchNonceDigest: launch.launchNonceDigest,
+      profileId: profile.profileId,
+      resourceManifestDigest: `sha256:${"a".repeat(64)}`,
+      sidecarVersion: "0.5.0"
+    };
+    const invalid = {
+      schema: "kestrel.desktop.sidecar-failure.v1",
+      launch_nonce_digest: "c".repeat(64),
+      profile_id: profile.profileId,
+      reason: "state_corrupt",
+      resource_manifest_digest: `sha256:${"a".repeat(64)}`,
+      sidecar_version: "0.5.0",
+      authentication_tag: "d".repeat(64)
+    };
+    await writeFile(launch.failurePath, JSON.stringify(invalid), {
+      mode: 0o600
+    });
+    await chmod(launch.failurePath, 0o600);
+    await expect(
+      readSidecarFailure(launch.failurePath, expected, profileAdapter)
+    ).rejects.toThrow("sidecar_failure_invalid");
+
+    const outside = join(testRoot, "outside-failure.json");
+    await writeFile(outside, JSON.stringify(invalid), { mode: 0o600 });
+    await rm(launch.failurePath);
+    await symlink(outside, launch.failurePath);
+    await expect(
+      readSidecarFailure(launch.failurePath, expected, profileAdapter)
+    ).rejects.toThrow("symlink");
+
+    await rm(launch.failurePath);
+    await writeFile(
+      launch.failurePath,
+      " ".repeat(16 * 1024 + 1),
+      { mode: 0o600 }
+    );
+    await expect(
+      readSidecarFailure(launch.failurePath, expected, profileAdapter)
+    ).rejects.toThrow("16 KiB");
   });
 
   it("cleans up only the readiness inode captured by the verified read", async () => {

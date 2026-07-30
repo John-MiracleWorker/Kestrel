@@ -1,12 +1,15 @@
 import { createHash, createHmac } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { VerifiedResourceSet } from "./resource-manifest";
 import {
+  createNodeSupervisorDependencies,
   SidecarSupervisor,
   SidecarSupervisorError,
   type AuthenticatedDesktopReadiness,
+  type AuthenticatedDesktopRecoveryReport,
   type ProfileLeaseEvidence,
   type SidecarSpawnRequest,
   type SidecarSupervisorConfig,
@@ -199,6 +202,37 @@ function apiReadiness(): AuthenticatedDesktopReadiness {
   };
 }
 
+function recoveryReport(
+  overrides: Partial<AuthenticatedDesktopRecoveryReport> = {}
+): AuthenticatedDesktopRecoveryReport {
+  return {
+    schema: "kestrel.desktop.recovery.v1" as const,
+    can_auto_resume: overrides.can_auto_resume ?? true,
+    reasons: overrides.reasons ?? [],
+    blockers: overrides.blockers ?? [],
+    actions: [
+      "inspect",
+      "export_support_bundle",
+      "retry_readiness"
+    ],
+    state:
+      overrides.state ?? {
+        integrity: "ok" as const,
+        schema_version: 21,
+        writable: true
+      },
+    memory: overrides.memory ?? { ready: true },
+    approvals:
+      overrides.approvals ?? { pending_high_risk: 0 },
+    routing:
+      overrides.routing ?? { ambiguous_provider_attempts: 0 },
+    credential_storage:
+      overrides.credential_storage ?? {
+        state: "available" as const
+      }
+  };
+}
+
 function harness(
   overrides: Partial<SidecarSupervisorDependencies> = {},
   configOverrides: Partial<SidecarSupervisorConfig> & {
@@ -234,7 +268,6 @@ function harness(
       }
     | { kind: "deactivate"; generation?: number }
   > = [];
-  let leaseInspection = 0;
   const dependencies: SidecarSupervisorDependencies = {
     apiSession: {
       activate(input: {
@@ -282,14 +315,13 @@ function harness(
       leaseControlRoot: "/profile/state/.kestrel-runtime-profiles/profile"
     }),
     inspectLease: async () => {
-      const phase = leaseInspection;
-      leaseInspection += 1;
-      if (phase === 0) {
-        return { status: "available" };
-      }
       const child = spawner.children.at(-1);
-      if (child === undefined) {
-        throw new Error("missing spawned child");
+      if (
+        child === undefined ||
+        child.exitCode !== null ||
+        child.signalCode !== null
+      ) {
+        return { status: "available" };
       }
       return leaseFor(child);
     },
@@ -300,6 +332,7 @@ function harness(
     createLaunchFiles: async (input) => ({
       bootstrapPath: "/profile/runtime/bootstrap.json",
       readinessPath: "/profile/runtime/desktop-readiness.json",
+      failurePath: "/profile/runtime/desktop-failure.json",
       launchNonce,
       launchNonceDigest,
       apiToken,
@@ -332,6 +365,12 @@ function harness(
       executableDigest
     }),
     requestReadiness: async () => apiReadiness(),
+    requestRecovery: async () => recoveryReport(),
+    requestRecoveryRetry: async () => ({
+      schema: "kestrel.desktop.recovery-retry-result.v1",
+      accepted: true,
+      report: recoveryReport()
+    }),
     requestShutdown: async (request) => {
       shutdownRequests.push(request);
       spawner.children.at(-1)?.exit(0);
@@ -347,6 +386,7 @@ function harness(
       }
       return false;
     },
+    now: () => Date.now(),
     log: (line) => logs.push(line),
     ...overrides
   };
@@ -443,6 +483,7 @@ function failedStartHarness(
     createLaunchFiles: async (input) => ({
       bootstrapPath: "/profile/runtime/bootstrap.json",
       readinessPath: "/profile/runtime/desktop-readiness.json",
+      failurePath: "/profile/runtime/desktop-failure.json",
       launchNonce,
       launchNonceDigest,
       apiToken,
@@ -525,7 +566,117 @@ describe("verified sidecar supervisor", () => {
     expect(spawner.children).toHaveLength(0);
     expect(supervisor.state).toMatchObject({
       kind: "recovery",
-      reason: "sidecar_unverified"
+      reason: "payload_verification_failed"
+    });
+  });
+
+  it("rejects unknown or contradictory recovery reports and bounds retry responses", async () => {
+    let recoveryMode: "unknown" | "contradictory" = "unknown";
+    let retryBody = "";
+    const authorizations: Array<string | undefined> = [];
+    const server = createServer((request, response) => {
+      authorizations.push(request.headers.authorization);
+      if (request.url === "/api/desktop/recovery/retry") {
+        request.setEncoding("utf8");
+        request.on("data", (chunk: string) => {
+          retryBody += chunk;
+        });
+        request.on("end", () => {
+          response.writeHead(200, {
+            "Content-Type": "application/json"
+          });
+          response.end(
+            JSON.stringify({ padding: "x".repeat(20 * 1024) })
+          );
+        });
+        return;
+      }
+      const report =
+        recoveryMode === "unknown"
+          ? {
+              ...recoveryReport(),
+              reasons: ["provider-secret-code"]
+            }
+          : {
+              ...recoveryReport(),
+              can_auto_resume: true,
+              reasons: ["pending_high_risk_approval"],
+              blockers: [],
+              approvals: { pending_high_risk: 1 }
+            };
+      response.writeHead(200, {
+        "Content-Type": "application/json"
+      });
+      response.end(JSON.stringify(report));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      server.close();
+      throw new Error("test_http_server_unavailable");
+    }
+    const dependencies = createNodeSupervisorDependencies({
+      apiSession: {
+        activate: () => undefined,
+        deactivate: () => undefined
+      },
+      resourceVerification: {
+        resourceRoot: "/unused",
+        manifestPath: "/unused/manifest.json",
+        signaturePath: "/unused/manifest.sig",
+        trustedKeys: new Map(),
+        requiredFiles: []
+      },
+      profile: {
+        profileId: "default",
+        trustedAnchor: "/unused",
+        profileRoot: "/unused/profile",
+        statePath: "/unused/profile/state/agent.db",
+        memoryDir: "/unused/profile/memory",
+        runtimeSettingsPath:
+          "/unused/profile/config/runtime_settings.json"
+      },
+      sidecarVersion: "0.5.0"
+    });
+    const baseUrl = `http://127.0.0.1:${address.port}/`;
+    try {
+      await expect(
+        dependencies.requestRecovery({ baseUrl, apiToken })
+      ).rejects.toMatchObject({
+        code: "authenticated_recovery_invalid"
+      });
+      recoveryMode = "contradictory";
+      await expect(
+        dependencies.requestRecovery({ baseUrl, apiToken })
+      ).rejects.toMatchObject({
+        code: "authenticated_recovery_invalid"
+      });
+      await expect(
+        dependencies.requestRecoveryRetry({ baseUrl, apiToken })
+      ).rejects.toThrow("desktop_http_response_too_large");
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error === undefined) {
+            resolve();
+          } else {
+            reject(error);
+          }
+        });
+      });
+    }
+
+    expect(authorizations).toEqual([
+      `Bearer ${apiToken}`,
+      `Bearer ${apiToken}`,
+      `Bearer ${apiToken}`
+    ]);
+    expect(JSON.parse(retryBody)).toEqual({
+      schema: "kestrel.desktop.recovery-retry.v1",
+      action: "retry_readiness"
     });
   });
 
@@ -869,6 +1020,260 @@ describe("verified sidecar supervisor", () => {
     ]);
   });
 
+  it("surfaces and exactly cleans an authenticated startup failure", async () => {
+    const failureIdentity = { dev: 7, ino: 11 };
+    const cleanupCalls: Array<
+      [
+        { dev: number; ino: number } | undefined,
+        { dev: number; ino: number } | undefined
+      ]
+    > = [];
+    const { supervisor } = harness({
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: async (readinessIdentity, startupFailureIdentity) => {
+          cleanupCalls.push([
+            readinessIdentity,
+            startupFailureIdentity
+          ]);
+        }
+      }),
+      waitForReadiness: async () => {
+        throw new SidecarSupervisorError(
+          "sidecar_exited_before_readiness",
+          "sidecar_unavailable"
+        );
+      },
+      readStartupFailure: async () => ({
+        identity: failureIdentity,
+        failure: {
+          schema: "kestrel.desktop.sidecar-failure.v1",
+          launch_nonce_digest: launchNonceDigest,
+          profile_id: "default",
+          reason: "state_corrupt",
+          resource_manifest_digest: manifestDigest,
+          sidecar_version: "0.5.0",
+          authentication_tag: "c".repeat(64)
+        }
+      })
+    });
+
+    await expect(supervisor.start()).rejects.toMatchObject({
+      code: "state_corrupt",
+      recoveryReason: "state_corrupt"
+    });
+
+    expect(supervisor.state).toEqual({
+      kind: "recovery",
+      reason: "state_corrupt",
+      detail: "state_corrupt"
+    });
+    expect(cleanupCalls).toContainEqual([
+      undefined,
+      failureIdentity
+    ]);
+  });
+
+  it("captures startup failure evidence before exit finalization cleanup", async () => {
+    const readiness = deferred<never>();
+    const failureIdentity = { dev: 13, ino: 17 };
+    const cleanupCalls: Array<
+      [
+        { dev: number; ino: number } | undefined,
+        { dev: number; ino: number } | undefined
+      ]
+    > = [];
+    const { supervisor, spawner } = harness({
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: async (readinessIdentity, startupFailureIdentity) => {
+          cleanupCalls.push([
+            readinessIdentity,
+            startupFailureIdentity
+          ]);
+        }
+      }),
+      waitForReadiness: () => readiness.promise,
+      readStartupFailure: async () => ({
+        identity: failureIdentity,
+        failure: {
+          schema: "kestrel.desktop.sidecar-failure.v1",
+          launch_nonce_digest: launchNonceDigest,
+          profile_id: "default",
+          reason: "memvid_reopen_failed",
+          resource_manifest_digest: manifestDigest,
+          sidecar_version: "0.5.0",
+          authentication_tag: "c".repeat(64)
+        }
+      })
+    });
+
+    const start = supervisor.start();
+    await eventually(() => {
+      expect(spawner.children).toHaveLength(1);
+    });
+    spawner.children[0]!.exit(1);
+
+    await expect(start).rejects.toMatchObject({
+      code: "memvid_reopen_failed",
+      recoveryReason: "memvid_reopen_failed"
+    });
+    await eventually(() => {
+      expect(cleanupCalls).toContainEqual([
+        undefined,
+        failureIdentity
+      ]);
+    });
+  });
+
+  it("keeps API authority inactive when live recovery inspection is blocked", async () => {
+    const { supervisor, apiSessionEvents } = harness({
+      requestRecovery: async () =>
+        recoveryReport({
+          can_auto_resume: false,
+          reasons: ["pending_high_risk_approval"],
+          blockers: ["pending_high_risk_approval"]
+        })
+    });
+
+    await expect(supervisor.start()).resolves.toBeDefined();
+
+    expect(supervisor.state).toEqual({
+      kind: "recovery",
+      reason: "reconciliation_required",
+      detail: "recovery_blocked_pending_high_risk_approval"
+    });
+    expect(
+      apiSessionEvents.some((event) => event.kind === "activate")
+    ).toBe(false);
+  });
+
+  it("coalesces one explicit recovery retry without automatic replay", async () => {
+    const secondVerification = deferred<VerifiedResourceSet>();
+    let verificationCalls = 0;
+    const { supervisor, spawner } = harness({
+      verifyResources: async () => {
+        verificationCalls += 1;
+        return verificationCalls === 1
+          ? verifiedResources()
+          : secondVerification.promise;
+      }
+    });
+    await supervisor.start();
+    supervisor.enterReconciliationRequired();
+
+    const first = supervisor.retryReadiness();
+    const duplicate = supervisor.retryReadiness();
+    await eventually(() => {
+      expect(verificationCalls).toBe(2);
+    });
+    expect(spawner.children).toHaveLength(1);
+
+    secondVerification.resolve(verifiedResources());
+    await expect(first).resolves.toEqual({ accepted: true });
+    await expect(duplicate).resolves.toEqual({ accepted: true });
+    expect(spawner.children).toHaveLength(2);
+    expect(supervisor.state.kind).toBe("ready");
+  });
+
+  it("never activates a stale generation after a live recovery retry", async () => {
+    const retried = deferred<{
+      schema: "kestrel.desktop.recovery-retry-result.v1";
+      accepted: true;
+      report: AuthenticatedDesktopRecoveryReport;
+    }>();
+    let retryCalls = 0;
+    const { supervisor, apiSessionEvents } = harness({
+      requestRecovery: async () =>
+        recoveryReport({
+          can_auto_resume: false,
+          reasons: ["ambiguous_provider_attempt"],
+          blockers: ["ambiguous_provider_attempt"],
+          routing: { ambiguous_provider_attempts: 1 }
+        }),
+      requestRecoveryRetry: async () => {
+        retryCalls += 1;
+        return retried.promise;
+      }
+    });
+    await supervisor.start();
+
+    const retry = supervisor.retryReadiness();
+    await eventually(() => {
+      expect(retryCalls).toBe(1);
+    });
+    await supervisor.stop();
+    retried.resolve({
+      schema: "kestrel.desktop.recovery-retry-result.v1",
+      accepted: true,
+      report: recoveryReport()
+    });
+
+    await expect(retry).resolves.toEqual({
+      accepted: false,
+      reason: "retry_failed"
+    });
+    expect(
+      apiSessionEvents.some((event) => event.kind === "activate")
+    ).toBe(false);
+    expect(supervisor.state).toEqual({ kind: "stopping" });
+  });
+
+  it("enters a bounded crash loop after two failed explicit retries", async () => {
+    let now = 1_000;
+    let verificationCalls = 0;
+    const { supervisor } = harness({
+      now: () => now,
+      verifyResources: async () => {
+        verificationCalls += 1;
+        if (verificationCalls === 1) {
+          return verifiedResources();
+        }
+        throw new Error("verification_failed");
+      }
+    });
+    await supervisor.start();
+    supervisor.enterReconciliationRequired();
+
+    await expect(supervisor.retryReadiness()).resolves.toEqual({
+      accepted: false,
+      reason: "retry_failed"
+    });
+    await expect(supervisor.retryReadiness()).resolves.toEqual({
+      accepted: false,
+      reason: "retry_failed"
+    });
+    await expect(supervisor.retryReadiness()).resolves.toEqual({
+      accepted: false,
+      reason: "retry_rate_limited"
+    });
+    expect(verificationCalls).toBe(3);
+    expect(supervisor.state).toEqual({
+      kind: "recovery",
+      reason: "sidecar_crash_loop",
+      detail: "recovery_retry_rate_limited"
+    });
+
+    now += 60_001;
+    await expect(supervisor.retryReadiness()).resolves.toEqual({
+      accepted: false,
+      reason: "retry_failed"
+    });
+    expect(verificationCalls).toBe(4);
+  });
+
   it("deactivates synchronously before stop waits for sidecar shutdown", async () => {
     let authorityActive = false;
     const shutdownGate = deferred<void>();
@@ -931,6 +1336,7 @@ describe("verified sidecar supervisor", () => {
       createLaunchFiles: async (input) => ({
         bootstrapPath: "/profile/runtime/bootstrap.json",
         readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
         launchNonce,
         launchNonceDigest,
         apiToken,
@@ -1055,6 +1461,7 @@ describe("verified sidecar supervisor", () => {
       createLaunchFiles: async (input) => ({
         bootstrapPath: "/profile/runtime/bootstrap.json",
         readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
         launchNonce,
         launchNonceDigest,
         apiToken,
@@ -1176,6 +1583,7 @@ describe("verified sidecar supervisor", () => {
       createLaunchFiles: async (input) => ({
         bootstrapPath: "/profile/runtime/bootstrap.json",
         readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
         launchNonce,
         launchNonceDigest,
         apiToken,
@@ -1208,6 +1616,7 @@ describe("verified sidecar supervisor", () => {
       createLaunchFiles: async (input) => ({
         bootstrapPath: "/profile/runtime/bootstrap.json",
         readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
         launchNonce,
         launchNonceDigest,
         apiToken,
@@ -1606,6 +2015,7 @@ describe("verified sidecar supervisor", () => {
       createLaunchFiles: async (input) => ({
         bootstrapPath: "/profile/runtime/bootstrap.json",
         readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
         launchNonce,
         launchNonceDigest,
         apiToken,

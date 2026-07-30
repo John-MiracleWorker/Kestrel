@@ -637,6 +637,30 @@ export type DesktopCredentialStorageReadiness = {
   remediation: string;
 };
 
+export type DesktopRecoveryReason =
+  | "sidecar_unavailable"
+  | "sidecar_unverified"
+  | "payload_verification_failed"
+  | "profile_conflict"
+  | "version_incompatible"
+  | "state_incompatible"
+  | "state_corrupt"
+  | "memvid_reopen_failed"
+  | "sidecar_crash_loop"
+  | "credential_backend_unavailable"
+  | "reconciliation_required";
+
+export type DesktopRecoveryActionResult =
+  | { accepted: true }
+  | {
+      accepted: false;
+      reason:
+        | "not_in_recovery"
+        | "recovery_blocked"
+        | "retry_rate_limited"
+        | "retry_failed";
+    };
+
 export type SetupReadinessReport = {
   schema: string;
   ready: boolean;

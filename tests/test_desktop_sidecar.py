@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import socket
+import sqlite3
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -21,16 +23,23 @@ from nested_memvid_agent.channels import ChannelManager
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
 from nested_memvid_agent.desktop_sidecar import (
+    DesktopSidecarFailure,
     DesktopSidecarReadiness,
+    DesktopStateCorruptError,
+    DesktopStateIncompatibleError,
     bind_desktop_socket,
     build_desktop_agent_config,
+    classify_desktop_startup_failure,
+    desktop_failure_path,
     desktop_readiness_path,
     remove_owned_desktop_readiness,
     run_desktop_sidecar,
     run_desktop_sidecar_preflight,
+    run_desktop_state_preflight,
     serve_desktop_app,
     verify_desktop_parent_identity,
     verify_resource_manifest_binding,
+    write_desktop_failure,
     write_desktop_readiness,
 )
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS
@@ -45,6 +54,7 @@ from nested_memvid_agent.server_desktop_routes import (
     DesktopShutdownController,
     register_desktop_routes,
 )
+from nested_memvid_agent.state_store import SCHEMA_VERSION
 
 
 class _RecordingServer:
@@ -231,6 +241,130 @@ def test_sidecar_reopens_existing_six_mv2_files(tmp_path: Path) -> None:
 
     assert opened == expected
     assert created == []
+
+
+@pytest.mark.parametrize(
+    ("phase", "error", "expected"),
+    [
+        ("lease", RuntimeError("profile lease already held"), "profile_conflict"),
+        (
+            "state",
+            RuntimeError("State schema 99 is newer than supported"),
+            "state_incompatible",
+        ),
+        ("state", ValueError("database disk image is malformed"), "state_corrupt"),
+        (
+            "memvid",
+            RuntimeError("sentinel provider text"),
+            "memvid_reopen_failed",
+        ),
+        ("app", RuntimeError("unclassified"), None),
+    ],
+)
+def test_startup_failure_classification_is_phase_bounded(
+    phase: str,
+    error: BaseException,
+    expected: str | None,
+) -> None:
+    assert classify_desktop_startup_failure(phase, error) == expected
+
+
+def test_desktop_state_preflight_rejects_newer_schema_without_mutation(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "agent.db"
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY,
+                version INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_version (id, version) VALUES (1, ?)",
+            (SCHEMA_VERSION + 1,),
+        )
+    before = state_path.read_bytes()
+    before_mtime = state_path.stat().st_mtime_ns
+
+    with pytest.raises(
+        DesktopStateIncompatibleError,
+        match="desktop_state_schema_newer_than_supported",
+    ):
+        run_desktop_state_preflight(state_path)
+
+    assert state_path.read_bytes() == before
+    assert state_path.stat().st_mtime_ns == before_mtime
+
+
+def test_desktop_state_preflight_rejects_corrupt_state(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "agent.db"
+    state_path.write_bytes(b"not-a-sqlite-database")
+
+    with pytest.raises(
+        DesktopStateCorruptError,
+        match="desktop_state_integrity_failed",
+    ):
+        run_desktop_state_preflight(state_path)
+
+
+def test_sidecar_failure_artifact_is_authenticated_and_secret_free(
+    tmp_path: Path,
+) -> None:
+    launch = _launch(tmp_path)
+    failure = DesktopSidecarFailure.create(
+        launch,
+        sidecar_version="0.5.0",
+        reason="state_corrupt",
+    )
+    path = desktop_failure_path(launch)
+
+    write_desktop_failure(path, failure)
+
+    raw = path.read_bytes()
+    payload = json.loads(raw)
+    unsigned = dict(payload)
+    authentication_tag = unsigned.pop("authentication_tag")
+    canonical = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    expected = hmac.new(
+        launch.api_token.encode(),
+        b"kestrel.desktop.sidecar-failure.v1\0" + canonical,
+        "sha256",
+    ).hexdigest()
+    assert hmac.compare_digest(authentication_tag, expected)
+    assert payload["launch_nonce_digest"] == sha256(
+        launch.launch_nonce.encode()
+    ).hexdigest()
+    assert payload["reason"] == "state_corrupt"
+    assert launch.api_token not in raw.decode()
+    assert launch.launch_nonce not in raw.decode()
+    assert len(raw) <= 16 * 1024
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_sidecar_failure_artifact_is_create_once(
+    tmp_path: Path,
+) -> None:
+    launch = _launch(tmp_path)
+    failure = DesktopSidecarFailure.create(
+        launch,
+        sidecar_version="0.5.0",
+        reason="memvid_reopen_failed",
+    )
+    path = desktop_failure_path(launch)
+    write_desktop_failure(path, failure)
+
+    with pytest.raises(FileExistsError):
+        write_desktop_failure(path, failure)
 
 
 def _launch(
@@ -730,6 +864,73 @@ def test_authenticated_shutdown_exits_real_serve_loop_before_lease_release(
     assert not readiness_path.exists()
 
 
+def test_prelease_identity_failure_does_not_claim_profile_conflict(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "kestrel-resource-manifest.json"
+    manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1"}\n')
+    parent_pid = os.getppid()
+    current_pid = os.getpid()
+    launch = replace(
+        _launch(
+            tmp_path,
+            manifest_digest=(
+                "sha256:" + sha256(manifest.read_bytes()).hexdigest()
+            ),
+        ),
+        parent_pid=parent_pid,
+        parent_birth_marker="verified-parent-birth",
+    )
+    bootstrap = tmp_path / "bootstrap.json"
+    _write_bootstrap(bootstrap, launch)
+    sock = bind_desktop_socket()
+    snapshots = {
+        parent_pid: _snapshot(
+            parent_pid,
+            birth_marker="verified-parent-birth",
+        ),
+        current_pid: _snapshot(
+            current_pid,
+            birth_marker="verified-sidecar-birth",
+        ),
+    }
+
+    def mismatched_identity(**kwargs: object) -> RuntimeLeaseIdentity:
+        return RuntimeLeaseIdentity(
+            profile_id="other",
+            management="desktop",
+            owner_digest="1" * 64,
+            pid=current_pid,
+            process_birth_marker="verified-sidecar-birth",
+            executable_digest="2" * 64,
+            launch_nonce_digest=sha256(b"launch-nonce").hexdigest(),
+            base_url=str(kwargs["base_url"]),
+            version="0.5.0",
+            created_at="2026-07-29T12:00:00+00:00",
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="desktop_runtime_identity_mismatch",
+    ):
+        asyncio.run(
+            run_desktop_sidecar(
+                bootstrap,
+                manifest_path=manifest,
+                inspector=lambda pid: snapshots.get(pid),
+                socket_factory=lambda: sock,
+                identity_factory=mismatched_identity,
+                lease_acquirer=lambda profile_root, identity: pytest.fail(
+                    f"lease acquired for invalid identity: "
+                    f"{profile_root} {identity}"
+                ),
+            )
+        )
+
+    assert not desktop_failure_path(launch).exists()
+    assert sock.fileno() == -1
+
+
 def test_preflight_failure_closes_socket_before_releasing_lease(
     tmp_path: Path,
 ) -> None:
@@ -806,6 +1007,14 @@ def test_preflight_failure_closes_socket_before_releasing_lease(
     assert events == ["lease", "preflight", "release"]
     assert not readiness_path.exists()
     assert not bootstrap.exists()
+    failure_payload = json.loads(
+        desktop_failure_path(launch).read_text(encoding="utf-8")
+    )
+    assert failure_payload["reason"] == "memvid_reopen_failed"
+    assert launch.api_token not in json.dumps(
+        failure_payload,
+        sort_keys=True,
+    )
 
 
 def test_post_publication_failure_removes_owned_readiness_before_lease_release(

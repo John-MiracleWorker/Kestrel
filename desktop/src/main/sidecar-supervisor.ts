@@ -20,9 +20,11 @@ import {
   createNodePrivateFileAdapter,
   createPrivateLaunchFiles,
   readPrivateJsonArtifact,
+  readSidecarFailure,
   readSidecarReadiness,
   resolvePrivateProfile,
   type CapturedPrivateFileIdentity,
+  type CapturedSidecarFailure,
   type CapturedSidecarReadiness,
   type CreatePrivateLaunchFilesInput,
   type PrivateFilePlatformAdapter,
@@ -58,6 +60,8 @@ const LOG_LINE_BYTES = 1_024;
 const HTTP_RESPONSE_BYTES = 16 * 1024;
 const DBUS_SESSION_ADDRESS_CHARACTERS = 2_048;
 const XDG_RUNTIME_DIRECTORY_CHARACTERS = 1_024;
+const RECOVERY_RETRY_LIMIT = 2;
+const RECOVERY_RETRY_WINDOW_MS = 60_000;
 const safeEnvironmentNames = [
   "LANG",
   "LC_ALL",
@@ -90,6 +94,154 @@ const authenticatedReadinessSchema = z
     ])
   })
   .strict();
+const recoveryReasonCodeSchema = z.enum([
+  "payload_verification_failed",
+  "profile_conflict",
+  "state_incompatible",
+  "state_corrupt",
+  "memvid_reopen_failed",
+  "sidecar_crash_loop",
+  "pending_high_risk_approval",
+  "ambiguous_provider_attempt",
+  "credential_backend_unavailable",
+  "recovery_inspection_unavailable"
+]);
+type RecoveryReasonCode = z.infer<typeof recoveryReasonCodeSchema>;
+const blockingRecoveryReasonCodes: ReadonlySet<RecoveryReasonCode> =
+  new Set([
+    "payload_verification_failed",
+    "profile_conflict",
+    "state_incompatible",
+    "state_corrupt",
+    "memvid_reopen_failed",
+    "sidecar_crash_loop",
+    "pending_high_risk_approval",
+    "ambiguous_provider_attempt",
+    "recovery_inspection_unavailable"
+  ]);
+const authenticatedRecoveryReportSchema = z
+  .object({
+    schema: z.literal("kestrel.desktop.recovery.v1"),
+    can_auto_resume: z.boolean(),
+    reasons: z.array(recoveryReasonCodeSchema).max(16),
+    blockers: z.array(recoveryReasonCodeSchema).max(16),
+    actions: z.tuple([
+      z.literal("inspect"),
+      z.literal("export_support_bundle"),
+      z.literal("retry_readiness")
+    ]),
+    state: z
+      .object({
+        integrity: z.enum(["ok", "error"]),
+        schema_version: z.number().int().nonnegative().nullable(),
+        writable: z.boolean()
+      })
+      .strict(),
+    memory: z.object({ ready: z.boolean() }).strict(),
+    approvals: z
+      .object({
+        pending_high_risk: z.number().int().min(0).max(1_000)
+      })
+      .strict(),
+    routing: z
+      .object({
+        ambiguous_provider_attempts: z
+          .number()
+          .int()
+          .min(0)
+          .max(1_000)
+      })
+      .strict(),
+    credential_storage: z
+      .object({
+        state: z.enum([
+          "available",
+          "session_only",
+          "locked_vault_required",
+          "unavailable"
+        ])
+      })
+      .strict()
+  })
+  .strict()
+  .superRefine((report, context) => {
+    if (report.can_auto_resume !== (report.blockers.length === 0)) {
+      context.addIssue({
+        code: "custom",
+        message: "recovery_resume_blocker_mismatch"
+      });
+    }
+    const reasons = new Set(report.reasons);
+    if (report.blockers.some((blocker) => !reasons.has(blocker))) {
+      context.addIssue({
+        code: "custom",
+        message: "recovery_blocker_missing_reason"
+      });
+    }
+    if (
+      report.reasons.some(
+        (reason) =>
+          blockingRecoveryReasonCodes.has(reason) &&
+          !report.blockers.includes(reason)
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "recovery_reason_missing_blocker"
+      });
+    }
+    if (
+      reasons.size !== report.reasons.length ||
+      new Set(report.blockers).size !== report.blockers.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "recovery_reason_duplicate"
+      });
+    }
+    const requiredReasons = [
+      ...(report.state.integrity === "error"
+        ? (["state_corrupt"] as const)
+        : []),
+      ...(!report.memory.ready
+        ? (["memvid_reopen_failed"] as const)
+        : []),
+      ...(report.approvals.pending_high_risk > 0
+        ? (["pending_high_risk_approval"] as const)
+        : []),
+      ...(report.routing.ambiguous_provider_attempts > 0
+        ? (["ambiguous_provider_attempt"] as const)
+        : []),
+      ...(["locked_vault_required", "unavailable"].includes(
+        report.credential_storage.state
+      )
+        ? (["credential_backend_unavailable"] as const)
+        : [])
+    ];
+    if (requiredReasons.some((reason) => !reasons.has(reason))) {
+      context.addIssue({
+        code: "custom",
+        message: "recovery_required_reason_missing"
+      });
+    }
+  });
+const authenticatedRecoveryRetryResultSchema = z
+  .object({
+    schema: z.literal(
+      "kestrel.desktop.recovery-retry-result.v1"
+    ),
+    accepted: z.boolean(),
+    report: authenticatedRecoveryReportSchema
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (result.accepted !== result.report.can_auto_resume) {
+      context.addIssue({
+        code: "custom",
+        message: "recovery_retry_acceptance_mismatch"
+      });
+    }
+  });
 const leaseMetadataSchema = z
   .object({
     schema: z.literal("kestrel.runtime_profile_lease.v1"),
@@ -123,6 +275,25 @@ export interface AuthenticatedDesktopReadiness {
     "policy"
   ];
 }
+
+export type AuthenticatedDesktopRecoveryReport = z.infer<
+  typeof authenticatedRecoveryReportSchema
+>;
+
+export type AuthenticatedDesktopRecoveryRetryResult = z.infer<
+  typeof authenticatedRecoveryRetryResultSchema
+>;
+
+export type SidecarRecoveryRetryResult =
+  | Readonly<{ accepted: true }>
+  | Readonly<{
+      accepted: false;
+      reason:
+        | "not_in_recovery"
+        | "recovery_blocked"
+        | "retry_rate_limited"
+        | "retry_failed";
+    }>;
 
 export type ProfileLeaseDisposition =
   | "available"
@@ -224,11 +395,27 @@ export interface SidecarSupervisorDependencies {
     timeoutMs: number;
     signal: AbortSignal;
   }): Promise<CapturedSidecarReadiness>;
+  readStartupFailure?(input: {
+    path: string;
+    apiToken: string;
+    launchNonceDigest: string;
+    profileId: string;
+    resourceManifestDigest: string;
+    sidecarVersion: string;
+  }): Promise<CapturedSidecarFailure | null>;
   inspectProcess(pid: number): Promise<SidecarProcessIdentity | null>;
   requestReadiness(input: {
     baseUrl: string;
     apiToken: string;
   }): Promise<AuthenticatedDesktopReadiness>;
+  requestRecovery(input: {
+    baseUrl: string;
+    apiToken: string;
+  }): Promise<AuthenticatedDesktopRecoveryReport>;
+  requestRecoveryRetry(input: {
+    baseUrl: string;
+    apiToken: string;
+  }): Promise<AuthenticatedDesktopRecoveryRetryResult>;
   requestShutdown(input: {
     baseUrl: string;
     apiToken: string;
@@ -237,6 +424,7 @@ export interface SidecarSupervisorDependencies {
     child: RetainedSidecarChild,
     timeoutMs: number
   ): Promise<boolean>;
+  now(): number;
   log(line: string): void;
 }
 
@@ -248,6 +436,19 @@ export interface SidecarSupervisorConfig {
   platform: NodeJS.Platform;
   environment: Readonly<Record<string, string | undefined>>;
 }
+
+export type SidecarRecoveryReason =
+  | "sidecar_unavailable"
+  | "sidecar_unverified"
+  | "payload_verification_failed"
+  | "profile_conflict"
+  | "version_incompatible"
+  | "state_incompatible"
+  | "state_corrupt"
+  | "memvid_reopen_failed"
+  | "sidecar_crash_loop"
+  | "credential_backend_unavailable"
+  | "reconciliation_required";
 
 export type SidecarSupervisorState =
   | { kind: "verifying" }
@@ -261,12 +462,7 @@ export type SidecarSupervisorState =
   | { kind: "stopping" }
   | {
       kind: "recovery";
-      reason:
-        | "sidecar_unavailable"
-        | "sidecar_unverified"
-        | "profile_conflict"
-        | "version_incompatible"
-        | "reconciliation_required";
+      reason: SidecarRecoveryReason;
       detail: string;
     };
 
@@ -281,6 +477,8 @@ interface ActiveSidecar {
   processIdentity: SidecarProcessIdentity | null;
   readiness: SidecarReadiness | null;
   readinessIdentity: CapturedPrivateFileIdentity | null;
+  failureIdentity: CapturedPrivateFileIdentity | null;
+  startupSettled: boolean;
   verified: boolean;
   finalization: Promise<void> | null;
 }
@@ -288,12 +486,7 @@ interface ActiveSidecar {
 export class SidecarSupervisorError extends Error {
   constructor(
     readonly code: string,
-    readonly recoveryReason:
-      | "sidecar_unavailable"
-      | "sidecar_unverified"
-      | "profile_conflict"
-      | "version_incompatible"
-      | "reconciliation_required"
+    readonly recoveryReason: SidecarRecoveryReason
   ) {
     super(code);
     this.name = "SidecarSupervisorError";
@@ -456,6 +649,26 @@ function fixedErrorCode(error: unknown): string {
   return "sidecar_start_failed";
 }
 
+const payloadVerificationErrorCodes = new Set([
+  "credential_asset_too_large",
+  "credential_snapshot_too_large",
+  "renderer_asset_too_large",
+  "renderer_snapshot_too_large",
+  "resource_digest_mismatch",
+  "resource_manifest_invalid",
+  "resource_manifest_not_canonical",
+  "resource_manifest_too_large",
+  "resource_missing",
+  "resource_path_untrusted",
+  "resource_signature_invalid",
+  "resource_signature_too_large",
+  "resource_signing_key_untrusted"
+]);
+
+function isPayloadVerificationError(error: unknown): boolean {
+  return payloadVerificationErrorCodes.has(fixedErrorCode(error));
+}
+
 function installBoundedLogReader(
   stream: Readable | null,
   source: "stdout" | "stderr",
@@ -603,6 +816,10 @@ export class SidecarSupervisor {
     null;
   private stopPromise: Promise<void> | null = null;
   private launchAbort: AbortController | null = null;
+  private recoveryRetryPromise:
+    | Promise<SidecarRecoveryRetryResult>
+    | null = null;
+  private recoveryRetryTimes: number[] = [];
 
   constructor(
     private readonly config: SidecarSupervisorConfig,
@@ -647,6 +864,178 @@ export class SidecarSupervisor {
       kind: "recovery",
       reason: "reconciliation_required",
       detail: "credential_mutation_reconciliation_required"
+    });
+  }
+
+  retryReadiness(): Promise<SidecarRecoveryRetryResult> {
+    if (this.recoveryRetryPromise !== null) {
+      return this.recoveryRetryPromise;
+    }
+    if (this.currentState.kind !== "recovery") {
+      return Promise.resolve({
+        accepted: false,
+        reason: "not_in_recovery"
+      });
+    }
+    const now = this.dependencies.now();
+    const threshold = now - RECOVERY_RETRY_WINDOW_MS;
+    this.recoveryRetryTimes = this.recoveryRetryTimes.filter(
+      (attemptedAt) => attemptedAt > threshold
+    );
+    if (this.recoveryRetryTimes.length >= RECOVERY_RETRY_LIMIT) {
+      this.transition({
+        kind: "recovery",
+        reason: "sidecar_crash_loop",
+        detail: "recovery_retry_rate_limited"
+      });
+      return Promise.resolve({
+        accepted: false,
+        reason: "retry_rate_limited"
+      });
+    }
+    this.recoveryRetryTimes.push(now);
+    const operation = this.performRecoveryRetry();
+    this.recoveryRetryPromise = operation;
+    void operation.then(
+      () => {
+        if (this.recoveryRetryPromise === operation) {
+          this.recoveryRetryPromise = null;
+        }
+      },
+      () => {
+        if (this.recoveryRetryPromise === operation) {
+          this.recoveryRetryPromise = null;
+        }
+      }
+    );
+    return operation;
+  }
+
+  private async performRecoveryRetry(): Promise<SidecarRecoveryRetryResult> {
+    const state = this.currentState;
+    if (state.kind !== "recovery") {
+      return {
+        accepted: false,
+        reason: "not_in_recovery"
+      };
+    }
+    const active = this.active;
+    if (
+      active !== null &&
+      active.verified &&
+      active.baseUrl !== "" &&
+      !this.childHasExited(active.child) &&
+      state.detail !==
+        "credential_mutation_reconciliation_required"
+    ) {
+      const generation = this.generation;
+      try {
+        const retry =
+          await this.dependencies.requestRecoveryRetry({
+            baseUrl: active.baseUrl,
+            apiToken: active.launch.apiToken
+          });
+        if (
+          this.active !== active ||
+          this.generation !== generation ||
+          this.currentState.kind !== "recovery"
+        ) {
+          return {
+            accepted: false,
+            reason: "retry_failed"
+          };
+        }
+        if (!retry.accepted || !retry.report.can_auto_resume) {
+          this.transitionBlockedRecovery(retry.report.blockers);
+          return {
+            accepted: false,
+            reason: "recovery_blocked"
+          };
+        }
+        const readiness =
+          await this.dependencies.requestReadiness({
+            baseUrl: active.baseUrl,
+            apiToken: active.launch.apiToken
+          });
+        if (
+          this.active !== active ||
+          this.generation !== generation ||
+          this.currentState.kind !== "recovery"
+        ) {
+          return {
+            accepted: false,
+            reason: "retry_failed"
+          };
+        }
+        validateAuthenticatedReadiness(
+          active,
+          readiness,
+          this.config.sidecarVersion
+        );
+        this.dependencies.apiSession.activate({
+          baseUrl: active.baseUrl,
+          apiToken: active.launch.apiToken,
+          credentialCapability:
+            deriveDesktopCredentialCapability(
+              active.launch.apiToken,
+              active.launch.launchNonce
+            ),
+          generation
+        });
+        this.transition({
+          kind: "ready",
+          profileId: active.profile.profileId,
+          baseUrl: active.baseUrl,
+          sidecarVersion: this.config.sidecarVersion
+        });
+        return { accepted: true };
+      } catch {
+        return {
+          accepted: false,
+          reason: "retry_failed"
+        };
+      }
+    }
+    try {
+      if (this.active !== null || this.startPromise !== null) {
+        await this.stop();
+      }
+      await this.start();
+      if (this.currentState.kind !== "ready") {
+        return {
+          accepted: false,
+          reason: "recovery_blocked"
+        };
+      }
+      return { accepted: true };
+    } catch {
+      return {
+        accepted: false,
+        reason: "retry_failed"
+      };
+    }
+  }
+
+  private transitionBlockedRecovery(
+    blockers: readonly string[]
+  ): void {
+    const blocker = blockers[0] ?? "recovery_inspection_unavailable";
+    const reason: SidecarRecoveryReason =
+      blocker === "state_incompatible"
+        ? "state_incompatible"
+        : blocker === "state_corrupt"
+          ? "state_corrupt"
+          : blocker === "memvid_reopen_failed"
+            ? "memvid_reopen_failed"
+            : blocker === "profile_conflict"
+              ? "profile_conflict"
+              : blocker === "sidecar_crash_loop"
+                ? "sidecar_crash_loop"
+                : "reconciliation_required";
+    this.transition({
+      kind: "recovery",
+      reason,
+      detail: `recovery_blocked_${blocker}`.slice(0, 160)
     });
   }
 
@@ -732,7 +1121,7 @@ export class SidecarSupervisor {
       if (sidecar === undefined) {
         throw new SidecarSupervisorError(
           "verified_sidecar_missing",
-          "sidecar_unverified"
+          "payload_verification_failed"
         );
       }
       executable = await this.dependencies.acquireVerifiedExecutable(
@@ -799,6 +1188,7 @@ export class SidecarSupervisor {
         if (
           current !== null &&
           current.child === child &&
+          (current.verified || current.startupSettled) &&
           this.childHasExited(current.child)
         ) {
           this.armConfirmedExit(current, generation);
@@ -860,6 +1250,8 @@ export class SidecarSupervisor {
         processIdentity: null,
         readiness: null,
         readinessIdentity: null,
+        failureIdentity: null,
+        startupSettled: false,
         verified: false,
         finalization: null
       };
@@ -952,6 +1344,24 @@ export class SidecarSupervisor {
         );
       }
       active.verified = true;
+      const desktopResources = Object.freeze({
+        rendererAssets: resources.rendererAssets,
+        credentialAssets: resources.credentialAssets,
+        credentialPreloadPath: credentialPreload.path
+      });
+      const recovery =
+        await this.dependencies.requestRecovery({
+          baseUrl: active.baseUrl,
+          apiToken: launch.apiToken
+        });
+      this.throwIfLaunchCancelled(generation, signal);
+      if (terminal !== null) {
+        throw terminal;
+      }
+      if (!recovery.can_auto_resume) {
+        this.transitionBlockedRecovery(recovery.blockers);
+        return desktopResources;
+      }
       const apiSessionActivation: DesktopApiSessionActivation = {
         baseUrl: active.baseUrl,
         apiToken: launch.apiToken,
@@ -965,11 +1375,7 @@ export class SidecarSupervisor {
         baseUrl: active.baseUrl,
         sidecarVersion: this.config.sidecarVersion
       });
-      return Object.freeze({
-        rendererAssets: resources.rendererAssets,
-        credentialAssets: resources.credentialAssets,
-        credentialPreloadPath: credentialPreload.path
-      });
+      return desktopResources;
     } catch (error) {
       this.dependencies.apiSession.deactivate(generation);
       let surfacedError: unknown =
@@ -981,6 +1387,46 @@ export class SidecarSupervisor {
           : error;
       const active =
         retainedActive?.child === child ? retainedActive : null;
+      if (
+        active !== null &&
+        active.readiness === null &&
+        launch !== null &&
+        !this.stopping &&
+        !signal.aborted &&
+        generation === this.generation &&
+        this.dependencies.readStartupFailure !== undefined
+      ) {
+        try {
+          const captured =
+            await this.dependencies.readStartupFailure({
+              path: launch.failurePath,
+              apiToken: launch.apiToken,
+              launchNonceDigest: launch.launchNonceDigest,
+              profileId: active.profile.profileId,
+              resourceManifestDigest:
+                active.resources.manifestDigest,
+              sidecarVersion: this.config.sidecarVersion
+            });
+          if (captured !== null) {
+            active.failureIdentity = captured.identity;
+            surfacedError = new SidecarSupervisorError(
+              captured.failure.reason,
+              captured.failure.reason
+            );
+          }
+        } catch (failureError) {
+          surfacedError =
+            failureError instanceof SidecarSupervisorError
+              ? failureError
+              : new SidecarSupervisorError(
+                  "sidecar_failure_invalid",
+                  "sidecar_unverified"
+                );
+        }
+      }
+      if (active !== null) {
+        active.startupSettled = true;
+      }
       if (active !== null) {
         try {
           await this.terminateActive(active, false);
@@ -1022,8 +1468,8 @@ export class SidecarSupervisor {
       const recoveryReason =
         surfacedError instanceof SidecarSupervisorError
           ? surfacedError.recoveryReason
-          : fixedErrorCode(surfacedError).startsWith("resource_")
-            ? "sidecar_unverified"
+          : isPayloadVerificationError(surfacedError)
+            ? "payload_verification_failed"
             : "sidecar_unavailable";
       if (!this.stopping) {
         this.transition({
@@ -1211,7 +1657,10 @@ export class SidecarSupervisor {
     let cleanupFailed = false;
     let closeFailed = false;
     try {
-      await active.launch.cleanup(active.readinessIdentity ?? undefined);
+      await active.launch.cleanup(
+        active.readinessIdentity ?? undefined,
+        active.failureIdentity ?? undefined
+      );
     } catch {
       cleanupFailed = true;
     }
@@ -1333,16 +1782,37 @@ async function requestBoundedJson(
   baseUrl: string,
   path: string,
   apiToken: string,
-  timeoutMs: number
+  timeoutMs: number,
+  body = ""
 ): Promise<{ statusCode: number; payload: unknown }> {
   const root = loopbackBaseUrl(baseUrl);
   const url = new URL(path, root);
   return new Promise((resolvePromise, rejectPromise) => {
     let absoluteTimeout: NodeJS.Timeout | undefined;
+    let settled = false;
     const clearDeadline = (): void => {
       if (absoluteTimeout !== undefined) {
         clearTimeout(absoluteTimeout);
       }
+    };
+    const rejectOnce = (error: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearDeadline();
+      rejectPromise(error);
+    };
+    const resolveOnce = (value: {
+      statusCode: number;
+      payload: unknown;
+    }): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearDeadline();
+      resolvePromise(value);
     };
     const request = httpRequest(
       url,
@@ -1350,7 +1820,12 @@ async function requestBoundedJson(
         method,
         headers: {
           Authorization: `Bearer ${apiToken}`,
-          "Content-Length": "0"
+          "Content-Length": String(
+            Buffer.byteLength(body, "utf8")
+          ),
+          ...(body === ""
+            ? {}
+            : { "Content-Type": "application/json" })
         },
         timeout: timeoutMs
       },
@@ -1358,38 +1833,54 @@ async function requestBoundedJson(
         const chunks: Buffer[] = [];
         let bytes = 0;
         response.on("data", (chunk: Buffer) => {
+          if (settled) {
+            return;
+          }
           bytes += chunk.byteLength;
           if (bytes > HTTP_RESPONSE_BYTES) {
-            request.destroy(new Error("desktop_http_response_too_large"));
+            rejectOnce(
+              new Error("desktop_http_response_too_large")
+            );
+            response.destroy();
+            request.destroy();
             return;
           }
           chunks.push(chunk);
         });
         response.on("end", () => {
-          clearDeadline();
+          if (settled) {
+            return;
+          }
           try {
-            resolvePromise({
+            resolveOnce({
               statusCode: response.statusCode ?? 0,
               payload: JSON.parse(Buffer.concat(chunks).toString("utf8"))
             });
           } catch (error) {
-            rejectPromise(error);
+            rejectOnce(
+              error instanceof Error
+                ? error
+                : new Error("desktop_http_json_invalid")
+            );
           }
         });
+        response.on("aborted", () => {
+          rejectOnce(new Error("desktop_http_response_aborted"));
+        });
+        response.on("error", rejectOnce);
       }
     );
     absoluteTimeout = setTimeout(() => {
-      request.destroy(new Error("desktop_http_timeout"));
+      rejectOnce(new Error("desktop_http_timeout"));
+      request.destroy();
     }, timeoutMs);
     request.on("timeout", () => {
-      request.destroy(new Error("desktop_http_timeout"));
+      rejectOnce(new Error("desktop_http_timeout"));
+      request.destroy();
     });
     request.on("close", clearDeadline);
-    request.on("error", (error) => {
-      clearDeadline();
-      rejectPromise(error);
-    });
-    request.end();
+    request.on("error", rejectOnce);
+    request.end(body);
   });
 }
 
@@ -1671,6 +2162,39 @@ export function createNodeSupervisorDependencies(
         "sidecar_unavailable"
       );
     },
+    async readStartupFailure({
+      path,
+      apiToken,
+      launchNonceDigest,
+      profileId,
+      resourceManifestDigest,
+      sidecarVersion
+    }): Promise<CapturedSidecarFailure | null> {
+      try {
+        return await readSidecarFailure(
+          path,
+          {
+            apiToken,
+            launchNonceDigest,
+            profileId,
+            resourceManifestDigest,
+            sidecarVersion
+          },
+          adapter
+        );
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message === "private_artifact_missing"
+        ) {
+          return null;
+        }
+        throw new SidecarSupervisorError(
+          "sidecar_failure_invalid",
+          "sidecar_unverified"
+        );
+      }
+    },
     inspectProcess,
     async requestReadiness({
       baseUrl,
@@ -1687,6 +2211,57 @@ export function createNodeSupervisorDependencies(
       if (response.statusCode !== 200 || !parsed.success) {
         throw new SidecarSupervisorError(
           "authenticated_readiness_invalid",
+          "sidecar_unverified"
+        );
+      }
+      return parsed.data;
+    },
+    async requestRecovery({
+      baseUrl,
+      apiToken
+    }): Promise<AuthenticatedDesktopRecoveryReport> {
+      const response = await requestBoundedJson(
+        "GET",
+        baseUrl,
+        "/api/desktop/recovery",
+        apiToken,
+        5_000
+      );
+      const parsed =
+        authenticatedRecoveryReportSchema.safeParse(
+          response.payload
+        );
+      if (response.statusCode !== 200 || !parsed.success) {
+        throw new SidecarSupervisorError(
+          "authenticated_recovery_invalid",
+          "sidecar_unverified"
+        );
+      }
+      return parsed.data;
+    },
+    async requestRecoveryRetry({
+      baseUrl,
+      apiToken
+    }): Promise<AuthenticatedDesktopRecoveryRetryResult> {
+      const body = JSON.stringify({
+        schema: "kestrel.desktop.recovery-retry.v1",
+        action: "retry_readiness"
+      });
+      const response = await requestBoundedJson(
+        "POST",
+        baseUrl,
+        "/api/desktop/recovery/retry",
+        apiToken,
+        5_000,
+        body
+      );
+      const parsed =
+        authenticatedRecoveryRetryResultSchema.safeParse(
+          response.payload
+        );
+      if (response.statusCode !== 200 || !parsed.success) {
+        throw new SidecarSupervisorError(
+          "authenticated_recovery_retry_invalid",
           "sidecar_unverified"
         );
       }
@@ -1712,6 +2287,7 @@ export function createNodeSupervisorDependencies(
       }
     },
     waitForExit: waitForRetainedChildExit,
+    now: () => Date.now(),
     log: input.log ?? (() => undefined)
   };
 }

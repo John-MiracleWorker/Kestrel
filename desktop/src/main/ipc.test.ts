@@ -504,6 +504,33 @@ describe("Desktop main IPC authority", () => {
     }
   });
 
+  it("returns a fixed bounded recovery retry rejection", async () => {
+    const { authority, handlers } = harness({
+      performRecoveryAction: async () => ({
+        accepted: false,
+        reason: "retry_rate_limited"
+      })
+    });
+    const renderer = new FakeWebContents(33);
+    authority.bindRenderer(renderer);
+
+    await expect(
+      handlers.get(DESKTOP_IPC_CHANNELS.recoveryAction)!(
+        eventFor(renderer),
+        {
+          schema: "kestrel.desktop.recovery-action.request.v1",
+          request: { action: "retry_readiness" }
+        }
+      )
+    ).resolves.toEqual({
+      ok: true,
+      value: {
+        accepted: false,
+        reason: "retry_rate_limited"
+      }
+    });
+  });
+
   it("rejects accessor-backed native output even when its values look valid", async () => {
     const accessorConnection = Object.defineProperties(
       {},

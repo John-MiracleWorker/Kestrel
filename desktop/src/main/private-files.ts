@@ -1,4 +1,9 @@
-import { createHash, randomBytes as secureRandomBytes } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes as secureRandomBytes,
+  timingSafeEqual
+} from "node:crypto";
 import { constants } from "node:fs";
 import {
   lstat,
@@ -39,8 +44,25 @@ const sidecarReadinessSchema = z
     launch_nonce_digest: sha256Schema
   })
   .strict();
+const sidecarFailureSchema = z
+  .object({
+    schema: z.literal("kestrel.desktop.sidecar-failure.v1"),
+    launch_nonce_digest: sha256Schema,
+    profile_id: z.string().trim().min(1).max(120),
+    reason: z.enum([
+      "profile_conflict",
+      "state_incompatible",
+      "state_corrupt",
+      "memvid_reopen_failed"
+    ]),
+    resource_manifest_digest: prefixedSha256Schema,
+    sidecar_version: z.string().trim().min(1).max(64),
+    authentication_tag: sha256Schema
+  })
+  .strict();
 
 export type SidecarReadiness = z.infer<typeof sidecarReadinessSchema>;
+export type SidecarFailure = z.infer<typeof sidecarFailureSchema>;
 
 export interface CapturedPrivateFileIdentity {
   dev: number;
@@ -50,6 +72,19 @@ export interface CapturedPrivateFileIdentity {
 export interface CapturedSidecarReadiness {
   readiness: SidecarReadiness;
   identity: CapturedPrivateFileIdentity;
+}
+
+export interface CapturedSidecarFailure {
+  failure: SidecarFailure;
+  identity: CapturedPrivateFileIdentity;
+}
+
+export interface ExpectedSidecarFailure {
+  apiToken: string;
+  launchNonceDigest: string;
+  profileId: string;
+  resourceManifestDigest: string;
+  sidecarVersion: string;
 }
 
 export interface PrivateProfileInput {
@@ -89,11 +124,15 @@ export interface PrivateFilePlatformAdapter {
 export interface PrivateLaunchFiles {
   bootstrapPath: string;
   readinessPath: string;
+  failurePath: string;
   launchNonce: string;
   launchNonceDigest: string;
   apiToken: string;
   profile: ResolvedPrivateProfile;
-  cleanup(readinessIdentity?: CapturedPrivateFileIdentity): Promise<void>;
+  cleanup(
+    readinessIdentity?: CapturedPrivateFileIdentity,
+    failureIdentity?: CapturedPrivateFileIdentity
+  ): Promise<void>;
 }
 
 export interface CreatePrivateLaunchFilesInput {
@@ -482,6 +521,76 @@ export async function readSidecarReadiness(
   };
 }
 
+function constantTimeTextEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left, "utf8");
+  const rightBytes = Buffer.from(right, "utf8");
+  return (
+    leftBytes.byteLength === rightBytes.byteLength &&
+    timingSafeEqual(leftBytes, rightBytes)
+  );
+}
+
+function sidecarFailureAuthenticationTag(
+  failure: Omit<SidecarFailure, "authentication_tag">,
+  apiToken: string
+): string {
+  const canonical = JSON.stringify({
+    launch_nonce_digest: failure.launch_nonce_digest,
+    profile_id: failure.profile_id,
+    reason: failure.reason,
+    resource_manifest_digest: failure.resource_manifest_digest,
+    schema: failure.schema,
+    sidecar_version: failure.sidecar_version
+  });
+  return createHmac("sha256", apiToken)
+    .update("kestrel.desktop.sidecar-failure.v1\0")
+    .update(canonical)
+    .digest("hex");
+}
+
+export async function readSidecarFailure(
+  path: string,
+  expected: ExpectedSidecarFailure,
+  adapter: PrivateFilePlatformAdapter = createNodePrivateFileAdapter()
+): Promise<CapturedSidecarFailure> {
+  const captured = await readPrivateJsonArtifactWithIdentity(
+    path,
+    adapter
+  );
+  const parsed = sidecarFailureSchema.safeParse(captured.value);
+  if (!parsed.success) {
+    throw new Error("sidecar_failure_invalid");
+  }
+  const failure = parsed.data;
+  const {
+    authentication_tag: authenticationTag,
+    ...unsigned
+  } = failure;
+  const expectedTag = sidecarFailureAuthenticationTag(
+    unsigned,
+    expected.apiToken
+  );
+  if (
+    !constantTimeTextEqual(authenticationTag, expectedTag) ||
+    !constantTimeTextEqual(
+      failure.launch_nonce_digest,
+      expected.launchNonceDigest
+    ) ||
+    failure.profile_id !== expected.profileId ||
+    !constantTimeTextEqual(
+      failure.resource_manifest_digest,
+      expected.resourceManifestDigest
+    ) ||
+    failure.sidecar_version !== expected.sidecarVersion
+  ) {
+    throw new Error("sidecar_failure_invalid");
+  }
+  return {
+    failure,
+    identity: captured.identity
+  };
+}
+
 export async function createPrivateLaunchFiles(
   input: CreatePrivateLaunchFilesInput
 ): Promise<PrivateLaunchFiles> {
@@ -510,6 +619,10 @@ export async function createPrivateLaunchFiles(
   const bootstrapPath = join(
     input.profile.runtimeDirectory,
     `desktop-bootstrap-${launchNonceDigest.slice(0, 24)}.json`
+  );
+  const failurePath = join(
+    input.profile.runtimeDirectory,
+    `desktop-failure-${launchNonceDigest.slice(0, 24)}.json`
   );
   const payload = {
     schema: "kestrel.desktop.bootstrap.v1",
@@ -558,12 +671,14 @@ export async function createPrivateLaunchFiles(
   return {
     bootstrapPath,
     readinessPath: input.profile.readinessPath,
+    failurePath,
     launchNonce,
     launchNonceDigest,
     apiToken,
     profile: input.profile,
     async cleanup(
-      readinessIdentity?: CapturedPrivateFileIdentity
+      readinessIdentity?: CapturedPrivateFileIdentity,
+      failureIdentity?: CapturedPrivateFileIdentity
     ): Promise<void> {
       if (bootstrapIdentity !== null) {
         await adapter.deleteCapturedFile(
@@ -575,6 +690,12 @@ export async function createPrivateLaunchFiles(
         await adapter.deleteCapturedFile(
           input.profile.readinessPath,
           readinessIdentity
+        );
+      }
+      if (failureIdentity !== undefined) {
+        await adapter.deleteCapturedFile(
+          failurePath,
+          failureIdentity
         );
       }
     }

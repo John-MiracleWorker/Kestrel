@@ -171,6 +171,9 @@ def _create_app(
         from .server_behavior_delta_routes import register_behavior_delta_routes
         from .server_capability_routes import register_capability_routes
         from .server_channel_routes import register_channel_routes
+        from .server_desktop_recovery_routes import (
+            register_desktop_recovery_routes,
+        )
         from .server_desktop_routes import (
             desktop_auth_error,
             desktop_credential_capability_error,
@@ -689,6 +692,22 @@ def _create_app(
                 ),
             }
         return dict(payload)
+
+    if desktop_context is not None:
+        from .desktop_recovery import DesktopRecoveryService
+
+        register_desktop_recovery_routes(
+            app,
+            service=DesktopRecoveryService(
+                state=state,
+                routing=routing_ledger,
+                credential_readiness=(
+                    current_desktop_storage_readiness
+                ),
+                memory_ready=lambda: True,
+            ),
+            http_exception=HTTPException,
+        )
 
     register_product_routes(
         app,

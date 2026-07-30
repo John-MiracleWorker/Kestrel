@@ -32,8 +32,14 @@ export type DesktopConnection =
         reason:
           | "sidecar_unavailable"
           | "sidecar_unverified"
+          | "payload_verification_failed"
           | "profile_conflict"
           | "version_incompatible"
+          | "state_incompatible"
+          | "state_corrupt"
+          | "memvid_reopen_failed"
+          | "sidecar_crash_loop"
+          | "credential_backend_unavailable"
           | "reconciliation_required";
       }>;
     }>;

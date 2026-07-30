@@ -443,8 +443,12 @@ if (!app.requestSingleInstanceLock()) {
               }
             );
           },
-          performRecoveryAction: async () =>
-            unavailableDesktopFeature(),
+          performRecoveryAction: async () => {
+            if (supervisor === null) {
+              return unavailableDesktopFeature();
+            }
+            return supervisor.retryReadiness();
+          },
           runtimeMarker: () => apiSession?.runtimeMarker() ?? null
         }
       );

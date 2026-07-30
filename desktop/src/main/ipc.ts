@@ -49,6 +49,7 @@ import {
   type DesktopFolderChoice,
   type DesktopRecoveryActionRequest,
   type DesktopRecoveryActionResult,
+  type DesktopRecoveryReason,
   type DesktopRuntimeMarker,
   type DesktopSupportBundleResult,
   type DesktopUpdateStatus
@@ -337,12 +338,7 @@ export type DesktopConnectionSourceState =
     }
   | {
       kind: "recovery";
-      reason:
-        | "sidecar_unavailable"
-        | "sidecar_unverified"
-        | "profile_conflict"
-        | "version_incompatible"
-        | "reconciliation_required";
+      reason: DesktopRecoveryReason;
     };
 
 function errorEnvelope(code: DesktopErrorCode): Readonly<{

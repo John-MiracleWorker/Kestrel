@@ -151,6 +151,37 @@ def test_shadow_coordinator_persists_decision_without_switching_provider(tmp_pat
     assert len(ledger.list_decisions(run_id=task.run_id)) == 1
 
 
+def test_unsettled_decision_projection_is_bounded_and_excludes_terminal_rows(
+    tmp_path: Path,
+) -> None:
+    state, task = _state_and_task(tmp_path)
+    ledger = _configured_ledger(state)
+    coordinator = DurableRoutingCoordinator(ledger, mode="shadow")
+    base = AgentConfig()
+    selected = coordinator.assign(base, task, subagent_id=None, attempt=1)
+    running = coordinator.assign(base, task, subagent_id=None, attempt=2)
+    completed = coordinator.assign(base, task, subagent_id=None, attempt=3)
+    coordinator.mark_started(running)
+    coordinator.mark_started(completed)
+    coordinator.record_outcome(
+        completed,
+        execution_status="complete",
+        validation_passed=True,
+    )
+
+    unsettled = ledger.list_unsettled_decisions(limit=100)
+
+    assert [entry.decision_id for entry in unsettled] == [
+        running.record.decision_id,
+        selected.record.decision_id,
+    ]
+    assert [entry.status for entry in unsettled] == [
+        "running",
+        "selected",
+    ]
+    assert ledger.list_unsettled_decisions(limit=1) == [unsettled[0]]
+
+
 def test_constrained_coordinator_switches_only_provider_connection_fields(tmp_path: Path) -> None:
     state, task = _state_and_task(tmp_path)
     ledger = _configured_ledger(state)
