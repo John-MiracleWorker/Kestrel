@@ -54,6 +54,7 @@ type SpawnChild = (
 export interface DeveloperRuntimeExecutableCapability
   extends VerifiedExecutableLaunchCapability {
   readonly mechanism: "developer_reverified_path";
+  readonly processModel: "pyinstaller_onefile";
   readonly residualRisk: "path_to_exec_race_not_native_sealed";
 }
 
@@ -223,6 +224,7 @@ export async function acquireDeveloperRuntimeExecutable(
     const capability: DeveloperRuntimeExecutableCapability = {
       resource,
       mechanism: "developer_reverified_path",
+      processModel: "pyinstaller_onefile",
       residualRisk: "path_to_exec_race_not_native_sealed",
       spawn(request): RetainedSidecarChild {
         if (closed) {
@@ -517,6 +519,7 @@ export async function createDeveloperRuntimePrivateFileAdapter(
 
 export interface DeveloperMacProcessEvidence {
   pid: number;
+  parentPid?: number;
   uid: number;
   birthMilliseconds: number;
 }
@@ -530,6 +533,11 @@ export interface MacOSDeveloperRetainedChildQualifier {
   readonly residualRisk: "ps_birth_time_second_resolution";
   inspectRetainedChild(
     child: RetainedSidecarChild,
+    executableDigest: string
+  ): Promise<SidecarProcessIdentity>;
+  qualifyDeveloperOneFilePayload(
+    child: RetainedSidecarChild,
+    payloadPid: number,
     executableDigest: string
   ): Promise<SidecarProcessIdentity>;
   inspectProcess(pid: number): Promise<SidecarProcessIdentity | null>;
@@ -549,7 +557,17 @@ export async function readMacOSDeveloperProcess(
   try {
     const { stdout } = await execFileAsync(
       "/bin/ps",
-      ["-ww", "-p", String(pid), "-o", "uid=", "-o", "lstart="],
+      [
+        "-ww",
+        "-p",
+        String(pid),
+        "-o",
+        "uid=",
+        "-o",
+        "ppid=",
+        "-o",
+        "lstart="
+      ],
       {
         encoding: "utf8",
         env: {
@@ -562,11 +580,18 @@ export async function readMacOSDeveloperProcess(
       }
     );
     const parts = stdout.trim().split(/\s+/);
-    if (parts.length !== 6 || !/^\d+$/.test(parts[0]!)) {
+    if (
+      parts.length !== 7 ||
+      !/^\d+$/.test(parts[0]!) ||
+      !/^\d+$/.test(parts[1]!)
+    ) {
       return null;
     }
-    const birthMilliseconds = Date.parse(parts.slice(1).join(" "));
+    const birthMilliseconds = Date.parse(parts.slice(2).join(" "));
+    const parentPid = Number(parts[1]);
     if (
+      !Number.isSafeInteger(parentPid) ||
+      parentPid < 0 ||
       !Number.isSafeInteger(birthMilliseconds) ||
       birthMilliseconds <= 0
     ) {
@@ -574,6 +599,7 @@ export async function readMacOSDeveloperProcess(
     }
     return {
       pid,
+      parentPid,
       uid: Number(parts[0]),
       birthMilliseconds
     };
@@ -591,6 +617,9 @@ function developerMacProcessIdentity(
     !Number.isSafeInteger(evidence.pid) ||
     !Number.isSafeInteger(evidence.uid) ||
     evidence.uid < 0 ||
+    (evidence.parentPid !== undefined &&
+      (!Number.isSafeInteger(evidence.parentPid) ||
+        evidence.parentPid < 0)) ||
     !Number.isSafeInteger(evidence.birthMilliseconds) ||
     evidence.birthMilliseconds <= 0 ||
     !SHA256_PATTERN.test(executableDigest)
@@ -599,6 +628,9 @@ function developerMacProcessIdentity(
   }
   return {
     pid: evidence.pid,
+    ...(evidence.parentPid === undefined
+      ? {}
+      : { parentPid: evidence.parentPid }),
     ownerDigest: createHash("sha256")
       .update(`uid:${evidence.uid}`)
       .digest("hex"),
@@ -618,11 +650,32 @@ export function createMacOSDeveloperRetainedChildQualifier(
   let retained:
     | {
         child: RetainedSidecarChild;
-        pid: number;
-        executableDigest: string;
-        processBirthMarker: string;
+        identity: SidecarProcessIdentity;
+        payload: SidecarProcessIdentity | null;
       }
     | null = null;
+
+  function sameStableIdentity(
+    left: SidecarProcessIdentity,
+    right: SidecarProcessIdentity
+  ): boolean {
+    return (
+      left.pid === right.pid &&
+      left.ownerDigest === right.ownerDigest &&
+      left.processBirthMarker === right.processBirthMarker &&
+      left.executableDigest === right.executableDigest
+    );
+  }
+
+  function sameQualifiedIdentity(
+    left: SidecarProcessIdentity,
+    right: SidecarProcessIdentity
+  ): boolean {
+    return (
+      sameStableIdentity(left, right) &&
+      left.parentPid === right.parentPid
+    );
+  }
 
   async function observedIdentity(
     pid: number,
@@ -663,43 +716,116 @@ export function createMacOSDeveloperRetainedChildQualifier(
       }
       if (
         retained !== null &&
-        (retained.pid !== child.pid ||
-          retained.executableDigest !== executableDigest ||
-          retained.processBirthMarker !== observed.processBirthMarker)
+        (!sameQualifiedIdentity(retained.identity, observed) ||
+          retained.child !== child)
       ) {
         throw new Error("developer_retained_child_identity_changed");
       }
       retained = {
         child,
-        pid: child.pid,
-        executableDigest,
-        processBirthMarker: observed.processBirthMarker
+        identity: observed,
+        payload: retained?.payload ?? null
       };
       return observed;
+    },
+    async qualifyDeveloperOneFilePayload(
+      child,
+      payloadPid,
+      executableDigest
+    ): Promise<SidecarProcessIdentity> {
+      if (
+        retained === null ||
+        retained.child !== child ||
+        child.pid === undefined ||
+        child.pid !== retained.identity.pid ||
+        child.exitCode !== null ||
+        child.signalCode !== null ||
+        !Number.isSafeInteger(payloadPid) ||
+        payloadPid <= 0 ||
+        payloadPid === child.pid ||
+        executableDigest !== retained.identity.executableDigest ||
+        !SHA256_PATTERN.test(executableDigest)
+      ) {
+        throw new Error(
+          "developer_onefile_payload_identity_unavailable"
+        );
+      }
+      const [launcherBefore, payloadBefore] = await Promise.all([
+        observedIdentity(child.pid, executableDigest),
+        observedIdentity(payloadPid, executableDigest)
+      ]);
+      if (
+        launcherBefore === null ||
+        payloadBefore === null ||
+        !sameQualifiedIdentity(
+          launcherBefore,
+          retained.identity
+        ) ||
+        payloadBefore.parentPid !== child.pid ||
+        launcherBefore.ownerDigest === undefined ||
+        payloadBefore.ownerDigest === undefined ||
+        launcherBefore.ownerDigest !== payloadBefore.ownerDigest ||
+        launcherBefore.executableDigest !== executableDigest ||
+        payloadBefore.executableDigest !== executableDigest ||
+        (retained.payload !== null &&
+          !sameQualifiedIdentity(retained.payload, payloadBefore))
+      ) {
+        throw new Error(
+          "developer_onefile_payload_identity_unavailable"
+        );
+      }
+      const [launcherAfter, payloadAfter] = await Promise.all([
+        observedIdentity(child.pid, executableDigest),
+        observedIdentity(payloadPid, executableDigest)
+      ]);
+      if (
+        launcherAfter === null ||
+        payloadAfter === null ||
+        !sameQualifiedIdentity(launcherBefore, launcherAfter) ||
+        !sameQualifiedIdentity(payloadBefore, payloadAfter)
+      ) {
+        throw new Error(
+          "developer_onefile_payload_identity_changed"
+        );
+      }
+      retained.payload = payloadAfter;
+      return payloadAfter;
     },
     async inspectProcess(
       pid
     ): Promise<SidecarProcessIdentity | null> {
-      if (
-        retained === null ||
-        retained.pid !== pid ||
-        retained.child.pid !== pid ||
-        retained.child.exitCode !== null ||
-        retained.child.signalCode !== null
-      ) {
+      if (retained === null) {
+        return null;
+      }
+      if (pid === retained.identity.pid) {
+        if (
+          retained.child.pid !== pid ||
+          retained.child.exitCode !== null ||
+          retained.child.signalCode !== null
+        ) {
+          return null;
+        }
+        const observed = await observedIdentity(
+          pid,
+          retained.identity.executableDigest
+        );
+        return observed !== null &&
+          sameQualifiedIdentity(observed, retained.identity)
+          ? observed
+          : null;
+      }
+      const payload = retained.payload;
+      if (payload === null || pid !== payload.pid) {
         return null;
       }
       const observed = await observedIdentity(
         pid,
-        retained.executableDigest
+        payload.executableDigest
       );
-      if (
-        observed === null ||
-        observed.processBirthMarker !== retained.processBirthMarker
-      ) {
-        return null;
-      }
-      return observed;
+      return observed !== null &&
+        sameStableIdentity(observed, payload)
+        ? observed
+        : null;
     }
   };
 }
@@ -797,6 +923,16 @@ export async function createDeveloperRuntimeSupervisorDependencies(
     inspectRetainedChild: (child, expectedExecutableDigest) =>
       retainedChild.inspectRetainedChild(
         child,
+        expectedExecutableDigest
+      ),
+    qualifyDeveloperOneFilePayload: (
+      child,
+      payloadPid,
+      expectedExecutableDigest
+    ) =>
+      retainedChild.qualifyDeveloperOneFilePayload(
+        child,
+        payloadPid,
         expectedExecutableDigest
       )
   };

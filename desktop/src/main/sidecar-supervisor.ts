@@ -323,6 +323,7 @@ export interface ProfileLeaseEvidence {
 
 export interface SidecarProcessIdentity {
   pid: number;
+  parentPid?: number;
   ownerDigest?: string;
   processBirthMarker: string;
   executableDigest: string;
@@ -368,6 +369,7 @@ export interface VerifiedExecutableLaunchCapability {
     | "sealed_verified_native"
     | "developer_reverified_path"
     | "test_verified_handle";
+  readonly processModel: "direct" | "pyinstaller_onefile";
   spawn(request: VerifiedExecutableSpawnRequest): RetainedSidecarChild;
   close(): Promise<void>;
 }
@@ -407,6 +409,11 @@ export interface SidecarSupervisorDependencies {
   inspectProcess(pid: number): Promise<SidecarProcessIdentity | null>;
   inspectRetainedChild?(
     child: RetainedSidecarChild,
+    expectedExecutableDigest: string
+  ): Promise<SidecarProcessIdentity | null>;
+  qualifyDeveloperOneFilePayload?(
+    child: RetainedSidecarChild,
+    payloadPid: number,
     expectedExecutableDigest: string
   ): Promise<SidecarProcessIdentity | null>;
   requestReadiness(input: {
@@ -479,6 +486,7 @@ interface ActiveSidecar {
   profile: ResolvedPrivateProfile;
   resources: VerifiedResourceSet;
   baseUrl: string;
+  launcherIdentity: SidecarProcessIdentity | null;
   processIdentity: SidecarProcessIdentity | null;
   readiness: SidecarReadiness | null;
   readinessIdentity: CapturedPrivateFileIdentity | null;
@@ -735,6 +743,37 @@ function installBoundedLogReader(
   });
 }
 
+function sameStableProcessIdentity(
+  left: SidecarProcessIdentity,
+  right: SidecarProcessIdentity
+): boolean {
+  return (
+    left.pid === right.pid &&
+    left.ownerDigest === right.ownerDigest &&
+    left.processBirthMarker === right.processBirthMarker &&
+    left.executableDigest === right.executableDigest
+  );
+}
+
+function sameQualifiedProcessIdentity(
+  left: SidecarProcessIdentity,
+  right: SidecarProcessIdentity
+): boolean {
+  return (
+    sameStableProcessIdentity(left, right) &&
+    left.parentPid === right.parentPid
+  );
+}
+
+function isDeveloperOneFile(active: ActiveSidecar): boolean {
+  return (
+    active.resources.manifest.build_mode === "developer" &&
+    active.resources.manifest.key_id === "developer" &&
+    active.executable.mechanism === "developer_reverified_path" &&
+    active.executable.processModel === "pyinstaller_onefile"
+  );
+}
+
 function validateLocalReadinessEvidence(
   active: ActiveSidecar,
   readiness: SidecarReadiness,
@@ -744,20 +783,39 @@ function validateLocalReadinessEvidence(
   expectedExecutableDigest: string
 ): string {
   const childPid = active.child.pid;
+  const launcherIdentity = active.launcherIdentity;
   const expectedBaseUrl = `http://127.0.0.1:${readiness.port}/`;
   if (
     childPid === undefined ||
     active.child.exitCode !== null ||
     active.child.signalCode !== null ||
-    readiness.pid !== childPid ||
     readiness.profile_id !== active.profile.profileId ||
     readiness.sidecar_version !== expectedVersion ||
     readiness.resource_manifest_digest !== active.resources.manifestDigest ||
     readiness.launch_nonce_digest !== active.launch.launchNonceDigest ||
     readiness.executable_digest !== expectedExecutableDigest ||
-    processIdentity.pid !== childPid ||
+    processIdentity.pid !== readiness.pid ||
     processIdentity.processBirthMarker !== readiness.process_birth_marker ||
     processIdentity.executableDigest !== readiness.executable_digest
+  ) {
+    throw new SidecarSupervisorError(
+      "sidecar_readiness_identity_mismatch",
+      "sidecar_unverified"
+    );
+  }
+  if (
+    isDeveloperOneFile(active)
+      ? launcherIdentity === null ||
+        launcherIdentity.pid !== childPid ||
+        readiness.pid === childPid ||
+        processIdentity.parentPid !== childPid ||
+        launcherIdentity.ownerDigest === undefined ||
+        processIdentity.ownerDigest === undefined ||
+        launcherIdentity.ownerDigest !== processIdentity.ownerDigest ||
+        launcherIdentity.executableDigest !==
+          expectedExecutableDigest
+      : readiness.pid !== childPid ||
+        processIdentity.pid !== childPid
   ) {
     throw new SidecarSupervisorError(
       "sidecar_readiness_identity_mismatch",
@@ -769,13 +827,15 @@ function validateLocalReadinessEvidence(
     lease.status !== "attach_desktop" ||
     current === undefined ||
     current.management !== "desktop" ||
-    current.pid !== childPid ||
+    current.pid !== processIdentity.pid ||
     current.profileId !== active.profile.profileId ||
     current.processBirthMarker !== readiness.process_birth_marker ||
     current.executableDigest !== readiness.executable_digest ||
     current.launchNonceDigest !== active.launch.launchNonceDigest ||
     current.baseUrl !== expectedBaseUrl ||
-    current.version !== expectedVersion
+    current.version !== expectedVersion ||
+    (processIdentity.ownerDigest !== undefined &&
+      current.ownerDigest !== processIdentity.ownerDigest)
   ) {
     throw new SidecarSupervisorError(
       "profile_lease_readiness_mismatch",
@@ -1259,6 +1319,7 @@ export class SidecarSupervisor {
         profile,
         resources,
         baseUrl: "",
+        launcherIdentity: null,
         processIdentity: null,
         readiness: null,
         readinessIdentity: null,
@@ -1287,7 +1348,7 @@ export class SidecarSupervisor {
           "sidecar_unverified"
         );
       }
-      active.processIdentity = spawnedIdentity;
+      active.launcherIdentity = spawnedIdentity;
       this.throwIfLaunchCancelled(generation, signal);
       const capturedReadiness = await Promise.race([
         this.dependencies.waitForReadiness({
@@ -1303,8 +1364,9 @@ export class SidecarSupervisor {
       if (terminal !== null) {
         throw terminal;
       }
-      const processIdentity = await this.inspectRetainedChildOrProcess(
-        child,
+      const processIdentity = await this.inspectReadinessProcess(
+        active,
+        readiness,
         expectedExecutableDigest
       );
       this.throwIfLaunchCancelled(generation, signal);
@@ -1324,6 +1386,17 @@ export class SidecarSupervisor {
       this.throwIfLaunchCancelled(generation, signal);
       if (terminal !== null) {
         throw terminal;
+      }
+      if (
+        !(await this.reattestRunningProcessIdentities(
+          active,
+          processIdentity
+        ))
+      ) {
+        throw new SidecarSupervisorError(
+          "sidecar_process_identity_unverified",
+          "sidecar_unverified"
+        );
       }
       const baseUrl = validateLocalReadinessEvidence(
         active,
@@ -1626,33 +1699,43 @@ export class SidecarSupervisor {
   private async reattestTerminationAuthority(
     active: ActiveSidecar
   ): Promise<boolean> {
-    const expected = active.processIdentity;
+    const expectedLauncher = active.launcherIdentity;
     const pid = active.child.pid;
-    if (expected === null || pid === undefined || pid !== expected.pid) {
+    if (
+      expectedLauncher === null ||
+      pid === undefined ||
+      pid !== expectedLauncher.pid
+    ) {
       return false;
     }
     let current: SidecarProcessIdentity | null;
     try {
       current = await this.inspectRetainedChildOrProcess(
         active.child,
-        expected.executableDigest
+        expectedLauncher.executableDigest
       );
     } catch {
       return false;
     }
     if (
       current === null ||
-      current.pid !== expected.pid ||
-      current.processBirthMarker !== expected.processBirthMarker ||
-      current.executableDigest !== expected.executableDigest ||
-      (expected.ownerDigest !== undefined &&
-        current.ownerDigest !== expected.ownerDigest)
+      !sameQualifiedProcessIdentity(current, expectedLauncher)
     ) {
       return false;
     }
     const readiness = active.readiness;
     if (readiness === null) {
       return true;
+    }
+    const expectedProcess = active.processIdentity;
+    if (
+      expectedProcess === null ||
+      !(await this.reattestRunningProcessIdentities(
+        active,
+        expectedProcess
+      ))
+    ) {
+      return false;
     }
     let lease: ProfileLeaseEvidence;
     try {
@@ -1666,13 +1749,109 @@ export class SidecarSupervisor {
       leaseCurrent !== undefined &&
       leaseCurrent.management === "desktop" &&
       leaseCurrent.profileId === active.profile.profileId &&
-      leaseCurrent.pid === expected.pid &&
-      leaseCurrent.processBirthMarker === expected.processBirthMarker &&
-      leaseCurrent.executableDigest === expected.executableDigest &&
+      leaseCurrent.pid === expectedProcess.pid &&
+      leaseCurrent.processBirthMarker ===
+        expectedProcess.processBirthMarker &&
+      leaseCurrent.executableDigest ===
+        expectedProcess.executableDigest &&
+      (expectedProcess.ownerDigest === undefined ||
+        leaseCurrent.ownerDigest === expectedProcess.ownerDigest) &&
       leaseCurrent.launchNonceDigest ===
         active.launch.launchNonceDigest &&
       leaseCurrent.baseUrl === active.baseUrl &&
-      leaseCurrent.version === this.config.sidecarVersion
+      leaseCurrent.version === this.config.sidecarVersion &&
+      (await this.reattestRunningProcessIdentities(
+        active,
+        expectedProcess
+      ))
+    );
+  }
+
+  private async inspectReadinessProcess(
+    active: ActiveSidecar,
+    readiness: SidecarReadiness,
+    expectedExecutableDigest: string
+  ): Promise<SidecarProcessIdentity | null> {
+    if (readiness.pid === active.child.pid) {
+      return this.inspectRetainedChildOrProcess(
+        active.child,
+        expectedExecutableDigest
+      );
+    }
+    if (
+      !isDeveloperOneFile(active) ||
+      this.dependencies.qualifyDeveloperOneFilePayload === undefined
+    ) {
+      return null;
+    }
+    try {
+      return await this.dependencies.qualifyDeveloperOneFilePayload(
+        active.child,
+        readiness.pid,
+        expectedExecutableDigest
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  private async reattestRunningProcessIdentities(
+    active: ActiveSidecar,
+    expectedProcess: SidecarProcessIdentity
+  ): Promise<boolean> {
+    const expectedLauncher = active.launcherIdentity;
+    const childPid = active.child.pid;
+    if (
+      expectedLauncher === null ||
+      childPid === undefined ||
+      expectedLauncher.pid !== childPid
+    ) {
+      return false;
+    }
+    let launcher: SidecarProcessIdentity | null;
+    try {
+      launcher = await this.inspectRetainedChildOrProcess(
+        active.child,
+        expectedLauncher.executableDigest
+      );
+    } catch {
+      return false;
+    }
+    if (
+      launcher === null ||
+      !sameQualifiedProcessIdentity(launcher, expectedLauncher)
+    ) {
+      return false;
+    }
+    if (expectedProcess.pid === childPid) {
+      return sameStableProcessIdentity(
+        launcher,
+        expectedProcess
+      );
+    }
+    if (!isDeveloperOneFile(active)) {
+      return false;
+    }
+    let processIdentity: SidecarProcessIdentity | null;
+    try {
+      processIdentity = await this.dependencies.inspectProcess(
+        expectedProcess.pid
+      );
+    } catch {
+      return false;
+    }
+    return (
+      processIdentity !== null &&
+      sameStableProcessIdentity(
+        processIdentity,
+        expectedProcess
+      ) &&
+      processIdentity.parentPid === childPid &&
+      launcher.ownerDigest !== undefined &&
+      processIdentity.ownerDigest !== undefined &&
+      launcher.ownerDigest === processIdentity.ownerDigest &&
+      launcher.executableDigest ===
+        processIdentity.executableDigest
     );
   }
 
@@ -1700,6 +1879,11 @@ export class SidecarSupervisor {
   }
 
   private async performFinalization(active: ActiveSidecar): Promise<void> {
+    if (!(await this.confirmRuntimeProcessesExited(active))) {
+      throw this.terminationError(
+        "sidecar_payload_exit_unconfirmed"
+      );
+    }
     let cleanupFailed = false;
     let closeFailed = false;
     try {
@@ -1722,6 +1906,45 @@ export class SidecarSupervisor {
       throw this.terminationError(
         "verified_executable_close_failed"
       );
+    }
+  }
+
+  private async confirmRuntimeProcessesExited(
+    active: ActiveSidecar
+  ): Promise<boolean> {
+    if (!this.childHasExited(active.child)) {
+      return false;
+    }
+    const processIdentity = active.processIdentity;
+    if (
+      processIdentity === null ||
+      processIdentity.pid === active.child.pid
+    ) {
+      return true;
+    }
+    const deadline = Date.now() + this.config.shutdownTimeoutMs;
+    while (true) {
+      let current: SidecarProcessIdentity | null;
+      try {
+        current = await this.dependencies.inspectProcess(
+          processIdentity.pid
+        );
+      } catch {
+        return false;
+      }
+      if (
+        current === null ||
+        !sameStableProcessIdentity(current, processIdentity)
+      ) {
+        return true;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return false;
+      }
+      await new Promise<void>((resolvePromise) => {
+        setTimeout(resolvePromise, Math.min(25, remaining));
+      });
     }
   }
 
@@ -1995,12 +2218,19 @@ export async function inspectNodeProcess(
     const closeParen = stat.lastIndexOf(")");
     const tail = stat.slice(closeParen + 2).trim().split(/\s+/);
     const startTicks = tail[19];
-    if (uid === undefined || startTicks === undefined) {
+    const parentPid = Number(tail[1]);
+    if (
+      uid === undefined ||
+      startTicks === undefined ||
+      !Number.isSafeInteger(parentPid) ||
+      parentPid < 0
+    ) {
       return null;
     }
     const executable = await realpath(executableLink);
     return {
       pid,
+      parentPid,
       ownerDigest: createHash("sha256")
         .update(`uid:${Number(uid)}`)
         .digest("hex"),

@@ -187,6 +187,18 @@ function verifiedResources(): VerifiedResourceSet {
   };
 }
 
+function developerVerifiedResources(): VerifiedResourceSet {
+  const resources = verifiedResources();
+  return {
+    ...resources,
+    manifest: {
+      ...resources.manifest,
+      build_mode: "developer",
+      key_id: "developer"
+    }
+  };
+}
+
 function leaseFor(child: FakeSidecarChild): ProfileLeaseEvidence {
   return {
     status: "attach_desktop",
@@ -201,6 +213,182 @@ function leaseFor(child: FakeSidecarChild): ProfileLeaseEvidence {
       version: "0.5.0"
     }
   };
+}
+
+function frozenDeveloperHarness(options: {
+  payloadIdentity?: Partial<{
+    pid: number;
+    parentPid: number;
+    ownerDigest: string;
+    processBirthMarker: string;
+    executableDigest: string;
+  }>;
+  processModel?: "direct" | "pyinstaller_onefile";
+  releaseResources?: boolean;
+  payloadSurvivesShutdown?: boolean;
+} = {}): ReturnType<typeof harness> & {
+  lifecycle: {
+    cleanupCalls: number;
+    closeCalls: number;
+    apiReadinessCalls: number;
+    payloadAlive(): boolean;
+  };
+} {
+  const payloadPid = options.payloadIdentity?.pid ?? 9001;
+  const launcherOwnerDigest = "7".repeat(64);
+  const payloadOwnerDigest =
+    options.payloadIdentity?.ownerDigest ?? launcherOwnerDigest;
+  let payloadAlive = true;
+  const lifecycle = {
+    cleanupCalls: 0,
+    closeCalls: 0,
+    apiReadinessCalls: 0,
+    payloadAlive: () => payloadAlive
+  };
+  let fixture!: ReturnType<typeof harness>;
+  fixture = harness(
+    {
+      verifyResources: async () =>
+        options.releaseResources
+          ? verifiedResources()
+          : developerVerifiedResources(),
+      acquireVerifiedExecutable: async (resources, relativePath) => {
+        const resource = resources.files.get(relativePath);
+        if (resource === undefined) {
+          throw new Error("missing verified executable");
+        }
+        return {
+          resource,
+          mechanism: "developer_reverified_path",
+          processModel:
+            options.processModel ?? "pyinstaller_onefile",
+          spawn: (request) =>
+            fixture.spawner.spawn({
+              executable: resource.path,
+              ...request
+            }),
+          close: async () => {
+            lifecycle.closeCalls += 1;
+          }
+        };
+      },
+      createLaunchFiles: async (input) => ({
+        bootstrapPath: "/profile/runtime/bootstrap.json",
+        readinessPath: "/profile/runtime/desktop-readiness.json",
+        failurePath: "/profile/runtime/desktop-failure.json",
+        launchNonce,
+        launchNonceDigest,
+        apiToken,
+        profile: input.profile,
+        cleanup: async () => {
+          lifecycle.cleanupCalls += 1;
+        }
+      }),
+      waitForReadiness: async ({ child }) => ({
+        identity: { dev: 1, ino: payloadPid },
+        readiness: {
+          schema: "kestrel.desktop.sidecar_readiness.v1",
+          pid: payloadPid,
+          process_birth_marker:
+            options.payloadIdentity?.processBirthMarker ??
+            "payload-birth-9001",
+          port: 43001,
+          profile_id: "default",
+          sidecar_version: "0.5.0",
+          executable_digest:
+            options.payloadIdentity?.executableDigest ??
+            executableDigest,
+          resource_manifest_digest: manifestDigest,
+          launch_nonce_digest: launchNonceDigest
+        }
+      }),
+      inspectRetainedChild: async (child) => {
+        const pid = child.pid;
+        if (
+          pid === undefined ||
+          child.exitCode !== null ||
+          child.signalCode !== null
+        ) {
+          return null;
+        }
+        return {
+          pid,
+          parentPid: process.pid,
+          ownerDigest: launcherOwnerDigest,
+          processBirthMarker: `bootloader-birth-${pid}`,
+          executableDigest
+        };
+      },
+      qualifyDeveloperOneFilePayload: async (child, pid) => ({
+        pid,
+        parentPid:
+          options.payloadIdentity?.parentPid ?? child.pid,
+        ownerDigest:
+          payloadOwnerDigest,
+        processBirthMarker:
+          options.payloadIdentity?.processBirthMarker ??
+          "payload-birth-9001",
+        executableDigest:
+          options.payloadIdentity?.executableDigest ??
+          executableDigest
+      }),
+      inspectProcess: async (pid) => {
+        if (pid !== payloadPid || !payloadAlive) {
+          return null;
+        }
+        return {
+          pid,
+          parentPid:
+            options.payloadIdentity?.parentPid ??
+            fixture.spawner.children.at(-1)?.pid,
+          ownerDigest:
+            payloadOwnerDigest,
+          processBirthMarker:
+            options.payloadIdentity?.processBirthMarker ??
+            "payload-birth-9001",
+          executableDigest:
+            options.payloadIdentity?.executableDigest ??
+            executableDigest
+        };
+      },
+      inspectLease: async () => {
+        const child = fixture.spawner.children.at(-1);
+        if (child === undefined) {
+          return { status: "available" };
+        }
+        return {
+          status: "attach_desktop",
+          current: {
+            profileId: "default",
+            management: "desktop",
+            ownerDigest: payloadOwnerDigest,
+            pid: payloadPid,
+            processBirthMarker:
+              options.payloadIdentity?.processBirthMarker ??
+              "payload-birth-9001",
+            executableDigest:
+              options.payloadIdentity?.executableDigest ??
+              executableDigest,
+            launchNonceDigest,
+            baseUrl: "http://127.0.0.1:43001/",
+            version: "0.5.0"
+          }
+        };
+      },
+      requestReadiness: async () => {
+        lifecycle.apiReadinessCalls += 1;
+        return apiReadiness();
+      },
+      requestShutdown: async () => {
+        if (!options.payloadSurvivesShutdown) {
+          payloadAlive = false;
+        }
+        fixture.spawner.children.at(-1)?.exit(0);
+      }
+    },
+    { shutdownTimeoutMs: 1 }
+  );
+  return { ...fixture, lifecycle };
 }
 
 function apiReadiness(): AuthenticatedDesktopReadiness {
@@ -312,6 +500,7 @@ function harness(
       return {
         resource,
         mechanism: "test_verified_handle",
+        processModel: "direct",
         spawn: (request) => {
           observeSpawn?.({
             executable: resource.path,
@@ -482,6 +671,7 @@ function failedStartHarness(
       return {
         resource,
         mechanism: "test_verified_handle",
+        processModel: "direct",
         spawn: (request) => {
           const child = context.spawner.spawn({
             executable: resource.path,
@@ -785,7 +975,7 @@ describe("verified sidecar supervisor", () => {
     await supervisor.start();
 
     expect(assuranceModes).toEqual(["developer"]);
-    expect(retainedPids).toEqual([9100, 9100]);
+    expect(retainedPids).toEqual([9100, 9100, 9100]);
   });
 
   it("never falls back to PID-only termination evidence for a developer retained child", async () => {
@@ -1517,6 +1707,7 @@ describe("verified sidecar supervisor", () => {
         return {
           resource,
           mechanism: "test_verified_handle",
+          processModel: "direct",
           spawn: (request) =>
             spawner.spawn({ executable: resource.path, ...request }),
           close: async () => {
@@ -1561,6 +1752,7 @@ describe("verified sidecar supervisor", () => {
         return {
           resource,
           mechanism: "test_verified_handle",
+          processModel: "direct",
           spawn: (request) =>
             spawner.spawn({ executable: resource.path, ...request }),
           close: async () => {
@@ -1644,6 +1836,7 @@ describe("verified sidecar supervisor", () => {
         return {
           resource,
           mechanism: "test_verified_handle",
+          processModel: "direct",
           spawn: (request) => {
             const child = spawner.spawn({
               executable: resource.path,
@@ -1683,6 +1876,7 @@ describe("verified sidecar supervisor", () => {
         return {
           resource,
           mechanism: "test_verified_handle",
+          processModel: "direct",
           spawn: (request) =>
             spawner.spawn({ executable: resource.path, ...request }),
           close: async () => {
@@ -1990,6 +2184,70 @@ describe("verified sidecar supervisor", () => {
       "sidecar_readiness_identity_mismatch"
     );
     expect(tokenWasSent).toBe(false);
+  });
+
+  it("qualifies one exact developer PyInstaller bootloader-to-payload edge", async () => {
+    const { supervisor, spawner, lifecycle } =
+      frozenDeveloperHarness();
+
+    await expect(supervisor.start()).resolves.toBeDefined();
+    await expect(
+      supervisor.stopAfterAuthenticatedShutdown()
+    ).resolves.toBeUndefined();
+
+    expect(spawner.children[0]?.exitCode).toBe(0);
+    expect(lifecycle.payloadAlive()).toBe(false);
+    expect(lifecycle.cleanupCalls).toBe(1);
+    expect(lifecycle.closeCalls).toBe(1);
+  });
+
+  it.each([
+    {
+      name: "release resources",
+      options: { releaseResources: true }
+    },
+    {
+      name: "a direct process model",
+      options: { processModel: "direct" as const }
+    },
+    {
+      name: "an unrelated payload parent",
+      options: { payloadIdentity: { parentPid: 31337 } }
+    },
+    {
+      name: "a different payload owner",
+      options: {
+        payloadIdentity: { ownerDigest: "8".repeat(64) }
+      }
+    },
+    {
+      name: "a different payload executable",
+      options: {
+        payloadIdentity: { executableDigest: "9".repeat(64) }
+      }
+    }
+  ])("rejects $name before API authentication", async ({ options }) => {
+    const fixture = frozenDeveloperHarness(options);
+
+    await expect(fixture.supervisor.start()).rejects.toMatchObject({
+      recoveryReason: "sidecar_unverified"
+    });
+    expect(fixture.lifecycle.apiReadinessCalls).toBe(0);
+  });
+
+  it("preserves launch evidence when the bootloader exits but its payload survives", async () => {
+    const { supervisor, lifecycle } = frozenDeveloperHarness({
+      payloadSurvivesShutdown: true
+    });
+    await supervisor.start();
+
+    await expect(
+      supervisor.stopAfterAuthenticatedShutdown()
+    ).rejects.toThrow("sidecar_payload_exit_unconfirmed");
+
+    expect(lifecycle.payloadAlive()).toBe(true);
+    expect(lifecycle.cleanupCalls).toBe(0);
+    expect(lifecycle.closeCalls).toBe(0);
   });
 
   it("authenticates graceful shutdown to the verified URL before any handle signal", async () => {

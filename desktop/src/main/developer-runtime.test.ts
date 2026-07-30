@@ -373,6 +373,112 @@ describe("macOS developer retained-child qualification", () => {
     child.exit(0);
     expect(await qualifier.inspectProcess(41001)).toBeNull();
   });
+
+  it("qualifies exactly one same-owner onefile payload directly below the retained bootloader", async () => {
+    const child = new FakeSidecarChild(5151);
+    const evidence = new Map([
+      [
+        5151,
+        {
+          pid: 5151,
+          parentPid: 4242,
+          uid: 501,
+          birthMilliseconds: 1_753_886_400_000
+        }
+      ],
+      [
+        9001,
+        {
+          pid: 9001,
+          parentPid: 5151,
+          uid: 501,
+          birthMilliseconds: 1_753_886_401_000
+        }
+      ]
+    ]);
+    const qualifier = createMacOSDeveloperRetainedChildQualifier({
+      platform: "darwin",
+      readProcess: async (pid) => evidence.get(pid) ?? null
+    });
+    const digest = "b".repeat(64);
+
+    await qualifier.inspectRetainedChild(child, digest);
+    await expect(
+      qualifier.qualifyDeveloperOneFilePayload(
+        child,
+        9001,
+        digest
+      )
+    ).resolves.toMatchObject({
+      pid: 9001,
+      parentPid: 5151,
+      processBirthMarker: "developer-ps-lstart-ms:1753886401000",
+      executableDigest: digest
+    });
+    expect(await qualifier.inspectProcess(9001)).toMatchObject({
+      pid: 9001,
+      parentPid: 5151
+    });
+    expect(await qualifier.inspectProcess(31337)).toBeNull();
+
+    child.exit(0);
+    evidence.set(9001, {
+      pid: 9001,
+      parentPid: 1,
+      uid: 501,
+      birthMilliseconds: 1_753_886_401_000
+    });
+    expect(await qualifier.inspectProcess(9001)).toMatchObject({
+      pid: 9001,
+      parentPid: 1
+    });
+    evidence.delete(9001);
+    expect(await qualifier.inspectProcess(9001)).toBeNull();
+  });
+
+  it.each([
+    {
+      name: "an unrelated parent",
+      parentPid: 31337,
+      uid: 501
+    },
+    {
+      name: "a different owner",
+      parentPid: 5151,
+      uid: 502
+    }
+  ])("rejects $name for a onefile payload", async ({ parentPid, uid }) => {
+    const child = new FakeSidecarChild(5151);
+    const qualifier = createMacOSDeveloperRetainedChildQualifier({
+      platform: "darwin",
+      readProcess: async (pid) =>
+        pid === 5151
+          ? {
+              pid,
+              parentPid: 4242,
+              uid: 501,
+              birthMilliseconds: 1_753_886_400_000
+            }
+          : {
+              pid,
+              parentPid,
+              uid,
+              birthMilliseconds: 1_753_886_401_000
+            }
+    });
+    const digest = "b".repeat(64);
+
+    await qualifier.inspectRetainedChild(child, digest);
+    await expect(
+      qualifier.qualifyDeveloperOneFilePayload(
+        child,
+        9001,
+        digest
+      )
+    ).rejects.toThrow(
+      "developer_onefile_payload_identity_unavailable"
+    );
+  });
 });
 
 describe("immutable packaged runtime selection", () => {
