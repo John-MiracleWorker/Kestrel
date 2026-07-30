@@ -253,7 +253,7 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
     monkeypatch.setitem(sys.modules, "PyInstaller.utils.hooks", hooks)
     observed: dict[str, object] = {}
 
-    def analysis(*_args: object, **kwargs: object) -> SimpleNamespace:
+    def analysis(*args: object, **kwargs: object) -> SimpleNamespace:
         datas = kwargs["datas"]
         assert isinstance(datas, list)
         assert all(
@@ -263,7 +263,9 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
             for item in datas
         )
         observed["datas"] = datas
+        observed["entrypoints"] = args[0]
         observed["hiddenimports"] = kwargs["hiddenimports"]
+        observed["pathex"] = kwargs["pathex"]
         return SimpleNamespace(
             pure=[],
             scripts=[],
@@ -281,9 +283,11 @@ def test_spec_dry_evaluation_passes_flat_supported_data_entries(
         },
     )
     assert observed["datas"]
+    assert observed["entrypoints"] == [str(ENTRYPOINT)]
     assert "mcp.client" in observed["hiddenimports"]
     assert "mcp.cli" not in observed["hiddenimports"]
     assert "mcp.cli.cli" not in observed["hiddenimports"]
+    assert observed["pathex"] == [str(ROOT / "src")]
 
 
 def test_build_guard_rejects_dirty_or_wrong_source_and_upx(

@@ -11,7 +11,7 @@ from PyInstaller.utils.hooks import (
 )
 
 
-project_root = Path(SPECPATH).resolve().parent.parent
+project_root = Path(SPECPATH).resolve().parent
 source_root = project_root / "src"
 web_dist = project_root / "web" / "dist"
 # Source payload root: web/dist (staged under nested_memvid_agent/web_dist).
