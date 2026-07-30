@@ -596,13 +596,15 @@ describe("external developer directory smoke contracts", () => {
         : join(applicationRoot, "resources", "app");
     const distPath = join(packagedApplicationRoot, "dist");
     const mainBytes = Buffer.from("export {};\n");
-    const declarationBytes = Buffer.from("export {};\n");
+    const runtimeProofBytes = Buffer.from(
+      "export const runtimeProof = true;\n",
+    );
     const files = {
-      "main.d.ts": {
+      "runtime-proof.js": {
         sha256: createHash("sha256")
-          .update(declarationBytes)
+          .update(runtimeProofBytes)
           .digest("hex"),
-        size: declarationBytes.byteLength,
+        size: runtimeProofBytes.byteLength,
       },
       "main.js": {
         sha256: createHash("sha256")
@@ -618,8 +620,8 @@ describe("external developer directory smoke contracts", () => {
     await mkdir(distPath, { recursive: true });
     await writeFile(join(distPath, "main.js"), mainBytes);
     await writeFile(
-      join(distPath, "main.d.ts"),
-      declarationBytes,
+      join(distPath, "runtime-proof.js"),
+      runtimeProofBytes,
     );
     const receipt = buildReceipt({
       application_root: applicationRoot,
@@ -630,7 +632,7 @@ describe("external developer directory smoke contracts", () => {
           .digest("hex"),
       packaged_dist_file_count: 2,
       packaged_dist_total_bytes:
-        mainBytes.byteLength + declarationBytes.byteLength,
+        mainBytes.byteLength + runtimeProofBytes.byteLength,
     });
     try {
       await expect(
@@ -638,7 +640,7 @@ describe("external developer directory smoke contracts", () => {
       ).resolves.toMatchObject({
         fileCount: 2,
         totalBytes:
-          mainBytes.byteLength + declarationBytes.byteLength,
+          mainBytes.byteLength + runtimeProofBytes.byteLength,
       });
       await writeFile(
         join(distPath, "main.js"),

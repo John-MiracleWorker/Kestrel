@@ -639,7 +639,7 @@ def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
     assert build_config["extends"] == "./tsconfig.json"
     assert build_config["compilerOptions"] == {
         "noEmit": False,
-        "declaration": True,
+        "declaration": False,
         "outDir": "dist",
         "rootDir": "src",
     }

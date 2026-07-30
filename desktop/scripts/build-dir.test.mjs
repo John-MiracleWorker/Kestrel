@@ -153,7 +153,10 @@ async function createFixture(
     recursive: true,
   });
   await writeFile(join(desktopRoot, "dist", "main.js"), "export {};\n");
-  await writeFile(join(desktopRoot, "dist", "main.d.ts"), "export {};\n");
+  await writeFile(
+    join(desktopRoot, "dist", "runtime-proof.js"),
+    "export const runtimeProof = true;\n",
+  );
   const desktopPackage = {
     name: "kestrel-desktop",
     version: "0.5.0",
@@ -649,52 +652,56 @@ describe("developer directory bundle", () => {
 
   it.runIf(
     process.env.RUN_DESKTOP_BUILDER_INTEGRATION === "1",
-  )("runs the pinned real electron-builder directory target", async () => {
-    const fixture = await createFixture();
-    const builderOutput = [];
-    const receipt = await buildDeveloperDirectory(
-      {
-        stageReceiptPath: fixture.stageReceiptPath,
-        outputRoot: fixture.outputRoot,
-        receiptPath: fixture.buildReceiptPath,
-      },
-      {
-        repositoryRoot: fixture.repositoryRoot,
-        desktopRoot: fixture.desktopRoot,
-        executeBuilder: async (invocation) => {
-          await runPinnedRealBuilder(invocation, builderOutput);
+  )(
+    "runs the pinned real electron-builder directory target",
+    async () => {
+      const fixture = await createFixture();
+      const builderOutput = [];
+      const receipt = await buildDeveloperDirectory(
+        {
+          stageReceiptPath: fixture.stageReceiptPath,
+          outputRoot: fixture.outputRoot,
+          receiptPath: fixture.buildReceiptPath,
         },
-      },
-    );
+        {
+          repositoryRoot: fixture.repositoryRoot,
+          desktopRoot: fixture.desktopRoot,
+          executeBuilder: async (invocation) => {
+            await runPinnedRealBuilder(invocation, builderOutput);
+          },
+        },
+      );
 
-    expect(receipt.directory_only).toBe(true);
-    expect(receipt.signed).toBe(false);
-    expect(builderOutput.join("\n")).not.toMatch(
-      /publishing|notarizing|signing identity/i,
-    );
-    const packagedAppRoot = dirname(
-      dirname(receipt.packaged_public_key_path),
-    );
-    for (const dependency of ["electron-updater", "zod"]) {
-      const sourcePackage = await readFile(
-        join(
-          fixture.desktopRoot,
-          "node_modules",
-          dependency,
-          "package.json",
-        ),
+      expect(receipt.directory_only).toBe(true);
+      expect(receipt.signed).toBe(false);
+      expect(builderOutput.join("\n")).not.toMatch(
+        /publishing|notarizing|signing identity/i,
       );
-      const packagedDependency = await readFile(
-        join(
-          packagedAppRoot,
-          "node_modules",
-          dependency,
-          "package.json",
-        ),
+      const packagedAppRoot = dirname(
+        dirname(receipt.packaged_public_key_path),
       );
-      expect(packagedDependency.equals(sourcePackage)).toBe(true);
-    }
-  });
+      for (const dependency of ["electron-updater", "zod"]) {
+        const sourcePackage = await readFile(
+          join(
+            fixture.desktopRoot,
+            "node_modules",
+            dependency,
+            "package.json",
+          ),
+        );
+        const packagedDependency = await readFile(
+          join(
+            packagedAppRoot,
+            "node_modules",
+            dependency,
+            "package.json",
+          ),
+        );
+        expect(packagedDependency.equals(sourcePackage)).toBe(true);
+      }
+    },
+    30_000,
+  );
 
   it.runIf(
     process.env.RUN_DESKTOP_BUILDER_INTEGRATION === "1",

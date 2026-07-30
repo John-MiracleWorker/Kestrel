@@ -19,7 +19,6 @@ describe("desktop build boundary", () => {
     expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
     expect(existsSync(dist)).toBe(true);
     expect(readdirSync(dist, { recursive: true }).sort()).toEqual([
-      "contracts.d.ts",
       "contracts.js",
       "credential",
       "credential/form.js",
@@ -27,35 +26,20 @@ describe("desktop build boundary", () => {
       "credential/preload.js",
       "credential/styles.css",
       "main",
-      "main.d.ts",
       "main.js",
-      "main/api-session.d.ts",
       "main/api-session.js",
-      "main/build-trust.d.ts",
       "main/build-trust.js",
-      "main/credential-api.d.ts",
       "main/credential-api.js",
-      "main/credential-window.d.ts",
       "main/credential-window.js",
-      "main/developer-runtime.d.ts",
       "main/developer-runtime.js",
-      "main/directory-smoke.d.ts",
       "main/directory-smoke.js",
-      "main/ipc.d.ts",
       "main/ipc.js",
-      "main/private-files.d.ts",
       "main/private-files.js",
-      "main/protocol.d.ts",
       "main/protocol.js",
-      "main/resource-manifest.d.ts",
       "main/resource-manifest.js",
-      "main/security.d.ts",
       "main/security.js",
-      "main/sidecar-supervisor.d.ts",
       "main/sidecar-supervisor.js",
-      "main/window.d.ts",
       "main/window.js",
-      "preload.d.ts",
       "preload.js"
     ]);
 
