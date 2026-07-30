@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Callable
 from typing import Any
 
 from starlette.requests import Request
 
-from .desktop_recovery import DesktopRecoveryService
+from .desktop_recovery import (
+    DesktopRecoveryReport,
+    DesktopRecoveryService,
+)
 
 _MAX_RETRY_REQUEST_BYTES = 1_024
+_RECOVERY_INSPECTION_TIMEOUT_SECONDS = 2.0
 _RETRY_SCHEMA = "kestrel.desktop.recovery-retry.v1"
-_RETRY_RESULT_SCHEMA = (
-    "kestrel.desktop.recovery-retry-result.v1"
-)
+_RETRY_RESULT_SCHEMA = "kestrel.desktop.recovery-retry-result.v1"
 
 
 def register_desktop_recovery_routes(
@@ -20,15 +24,28 @@ def register_desktop_recovery_routes(
     service: DesktopRecoveryService,
     http_exception: Any,
 ) -> None:
+    async def bounded_report(
+        operation: Callable[[], DesktopRecoveryReport],
+    ) -> DesktopRecoveryReport:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(operation),
+                timeout=_RECOVERY_INSPECTION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return service.inspection_unavailable_report()
+
     @app.get("/api/desktop/recovery")  # type: ignore[untyped-decorator]
-    def desktop_recovery() -> dict[str, object]:
-        return service.inspect().to_public_payload()
+    async def desktop_recovery() -> dict[str, object]:
+        report = await bounded_report(service.inspect)
+        return report.to_public_payload()
 
     @app.get(  # type: ignore[untyped-decorator]
         "/api/desktop/recovery/support-bundle-preview"
     )
-    def desktop_recovery_support_preview() -> dict[str, object]:
-        return service.support_bundle_preview()
+    async def desktop_recovery_support_preview() -> dict[str, object]:
+        report = await bounded_report(service.inspect)
+        return service.support_bundle_preview(report)
 
     @app.post("/api/desktop/recovery/retry")  # type: ignore[untyped-decorator]
     async def desktop_recovery_retry(
@@ -54,7 +71,7 @@ def register_desktop_recovery_routes(
                 status_code=400,
                 detail="invalid_desktop_recovery_request",
             )
-        report = service.retry_readiness()
+        report = await bounded_report(service.retry_readiness)
         return {
             "schema": _RETRY_RESULT_SCHEMA,
             "accepted": report.can_auto_resume,

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Protocol
 
 from .state_store import SCHEMA_VERSION
 
 _RECOVERY_SCHEMA = "kestrel.desktop.recovery.v1"
-_SUPPORT_PREVIEW_SCHEMA = (
-    "kestrel.desktop.recovery-support-preview.v1"
-)
+_SUPPORT_PREVIEW_SCHEMA = "kestrel.desktop.recovery-support-preview.v1"
 _MAX_RECOVERY_ITEMS = 1_000
 _ACTIONS = (
     "inspect",
@@ -77,19 +76,9 @@ class DesktopRecoveryReport:
                 "writable": self.state_writable,
             },
             "memory": {"ready": self.memory_ready},
-            "approvals": {
-                "pending_high_risk": (
-                    self.pending_high_risk_approvals
-                )
-            },
-            "routing": {
-                "ambiguous_provider_attempts": (
-                    self.ambiguous_provider_attempts
-                )
-            },
-            "credential_storage": {
-                "state": self.credential_storage_state
-            },
+            "approvals": {"pending_high_risk": (self.pending_high_risk_approvals)},
+            "routing": {"ambiguous_provider_attempts": (self.ambiguous_provider_attempts)},
+            "credential_storage": {"state": self.credential_storage_state},
         }
 
 
@@ -108,8 +97,17 @@ class DesktopRecoveryService:
         self._routing = routing
         self._credential_readiness = credential_readiness
         self._memory_ready = memory_ready
+        self._inspection_lock = Lock()
 
     def inspect(self) -> DesktopRecoveryReport:
+        if not self._inspection_lock.acquire(blocking=False):
+            return self.inspection_unavailable_report()
+        try:
+            return self._inspect_once()
+        finally:
+            self._inspection_lock.release()
+
+    def _inspect_once(self) -> DesktopRecoveryReport:
         reasons: list[str] = []
         inspection_failed = False
 
@@ -136,9 +134,7 @@ class DesktopRecoveryService:
 
         try:
             pending_high_risk = _bounded_count(
-                self._state.count_pending_high_risk_approvals(
-                    limit=_MAX_RECOVERY_ITEMS
-                )
+                self._state.count_pending_high_risk_approvals(limit=_MAX_RECOVERY_ITEMS)
             )
         except Exception:
             pending_high_risk = 0
@@ -148,9 +144,7 @@ class DesktopRecoveryService:
 
         try:
             ambiguous_provider_attempts = _bounded_count(
-                self._routing.count_running_decisions(
-                    limit=_MAX_RECOVERY_ITEMS
-                )
+                self._routing.count_running_decisions(limit=_MAX_RECOVERY_ITEMS)
             )
         except Exception:
             ambiguous_provider_attempts = 0
@@ -159,9 +153,7 @@ class DesktopRecoveryService:
             reasons.append("ambiguous_provider_attempt")
 
         try:
-            credential_state = _credential_state(
-                self._credential_readiness()
-            )
+            credential_state = _credential_state(self._credential_readiness())
         except Exception:
             credential_state = "unavailable"
             inspection_failed = True
@@ -174,11 +166,7 @@ class DesktopRecoveryService:
         if inspection_failed:
             reasons.append("recovery_inspection_unavailable")
         ordered_reasons = _unique(reasons)
-        blockers = tuple(
-            reason
-            for reason in ordered_reasons
-            if reason in _BLOCKING_REASONS
-        )
+        blockers = tuple(reason for reason in ordered_reasons if reason in _BLOCKING_REASONS)
         return DesktopRecoveryReport(
             can_auto_resume=not blockers,
             reasons=ordered_reasons,
@@ -198,8 +186,28 @@ class DesktopRecoveryService:
 
         return self.inspect()
 
-    def support_bundle_preview(self) -> dict[str, Any]:
-        report = self.inspect()
+    def inspection_unavailable_report(self) -> DesktopRecoveryReport:
+        """Return a fixed fail-closed report without touching authorities."""
+
+        return DesktopRecoveryReport(
+            can_auto_resume=False,
+            reasons=("recovery_inspection_unavailable",),
+            blockers=("recovery_inspection_unavailable",),
+            actions=_ACTIONS,
+            state_integrity="error",
+            state_schema_version=None,
+            state_writable=False,
+            memory_ready=False,
+            pending_high_risk_approvals=0,
+            ambiguous_provider_attempts=0,
+            credential_storage_state="unavailable",
+        )
+
+    def support_bundle_preview(
+        self,
+        report: DesktopRecoveryReport | None = None,
+    ) -> dict[str, Any]:
+        active_report = report or self.inspect()
         return {
             "schema": _SUPPORT_PREVIEW_SCHEMA,
             "redacted": True,
@@ -216,7 +224,7 @@ class DesktopRecoveryService:
                 "approval_arguments",
                 "filesystem_paths",
             ],
-            "recovery": report.to_public_payload(),
+            "recovery": active_report.to_public_payload(),
         }
 
 
@@ -229,11 +237,7 @@ def _state_schema_version(
     health: Mapping[str, object],
 ) -> int | None:
     value = health.get("schema_version")
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < 0
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
 

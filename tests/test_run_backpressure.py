@@ -704,6 +704,87 @@ def test_memvid_agent_close_failure_keeps_slot_until_verified_retry(
     assert manager.shutdown(timeout_seconds=1.0) is True
 
 
+def test_memvid_close_observer_runs_once_after_close_before_slot_release(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _install_fake_memvid_sdk(monkeypatch)
+    manager = _manager(tmp_path, backend="memvid")
+    events: list[str] = []
+
+    def observe_closed_memory() -> None:
+        assert manager._memvid_agent_active is True
+        events.append("observed")
+
+    manager.configure_memory_close_observer(observe_closed_memory)
+    agent = manager._build_agent(manager.config)
+    original_close_all = agent.memory.close_all
+
+    def close_all() -> None:
+        original_close_all()
+        events.append("closed")
+
+    agent.memory.close_all = close_all  # type: ignore[method-assign]
+    agent.close()
+    agent.close()
+
+    assert events == ["closed", "observed"]
+    assert manager._memvid_agent_active is False
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_memvid_close_observer_waits_for_successful_close_retry(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _install_fake_memvid_sdk(monkeypatch)
+    manager = _manager(tmp_path, backend="memvid")
+    observed: list[str] = []
+    manager.configure_memory_close_observer(lambda: observed.append("observed"))
+    agent = manager._build_agent(manager.config)
+    original_close_all = agent.memory.close_all
+    allow_close = False
+
+    def close_all() -> None:
+        if not allow_close:
+            raise RuntimeError("injected memory close failure")
+        original_close_all()
+
+    agent.memory.close_all = close_all  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="injected memory close failure"):
+        agent.close()
+    assert observed == []
+    assert manager._memvid_agent_active is True
+
+    allow_close = True
+    agent.close()
+    assert observed == ["observed"]
+    assert manager._memvid_agent_active is False
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_memvid_close_observer_failure_cannot_hold_lifecycle_slot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _install_fake_memvid_sdk(monkeypatch)
+    manager = _manager(tmp_path, backend="memvid")
+
+    def fail_observer() -> None:
+        raise RuntimeError("injected receipt refresh failure")
+
+    manager.configure_memory_close_observer(fail_observer)
+    agent = manager._build_agent(manager.config)
+
+    agent.close()
+
+    assert manager._memvid_agent_active is False
+    replacement = manager._build_agent(manager.config)
+    replacement.close()
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+
 def test_run_manager_shutdown_retries_quarantined_agent_close(
     tmp_path,
     monkeypatch,

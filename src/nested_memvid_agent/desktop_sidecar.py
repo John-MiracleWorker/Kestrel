@@ -11,7 +11,7 @@ import sqlite3
 import stat
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
@@ -21,6 +21,10 @@ from .config import AgentConfig
 from .desktop_bootstrap import (
     DesktopLaunchConfig,
     consume_desktop_bootstrap,
+)
+from .desktop_memory_health import (
+    DesktopMemvidPreflightReceipt,
+    capture_desktop_memvid_preflight_receipt,
 )
 from .layers import DEFAULT_LAYER_SPECS, prepare_private_memory_artifacts
 from .platform_primitives import is_link_or_reparse_point
@@ -82,7 +86,7 @@ class _RuntimeLease(Protocol):
 BackendFactory = Callable[[Path], _PreflightBackend]
 ServerFactory = Callable[[Any], _DesktopServer]
 SocketFactory = Callable[[], socket.socket]
-Preflight = Callable[[Path], None]
+Preflight = Callable[[Path], DesktopMemvidPreflightReceipt | None]
 
 
 class IdentityFactory(Protocol):
@@ -239,15 +243,11 @@ class DesktopSidecarFailure:
             or not self.sidecar_version.strip()
             or len(self.sidecar_version) > 64
         ):
-            raise ValueError(
-                "sidecar_version must be bounded non-empty text"
-            )
+            raise ValueError("sidecar_version must be bounded non-empty text")
         if self.reason not in _DESKTOP_STARTUP_FAILURE_REASONS:
             raise ValueError("unsupported desktop startup failure reason")
         if self.schema != _SIDECAR_FAILURE_SCHEMA:
-            raise ValueError(
-                f"schema must be {_SIDECAR_FAILURE_SCHEMA}"
-            )
+            raise ValueError(f"schema must be {_SIDECAR_FAILURE_SCHEMA}")
 
     @classmethod
     def create(
@@ -259,20 +259,15 @@ class DesktopSidecarFailure:
     ) -> DesktopSidecarFailure:
         unsigned = {
             "schema": _SIDECAR_FAILURE_SCHEMA,
-            "launch_nonce_digest": sha256(
-                launch.launch_nonce.encode("utf-8")
-            ).hexdigest(),
+            "launch_nonce_digest": sha256(launch.launch_nonce.encode("utf-8")).hexdigest(),
             "profile_id": launch.profile_id,
             "reason": reason,
-            "resource_manifest_digest": (
-                launch.resource_manifest_digest
-            ),
+            "resource_manifest_digest": (launch.resource_manifest_digest),
             "sidecar_version": sidecar_version,
         }
         tag = hmac.new(
             launch.api_token.encode("utf-8"),
-            _SIDECAR_FAILURE_CONTEXT
-            + _canonical_json(unsigned).encode("utf-8"),
+            _SIDECAR_FAILURE_CONTEXT + _canonical_json(unsigned).encode("utf-8"),
             "sha256",
         ).hexdigest()
         return cls(**unsigned, authentication_tag=tag)
@@ -283,9 +278,7 @@ class DesktopSidecarFailure:
             "launch_nonce_digest": self.launch_nonce_digest,
             "profile_id": self.profile_id,
             "reason": self.reason,
-            "resource_manifest_digest": (
-                self.resource_manifest_digest
-            ),
+            "resource_manifest_digest": (self.resource_manifest_digest),
             "sidecar_version": self.sidecar_version,
             "authentication_tag": self.authentication_tag,
         }
@@ -347,9 +340,10 @@ def run_desktop_sidecar_preflight(
     memory_dir: Path,
     *,
     backend_factory: BackendFactory | None = None,
-) -> None:
+) -> DesktopMemvidPreflightReceipt:
     """Open and close every canonical Memvid v2 layer before API readiness."""
 
+    ensure_owner_only_directory(memory_dir)
     prepare_private_memory_artifacts(memory_dir)
     opened: list[_PreflightBackend] = []
     try:
@@ -371,6 +365,9 @@ def run_desktop_sidecar_preflight(
                 cleanup_error = cleanup_error or exc
         if cleanup_error is not None:
             raise RuntimeError("desktop_memvid_preflight_cleanup_incomplete") from cleanup_error
+    return capture_desktop_memvid_preflight_receipt(Path(memory_dir))
+
+
 def build_desktop_agent_config(launch: DesktopLaunchConfig) -> AgentConfig:
     """Build the immutable profile boundary around owner-tunable runtime settings."""
 
@@ -383,11 +380,7 @@ def build_desktop_agent_config(launch: DesktopLaunchConfig) -> AgentConfig:
         workspace=root / "workspace",
         log_dir=root / "logs",
         state_path=launch.state_path,
-        secret_store_path=(
-            root
-            / "secrets"
-            / "desktop-keyring-metadata.json"
-        ),
+        secret_store_path=(root / "secrets" / "desktop-keyring-metadata.json"),
         secret_backend="desktop",
         skills_dir=root / "skills",
         plugins_dir=root / "plugins",
@@ -480,7 +473,17 @@ async def run_desktop_sidecar(
         startup_phase = "state"
         run_desktop_state_preflight(launch.state_path)
         startup_phase = "memvid"
-        preflight(launch.memory_dir)
+        memory_preflight_receipt = preflight(launch.memory_dir)
+        if memory_preflight_receipt is not None:
+            if type(memory_preflight_receipt) is not DesktopMemvidPreflightReceipt:
+                raise RuntimeError("desktop_memvid_preflight_receipt_invalid")
+            launch = replace(
+                launch,
+                memory_preflight_receipt=memory_preflight_receipt.bind(
+                    launch_nonce_digest=sha256(launch.launch_nonce.encode("utf-8")).hexdigest(),
+                    resource_manifest_digest=verified_manifest_digest,
+                ),
+            )
         startup_phase = "app"
         config = build_desktop_agent_config(launch)
         shutdown_controller = DesktopShutdownController()
@@ -515,9 +518,7 @@ async def run_desktop_sidecar(
                         desktop_failure_path(launch),
                         DesktopSidecarFailure.create(
                             launch,
-                            sidecar_version=(
-                                launch.readiness().sidecar_version
-                            ),
+                            sidecar_version=(launch.readiness().sidecar_version),
                             reason=reason,
                         ),
                     )
@@ -641,24 +642,15 @@ def verify_resource_manifest_binding(
 
 
 def desktop_readiness_path(launch: DesktopLaunchConfig) -> Path:
-    return (
-        launch.profile_root
-        / _SIDECAR_READINESS_DIRECTORY
-        / _SIDECAR_READINESS_NAME
-    )
+    return launch.profile_root / _SIDECAR_READINESS_DIRECTORY / _SIDECAR_READINESS_NAME
 
 
 def desktop_failure_path(launch: DesktopLaunchConfig) -> Path:
-    nonce_digest = sha256(
-        launch.launch_nonce.encode("utf-8")
-    ).hexdigest()
+    nonce_digest = sha256(launch.launch_nonce.encode("utf-8")).hexdigest()
     return (
         launch.profile_root
         / _SIDECAR_READINESS_DIRECTORY
-        / (
-            f"{_SIDECAR_FAILURE_PREFIX}"
-            f"{nonce_digest[:24]}.json"
-        )
+        / (f"{_SIDECAR_FAILURE_PREFIX}{nonce_digest[:24]}.json")
     )
 
 
@@ -692,10 +684,7 @@ def classify_desktop_startup_failure(
     if isinstance(error, DesktopStateCorruptError):
         return "state_corrupt"
     if phase == "state":
-        if (
-            isinstance(error, RuntimeError)
-            and "newer than supported" in str(error)
-        ):
+        if isinstance(error, RuntimeError) and "newer than supported" in str(error):
             return "state_incompatible"
         if isinstance(
             error,
@@ -716,13 +705,9 @@ def run_desktop_state_preflight(state_path: Path) -> None:
             path.resolve().as_uri() + "?mode=ro",
             uri=True,
         ) as connection:
-            row = connection.execute(
-                "PRAGMA quick_check(1)"
-            ).fetchone()
+            row = connection.execute("PRAGMA quick_check(1)").fetchone()
             if row is None or str(row[0]) != "ok":
-                raise DesktopStateCorruptError(
-                    "desktop_state_integrity_failed"
-                )
+                raise DesktopStateCorruptError("desktop_state_integrity_failed")
             table = connection.execute(
                 """
                 SELECT 1 FROM sqlite_master
@@ -734,22 +719,16 @@ def run_desktop_state_preflight(state_path: Path) -> None:
             version_row = connection.execute(
                 "SELECT version FROM schema_version WHERE id = 1"
             ).fetchone()
-            version = (
-                0 if version_row is None else int(version_row[0])
-            )
+            version = 0 if version_row is None else int(version_row[0])
             if version > SCHEMA_VERSION:
-                raise DesktopStateIncompatibleError(
-                    "desktop_state_schema_newer_than_supported"
-                )
+                raise DesktopStateIncompatibleError("desktop_state_schema_newer_than_supported")
     except (
         DesktopStateCorruptError,
         DesktopStateIncompatibleError,
     ):
         raise
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
-        raise DesktopStateCorruptError(
-            "desktop_state_integrity_failed"
-        ) from exc
+        raise DesktopStateCorruptError("desktop_state_integrity_failed") from exc
 
 
 def write_desktop_readiness(

@@ -3,9 +3,10 @@ from collections.abc import Callable, MutableMapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from functools import partial
+from hashlib import sha256
 from importlib import import_module
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -14,7 +15,11 @@ from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
 from .config import AgentConfig
 from .desktop_bootstrap import DesktopLaunchConfig
-from .desktop_memory_health import inspect_desktop_memvid_readiness
+from .desktop_memory_health import (
+    DesktopMemvidPreflightReceipt,
+    capture_desktop_memvid_preflight_receipt,
+    inspect_desktop_memvid_readiness,
+)
 from .event_bus import RunEventBus
 from .layers import (
     load_layer_specs,
@@ -258,15 +263,16 @@ def _create_app(
             active_config,
             desktop_context,
         )
-    _prepare_private_runtime_artifacts(active_config)
+    _prepare_private_runtime_artifacts(
+        active_config,
+        harden_existing_memory=desktop_context is None,
+    )
     workspace = active_config.workspace.expanduser().resolve()
     secret_store_path = active_config.secret_store_path.expanduser()
     if not secret_store_path.is_absolute():
         secret_store_path = workspace / secret_store_path
     secret_store_path = secret_store_path.resolve()
-    secret_broker = build_secret_broker(
-        secret_store_path, backend=active_config.secret_backend
-    )
+    secret_broker = build_secret_broker(secret_store_path, backend=active_config.secret_backend)
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
     mcp = MCPManager(
@@ -294,6 +300,44 @@ def _create_app(
     routing_ledger = run_manager_build.routing_ledger
     routing_config = run_manager_build.routing_config
 
+    desktop_memory_receipt: DesktopMemvidPreflightReceipt | None = (
+        desktop_context.memory_preflight_receipt if desktop_context is not None else None
+    )
+    desktop_memory_receipt_lock = Lock()
+
+    if desktop_context is not None:
+        desktop_launch_nonce_digest = sha256(
+            desktop_context.launch_nonce.encode("utf-8")
+        ).hexdigest()
+        desktop_resource_manifest_digest = desktop_context.resource_manifest_digest
+
+        def current_desktop_memory_ready() -> bool:
+            with desktop_memory_receipt_lock:
+                current_receipt = desktop_memory_receipt
+            return inspect_desktop_memvid_readiness(
+                desktop_context.memory_dir,
+                receipt=current_receipt,
+                launch_nonce_digest=desktop_launch_nonce_digest,
+                resource_manifest_digest=(desktop_resource_manifest_digest),
+            )
+
+        def refresh_desktop_memory_receipt() -> None:
+            nonlocal desktop_memory_receipt
+            refreshed: DesktopMemvidPreflightReceipt | None
+            try:
+                refreshed = capture_desktop_memvid_preflight_receipt(
+                    desktop_context.memory_dir
+                ).bind(
+                    launch_nonce_digest=(desktop_launch_nonce_digest),
+                    resource_manifest_digest=(desktop_resource_manifest_digest),
+                )
+            except Exception:
+                refreshed = None
+            with desktop_memory_receipt_lock:
+                desktop_memory_receipt = refreshed
+
+        runs.configure_memory_close_observer(refresh_desktop_memory_receipt)
+
     def abort_runtime_construction() -> None:
         runs_stopped = runs.shutdown(timeout_seconds=5.0)
         if not runs_stopped:
@@ -303,7 +347,9 @@ def _create_app(
             raise RuntimeError("runtime_shutdown_incomplete")
 
     construction_cleanup.append(abort_runtime_construction)
-    channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve, run_manager=runs)
+    channels = ChannelManager(
+        active_config, secret_resolver=secret_broker.resolve, run_manager=runs
+    )
     routine_service = RoutineService(
         state,
         runs,
@@ -342,7 +388,10 @@ def _create_app(
                 next_config,
                 desktop_context,
             )
-        _prepare_private_runtime_artifacts(next_config)
+        _prepare_private_runtime_artifacts(
+            next_config,
+            harden_existing_memory=desktop_context is None,
+        )
 
     channels.configure_runtime_settings(
         settings_store=runtime_settings_store,
@@ -446,10 +495,7 @@ def _create_app(
         finally:
             shutdown_incomplete = False
             try:
-                loop_stopped = (
-                    routine_loop is None
-                    or routine_loop.close(timeout_seconds=5.0)
-                )
+                loop_stopped = routine_loop is None or routine_loop.close(timeout_seconds=5.0)
                 if routine_loop is not None and not loop_stopped:
                     loop_stopped = routine_loop.close(timeout_seconds=1.0)
                 shutdown_incomplete = not loop_stopped
@@ -512,9 +558,7 @@ def _create_app(
         method = str(getattr(request, "method", "GET")).upper()
         api_path = path == "/api" or path.startswith("/api/")
         guarded_path = api_path or path == "/metrics"
-        public_telegram_webhook = (
-            method == "POST" and path == "/api/channels/telegram/webhook"
-        )
+        public_telegram_webhook = method == "POST" and path == "/api/channels/telegram/webhook"
         cors_preflight = (
             method == "OPTIONS"
             and bool(origin)
@@ -529,19 +573,16 @@ def _create_app(
                 )
                 if auth_error is not None:
                     status_code, detail = auth_error
-                    return responses_module.JSONResponse({"detail": detail}, status_code=status_code)
-            if (
-                desktop_context is not None
-                and desktop_credential_mutation_request(
-                    method,
-                    path,
-                )
-            ):
-                capability_error = (
-                    desktop_credential_capability_error(
-                        desktop_context,
-                        headers,
+                    return responses_module.JSONResponse(
+                        {"detail": detail}, status_code=status_code
                     )
+            if desktop_context is not None and desktop_credential_mutation_request(
+                method,
+                path,
+            ):
+                capability_error = desktop_credential_capability_error(
+                    desktop_context,
+                    headers,
                 )
                 if capability_error is not None:
                     status_code, detail = capability_error
@@ -554,9 +595,13 @@ def _create_app(
                 try:
                     request_bytes = int(content_length)
                 except ValueError:
-                    return responses_module.JSONResponse({"detail": "invalid_content_length"}, status_code=400)
+                    return responses_module.JSONResponse(
+                        {"detail": "invalid_content_length"}, status_code=400
+                    )
                 if request_bytes > active_config.max_request_body_bytes:
-                    return responses_module.JSONResponse({"detail": "request_body_too_large"}, status_code=413)
+                    return responses_module.JSONResponse(
+                        {"detail": "request_body_too_large"}, status_code=413
+                    )
             if method not in {"GET", "HEAD", "OPTIONS"}:
                 try:
                     await _cache_bounded_request_body(
@@ -576,7 +621,9 @@ def _create_app(
                     window_seconds=active_config.api_rate_limit_window_seconds,
                     max_keys=active_config.api_rate_limit_max_clients,
                 ):
-                    return responses_module.JSONResponse({"detail": "rate_limit_exceeded"}, status_code=429)
+                    return responses_module.JSONResponse(
+                        {"detail": "rate_limit_exceeded"}, status_code=429
+                    )
         return await call_next(request)
 
     @app.middleware("http")  # type: ignore[untyped-decorator]
@@ -617,9 +664,7 @@ def _create_app(
             shutdown_controller=desktop_shutdown,
             secret_broker=secret_broker,
             http_exception=HTTPException,
-            sensitive_material_transition=(
-                mcp_sensitive_material_transition
-            ),
+            sensitive_material_transition=(mcp_sensitive_material_transition),
         )
     register_routing_routes(
         app,
@@ -645,9 +690,7 @@ def _create_app(
         secret_broker=secret_broker,
         sensitive_material_transition=mcp_sensitive_material_transition,
         mutation_dependency=(
-            require_desktop_credential_capability
-            if desktop_context is not None
-            else None
+            require_desktop_credential_capability if desktop_context is not None else None
         ),
     )
     desktop_storage_readiness = getattr(
@@ -664,33 +707,23 @@ def _create_app(
         )
         if current is None:
             return {
-                "schema": (
-                    "kestrel.desktop_credential_readiness.v1"
-                ),
+                "schema": ("kestrel.desktop_credential_readiness.v1"),
                 "state": "unavailable",
                 "backend": None,
                 "persistence": "none",
                 "reason": "metadata_invalid",
-                "remediation": (
-                    "Repair the Desktop credential readiness "
-                    "metadata and retry."
-                ),
+                "remediation": ("Repair the Desktop credential readiness metadata and retry."),
             }
         try:
             payload = current.to_public_payload()
         except Exception:
             return {
-                "schema": (
-                    "kestrel.desktop_credential_readiness.v1"
-                ),
+                "schema": ("kestrel.desktop_credential_readiness.v1"),
                 "state": "unavailable",
                 "backend": None,
                 "persistence": "none",
                 "reason": "metadata_invalid",
-                "remediation": (
-                    "Repair the Desktop credential readiness "
-                    "metadata and retry."
-                ),
+                "remediation": ("Repair the Desktop credential readiness metadata and retry."),
             }
         return dict(payload)
 
@@ -702,12 +735,8 @@ def _create_app(
             service=DesktopRecoveryService(
                 state=state,
                 routing=routing_ledger,
-                credential_readiness=(
-                    current_desktop_storage_readiness
-                ),
-                memory_ready=lambda: inspect_desktop_memvid_readiness(
-                    active_config.memory_dir
-                ),
+                credential_readiness=(current_desktop_storage_readiness),
+                memory_ready=current_desktop_memory_ready,
             ),
             http_exception=HTTPException,
         )
@@ -715,20 +744,11 @@ def _create_app(
     register_product_routes(
         app,
         active_config=lambda: active_config,
-        secret_resolver=(
-            None
-            if desktop_context is not None
-            else secret_broker.resolve
-        ),
-        secret_status=(
-            secret_broker.metadata_status
-            if desktop_context is not None
-            else None
-        ),
+        secret_resolver=(None if desktop_context is not None else secret_broker.resolve),
+        secret_status=(secret_broker.metadata_status if desktop_context is not None else None),
         credential_storage=(
             current_desktop_storage_readiness
-            if desktop_context is not None
-            and desktop_storage_readiness is not None
+            if desktop_context is not None and desktop_storage_readiness is not None
             else None
         ),
     )
@@ -966,8 +986,9 @@ def _create_app(
         runs=runs,
         routine_loop=routine_loop,
     )
-    register_behavior_delta_routes(app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state))
-
+    register_behavior_delta_routes(
+        app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state)
+    )
 
     @app.get("/api/learning/dashboard")  # type: ignore[untyped-decorator]
     def learning_dashboard(since: str = "30d") -> dict[str, object]:
@@ -1007,7 +1028,9 @@ def _create_app(
             raw_rows = execution.data.get("trusted_onboarding_hits")
             rows = raw_rows if isinstance(raw_rows, list) else []
         state_payload = onboarding_state_from_reflection(rows)
-        state_payload["reflection"] = execution.data.get("reflection") if isinstance(execution.data, dict) else None
+        state_payload["reflection"] = (
+            execution.data.get("reflection") if isinstance(execution.data, dict) else None
+        )
         return state_payload
 
     @app.post("/api/self/onboarding")  # type: ignore[untyped-decorator]
@@ -1338,7 +1361,11 @@ def _create_app(
         include_inactive: bool = False,
     ) -> list[dict[str, object]]:
         return _search_memory(
-            query=query, layers=_csv_layers(layers), k=k, mode=mode, include_inactive=include_inactive
+            query=query,
+            layers=_csv_layers(layers),
+            k=k,
+            mode=mode,
+            include_inactive=include_inactive,
         )
 
     @app.post("/api/memory/search")  # type: ignore[untyped-decorator]
@@ -1603,9 +1630,17 @@ def _create_app(
     return app
 
 
-def _prepare_private_runtime_artifacts(config: AgentConfig) -> None:
+def _prepare_private_runtime_artifacts(
+    config: AgentConfig,
+    *,
+    harden_existing_memory: bool = True,
+) -> None:
     specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
-    prepare_private_memory_artifacts(config.memory_dir, specs=specs)
+    prepare_private_memory_artifacts(
+        config.memory_dir,
+        specs=specs,
+        harden_existing=harden_existing_memory,
+    )
     prepare_private_runs_root(config.memory_dir.parent / "runs")
 
 
@@ -1620,11 +1655,7 @@ def _apply_desktop_runtime_authority(
         backend="memvid",
         memory_dir=launch.memory_dir,
         state_path=launch.state_path,
-        secret_store_path=(
-            launch.profile_root
-            / "secrets"
-            / "desktop-keyring-metadata.json"
-        ),
+        secret_store_path=(launch.profile_root / "secrets" / "desktop-keyring-metadata.json"),
         secret_backend="desktop",
         require_api_auth=True,
         cors_origins=(_DESKTOP_RENDERER_ORIGIN,),
@@ -1651,7 +1682,9 @@ def _resolve_web_dist() -> Path | None:
         module_path.parent / "web_dist",
         module_path.parents[2] / "web" / "dist",
     )
-    return next((candidate for candidate in candidates if (candidate / "index.html").is_file()), None)
+    return next(
+        (candidate for candidate in candidates if (candidate / "index.html").is_file()), None
+    )
 
 
 def _probe_provider_health(
@@ -1675,7 +1708,11 @@ def _probe_provider_health(
         pass
     provider_id = provider_health_id(config)
     snapshot = global_provider_health_registry.snapshot(provider_id)
-    return {"provider_id": provider_id, "operational": snapshot.get("state") == "healthy", **snapshot}
+    return {
+        "provider_id": provider_id,
+        "operational": snapshot.get("state") == "healthy",
+        **snapshot,
+    }
 
 
 def _provider_secret_env_names(config: AgentConfig) -> set[str]:

@@ -1,121 +1,246 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
-from typing import Any
 
 from nested_memvid_agent.desktop_memory_health import (
+    capture_desktop_memvid_preflight_receipt,
     inspect_desktop_memvid_readiness,
 )
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS
-from nested_memvid_agent.models import MemoryLayer
 
-
-class _Backend:
-    def __init__(
-        self,
-        *,
-        path: Path,
-        layer: MemoryLayer,
-        read_only: bool,
-        path_lock_blocking: bool,
-        calls: list[tuple[str, object]],
-        fail_open: bool = False,
-        fail_close: bool = False,
-    ) -> None:
-        calls.append(
-            (
-                "construct",
-                (path, layer, read_only, path_lock_blocking),
-            )
-        )
-        self.path = path
-        self.calls = calls
-        self.fail_open = fail_open
-        self.fail_close = fail_close
-
-    def open(self) -> None:
-        self.calls.append(("open", self.path))
-        if self.fail_open:
-            raise RuntimeError("sentinel-open-failure")
-
-    def close(self) -> None:
-        self.calls.append(("close", self.path))
-        if self.fail_close:
-            raise RuntimeError("sentinel-close-failure")
+_LAUNCH_NONCE_DIGEST = "a" * 64
+_RESOURCE_MANIFEST_DIGEST = "sha256:" + ("b" * 64)
+_VALID_MV2 = b"MV2\x00" + (b"x" * 300) + b"MV2FOOT!" + (b"\x00" * 64)
 
 
 def _seed_layer_paths(memory_dir: Path) -> None:
-    memory_dir.mkdir()
+    memory_dir.mkdir(mode=0o700)
+    memory_dir.chmod(0o700)
     for spec in DEFAULT_LAYER_SPECS.values():
-        (memory_dir / spec.mv2_file).write_bytes(b"test-mv2")
+        path = memory_dir / spec.mv2_file
+        path.write_bytes(_VALID_MV2)
+        path.chmod(0o600)
 
 
-def test_memvid_recovery_probe_opens_every_existing_layer_read_only(
+def _bound_receipt(memory_dir: Path):
+    return capture_desktop_memvid_preflight_receipt(memory_dir).bind(
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+    )
+
+
+def _metadata_snapshot(
+    root: Path,
+) -> dict[str, tuple[int, int, int, int, int]]:
+    paths = [root, *sorted(root.rglob("*"))]
+    return {
+        "." if path == root else str(path.relative_to(root)): (
+            stat.S_IMODE(path.lstat().st_mode),
+            path.lstat().st_size,
+            path.lstat().st_mtime_ns,
+            path.lstat().st_ctime_ns,
+            path.lstat().st_nlink,
+        )
+        for path in paths
+    }
+
+
+def test_memvid_recovery_probe_is_bounded_nonmutating_and_generation_bound(
     tmp_path: Path,
 ) -> None:
     memory_dir = tmp_path / "memory"
     _seed_layer_paths(memory_dir)
-    calls: list[tuple[str, object]] = []
+    receipt = _bound_receipt(memory_dir)
+    probed: list[Path] = []
 
-    def factory(**kwargs: Any) -> _Backend:
-        return _Backend(calls=calls, **kwargs)
+    def sdk_metadata_probe(filename: str) -> bool:
+        probed.append(Path(filename))
+        return True
 
+    before = _metadata_snapshot(memory_dir)
     assert inspect_desktop_memvid_readiness(
         memory_dir,
-        backend_factory=factory,
+        receipt=receipt,
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=sdk_metadata_probe,
+        max_layer_bytes=len(_VALID_MV2),
     )
-    constructs = [
-        payload for action, payload in calls if action == "construct"
-    ]
-    assert len(constructs) == len(DEFAULT_LAYER_SPECS)
-    assert all(read_only is True for _, _, read_only, _ in constructs)
-    assert all(
-        path_lock_blocking is False
-        for _, _, _, path_lock_blocking in constructs
+    assert _metadata_snapshot(memory_dir) == before
+    assert probed == [memory_dir / spec.mv2_file for spec in DEFAULT_LAYER_SPECS.values()]
+    assert not any(".kestrel.lock" in path.name for path in memory_dir.iterdir())
+
+
+def test_memvid_recovery_probe_fails_closed_without_current_launch_receipt(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_layer_paths(memory_dir)
+    calls: list[str] = []
+
+    assert not inspect_desktop_memvid_readiness(
+        memory_dir,
+        receipt=None,
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=lambda filename: calls.append(filename) is None,
     )
-    assert sum(action == "close" for action, _ in calls) == len(
-        DEFAULT_LAYER_SPECS
+    assert calls == []
+
+
+def test_memvid_recovery_probe_fails_closed_for_wrong_launch_generation(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_layer_paths(memory_dir)
+    receipt = _bound_receipt(memory_dir)
+    calls: list[str] = []
+
+    assert not inspect_desktop_memvid_readiness(
+        memory_dir,
+        receipt=receipt,
+        launch_nonce_digest="c" * 64,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=lambda filename: calls.append(filename) is None,
     )
+    assert calls == []
+
+
+def test_memvid_recovery_probe_rejects_same_size_content_change(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_layer_paths(memory_dir)
+    receipt = _bound_receipt(memory_dir)
+    changed = memory_dir / "working.mv2"
+    changed.write_bytes(b"MV2\x00" + (b"y" * 300) + b"MV2FOOT!" + (b"\x00" * 64))
+    changed.chmod(0o600)
+    calls: list[str] = []
+
+    assert not inspect_desktop_memvid_readiness(
+        memory_dir,
+        receipt=receipt,
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=lambda filename: calls.append(filename) is None,
+    )
+    assert calls == []
 
 
 def test_memvid_recovery_probe_fails_closed_without_creating_missing_layer(
     tmp_path: Path,
 ) -> None:
     memory_dir = tmp_path / "memory"
-    memory_dir.mkdir()
-    calls: list[tuple[str, object]] = []
+    memory_dir.mkdir(mode=0o700)
+    memory_dir.chmod(0o700)
 
-    def factory(**kwargs: Any) -> _Backend:
-        return _Backend(calls=calls, **kwargs)
+    try:
+        receipt = capture_desktop_memvid_preflight_receipt(memory_dir)
+    except FileNotFoundError:
+        receipt = None
 
-    assert not inspect_desktop_memvid_readiness(
-        memory_dir,
-        backend_factory=factory,
-    )
-    assert calls == []
+    assert receipt is None
     assert list(memory_dir.iterdir()) == []
 
 
-def test_memvid_recovery_probe_closes_prior_layers_and_fails_closed(
+def test_memvid_recovery_probe_requires_mv2_header_and_bounded_footer(
     tmp_path: Path,
 ) -> None:
     memory_dir = tmp_path / "memory"
     _seed_layer_paths(memory_dir)
-    calls: list[tuple[str, object]] = []
-    construction_count = 0
-
-    def factory(**kwargs: Any) -> _Backend:
-        nonlocal construction_count
-        construction_count += 1
-        return _Backend(
-            calls=calls,
-            fail_open=construction_count == 2,
-            **kwargs,
-        )
+    receipt = _bound_receipt(memory_dir)
+    invalid = memory_dir / "working.mv2"
+    invalid.write_bytes(b"NOT2" + _VALID_MV2[4:])
+    invalid.chmod(0o600)
+    receipt = _bound_receipt(memory_dir)
+    calls: list[str] = []
 
     assert not inspect_desktop_memvid_readiness(
         memory_dir,
-        backend_factory=factory,
+        receipt=receipt,
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=lambda filename: calls.append(filename) is None,
     )
-    closed = [payload for action, payload in calls if action == "close"]
-    assert closed == [memory_dir / "working.mv2"]
+    assert calls == []
+
+    invalid.write_bytes(b"MV2\x00" + (b"x" * (len(_VALID_MV2) - 4)))
+    invalid.chmod(0o600)
+    receipt = _bound_receipt(memory_dir)
+    assert not inspect_desktop_memvid_readiness(
+        memory_dir,
+        receipt=receipt,
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=lambda filename: calls.append(filename) is None,
+    )
+    assert calls == []
+
+
+def test_memvid_recovery_probe_enforces_finite_layer_size_without_sdk_probe(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_layer_paths(memory_dir)
+    receipt = _bound_receipt(memory_dir)
+    calls: list[str] = []
+
+    assert not inspect_desktop_memvid_readiness(
+        memory_dir,
+        receipt=receipt,
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=lambda filename: calls.append(filename) is None,
+        max_layer_bytes=len(_VALID_MV2) - 1,
+    )
+    assert calls == []
+
+
+def test_memvid_recovery_probe_ignores_untrusted_exact_index_content(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_layer_paths(memory_dir)
+    exact_index = memory_dir / "working.mv2.records.json"
+    exact_index.write_text(
+        "{invalid-and-intentionally-large:" + ("x" * 64_000),
+        encoding="utf-8",
+    )
+    exact_index.chmod(0o000)
+    receipt = _bound_receipt(memory_dir)
+    calls: list[str] = []
+
+    try:
+        assert inspect_desktop_memvid_readiness(
+            memory_dir,
+            receipt=receipt,
+            launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+            resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+            sdk_metadata_probe=lambda filename: not calls.append(filename),
+        )
+    finally:
+        exact_index.chmod(0o600)
+    assert len(calls) == len(DEFAULT_LAYER_SPECS)
+
+
+def test_memvid_recovery_probe_fails_closed_when_sdk_metadata_probe_fails(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    _seed_layer_paths(memory_dir)
+    receipt = _bound_receipt(memory_dir)
+    calls: list[str] = []
+
+    def sdk_metadata_probe(filename: str) -> bool:
+        calls.append(filename)
+        return len(calls) != 2
+
+    assert not inspect_desktop_memvid_readiness(
+        memory_dir,
+        receipt=receipt,
+        launch_nonce_digest=_LAUNCH_NONCE_DIGEST,
+        resource_manifest_digest=_RESOURCE_MANIFEST_DIGEST,
+        sdk_metadata_probe=sdk_metadata_probe,
+    )
+    assert len(calls) == 2

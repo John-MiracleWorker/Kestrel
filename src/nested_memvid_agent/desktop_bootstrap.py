@@ -10,6 +10,7 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
+from .desktop_memory_health import DesktopMemvidPreflightReceipt
 from .layers import DEFAULT_LAYER_SPECS
 from .platform_primitives import is_link_or_reparse_point
 from .private_artifacts import read_private_text
@@ -74,6 +75,11 @@ class DesktopLaunchConfig:
     parent_pid: int
     parent_birth_marker: str
     resource_manifest_digest: str
+    memory_preflight_receipt: DesktopMemvidPreflightReceipt | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         profile_id = _required_string(self.profile_id, "profile_id")

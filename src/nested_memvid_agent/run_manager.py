@@ -175,6 +175,7 @@ class RunManager:
             self._approval_lock = Lock()
             self._memvid_agent_condition = Condition(Lock())
             self._memvid_agent_active = False
+            self._memory_close_observer: Callable[[], None] | None = None
             self._shutdown_event = Event()
             self._approval_call_arguments: dict[str, tuple[str, dict[str, Any]]] = {}
             self._execution_locks = tuple(RLock() for _ in range(64))
@@ -219,6 +220,17 @@ class RunManager:
         except BaseException:
             self._release_runtime_ownership()
             raise
+
+    def configure_memory_close_observer(
+        self,
+        observer: Callable[[], None],
+    ) -> None:
+        """Observe successful Memvid closes while the lifecycle slot is held."""
+
+        if not callable(observer):
+            raise TypeError("memory close observer must be callable")
+        with self._memvid_agent_condition:
+            self._memory_close_observer = observer
 
     def _uses_actionable_project_routing(self) -> bool:
         """Return whether task-level routing, rather than the direct LLM, is authoritative."""
@@ -1353,8 +1365,7 @@ class RunManager:
             and project.cost_budget is not None
             and direct_estimated_cost is not None
             and normalized_mission_plan
-            and direct_estimated_cost * len(normalized_mission_plan)
-            > project.cost_budget
+            and direct_estimated_cost * len(normalized_mission_plan) > project.cost_budget
         ):
             raise ValueError(
                 "mission direct-provider estimate exceeds the current project cost budget"
@@ -1452,9 +1463,7 @@ class RunManager:
                 canonical = registry.canonical_name(requested_tool)
                 spec = registry.spec_for(canonical or requested_tool)
                 if canonical is None or spec is None:
-                    raise ValueError(
-                        f"mission task requires an unknown tool: {requested_tool}"
-                    )
+                    raise ValueError(f"mission task requires an unknown tool: {requested_tool}")
                 decision = self.capabilities.tool_decision(spec)
                 required_capability_keys = _project_capability_keys_for_tool(spec)
                 if not decision.effective_enabled or any(
@@ -1475,9 +1484,7 @@ class RunManager:
             if risk not in _MISSION_RISK_RANK:
                 raise ValueError("mission task risk must be low, medium, high, or critical")
             if _MISSION_RISK_RANK[risk] < minimum_risk_rank:
-                raise ValueError(
-                    "mission task risk cannot downgrade its required tool risk"
-                )
+                raise ValueError("mission task risk cannot downgrade its required tool risk")
             normalized.append(
                 {
                     "task_id": task_id,
@@ -1494,8 +1501,7 @@ class RunManager:
             unknown = sorted(set(task["dependencies"]) - task_ids)
             if unknown:
                 raise ValueError(
-                    "mission task dependencies reference unknown tasks: "
-                    + ", ".join(unknown)
+                    "mission task dependencies reference unknown tasks: " + ", ".join(unknown)
                 )
         _assert_acyclic_mission_plan(normalized)
         return tuple(normalized)
@@ -1771,8 +1777,7 @@ class RunManager:
             )
         )
         mission_task_ids = {
-            str(planned["task_id"]): f"task_{uuid4().hex}"
-            for planned in planned_tasks
+            str(planned["task_id"]): f"task_{uuid4().hex}" for planned in planned_tasks
         }
         tasks = [root]
         for planned in planned_tasks:
@@ -1867,9 +1872,7 @@ class RunManager:
                 raise ValueError(f"approval packet contains an unknown tool: {requested_name}")
             capability = self.capabilities.tool_decision(spec)
             if not capability.effective_enabled:
-                raise PermissionError(
-                    f"approval packet tool is disabled: {canonical}"
-                )
+                raise PermissionError(f"approval packet tool is disabled: {canonical}")
             if project is not None:
                 missing = [
                     key
@@ -1893,9 +1896,7 @@ class RunManager:
                     resource_digest=self.tool_resource_digest(spec),
                     reason=str(raw.get("reason") or ""),
                     resource_scope=str(raw.get("resource_scope") or ""),
-                    expected_side_effect=str(
-                        raw.get("expected_side_effect") or ""
-                    ),
+                    expected_side_effect=str(raw.get("expected_side_effect") or ""),
                     rollback=str(raw.get("rollback") or ""),
                 )
             )
@@ -2573,9 +2574,7 @@ class RunManager:
                         run_id=run_id,
                         project_id=agent.config.project_id,
                         project_revision=agent.config.project_revision,
-                        project_baseline_index_digest=(
-                            agent.config.project_baseline_index_digest
-                        ),
+                        project_baseline_index_digest=(agent.config.project_baseline_index_digest),
                         allowed_paths=agent.config.project_allowed_paths,
                         execution_origin="manual",
                         approval_handler=self._approval_handler if run_id else None,
@@ -3094,9 +3093,7 @@ class RunManager:
             fanout_id=fanout_id,
             run_id=run_id,
             source_task_id=source_task_id,
-            task_contract_digest=self.candidate_fanouts.task_contract_digest(
-                source_task_id
-            ),
+            task_contract_digest=self.candidate_fanouts.task_contract_digest(source_task_id),
             candidates=tuple(isolations),
             estimated_budget_delta_usd=estimated_budget_delta_usd,
         )
@@ -3140,13 +3137,10 @@ class RunManager:
                 run_id=run_id,
                 worker_id=candidate_id,
             )
-            if (
-                str(isolation.workspace) != str(raw.get("workspace"))
-                or isolation.branch != str(raw.get("branch"))
+            if str(isolation.workspace) != str(raw.get("workspace")) or isolation.branch != str(
+                raw.get("branch")
             ):
-                raise ValueError(
-                    "prepared candidate isolation does not match the approved plan"
-                )
+                raise ValueError("prepared candidate isolation does not match the approved plan")
             prepared.append(isolation.to_payload())
         fanout = self.candidate_fanouts.create_fanout(
             fanout_id=fanout_id,
@@ -3213,8 +3207,7 @@ class RunManager:
                     item
                     for fanout in self._candidate_fanouts_for_run(run_id)
                     for item in fanout.candidates
-                    if item.candidate_id == candidate_id
-                    and item.task_id == task_id
+                    if item.candidate_id == candidate_id and item.task_id == task_id
                 ),
                 None,
             )
@@ -3223,9 +3216,7 @@ class RunManager:
             workspace = Path(candidate.workspace)
         config = self._config_for_run(run)
         if not config.allow_browser_validation:
-            raise PermissionError(
-                "browser validation is disabled by allow_browser_validation"
-            )
+            raise PermissionError("browser validation is disabled by allow_browser_validation")
         selected_image = str(image or config.validation_container_image or "").strip()
         record = self.browser_validations.validate(
             BrowserValidationRequest(
@@ -3240,11 +3231,7 @@ class RunManager:
                     BrowserAssertion(
                         selector=str(item.get("selector") or ""),
                         expectation=str(item.get("expectation") or ""),
-                        value=(
-                            None
-                            if item.get("value") is None
-                            else str(item.get("value"))
-                        ),
+                        value=(None if item.get("value") is None else str(item.get("value"))),
                     )
                     for item in assertions
                 ),
@@ -3252,11 +3239,7 @@ class RunManager:
                     BrowserInteraction(
                         action=str(item.get("action") or ""),
                         selector=str(item.get("selector") or ""),
-                        value=(
-                            None
-                            if item.get("value") is None
-                            else str(item.get("value"))
-                        ),
+                        value=(None if item.get("value") is None else str(item.get("value"))),
                     )
                     for item in interactions
                 ),
@@ -3280,10 +3263,7 @@ class RunManager:
                 """,
                 (run_id,),
             ).fetchall()
-        return [
-            self.candidate_fanouts.get_fanout(str(row["fanout_id"]))
-            for row in rows
-        ]
+        return [self.candidate_fanouts.get_fanout(str(row["fanout_id"])) for row in rows]
 
     def create_subagent(
         self, *, run_id: str, profile: str, goal: str, task_id: str | None = None
@@ -4662,9 +4642,7 @@ class RunManager:
                     run_id=run_id,
                     project_id=agent.config.project_id,
                     project_revision=agent.config.project_revision,
-                    project_baseline_index_digest=(
-                        agent.config.project_baseline_index_digest
-                    ),
+                    project_baseline_index_digest=(agent.config.project_baseline_index_digest),
                     allowed_paths=agent.config.project_allowed_paths,
                     execution_origin=execution_origin,
                     approved_tool_call_ids=frozenset({call.id}),
@@ -5638,9 +5616,7 @@ class RunManager:
             for task in children
             if str((task.plan or {}).get("replaces_task_id") or "").strip()
         }
-        effective_children = [
-            task for task in children if task.task_id not in superseded_task_ids
-        ]
+        effective_children = [task for task in children if task.task_id not in superseded_task_ids]
         child_statuses = {task.status for task in effective_children}
         root_result = dict(root.result or {})
         root_result["child_statuses"] = sorted(child_statuses)
@@ -5884,16 +5860,38 @@ class RunManager:
         if self._shutdown_event.is_set():
             raise RuntimeError("run_manager_shutting_down")
         release_memvid_slot: Callable[[], None] | None = None
+        close_handler: Callable[[], None] | None = None
+        agent_constructed = False
         if config.backend == "memvid":
             release_memvid_slot = self._acquire_memvid_agent_slot()
+            release = release_memvid_slot
+
+            def memory_closed() -> None:
+                try:
+                    if agent_constructed:
+                        with self._memvid_agent_condition:
+                            observer = self._memory_close_observer
+                        if observer is not None:
+                            try:
+                                observer()
+                            except Exception:
+                                # Readiness fails closed; slot release is
+                                # still guaranteed by the outer finally.
+                                return
+                finally:
+                    release()
+
+            close_handler = memory_closed
         try:
-            return build_agent(
+            agent = build_agent(
                 config,
                 tools=self.build_registry(config),
                 state=self.state,
                 secret_resolver=self.secret_resolver,
-                close_handler=release_memvid_slot,
+                close_handler=close_handler,
             )
+            agent_constructed = True
+            return agent
         except MemoryCleanupIncompleteError as exc:
             if release_memvid_slot is not None:
                 with self._lock:
@@ -6195,9 +6193,7 @@ class RunManager:
             *self.skills.tool_adapters(include_disabled=True),
         ]:
             registry.register(adapter)
-        registry.set_capability_gate(
-            lambda spec: self._capability_gate(spec, config=active_config)
-        )
+        registry.set_capability_gate(lambda spec: self._capability_gate(spec, config=active_config))
         return registry
 
     def _capability_gate(
@@ -6233,15 +6229,11 @@ class RunManager:
                 f"Tool {spec.name} is blocked because the project scope changed.",
             )
         if (
-            (
-                active_config.project_revision is not None
-                and active_config.project_revision != project.revision
-            )
-            or (
-                active_config.project_baseline_index_digest is not None
-                and active_config.project_baseline_index_digest
-                != project.baseline_index_digest
-            )
+            active_config.project_revision is not None
+            and active_config.project_revision != project.revision
+        ) or (
+            active_config.project_baseline_index_digest is not None
+            and active_config.project_baseline_index_digest != project.baseline_index_digest
         ):
             return (
                 False,
@@ -7465,15 +7457,9 @@ def _project_repair_tool_artifact(
             artifact["summary"] = safe_summary[:4_096]
         raw_risks = data.get("risks")
         if isinstance(raw_risks, list):
-            safe_risks = redact_secrets(
-                [str(item).strip()[:2_048] for item in raw_risks[:32]]
-            )
+            safe_risks = redact_secrets([str(item).strip()[:2_048] for item in raw_risks[:32]])
             if isinstance(safe_risks, list):
-                artifact["risks"] = [
-                    item
-                    for item in safe_risks
-                    if isinstance(item, str) and item
-                ]
+                artifact["risks"] = [item for item in safe_risks if isinstance(item, str) and item]
         if diff_preview is not None:
             artifact["diff_preview"] = diff_preview
         return artifact
@@ -7681,10 +7667,7 @@ def _repair_diff_preview_projection(
         or not isinstance(content, str)
         or len(content) > _MAX_REPAIR_DIFF_PREVIEW_CHARS
         or "\x00" in content
-        or any(
-            ord(character) < 32 and character not in {"\n", "\r", "\t"}
-            for character in content
-        )
+        or any(ord(character) < 32 and character not in {"\n", "\r", "\t"} for character in content)
         or str(redact_secrets(content)) != content
         or value.get("bound_diff_digest") != expected_diff_digest
         or value.get("redacted") is not True
@@ -8093,13 +8076,12 @@ def _bounded_mission_text(
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")
     normalized = value.strip()
-    if not normalized or len(normalized) > maximum or any(
-        not character.isprintable() and character not in "\n\t"
-        for character in normalized
+    if (
+        not normalized
+        or len(normalized) > maximum
+        or any(not character.isprintable() and character not in "\n\t" for character in normalized)
     ):
-        raise ValueError(
-            f"{field_name} must contain between 1 and {maximum} printable characters"
-        )
+        raise ValueError(f"{field_name} must contain between 1 and {maximum} printable characters")
     return normalized
 
 
@@ -8115,8 +8097,7 @@ def _mission_string_sequence(
         raise ValueError(f"{field_name} must be a sequence")
     if not minimum_items <= len(value) <= maximum_items:
         raise ValueError(
-            f"{field_name} must contain between {minimum_items} and "
-            f"{maximum_items} items"
+            f"{field_name} must contain between {minimum_items} and {maximum_items} items"
         )
     return tuple(
         _bounded_mission_text(
@@ -8130,8 +8111,7 @@ def _mission_string_sequence(
 
 def _assert_acyclic_mission_plan(tasks: Sequence[Mapping[str, Any]]) -> None:
     dependencies = {
-        str(task["task_id"]): tuple(str(item) for item in task["dependencies"])
-        for task in tasks
+        str(task["task_id"]): tuple(str(item) for item in task["dependencies"]) for task in tasks
     }
     visiting: set[str] = set()
     visited: set[str] = set()

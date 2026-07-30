@@ -22,6 +22,9 @@ import nested_memvid_agent.server as server_module
 from nested_memvid_agent.channels import ChannelManager
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_bootstrap import DesktopLaunchConfig
+from nested_memvid_agent.desktop_memory_health import (
+    capture_desktop_memvid_preflight_receipt,
+)
 from nested_memvid_agent.desktop_sidecar import (
     DesktopSidecarFailure,
     DesktopSidecarReadiness,
@@ -211,20 +214,14 @@ class _RecordingBackend:
 def test_sidecar_reopens_existing_six_mv2_files(tmp_path: Path) -> None:
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
-    expected = [
-        memory_dir / spec.mv2_file
-        for spec in DEFAULT_LAYER_SPECS.values()
-    ]
+    expected = [memory_dir / spec.mv2_file for spec in DEFAULT_LAYER_SPECS.values()]
     for path in expected:
         path.write_bytes(b"existing mv2")
 
     opened: list[Path] = []
     created: list[Path] = []
 
-    layers_by_name = {
-        spec.mv2_file: layer
-        for layer, spec in DEFAULT_LAYER_SPECS.items()
-    }
+    layers_by_name = {spec.mv2_file: layer for layer, spec in DEFAULT_LAYER_SPECS.items()}
 
     def backend_factory(path: Path) -> _RecordingBackend:
         return _RecordingBackend(
@@ -234,13 +231,19 @@ def test_sidecar_reopens_existing_six_mv2_files(tmp_path: Path) -> None:
             created=created,
         )
 
-    run_desktop_sidecar_preflight(
+    receipt = run_desktop_sidecar_preflight(
         memory_dir,
         backend_factory=backend_factory,
     )
 
     assert opened == expected
     assert created == []
+    assert receipt.memory_dir == str(memory_dir.resolve())
+    assert tuple(layer.filename for layer in receipt.layers) == tuple(
+        path.name for path in expected
+    )
+    assert receipt.launch_nonce_digest is None
+    assert receipt.resource_manifest_digest is None
 
 
 @pytest.mark.parametrize(
@@ -340,9 +343,7 @@ def test_sidecar_failure_artifact_is_authenticated_and_secret_free(
         "sha256",
     ).hexdigest()
     assert hmac.compare_digest(authentication_tag, expected)
-    assert payload["launch_nonce_digest"] == sha256(
-        launch.launch_nonce.encode()
-    ).hexdigest()
+    assert payload["launch_nonce_digest"] == sha256(launch.launch_nonce.encode()).hexdigest()
     assert payload["reason"] == "state_corrupt"
     assert launch.api_token not in raw.decode()
     assert launch.launch_nonce not in raw.decode()
@@ -463,10 +464,7 @@ def test_resource_manifest_binding_rejects_tampering(tmp_path: Path) -> None:
     expected = "sha256:" + sha256(manifest.read_bytes()).hexdigest()
     launch = _launch(tmp_path, manifest_digest=expected)
 
-    assert (
-        verify_resource_manifest_binding(launch, manifest_path=manifest)
-        == expected
-    )
+    assert verify_resource_manifest_binding(launch, manifest_path=manifest) == expected
 
     manifest.write_bytes(b'{"schema":"kestrel.resource_manifest.v1","tampered":true}\n')
     with pytest.raises(RuntimeError, match="resource_manifest_digest_mismatch"):
@@ -694,7 +692,7 @@ def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
         assert identity.base_url.endswith("/")
         return FakeLease()
 
-    def preflight(memory_dir: Path) -> None:
+    def preflight(memory_dir: Path):
         events.append("preflight")
         assert events.index("lease") < events.index("preflight")
         assert memory_dir == launch.memory_dir
@@ -708,6 +706,11 @@ def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
             assert private_directory.is_dir()
             if os.name != "nt":
                 assert private_directory.stat().st_mode & 0o777 == 0o700
+        for spec in DEFAULT_LAYER_SPECS.values():
+            path = memory_dir / spec.mv2_file
+            path.write_bytes(b"startup-opened-mv2")
+            path.chmod(0o600)
+        return capture_desktop_memvid_preflight_receipt(memory_dir)
 
     app = object()
 
@@ -721,6 +724,12 @@ def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
         events.append("app")
         assert events.index("lease") < events.index("app")
         assert desktop_context == launch
+        receipt = desktop_context.memory_preflight_receipt
+        assert receipt is not None
+        assert (
+            receipt.launch_nonce_digest == sha256(launch.launch_nonce.encode("utf-8")).hexdigest()
+        )
+        assert receipt.resource_manifest_digest == manifest_digest
         assert config.backend == "memvid"
         assert config.state_path == launch.state_path
         assert config.memory_dir == launch.memory_dir
@@ -745,18 +754,16 @@ def test_sidecar_lifecycle_acquires_before_writers_and_releases_last(
             lease_acquirer=lease_acquirer,
             preflight=preflight,
             app_factory=app_factory,
-            server_factory=lambda candidate: LifecycleServer()
-            if candidate is app
-            else pytest.fail("unexpected app"),
+            server_factory=lambda candidate: (
+                LifecycleServer() if candidate is app else pytest.fail("unexpected app")
+            ),
         )
     )
 
     assert events == ["identity", "lease", "preflight", "app", "serve", "release"]
     assert not bootstrap.exists()
     assert not readiness_path.exists()
-    assert captured_readiness[0]["launch_nonce_digest"] == sha256(
-        b"launch-nonce"
-    ).hexdigest()
+    assert captured_readiness[0]["launch_nonce_digest"] == sha256(b"launch-nonce").hexdigest()
     serialized = json.dumps(captured_readiness[0], sort_keys=True)
     assert "desktop-secret-token" not in serialized
     assert "launch-nonce" not in serialized
@@ -769,9 +776,7 @@ def test_authenticated_shutdown_exits_real_serve_loop_before_lease_release(
     from fastapi import Request as FastAPIRequest
     from starlette.responses import JSONResponse
 
-    bootstrap, manifest, launch, snapshots, identity_factory = (
-        _verified_sidecar_inputs(tmp_path)
-    )
+    bootstrap, manifest, launch, snapshots, identity_factory = _verified_sidecar_inputs(tmp_path)
     readiness_path = desktop_readiness_path(launch)
     events: list[str] = []
 
@@ -874,9 +879,7 @@ def test_prelease_identity_failure_does_not_claim_profile_conflict(
     launch = replace(
         _launch(
             tmp_path,
-            manifest_digest=(
-                "sha256:" + sha256(manifest.read_bytes()).hexdigest()
-            ),
+            manifest_digest=("sha256:" + sha256(manifest.read_bytes()).hexdigest()),
         ),
         parent_pid=parent_pid,
         parent_birth_marker="verified-parent-birth",
@@ -921,8 +924,7 @@ def test_prelease_identity_failure_does_not_claim_profile_conflict(
                 socket_factory=lambda: sock,
                 identity_factory=mismatched_identity,
                 lease_acquirer=lambda profile_root, identity: pytest.fail(
-                    f"lease acquired for invalid identity: "
-                    f"{profile_root} {identity}"
+                    f"lease acquired for invalid identity: {profile_root} {identity}"
                 ),
             )
         )
@@ -1007,9 +1009,7 @@ def test_preflight_failure_closes_socket_before_releasing_lease(
     assert events == ["lease", "preflight", "release"]
     assert not readiness_path.exists()
     assert not bootstrap.exists()
-    failure_payload = json.loads(
-        desktop_failure_path(launch).read_text(encoding="utf-8")
-    )
+    failure_payload = json.loads(desktop_failure_path(launch).read_text(encoding="utf-8"))
     assert failure_payload["reason"] == "memvid_reopen_failed"
     assert launch.api_token not in json.dumps(
         failure_payload,
@@ -1021,9 +1021,7 @@ def test_post_publication_failure_removes_owned_readiness_before_lease_release(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    bootstrap, manifest, launch, snapshots, identity_factory = (
-        _verified_sidecar_inputs(tmp_path)
-    )
+    bootstrap, manifest, launch, snapshots, identity_factory = _verified_sidecar_inputs(tmp_path)
     readiness_path = desktop_readiness_path(launch)
     sock = bind_desktop_socket()
     events: list[str] = []
@@ -1074,9 +1072,7 @@ def test_readiness_removal_failure_still_closes_socket_and_releases_lease_last(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    bootstrap, manifest, launch, snapshots, identity_factory = (
-        _verified_sidecar_inputs(tmp_path)
-    )
+    bootstrap, manifest, launch, snapshots, identity_factory = _verified_sidecar_inputs(tmp_path)
     sock = bind_desktop_socket()
     events: list[str] = []
 
@@ -1127,9 +1123,7 @@ def test_server_failure_remains_primary_when_readiness_cleanup_also_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    bootstrap, manifest, launch, snapshots, identity_factory = (
-        _verified_sidecar_inputs(tmp_path)
-    )
+    bootstrap, manifest, launch, snapshots, identity_factory = _verified_sidecar_inputs(tmp_path)
     sock = bind_desktop_socket()
     events: list[str] = []
 
@@ -1176,8 +1170,7 @@ def test_server_failure_remains_primary_when_readiness_cleanup_also_fails(
     assert events == ["serve", "remove", "release"]
     assert sock.fileno() == -1
     assert any(
-        "readiness" in note and "cleanup" in note
-        for note in getattr(caught.value, "__notes__", ())
+        "readiness" in note and "cleanup" in note for note in getattr(caught.value, "__notes__", ())
     )
 
 
@@ -1189,9 +1182,7 @@ def test_desktop_server_uses_bootstrap_settings_and_locks_memvid_paths(
     base = build_desktop_agent_config(launch)
     assert base.secret_backend == "desktop"
     assert base.secret_store_path == (
-        launch.profile_root
-        / "secrets"
-        / "desktop-keyring-metadata.json"
+        launch.profile_root / "secrets" / "desktop-keyring-metadata.json"
     )
     outside_memory = tmp_path / "outside-memory"
     configured = replace(
@@ -1201,15 +1192,18 @@ def test_desktop_server_uses_bootstrap_settings_and_locks_memvid_paths(
         backend="memory",
         memory_dir=outside_memory,
     )
-    RuntimeSettingsStore(launch.runtime_settings_path).save(
-        RuntimeSettings.from_config(configured)
-    )
+    RuntimeSettingsStore(launch.runtime_settings_path).save(RuntimeSettings.from_config(configured))
     captured: list[AgentConfig] = []
 
     class StopConstruction(RuntimeError):
         pass
 
-    def capture(config: AgentConfig) -> None:
+    def capture(
+        config: AgentConfig,
+        *,
+        harden_existing_memory: bool = True,
+    ) -> None:
+        assert harden_existing_memory is False
         captured.append(config)
         raise StopConstruction
 
@@ -1226,9 +1220,7 @@ def test_desktop_server_uses_bootstrap_settings_and_locks_memvid_paths(
     assert captured[0].state_path == launch.state_path
     assert captured[0].secret_backend == "desktop"
     assert captured[0].secret_store_path == (
-        launch.profile_root
-        / "secrets"
-        / "desktop-keyring-metadata.json"
+        launch.profile_root / "secrets" / "desktop-keyring-metadata.json"
     )
 
 
@@ -1275,9 +1267,7 @@ def test_desktop_runtime_update_canonicalizes_memory_authority_everywhere(
         initial_settings = initial.json()["settings"]
         assert initial_settings["backend"] == "memvid"
         assert initial_settings["memory_dir"] == str(launch.memory_dir)
-        migrated = json.loads(
-            launch.runtime_settings_path.read_text(encoding="utf-8")
-        )
+        migrated = json.loads(launch.runtime_settings_path.read_text(encoding="utf-8"))
         assert migrated["backend"] == "memvid"
         assert migrated["memory_dir"] == str(launch.memory_dir)
         updated = client.put(
@@ -1324,10 +1314,7 @@ def test_desktop_runtime_update_canonicalizes_memory_authority_everywhere(
     assert runtime_payload["limits"]["max_tool_rounds"] == 9
     assert runtime_payload["paths"]["memory_dir"] == str(launch.memory_dir)
     assert runtime_payload["settings"]["runtime"]["backend"] == "memvid"
-    assert (
-        runtime_payload["settings"]["runtime"]["memory_dir"]
-        == str(launch.memory_dir)
-    )
+    assert runtime_payload["settings"]["runtime"]["memory_dir"] == str(launch.memory_dir)
 
     assert len(captured_runs) == 1
     assert captured_runs[0].config.provider == "codex-cli"

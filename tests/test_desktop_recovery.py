@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event, Thread
+from time import monotonic
 
 from nested_memvid_agent.desktop_recovery import DesktopRecoveryService
 from nested_memvid_agent.state_store import SCHEMA_VERSION, AgentStateStore
@@ -74,9 +76,7 @@ def _service(
     return DesktopRecoveryService(
         state=state or _State(),
         routing=routing or _Routing(),
-        credential_readiness=lambda: _credential_readiness(
-            credential_state
-        ),
+        credential_readiness=lambda: _credential_readiness(credential_state),
         memory_ready=lambda: memory_ready,
     )
 
@@ -204,9 +204,7 @@ def test_support_bundle_preview_is_bounded_metadata_without_paths_or_text() -> N
     preview = service.support_bundle_preview()
     rendered = json.dumps(preview, sort_keys=True)
 
-    assert preview["schema"] == (
-        "kestrel.desktop.recovery-support-preview.v1"
-    )
+    assert preview["schema"] == ("kestrel.desktop.recovery-support-preview.v1")
     assert preview["redacted"] is True
     assert preview["entries"] == [
         "recovery.json",
@@ -260,3 +258,39 @@ def test_pending_high_risk_count_is_bounded_and_never_decodes_arguments(
 
     assert state.count_pending_high_risk_approvals(limit=1_000) == 1_000
     assert state.count_pending_high_risk_approvals(limit=7) == 7
+
+
+def test_concurrent_inspection_fails_closed_without_starting_second_probe() -> None:
+    entered = Event()
+    release = Event()
+    probe_count = 0
+
+    def blocking_memory_probe() -> bool:
+        nonlocal probe_count
+        probe_count += 1
+        entered.set()
+        assert release.wait(timeout=2)
+        return True
+
+    service = DesktopRecoveryService(
+        state=_State(),
+        routing=_Routing(),
+        credential_readiness=_credential_readiness,
+        memory_ready=blocking_memory_probe,
+    )
+    completed: list[object] = []
+    first = Thread(target=lambda: completed.append(service.inspect()))
+    first.start()
+    assert entered.wait(timeout=1)
+
+    started = monotonic()
+    second = service.inspect()
+    elapsed = monotonic() - started
+    release.set()
+    first.join(timeout=1)
+
+    assert elapsed < 0.25
+    assert second.can_auto_resume is False
+    assert second.blockers == ("recovery_inspection_unavailable",)
+    assert probe_count == 1
+    assert len(completed) == 1

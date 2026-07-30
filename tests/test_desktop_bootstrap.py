@@ -110,6 +110,10 @@ def test_bootstrap_rejects_non_owner_only_permissions(tmp_path: Path) -> None:
     ("mutation", "message"),
     [
         ({"unexpected": "field"}, "exactly"),
+        (
+            {"memory_preflight_receipt": {"forged": True}},
+            "exactly",
+        ),
         ({"memory_layers": _MEMORY_LAYERS[:-1]}, "six default"),
         ({"parent_pid": True}, "parent_pid"),
     ],
