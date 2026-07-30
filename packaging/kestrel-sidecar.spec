@@ -113,10 +113,12 @@ datas = [
 excludes = [
     ".env",
     ".nest",
+    "_pytest",
     "benchmark",
     "google.genai._test_api_client",
     "google.genai.tests",
     "jsonschema.benchmarks",
+    "mcp.cli",
     "pytest",
     "qrcode",
     "tests",

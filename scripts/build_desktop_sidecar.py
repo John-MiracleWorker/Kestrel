@@ -221,11 +221,25 @@ def _forbidden_frozen_archive_member(name: str) -> bool:
             for component in path_components
         )
         or any(
-            component in {"benchmark", "benchmarks", "test", "tests"}
+            component
+            in {
+                "_pytest",
+                "benchmark",
+                "benchmarks",
+                "memvid_v1",
+                "pytest",
+                "qr",
+                "qrcode",
+                "test",
+                "tests",
+                "video_frames",
+            }
             or component.startswith("test_")
             or component.startswith("_test_")
             for component in module_components
         )
+        or normalized == "mcp.cli"
+        or normalized.startswith("mcp.cli.")
     )
 
 
