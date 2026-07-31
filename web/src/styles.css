@@ -1,5 +1,3 @@
-@import url("https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap");
-
   /* ---------- chat page shell ---------- */
   html, body { height: 100%; }
   body { overflow: hidden; }
@@ -17,7 +15,7 @@
 
   /* ---------- thread rail ---------- */
   .rail {
-    background: #f3f0e8;
+    background: var(--surface-sunken);
     border-right: 1px solid var(--rule);
     display: flex;
     flex-direction: column;
@@ -804,7 +802,7 @@
   .task-row.done .ind {
     background: var(--good);
     border-color: var(--good);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M2 5l2 2 4-4'/%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M2 5l2 2 4-4'/%3E%3C/svg%3E");
     background-position: center;
     background-repeat: no-repeat;
   }
@@ -863,31 +861,6 @@
 
 * { box-sizing: border-box; }
 
-:root {
-  --bg: #131313;
-  --paper: #1c1b1b;
-  --ink: #e5e2e1;
-  --ink-soft: #c8c6c5;
-  --muted: #a7b5b8;
-  --faint: #6f7d80;
-  --rule: #2f3a3d;
-  --rule-strong: #3b494c;
-  --accent: #00e5ff;
-  --accent-ink: #c3f5ff;
-  --accent-soft: rgba(0, 229, 255, 0.12);
-  --warn: #ffd166;
-  --warn-soft: rgba(255, 209, 102, 0.14);
-  --danger: #ffb4ab;
-  --danger-soft: rgba(255, 180, 171, 0.14);
-  --good: #7ee787;
-  --good-soft: rgba(126, 231, 135, 0.12);
-  --shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
-
-  --sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --serif: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --mono: "Geist Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
-}
-
 html, body {
   margin: 0;
   background: var(--bg);
@@ -908,7 +881,7 @@ a { color: inherit; }
   position: sticky;
   top: 0;
   z-index: 30;
-  background: rgba(247, 245, 240, 0.92);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
   backdrop-filter: saturate(140%) blur(8px);
   -webkit-backdrop-filter: saturate(140%) blur(8px);
   border-bottom: 1px solid var(--rule);
@@ -1282,7 +1255,7 @@ a { color: inherit; }
   appearance: none;
   -webkit-appearance: none;
   padding-right: 32px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='none' stroke='%2315171a' stroke-width='1.5' d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='none' stroke='%2315171a' stroke-width='1.5' d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 12px center;
 }
@@ -1600,7 +1573,7 @@ textarea.input {
   color: var(--ink);
   border-color: #fff;
 }
-.savebar-inner .btn.primary:hover { background: #f3f0e8; }
+.savebar-inner .btn.primary:hover { background: var(--surface-sunken); }
 
 /* ---------- misc ---------- */
 
@@ -2526,7 +2499,7 @@ textarea.input {
 
 .inspector {
   border-left: 1px solid var(--rule);
-  background: #f3f0e8;
+  background: var(--surface-sunken);
   grid-column: 3;
   grid-row: 1;
   min-width: 0;
@@ -3413,15 +3386,23 @@ textarea.input {
 /* ---------- Stitch command-center integration ---------- */
 body {
   background:
-    radial-gradient(circle at 18% -10%, rgba(0, 229, 255, 0.16), transparent 34%),
-    radial-gradient(circle at 92% 12%, rgba(0, 104, 117, 0.18), transparent 30%),
+    radial-gradient(
+      circle at 18% -10%,
+      color-mix(in srgb, var(--action) 16%, transparent),
+      transparent 34%
+    ),
+    radial-gradient(
+      circle at 92% 12%,
+      color-mix(in srgb, var(--structural) 14%, transparent),
+      transparent 30%
+    ),
     var(--bg);
 }
 
 .topbar {
-  background: rgba(19, 19, 19, 0.88);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
   border-bottom-color: var(--rule-strong);
-  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.22);
+  box-shadow: var(--shadow);
 }
 
 .topbar-inner {
@@ -3430,10 +3411,10 @@ body {
 }
 
 .brand-mark {
-  color: #00363d;
+  color: var(--on-action);
   background: var(--accent);
   border-radius: 4px;
-  box-shadow: 0 0 18px rgba(0, 229, 255, 0.28);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--action) 28%, transparent);
 }
 
 .brand-name,
@@ -3448,8 +3429,8 @@ body {
 .status-pill,
 .thread-button.active,
 .icon-btn.active {
-  background: rgba(0, 229, 255, 0.08);
-  border-color: rgba(0, 229, 255, 0.28);
+  background: color-mix(in srgb, var(--action) 10%, var(--surface));
+  border-color: color-mix(in srgb, var(--action) 42%, var(--border));
 }
 
 .chat-shell {
@@ -3459,7 +3440,7 @@ body {
 
 .rail,
 .inspector {
-  background: rgba(14, 14, 14, 0.92);
+  background: color-mix(in srgb, var(--surface-sunken) 92%, transparent);
   border-color: var(--rule-strong);
 }
 
@@ -3497,8 +3478,8 @@ body {
 .stitch-rail-nav button:hover,
 .stitch-rail-nav button.active {
   color: var(--accent);
-  background: rgba(0, 229, 255, 0.08);
-  border-color: rgba(0, 229, 255, 0.20);
+  background: color-mix(in srgb, var(--action) 10%, transparent);
+  border-color: color-mix(in srgb, var(--action) 36%, var(--border));
 }
 
 .rail-search input,
@@ -3512,7 +3493,7 @@ body {
 .panel select,
 .panel textarea {
   color: var(--ink);
-  background: #0e0e0e;
+  background: var(--surface-sunken);
   border-color: var(--rule-strong);
 }
 
@@ -3527,12 +3508,12 @@ body {
 .panel select:focus,
 .panel textarea:focus {
   border-color: var(--accent);
-  background: #131313;
-  box-shadow: 0 0 0 3px rgba(0, 229, 255, 0.12);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 24%, transparent);
 }
 
 .conversation {
-  background: rgba(19, 19, 19, 0.72);
+  background: color-mix(in srgb, var(--canvas) 88%, transparent);
   min-width: 0;
   overflow: hidden;
   container-type: inline-size;
@@ -3551,7 +3532,7 @@ body {
 .capability-row,
 .channel-card,
 .persona-card {
-  background: rgba(28, 27, 27, 0.82);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
   border-color: var(--rule-strong);
   box-shadow: var(--shadow);
 }
@@ -3566,7 +3547,7 @@ body {
 .btn,
 .page-shell button:not(.tag):not(.icon-btn):not(.new-chat):not(.send),
 .panel button:not(.tag):not(.icon-btn):not(.new-chat):not(.send) {
-  background: #1c1b1b;
+  background: var(--surface);
   color: var(--ink);
   border-color: var(--rule-strong);
 }
@@ -3583,7 +3564,7 @@ body {
 .page-shell .btn.primary,
 .panel .btn.primary {
   background: var(--accent);
-  color: #00363d;
+  color: var(--on-action);
   border-color: var(--accent);
   font-weight: 800;
 }
@@ -3625,7 +3606,11 @@ body {
   position: absolute;
   inset: auto -20% -55% 20%;
   height: 90px;
-  background: radial-gradient(circle, rgba(0, 229, 255, 0.22), transparent 70%);
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--action) 22%, transparent),
+    transparent 70%
+  );
   pointer-events: none;
 }
 
@@ -3644,7 +3629,7 @@ body {
   height: 7px;
   border-radius: 999px;
   background: var(--accent);
-  box-shadow: 0 0 14px rgba(0, 229, 255, 0.75);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--action) 68%, transparent);
 }
 
 .stitch-hero-card h2 {
@@ -3671,7 +3656,7 @@ body {
 
 .stitch-stat-grid .metric {
   min-height: 88px;
-  background: rgba(14, 14, 14, 0.78);
+  background: color-mix(in srgb, var(--surface-sunken) 84%, transparent);
   border: 1px solid var(--rule-strong);
   border-radius: 8px;
   padding: 13px;
@@ -3702,67 +3687,67 @@ body {
 .status-dot,
 .status-dot-sm.running {
   background: var(--accent);
-  box-shadow: 0 0 12px rgba(0, 229, 255, 0.6);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--action) 54%, transparent);
 }
 
 .json-block {
-  background: #0e0e0e;
+  background: var(--surface-sunken);
   color: var(--ink-soft);
   border-color: var(--rule-strong);
 }
 
-.badge.good { border-color: rgba(126, 231, 135, 0.35); }
-.badge.warn { color: var(--warn); border-color: rgba(255, 209, 102, 0.35); }
-.badge.danger { border-color: rgba(255, 180, 171, 0.35); }
+.badge.good { border-color: color-mix(in srgb, var(--success) 42%, var(--border)); }
+.badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--caution) 42%, var(--border)); }
+.badge.danger { border-color: color-mix(in srgb, var(--danger) 42%, var(--border)); }
 
 /* ---------- simple chat mode ---------- */
 body:has(.chat-shell[data-active-section="chat"]) {
-  background: #f7f8f5;
-  color: #1f2726;
+  background: var(--canvas);
+  color: var(--ink);
 }
 
 body:has(.chat-shell[data-active-section="chat"]) .topbar {
-  background: rgba(247, 248, 245, 0.94);
-  border-bottom-color: #dce4de;
-  box-shadow: 0 1px 0 rgba(41, 57, 53, 0.04);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  border-bottom-color: var(--border);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--structural) 10%, transparent);
 }
 
 body:has(.chat-shell[data-active-section="chat"]) .brand-name,
 body:has(.chat-shell[data-active-section="chat"]) .primary-nav button.active {
-  color: #1f2726;
+  color: var(--ink);
 }
 
 body:has(.chat-shell[data-active-section="chat"]) .brand-tag,
 body:has(.chat-shell[data-active-section="chat"]) .primary-nav button,
 body:has(.chat-shell[data-active-section="chat"]) .topbar-meta {
-  color: #66736f;
+  color: var(--muted-ink);
 }
 
 body:has(.chat-shell[data-active-section="chat"]) .primary-nav button {
-  color: #45544f;
+  color: var(--structural);
 }
 
 body:has(.chat-shell[data-active-section="chat"]) .setup-button,
 body:has(.chat-shell[data-active-section="chat"]) .status-pill {
-  background: #ffffff;
-  color: #25322f;
-  border-color: #d5ded8;
+  background: var(--surface);
+  color: var(--ink);
+  border-color: var(--border);
 }
 
 body:has(.chat-shell[data-active-section="chat"]) .status-dot {
-  background: #2f8a70;
-  box-shadow: 0 0 0 3px rgba(47, 138, 112, 0.14);
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-soft);
 }
 
 .chat-shell[data-active-section="chat"] {
-  background: #f7f8f5;
+  background: var(--canvas);
 }
 
 .chat-shell[data-active-section="chat"] .rail,
 .chat-shell[data-active-section="chat"] .inspector {
-  background: #edf2ee;
-  border-color: #d5ded8;
-  color: #1f2726;
+  background: var(--surface-sunken);
+  border-color: var(--border);
+  color: var(--ink);
   box-shadow: none;
 }
 
@@ -3780,7 +3765,7 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
 .chat-shell[data-active-section="chat"] .markdown-message strong,
 .chat-shell[data-active-section="chat"] .markdown-message em,
 .chat-shell[data-active-section="chat"] .act-row .text strong {
-  color: #1f2726;
+  color: var(--ink);
 }
 
 .chat-shell[data-active-section="chat"] .rail-head h2 small,
@@ -3791,64 +3776,64 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
 .chat-shell[data-active-section="chat"] .markdown-message li::marker,
 .chat-shell[data-active-section="chat"] .markdown-message blockquote,
 .chat-shell[data-active-section="chat"] .typing {
-  color: #66736f;
+  color: var(--muted-ink);
 }
 
 .chat-shell[data-active-section="chat"] .rail-head h2 small,
 .chat-shell[data-active-section="chat"] .simple-meta .sep {
-  color: #596762;
+  color: var(--muted-ink);
 }
 
 .chat-shell[data-active-section="chat"] .act-heading,
 .chat-shell[data-active-section="chat"] .act-row .text code,
 .chat-shell[data-active-section="chat"] .act-row .text .detail,
 .chat-shell[data-active-section="chat"] .mode-select {
-  color: #45544f;
+  color: var(--structural);
 }
 
 .chat-shell[data-active-section="chat"] .transcript:focus,
 .chat-shell[data-active-section="chat"] .transcript:focus-visible {
-  outline-color: #1f5f4e;
+  outline-color: var(--focus);
 }
 
 .chat-shell[data-active-section="chat"] .markdown-message code {
-  background: rgba(31, 39, 38, 0.07);
-  color: #1f2726;
+  background: color-mix(in srgb, var(--structural) 8%, transparent);
+  color: var(--ink);
 }
 
 .chat-shell[data-active-section="chat"] .markdown-message pre {
-  background: #eef3ef;
-  border-color: #d5ded8;
+  background: var(--surface-sunken);
+  border-color: var(--border);
 }
 
 .chat-shell[data-active-section="chat"] .markdown-message th,
 .chat-shell[data-active-section="chat"] .markdown-message td {
-  border-color: #d5ded8;
+  border-color: var(--border);
 }
 
 .chat-shell[data-active-section="chat"] .markdown-message th {
-  color: #1f2726;
-  background: rgba(47, 138, 112, 0.08);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
 }
 
 .chat-shell[data-active-section="chat"] .rail-search input,
 .chat-shell[data-active-section="chat"] .composer textarea,
 .chat-shell[data-active-section="chat"] .mode-select select {
-  background: #ffffff;
-  color: #1f2726;
-  border-color: #d5ded8;
+  background: var(--surface);
+  color: var(--ink);
+  border-color: var(--border);
 }
 
 .chat-shell[data-active-section="chat"] .rail-search input:focus,
 .chat-shell[data-active-section="chat"] .composer textarea:focus,
 .chat-shell[data-active-section="chat"] .mode-select select:focus {
-  border-color: #2f8a70;
-  background: #ffffff;
-  box-shadow: 0 0 0 3px rgba(47, 138, 112, 0.14);
+  border-color: var(--focus);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 22%, transparent);
 }
 
 .chat-shell[data-active-section="chat"] .thread-button:hover {
-  background: rgba(47, 138, 112, 0.08);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
 }
 
 .chat-shell[data-active-section="chat"] .thread-button.active,
@@ -3859,18 +3844,18 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
 .chat-shell[data-active-section="chat"] .approval-card,
 .chat-shell[data-active-section="chat"] .trace-row,
 .chat-shell[data-active-section="chat"] .task-card {
-  background: #ffffff;
-  border-color: #d5ded8;
-  box-shadow: 0 14px 36px rgba(41, 57, 53, 0.08);
+  background: var(--surface);
+  border-color: var(--border);
+  box-shadow: var(--shadow);
 }
 
 .chat-shell[data-active-section="chat"] .conversation {
-  background: #f7f8f5;
-  color: #1f2726;
+  background: var(--canvas);
+  color: var(--ink);
 }
 
 .chat-shell[data-active-section="chat"] .simple-conv-head {
-  border-bottom-color: #dce4de;
+  border-bottom-color: var(--border);
   padding-block: 20px 16px;
 }
 
@@ -3885,37 +3870,37 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
 
 .chat-shell[data-active-section="chat"] .simple-conv-tools button,
 .chat-shell[data-active-section="chat"] .conv-tools button {
-  background: #ffffff;
-  color: #25322f;
-  border-color: #d5ded8;
+  background: var(--surface);
+  color: var(--ink);
+  border-color: var(--border);
 }
 
 .chat-shell[data-active-section="chat"] .simple-conv-tools button:hover,
 .chat-shell[data-active-section="chat"] .conv-tools button:hover {
-  color: #1f5f4e;
-  border-color: #2f8a70;
+  color: var(--action);
+  border-color: var(--action);
 }
 
 .chat-shell[data-active-section="chat"] .composer button[type="submit"] {
-  background: #2f8a70;
-  border-color: #2f8a70;
-  color: #ffffff;
+  background: var(--action);
+  border-color: var(--action);
+  color: var(--on-action);
 }
 
 .chat-shell[data-active-section="chat"] .badge {
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .chat-shell[data-active-section="chat"] .badge.good,
 .chat-shell[data-active-section="chat"] .badge.neutral {
-  color: #1f5f4e;
-  border-color: rgba(47, 138, 112, 0.32);
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 38%, var(--border));
 }
 
 .chat-shell[data-active-section="chat"] .json-block {
-  background: #f2f6f3;
-  color: #25322f;
-  border-color: #d5ded8;
+  background: var(--surface-sunken);
+  color: var(--ink);
+  border-color: var(--border);
 }
 
 .advanced-overview {
@@ -3941,7 +3926,7 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
   color: var(--ink-soft);
   border: 1px solid var(--rule-strong);
   border-radius: 5px;
-  background: rgba(28, 27, 27, .82);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
   font: 600 12px/1 var(--sans);
   cursor: pointer;
 }
