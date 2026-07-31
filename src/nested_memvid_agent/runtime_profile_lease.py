@@ -170,6 +170,8 @@ class RuntimeProfileLease:
         inspector: LeaseProcessInspector | None = None,
     ) -> RuntimeProfileLease:
         root = Path(profile_root).expanduser().resolve(strict=False)
+        if root.parent.name == _LEASE_CONTROL_DIRECTORY_NAME:
+            ensure_owner_only_directory(root.parent)
         ensure_owner_only_directory(root)
         descriptor = open_private_file_descriptor(runtime_profile_lock_path(root))
         try:

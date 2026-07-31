@@ -263,6 +263,25 @@ def test_profile_lease_artifacts_are_owner_only(tmp_path: Path) -> None:
         lease.release()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not enforced on Windows")
+def test_resolved_profile_lease_control_tree_is_owner_only(tmp_path: Path) -> None:
+    profile_root = resolve_runtime_profile_root(
+        tmp_path / "state" / "agent.db",
+        tmp_path / "memory",
+        profile_id="default",
+    )
+    profile_root.parent.mkdir(parents=True, mode=0o755)
+    profile_root.parent.chmod(0o755)
+    assert stat.S_IMODE(profile_root.parent.stat().st_mode) == 0o755
+
+    lease = RuntimeProfileLease.acquire(profile_root, _identity("desktop"))
+    try:
+        assert stat.S_IMODE(profile_root.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(profile_root.stat().st_mode) == 0o700
+    finally:
+        lease.release()
+
+
 def test_release_removes_only_its_metadata_and_makes_profile_available(
     tmp_path: Path,
 ) -> None:
