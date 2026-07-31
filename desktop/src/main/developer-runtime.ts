@@ -530,6 +530,27 @@ export type DeveloperMacProcessReader = (
   pid: number
 ) => Promise<DeveloperMacProcessEvidence | null>;
 
+interface DeveloperMacProcessCommandOptions {
+  encoding: "utf8";
+  env: {
+    LANG: string;
+    LC_ALL: string;
+    PATH: string;
+  };
+  maxBuffer: number;
+  timeout: number;
+}
+
+type DeveloperMacProcessCommandRunner = (
+  executable: string,
+  argumentsValue: string[],
+  options: DeveloperMacProcessCommandOptions
+) => Promise<{ stdout: string }>;
+
+export interface ReadMacOSDeveloperProcessOptions {
+  runCommand?: DeveloperMacProcessCommandRunner;
+}
+
 export interface MacOSDeveloperRetainedChildQualifier {
   readonly mechanism: "developer_retained_child_ps_milliseconds";
   readonly residualRisk: "ps_birth_time_second_resolution";
@@ -746,13 +767,14 @@ async function inspectMappedMacOSExecutable(
 }
 
 export async function readMacOSDeveloperProcess(
-  pid: number
+  pid: number,
+  options: ReadMacOSDeveloperProcessOptions = {}
 ): Promise<DeveloperMacProcessEvidence | null> {
   if (!Number.isSafeInteger(pid) || pid <= 0) {
     return null;
   }
   try {
-    const commandOptions = {
+    const commandOptions: DeveloperMacProcessCommandOptions = {
       encoding: "utf8" as const,
       env: {
         LANG: "C",
@@ -762,47 +784,38 @@ export async function readMacOSDeveloperProcess(
       maxBuffer: MAX_PROCESS_EVIDENCE_BYTES,
       timeout: 2_000
     };
-    const [processResult, mappingResult] = await Promise.all([
-      execFileAsync(
-        "/bin/ps",
-        [
-          "-ww",
-          "-p",
-          String(pid),
-          "-o",
-          "uid=",
-          "-o",
-          "ppid=",
-          "-o",
-          "lstart=",
-          "-o",
-          "comm="
-        ],
-        commandOptions
-      ),
-      execFileAsync(
-        "/usr/sbin/lsof",
-        [
-          "-a",
-          "-p",
-          String(pid),
-          "-d",
-          "txt",
-          "-F",
-          "pftnDsi"
-        ],
-        commandOptions
-      )
-    ]);
+    const runCommand: DeveloperMacProcessCommandRunner =
+      options.runCommand ??
+      (async (executable, argumentsValue, commandInput) => {
+        const result = await execFileAsync(
+          executable,
+          argumentsValue,
+          commandInput
+        );
+        return { stdout: result.stdout };
+      });
+    const processResult = await runCommand(
+      "/bin/ps",
+      [
+        "-ww",
+        "-p",
+        String(pid),
+        "-o",
+        "uid=",
+        "-o",
+        "ppid=",
+        "-o",
+        "lstart=",
+        "-o",
+        "comm="
+      ],
+      commandOptions
+    );
     const match =
       /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})\s+(.+?)\s*$/u.exec(
         processResult.stdout
       );
-    const mappings = parseMacOSExecutableMappings(
-      mappingResult.stdout,
-      pid
-    );
-    if (match === null || mappings === null) {
+    if (match === null || !processPathTrusted(match[8]!)) {
       return null;
     }
     const birthMilliseconds = Date.parse(
@@ -810,19 +823,44 @@ export async function readMacOSDeveloperProcess(
     );
     const parentPid = Number(match[2]);
     const uid = Number(match[1]);
-    const executable = await inspectMappedMacOSExecutable(
-      match[8]!,
-      mappings
-    );
     if (
       !Number.isSafeInteger(parentPid) ||
       parentPid < 0 ||
       !Number.isSafeInteger(uid) ||
       uid < 0 ||
       !Number.isSafeInteger(birthMilliseconds) ||
-      birthMilliseconds <= 0 ||
-      executable === null
+      birthMilliseconds <= 0
     ) {
+      return null;
+    }
+    const commandPath = match[8]!;
+    const mappingResult = await runCommand(
+      "/usr/sbin/lsof",
+      [
+        "-a",
+        "-p",
+        String(pid),
+        "-d",
+        "txt",
+        "-F",
+        "pftnDsi",
+        "--",
+        commandPath
+      ],
+      commandOptions
+    );
+    const mappings = parseMacOSExecutableMappings(
+      mappingResult.stdout,
+      pid
+    );
+    if (mappings === null) {
+      return null;
+    }
+    const executable = await inspectMappedMacOSExecutable(
+      commandPath,
+      mappings
+    );
+    if (executable === null) {
       return null;
     }
     return {

@@ -343,6 +343,88 @@ describe("developer-runtime private profile mutation", () => {
 });
 
 describe("macOS developer retained-child qualification", () => {
+  it("filters lsof to the exact ps command path before parsing mappings", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "kestrel-developer-process-reader-")
+    );
+    try {
+      const executable = join(root, "Kestrel Developer");
+      await copyFile("/bin/sleep", executable);
+      await chmod(executable, 0o700);
+      const metadata = await lstat(executable);
+      const pid = 4242;
+      const calls: Array<{
+        executable: string;
+        argumentsValue: readonly string[];
+      }> = [];
+      const oversizedMappings = [
+        `p${pid}`,
+        ...Array.from({ length: 33 }, (_value, index) => [
+          "ftxt",
+          "tREG",
+          `D0x${metadata.dev.toString(16)}`,
+          `s${metadata.size}`,
+          `i${metadata.ino + index}`,
+          `n${executable}.${index}`
+        ]).flat()
+      ].join("\n");
+      const exactMapping = [
+        `p${pid}`,
+        "ftxt",
+        "tREG",
+        `D0x${metadata.dev.toString(16)}`,
+        `s${metadata.size}`,
+        `i${metadata.ino}`,
+        `n${executable}`
+      ].join("\n");
+
+      const evidence = await readMacOSDeveloperProcess(pid, {
+        runCommand: async (
+          command,
+          argumentsValue
+        ): Promise<{ stdout: string }> => {
+          calls.push({
+            executable: command,
+            argumentsValue: [...argumentsValue]
+          });
+          if (command === "/bin/ps") {
+            return {
+              stdout:
+                `501 ${process.pid} Thu Jul 30 20:35:37 2026     ` +
+                `${executable}\n`
+            };
+          }
+          if (command !== "/usr/sbin/lsof") {
+            throw new Error("unexpected process evidence command");
+          }
+          return {
+            stdout:
+              argumentsValue.at(-2) === "--" &&
+              argumentsValue.at(-1) === executable
+                ? exactMapping
+                : oversizedMappings
+          };
+        }
+      });
+
+      expect(evidence).toMatchObject({
+        pid,
+        parentPid: process.pid,
+        uid: 501,
+        executablePath: await realpath(executable),
+        executableDigest: await sha256File(executable)
+      });
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.executable).toBe("/bin/ps");
+      expect(calls[1]).toMatchObject({
+        executable: "/usr/sbin/lsof",
+        argumentsValue: expect.arrayContaining(["--", executable])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(process.platform !== "darwin")(
     "observes the canonical mapped executable and hashes its exact backing file",
     async () => {
