@@ -115,4 +115,72 @@ describe("CommandBar", () => {
     const report = await axe.run(document.body);
     expect(report.violations).toEqual([]);
   });
+
+  it("searches projected settings and reports their owning feature surface", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/settings") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              schema: "kestrel.effective_settings.v1",
+              revision: "rev-1",
+              categories: ["Safety and permissions"],
+              items: [
+                {
+                  id: "tools.web_search.enabled",
+                  key: "allow_web",
+                  category: "Safety and permissions",
+                  type: "boolean",
+                  configured_value: true,
+                  effective_value: false,
+                  blockers: ["capability:network_disabled"],
+                  authority_impact: "grants_authority",
+                  privacy_impact: "network_egress",
+                  applies: "new_runs",
+                  revision: "rev-1",
+                  provenance: "runtime",
+                  undo_available: true,
+                  allowed_values: null,
+                  allowed_range: null,
+                  restart_required: false,
+                  writable: true,
+                  requires_approval: true,
+                },
+              ],
+              items_by_id: {},
+              counts: { total: 1, blocked: 1, restart_required: 0 },
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ detail: "not_found" }), { status: 404 }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<CommandBar onNavigate={vi.fn()} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open command palette" }),
+    );
+    const dialog = screen.getByRole("dialog", {
+      name: "Open a Kestrel destination",
+    });
+    fireEvent.change(
+      within(dialog).getByRole("searchbox", {
+        name: "Search destinations",
+      }),
+      { target: { value: "web search" } },
+    );
+
+    const hit = await within(dialog).findByRole("button", {
+      name: /tools\.web_search\.enabled/,
+    });
+    expect(hit).toHaveTextContent("Safety and permissions");
+    expect(within(dialog).queryByRole("status")).not.toBeInTheDocument();
+  });
 });

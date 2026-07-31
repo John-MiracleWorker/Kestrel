@@ -184,6 +184,14 @@ const rawApiFixtures = {
   },
   "/api/secrets": [],
   "/api/sessions": [],
+  "/api/settings": {
+    schema: "kestrel.effective_settings.v1",
+    revision: "fixture-settings-revision-1",
+    categories: [],
+    items: [],
+    items_by_id: {},
+    counts: { total: 0, blocked: 0, restart_required: 0 },
+  },
   "/api/skills": [],
   "/api/tools": [],
 } as const;

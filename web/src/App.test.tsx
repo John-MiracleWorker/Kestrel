@@ -3655,6 +3655,16 @@ function payloadFor(path: string): unknown {
   if (path === "/api/plugins") return [];
   if (path === "/api/channels") return channelsPayload;
   if (path === "/api/secrets") return secrets;
+  if (path === "/api/settings") {
+    return {
+      schema: "kestrel.effective_settings.v1",
+      revision: "app-fixture-settings-revision-1",
+      categories: [],
+      items: [],
+      items_by_id: {},
+      counts: { total: 0, blocked: 0, restart_required: 0 },
+    };
+  }
 
   if (path === "/api/routing/status") {
     return {

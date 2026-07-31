@@ -9,6 +9,14 @@ import {
 import { createPortal } from "react-dom";
 import { Search } from "lucide-react";
 import { Button } from "../design/Button";
+import { getJson } from "../api";
+import {
+  filterSettings,
+} from "../settings/SettingsSearch";
+import type {
+  ProjectedSetting,
+  SettingsProjection,
+} from "../settings/types";
 import {
   DESTINATIONS,
   type AppDestination,
@@ -25,11 +33,13 @@ export function CommandBar({
 }: CommandBarProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [settings, setSettings] = useState<ProjectedSetting[]>([]);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const restoreFocusAfterClose = useRef(false);
   const paletteOpenRef = useRef(false);
+  const settingsRequestRef = useRef(0);
   const headingId = `${useId()}-heading`;
   const matches = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -40,6 +50,26 @@ export function CommandBar({
         .includes(normalized),
     );
   }, [query]);
+  const settingsMatches = useMemo(
+    () => filterSettings(settings, query),
+    [settings, query],
+  );
+
+  useEffect(() => {
+    if (!open || settings.length > 0) return;
+    const generation = settingsRequestRef.current + 1;
+    settingsRequestRef.current = generation;
+    void getJson<SettingsProjection>("/api/settings")
+      .then((projection) => {
+        if (settingsRequestRef.current === generation) {
+          setSettings(projection.items);
+        }
+      })
+      .catch(() => {
+        // Settings search is additive; destination navigation must keep
+        // working even when the projection is unavailable.
+      });
+  }, [open, settings.length]);
 
   useEffect(() => {
     const openFromShortcut = (event: KeyboardEvent) => {
@@ -186,9 +216,48 @@ export function CommandBar({
                         </button>
                       );
                     })
-                  ) : (
+                  ) : settingsMatches.length === 0 ? (
                     <p role="status">No matching destination.</p>
-                  )}
+                  ) : null}
+                  {query.trim() !== "" && settingsMatches.length > 0 ? (
+                    <div
+                      className="workbench-command-settings"
+                      aria-label="Settings results"
+                    >
+                      <p className="workbench-command-settings-heading">
+                        Settings
+                      </p>
+                      {settingsMatches.map((setting) => (
+                        <button
+                          type="button"
+                          aria-label={`${setting.id} (${setting.category})`}
+                          key={setting.id}
+                          onClick={() => {
+                            returnFocusRef.current = triggerRef.current;
+                            restoreFocusAfterClose.current = true;
+                            paletteOpenRef.current = false;
+                            setOpen(false);
+                            setQuery("");
+                            onOpenChange?.(false);
+                            onNavigate("settings");
+                          }}
+                        >
+                          <Search size={16} aria-hidden="true" />
+                          <span>
+                            <strong>{setting.id}</strong>
+                            <small>
+                              {setting.category} ·{" "}
+                              {setting.blockers.length > 0
+                                ? "blocked"
+                                : setting.writable
+                                  ? "configurable"
+                                  : "read-only"}
+                            </small>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <p className="workbench-command-hint">
                   <kbd>Esc</kbd> closes · opening a destination never starts a

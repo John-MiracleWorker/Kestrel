@@ -39,6 +39,7 @@ const expectedFixturePaths = [
   "/api/runtime/settings",
   "/api/secrets",
   "/api/sessions",
+  "/api/settings",
   "/api/skills",
   "/api/tools",
 ] as const;

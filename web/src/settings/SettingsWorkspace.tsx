@@ -2,6 +2,7 @@ import { Check, RefreshCw, Sprout } from "lucide-react";
 import type { ReactNode } from "react";
 import { ActionError } from "../components";
 import type { SettingsWorkspaceController } from "./settingsController";
+import { SettingsIndex } from "./SettingsIndex";
 
 export function SettingsWorkspace({
   controller,
@@ -101,6 +102,7 @@ export function SettingsWorkspace({
       {error && (
         <ActionError message={error} onDismiss={onDismissError} />
       )}
+      <SettingsIndex />
       {children}
     </section>
   );
