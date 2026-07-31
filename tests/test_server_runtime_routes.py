@@ -481,6 +481,43 @@ def test_runtime_settings_serializes_persistence_and_activation(tmp_path) -> Non
     assert runtime["model"] == "serialized-model"
 
 
+def test_create_app_registers_effective_settings_routes(tmp_path) -> None:
+    config = AgentConfig(
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+        log_dir=tmp_path / "logs",
+    )
+
+    with TestClient(create_app(config)) as client:
+        listed = client.get("/api/settings")
+        assert listed.status_code == 200
+        payload = listed.json()
+        assert payload["schema"] == "kestrel.effective_settings.v1"
+        assert payload["revision"]
+        items = {item["id"]: item for item in payload["items"]}
+        assert "model" in items
+        assert "tools.web_search.enabled" in items
+        assert items["model"]["revision"] == payload["revision"]
+
+        updated = client.put(
+            "/api/settings/model",
+            json={"value": "mock-v2", "expected_revision": payload["revision"]},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["setting"]["configured_value"] == "mock-v2"
+
+        stale = client.put(
+            "/api/settings/model",
+            json={"value": "mock-v3", "expected_revision": payload["revision"]},
+        )
+        assert stale.status_code == 409
+        detail = stale.json()["detail"]
+        assert detail["error"] == "setting_revision_conflict"
+        assert detail["current"]["configured_value"] == "mock-v2"
+
+
 def test_runtime_settings_activation_failure_restores_persisted_and_live_config(
     tmp_path,
 ) -> None:

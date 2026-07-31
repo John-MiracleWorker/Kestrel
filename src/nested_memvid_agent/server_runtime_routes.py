@@ -311,6 +311,19 @@ def _revoke_disabled_tool_approvals(
     previous_config: AgentConfig,
     next_config: AgentConfig,
 ) -> int:
+    return revoke_disabled_tool_approvals(
+        runs,
+        previous_config=previous_config,
+        next_config=next_config,
+    )
+
+
+def revoke_disabled_tool_approvals(
+    runs: Any | None,
+    *,
+    previous_config: AgentConfig,
+    next_config: AgentConfig,
+) -> int:
     if runs is None:
         return 0
     registry = runs.build_registry()

@@ -175,7 +175,7 @@ def _create_app(
         )
         from .provider_probe import ProviderProbeService
         from .server_behavior_delta_routes import register_behavior_delta_routes
-        from .server_capability_routes import register_capability_routes
+        from .server_capability_routes import _catalog, register_capability_routes
         from .server_channel_routes import register_channel_routes
         from .server_desktop_recovery_routes import (
             register_desktop_recovery_routes,
@@ -223,8 +223,12 @@ def _create_app(
         from .server_project_routes import register_project_routes
         from .server_routine_routes import register_routine_routes
         from .server_routing_routes import register_routing_routes
-        from .server_runtime_routes import register_runtime_routes
+        from .server_runtime_routes import (
+            register_runtime_routes,
+            revoke_disabled_tool_approvals,
+        )
         from .server_secret_routes import register_secret_routes
+        from .server_settings_routes import register_settings_routes
         from .server_tool_routes import register_tool_routes, tool_invoke_response
         from .server_web_routes import register_web_routes
     except ImportError as exc:
@@ -656,6 +660,37 @@ def _create_app(
             config=active_config,
             secret_resolver=secret_broker.resolve,
         ),
+    )
+    def _settings_commit_effects(update: Any) -> dict[str, Any]:
+        revoked = revoke_disabled_tool_approvals(
+            runs,
+            previous_config=update.previous_config,
+            next_config=update.config,
+        )
+        return {
+            "revoked_approvals": revoked,
+            "authority_changes": (
+                [
+                    {
+                        "type": "approvals_revoked",
+                        "count": revoked,
+                        "reason": "global_capability_disabled",
+                    }
+                ]
+                if revoked
+                else []
+            ),
+        }
+
+    register_settings_routes(
+        app,
+        active_config=lambda: active_config,
+        settings_store=runtime_settings_store,
+        capabilities=lambda: _catalog(state=state, runs=runs),
+        validate_config_update=validate_runtime_config,
+        on_config_update=update_active_config,
+        on_commit=_settings_commit_effects,
+        http_exception=HTTPException,
     )
     if desktop_context is not None:
         register_desktop_routes(
