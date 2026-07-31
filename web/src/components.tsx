@@ -1,4 +1,5 @@
 import { ReactNode } from "react";
+import { X } from "lucide-react";
 
 export function Panel({
   id,
@@ -82,6 +83,43 @@ export function InlineMeta({ items }: { items: Array<string | number | null | un
         .map((item, index) => (
           <span key={`${String(item)}-${index}`}>{item}</span>
         ))}
+    </div>
+  );
+}
+
+export function ActionError({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="alert" role="alert">
+      <strong>Action failed</strong>
+      <span>{message}</span>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss error"
+      >
+        <X size={15} />
+      </button>
+    </div>
+  );
+}
+
+export function Metric({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | number;
+}) {
+  return (
+    <div className="metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }

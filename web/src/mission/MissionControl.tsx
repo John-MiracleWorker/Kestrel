@@ -87,7 +87,7 @@ const TEMPLATE_ICONS = {
   documentation: FileText
 } as const;
 
-type MissionControlProps = {
+export type MissionControlProps = {
   runs: Run[];
   activeRun: Run | null;
   taskGraph: TaskGraph | null;

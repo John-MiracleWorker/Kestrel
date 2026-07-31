@@ -71,6 +71,7 @@ export function AppRouter({
   ) : (
     <LegacyWorkbench
       requestedSection={legacySectionForLocation(location)}
+      requestedSubroute={location.subroute}
       onRouteSection={routeLegacySection}
     />
   );
@@ -118,7 +119,7 @@ export function legacySectionForLocation(
     return "mission";
   }
   if (location.destination === "projects") return "mission";
-  if (location.destination === "memory") return "advanced";
+  if (location.destination === "memory") return "memory";
   if (location.destination === "flock") return "routing";
   if (location.destination === "automate") return "routines";
   if (location.destination === "settings") return "settings";
@@ -151,6 +152,9 @@ function locationForLegacySection(
       subroute: "routing",
       query: {},
     };
+  }
+  if (section === "memory") {
+    return destinationLocation("memory");
   }
   if (section === "advanced") {
     return {

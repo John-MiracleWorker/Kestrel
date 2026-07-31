@@ -6,9 +6,12 @@
 
   .chat-shell {
     display: grid;
-    grid-template-columns: 268px minmax(0, 1fr) 320px;
+    grid-template-columns: 268px minmax(0, 1fr);
     height: calc(100vh - var(--kestrel-topbar-height, 67px));
     height: calc(100dvh - var(--kestrel-topbar-height, 67px));
+  }
+  .chat-shell:has(> .inspector) {
+    grid-template-columns: 268px minmax(0, 1fr) 320px;
   }
   .chat-shell.no-inspector { grid-template-columns: 268px minmax(0, 1fr); }
 

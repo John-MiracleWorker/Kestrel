@@ -1017,7 +1017,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.click(screen.getByRole("link", { name: "Memory" }));
 
     expect(await screen.findByRole("heading", { name: "Learning Dashboard" })).toBeInTheDocument();
     expect(screen.getByText("Auto-activations")).toBeInTheDocument();
@@ -1494,6 +1494,37 @@ describe("App", () => {
     });
   });
 
+  it("keeps a committed run independent from unavailable extension inventory", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/plugins") {
+        throw new Error("plugin_inventory_unavailable");
+      }
+      return fetchMock(input, init);
+    });
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /new chat/i }));
+    fireEvent.change(screen.getByLabelText("Ask Kestrel"), {
+      target: { value: "Keep Mission independent" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    expect(await screen.findByText("Run queued.")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        fetchSpy.mock.calls.some(
+          ([path]) => path === "/api/runs/run_created/task-graph",
+        ),
+      ).toBe(true);
+    });
+    expect(
+      fetchSpy.mock.calls.some(([path]) => path === "/api/plugins"),
+    ).toBe(false);
+    expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
+  });
+
   it("clears a queued success notice after the run reaches a terminal state", async () => {
     render(<App />);
 
@@ -1773,6 +1804,30 @@ describe("App", () => {
         arguments: pendingApproval.arguments
       });
     });
+  });
+
+  it("keeps a committed approval independent from unavailable extension inventory", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/plugins") {
+        throw new Error("plugin_inventory_unavailable");
+      }
+      return fetchMock(input, init);
+    });
+    render(<App />);
+
+    const approvalCard = await screen.findByRole("group", {
+      name: /approval for shell.run/i,
+    });
+    fireEvent.click(
+      within(approvalCard).getByRole("button", { name: /approve/i }),
+    );
+
+    expect(await screen.findByText("Approval accepted.")).toBeInTheDocument();
+    expect(
+      fetchSpy.mock.calls.some(([path]) => path === "/api/plugins"),
+    ).toBe(false);
+    expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
   });
 
   it("approves repair commit cards with immutable approval arguments after tool form edits", async () => {
@@ -2748,7 +2803,7 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.click(screen.getByRole("link", { name: "Memory" }));
 
     const panel = await screen.findByLabelText("Behavior Deltas Review");
     expect(within(panel).getByText("Behavior Deltas Review")).toBeInTheDocument();

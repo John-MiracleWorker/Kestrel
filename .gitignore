@@ -12,6 +12,8 @@ build/
 .env
 .nest/
 memory/
+!web/src/memory/
+!web/src/memory/**
 logs/
 tmp-debug/
 tmp-golden/

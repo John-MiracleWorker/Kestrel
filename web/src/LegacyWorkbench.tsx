@@ -15,7 +15,6 @@ import {
   Layers,
   LineChart,
   MessageCircle,
-  PanelRightOpen,
   Pencil,
   Play,
   PlugZap,
@@ -38,43 +37,43 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ApiAuthError, ApiResponseError, deleteJson, getJson, getLearningDashboard, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
+import { AutomateWorkspace } from "./automate/AutomateWorkspace";
+import { ApiAuthError, ApiResponseError, deleteJson, getJson, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
-import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "./components";
-import { MissionControl } from "./mission/MissionControl";
+import { ConversationPanel } from "./chat/ConversationPanel";
+import { ActionError, EmptyState, Field, InlineMeta, JsonBlock, Metric, Panel, StatusBadge } from "./components";
+import {
+  ExtendWorkspace,
+  useExtendWorkspace,
+} from "./extend/ExtendWorkspace";
+import { FlockWorkspace } from "./flock/FlockWorkspace";
+import { MemoryWorkspace, useMemoryWorkspace } from "./memory/MemoryWorkspace";
 import type { MissionLaunch } from "./mission/types";
 import { OutcomesDashboard } from "./outcomes/OutcomesDashboard";
 import { readDesktopBridge } from "./platform/desktopBridge";
 import { isDesktopRuntime } from "./platform/runtimeTransport";
+import { ProjectsWorkspace } from "./projects/ProjectsWorkspace";
 import { RepairReviewPanel } from "./repair/RepairReviewPanel";
-import { RoutingCenter } from "./routing/RoutingCenter";
+import { SettingsWorkspace } from "./settings/SettingsWorkspace";
+import { useSettingsWorkspace } from "./settings/settingsController";
 import {
-  activityItemsForEvents,
-  assistantTextForRun,
   deriveThreadTitle,
   eventBelongsToRun,
   eventKey,
   eventTimestamp,
   friendlyEventLabel,
-  riskLabel,
-  summarizeArguments,
-  type LiveActivityItem
+  riskLabel
 } from "./runActivity";
 import type {
   AgentLogEvent,
   ApiResult,
   Approval,
-  BehaviorDeltaReport,
   Capability,
   CapabilityKind,
   CapabilityMutationResult,
   CapabilitySnapshot,
-  LearningDashboard,
   Channel,
-  ContextPackResult,
   McpServer,
-  MemoryHit,
-  MemoryLayerStatus,
   OnboardingProfile,
   PersonaPreset,
   Plugin,
@@ -116,6 +115,7 @@ export type LegacyWorkbenchSection =
   | "mission"
   | "chat"
   | "outcomes"
+  | "memory"
   | "routines"
   | "routing"
   | "advanced"
@@ -679,9 +679,11 @@ function BrowserSecretMutationForm({
 
 export function LegacyWorkbench({
   requestedSection,
+  requestedSubroute,
   onRouteSection,
 }: {
   requestedSection?: LegacyWorkbenchSection;
+  requestedSubroute?: string;
   onRouteSection?: (section: LegacyWorkbenchSection) => void;
 }) {
   const desktopRuntime = isDesktopRuntime();
@@ -690,8 +692,6 @@ export function LegacyWorkbench({
   const [authPromptOpen, setAuthPromptOpen] = useState(false);
   const [apiReady, setApiReady] = useState(false);
   const [apiTokenDraft, setApiTokenDraft] = useState(() => getApiToken());
-  const [runtime, setRuntime] = useState<Record<string, unknown> | null>(null);
-  const [runtimeSettingsResult, setRuntimeSettingsResult] = useState<Record<string, unknown> | null>(null);
   const [selfState, setSelfState] = useState<SelfState | null>(null);
   const [onboardingState, setOnboardingState] = useState<SelfOnboardingState | null>(null);
   const [setupReadiness, setSetupReadiness] = useState<SetupReadinessReport | null>(null);
@@ -700,26 +700,7 @@ export function LegacyWorkbench({
   const [setupDraft, setSetupDraft] = useState<SetupDraft>(emptySetupDraft);
   const [runs, setRuns] = useState<Run[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [tools, setTools] = useState<Tool[]>([]);
-  const [capabilitySnapshot, setCapabilitySnapshot] = useState<CapabilitySnapshot>(emptyCapabilitySnapshot);
-  const [capabilityPending, setCapabilityPending] = useState<Set<string>>(() => new Set());
-  const [capabilitySearch, setCapabilitySearch] = useState("");
-  const [capabilityKindFilter, setCapabilityKindFilter] = useState<"all" | CapabilityKind>("all");
-  const [capabilityStateFilter, setCapabilityStateFilter] = useState("all");
   const [approvals, setApprovals] = useState<Approval[]>([]);
-  const [allApprovals, setAllApprovals] = useState<Approval[]>([]);
-  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
-  const [skills, setSkills] = useState<Skill[]>([]);
-  const [plugins, setPlugins] = useState<Plugin[]>([]);
-  const [channels, setChannels] = useState<Channel[]>([]);
-  const [secrets, setSecrets] = useState<SecretRef[]>([]);
-  const [memoryLayers, setMemoryLayers] = useState<MemoryLayerStatus[]>([]);
-  const [behaviorDeltaReport, setBehaviorDeltaReport] = useState<BehaviorDeltaReport | null>(null);
-  const [behaviorDeltaError, setBehaviorDeltaError] = useState<string | null>(null);
-  const [learningDashboard, setLearningDashboard] = useState<LearningDashboard | null>(null);
-  const [learningDashboardError, setLearningDashboardError] = useState<string | null>(null);
-  const [lessons, setLessons] = useState<Array<Record<string, unknown>>>([]);
-  const [failures, setFailures] = useState<Array<Record<string, unknown>>>([]);
   const [logs, setLogs] = useState<AgentLogEvent[]>([]);
   const [events, setEvents] = useState<TraceEvent[]>([]);
   const [runTrace, setRunTrace] = useState<RunTrace | null>(null);
@@ -736,122 +717,12 @@ export function LegacyWorkbench({
   const threadRunsRef = useRef<Run[]>([]);
   const topbarRef = useRef<HTMLElement | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
-  const transcriptRef = useRef<HTMLDivElement | null>(null);
-  const followTranscriptRef = useRef(true);
   const idleRefreshInFlightRef = useRef(false);
-  const memoryBackendHydratedRef = useRef(false);
   const setupDraftHydratedRef = useRef(false);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeSection, setActiveSection] =
     useState<LegacyWorkbenchSection>(
       requestedSection ?? DEFAULT_APP_SECTION,
     );
-
-  const [message, setMessage] = useState("");
-  const [sessionId, setSessionId] = useState("");
-  const [workspace, setWorkspace] = useState("");
-  const [provider, setProvider] = useState("mock");
-  const [model, setModel] = useState("mock");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [apiKeyEnv, setApiKeyEnv] = useState("");
-  const [providerSecretResult, setProviderSecretResult] = useState<SecretRef | null>(null);
-  const [temperature, setTemperature] = useState("0.2");
-  const [maxToolRounds, setMaxToolRounds] = useState("6");
-  const [modelCatalogs, setModelCatalogs] = useState<Record<string, ProviderModelCatalog>>({});
-  const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
-  const [autonomyMode, setAutonomyMode] = useState("background");
-  const [streamResponses, setStreamResponses] = useState(false);
-  const [memoryBackendDraft, setMemoryBackendDraft] = useState<"In-memory" | "Memvid">("In-memory");
-  const [apiAuthRequired, setApiAuthRequired] = useState(false);
-  const [toolPermissions, setToolPermissions] = useState<ToolPermissionDraft>(defaultToolPermissions);
-
-  const [subagentProfile, setSubagentProfile] = useState("worker");
-  const [subagentGoal, setSubagentGoal] = useState("");
-  const [schedulerTasks, setSchedulerTasks] = useState("3");
-  const [schedulerCycles, setSchedulerCycles] = useState("5");
-  const [schedulerResult, setSchedulerResult] = useState<Record<string, unknown> | null>(null);
-
-  const [memoryQuery, setMemoryQuery] = useState("");
-  const [memoryHits, setMemoryHits] = useState<MemoryHit[]>([]);
-  const [memoryInspect, setMemoryInspect] = useState<Record<string, unknown> | null>(null);
-  const [contextQuery, setContextQuery] = useState("");
-  const [contextLayers, setContextLayers] = useState("policy,self,procedural,semantic,episodic,working");
-  const [contextBudget, setContextBudget] = useState("6000");
-  const [contextExpandRaw, setContextExpandRaw] = useState(false);
-  const [contextResult, setContextResult] = useState<ContextPackResult | null>(null);
-  const [learningTitle, setLearningTitle] = useState("");
-  const [learningContent, setLearningContent] = useState("");
-  const [learningKind, setLearningKind] = useState("observation");
-  const [learningValidation, setLearningValidation] = useState("0.78");
-  const [learningRepeat, setLearningRepeat] = useState("1");
-  const [learningExplicit, setLearningExplicit] = useState(false);
-  const [learningResult, setLearningResult] = useState<Record<string, unknown> | null>(null);
-  const [capsuleResult, setCapsuleResult] = useState<Record<string, unknown> | null>(null);
-  const [conflictResult, setConflictResult] = useState<Record<string, unknown> | null>(null);
-
-  const [toolName, setToolName] = useState("");
-  const [toolArgs, setToolArgs] = useState("{}");
-  const [preparedToolPreview, setPreparedToolPreview] = useState<PreparedToolPreview | null>(null);
-  const [toolResult, setToolResult] = useState<Record<string, unknown> | null>(null);
-  const [toolFilter, setToolFilter] = useState("");
-  const [toolSourceFilter, setToolSourceFilter] = useState("all");
-  const [toolRiskFilter, setToolRiskFilter] = useState("all");
-  const [toolEnabledFilter, setToolEnabledFilter] = useState("all");
-
-  const [mcpId, setMcpId] = useState("");
-  const [mcpName, setMcpName] = useState("");
-  const [mcpTransport, setMcpTransport] = useState("stdio");
-  const [mcpEndpoint, setMcpEndpoint] = useState("");
-  const [mcpArgs, setMcpArgs] = useState("[]");
-  const [mcpEnv, setMcpEnv] = useState("{}");
-  const [mcpSecretEnv, setMcpSecretEnv] = useState("{}");
-  const [mcpRiskPolicy, setMcpRiskPolicy] = useState("approval_by_default");
-  const [mcpEditingServerId, setMcpEditingServerId] = useState<string | null>(null);
-  const [mcpArgsTouched, setMcpArgsTouched] = useState(false);
-  const [mcpEnvTouched, setMcpEnvTouched] = useState(false);
-  const [mcpSecretEnvTouched, setMcpSecretEnvTouched] = useState(false);
-  const [mcpToolSelection, setMcpToolSelection] = useState("");
-  const [mcpToolArgs, setMcpToolArgs] = useState("{}");
-  const [mcpResult, setMcpResult] = useState<Record<string, unknown> | null>(null);
-
-  const [skillTask, setSkillTask] = useState("");
-  const [skillSelection, setSkillSelection] = useState("");
-  const [skillManifest, setSkillManifest] = useState('{\n  "id": "local-skill",\n  "name": "Local Skill",\n  "description": "Describe what this skill does.",\n  "risk": "medium"\n}');
-  const [skillInstructions, setSkillInstructions] = useState("");
-  const [skillResult, setSkillResult] = useState<Record<string, unknown> | null>(null);
-  const [skillDiscovery, setSkillDiscovery] = useState<SkillDiscoveryReport | null>(null);
-  const [skillDiscovering, setSkillDiscovering] = useState(false);
-  const [pluginSource, setPluginSource] = useState("");
-  const [pluginRef, setPluginRef] = useState("");
-  const [pluginEnable, setPluginEnable] = useState(false);
-  const [pluginResult, setPluginResult] = useState<Record<string, unknown> | null>(null);
-  const [pluginReview, setPluginReview] = useState<PluginReviewReport | null>(null);
-  const [pluginReviewSource, setPluginReviewSource] = useState("");
-  const [pluginReviewRef, setPluginReviewRef] = useState<string | null>(null);
-  const [pluginUpdateReviews, setPluginUpdateReviews] = useState<Record<string, string>>({});
-
-  const [channelId, setChannelId] = useState("webhook");
-  const [channelProvider, setChannelProvider] = useState("webhook");
-  const [channelTokenEnv, setChannelTokenEnv] = useState("");
-  const [channelWebhookEnv, setChannelWebhookEnv] = useState("NEST_AGENT_CHANNEL_WEBHOOK_URL");
-  const [channelEnabled, setChannelEnabled] = useState(true);
-  const [channelSendEnabled, setChannelSendEnabled] = useState(false);
-  const [channelAutoReply, setChannelAutoReply] = useState(false);
-  const [channelSettings, setChannelSettings] = useState("{}");
-  const [channelPayload, setChannelPayload] = useState('{\n  "conversation_id": "local-thread",\n  "text": "hello from the UI"\n}');
-  const [channelResult, setChannelResult] = useState<Record<string, unknown> | null>(null);
-  const [telegramWebhookUrl, setTelegramWebhookUrl] = useState("");
-  const [telegramActionResult, setTelegramActionResult] = useState<Record<string, unknown> | null>(null);
-  const [secretResult, setSecretResult] = useState<SecretRef | null>(null);
-
-  const [diagnosisText, setDiagnosisText] = useState("");
-  const [diagnosisResult, setDiagnosisResult] = useState<Record<string, unknown> | null>(null);
-  const [selfTitle, setSelfTitle] = useState("");
-  const [selfContent, setSelfContent] = useState("");
-  const [selfSchema, setSelfSchema] = useState("user_workflow_preference");
-  const [selfRememberResult, setSelfRememberResult] = useState<Record<string, unknown> | null>(null);
-  const [webQuery, setWebQuery] = useState("");
-  const [webResult, setWebResult] = useState<Record<string, unknown> | null>(null);
 
   const handleAuthRequired = useCallback(() => {
     setApiReady(false);
@@ -865,6 +736,16 @@ export function LegacyWorkbench({
     setApiTokenDraft(getApiToken());
     setError(null);
   }, [desktopRuntime]);
+  const reportError = useCallback(
+    (value: unknown) => {
+      if (value instanceof ApiAuthError) {
+        handleAuthRequired();
+        return;
+      }
+      setError(value instanceof Error ? value.message : String(value));
+    },
+    [handleAuthRequired],
+  );
 
   const sortedThreadRuns = useMemo(
     () => [...threadRuns].sort((left, right) => left.created_at.localeCompare(right.created_at)),
@@ -879,6 +760,261 @@ export function LegacyWorkbench({
     if (activeSessionId && globalRun.session_id !== activeSessionId) return null;
     return globalRun;
   }, [runs, sortedThreadRuns, activeRunId, activeSessionId]);
+  const settingsWorkspace = useSettingsWorkspace({
+    enabled:
+      apiReady &&
+      (activeSection === "advanced" || activeSection === "settings"),
+    includeCapabilities: activeSection === "settings",
+    desktopRuntime,
+    onError: reportError,
+    onNotice: setNotice,
+    refreshCore: () =>
+      refreshCoreAfterCommittedMutation({
+        runId: activeRun?.run_id,
+        sessionId: activeRun?.session_id,
+      }),
+  });
+  const {
+    runtime,
+    runtimeSettingsResult,
+    hydrateRuntime,
+    workspace,
+    setWorkspace,
+    provider,
+    model,
+    setModel,
+    baseUrl,
+    setBaseUrl,
+    apiKeyEnv,
+    setApiKeyEnv,
+    providerSecretResult,
+    temperature,
+    setTemperature,
+    maxToolRounds,
+    setMaxToolRounds,
+    modelCatalogs,
+    modelCatalogLoading,
+    providerCatalog,
+    modelSuggestions,
+    modelCatalogLabel,
+    autonomyMode,
+    setAutonomyMode,
+    streamResponses,
+    setStreamResponses,
+    memoryBackendDraft,
+    setMemoryBackendDraft,
+    apiAuthRequired,
+    setApiAuthRequired,
+    toolPermissions,
+    setToolPermissions,
+    channels,
+    secrets,
+    channelId,
+    setChannelId,
+    channelProvider,
+    setChannelProvider,
+    channelTokenEnv,
+    setChannelTokenEnv,
+    channelWebhookEnv,
+    setChannelWebhookEnv,
+    channelEnabled,
+    setChannelEnabled,
+    channelSendEnabled,
+    setChannelSendEnabled,
+    channelAutoReply,
+    setChannelAutoReply,
+    channelSettings,
+    setChannelSettings,
+    channelPayload,
+    setChannelPayload,
+    channelResult,
+    telegramWebhookUrl,
+    setTelegramWebhookUrl,
+    telegramActionResult,
+    secretResult,
+    chooseProvider,
+    refreshProviderModels,
+    saveRuntimeSettings,
+    storeDesktopProviderKey,
+    loadChannel,
+    saveChannel,
+    deleteChannel,
+    ingestChannel,
+    telegramWebhookInfo,
+    telegramSetWebhook,
+    telegramDeleteWebhook,
+    acceptBrowserSecret,
+    acceptBrowserProviderSecret,
+    validateSecret,
+    deleteSecret,
+  } = settingsWorkspace;
+  const extendWorkspace = useExtendWorkspace({
+    enabled: apiReady && activeSection === "advanced",
+    activeRun,
+    activeSessionId,
+    workspace,
+    toolPermissions,
+    enqueueRun,
+    onError: reportError,
+    onNotice: setNotice,
+    refreshCore: () =>
+      refreshCoreAfterCommittedMutation({
+        runId: activeRun?.run_id,
+        sessionId: activeRun?.session_id,
+      }),
+    refreshRunDetails,
+    refreshAll,
+    createSessionId: createThreadId,
+  });
+  const {
+    operatorMessage,
+    setOperatorMessage,
+    sessionId,
+    setSessionId,
+    subagentProfile,
+    setSubagentProfile,
+    subagentGoal,
+    setSubagentGoal,
+    schedulerTasks,
+    setSchedulerTasks,
+    schedulerCycles,
+    setSchedulerCycles,
+    schedulerResult,
+    selfTitle,
+    setSelfTitle,
+    selfContent,
+    setSelfContent,
+    selfSchema,
+    setSelfSchema,
+    selfRememberResult,
+    webQuery,
+    setWebQuery,
+    webResult,
+    submitRun,
+    runScheduler,
+    submitSubagent,
+    rememberSelf,
+    searchWeb,
+    allApprovals,
+    mcpServers,
+    skills,
+    plugins,
+    toolName,
+    setToolName,
+    toolArgs,
+    setToolArgs,
+    preparedToolPreview,
+    setPreparedToolPreview,
+    toolResult,
+    toolFilter,
+    setToolFilter,
+    toolSourceFilter,
+    setToolSourceFilter,
+    toolRiskFilter,
+    setToolRiskFilter,
+    toolEnabledFilter,
+    setToolEnabledFilter,
+    mcpId,
+    setMcpId,
+    mcpName,
+    setMcpName,
+    mcpTransport,
+    setMcpTransport,
+    mcpEndpoint,
+    setMcpEndpoint,
+    mcpArgs,
+    setMcpArgs,
+    mcpEnv,
+    setMcpEnv,
+    mcpSecretEnv,
+    setMcpSecretEnv,
+    mcpRiskPolicy,
+    setMcpRiskPolicy,
+    mcpArgsTouched,
+    setMcpArgsTouched,
+    mcpEnvTouched,
+    setMcpEnvTouched,
+    mcpSecretEnvTouched,
+    setMcpSecretEnvTouched,
+    mcpToolSelection,
+    setMcpToolSelection,
+    mcpToolArgs,
+    setMcpToolArgs,
+    mcpResult,
+    skillTask,
+    setSkillTask,
+    skillSelection,
+    setSkillSelection,
+    skillManifest,
+    setSkillManifest,
+    skillInstructions,
+    setSkillInstructions,
+    skillResult,
+    skillDiscovery,
+    skillDiscovering,
+    pluginSource,
+    setPluginSource,
+    pluginRef,
+    setPluginRef,
+    pluginEnable,
+    setPluginEnable,
+    pluginResult,
+    pluginReview,
+    pluginUpdateReviews,
+    mcpToolOptions,
+    enabledSkills,
+    selectedTool,
+    selectedToolEnabled,
+    selectedMcpToolEnabled,
+    selectedSkillEnabled,
+    loadedMcpServer,
+    filteredTools,
+    toolSources,
+    toolRisks,
+    reviewedCurrentPlugin,
+    pluginEnableBlockers,
+    invokeTool,
+    loadMcp,
+    saveMcp,
+    controlMcp,
+    deleteMcp,
+    invokeMcp,
+    toggleSkill,
+    discoverSkills,
+    installSkill,
+    runSkill,
+    reviewPlugin,
+    installPlugin,
+    pluginAction,
+  } = extendWorkspace;
+  const capabilityWorkspace =
+    activeSection === "settings" ? settingsWorkspace : extendWorkspace;
+  const {
+    tools,
+    capabilitySnapshot,
+    capabilityPending,
+    capabilitySearch,
+    setCapabilitySearch,
+    capabilityKindFilter,
+    setCapabilityKindFilter,
+    capabilityStateFilter,
+    setCapabilityStateFilter,
+    capabilities,
+    filteredCapabilities,
+    enabledToolCount,
+    setCapabilityEnabled,
+  } = capabilityWorkspace;
+  const memoryWorkspace = useMemoryWorkspace({
+    enabled:
+      apiReady &&
+      (activeSection === "memory" ||
+        activeSection === "advanced" ||
+        activeSection === "settings"),
+    activeRunId: activeRun?.run_id ?? null,
+    onAuthRequired: handleAuthRequired,
+    onError: setError,
+    onNotice: setNotice,
+  });
   const threadSummaries = useMemo(() => {
     const remoteThreads = sessions.map((session) => ({
       session_id: session.session_id,
@@ -910,19 +1046,6 @@ export function LegacyWorkbench({
       .forEach((event) => rows.set(eventKey(event), event));
     return [...rows.values()].sort((left, right) => eventTimestamp(left).localeCompare(eventTimestamp(right)));
   }, [events, activeRun?.run_id, runTrace]);
-  const providerCatalog = modelCatalogs[provider] ?? null;
-  const modelSuggestions = providerCatalog?.models?.length
-    ? providerCatalog.models
-    : deterministicModelDefaults[provider] ?? [];
-  const modelCatalogLabel = modelCatalogLoading
-    ? "loading"
-    : providerCatalog?.ok
-      ? providerCatalog.source === "provider"
-        ? `${providerCatalog.models.length} provider models`
-        : `${providerCatalog.models.length} discovered models`
-      : providerCatalog?.error
-        ? "catalog unavailable"
-        : "not discovered";
   const streamedAssistant = useMemo(
     () =>
       events
@@ -932,96 +1055,10 @@ export function LegacyWorkbench({
     [events]
   );
   const proofOfWork = useMemo(() => extractProofOfWork(runTrace), [runTrace]);
-  const capabilities = capabilitySnapshot.items;
-  const mcpToolOptions = useMemo(
-    () =>
-      mcpServers.flatMap((server) => {
-        const serverCapability = capabilityForMcpServer(capabilities, server.id);
-        const serverEnabled = serverCapability?.effective_enabled ?? server.enabled;
-        if (!serverEnabled) return [];
-        return server.tools.flatMap((tool) => {
-          const toolCapability = capabilityForMcpTool(capabilities, server.id, tool);
-          const toolEnabled = toolCapability?.effective_enabled ?? tool.enabled ?? true;
-          return toolEnabled
-            ? [{ server, tool, value: `${server.id}::${tool.remote_name ?? tool.name}` }]
-            : [];
-        });
-      }),
-    [mcpServers, capabilities]
-  );
-  const enabledSkills = useMemo(
-    () =>
-      skills.filter((skill) => {
-        const capability = capabilityForSkill(capabilities, skill.id);
-        return capability?.effective_enabled ?? skill.enabled;
-      }),
-    [skills, capabilities]
-  );
-  const filteredCapabilities = useMemo(
-    () => {
-      const query = capabilitySearch.trim().toLowerCase();
-      return [...capabilities]
-        .filter((capability) => {
-          if (capabilityKindFilter !== "all" && capability.kind !== capabilityKindFilter) return false;
-          if (capabilityStateFilter === "active" && !capability.effective_enabled) return false;
-          if (capabilityStateFilter === "off" && capability.configured_enabled) return false;
-          if (capabilityStateFilter === "blocked" && capability.blocked_by.length === 0) return false;
-          if (!query) return true;
-          return [capability.name, capability.id, capability.description, capability.source, capability.parent_key ?? ""]
-            .join(" ")
-            .toLowerCase()
-            .includes(query);
-        })
-        .sort((left, right) => left.name.localeCompare(right.name));
-    },
-    [capabilities, capabilitySearch, capabilityKindFilter, capabilityStateFilter]
-  );
-  const selectedTool = useMemo(() => tools.find((tool) => tool.name === toolName) ?? null, [tools, toolName]);
-  const selectedToolEnabled = Boolean(
-    selectedTool && isToolEffectivelyEnabled(selectedTool, toolPermissions, capabilities)
-  );
-  const selectedMcpToolEnabled = mcpToolOptions.some((option) => option.value === mcpToolSelection);
-  const selectedSkillEnabled = enabledSkills.some((skill) => skill.id === skillSelection);
-  const loadedMcpServer = mcpEditingServerId
-    ? mcpServers.find((server) => server.id === mcpEditingServerId) ?? null
-    : null;
   const activeThread = useMemo(
     () => threadSummaries.find((thread) => thread.session_id === activeSessionId) ?? null,
     [threadSummaries, activeSessionId]
   );
-  const enabledToolCount = useMemo(
-    () => tools.filter((tool) => isToolEffectivelyEnabled(tool, toolPermissions, capabilities)).length,
-    [tools, toolPermissions, capabilities]
-  );
-  const filteredTools = useMemo(
-    () =>
-      tools.filter((tool) => {
-        const enabled = isToolEffectivelyEnabled(tool, toolPermissions, capabilities);
-        const query = toolFilter.trim().toLowerCase();
-        const haystack = [
-          tool.name,
-          tool.description,
-          tool.source,
-          tool.risk,
-          ...(tool.capabilities ?? [])
-        ].join(" ").toLowerCase();
-        if (query && !haystack.includes(query)) return false;
-        if (toolSourceFilter !== "all" && tool.source !== toolSourceFilter) return false;
-        if (toolRiskFilter !== "all" && tool.risk !== toolRiskFilter) return false;
-        if (toolEnabledFilter === "enabled" && !enabled) return false;
-        if (toolEnabledFilter === "disabled" && enabled) return false;
-        return true;
-      }),
-    [tools, toolPermissions, capabilities, toolFilter, toolSourceFilter, toolRiskFilter, toolEnabledFilter]
-  );
-  const toolSources = useMemo(() => uniqueStrings(tools.map((tool) => tool.source)), [tools]);
-  const toolRisks = useMemo(() => uniqueStrings(tools.map((tool) => tool.risk)), [tools]);
-  const pluginSourceValue = pluginSource.trim();
-  const pluginRefValue = pluginRef.trim() || null;
-  const reviewedCurrentPlugin =
-    Boolean(pluginReview) && pluginReviewSource === pluginSourceValue && pluginReviewRef === pluginRefValue;
-  const pluginEnableBlockers = reviewedCurrentPlugin ? pluginReview?.enable_blockers ?? [] : [];
-
   function routeToSection(section: LegacyWorkbenchSection) {
     setNotice(null);
     setError(null);
@@ -1045,7 +1082,6 @@ export function LegacyWorkbench({
   }
 
   function selectSessionId(sessionId: string | null) {
-    followTranscriptRef.current = true;
     activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
   }
@@ -1053,55 +1089,6 @@ export function LegacyWorkbench({
   function selectRunId(runId: string | null) {
     activeRunIdRef.current = runId;
     setActiveRunId(runId);
-  }
-
-  function chooseProvider(nextProvider: string) {
-    const nextOption = providerOptionMap[nextProvider];
-    setProvider(nextProvider);
-    setBaseUrl(nextOption?.baseUrl ?? "");
-    setApiKeyEnv(nextOption?.apiKeyEnv ?? "");
-    setProviderSecretResult(null);
-    const suggestions = modelsForProvider(nextProvider, modelCatalogs);
-    setModel((current) => {
-      if (!current.trim() || !isKnownProviderModel(nextProvider, current, modelCatalogs)) {
-        return suggestions[0] ?? "";
-      }
-      return current;
-    });
-  }
-
-  async function refreshProviderModels(nextProvider = provider) {
-    setModelCatalogLoading(true);
-    try {
-      const catalog = await getJson<ProviderModelCatalog>(`/api/runtime/models${queryString({ provider: nextProvider })}`);
-      setModelCatalogs((catalogs) => ({ ...catalogs, [catalog.provider]: catalog }));
-      setApiKeyEnv((current) => current.trim() || catalog.api_key_env || providerOptionMap[catalog.provider]?.apiKeyEnv || "");
-      setModel((current) => {
-        if (!catalog.models.length || !catalog.ok) return current;
-        if (!current.trim()) {
-          return catalog.models[0] ?? current;
-        }
-        return current;
-      });
-    } catch {
-      const fallback = deterministicModelDefaults[nextProvider] ?? [];
-      setModelCatalogs((catalogs) => ({
-        ...catalogs,
-        [nextProvider]: {
-          provider: nextProvider,
-          models: fallback,
-          fallback_models: fallback,
-          source: "fallback",
-          ok: false,
-          fetchable: true,
-          error: "model catalog unavailable",
-          base_url_configured: false,
-          api_key_configured: false
-        }
-      }));
-    } finally {
-      setModelCatalogLoading(false);
-    }
   }
 
   useEffect(() => {
@@ -1156,12 +1143,6 @@ export function LegacyWorkbench({
       setNotice(null);
     }
   }, [notice, activeRun?.status]);
-
-  useEffect(() => {
-    const transcript = transcriptRef.current;
-    if (!transcript || !followTranscriptRef.current) return;
-    transcript.scrollTop = transcript.scrollHeight;
-  }, [activeSessionId, sortedThreadRuns.length, activeRun?.status, activeRunEvents.length, streamedAssistant]);
 
   useEffect(() => {
     if (!onboardingState) return;
@@ -1290,40 +1271,25 @@ export function LegacyWorkbench({
     }
   }
 
-  async function refreshSummary() {
-    const [runList, sessionList, toolList, capabilityReport, pendingApprovalList, approvalList, mcpList, skillList, pluginList, channelList, secretList, layerList] =
-      await Promise.all([
-        getJson<Run[]>("/api/runs"),
-        getJson<Session[]>("/api/sessions"),
-        getJson<Tool[]>("/api/tools"),
-        getJson<CapabilitySnapshot>("/api/capabilities"),
-        getJson<Approval[]>("/api/approvals?status=pending"),
-        getJson<Approval[]>("/api/approvals"),
-        getJson<McpServer[]>("/api/mcp/servers"),
-        getJson<Skill[]>("/api/skills"),
-        getJson<Plugin[]>("/api/plugins"),
-        getJson<Channel[]>("/api/channels"),
-        getJson<SecretRef[]>("/api/secrets"),
-        getJson<MemoryLayerStatus[]>("/api/memory/layers")
-      ]);
-    setRuns(runList);
-    setSessions(sessionList);
-    setTools(toolList);
-    setCapabilitySnapshot(capabilityReport);
-    setApprovals(pendingApprovalList);
-    setAllApprovals(approvalList);
-    setMcpServers(mcpList);
-    setSkills(skillList);
-    setPlugins(pluginList);
-    setChannels(channelList);
-    setSecrets(secretList);
-    setMemoryLayers(layerList);
-    if (!memoryBackendHydratedRef.current) {
-      setMemoryBackendDraft(layerList.some((layer) => layer.backend.toLowerCase().includes("memvid")) ? "Memvid" : "In-memory");
-      memoryBackendHydratedRef.current = true;
+  async function refreshSettingsInventory() {
+    await settingsWorkspace.refreshInventory();
+  }
+
+  async function refreshOperatorInventory() {
+    const refreshes: Array<Promise<void>> = [
+      refreshSettingsInventory(),
+    ];
+    if (activeSectionRef.current === "advanced") {
+      refreshes.push(extendWorkspace.refresh());
     }
-    applyRunSessionSelection(runList, sessionList, pendingApprovalList);
-    await refreshSelectedThreadIfChanged(sessionList);
+    await Promise.all(refreshes);
+  }
+
+  async function refreshOperatorSummary() {
+    await Promise.all([
+      refreshChatSummary(),
+      refreshOperatorInventory(),
+    ]);
   }
 
   async function refreshSelectedThreadIfChanged(sessionList: Session[]) {
@@ -1345,8 +1311,11 @@ export function LegacyWorkbench({
     if (idleRefreshInFlightRef.current) return;
     idleRefreshInFlightRef.current = true;
     try {
-      if (activeSectionRef.current === "advanced") {
-        await refreshSummary();
+      if (
+        activeSectionRef.current === "advanced" ||
+        activeSectionRef.current === "settings"
+      ) {
+        await refreshOperatorSummary();
       } else {
         await refreshChatSummary();
       }
@@ -1356,17 +1325,13 @@ export function LegacyWorkbench({
   }
 
   async function refreshAll() {
-    await refreshSummary();
+    await refreshChatSummary();
     const [
       runtimeConfig,
       selfSnapshot,
       onboardingSnapshot,
       setupReadinessReport,
-      logList,
-      lessonList,
-      failureList,
-      deltaReport,
-      learningReport
+      logList
     ] = await Promise.all([
       getJson<RuntimeConfig>("/api/runtime/config"),
       getJson<SelfState>("/api/self"),
@@ -1375,49 +1340,62 @@ export function LegacyWorkbench({
         reportError(error);
         return null;
       }),
-      getJson<AgentLogEvent[]>("/api/logs?limit=120"),
-      getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/lessons?k=20"),
-      getJson<{ items: Array<Record<string, unknown>> }>("/api/cognition/failures?k=20"),
-      getJson<BehaviorDeltaReport>("/api/memory/deltas?since=all").catch((error) => {
-        setBehaviorDeltaError(error instanceof Error ? error.message : String(error));
-        return null;
-      }),
-      getLearningDashboard<LearningDashboard>("all").catch((error) => {
-        setLearningDashboardError(error instanceof Error ? error.message : String(error));
-        return null;
-      })
+      getJson<AgentLogEvent[]>("/api/logs?limit=120")
     ]);
-    setRuntime(runtimeConfig);
+    hydrateRuntime(runtimeConfig);
     setSelfState(selfSnapshot);
     setOnboardingState(onboardingSnapshot);
     setSetupReadiness(setupReadinessReport);
-    const savedSettings = runtimeSettingsFrom(runtimeConfig);
-    const nextProvider = String(savedSettings.provider ?? runtimeConfig.provider?.name ?? "mock");
-    const nextProviderOption = providerOptionMap[nextProvider];
-    setProvider(nextProvider);
-    setModel(String(savedSettings.model ?? runtimeConfig.provider?.model ?? "mock"));
-    setBaseUrl(String(savedSettings.base_url ?? nextProviderOption?.baseUrl ?? ""));
-    setApiKeyEnv(String(savedSettings.api_key_env ?? runtimeConfig.provider?.api_key_env ?? nextProviderOption?.apiKeyEnv ?? ""));
-    setProviderSecretResult(null);
-    setTemperature(formatTemperature(savedSettings.temperature ?? runtimeConfig.provider?.temperature ?? 0.2));
-    setMaxToolRounds(formatToolRounds(savedSettings.max_tool_rounds ?? runtimeConfig.limits?.max_tool_rounds ?? 6));
-    setWorkspace(String(savedSettings.workspace ?? runtimeConfig.paths?.workspace ?? ""));
-    setAutonomyMode(validAutonomyMode(savedSettings.autonomy_mode, "background"));
-    setMemoryBackendDraft(String(savedSettings.backend ?? "").toLowerCase() === "memvid" ? "Memvid" : "In-memory");
-    setStreamResponses(Boolean(savedSettings.stream ?? runtimeConfig.provider?.stream));
-    setApiAuthRequired(Boolean(savedSettings.require_api_auth ?? runtimeConfig.feature_flags?.require_api_auth));
-    setToolPermissions(toolPermissionsFromRuntime(runtimeConfig));
     setLogs(logList);
-    setLessons(lessonList.items);
-    setFailures(failureList.items);
-    if (deltaReport) {
-      setBehaviorDeltaReport(deltaReport);
-      setBehaviorDeltaError(null);
+  }
+
+  async function refreshOperatorWorkspace() {
+    await refreshAll();
+    await Promise.all([
+      refreshOperatorInventory(),
+      memoryWorkspace.refresh(),
+    ]);
+  }
+
+  async function refreshAfterCommittedMutation(
+    refreshes: Array<() => Promise<void>>,
+  ) {
+    const results = await Promise.allSettled(
+      refreshes.map((refresh) => refresh()),
+    );
+    const failures = results
+      .filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      )
+      .map((result) => result.reason);
+    if (failures.length === 0) return;
+    const authFailure = failures.find((value) => value instanceof ApiAuthError);
+    if (authFailure) {
+      handleAuthRequired();
+      return;
     }
-    if (learningReport) {
-      setLearningDashboard(learningReport);
-      setLearningDashboardError(null);
+    setError(
+      `The change was committed, but part of the refreshed view is unavailable: ${failures
+        .map((value) => (value instanceof Error ? value.message : String(value)))
+        .join("; ")}`,
+    );
+  }
+
+  async function refreshCoreAfterCommittedMutation({
+    runId,
+    sessionId,
+  }: {
+    runId?: string | null;
+    sessionId?: string | null;
+  } = {}) {
+    const refreshes: Array<() => Promise<void>> = [
+      () => refreshChatSummary(sessionId ?? undefined),
+    ];
+    if (runId) {
+      refreshes.push(() => refreshRunDetails(runId));
     }
+    await refreshAfterCommittedMutation(refreshes);
   }
 
   async function refreshThreadRuns(sessionId: string) {
@@ -1456,14 +1434,6 @@ export function LegacyWorkbench({
     setRunTrace(trace);
   }
 
-  function reportError(value: unknown) {
-    if (value instanceof ApiAuthError) {
-      handleAuthRequired();
-      return;
-    }
-    setError(value instanceof Error ? value.message : String(value));
-  }
-
   async function saveToken(event: FormEvent) {
     event.preventDefault();
     setApiToken(apiTokenDraft);
@@ -1481,70 +1451,6 @@ export function LegacyWorkbench({
     }
   }
 
-  async function saveRuntimeSettings() {
-    const currentRuntime = runtime as RuntimeConfig | null;
-    const savedSettings = runtimeSettingsFrom(currentRuntime);
-    await guarded(async () => {
-      const result = await putJson<Record<string, unknown>>("/api/runtime/settings", {
-        expected_revision: String(savedSettings.revision ?? ""),
-        provider,
-        model: model.trim() || "mock",
-        base_url: baseUrl.trim() || null,
-        api_key_env: effectiveApiKeyEnv.trim() || null,
-        temperature: coerceTemperature(temperature),
-        max_tool_rounds: coerceToolRounds(maxToolRounds),
-        backend: memoryBackendDraft === "Memvid" ? "memvid" : "memory",
-        memory_dir: String(savedSettings.memory_dir ?? currentRuntime?.paths?.memory_dir ?? ".nest/memory"),
-        workspace: workspace.trim() || String(currentRuntime?.paths?.workspace ?? "."),
-        stream: streamResponses,
-        autonomy_mode: autonomyMode,
-        ...toolPermissions
-      });
-      setRuntimeSettingsResult(result);
-      await refreshAll();
-    }, "Settings saved and applied to new runs.");
-  }
-
-  async function storeDesktopProviderKey() {
-    if (
-      !desktopRuntime ||
-      !desktopCredentialProviders.has(provider)
-    ) {
-      return;
-    }
-    await guarded(async () => {
-      const bridge = readDesktopBridge();
-      if (bridge === null) {
-        throw new Error("desktop_bridge_unavailable");
-      }
-      const result = desktopCredentialDialogResult(
-        await bridge.openCredentialDialog({
-          providerId: provider,
-          purpose: "provider_api_key"
-        })
-      );
-      if (result.status === "cancelled") {
-        setNotice("Credential entry cancelled.");
-        return;
-      }
-      const canonicalName =
-        providerOptionMap[provider]?.apiKeyEnv ?? "";
-      setProviderSecretResult({
-        id: result.secretRef.slice("secret://".length),
-        name: canonicalName,
-        purpose: "Provider API key",
-        secret_ref: result.secretRef,
-        configured: true,
-        validated: result.validation === "valid",
-        fingerprint: result.fingerprint,
-        source: "desktop_keyring"
-      });
-      setNotice("Provider key stored.");
-      await refreshProviderModels(provider);
-      await refreshSummary();
-    });
-  }
-
   async function guarded(action: () => Promise<void>, success?: string) {
     setError(null);
     try {
@@ -1555,15 +1461,15 @@ export function LegacyWorkbench({
     }
   }
 
-  async function submitRun(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      await enqueueRun({
-        objective: message,
-        sessionId: sessionId.trim() || activeSessionIdRef.current || createThreadId(),
-        workspace: workspace.trim() || null
-      });
-    }, "Run queued.");
+  async function submitConversationMessage(objective: string) {
+    await enqueueRun({
+      objective,
+      sessionId:
+        activeSessionIdRef.current ||
+        createThreadId(),
+      workspace: workspace.trim() || null,
+    });
+    setNotice("Run queued.");
   }
 
   async function launchMission(mission: MissionLaunch) {
@@ -1600,7 +1506,6 @@ export function LegacyWorkbench({
     missionBinding?: MissionLaunch["preflight"]["launch_binding"];
   }) {
     if (!objective.trim() || !runtime) return;
-    followTranscriptRef.current = true;
     const payload: Record<string, unknown> = {
       message: objective.trim(),
       session_id: targetSessionId,
@@ -1621,7 +1526,6 @@ export function LegacyWorkbench({
       payload.model = model.trim();
     }
     const run = await postJson<Run>("/api/runs", payload);
-    setMessage("");
     selectSessionId(run.session_id);
     selectRunId(run.run_id);
     setThreadRuns((rows) => [...rows.filter((row) => row.run_id !== run.run_id), run]);
@@ -1638,9 +1542,10 @@ export function LegacyWorkbench({
       },
       ...threads.filter((thread) => thread.session_id !== run.session_id)
     ]);
-    await refreshSummary();
-    await refreshThreadRuns(run.session_id);
-    await refreshRunDetails(run.run_id);
+    await refreshCoreAfterCommittedMutation({
+      runId: run.run_id,
+      sessionId: run.session_id,
+    });
   }
 
   function createNewThread() {
@@ -1698,8 +1603,10 @@ export function LegacyWorkbench({
         approved,
         arguments: approval.arguments
       });
-      await refreshSummary();
-      if (activeRun) await refreshRunDetails(activeRun.run_id);
+      await refreshCoreAfterCommittedMutation({
+        runId: activeRun?.run_id,
+        sessionId: activeRun?.session_id,
+      });
     }, approved ? "Approval accepted." : "Approval denied.");
   }
 
@@ -1707,435 +1614,11 @@ export function LegacyWorkbench({
     if (!activeRun) return;
     await guarded(async () => {
       await postJson(`/api/runs/${activeRun.run_id}/approve-task`, { task_id: task.task_id });
-      await refreshSummary();
-      await refreshRunDetails(activeRun.run_id);
+      await refreshCoreAfterCommittedMutation({
+        runId: activeRun.run_id,
+        sessionId: activeRun.session_id,
+      });
     }, "Task approved.");
-  }
-
-  async function runScheduler(mode: "step" | "run") {
-    if (!activeRun) return;
-    await guarded(async () => {
-      const payload =
-        mode === "step"
-          ? { max_tasks: Number(schedulerTasks) || null }
-          : { max_tasks: Number(schedulerTasks) || null, max_cycles: Number(schedulerCycles) || null };
-      const result = await postJson<Record<string, unknown>>(`/api/runs/${activeRun.run_id}/scheduler/${mode}`, payload);
-      setSchedulerResult(result);
-      await refreshSummary();
-      await refreshRunDetails(activeRun.run_id);
-    }, mode === "step" ? "Scheduler step complete." : "Scheduler drain complete.");
-  }
-
-  async function submitSubagent(event: FormEvent) {
-    event.preventDefault();
-    if (!activeRun) return;
-    await guarded(async () => {
-      await postJson("/api/subagents", {
-        run_id: activeRun.run_id,
-        profile: subagentProfile,
-        goal: subagentGoal
-      });
-      setSubagentGoal("");
-      await refreshRunDetails(activeRun.run_id);
-    }, "Subagent queued.");
-  }
-
-  async function searchMemory(event?: FormEvent) {
-    event?.preventDefault();
-    await guarded(async () => {
-      if (!memoryQuery.trim()) return;
-      const params = queryString({ query: memoryQuery, k: 12 });
-      const hits = await getJson<MemoryHit[]>(`/api/memory/search${params}`);
-      const inspected = await getJson<Record<string, unknown>>(`/api/memory/inspect${params}`);
-      setMemoryHits(hits);
-      setMemoryInspect(inspected);
-    });
-  }
-
-  async function packContext(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const query = contextQuery.trim() || memoryQuery.trim();
-      if (!query) return;
-      const params = queryString({
-        query,
-        token_budget: contextBudget,
-        layers: contextLayers,
-        expand_raw: contextExpandRaw,
-        include_telemetry: true
-      });
-      setContextResult(await getJson<ContextPackResult>(`/api/context${params}`));
-    });
-  }
-
-  async function findConflicts() {
-    await guarded(async () => {
-      const query = contextQuery.trim() || memoryQuery.trim();
-      if (!query) return;
-      setConflictResult(await getJson<Record<string, unknown>>(`/api/memory/conflicts${queryString({ query, k: 8 })}`));
-    });
-  }
-
-  async function submitLearning(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>("/api/memory/learn", {
-        title: learningTitle,
-        content: learningContent,
-        kind: learningKind,
-        validation_score: Number(learningValidation),
-        repeat_count: Number(learningRepeat),
-        explicit_instruction: learningExplicit
-      });
-      setLearningResult(result);
-      await refreshAll();
-    }, "Learning signal reviewed.");
-  }
-
-  async function capsule(action: "summarize" | "apply") {
-    if (!activeRun) return;
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>(`/api/capsules/${activeRun.run_id}/${action}`, {
-        dry_run: action === "summarize",
-        include_policy: false
-      });
-      setCapsuleResult(result);
-      await refreshAll();
-    });
-  }
-
-  async function invokeTool(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      if (!selectedTool || !selectedToolEnabled) {
-        throw new Error("This tool is disabled. Enable it in Settings before invoking it.");
-      }
-      const args = readJson<Record<string, unknown>>(toolArgs, {});
-      setPreparedToolPreview(null);
-      const result = await postJson<Record<string, unknown>>(`/api/tools/${encodeURIComponent(toolName)}/invoke`, {
-        arguments: args,
-        session_id: activeRun?.session_id ?? "manual",
-        run_id: activeRun?.run_id ?? null
-      });
-      setToolResult(result);
-      await refreshSummary();
-    });
-  }
-
-  async function setCapabilityEnabled(capability: Capability, enabled: boolean) {
-    if (
-      enabled &&
-      ["high", "critical"].includes(capability.risk.toLowerCase()) &&
-      !window.confirm(
-        `Enable ${capability.name}? This ${capability.risk}-risk capability${
-          capability.requires_approval ? " will still require approval when invoked" : " can be invoked without per-call approval"
-        }.`
-      )
-    ) {
-      return;
-    }
-
-    setError(null);
-    setCapabilityPending((pending) => new Set(pending).add(capability.key));
-    try {
-      const result = await putJson<CapabilityMutationResult>(
-        `/api/capabilities/${capability.kind}/${encodeURIComponent(capability.id)}`,
-        { enabled, expected_revision: capability.revision }
-      );
-      setCapabilitySnapshot((snapshot) => replaceCapability(snapshot, result.capability));
-      await refreshSummary();
-      const revoked = result.revoked_approvals
-        ? ` ${result.revoked_approvals} pending approval${result.revoked_approvals === 1 ? " was" : "s were"} revoked.`
-        : "";
-      const capabilityState = enabled && !result.capability.effective_enabled
-        ? `configured on but blocked by ${result.capability.blocked_by.map(formatCapabilityBlocker).join(", ")}`
-        : enabled
-          ? "enabled"
-          : "disabled";
-      setNotice(
-        `${result.capability.name} ${capabilityState} for future invocations.${revoked}`
-      );
-    } catch (value) {
-      reportError(value);
-      await refreshSummary().catch(() => undefined);
-    } finally {
-      setCapabilityPending((pending) => {
-        const next = new Set(pending);
-        next.delete(capability.key);
-        return next;
-      });
-    }
-  }
-
-  function loadMcp(server: McpServer) {
-    setMcpId(server.id);
-    setMcpName(server.name);
-    setMcpTransport(server.transport);
-    setMcpEndpoint(server.transport === "stdio" ? server.command ?? "" : server.url ?? "");
-    setMcpArgs("[]");
-    setMcpEnv("{}");
-    setMcpSecretEnv("{}");
-    setMcpRiskPolicy(server.risk_policy ?? "approval_by_default");
-    setMcpEditingServerId(server.id);
-    setMcpArgsTouched(false);
-    setMcpEnvTouched(false);
-    setMcpSecretEnvTouched(false);
-  }
-
-  async function saveMcp(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const payload: Record<string, unknown> = {
-        id: mcpId,
-        name: mcpName || mcpId,
-        transport: mcpTransport,
-        command: mcpTransport === "stdio" ? mcpEndpoint || null : null,
-        url: mcpTransport === "stdio" ? null : mcpEndpoint || null,
-        risk_policy: mcpRiskPolicy
-      };
-      if (mcpArgsTouched) payload.args = readJson<string[]>(mcpArgs, []);
-      if (mcpEnvTouched) payload.env = readJson<Record<string, string>>(mcpEnv, {});
-      if (mcpSecretEnvTouched) payload.secret_env = readJson<Record<string, string>>(mcpSecretEnv, {});
-      const path = mcpServers.some((server) => server.id === mcpId) ? `/api/mcp/servers/${encodeURIComponent(mcpId)}` : "/api/mcp/servers";
-      const saved = path === "/api/mcp/servers" ? await postJson<McpServer>(path, payload) : await putJson<McpServer>(path, payload);
-      setMcpId(saved.id);
-      setMcpEditingServerId(saved.id);
-      setMcpArgsTouched(false);
-      setMcpEnvTouched(false);
-      setMcpSecretEnvTouched(false);
-      await refreshSummary();
-    }, "MCP server saved.");
-  }
-
-  async function controlMcp(server: McpServer, action: "connect" | "disconnect" | "restart" | "sync" | "test") {
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>(`/api/mcp/servers/${encodeURIComponent(server.id)}/${action}`);
-      setMcpResult(result);
-      await refreshSummary();
-    });
-  }
-
-  async function deleteMcp(server: McpServer) {
-    await guarded(async () => {
-      await deleteJson(`/api/mcp/servers/${encodeURIComponent(server.id)}`);
-      await refreshSummary();
-    }, "MCP server removed.");
-  }
-
-  async function invokeMcp(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      if (!selectedMcpToolEnabled) {
-        throw new Error("This MCP tool is disabled. Enable its server and tool before invoking it.");
-      }
-      const [serverId, remoteName] = mcpToolSelection.split("::");
-      const result = await postJson<Record<string, unknown>>(
-        `/api/mcp/servers/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(remoteName)}/invoke`,
-        { arguments: readJson<Record<string, unknown>>(mcpToolArgs, {}) }
-      );
-      setMcpResult(result);
-      await refreshSummary();
-    });
-  }
-
-  async function toggleSkill(skill: Skill) {
-    await guarded(async () => {
-      await postJson(`/api/skills/${encodeURIComponent(skill.id)}/${skill.enabled ? "disable" : "enable"}`);
-      await refreshSummary();
-    });
-  }
-
-  async function discoverSkills() {
-    await guarded(async () => {
-      setSkillDiscovering(true);
-      try {
-        const result = await postJson<SkillDiscoveryReport>("/api/skills/discover");
-        setSkillDiscovery(result);
-        setSkillResult(result as unknown as Record<string, unknown>);
-        setSkills(result.skills);
-        await refreshSummary();
-        setNotice(result.message);
-      } finally {
-        setSkillDiscovering(false);
-      }
-    });
-  }
-
-  async function installSkill(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>("/api/skills/install", {
-        manifest: readJson<Record<string, unknown>>(skillManifest, {}),
-        instructions: skillInstructions,
-        overwrite: true,
-        dry_run: false
-      });
-      setSkillResult(result);
-      await refreshSummary();
-    });
-  }
-
-  async function runSkill(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      if (!selectedSkillEnabled) {
-        throw new Error("This skill is disabled. Enable it in Settings before running it.");
-      }
-      const result = await postJson<Record<string, unknown>>(`/api/skills/${encodeURIComponent(skillSelection)}/run`, {
-        arguments: { task: skillTask, context: { active_run_id: activeRun?.run_id ?? null } },
-        session_id: activeRun?.session_id ?? "manual",
-        run_id: activeRun?.run_id ?? null
-      });
-      setSkillResult(result);
-      await refreshSummary();
-    });
-  }
-
-  async function reviewPlugin(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const source = pluginSource.trim();
-      const ref = pluginRef.trim() || null;
-      const result = await postJson<PluginReviewReport>("/api/plugins/review", {
-        source,
-        ref
-      });
-      setPluginReview(result);
-      setPluginReviewSource(source);
-      setPluginReviewRef(ref);
-      setPluginResult(result as unknown as Record<string, unknown>);
-      if (result.enable_blockers.length > 0) {
-        setPluginEnable(false);
-      }
-      setNotice(result.enable_blockers.length ? "Plugin review found enable blockers." : "Plugin review complete.");
-    });
-  }
-
-  async function installPlugin() {
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>("/api/plugins/install", {
-        source: pluginSource,
-        ref: pluginRef || null,
-        enable: pluginEnable,
-        overwrite: true
-      });
-      setPluginResult(result);
-      await refreshSummary();
-    });
-  }
-
-  async function pluginAction(plugin: Plugin, action: "enable" | "disable" | "update" | "remove") {
-    await guarded(async () => {
-      const path = `/api/plugins/${encodeURIComponent(plugin.id)}`;
-      if (action === "update" && !pluginUpdateReviews[plugin.id]) {
-        const review = await postJson<PluginReviewReport>(
-          `${path}/review-update`,
-          { ref: plugin.source_ref }
-        );
-        setPluginUpdateReviews((current) => ({
-          ...current,
-          [plugin.id]: review.commit_sha
-        }));
-        setPluginResult(review as unknown as Record<string, unknown>);
-        setNotice(
-          review.authority_delta?.expands_authority
-            ? "Update review found added authority. Disable the plugin before applying it."
-            : "Update reviewed. Apply only after inspecting provenance, compatibility, and authority delta."
-        );
-        return;
-      }
-      const result =
-        action === "remove"
-          ? await deleteJson<Record<string, unknown>>(path)
-          : await postJson<Record<string, unknown>>(`${path}/${action}`, action === "update" ? { ref: plugin.source_ref } : {});
-      if (action === "update" || action === "remove") {
-        setPluginUpdateReviews((current) => {
-          const next = { ...current };
-          delete next[plugin.id];
-          return next;
-        });
-      }
-      setPluginResult(result);
-      await refreshSummary();
-    });
-  }
-
-  function loadChannel(channel: Channel) {
-    setChannelId(channel.id);
-    setChannelProvider(channel.provider);
-    setChannelTokenEnv(channel.token_env ?? "");
-    setChannelWebhookEnv(channel.webhook_url_env ?? "");
-    setChannelEnabled(channel.enabled);
-    setChannelSendEnabled(channel.send_enabled);
-    setChannelAutoReply(channel.auto_reply);
-    setChannelSettings(JSON.stringify(channel.settings ?? {}, null, 2));
-  }
-
-  async function saveChannel(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const payload = {
-        id: channelId,
-        provider: channelProvider,
-        enabled: channelEnabled,
-        send_enabled: channelSendEnabled,
-        auto_reply: channelAutoReply,
-        token_env: channelTokenEnv || null,
-        webhook_url_env: channelWebhookEnv || null,
-        settings: readJson<Record<string, unknown>>(channelSettings, {})
-      };
-      const path = channels.some((channel) => channel.id === channelId) ? `/api/channels/${encodeURIComponent(channelId)}` : "/api/channels";
-      const saved = path === "/api/channels" ? await postJson<Channel>(path, payload) : await putJson<Channel>(path, payload);
-      setChannelId(saved.id);
-      await refreshSummary();
-    }, "Channel saved.");
-  }
-
-  async function deleteChannel(channel: Channel) {
-    await guarded(async () => {
-      await deleteJson(`/api/channels/${encodeURIComponent(channel.id)}`);
-      await refreshSummary();
-    }, "Channel removed.");
-  }
-
-  async function ingestChannel(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>("/api/channels/ingest", {
-        provider: channelProvider,
-        channel_id: channelId,
-        payload: readJson<Record<string, unknown>>(channelPayload, {}),
-        send: false
-      });
-      setChannelResult(result);
-      await refreshAll();
-    });
-  }
-
-  async function telegramWebhookInfo(channel: Channel) {
-    await guarded(async () => {
-      const result = await getJson<Record<string, unknown>>(`/api/channels/${encodeURIComponent(channel.id)}/telegram/webhook-info`);
-      setTelegramActionResult(result);
-    }, "Telegram webhook info loaded.");
-  }
-
-  async function telegramSetWebhook(channel: Channel) {
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>(`/api/channels/${encodeURIComponent(channel.id)}/telegram/set-webhook`, {
-        url: telegramWebhookUrl,
-        drop_pending_updates: false
-      });
-      setTelegramActionResult(result);
-    }, "Telegram webhook updated.");
-  }
-
-  async function telegramDeleteWebhook(channel: Channel) {
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>(`/api/channels/${encodeURIComponent(channel.id)}/telegram/delete-webhook`, {
-        drop_pending_updates: false
-      });
-      setTelegramActionResult(result);
-    }, "Telegram webhook removed.");
   }
 
   function telegramOwnerLabels(channel: Channel): string[] {
@@ -2148,65 +1631,6 @@ export function LegacyWorkbench({
     const status = channel.env_status;
     if (!status || typeof status !== "object") return false;
     return Boolean((status as Record<string, unknown>)[key]);
-  }
-
-  async function acceptBrowserSecret(saved: SecretRef) {
-    setSecretResult(saved);
-    setNotice("Secret stored.");
-    await refreshSummary();
-  }
-
-  async function validateSecret(secret: SecretRef) {
-    if (desktopRuntime) {
-      throw new Error(
-        "desktop_generic_secret_mutation_unavailable"
-      );
-    }
-    await guarded(async () => {
-      const result = await postJson<SecretRef>(`/api/secrets/${encodeURIComponent(secret.id)}/validate`);
-      setSecretResult(result);
-      await refreshSummary();
-    }, "Secret validated.");
-  }
-
-  async function deleteSecret(secret: SecretRef) {
-    if (desktopRuntime) {
-      throw new Error(
-        "desktop_generic_secret_mutation_unavailable"
-      );
-    }
-    await guarded(async () => {
-      await deleteJson(`/api/secrets/${encodeURIComponent(secret.id)}`);
-      setSecretResult(null);
-      await refreshSummary();
-    }, "Secret removed.");
-  }
-
-  async function diagnose(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>("/api/diagnosis/recall", {
-        failure_text: diagnosisText,
-        source: "web-ui",
-        k: 5
-      });
-      setDiagnosisResult(result);
-    });
-  }
-
-  async function rememberSelf(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>("/api/self/remember", {
-        title: selfTitle,
-        content: selfContent,
-        schema: selfSchema,
-        validation_status: "user_confirmed",
-        confidence: 0.88
-      });
-      setSelfRememberResult(result);
-      await refreshAll();
-    }, "Soul memory reviewed.");
   }
 
   async function saveSetup(event: FormEvent) {
@@ -2231,7 +1655,6 @@ export function LegacyWorkbench({
         profile: result.profile,
         personas: result.personas
       });
-      setSelfRememberResult(result.memory);
       localStorage.setItem(SETUP_DISMISSED_KEY, "1");
       setSetupDismissed(true);
       setSetupOpen(false);
@@ -2244,17 +1667,6 @@ export function LegacyWorkbench({
     localStorage.setItem(SETUP_DISMISSED_KEY, "1");
     setSetupDismissed(true);
     setSetupOpen(false);
-  }
-
-  async function searchWeb(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const result = await postJson<Record<string, unknown>>("/api/web/search", {
-        query: webQuery,
-        max_results: 5
-      });
-      setWebResult(result);
-    });
   }
 
   const runtimeConfig = runtime as RuntimeConfig | null;
@@ -2286,8 +1698,8 @@ export function LegacyWorkbench({
           "available"
         ? "Credentials use persistent platform storage."
         : "Credential storage needs attention.";
-  const activeDeltaCount = behaviorDeltaReport?.summary.active_deltas ?? 0;
-  const totalDeltaCount = behaviorDeltaReport?.summary.total_deltas ?? 0;
+  const activeDeltaCount = memoryWorkspace.activeDeltaCount;
+  const totalDeltaCount = memoryWorkspace.totalDeltaCount;
   const pendingApprovalCount = approvals.filter((approval) => approval.status === "pending").length;
   const oracleShadowLabel = `${events.filter((event) => event.type.includes("oracle") || event.type.includes("routing")).length} observations`;
   const onboardingProfile = onboardingState?.profile ?? null;
@@ -2319,6 +1731,81 @@ export function LegacyWorkbench({
     activeRun || simpleStatus.label !== "Ready"
       ? simpleStatus.detail
       : chatIntro;
+  const renderConversationInspector = (onClose: () => void) => (
+    <aside className="inspector" aria-label="Run details">
+      <div className="inspector-head">
+        <h2>Run details</h2>
+        <button type="button" aria-label="Close panel" onClick={onClose}>
+          <X size={15} />
+        </button>
+      </div>
+      {activeRun ? (
+        <>
+          <section>
+            <h3>Current run</h3>
+            <StatusBadge value={activeRun.status} />
+            <InlineMeta
+              items={[
+                activeRun.run_id,
+                activeRun.session_id,
+                activeRun.model,
+              ]}
+            />
+            {activeRun.error && (
+              <p className="danger-text">{activeRun.error}</p>
+            )}
+          </section>
+          <section>
+            <h3>Plan</h3>
+            <TaskList
+              title="Needs You"
+              tasks={taskGraph?.approval_blocked_tasks ?? []}
+              onApprove={approveTask}
+            />
+            <TaskList
+              title="Ready"
+              tasks={taskGraph?.ready_tasks ?? []}
+              onApprove={approveTask}
+            />
+          </section>
+          {proofOfWork && (
+            <section>
+              <h3>Validation</h3>
+              <SummaryList
+                title="Completed"
+                values={asStringArray(proofOfWork.completed_steps)}
+              />
+              <SummaryList
+                title="Evidence"
+                values={asStringArray(proofOfWork.validation_evidence)}
+              />
+              <SummaryList
+                title="Risks"
+                values={asStringArray(proofOfWork.remaining_risks)}
+              />
+            </section>
+          )}
+          <section>
+            <h3>Activity</h3>
+            <div className="trace-list compact-trace">
+              {(runTrace?.timeline ?? events).slice(-12).map((event) => (
+                <div
+                  className="trace-row"
+                  key={`${event.id}-${event.type}`}
+                >
+                  <strong>{friendlyEventLabel(event.type)}</strong>
+                  <small>{event.created_at}</small>
+                  <code>{JSON.stringify(event.payload).slice(0, 220)}</code>
+                </div>
+              ))}
+            </div>
+          </section>
+        </>
+      ) : (
+        <EmptyState>No run selected.</EmptyState>
+      )}
+    </aside>
+  );
 
   return (
     <>
@@ -2400,7 +1887,7 @@ export function LegacyWorkbench({
           </section>
         </div>
       ) : activeSection === "mission" ? (
-        <MissionControl
+        <ProjectsWorkspace
           runs={runs}
           activeRun={activeRun}
           taskGraph={taskGraph}
@@ -2424,7 +1911,7 @@ export function LegacyWorkbench({
       ) : activeSection === "outcomes" ? (
         <OutcomesDashboard onBack={() => routeToSection("mission")} />
       ) : (
-      <div className={`chat-shell ${inspectorOpen ? "" : "no-inspector"}`} data-active-section={activeSection}>
+      <div className="chat-shell" data-active-section={activeSection}>
       <a
         className="skip-link"
         href="#workspace"
@@ -2472,6 +1959,39 @@ export function LegacyWorkbench({
         </div>
       </aside>
 
+      {activeSection === "chat" ? (
+        <ConversationPanel
+          agentDisplayName={agentDisplayName}
+          hasActiveThread={Boolean(activeThread)}
+          chatStatusDetail={chatStatusDetail}
+          status={simpleStatus}
+          activeRun={activeRun}
+          runs={sortedThreadRuns}
+          events={activeRunEvents}
+          streamedAssistant={streamedAssistant}
+          approvals={activeApprovals}
+          autonomyMode={autonomyMode}
+          autonomyOptions={autonomyOptions}
+          autonomousSchedulerEnabled={Boolean(
+            (runtime as RuntimeConfig | null)?.feature_flags
+              ?.enable_autonomous_scheduler,
+          )}
+          notice={notice}
+          error={error}
+          onAutonomyModeChange={setAutonomyMode}
+          onOpenSetup={() => setSetupOpen(true)}
+          onOpenSettings={() => routeToSection("settings")}
+          onRefresh={refreshAll}
+          onSubmitMessage={submitConversationMessage}
+          onError={reportError}
+          onDismissError={() => setError(null)}
+          onDecideApproval={decideApproval}
+          onContainer={(element) => {
+            conversationRef.current = element;
+          }}
+          renderInspector={renderConversationInspector}
+        />
+      ) : (
       <div
         className="conversation"
         id="legacy-workspace"
@@ -2479,121 +1999,39 @@ export function LegacyWorkbench({
           conversationRef.current = element;
         }}
       >
-        {activeSection === "chat" && (
-          <>
-        <header className="conv-head simple-conv-head" data-section="chat">
-          <div>
-            <h1>Ask {agentDisplayName}</h1>
-            <div className="conv-meta simple-meta">
-              <span>{activeThread ? "Current chat" : "New chat"}</span>
-              <span className="sep">·</span>
-              <span>{chatStatusDetail}</span>
-            </div>
-          </div>
-          <div className="conv-tools simple-conv-tools">
-            <StatusBadge value={simpleStatus.label} />
-            {simpleStatus.action === "setup" && (
-              <button type="button" onClick={() => setSetupOpen(true)}>
-                <Sparkles size={15} /> Setup
-              </button>
-            )}
-            {simpleStatus.action === "model-settings" && (
-              <button type="button" onClick={() => routeToSection("settings")}>
-                <Settings size={15} /> Open model settings
-              </button>
-            )}
-            {activeRun && (
-              <button type="button" onClick={() => setInspectorOpen((open) => !open)}>
-                <PanelRightOpen size={15} /> Details
-              </button>
-            )}
-            <button type="button" onClick={() => refreshAll().catch(reportError)}>
-              <RefreshCw size={15} /> Refresh
-            </button>
-          </div>
-        </header>
-
-        <div className="announcer" aria-live="polite">
-          {notice}
-        </div>
-        {error && <ActionError message={error} onDismiss={() => setError(null)} />}
-
-        <section className={`conversation-layout ${inspectorOpen ? "with-inspector" : ""}`} data-section="chat">
-          <div className="transcript-inner">
-            <div
-              className="transcript"
-              role="region"
-              aria-label="Conversation transcript"
-              tabIndex={0}
-              ref={transcriptRef}
-              onScroll={(event) => {
-                const transcript = event.currentTarget;
-                const distanceFromBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
-                followTranscriptRef.current = distanceFromBottom < 96;
-              }}
-            >
-              {sortedThreadRuns.length === 0 ? (
-                <div className="empty-state">
-                  <MessageCircle size={28} />
-                  <h2>Tell {agentDisplayName} what to do.</h2>
-                  <p>Start with a build, fix, research, inspection, or continuation request. {agentDisplayName} will keep the work in this thread.</p>
-                </div>
-              ) : (
-                sortedThreadRuns.map((run) => (
-                  <div className="turn" key={run.run_id}>
-                    <article className="msg user">
-                      <strong>You</strong>
-                      <p>{run.message}</p>
-                    </article>
-                    <article className="msg kestrel">
-
-                      <strong>Kestrel</strong>
-                      <MarkdownMessage text={assistantTextForRun(run, activeRun?.run_id, streamedAssistant)} />
-                      {run.run_id === activeRun?.run_id && <LiveRunActivity run={run} events={activeRunEvents} />}
-                    </article>
-                  </div>
-                ))
-              )}
-              {activeApprovals.map((approval) => (
-                <ApprovalCardInline key={approval.approval_id} approval={approval} onApprove={decideApproval} />
-              ))}
-            </div>
-            <form className="composer" onSubmit={submitRun}>
-              <label className="composer-field">
-                <span>Ask {agentDisplayName}</span>
-                <textarea
-                  value={message}
-                  onChange={(event) => setMessage(event.target.value)}
-                  placeholder={`Ask ${agentDisplayName} to build, fix, research, inspect, or continue something...`}
-                  rows={3}
-                />
-              </label>
-              <div className="composer-bar">
-                <label className="mode-select">
-                  <span>Mode</span>
-                  <select value={autonomyMode} onChange={(event) => setAutonomyMode(event.target.value)}>
-                    {autonomyOptions
-                      .filter((option) => option.value !== "autonomous" || Boolean((runtime as RuntimeConfig | null)?.feature_flags?.enable_autonomous_scheduler))
-                      .map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                  </select>
-                </label>
-                <button type="submit" disabled={!message.trim()}>
-                  <Send size={15} /> Send
+        {activeSection === "memory" && (
+          <section
+            className="shell page-shell advanced-page"
+            data-section="memory"
+            aria-label="Memory workspace"
+          >
+            <header className="page-head">
+              <div>
+                <p className="page-eyebrow">Nested learning</p>
+                <h1 className="page-title">Memory<em>.</em></h1>
+                <p className="page-subtitle">
+                  Inspect layer health, bounded recall, evidence packing, and
+                  gated learning without granting policy authority.
+                </p>
+              </div>
+              <div className="page-actions">
+                <button
+                  className="btn subtle"
+                  type="button"
+                  onClick={() => memoryWorkspace.refresh()}
+                >
+                  <RefreshCw size={15} /> Refresh
                 </button>
               </div>
-            </form>
-          </div>
-
-        </section>
-
-          </>
+            </header>
+            {error && (
+              <ActionError message={error} onDismiss={() => setError(null)} />
+            )}
+            <MemoryWorkspace controller={memoryWorkspace} />
+          </section>
         )}
         {activeSection === "routines" && (
-          <RoutineWorkbench onAuthRequired={handleAuthRequired} />
+          <AutomateWorkspace onAuthRequired={handleAuthRequired} />
         )}
         {activeSection === "routing" && (
           <section
@@ -2617,7 +2055,8 @@ export function LegacyWorkbench({
             </header>
             {error && <div className="banner error">{error}</div>}
             {notice && <div className="banner success">{notice}</div>}
-            <RoutingCenter
+            <FlockWorkspace
+              subroute={requestedSubroute ?? "routing"}
               activeRunId={activeRun?.run_id ?? null}
               activeTaskId={
                 taskGraph?.tasks.find((task) => ["running", "blocked", "pending"].includes(task.status))?.task_id ??
@@ -2629,40 +2068,13 @@ export function LegacyWorkbench({
           </section>
         )}
         {activeSection === "advanced" && (
-          <section id="advanced" className="shell page-shell advanced-page" data-section="advanced" aria-label="Advanced Operator Console">
-            <header className="page-head">
-              <div>
-                <p className="page-eyebrow">Operator Console</p>
-                <h1 className="page-title">Advanced<em>.</em></h1>
-                <p className="page-subtitle">
-                  Tuning surfaces for the runtime that powers Kestrel: runs, approvals, memory,
-                  tools, MCP, plugins, channels, traces, and gated capabilities. Defaults stay conservative.
-                </p>
-              </div>
-              <div className="page-actions">
-                <button className="btn subtle" type="button" onClick={() => refreshAll().catch(reportError)}>
-                  <RefreshCw size={15} /> Refresh
-                </button>
-                <button className="btn primary" type="button" onClick={() => routeToSection("chat")}>
-                  <X size={15} /> Close
-                </button>
-              </div>
-            </header>
-            <nav className="advanced-surface-nav" aria-label="Advanced workspaces">
-              <button type="button" onClick={() => routeToSection("routines")}>
-                <CalendarClock size={15} /> Routines
-              </button>
-              <button type="button" onClick={() => routeToSection("routing")}>
-                <Route size={15} /> Routing
-              </button>
-              <button type="button" onClick={() => routeToSection("outcomes")}>
-                <LineChart size={15} /> Outcomes
-              </button>
-              <button type="button" onClick={() => routeToSection("settings")}>
-                <Settings size={15} /> Settings
-              </button>
-            </nav>
-            {error && <ActionError message={error} onDismiss={() => setError(null)} />}
+          <ExtendWorkspace
+            controller={extendWorkspace}
+            error={error}
+            onDismissError={() => setError(null)}
+            onNavigate={routeToSection}
+            onRefresh={refreshOperatorWorkspace}
+          >
             <section className="stitch-command-deck advanced-overview" aria-label="Advanced overview">
               <div className="stitch-hero-card">
                 <div>
@@ -2698,7 +2110,16 @@ export function LegacyWorkbench({
                 ["channels", "Channels"],
                 ["observability", "Observability"]
               ].map(([id, label]) => (
-                <button className="tag ghost" type="button" key={id} onClick={() => scrollToElement(id)}>
+                <button
+                  className="tag ghost"
+                  type="button"
+                  key={id}
+                  onClick={() =>
+                    id === "memory"
+                      ? routeToSection("memory")
+                      : scrollToElement(id)
+                  }
+                >
                   {label}
                 </button>
               ))}
@@ -2712,7 +2133,7 @@ export function LegacyWorkbench({
           >
             <form className="stack-form" onSubmit={submitRun}>
               <Field label="Objective">
-                <textarea value={message} onChange={(event) => setMessage(event.target.value)} rows={5} />
+                <textarea value={operatorMessage} onChange={(event) => setOperatorMessage(event.target.value)} rows={5} />
               </Field>
               <div className="field-row">
                 <Field label="Session ID" hint="Leave blank to create a new session.">
@@ -2756,7 +2177,7 @@ export function LegacyWorkbench({
                 ))}
               </datalist>
               <div className="page-actions">
-                <button type="submit" disabled={!message.trim()}>
+                <button type="submit" disabled={!operatorMessage.trim()}>
                   <Send size={15} /> Queue Run
                 </button>
                 {activeRun?.status === "running" && (
@@ -2765,7 +2186,10 @@ export function LegacyWorkbench({
                     className="btn danger"
                     onClick={() => guarded(async () => {
                       await postJson(`/api/runs/${activeRun.run_id}/cancel`);
-                      await refreshSummary();
+                      await refreshCoreAfterCommittedMutation({
+                        runId: activeRun.run_id,
+                        sessionId: activeRun.session_id,
+                      });
                     })}
                   >
                     <Square size={14} /> Cancel
@@ -3006,167 +2430,6 @@ export function LegacyWorkbench({
               <button type="submit" disabled={!webQuery.trim()}>Search Web</button>
             </form>
             {webResult && <JsonBlock value={webResult} />}
-          </Panel>
-        </section>
-
-        <section id="memory" className="content-grid wide-left">
-          <Panel title="Memory & Context" icon={<Database size={19} />}>
-            <div className="layer-grid">
-              {memoryLayers.map((layer) => (
-                <div className="layer-chip" key={layer.layer}>
-                  <strong>{layer.layer}</strong>
-                  <StatusBadge value={layer.ok ? "ok" : "failed"} />
-                  <small>{layer.backend}</small>
-                </div>
-              ))}
-            </div>
-            <form onSubmit={searchMemory} className="inline-form">
-              <Field label="Memory query">
-                <input value={memoryQuery} onChange={(event) => setMemoryQuery(event.target.value)} />
-              </Field>
-              <button type="submit"><Search size={15} /> Search</button>
-            </form>
-            <div className="hit-list">
-              {memoryHits.map((hit) => (
-                <div className="data-row" key={`${hit.layer}-${hit.record_id ?? hit.title}`}>
-                  <strong>{hit.title}</strong>
-                  <InlineMeta items={[hit.layer, hit.kind, hit.score.toFixed(2)]} />
-                  <p>{hit.snippet}</p>
-                </div>
-              ))}
-            </div>
-          </Panel>
-
-          <Panel title="Context Pack" icon={<FileText size={19} />}>
-            <form onSubmit={packContext} className="stack-form">
-              <Field label="Objective or claim">
-                <input value={contextQuery} onChange={(event) => setContextQuery(event.target.value)} />
-              </Field>
-              <Field label="Layers CSV">
-                <input value={contextLayers} onChange={(event) => setContextLayers(event.target.value)} />
-              </Field>
-              <Field label="Token budget">
-                <input value={contextBudget} onChange={(event) => setContextBudget(event.target.value)} inputMode="numeric" />
-              </Field>
-              <label className="check-row">
-                <input type="checkbox" checked={contextExpandRaw} onChange={(event) => setContextExpandRaw(event.target.checked)} />
-                <span>Expand raw evidence</span>
-              </label>
-              <div className="page-actions">
-                <button type="submit">Pack</button>
-                <button type="button" onClick={findConflicts}>Find Conflicts</button>
-                <button type="button" disabled={!activeRun} onClick={() => capsule("summarize")}>Capsule Preview</button>
-                <button type="button" disabled={!activeRun} onClick={() => capsule("apply")}>Request Capsule Apply</button>
-              </div>
-            </form>
-            {contextResult && <JsonBlock value={contextResult.packed_prompt || contextResult} maxHeight="360px" />}
-            {conflictResult && <JsonBlock value={conflictResult} />}
-            {capsuleResult && <JsonBlock value={capsuleResult} />}
-          </Panel>
-
-          <Panel title="Learning Review" icon={<Brain size={19} />}>
-            <form onSubmit={submitLearning} className="stack-form">
-              <Field label="Title">
-                <input value={learningTitle} onChange={(event) => setLearningTitle(event.target.value)} />
-              </Field>
-              <Field label="Validated content">
-                <textarea value={learningContent} onChange={(event) => setLearningContent(event.target.value)} rows={4} />
-              </Field>
-              <div className="field-row">
-                <Field label="Kind">
-                  <select value={learningKind} onChange={(event) => setLearningKind(event.target.value)}>
-                    {["observation", "fact", "event", "failure", "procedure", "policy"].map((kind) => (
-                      <option key={kind} value={kind}>{kind}</option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="Validation score">
-                  <input value={learningValidation} onChange={(event) => setLearningValidation(event.target.value)} inputMode="decimal" />
-                </Field>
-                <Field label="Repeat count">
-                  <input value={learningRepeat} onChange={(event) => setLearningRepeat(event.target.value)} inputMode="numeric" />
-                </Field>
-              </div>
-              <label className="check-row">
-                <input type="checkbox" checked={learningExplicit} onChange={(event) => setLearningExplicit(event.target.checked)} />
-                <span>Explicit instruction</span>
-              </label>
-              <button type="submit">Review Learning Signal</button>
-            </form>
-            {learningResult && <JsonBlock value={learningResult} />}
-          </Panel>
-
-          <Panel title="Behavior Deltas Review" icon={<ShieldCheck size={19} />}>
-            <section aria-label="Behavior Deltas Review" className="run-detail">
-              <h3>Behavior Deltas Review</h3>
-              <p className="muted">Mutation actions require exact-call approval and MutationGate review.</p>
-              {behaviorDeltaError && <p className="danger-text">Behavior delta ledger unavailable: {behaviorDeltaError}</p>}
-              {behaviorDeltaReport ? (
-                <>
-                  <div className="metric-grid">
-                    <Metric label="Total Deltas" value={behaviorDeltaReport.summary.total_deltas} />
-                    <Metric label="Active" value={behaviorDeltaReport.summary.active_deltas} />
-                    <Metric label="Useful Rate" value={formatPercent(behaviorDeltaReport.summary.useful_rate)} />
-                    <Metric label="Never Activated" value={behaviorDeltaReport.summary.never_activated} />
-                  </div>
-
-                  <section aria-label="Learning Dashboard" className="run-detail">
-                    <h3>Learning Dashboard</h3>
-                    <p className="muted">Read-only rollout telemetry for autonomous learning defaults and rollback safety.</p>
-                    {learningDashboardError && <p className="danger-text">Learning dashboard unavailable: {learningDashboardError}</p>}
-                    {learningDashboard ? (
-                      <>
-                        <div className="metric-grid">
-                          <Metric label="Auto-activations" value={learningDashboard.headline.auto_activations} />
-                          <Metric label="Rollbacks" value={learningDashboard.headline.rollbacks} />
-                          <Metric label="FP Rate" value={formatPercent(learningDashboard.headline.false_positive_rate)} />
-                          <Metric label="Activations then rolled back" value={learningDashboard.headline.activations_then_rolled_back} />
-                        </div>
-                        <div className="list compact-list">
-                          {learningDashboard.layers.map((layer) => (
-                            <div className="data-row" key={layer.layer}>
-                              <strong>{layer.layer}</strong>
-                              <InlineMeta items={[`${layer.activations} activations`, `${layer.auto_activations} auto`, `${layer.rollbacks} rollbacks`]} />
-                              <p>{`False positives ${formatPercent(layer.false_positive_rate)} · rollback avg ${layer.average_time_to_rollback_hours ?? "n/a"}h`}</p>
-                            </div>
-                          ))}
-                          {learningDashboard.layers.length === 0 && <EmptyState>No learning dashboard activity recorded.</EmptyState>}
-                        </div>
-                      </>
-                    ) : (
-                      <EmptyState>Learning dashboard is loading.</EmptyState>
-                    )}
-                  </section>
-                  <div className="list compact-list">
-                    {behaviorDeltaReport.deltas.slice(0, 12).map((delta) => (
-                      <div className="data-row" key={delta.delta_id}>
-                        <strong>{delta.title}</strong>
-                        <InlineMeta items={[delta.delta_id, `${delta.status} · ${delta.kind} · ${delta.risk}`, `${delta.activation_count} activations`]} />
-                        <p>{`Useful ${formatPercent(delta.useful_rate)} · Failure ${formatPercent(delta.failure_rate)} · Rollback ${formatPercent(delta.rollback_rate)}`}</p>
-                        <StatusBadge value={delta.target_layer} />
-                      </div>
-                    ))}
-                    {behaviorDeltaReport.deltas.length === 0 && <EmptyState>No behavior deltas recorded.</EmptyState>}
-                  </div>
-                </>
-              ) : (
-                <EmptyState>Behavior delta report is loading.</EmptyState>
-              )}
-            </section>
-          </Panel>
-
-          <Panel title="Lessons & Failures" icon={<TestTube2 size={19} />}>
-            <h3>Lessons</h3>
-            <RecordList records={lessons} />
-            <h3>Failure Episodes</h3>
-            <RecordList records={failures} />
-            <form onSubmit={diagnose} className="stack-form">
-              <Field label="Diagnose failure text">
-                <textarea value={diagnosisText} onChange={(event) => setDiagnosisText(event.target.value)} rows={4} />
-              </Field>
-              <button type="submit">Classify & Recall Lessons</button>
-            </form>
-            {diagnosisResult && <JsonBlock value={diagnosisResult} />}
           </Panel>
         </section>
 
@@ -3630,37 +2893,17 @@ export function LegacyWorkbench({
             </div>
           </Panel>
         </section>
-      </section>
+      </ExtendWorkspace>
       )}
         {activeSection === "settings" && (
-          <section id="settings" className="shell page-shell settings-page" data-section="settings" aria-label="Settings">
-            <header className="page-head">
-              <div>
-                <p className="page-eyebrow">Configuration</p>
-                <h1 className="page-title">Settings<em>.</em></h1>
-                <p className="page-subtitle">
-                  The everyday surface for Kestrel: identity, provider, memory, channels,
-                  secrets, and permissions. Deep runtime controls stay one click away in Advanced.
-                </p>
-              </div>
-              <div className="page-actions">
-                <button className="btn subtle" type="button" onClick={() => refreshAll().catch(reportError)}>
-                  <RefreshCw size={15} /> Refresh
-                </button>
-                <button className="btn primary" type="button" onClick={() => saveRuntimeSettings().catch(reportError)}>
-                  <Check size={15} /> Save Settings
-                </button>
-                <button className="btn subtle" type="button" onClick={() => jumpToAdvanced("runtime")}>
-                  Open Advanced
-                </button>
-              </div>
-            </header>
-            {notice && (
-              <div className="announcer page-notice" aria-live="polite">
-                {notice}
-              </div>
-            )}
-            {error && <ActionError message={error} onDismiss={() => setError(null)} />}
+          <SettingsWorkspace
+            controller={settingsWorkspace}
+            error={error}
+            notice={notice}
+            onDismissError={() => setError(null)}
+            onOpenAdvanced={() => jumpToAdvanced("runtime")}
+            onRefresh={refreshOperatorWorkspace}
+          >
 
             <section className="section" id="identity">
               <div className="section-head">
@@ -3811,12 +3054,7 @@ export function LegacyWorkbench({
                       providerDisplayName={providerDisplayName}
                       providerRequiresKey={providerRequiresKey}
                       providerSecretResult={providerSecretResult}
-                      onStored={async (result) => {
-                        setProviderSecretResult(result);
-                        setNotice("Provider key stored.");
-                        await refreshProviderModels(provider);
-                        await refreshSummary();
-                      }}
+                      onStored={acceptBrowserProviderSecret}
                       onError={reportError}
                     />
                   )}
@@ -3953,7 +3191,7 @@ export function LegacyWorkbench({
                   </div>
                 </div>
                 <div className="layer-grid settings-layer-grid">
-                  {memoryLayers.map((layer) => (
+                  {memoryWorkspace.memoryLayers.map((layer) => (
                     <article className="layer-card" key={layer.layer}>
                       <h3>{layer.layer}<span className="file">{layer.path}</span></h3>
                       <p className="desc">{layer.backend}</p>
@@ -4061,7 +3299,15 @@ export function LegacyWorkbench({
                   <Metric label="Runs" value={runs.length} />
                   <Metric label="Pending approvals" value={approvals.length} />
                   <Metric label="Tools enabled" value={`${enabledToolCount}/${tools.length}`} />
-                  <Metric label="MCP servers" value={mcpServers.length} />
+                  <Metric
+                    label="MCP servers"
+                    value={
+                      capabilities.filter(
+                        (capability) =>
+                          capability.kind === "mcp_server",
+                      ).length
+                    }
+                  />
                 </div>
                 <div className="permission-grid">
                   {toolPermissionDefinitions.map((permission) => {
@@ -4264,55 +3510,9 @@ export function LegacyWorkbench({
                 {runtime ? <JsonBlock value={runtime} maxHeight="680px" /> : <EmptyState>Runtime config is loading.</EmptyState>}
               </div>
             </section>
-          </section>
+          </SettingsWorkspace>
         )}
       </div>
-      {activeSection === "chat" && inspectorOpen && (
-        <aside className="inspector" aria-label="Run details">
-          <div className="inspector-head">
-            <h2>Run details</h2>
-            <button type="button" aria-label="Close panel" onClick={() => setInspectorOpen(false)}>
-              <X size={15} />
-            </button>
-          </div>
-          {activeRun ? (
-            <>
-              <section>
-                <h3>Current run</h3>
-                <StatusBadge value={activeRun.status} />
-                <InlineMeta items={[activeRun.run_id, activeRun.session_id, activeRun.model]} />
-                {activeRun.error && <p className="danger-text">{activeRun.error}</p>}
-              </section>
-              <section>
-                <h3>Plan</h3>
-                <TaskList title="Needs You" tasks={taskGraph?.approval_blocked_tasks ?? []} onApprove={approveTask} />
-                <TaskList title="Ready" tasks={taskGraph?.ready_tasks ?? []} onApprove={approveTask} />
-              </section>
-              {proofOfWork && (
-                <section>
-                  <h3>Validation</h3>
-                  <SummaryList title="Completed" values={asStringArray(proofOfWork.completed_steps)} />
-                  <SummaryList title="Evidence" values={asStringArray(proofOfWork.validation_evidence)} />
-                  <SummaryList title="Risks" values={asStringArray(proofOfWork.remaining_risks)} />
-                </section>
-              )}
-              <section>
-                <h3>Activity</h3>
-                <div className="trace-list compact-trace">
-                  {(runTrace?.timeline ?? events).slice(-12).map((event) => (
-                    <div className="trace-row" key={`${event.id}-${event.type}`}>
-                      <strong>{friendlyEventLabel(event.type)}</strong>
-                      <small>{event.created_at}</small>
-                      <code>{JSON.stringify(event.payload).slice(0, 220)}</code>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            </>
-          ) : (
-            <EmptyState>No run selected.</EmptyState>
-          )}
-        </aside>
       )}
     </div>
       )}
@@ -4330,889 +3530,6 @@ export function LegacyWorkbench({
       )}
   </>
   );
-}
-
-type RoutineDraft = {
-  name: string;
-  prompt: string;
-  schedule_kind: "once" | "interval" | "cron";
-  start_at_local: string;
-  interval_seconds: string;
-  cron_expression: string;
-  timezone: string;
-  delivery_channel_id: string;
-  delivery_conversation_id: string;
-  delivery_template: string;
-  workspace: string;
-  provider: string;
-  model: string;
-  autonomy_mode: string;
-  misfire_grace_seconds: string;
-};
-
-type RoutineRunNowRequestRecord = {
-  idempotencyKey: string;
-  expectedRevision: number;
-};
-
-const ROUTINE_RUN_NOW_STORAGE_PREFIX = "kestrel.routine.run-now.v1:";
-const ROUTINE_HISTORY_POLL_INTERVAL_MS = 1_500;
-const ROUTINE_HISTORY_MAX_POLLS = 400;
-const ROUTINE_NONTERMINAL_STATUSES = new Set(["claimed", "running"]);
-const ROUTINE_RUN_NOW_DEFINITIVE_REJECTION_STATUSES = new Set([400, 401, 403, 404, 409, 422]);
-
-type RoutineHistoryRequest = {
-  routineId: string;
-  controller: AbortController;
-  promise: Promise<void>;
-};
-
-function RoutineWorkbench({ onAuthRequired }: { onAuthRequired: () => void }) {
-  const [status, setStatus] = useState<RoutineStatus | null>(null);
-  const [routines, setRoutines] = useState<Routine[]>([]);
-  const [selectedRoutineId, setSelectedRoutineId] = useState<string | null>(null);
-  const selectedRoutineIdRef = useRef<string | null>(null);
-  const [history, setHistory] = useState<RoutineOccurrence[]>([]);
-  const [deliveries, setDeliveries] = useState<RoutineDelivery[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [historyError, setHistoryError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [editorMode, setEditorMode] = useState<"create" | "edit" | null>(null);
-  const [draft, setDraft] = useState<RoutineDraft>(() => emptyRoutineDraft());
-  const [mutationPending, setMutationPending] = useState(false);
-  const [runNowPendingId, setRunNowPendingId] = useState<string | null>(null);
-  const [uncertainRoutineIds, setUncertainRoutineIds] = useState<Set<string>>(() => new Set());
-  const [runNowResult, setRunNowResult] = useState<RoutineRunNowResult | null>(null);
-  const runNowRequestRef = useRef(new Map<string, RoutineRunNowRequestRecord>());
-  const historyRequestRef = useRef<RoutineHistoryRequest | null>(null);
-
-  const selectedRoutine = routines.find((routine) => routine.routine_id === selectedRoutineId) ?? null;
-  const selectedHistoryHasNonterminalOccurrence = history.some((occurrence) =>
-    ROUTINE_NONTERMINAL_STATUSES.has(occurrence.status)
-  );
-  const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local time";
-
-  function selectRoutineId(routineId: string | null) {
-    if (selectedRoutineIdRef.current !== routineId) {
-      historyRequestRef.current?.controller.abort();
-      historyRequestRef.current = null;
-      setHistory([]);
-      setDeliveries([]);
-      setHistoryError(null);
-      setHistoryLoading(false);
-    }
-    selectedRoutineIdRef.current = routineId;
-    setSelectedRoutineId(routineId);
-  }
-
-  const handleError = useCallback((value: unknown, fallback: string) => {
-    if (value instanceof ApiAuthError) {
-      onAuthRequired();
-      return "Kestrel API authentication is required for routine owner actions.";
-    }
-    return value instanceof Error ? value.message : fallback;
-  }, [onAuthRequired]);
-
-  const refreshHistory = useCallback(async (routineId: string, options: { showLoading?: boolean } = {}) => {
-    const existingRequest = historyRequestRef.current;
-    if (existingRequest?.routineId === routineId) {
-      return existingRequest.promise;
-    }
-
-    existingRequest?.controller.abort();
-    const controller = new AbortController();
-    const request: RoutineHistoryRequest = {
-      routineId,
-      controller,
-      promise: Promise.resolve()
-    };
-    historyRequestRef.current = request;
-
-    if (options.showLoading !== false) setHistoryLoading(true);
-    setHistoryError(null);
-    request.promise = (async () => {
-      try {
-        const rows = await getJson<RoutineOccurrence[]>(
-          `/api/routines/${encodeURIComponent(routineId)}/history${queryString({ limit: 50 })}`,
-          { signal: controller.signal }
-        );
-        if (controller.signal.aborted || selectedRoutineIdRef.current !== routineId) return;
-        setHistory(rows);
-        try {
-          const deliveryRows = await getJson<RoutineDelivery[]>(
-            `/api/routines/${encodeURIComponent(routineId)}/deliveries${queryString({ limit: 50 })}`,
-            { signal: controller.signal }
-          );
-          if (!controller.signal.aborted && selectedRoutineIdRef.current === routineId) {
-            setDeliveries(Array.isArray(deliveryRows) ? deliveryRows : []);
-          }
-        } catch {
-          if (!controller.signal.aborted && selectedRoutineIdRef.current === routineId) {
-            setDeliveries([]);
-          }
-        }
-        setRunNowResult((current) => {
-          if (!current || current.occurrence.routine_id !== routineId) return current;
-          const occurrence = rows.find(
-            (row) => row.occurrence_id === current.occurrence.occurrence_id
-          );
-          if (!occurrence) return current;
-          return {
-            ...current,
-            occurrence,
-            dispatch: current.dispatch
-              ? {
-                  ...current.dispatch,
-                  status: occurrence.status,
-                  error: occurrence.error
-                }
-              : null
-          };
-        });
-      } catch (value) {
-        if (controller.signal.aborted || selectedRoutineIdRef.current !== routineId) return;
-        setHistory([]);
-        setDeliveries([]);
-        setHistoryError(handleError(value, "Routine history is unavailable."));
-      } finally {
-        if (historyRequestRef.current === request) historyRequestRef.current = null;
-        if (!controller.signal.aborted && selectedRoutineIdRef.current === routineId) {
-          setHistoryLoading(false);
-        }
-      }
-    })();
-    return request.promise;
-  }, [handleError]);
-
-  async function refreshWorkbench(preferredRoutineId = selectedRoutineIdRef.current) {
-    setLoading(true);
-    setLoadError(null);
-    const [statusResult, routinesResult] = await Promise.allSettled([
-      getJson<RoutineStatus>("/api/routines/status"),
-      getJson<Routine[]>("/api/routines")
-    ]);
-
-    if (statusResult.status === "fulfilled") {
-      setStatus(statusResult.value);
-    } else {
-      setStatus(null);
-      setLoadError(handleError(statusResult.reason, "Routine status is unavailable."));
-    }
-
-    if (routinesResult.status === "fulfilled") {
-      const nextRoutines = routinesResult.value;
-      setRoutines(nextRoutines);
-      const recoveredUncertain = new Set<string>();
-      nextRoutines.forEach((routine) => {
-        const recovered = runNowRequestRef.current.get(routine.routine_id) ?? readStoredRunNowRequest(routine.routine_id);
-        if (!recovered) return;
-        runNowRequestRef.current.set(routine.routine_id, recovered);
-        recoveredUncertain.add(routine.routine_id);
-      });
-      setUncertainRoutineIds(recoveredUncertain);
-      const nextSelection =
-        nextRoutines.find((routine) => routine.routine_id === preferredRoutineId)?.routine_id ??
-        nextRoutines[0]?.routine_id ??
-        null;
-      selectRoutineId(nextSelection);
-      if (nextSelection) {
-        await refreshHistory(nextSelection);
-      } else {
-        setHistory([]);
-        setDeliveries([]);
-        setHistoryError(null);
-      }
-    } else {
-      setRoutines([]);
-      selectRoutineId(null);
-      setHistory([]);
-      setDeliveries([]);
-      const message = handleError(routinesResult.reason, "Routine definitions are unavailable.");
-      setLoadError((current) => current ? `${current} ${message}` : message);
-    }
-    setLoading(false);
-  }
-
-  useEffect(() => {
-    void refreshWorkbench();
-  }, []);
-
-  useEffect(() => () => {
-    selectedRoutineIdRef.current = null;
-    historyRequestRef.current?.controller.abort();
-    historyRequestRef.current = null;
-  }, []);
-
-  useEffect(() => {
-    if (!selectedRoutineId || !selectedHistoryHasNonterminalOccurrence) return;
-
-    let cancelled = false;
-    let pollCount = 0;
-    let timeoutId: number | null = null;
-
-    const poll = async () => {
-      if (cancelled) return;
-      pollCount += 1;
-      await refreshHistory(selectedRoutineId, { showLoading: false });
-      if (!cancelled && pollCount < ROUTINE_HISTORY_MAX_POLLS) schedulePoll();
-    };
-    const schedulePoll = () => {
-      timeoutId = window.setTimeout(() => {
-        timeoutId = null;
-        void poll();
-      }, ROUTINE_HISTORY_POLL_INTERVAL_MS);
-    };
-
-    schedulePoll();
-    return () => {
-      cancelled = true;
-      if (timeoutId !== null) window.clearTimeout(timeoutId);
-    };
-  }, [refreshHistory, selectedHistoryHasNonterminalOccurrence, selectedRoutineId]);
-
-  async function chooseRoutine(routine: Routine) {
-    selectRoutineId(routine.routine_id);
-    setRunNowResult(null);
-    await refreshHistory(routine.routine_id);
-  }
-
-  function openCreateEditor() {
-    setDraft(emptyRoutineDraft());
-    setEditorMode("create");
-    setActionError(null);
-  }
-
-  function openEditEditor(routine: Routine) {
-    setDraft(routineDraftFrom(routine));
-    selectRoutineId(routine.routine_id);
-    setEditorMode("edit");
-    setActionError(null);
-  }
-
-  async function submitRoutine(event: FormEvent) {
-    event.preventDefault();
-    setActionError(null);
-    setNotice(null);
-    setMutationPending(true);
-    try {
-      const payload = routinePayload(draft);
-      const saved = editorMode === "edit" && selectedRoutine
-        ? await putJson<Routine>(`/api/routines/${encodeURIComponent(selectedRoutine.routine_id)}`, {
-            expected_revision: selectedRoutine.revision,
-            ...payload
-          })
-        : await postJson<Routine>("/api/routines", payload);
-      setEditorMode(null);
-      setNotice(editorMode === "edit" ? `${saved.name} updated.` : `${saved.name} created disabled; review it before enabling.`);
-      await refreshWorkbench(saved.routine_id);
-    } catch (value) {
-      setActionError(handleError(value, "Routine could not be saved."));
-    } finally {
-      setMutationPending(false);
-    }
-  }
-
-  async function toggleRoutine(routine: Routine) {
-    setActionError(null);
-    setNotice(null);
-    setMutationPending(true);
-    try {
-      const saved = await putJson<Routine>(`/api/routines/${encodeURIComponent(routine.routine_id)}/enabled`, {
-        expected_revision: routine.revision,
-        enabled: !routine.enabled
-      });
-      setNotice(`${saved.name} ${saved.enabled ? "enabled" : "paused"}.`);
-      await refreshWorkbench(saved.routine_id);
-    } catch (value) {
-      setActionError(handleError(value, "Routine state could not be changed."));
-    } finally {
-      setMutationPending(false);
-    }
-  }
-
-  async function deleteRoutine(routine: Routine) {
-    if (!window.confirm(`Delete ${routine.name}? Its occurrence history remains in the local audit store.`)) return;
-    setActionError(null);
-    setNotice(null);
-    setMutationPending(true);
-    try {
-      await deleteJson<Routine>(
-        `/api/routines/${encodeURIComponent(routine.routine_id)}${queryString({ expected_revision: routine.revision })}`
-      );
-      forgetRunNowRequest(runNowRequestRef.current, routine.routine_id);
-      setUncertainRoutineIds((current) => withoutSetValue(current, routine.routine_id));
-      setNotice(`${routine.name} deleted.`);
-      await refreshWorkbench(null);
-    } catch (value) {
-      setActionError(handleError(value, "Routine could not be deleted."));
-    } finally {
-      setMutationPending(false);
-    }
-  }
-
-  async function runRoutineNow(routine: Routine) {
-    let request = runNowRequestRef.current.get(routine.routine_id) ?? readStoredRunNowRequest(routine.routine_id);
-    if (!request) {
-      request = {
-        idempotencyKey: crypto.randomUUID(),
-        expectedRevision: routine.revision
-      };
-      runNowRequestRef.current.set(routine.routine_id, request);
-      storeRunNowRequest(routine.routine_id, request);
-    }
-
-    setRunNowPendingId(routine.routine_id);
-    setActionError(null);
-    setNotice(null);
-    try {
-      const result = await postJson<RoutineRunNowResult>(
-        `/api/routines/${encodeURIComponent(routine.routine_id)}/actions/run-now`,
-        {
-          expected_revision: request.expectedRevision,
-          idempotency_key: request.idempotencyKey
-        }
-      );
-      forgetRunNowRequest(runNowRequestRef.current, routine.routine_id);
-      setUncertainRoutineIds((current) => withoutSetValue(current, routine.routine_id));
-      setRunNowResult(result);
-      setNotice(
-        result.idempotent_replay
-          ? `${routine.name} request recovered without creating a duplicate run.`
-          : `${routine.name} dispatched.`
-      );
-      await refreshHistory(routine.routine_id);
-    } catch (value) {
-      if (
-        value instanceof ApiResponseError
-        && ROUTINE_RUN_NOW_DEFINITIVE_REJECTION_STATUSES.has(value.status)
-      ) {
-        forgetRunNowRequest(runNowRequestRef.current, routine.routine_id);
-        setUncertainRoutineIds((current) => withoutSetValue(current, routine.routine_id));
-        setActionError(handleError(value, "Routine dispatch was rejected."));
-      } else {
-        setUncertainRoutineIds((current) => new Set(current).add(routine.routine_id));
-        const reason = value instanceof ApiResponseError
-          ? `The server returned ${value.status} before confirming the outcome for ${routine.name}.`
-          : `No response was received for ${routine.name}.`;
-        setActionError(`${reason} Retry run now to safely reuse the same request key.`);
-      }
-    } finally {
-      setRunNowPendingId(null);
-    }
-  }
-
-  async function reconcileRoutineDelivery(
-    delivery: RoutineDelivery,
-    resolution: "retry" | "delivered" | "failed"
-  ) {
-    setMutationPending(true);
-    setActionError(null);
-    setNotice(null);
-    try {
-      const updated = await postJson<RoutineDelivery>(
-        `/api/routine-deliveries/${encodeURIComponent(delivery.delivery_id)}/actions/reconcile`,
-        {
-          expected_attempt_count: delivery.attempt_count,
-          resolution,
-          receipt: resolution === "delivered"
-            ? { operator_confirmed: true }
-            : null
-        }
-      );
-      setNotice(`Delivery ${updated.delivery_id} reconciled as ${updated.status}.`);
-      await refreshHistory(delivery.routine_id);
-    } catch (value) {
-      setActionError(handleError(value, "Routine delivery could not be reconciled."));
-    } finally {
-      setMutationPending(false);
-    }
-  }
-
-  const enabledCount = routines.filter((routine) => routine.enabled).length;
-  const selectedIsUncertain = selectedRoutine ? uncertainRoutineIds.has(selectedRoutine.routine_id) : false;
-
-  return (
-    <section id="routines" className="shell page-shell routines-page" data-section="routines" aria-label="Routine Workbench">
-      <header className="page-head">
-        <div>
-          <p className="page-eyebrow">Personal automation</p>
-          <h1 className="page-title">Routine Workbench<em>.</em></h1>
-          <p className="page-subtitle">
-            Schedule durable local turns, inspect their audit history, and dispatch one routine now without duplicate retries.
-          </p>
-        </div>
-        <div className="page-actions">
-          <button className="btn subtle" type="button" onClick={() => void refreshWorkbench()} disabled={loading}>
-            <RefreshCw size={15} /> Refresh
-          </button>
-          <button className="btn primary" type="button" onClick={openCreateEditor}>
-            <Plus size={15} /> New routine
-          </button>
-        </div>
-      </header>
-
-      <div className="announcer page-notice" aria-live="polite">{notice}</div>
-      {loadError && <ActionError message={loadError} onDismiss={() => setLoadError(null)} />}
-      {actionError && <ActionError message={actionError} onDismiss={() => setActionError(null)} />}
-
-      <section className="routine-status-grid" aria-label="Routine service status">
-        <Metric label="Definitions" value={routines.length} />
-        <Metric label="Enabled" value={enabledCount} />
-        <Metric label="Dispatcher" value={status?.enabled ? "enabled" : "disabled"} />
-        <Metric label="Loop" value={status?.loop?.running ? "running" : status?.loop ? "stopped" : "unavailable"} />
-      </section>
-
-      {status && !status.enabled && (
-        <section className="routine-disabled-callout" role="status">
-          <ShieldCheck size={18} />
-          <div>
-            <strong>Proactive dispatch is disabled.</strong>
-            <p>Definitions remain editable, but scheduled and manual runs stay fail-closed until proactive routines are enabled at launch.</p>
-          </div>
-        </section>
-      )}
-      {status?.loop?.last_error && (
-        <section className="routine-disabled-callout danger" role="alert">
-          <div>
-            <strong>The routine loop reported an error.</strong>
-            <p>{status.loop.last_error}</p>
-          </div>
-        </section>
-      )}
-
-      <div className="routine-workbench-grid">
-        <Panel
-          id="routine-definitions"
-          title="Routines"
-          icon={<CalendarClock size={19} />}
-          actions={<StatusBadge value={loading ? "loading" : `${routines.length} total`} />}
-        >
-          <div className="routine-list">
-            {routines.map((routine) => (
-              <article
-                className={`routine-card ${routine.routine_id === selectedRoutineId ? "selected" : ""}`}
-                key={routine.routine_id}
-              >
-                <button type="button" className="routine-select" onClick={() => void chooseRoutine(routine)}>
-                  <span>
-                    <strong>{routine.name}</strong>
-                    <small>{routineScheduleLabel(routine)}</small>
-                  </span>
-                  <StatusBadge value={routine.enabled ? "enabled" : "paused"} />
-                </button>
-                <div className="routine-card-actions">
-                  <button
-                    type="button"
-                    aria-label={`${routine.enabled ? "Pause" : "Enable"} ${routine.name}`}
-                    onClick={() => void toggleRoutine(routine)}
-                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
-                  >
-                    {routine.enabled ? "Pause" : "Enable"}
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Edit ${routine.name}`}
-                    onClick={() => openEditEditor(routine)}
-                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
-                  >
-                    <Pencil size={14} /> Edit
-                  </button>
-                  <button
-                    type="button"
-                    className="btn danger"
-                    aria-label={`Delete ${routine.name}`}
-                    onClick={() => void deleteRoutine(routine)}
-                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
-                  >
-                    <Trash2 size={14} /> Delete
-                  </button>
-                </div>
-              </article>
-            ))}
-            {!loading && routines.length === 0 && <EmptyState>No routines yet. Create one to start with a disabled, reviewable definition.</EmptyState>}
-          </div>
-        </Panel>
-
-        <Panel
-          id="routine-detail"
-          title={selectedRoutine?.name ?? "Routine detail"}
-          icon={<Play size={19} />}
-          actions={selectedRoutine ? <StatusBadge value={`revision ${selectedRoutine.revision}`} /> : undefined}
-        >
-          {selectedRoutine ? (
-            <div className="routine-detail">
-              <p>{selectedRoutine.prompt}</p>
-              <dl className="routine-facts">
-                <div><dt>Schedule</dt><dd>{routineScheduleLabel(selectedRoutine)}</dd></div>
-                <div><dt>Next run</dt><dd>{formatRoutineDate(selectedRoutine.next_run_at)}</dd></div>
-                <div><dt>Workspace</dt><dd>{selectedRoutine.workspace || "Configured default"}</dd></div>
-                <div><dt>Provider</dt><dd>{[selectedRoutine.provider, selectedRoutine.model].filter(Boolean).join(" / ") || "Configured default"}</dd></div>
-                <div><dt>Autonomy</dt><dd>{selectedRoutine.autonomy_mode}</dd></div>
-                <div><dt>Timezone</dt><dd>{selectedRoutine.timezone || "UTC"} schedule · {localTimeZone} display</dd></div>
-                <div>
-                  <dt>Delivery</dt>
-                  <dd>
-                    {selectedRoutine.delivery && "channel_id" in selectedRoutine.delivery
-                      ? `${selectedRoutine.delivery.channel_id} / ${selectedRoutine.delivery.conversation_id}`
-                      : "No external destination"}
-                  </dd>
-                </div>
-              </dl>
-              <button
-                type="button"
-                className="btn primary routine-run-now"
-                aria-label={`${selectedIsUncertain ? "Retry" : "Run"} ${selectedRoutine.name} now`}
-                disabled={!status?.enabled || !selectedRoutine.enabled || runNowPendingId !== null}
-                onClick={() => void runRoutineNow(selectedRoutine)}
-              >
-                <Play size={14} />
-                {runNowPendingId === selectedRoutine.routine_id
-                  ? "Dispatching…"
-                  : selectedIsUncertain
-                    ? "Retry run now safely"
-                    : "Run now"}
-              </button>
-              {!selectedRoutine.enabled && <p className="muted">Enable this definition before running it.</p>}
-              {selectedIsUncertain && (
-                <p className="routine-retry-note" role="status">
-                  Retry will reuse the original idempotency key and revision until the server gives a definite response.
-                </p>
-              )}
-              {runNowResult?.occurrence.routine_id === selectedRoutine.routine_id && (
-                <div className="routine-run-result" aria-live="polite">
-                  <strong>{runNowResult.idempotent_replay ? "Recovered dispatch" : "Dispatch accepted"}</strong>
-                  <InlineMeta items={[runNowResult.occurrence.run_id, runNowResult.occurrence.status, runNowResult.occurrence.trigger_kind]} />
-                </div>
-              )}
-              <section className="routine-history" aria-labelledby="routine-history-title">
-                <div className="routine-history-head">
-                  <h3 id="routine-history-title">Run history</h3>
-                  <StatusBadge value={historyLoading ? "loading" : `${history.length} records`} />
-                </div>
-                {historyError && <p className="danger-text">History unavailable: {historyError}</p>}
-                <div className="list compact-list">
-                  {history.map((occurrence) => (
-                    <article className="data-row" key={occurrence.occurrence_id}>
-                      <div className="run-title">
-                        <strong>{occurrence.trigger_kind === "manual" ? "Manual run" : "Scheduled run"}</strong>
-                        <StatusBadge value={occurrence.status} />
-                      </div>
-                      <InlineMeta items={[occurrence.run_id, formatRoutineDate(occurrence.requested_at ?? occurrence.scheduled_for)]} />
-                      {(occurrence.error || occurrence.skip_reason) && <p className="danger-text">{occurrence.error || occurrence.skip_reason}</p>}
-                    </article>
-                  ))}
-                  {!historyLoading && !historyError && history.length === 0 && <EmptyState>No occurrences recorded for this routine.</EmptyState>}
-                </div>
-              </section>
-              <section className="routine-history" aria-labelledby="routine-delivery-title">
-                <div className="routine-history-head">
-                  <h3 id="routine-delivery-title">Delivery history</h3>
-                  <StatusBadge value={`${deliveries.length} records`} />
-                </div>
-                <div className="list compact-list">
-                  {deliveries.map((delivery) => (
-                    <article className="data-row" key={delivery.delivery_id}>
-                      <div className="run-title">
-                        <strong>{delivery.destination.channel_id} / {delivery.destination.conversation_id}</strong>
-                        <StatusBadge value={delivery.status} />
-                      </div>
-                      <InlineMeta items={[
-                        `attempt ${delivery.attempt_count}`,
-                        delivery.idempotency_key,
-                        formatRoutineDate(delivery.delivered_at ?? delivery.updated_at)
-                      ]} />
-                      {delivery.error ? <p className="danger-text">{delivery.error}</p> : null}
-                      {["uncertain", "failed", "blocked"].includes(delivery.status) ? (
-                        <div className="page-actions">
-                          <button
-                            type="button"
-                            disabled={mutationPending || !status?.enabled}
-                            onClick={() => void reconcileRoutineDelivery(delivery, "retry")}
-                          >
-                            Retry with same key
-                          </button>
-                          <button
-                            type="button"
-                            disabled={mutationPending || !status?.enabled}
-                            onClick={() => void reconcileRoutineDelivery(delivery, "delivered")}
-                          >
-                            Mark delivered
-                          </button>
-                          <button
-                            type="button"
-                            disabled={mutationPending || !status?.enabled}
-                            onClick={() => void reconcileRoutineDelivery(delivery, "failed")}
-                          >
-                            Mark failed
-                          </button>
-                        </div>
-                      ) : null}
-                    </article>
-                  ))}
-                  {!historyLoading && deliveries.length === 0 ? (
-                    <EmptyState>No delivery attempts recorded for this routine.</EmptyState>
-                  ) : null}
-                </div>
-              </section>
-            </div>
-          ) : (
-            <EmptyState>Select a routine to inspect its schedule and run history.</EmptyState>
-          )}
-        </Panel>
-      </div>
-
-      {editorMode && (
-        <Panel
-          id="routine-editor"
-          title={editorMode === "edit" ? `Edit ${selectedRoutine?.name ?? "routine"}` : "Create routine"}
-          icon={editorMode === "edit" ? <Pencil size={19} /> : <Plus size={19} />}
-        >
-          <form className="routine-editor-form" aria-label={editorMode === "edit" ? "Edit routine" : "Create routine"} onSubmit={submitRoutine}>
-            <Field label="Routine name">
-              <input required maxLength={200} value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} />
-            </Field>
-            <Field label="Prompt">
-              <textarea required maxLength={20_000} rows={5} value={draft.prompt} onChange={(event) => setDraft((current) => ({ ...current, prompt: event.target.value }))} />
-            </Field>
-            <div className="field-row">
-              <Field label="Schedule">
-                <select value={draft.schedule_kind} onChange={(event) => setDraft((current) => ({ ...current, schedule_kind: event.target.value as "once" | "interval" | "cron" }))}>
-                  <option value="once">Once</option>
-                  <option value="interval">Fixed interval</option>
-                  <option value="cron">Cron / calendar</option>
-                </select>
-              </Field>
-              <Field label={`Start time (${localTimeZone})`} hint="Stored as UTC after submission.">
-                <input type="datetime-local" required value={draft.start_at_local} onChange={(event) => setDraft((current) => ({ ...current, start_at_local: event.target.value }))} />
-              </Field>
-              {draft.schedule_kind === "interval" && (
-                <Field label="Interval seconds" hint="Minimum 60 seconds.">
-                  <input type="number" required min="60" max="31536000" step="1" value={draft.interval_seconds} onChange={(event) => setDraft((current) => ({ ...current, interval_seconds: event.target.value }))} />
-                </Field>
-              )}
-              {draft.schedule_kind === "cron" && (
-                <>
-                  <Field label="Cron expression" hint="Five fields: minute hour day month weekday.">
-                    <input required value={draft.cron_expression} onChange={(event) => setDraft((current) => ({ ...current, cron_expression: event.target.value }))} placeholder="0 9 * * 1-5" />
-                  </Field>
-                  <Field label="IANA timezone" hint="DST is evaluated in this named timezone.">
-                    <input required maxLength={128} value={draft.timezone} onChange={(event) => setDraft((current) => ({ ...current, timezone: event.target.value }))} placeholder="America/Detroit" />
-                  </Field>
-                </>
-              )}
-              <Field label="Misfire grace seconds">
-                <input type="number" required min="0" max="604800" step="1" value={draft.misfire_grace_seconds} onChange={(event) => setDraft((current) => ({ ...current, misfire_grace_seconds: event.target.value }))} />
-              </Field>
-            </div>
-            <div className="field-row">
-              <Field label="Workspace" hint="Blank uses the configured default.">
-                <input maxLength={4096} value={draft.workspace} onChange={(event) => setDraft((current) => ({ ...current, workspace: event.target.value }))} />
-              </Field>
-              <Field label="Provider" hint="Blank uses the configured default.">
-                <input maxLength={256} value={draft.provider} onChange={(event) => setDraft((current) => ({ ...current, provider: event.target.value }))} />
-              </Field>
-              <Field label="Model" hint="Blank uses the configured default.">
-                <input maxLength={256} value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} />
-              </Field>
-              <Field label="Autonomy">
-                <select value={draft.autonomy_mode} onChange={(event) => setDraft((current) => ({ ...current, autonomy_mode: event.target.value }))}>
-                  <option value="background">Safe Auto</option>
-                  <option value="manual">Manual</option>
-                  <option value="autonomous">Autopilot</option>
-                </select>
-              </Field>
-            </div>
-            <div className="field-row">
-              <Field label="Delivery channel" hint="Optional configured channel id.">
-                <input maxLength={128} value={draft.delivery_channel_id} onChange={(event) => setDraft((current) => ({ ...current, delivery_channel_id: event.target.value }))} placeholder="telegram" />
-              </Field>
-              <Field label="Delivery conversation" hint="Required when a channel is selected.">
-                <input maxLength={512} value={draft.delivery_conversation_id} onChange={(event) => setDraft((current) => ({ ...current, delivery_conversation_id: event.target.value }))} placeholder="chat or webhook destination" />
-              </Field>
-              <Field label="Delivery template" hint="Supports {result}, {run_id}, and {run_status}.">
-                <input maxLength={4000} value={draft.delivery_template} onChange={(event) => setDraft((current) => ({ ...current, delivery_template: event.target.value }))} />
-              </Field>
-            </div>
-            <div className="page-actions">
-              <button className="btn primary" type="submit" disabled={mutationPending}>{mutationPending ? "Saving…" : "Save routine"}</button>
-              <button className="btn subtle" type="button" onClick={() => setEditorMode(null)} disabled={mutationPending}>Cancel</button>
-            </div>
-          </form>
-        </Panel>
-      )}
-    </section>
-  );
-}
-
-function emptyRoutineDraft(): RoutineDraft {
-  const start = new Date(Date.now() + 60 * 60 * 1000);
-  start.setSeconds(0, 0);
-  return {
-    name: "",
-    prompt: "",
-    schedule_kind: "once",
-    start_at_local: localDateTimeInput(start),
-    interval_seconds: "3600",
-    cron_expression: "0 9 * * 1-5",
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-    delivery_channel_id: "",
-    delivery_conversation_id: "",
-    delivery_template: "{result}",
-    workspace: "",
-    provider: "",
-    model: "",
-    autonomy_mode: "background",
-    misfire_grace_seconds: "60"
-  };
-}
-
-function routineDraftFrom(routine: Routine): RoutineDraft {
-  return {
-    name: routine.name,
-    prompt: routine.prompt,
-    schedule_kind: routine.schedule_kind,
-    start_at_local: localDateTimeInput(new Date(routine.start_at)),
-    interval_seconds: String(routine.interval_seconds ?? 3600),
-    cron_expression: routine.cron_expression ?? "0 9 * * 1-5",
-    timezone: routine.timezone ?? "UTC",
-    delivery_channel_id: routine.delivery && "channel_id" in routine.delivery
-      ? routine.delivery.channel_id
-      : "",
-    delivery_conversation_id: routine.delivery && "conversation_id" in routine.delivery
-      ? routine.delivery.conversation_id
-      : "",
-    delivery_template: routine.delivery && "template" in routine.delivery
-      ? routine.delivery.template
-      : "{result}",
-    workspace: routine.workspace ?? "",
-    provider: routine.provider ?? "",
-    model: routine.model ?? "",
-    autonomy_mode: routine.autonomy_mode,
-    misfire_grace_seconds: String(routine.misfire_grace_seconds)
-  };
-}
-
-function routinePayload(draft: RoutineDraft): Record<string, unknown> {
-  const start = new Date(draft.start_at_local);
-  if (Number.isNaN(start.valueOf())) throw new Error("Start time must be a valid local date and time.");
-  const intervalSeconds = Number(draft.interval_seconds);
-  const misfireGraceSeconds = Number(draft.misfire_grace_seconds);
-  if (
-    draft.schedule_kind === "interval" &&
-    (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 31_536_000)
-  ) {
-    throw new Error("Interval seconds must be an integer between 60 and 31536000.");
-  }
-  if (!Number.isInteger(misfireGraceSeconds) || misfireGraceSeconds < 0 || misfireGraceSeconds > 604_800) {
-    throw new Error("Misfire grace seconds must be an integer between 0 and 604800.");
-  }
-  if (draft.schedule_kind === "cron" && draft.cron_expression.trim().split(/\s+/).length !== 5) {
-    throw new Error("Cron expression must contain five fields.");
-  }
-  const deliveryChannel = draft.delivery_channel_id.trim();
-  const deliveryConversation = draft.delivery_conversation_id.trim();
-  if (Boolean(deliveryChannel) !== Boolean(deliveryConversation)) {
-    throw new Error("Delivery channel and conversation must be configured together.");
-  }
-  return {
-    name: draft.name.trim(),
-    prompt: draft.prompt.trim(),
-    schedule_kind: draft.schedule_kind,
-    start_at: start.toISOString(),
-    interval_seconds: draft.schedule_kind === "interval" ? intervalSeconds : null,
-    cron_expression: draft.schedule_kind === "cron" ? draft.cron_expression.trim() : null,
-    timezone: draft.timezone.trim() || "UTC",
-    delivery: deliveryChannel
-      ? {
-          channel_id: deliveryChannel,
-          conversation_id: deliveryConversation,
-          template: draft.delivery_template.trim() || "{result}"
-        }
-      : null,
-    workspace: draft.workspace.trim() || null,
-    provider: draft.provider.trim() || null,
-    model: draft.model.trim() || null,
-    autonomy_mode: draft.autonomy_mode,
-    misfire_grace_seconds: misfireGraceSeconds
-  };
-}
-
-function localDateTimeInput(date: Date): string {
-  const offset = date.getTimezoneOffset() * 60_000;
-  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
-}
-
-function routineScheduleLabel(routine: Routine): string {
-  if (routine.schedule_kind === "cron") {
-    return `${routine.cron_expression ?? "Cron"} · ${routine.timezone ?? "UTC"}`;
-  }
-  if (routine.schedule_kind === "interval") {
-    return `Every ${formatDuration(routine.interval_seconds ?? 0)} from ${formatRoutineDate(routine.start_at)}`;
-  }
-  return `Once at ${formatRoutineDate(routine.start_at)}`;
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds > 0 && seconds % 86_400 === 0) return `${seconds / 86_400}d`;
-  if (seconds > 0 && seconds % 3_600 === 0) return `${seconds / 3_600}h`;
-  if (seconds > 0 && seconds % 60 === 0) return `${seconds / 60}m`;
-  return `${seconds}s`;
-}
-
-function formatRoutineDate(value: string | null | undefined): string {
-  if (!value) return "Not scheduled";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
-}
-
-function storeRunNowRequest(routineId: string, request: RoutineRunNowRequestRecord) {
-  try {
-    sessionStorage.setItem(`${ROUTINE_RUN_NOW_STORAGE_PREFIX}${encodeURIComponent(routineId)}`, JSON.stringify(request));
-  } catch {
-    // The in-memory request map still preserves retry safety when browser storage is unavailable.
-  }
-}
-
-function readStoredRunNowRequest(routineId: string): RoutineRunNowRequestRecord | null {
-  const key = `${ROUTINE_RUN_NOW_STORAGE_PREFIX}${encodeURIComponent(routineId)}`;
-  try {
-    const raw = sessionStorage.getItem(key);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<RoutineRunNowRequestRecord>;
-    if (
-      typeof parsed.idempotencyKey !== "string" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.idempotencyKey) ||
-      !Number.isInteger(parsed.expectedRevision) ||
-      Number(parsed.expectedRevision) < 1
-    ) {
-      sessionStorage.removeItem(key);
-      return null;
-    }
-    return {
-      idempotencyKey: parsed.idempotencyKey,
-      expectedRevision: Number(parsed.expectedRevision)
-    };
-  } catch {
-    return null;
-  }
-}
-
-function forgetRunNowRequest(requests: Map<string, RoutineRunNowRequestRecord>, routineId: string) {
-  requests.delete(routineId);
-  try {
-    sessionStorage.removeItem(`${ROUTINE_RUN_NOW_STORAGE_PREFIX}${encodeURIComponent(routineId)}`);
-  } catch {
-    // The request is already removed from the active in-memory retry boundary.
-  }
-}
-
-function withoutSetValue(values: Set<string>, value: string): Set<string> {
-  const next = new Set(values);
-  next.delete(value);
-  return next;
 }
 
 function SetupWizard({
@@ -5441,26 +3758,6 @@ function ApprovalCard({ approval, onApprove }: { approval: Approval; onApprove: 
   );
 }
 
-function ApprovalCardInline({ approval, onApprove }: { approval: Approval; onApprove: (approval: Approval, approved: boolean) => void }) {
-  return (
-    <div className="approval-card inline-approval" role="group" aria-label={`Approval for ${approval.tool_name}`}>
-      <div>
-        <span className="progress-chip">Needs approval</span>
-        <strong>{approval.tool_name}</strong>
-        <InlineMeta items={[riskLabel(approval.risk), summarizeArguments(approval.arguments)]} />
-      </div>
-      <details>
-        <summary>View raw JSON</summary>
-        <JsonBlock value={approval.arguments} maxHeight="160px" />
-      </details>
-      <div className="page-actions">
-        <button type="button" onClick={() => onApprove(approval, true)}><Check size={15} /> Approve</button>
-        <button type="button" className="btn danger" onClick={() => onApprove(approval, false)}><X size={15} /> Deny</button>
-      </div>
-    </div>
-  );
-}
-
 function MarkdownMessage({ text }: { text: string }) {
   return (
     <div className="markdown-message">
@@ -5471,88 +3768,11 @@ function MarkdownMessage({ text }: { text: string }) {
   );
 }
 
-function LiveRunActivity({ run, events }: { run: Run; events: TraceEvent[] }) {
-  const items = activityItemsForEvents(events);
-  const isRunning = run.status === "queued" || run.status === "running";
-  if (items.length === 0 && !isRunning) return null;
-  return (
-    <div className="activity" role="status" aria-label="Live run activity" aria-live="polite">
-      <div className="act-heading">
-        <Brain size={15} />
-        <strong>Thinking</strong>
-      </div>
-      {items.map((item) => (
-        <div className={`act-row ${item.status === "completed" ? "done" : item.status === "running" ? "run" : item.status === "failed" ? "fail" : "info"}`} key={item.id}>
-          <span className="act-icon" aria-hidden="true">
-            {activityIcon(item)}
-          </span>
-          <span className="text">
-            <strong>{item.label}</strong>
-            {item.meta && <code>{item.meta}</code>}
-            {item.detail && <span className="detail">{item.detail}</span>}
-          </span>
-        </div>
-      ))}
-      {isRunning && <TypingIndicator />}
-    </div>
-  );
-}
-
-function TypingIndicator() {
-  return (
-    <div className="typing" aria-label="Kestrel is responding">
-      <span>Working</span>
-      <span className="dots" aria-hidden="true">
-        <span></span>
-        <span></span>
-        <span></span>
-      </span>
-    </div>
-  );
-}
-
-function activityIcon(item: LiveActivityItem) {
-  if (item.status === "completed") return <Check size={14} />;
-  if (item.status === "failed") return <X size={14} />;
-  if (item.kind === "tool") return <Wrench size={14} />;
-  return <Sparkles size={14} />;
-}
-
-function RecordList({ records }: { records: Array<Record<string, unknown>> }) {
-  if (records.length === 0) return <EmptyState>No records found.</EmptyState>;
-  return (
-    <div className="list">
-      {records.slice(0, 8).map((item, index) => {
-        const record = item.record as Record<string, unknown> | undefined;
-        return (
-          <div className="data-row" key={`${String(record?.id ?? "record")}-${index}`}>
-            <strong>{String(record?.title ?? item.title ?? "Record")}</strong>
-            <InlineMeta items={[String(record?.layer ?? ""), String(record?.kind ?? ""), scoreLabel(item.score)]} />
-            <p>{String(record?.content ?? item.snippet ?? "").slice(0, 360)}</p>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function SummaryList({ title, values }: { title: string; values: string[] }) {
   return (
     <div className="summary-list">
       <h3>{title}</h3>
       {values.length === 0 ? <small>none</small> : values.slice(0, 5).map((value) => <span key={value}>{value}</span>)}
-    </div>
-  );
-}
-
-function ActionError({ message, onDismiss }: { message: string; onDismiss: () => void }) {
-  return (
-    <div className="alert" role="alert">
-      <strong>Action failed</strong>
-      <span>{message}</span>
-      <button type="button" onClick={onDismiss} aria-label="Dismiss error">
-        <X size={15} />
-      </button>
     </div>
   );
 }
@@ -5644,15 +3864,6 @@ function CapabilitySwitch({
         <span className="track"><span className="thumb"></span></span>
       </span>
     </label>
-  );
-}
-
-function Metric({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
   );
 }
 
@@ -5784,11 +3995,6 @@ function asStringArray(value: unknown): string[] {
 
 function scoreLabel(value: unknown): string {
   return typeof value === "number" ? value.toFixed(2) : "";
-}
-
-function formatPercent(value: number): string {
-  if (!Number.isFinite(value)) return "0%";
-  return `${Math.round(value * 100)}%`;
 }
 
 function uniqueStrings(values: string[]): string[] {

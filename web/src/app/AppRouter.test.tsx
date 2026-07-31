@@ -142,5 +142,12 @@ describe("AppRouter", () => {
         query: {},
       }),
     ).toBe("routines");
+    expect(
+      legacySectionForLocation({
+        destination: "memory",
+        subroute: "layers",
+        query: {},
+      }),
+    ).toBe("memory");
   });
 });
