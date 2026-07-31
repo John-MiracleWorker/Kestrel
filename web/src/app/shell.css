@@ -1,0 +1,550 @@
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.workbench-shell {
+  --workbench-navigation-width: 224px;
+  --workbench-shell-header-height: 64px;
+  display: grid;
+  grid-template-columns: var(--workbench-navigation-width) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background:
+    radial-gradient(
+      circle at 82% 5%,
+      color-mix(in srgb, var(--attention-soft) 45%, transparent) 0 8rem,
+      transparent 8.1rem
+    ),
+    var(--canvas);
+  color: var(--ink);
+}
+
+.workbench-navigation-rail {
+  position: relative;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+  min-height: 0;
+  padding: var(--space-5) var(--space-4);
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  background:
+    linear-gradient(
+      165deg,
+      color-mix(in srgb, var(--action-soft) 38%, var(--surface)) 0%,
+      var(--surface) 44%,
+      color-mix(in srgb, var(--attention-soft) 28%, var(--surface-sunken)) 100%
+    );
+  box-shadow: 10px 0 34px color-mix(in srgb, var(--structural) 10%, transparent);
+}
+
+.workbench-shell-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: 0.35rem 0.45rem;
+}
+
+.workbench-shell-brand-mark {
+  display: grid;
+  flex: none;
+  width: 2.35rem;
+  height: 2.35rem;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 56% 44% 58% 42%;
+  background: var(--action);
+  color: var(--on-action);
+  box-shadow: 3px 3px 0 color-mix(in srgb, var(--structural) 36%, transparent);
+  font: 700 1.2rem/1 var(--serif);
+  transform: rotate(-3deg);
+}
+
+.workbench-navigation-copy {
+  min-width: 0;
+}
+
+.workbench-navigation-copy strong,
+.workbench-navigation-copy small {
+  display: block;
+}
+
+.workbench-navigation-copy strong {
+  color: var(--ink);
+  font: 650 1.15rem/1.05 var(--serif);
+}
+
+.workbench-navigation-copy small {
+  margin-top: 0.25rem;
+  color: var(--muted-ink);
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.workbench-destinations {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.workbench-destinations a {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  min-height: 2.7rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid transparent;
+  border-radius: 0.8rem 0.55rem 0.9rem 0.5rem;
+  color: var(--muted-ink);
+  font-size: 0.92rem;
+  font-weight: 750;
+  text-decoration: none;
+  transition:
+    transform var(--motion-fast) ease,
+    color var(--motion-fast) ease,
+    border-color var(--motion-fast) ease,
+    background var(--motion-fast) ease;
+}
+
+.workbench-destinations a:hover {
+  border-color: color-mix(in srgb, var(--action) 48%, var(--border));
+  background: color-mix(in srgb, var(--action-soft) 52%, var(--surface));
+  color: var(--ink);
+  transform: translateX(2px);
+}
+
+.workbench-destinations a:focus-visible {
+  outline: 2px solid var(--surface);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 4px var(--focus);
+}
+
+.workbench-destinations a[aria-current="page"] {
+  border-color: color-mix(in srgb, var(--attention) 55%, var(--border));
+  background: color-mix(in srgb, var(--selected) 42%, var(--surface));
+  color: var(--ink);
+  box-shadow: 3px 3px 0 color-mix(in srgb, var(--structural) 22%, transparent);
+}
+
+.workbench-destinations a[aria-current="page"]::before {
+  position: absolute;
+  top: 50%;
+  left: -0.38rem;
+  width: 0.58rem;
+  height: 1.2rem;
+  border-radius: 55% 45% 52% 48%;
+  background: var(--action);
+  content: "";
+  transform: translateY(-50%) rotate(-8deg);
+}
+
+.workbench-navigation-bloom {
+  position: relative;
+  width: 3.5rem;
+  height: 2.2rem;
+  margin: auto auto 0.15rem;
+  opacity: 0.68;
+}
+
+.workbench-navigation-bloom span {
+  position: absolute;
+  bottom: 0;
+  width: 1.35rem;
+  height: 1.9rem;
+  border: 1px solid color-mix(in srgb, var(--structural) 55%, transparent);
+  border-radius: 70% 30% 70% 30%;
+  background: color-mix(in srgb, var(--action-soft) 72%, transparent);
+  transform-origin: bottom center;
+}
+
+.workbench-navigation-bloom span:nth-child(1) {
+  left: 0.3rem;
+  transform: rotate(-38deg);
+}
+
+.workbench-navigation-bloom span:nth-child(2) {
+  left: 1.1rem;
+}
+
+.workbench-navigation-bloom span:nth-child(3) {
+  left: 1.9rem;
+  transform: rotate(38deg);
+}
+
+.workbench-navigation-boundary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0.55rem 0.65rem 0;
+  border-top: 1px solid var(--border);
+  color: var(--muted-ink);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.workbench-navigation-boundary > span:first-child {
+  color: var(--success);
+}
+
+.workbench-shell-frame {
+  display: grid;
+  grid-template-rows: var(--workbench-shell-header-height) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-command-bar {
+  position: relative;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  min-width: 0;
+  padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: saturate(130%) blur(12px);
+}
+
+.workbench-command-bar > div:first-child {
+  min-width: 0;
+}
+
+.workbench-command-bar p,
+.workbench-command-bar span {
+  margin: 0;
+}
+
+.workbench-command-bar > div:first-child p {
+  color: var(--structural);
+  font: 700 1.05rem/1.1 var(--serif);
+}
+
+.workbench-command-bar > div:first-child span {
+  display: block;
+  margin-top: 0.15rem;
+  overflow: hidden;
+  color: var(--muted-ink);
+  font-size: 0.74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-command-trigger {
+  flex: none;
+  min-width: min(18rem, 36vw);
+  justify-content: flex-start;
+  box-shadow: 2px 2px 0 color-mix(in srgb, var(--structural) 22%, transparent);
+}
+
+.workbench-command-trigger .wf-button-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.workbench-command-trigger kbd {
+  margin-left: auto;
+  color: var(--muted-ink);
+  font-size: 0.66rem;
+}
+
+.workbench-command-palette-layer {
+  position: fixed;
+  z-index: 300;
+  inset: 0;
+  display: grid;
+  align-items: start;
+  justify-items: center;
+  padding: min(15vh, 8rem) var(--space-5) var(--space-5);
+  background: color-mix(in srgb, var(--canvas) 48%, transparent);
+  backdrop-filter: blur(9px);
+}
+
+.workbench-command-palette {
+  display: grid;
+  gap: var(--space-4);
+  width: min(39rem, 100%);
+  max-height: min(37rem, calc(100dvh - 4rem));
+  padding: var(--space-5);
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 1.15rem 0.8rem 1.35rem 0.9rem;
+  background: var(--surface);
+  box-shadow:
+    var(--shadow),
+    6px 6px 0 color-mix(in srgb, var(--structural) 32%, transparent);
+}
+
+.workbench-command-palette-heading {
+  display: flex;
+  align-items: start;
+  gap: var(--space-3);
+  color: var(--action);
+}
+
+.workbench-command-palette-heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font: 650 1.3rem/1.15 var(--serif);
+}
+
+.workbench-command-palette-heading p {
+  margin-top: var(--space-1);
+  color: var(--muted-ink);
+  font-size: 0.78rem;
+}
+
+.workbench-command-search input {
+  width: 100%;
+  min-height: 2.85rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-medium);
+  background: var(--surface-sunken);
+  color: var(--ink);
+  font-size: 1rem;
+}
+
+.workbench-command-search input:focus-visible,
+.workbench-command-results button:focus-visible {
+  outline: 2px solid var(--surface);
+  outline-offset: 1px;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 4px var(--focus);
+}
+
+.workbench-command-results {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.workbench-command-results button {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: 3.2rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  background: var(--surface);
+  color: var(--structural);
+  text-align: left;
+  cursor: pointer;
+}
+
+.workbench-command-results button:hover {
+  border-color: var(--action);
+  background: var(--action-soft);
+}
+
+.workbench-command-results button span {
+  display: grid;
+}
+
+.workbench-command-results button strong {
+  color: var(--ink);
+  font-size: 0.92rem;
+}
+
+.workbench-command-results button small {
+  color: var(--muted-ink);
+  font: 0.7rem/1.3 var(--mono);
+}
+
+.workbench-command-results > p,
+.workbench-command-hint {
+  margin: 0;
+  color: var(--muted-ink);
+  font-size: 0.76rem;
+}
+
+.workbench-command-hint {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.workbench-shell-body,
+.workbench-shell-content {
+  min-width: 0;
+  min-height: 0;
+}
+
+.workbench-shell-body {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.workbench-shell-body.with-context {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.workbench-shell-content {
+  position: relative;
+  overflow: auto;
+}
+
+main.workbench-shell-content:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: -3px;
+}
+
+.workbench-context-dock {
+  position: relative;
+  z-index: 40;
+  width: 0;
+  min-width: 0;
+  min-height: 0;
+  transition: width var(--motion-standard) ease;
+}
+
+.workbench-context-dock[data-open="true"] {
+  width: min(20rem, 32vw);
+}
+
+.workbench-context-toggle {
+  position: absolute;
+  z-index: 2;
+  top: var(--space-3);
+  right: var(--space-3);
+  white-space: nowrap;
+}
+
+.workbench-context-dock[data-open="true"] .workbench-context-toggle {
+  right: calc(100% + var(--space-3));
+}
+
+.workbench-context-rail {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: var(--space-5);
+  overflow: auto;
+  border-left: 1px solid var(--border);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--info-soft) 24%, var(--surface)) 0%,
+      var(--surface) 52%,
+      color-mix(in srgb, var(--attention-soft) 20%, var(--surface)) 100%
+    );
+}
+
+.workbench-context-rail:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: -3px;
+}
+
+.workbench-route-recovery {
+  position: absolute;
+  z-index: 80;
+  top: var(--space-3);
+  left: 50%;
+  width: min(38rem, calc(100% - 2rem));
+  padding: 0.65rem 0.85rem;
+  transform: translateX(-50%);
+  border: 1px solid var(--caution);
+  border-radius: var(--radius-medium);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-offset);
+  font-size: 0.82rem;
+}
+
+.workbench-shell-content .chat-shell {
+  height: calc(
+    100dvh - var(--workbench-shell-header-height) -
+      var(--kestrel-topbar-height, 67px)
+  );
+}
+
+.workbench-shell-content .mission-shell {
+  height: calc(
+    100dvh - var(--workbench-shell-header-height) -
+      var(--kestrel-topbar-height, 59px)
+  );
+}
+
+@media (max-width: 1400px) {
+  .workbench-shell-content .chat-shell {
+    grid-template-columns: 240px minmax(0, 1fr);
+  }
+
+  .workbench-shell-content .inspector {
+    display: none;
+  }
+}
+
+@media (max-width: 1100px) {
+  .workbench-shell {
+    --workbench-navigation-width: 76px;
+  }
+
+  .workbench-navigation-rail {
+    align-items: center;
+    padding-inline: var(--space-3);
+  }
+
+  .workbench-navigation-copy,
+  .workbench-destination-label,
+  .workbench-context-toggle-label {
+    display: none;
+  }
+
+  .workbench-destinations a {
+    justify-content: center;
+    width: 2.9rem;
+    padding-inline: 0.5rem;
+  }
+
+  .workbench-navigation-boundary {
+    justify-content: center;
+    width: 100%;
+  }
+
+  .workbench-command-bar {
+    padding-inline: var(--space-4);
+  }
+}
+
+@media (max-width: 1000px) {
+  .workbench-shell-body.with-context {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workbench-context-dock {
+    position: absolute;
+    inset: 0 0 0 auto;
+  }
+
+  .workbench-context-dock[data-open="true"] {
+    width: min(22rem, calc(100% - 4rem));
+    box-shadow: -18px 0 50px color-mix(in srgb, var(--structural) 24%, transparent);
+  }
+}

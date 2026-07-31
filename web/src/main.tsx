@@ -7,6 +7,7 @@ import "./design/tokens.css";
 import "./design/typography.css";
 import "./styles.css";
 import "./design/design-system.css";
+import "./app/shell.css";
 
 installTheme();
 

@@ -16,6 +16,7 @@ describe("styles.css", () => {
     `${process.cwd()}/src/design/typography.css`,
     `${process.cwd()}/src/styles.css`,
     `${process.cwd()}/src/design/design-system.css`,
+    `${process.cwd()}/src/app/shell.css`,
   ];
 
   it("keeps production CSS free of HTML wrappers and remote assets", () => {
@@ -101,5 +102,25 @@ describe("styles.css", () => {
       /:root\[data-reduced-motion="reduce"\]\s+\.wf-button:active/,
     );
     expect(designSystem).toMatch(/transform:\s*none/);
+  });
+
+  it("reclaims the legacy inspector width after adding the navigation rail", () => {
+    const shell = readFileSync(
+      `${process.cwd()}/src/app/shell.css`,
+      "utf8",
+    );
+
+    expect(shell).toMatch(
+      /@media \(max-width: 1400px\)[\s\S]*\.workbench-shell-content \.chat-shell\s*\{\s*grid-template-columns:\s*240px minmax\(0, 1fr\)/,
+    );
+    expect(shell).toMatch(
+      /@media \(max-width: 1400px\)[\s\S]*\.workbench-shell-content \.inspector\s*\{\s*display:\s*none/,
+    );
+    expect(shell).toMatch(
+      /@media \(max-width: 1100px\)[\s\S]*\.workbench-destination-label[\s\S]*display:\s*none/,
+    );
+    expect(shell).toMatch(
+      /@media \(max-width: 1000px\)[\s\S]*\.workbench-shell-body\.with-context\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/,
+    );
   });
 });
