@@ -6,6 +6,7 @@ import { installTheme } from "./design/theme";
 import "./design/tokens.css";
 import "./design/typography.css";
 import "./styles.css";
+import "./design/design-system.css";
 
 installTheme();
 

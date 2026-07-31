@@ -15,6 +15,7 @@ describe("styles.css", () => {
     `${process.cwd()}/src/design/tokens.css`,
     `${process.cwd()}/src/design/typography.css`,
     `${process.cwd()}/src/styles.css`,
+    `${process.cwd()}/src/design/design-system.css`,
   ];
 
   it("keeps production CSS free of HTML wrappers and remote assets", () => {
@@ -78,5 +79,27 @@ describe("styles.css", () => {
     expect(simpleChat).toContain("var(--canvas)");
     expect(simpleChat).toContain("var(--surface)");
     expect(simpleChat).toContain("var(--ink)");
+  });
+
+  it("keeps primitive focus visible and removes press motion when requested", () => {
+    const designSystem = readFileSync(
+      `${process.cwd()}/src/design/design-system.css`,
+      "utf8",
+    );
+    const main = readFileSync(`${process.cwd()}/src/main.tsx`, "utf8");
+
+    expect(designSystem).toMatch(/\.wf-button:focus-visible/);
+    expect(designSystem).toMatch(/outline:\s*2px solid var\(--surface\)/);
+    expect(designSystem).not.toMatch(/outline:\s*none/);
+    expect(designSystem).toMatch(
+      /:is\(\.page-shell,\s*\.panel\)\s+:is\(input,\s*select,\s*textarea\)\.wf-field-control:focus-visible/,
+    );
+    expect(main.indexOf('"./design/design-system.css"')).toBeGreaterThan(
+      main.indexOf('"./styles.css"'),
+    );
+    expect(designSystem).toMatch(
+      /:root\[data-reduced-motion="reduce"\]\s+\.wf-button:active/,
+    );
+    expect(designSystem).toMatch(/transform:\s*none/);
   });
 });
