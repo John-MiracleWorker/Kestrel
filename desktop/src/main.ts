@@ -169,7 +169,7 @@ async function createPackagedSidecarSupervisor(
     {
       sidecarRelativePath,
       sidecarVersion,
-      readinessTimeoutMs: 40_000,
+      readinessTimeoutMs: 90_000,
       shutdownTimeoutMs: 10_000,
       platform: process.platform,
       environment: process.env

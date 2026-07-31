@@ -657,10 +657,12 @@ def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
     main_source = (ROOT / "desktop" / "src" / "main.ts").read_text(
         encoding="utf-8"
     )
-    assert "readinessTimeoutMs: 40_000" in main_source
+    assert "readinessTimeoutMs: 90_000" in main_source
     assert "readinessTimeoutMs: 15_000" not in main_source
+    assert "readinessTimeoutMs: 40_000" not in main_source
 
     smoke_source = (
         ROOT / "desktop" / "scripts" / "smoke-dir.mjs"
     ).read_text(encoding="utf-8")
-    assert "const CYCLE_TIMEOUT_MS = 60_000;" in smoke_source
+    assert "const CYCLE_TIMEOUT_MS = 150_000;" in smoke_source
+    assert "const CYCLE_TIMEOUT_MS = 60_000;" not in smoke_source
