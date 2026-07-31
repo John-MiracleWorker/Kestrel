@@ -1,0 +1,14 @@
+/* Automate workspace: routine list, delivery history, and delivery channels. */
+
+.routines-page .delivery-truth-note {
+  margin: 0 0 var(--space-3, 0.75rem);
+  max-width: 70ch;
+}
+
+.routines-page .delivery-history {
+  margin-top: var(--space-4, 1rem);
+}
+
+.routines-page .automate-channels-grid {
+  margin-top: var(--space-4, 1rem);
+}

@@ -46,6 +46,8 @@ import {
   ExtendWorkspace,
   useExtendWorkspace,
 } from "./extend/ExtendWorkspace";
+import { CapabilityRow } from "./extend/CapabilityControls";
+import { capabilityKindLabel, capabilityKindOrder, isToolEffectivelyEnabled } from "./extend/extendUtils";
 import { FlockWorkspace } from "./flock/FlockWorkspace";
 import { MemoryWorkspace, useMemoryWorkspace } from "./memory/MemoryWorkspace";
 import type { MissionLaunch } from "./mission/types";
@@ -271,7 +273,6 @@ const emptyCapabilitySnapshot: CapabilitySnapshot = {
   items: [],
   counts: { total: 0, configured_enabled: 0, effective_enabled: 0, blocked: 0 }
 };
-const capabilityKindOrder: CapabilityKind[] = ["mcp_server", "tool", "skill"];
 const HASH_ROUTING_ENABLED = typeof navigator === "undefined" || !navigator.userAgent.toLowerCase().includes("jsdom");
 const DEFAULT_APP_SECTION: LegacyWorkbenchSection = HASH_ROUTING_ENABLED
   ? "mission"
@@ -2004,7 +2005,16 @@ export function LegacyWorkbench({
           </section>
         )}
         {activeSection === "routines" && (
-          <AutomateWorkspace onAuthRequired={handleAuthRequired} />
+          <AutomateWorkspace
+            onAuthRequired={handleAuthRequired}
+            channelsSlice={{
+              channels,
+              onEditChannel: (channel) => {
+                loadChannel(channel);
+                jumpToAdvanced("channels");
+              }
+            }}
+          />
         )}
         {activeSection === "routing" && (
           <section
@@ -2048,6 +2058,9 @@ export function LegacyWorkbench({
             onNavigate={routeToSection}
             onRefresh={refreshOperatorWorkspace}
           >
+            {{
+              capabilities: (
+                <>
             <section className="stitch-command-deck advanced-overview" aria-label="Advanced overview">
               <div className="stitch-hero-card">
                 <div>
@@ -2407,7 +2420,7 @@ export function LegacyWorkbench({
         </section>
 
         <section id="tools" className="section">
-          <Panel title="Connected Tools" icon={<Wrench size={19} />}>
+          <Panel id="connected-tools" title="Connected Tools" icon={<Wrench size={19} />}>
             <form onSubmit={invokeTool} className="stack-form">
               <Field label="Tool">
                 <select
@@ -2533,262 +2546,6 @@ export function LegacyWorkbench({
           </Panel>
         </section>
 
-        <section id="mcp" className="content-grid wide-left">
-          <Panel title="MCP Servers" icon={<PlugZap size={19} />}>
-            <form onSubmit={saveMcp} className="stack-form">
-              <div className="field-row">
-                <Field label="Server ID"><input value={mcpId} onChange={(event) => setMcpId(event.target.value)} /></Field>
-                <Field label="Name"><input value={mcpName} onChange={(event) => setMcpName(event.target.value)} /></Field>
-                <Field label="Transport">
-                  <select value={mcpTransport} onChange={(event) => setMcpTransport(event.target.value)}>
-                    <option value="stdio">stdio</option>
-                    <option value="streamable_http">streamable_http</option>
-                    <option value="sse">sse</option>
-                  </select>
-                </Field>
-                <Field label="Command or URL"><input value={mcpEndpoint} onChange={(event) => setMcpEndpoint(event.target.value)} /></Field>
-                <Field label="Risk policy">
-                  <select value={mcpRiskPolicy} onChange={(event) => setMcpRiskPolicy(event.target.value)}>
-                    <option value="approval_by_default">approval_by_default</option>
-                    <option value="trust_manifest">trust_manifest</option>
-                  </select>
-                </Field>
-              </div>
-              <div className="check-row">
-                <StatusBadge value={loadedMcpServer?.enabled ?? false} />
-                <span>Enable or disable this server with its capability switch after saving.</span>
-              </div>
-              <Field
-                label="Args JSON"
-                hint={loadedMcpServer && !mcpArgsTouched ? `${loadedMcpServer.argument_count ?? 0} stored arguments are hidden. Edit to replace them.` : undefined}
-              >
-                <textarea value={mcpArgs} onChange={(event) => { setMcpArgs(event.target.value); setMcpArgsTouched(true); }} rows={3} />
-              </Field>
-              <Field
-                label="Env JSON"
-                hint={loadedMcpServer && !mcpEnvTouched ? `${loadedMcpServer.env_keys?.length ?? 0} stored environment names are hidden. Edit to replace them.` : undefined}
-              >
-                <textarea value={mcpEnv} onChange={(event) => { setMcpEnv(event.target.value); setMcpEnvTouched(true); }} rows={3} />
-              </Field>
-              <Field
-                label="Secret env names JSON"
-                hint={loadedMcpServer && !mcpSecretEnvTouched ? `${Object.keys(loadedMcpServer.secret_env_status ?? {}).length} secret bindings are hidden. Edit to replace them.` : undefined}
-              >
-                <textarea value={mcpSecretEnv} onChange={(event) => { setMcpSecretEnv(event.target.value); setMcpSecretEnvTouched(true); }} rows={3} />
-              </Field>
-              <button type="submit" disabled={!mcpId.trim()}>Save Server</button>
-            </form>
-            {mcpServers.map((server) => {
-              const serverCapability = capabilityForMcpServer(capabilities, server.id);
-              const childCapabilities = serverCapability
-                ? capabilities.filter((capability) => capability.kind === "tool" && capability.parent_key === serverCapability.key)
-                : [];
-              return (
-                <div className="data-row" key={server.id}>
-                  <button type="button" className="link-button" onClick={() => loadMcp(server)}>{server.name}</button>
-                  <InlineMeta
-                    items={[
-                      server.id,
-                      server.transport,
-                      server.session_state,
-                      `${server.tool_count ?? server.tools.length} tools`,
-                      serverCapability?.effective_enabled ?? server.enabled ? "enabled" : "disabled"
-                    ]}
-                  />
-                  <div className="capability-inline-control">
-                    <StatusBadge value={server.status} />
-                    {serverCapability && (
-                      <CapabilitySwitch
-                        capability={serverCapability}
-                        pending={capabilityPending.has(serverCapability.key)}
-                        onChange={setCapabilityEnabled}
-                        compact
-                      />
-                    )}
-                  </div>
-                  {server.error && <p className="danger-text">{server.error}</p>}
-                  {childCapabilities.length > 0 && (
-                    <div className="capability-child-list" aria-label={`${server.name} tools`}>
-                      {childCapabilities.map((capability) => (
-                        <div className="capability-child-row" key={capability.key}>
-                          <span>{capability.name}</span>
-                          <StatusBadge value={capability.effective_enabled ? "effective on" : "effective off"} />
-                          <CapabilitySwitch
-                            capability={capability}
-                            pending={capabilityPending.has(capability.key)}
-                            onChange={setCapabilityEnabled}
-                            compact
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  <div className="page-actions">
-                    {(["connect", "sync", "test", "restart", "disconnect"] as const).map((action) => (
-                      <button type="button" key={action} onClick={() => controlMcp(server, action)}>{action}</button>
-                    ))}
-                    <button type="button" className="btn danger" onClick={() => deleteMcp(server)}>Delete</button>
-                  </div>
-                </div>
-              );
-            })}
-          </Panel>
-          <Panel title="MCP Tool Invoke" icon={<Wrench size={19} />}>
-            <form onSubmit={invokeMcp} className="stack-form">
-              <Field label="MCP tool">
-                <select
-                  value={mcpToolSelection}
-                  onChange={(event) => {
-                    setMcpToolSelection(event.target.value);
-                    const option = mcpToolOptions.find((item) => item.value === event.target.value);
-                    setMcpToolArgs(JSON.stringify(schemaDefault(option?.tool.parameters), null, 2));
-                  }}
-                >
-                  <option value="">Select tool</option>
-                  {mcpToolOptions.map(({ server, tool, value }) => (
-                    <option key={value} value={value}>{server.id} / {tool.remote_name ?? tool.name}</option>
-                  ))}
-                </select>
-              </Field>
-              <Field label="Arguments JSON"><textarea value={mcpToolArgs} onChange={(event) => setMcpToolArgs(event.target.value)} rows={8} /></Field>
-              <button type="submit" disabled={!mcpToolSelection || !selectedMcpToolEnabled}>Invoke MCP Tool</button>
-            </form>
-            {mcpResult && <JsonBlock value={mcpResult} maxHeight="420px" />}
-          </Panel>
-        </section>
-
-        <section id="skills" className="section">
-          <Panel
-            title="Skills"
-            icon={<Sparkles size={19} />}
-            actions={<button type="button" onClick={discoverSkills} disabled={skillDiscovering}>{skillDiscovering ? "Discovering" : "Discover"}</button>}
-          >
-            {skillDiscovery ? (
-              <div className="data-row compact">
-                <strong>{skillDiscovery.message}</strong>
-                <InlineMeta
-                  items={[
-                    skillDiscovery.skills_dir,
-                    `${skillDiscovery.discovered_count} discovered`,
-                    `${skillDiscovery.enabled_count} enabled`,
-                    `${skillDiscovery.validation_errors.length} rejected`
-                  ]}
-                />
-              </div>
-            ) : null}
-            <div className="list">
-              {skills.length === 0 ? (
-                <EmptyState>No discovered skills in the registry.</EmptyState>
-              ) : skills.map((skill) => {
-                const capability = capabilityForSkill(capabilities, skill.id);
-                const effectiveEnabled = capability?.effective_enabled ?? skill.enabled;
-                return (
-                  <div className="data-row" key={skill.id}>
-                    <button
-                      type="button"
-                      className="link-button"
-                      disabled={!effectiveEnabled}
-                      onClick={() => setSkillSelection(skill.id)}
-                    >
-                      {skill.name}
-                    </button>
-                    <InlineMeta items={[skill.id, effectiveEnabled ? "enabled" : "disabled"]} />
-                    <p>{skill.description}</p>
-                    {capability ? (
-                      <CapabilitySwitch
-                        capability={capability}
-                        pending={capabilityPending.has(capability.key)}
-                        onChange={setCapabilityEnabled}
-                        compact
-                      />
-                    ) : (
-                      <button type="button" onClick={() => toggleSkill(skill)}>{skill.enabled ? "Disable" : "Enable"}</button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            {skillDiscovery?.validation_errors.length ? <JsonBlock value={skillDiscovery.validation_errors} maxHeight="180px" /> : null}
-          </Panel>
-          <Panel title="Run or Install Skill" icon={<Bot size={19} />}>
-            <form onSubmit={runSkill} className="stack-form">
-              <Field label="Skill">
-                <select value={skillSelection} onChange={(event) => setSkillSelection(event.target.value)}>
-                  <option value="">Select skill</option>
-                  {enabledSkills.map((skill) => <option key={skill.id} value={skill.id}>{skill.id}</option>)}
-                </select>
-              </Field>
-              <Field label="Skill task"><textarea value={skillTask} onChange={(event) => setSkillTask(event.target.value)} rows={3} /></Field>
-              <button type="submit" disabled={!skillSelection || !skillTask.trim() || !selectedSkillEnabled}>Run Skill</button>
-            </form>
-            <form onSubmit={installSkill} className="stack-form separated">
-              <Field label="Skill manifest JSON"><textarea value={skillManifest} onChange={(event) => setSkillManifest(event.target.value)} rows={7} /></Field>
-              <Field label="Skill instructions"><textarea value={skillInstructions} onChange={(event) => setSkillInstructions(event.target.value)} rows={5} /></Field>
-              <button type="submit" disabled={!skillInstructions.trim()}>Install Skill</button>
-            </form>
-            {skillResult && <JsonBlock value={skillResult} maxHeight="360px" />}
-          </Panel>
-          <Panel title="Plugins" icon={<GitBranch size={19} />}>
-            <form onSubmit={reviewPlugin} className="inline-form">
-              <Field label="GitHub source"><input value={pluginSource} onChange={(event) => setPluginSource(event.target.value)} /></Field>
-              <Field label="Ref"><input value={pluginRef} onChange={(event) => setPluginRef(event.target.value)} /></Field>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={pluginEnable}
-                  disabled={!reviewedCurrentPlugin || pluginEnableBlockers.length > 0}
-                  onChange={(event) => setPluginEnable(event.target.checked)}
-                />
-                <span>Enable after install</span>
-              </label>
-              <button type="submit" disabled={!pluginSource.trim()}>Review</button>
-              <button
-                type="button"
-                disabled={!pluginSource.trim() || !reviewedCurrentPlugin || (pluginEnable && pluginEnableBlockers.length > 0)}
-                onClick={() => installPlugin().catch(reportError)}
-              >
-                Install
-              </button>
-            </form>
-            {reviewedCurrentPlugin && pluginReview && (
-              <div className="data-row">
-                <strong>Review: {pluginReviewName(pluginReview)}</strong>
-                <InlineMeta items={[String(pluginReview.risk_report.risk ?? "medium"), pluginReview.commit_sha.slice(0, 12)]} />
-                <p>Dependencies: {pluginDependencySummary(pluginReview)}</p>
-                <p>Isolation: {pluginIsolationSummary(pluginReview)}</p>
-                <p>Provenance: {String(pluginReview.provenance_review?.status ?? "unverified")}</p>
-                <p>Compatibility: {String(pluginReview.compatibility_review?.status ?? "unknown")}</p>
-                {pluginReview.authority_delta?.added.length ? (
-                  <p>Added authority: {pluginReview.authority_delta.added.join(", ")}</p>
-                ) : null}
-                {pluginEnableBlockers.length > 0 && <InlineMeta items={pluginEnableBlockers} />}
-              </div>
-            )}
-            {plugins.map((plugin) => (
-              <div className="data-row" key={plugin.id}>
-                <strong>{plugin.name}</strong>
-                <InlineMeta items={[plugin.id, plugin.format, plugin.install_status, plugin.enabled ? "enabled" : "disabled"]} />
-                <p>{plugin.description}</p>
-                {pluginBlockers(plugin).length > 0 && <InlineMeta items={pluginBlockers(plugin)} />}
-                <div className="page-actions">
-                  <button
-                    type="button"
-                    disabled={!plugin.enabled && pluginBlockers(plugin).length > 0}
-                    onClick={() => pluginAction(plugin, plugin.enabled ? "disable" : "enable")}
-                  >
-                    {plugin.enabled ? "Disable" : "Enable"}
-                  </button>
-                  <button type="button" onClick={() => pluginAction(plugin, "update")}>
-                    {pluginUpdateReviews[plugin.id] ? "Apply reviewed update" : "Review update"}
-                  </button>
-                  <button type="button" className="btn danger" onClick={() => pluginAction(plugin, "remove")}>Remove</button>
-                </div>
-              </div>
-            ))}
-            {pluginResult && <JsonBlock value={pluginResult} maxHeight="320px" />}
-          </Panel>
-        </section>
-
         <section id="channels" className="section">
           <Panel title="Channels" icon={<Bell size={19} />}>
             <form onSubmit={saveChannel} className="stack-form">
@@ -2866,6 +2623,9 @@ export function LegacyWorkbench({
             </div>
           </Panel>
         </section>
+                </>
+              )
+            }}
       </ExtendWorkspace>
       )}
         {activeSection === "settings" && (
@@ -3296,7 +3056,7 @@ export function LegacyWorkbench({
                   {filteredCapabilities.length === 0 ? (
                     <EmptyState>No capabilities match the current filters.</EmptyState>
                   ) : (
-                    capabilityKindOrder.map((kind) => {
+                    capabilityKindOrder().map((kind) => {
                       const rows = filteredCapabilities.filter((capability) => capability.kind === kind);
                       if (rows.length === 0) return null;
                       const groupId = `capability-group-${kind}`;
@@ -3640,96 +3400,6 @@ function SummaryList({ title, values }: { title: string; values: string[] }) {
   );
 }
 
-function CapabilityRow({
-  capability,
-  pending,
-  onChange
-}: {
-  capability: Capability;
-  pending: boolean;
-  onChange: (capability: Capability, enabled: boolean) => Promise<void>;
-}) {
-  const rowId = capabilityDomId(capability.key);
-  const titleId = `${rowId}-title`;
-  const blockerId = capability.blocked_by.length > 0 ? `${rowId}-blockers` : undefined;
-  const needsReauthorization =
-    capability.configured_enabled && capability.blocked_by.includes("resource_changed");
-  return (
-    <article className="capability-row" aria-labelledby={titleId} aria-busy={pending}>
-      <div className="capability-row-copy">
-        <div className="capability-row-title">
-          <strong id={titleId}>{capability.name}</strong>
-          <code>{capability.id}</code>
-        </div>
-        <p>{capability.description}</p>
-        <InlineMeta items={[capability.source, capability.parent_key, capability.enablement_flag, capability.status]} />
-        {blockerId && (
-          <p className="capability-blockers" id={blockerId}>
-            <strong>Blocked by:</strong> {capability.blocked_by.map(formatCapabilityBlocker).join(", ")}
-          </p>
-        )}
-      </div>
-      <div className="capability-row-status">
-        <div className="capability-badges" aria-label={`${capability.name} policy`}>
-          <StatusBadge value={capability.risk} />
-          <StatusBadge value={capability.requires_approval ? "approval required" : "direct"} />
-          <StatusBadge value={capability.effective_enabled ? "effective on" : "effective off"} />
-        </div>
-        <CapabilitySwitch
-          capability={capability}
-          pending={pending}
-          onChange={onChange}
-          describedBy={blockerId}
-        />
-        {needsReauthorization && (
-          <button
-            type="button"
-            className="btn subtle"
-            disabled={pending}
-            onClick={() => void onChange(capability, true)}
-          >
-            Reauthorize
-          </button>
-        )}
-      </div>
-    </article>
-  );
-}
-
-function CapabilitySwitch({
-  capability,
-  pending,
-  onChange,
-  describedBy,
-  compact = false
-}: {
-  capability: Capability;
-  pending: boolean;
-  onChange: (capability: Capability, enabled: boolean) => Promise<void>;
-  describedBy?: string;
-  compact?: boolean;
-}) {
-  const action = capability.configured_enabled ? "Disable" : "Enable";
-  return (
-    <label className={`capability-toggle ${compact ? "compact" : ""}`}>
-      <span>{pending ? "Saving…" : capability.configured_enabled ? "On" : "Off"}</span>
-      <span className="toggle">
-        <input
-          type="checkbox"
-          role="switch"
-          aria-label={`${action} ${capability.name}`}
-          aria-describedby={describedBy}
-          aria-checked={capability.configured_enabled}
-          checked={capability.configured_enabled}
-          disabled={pending}
-          onChange={(event) => void onChange(capability, event.currentTarget.checked)}
-        />
-        <span className="track"><span className="thumb"></span></span>
-      </span>
-    </label>
-  );
-}
-
 function readJson<T>(text: string, fallback: T): T {
   const trimmed = text.trim();
   if (!trimmed) return fallback;
@@ -3864,30 +3534,6 @@ function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.filter((value) => value.trim()).sort()));
 }
 
-function pluginReviewName(review: PluginReviewReport): string {
-  return String(review.manifest.id ?? review.source_url);
-}
-
-function pluginDependencySummary(review: PluginReviewReport): string {
-  const declared = review.dependency_review.declared;
-  if (!declared || typeof declared !== "object" || Array.isArray(declared)) return "none";
-  const parts = Object.entries(declared).flatMap(([kind, value]) =>
-    stringArray(value).map((item) => `${kind}:${item}`)
-  );
-  return parts.length ? parts.join(", ") : "none";
-}
-
-function pluginIsolationSummary(review: PluginReviewReport): string {
-  const mode = String(review.isolation_review.mode ?? "shared");
-  const required = Boolean(review.isolation_review.required);
-  const available = Boolean(review.isolation_review.available);
-  return `${mode}${required ? " required" : ""}${available ? "" : " unavailable"}`;
-}
-
-function pluginBlockers(plugin: Plugin): string[] {
-  return stringArray(plugin.risk_report.enable_blockers);
-}
-
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
 }
@@ -3993,76 +3639,6 @@ function isToolEnabled(tool: Tool, permissions: ToolPermissionDraft): boolean {
   if (flag in permissions) return permissions[flag as ToolPermissionKey];
   if (typeof tool.enabled === "boolean") return tool.enabled;
   return false;
-}
-
-function capabilityForTool(capabilities: Capability[], toolName: string): Capability | undefined {
-  return capabilities.find((capability) => capability.kind === "tool" && capability.id === toolName);
-}
-
-function capabilityForMcpServer(capabilities: Capability[], serverId: string): Capability | undefined {
-  return capabilities.find((capability) => capability.kind === "mcp_server" && capability.id === serverId);
-}
-
-function capabilityForMcpTool(
-  capabilities: Capability[],
-  serverId: string,
-  tool: Tool & { remote_name?: string }
-): Capability | undefined {
-  const remoteName = tool.remote_name ?? tool.name;
-  const registeredName = tool.name.startsWith("mcp.") ? tool.name : `mcp.${serverId}.${remoteName}`;
-  return (
-    capabilityForTool(capabilities, registeredName) ??
-    capabilityForTool(capabilities, tool.name) ??
-    capabilities.find(
-      (capability) =>
-        capability.kind === "tool" &&
-        capability.parent_key === `mcp_server:${serverId}` &&
-        [remoteName, registeredName].includes(capability.id)
-    )
-  );
-}
-
-function capabilityForSkill(capabilities: Capability[], skillId: string): Capability | undefined {
-  return capabilities.find((capability) => capability.kind === "skill" && capability.id === skillId);
-}
-
-function isToolEffectivelyEnabled(
-  tool: Tool,
-  permissions: ToolPermissionDraft,
-  capabilities: Capability[]
-): boolean {
-  return capabilityForTool(capabilities, tool.name)?.effective_enabled ?? isToolEnabled(tool, permissions);
-}
-
-function replaceCapability(snapshot: CapabilitySnapshot, capability: Capability): CapabilitySnapshot {
-  const found = snapshot.items.some((item) => item.key === capability.key);
-  const items = found
-    ? snapshot.items.map((item) => item.key === capability.key ? capability : item)
-    : [...snapshot.items, capability];
-  return { items, counts: capabilityCounts(items) };
-}
-
-function capabilityCounts(items: Capability[]): CapabilitySnapshot["counts"] {
-  return {
-    total: items.length,
-    configured_enabled: items.filter((item) => item.configured_enabled).length,
-    effective_enabled: items.filter((item) => item.effective_enabled).length,
-    blocked: items.filter((item) => item.blocked_by.length > 0).length
-  };
-}
-
-function capabilityKindLabel(kind: CapabilityKind): string {
-  if (kind === "mcp_server") return "MCP Servers";
-  if (kind === "skill") return "Skills";
-  return "Tools";
-}
-
-function capabilityDomId(key: string): string {
-  return `capability-${key.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
-}
-
-function formatCapabilityBlocker(value: string): string {
-  return value.replace(/[_:]+/g, " ");
 }
 
 function validAutonomyMode(value: unknown, fallback: string): string {

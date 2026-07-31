@@ -35,6 +35,10 @@ import {
   type AdvancedRunRequest,
   useAdvancedOperations,
 } from "./advancedOperations";
+import { McpPanel } from "./McpPanel";
+import { PluginsPanel } from "./PluginsPanel";
+import { SkillsPanel } from "./SkillsPanel";
+import "./extend.css";
 import type {
   Approval,
   Capability,
@@ -868,7 +872,7 @@ export function ExtendWorkspace({
     destination: "routines" | "routing" | "outcomes" | "settings" | "chat",
   ) => void;
   onRefresh: () => Promise<void>;
-  children: ReactNode;
+  children: { capabilities: ReactNode };
 }) {
   return (
     <section
@@ -944,7 +948,92 @@ export function ExtendWorkspace({
         {controller.tools.length} tools and {controller.plugins.length} plugins
         loaded.
       </span>
-      {children}
+      <section id="mcp" className="content-grid wide-left">
+        <McpPanel
+          mcpServers={controller.mcpServers}
+          capabilities={controller.capabilities}
+          capabilityPending={controller.capabilityPending}
+          setCapabilityEnabled={controller.setCapabilityEnabled}
+          loadMcp={controller.loadMcp}
+          controlMcp={controller.controlMcp}
+          deleteMcp={controller.deleteMcp}
+          saveMcp={controller.saveMcp}
+          mcpId={controller.mcpId}
+          setMcpId={controller.setMcpId}
+          mcpName={controller.mcpName}
+          setMcpName={controller.setMcpName}
+          mcpTransport={controller.mcpTransport}
+          setMcpTransport={controller.setMcpTransport}
+          mcpEndpoint={controller.mcpEndpoint}
+          setMcpEndpoint={controller.setMcpEndpoint}
+          mcpArgs={controller.mcpArgs}
+          setMcpArgs={controller.setMcpArgs}
+          mcpEnv={controller.mcpEnv}
+          setMcpEnv={controller.setMcpEnv}
+          mcpSecretEnv={controller.mcpSecretEnv}
+          setMcpSecretEnv={controller.setMcpSecretEnv}
+          mcpRiskPolicy={controller.mcpRiskPolicy}
+          setMcpRiskPolicy={controller.setMcpRiskPolicy}
+          mcpArgsTouched={controller.mcpArgsTouched}
+          setMcpArgsTouched={controller.setMcpArgsTouched}
+          mcpEnvTouched={controller.mcpEnvTouched}
+          setMcpEnvTouched={controller.setMcpEnvTouched}
+          mcpSecretEnvTouched={controller.mcpSecretEnvTouched}
+          setMcpSecretEnvTouched={controller.setMcpSecretEnvTouched}
+          loadedMcpServer={controller.loadedMcpServer}
+          mcpToolOptions={controller.mcpToolOptions}
+          mcpToolSelection={controller.mcpToolSelection}
+          setMcpToolSelection={controller.setMcpToolSelection}
+          mcpToolArgs={controller.mcpToolArgs}
+          setMcpToolArgs={controller.setMcpToolArgs}
+          mcpResult={controller.mcpResult}
+          invokeMcp={controller.invokeMcp}
+          selectedMcpToolEnabled={controller.selectedMcpToolEnabled}
+        />
+      </section>
+      <section id="skills" className="section">
+        <SkillsPanel
+          skills={controller.skills}
+          capabilities={controller.capabilities}
+          capabilityPending={controller.capabilityPending}
+          onCapabilityEnabledChange={controller.setCapabilityEnabled}
+          onToggleSkill={controller.toggleSkill}
+          skillDiscovery={controller.skillDiscovery}
+          skillDiscovering={controller.skillDiscovering}
+          onDiscover={controller.discoverSkills}
+          skillSelection={controller.skillSelection}
+          onSkillSelectionChange={controller.setSkillSelection}
+          enabledSkills={controller.enabledSkills}
+          skillTask={controller.skillTask}
+          onSkillTaskChange={controller.setSkillTask}
+          onRunSkill={controller.runSkill}
+          selectedSkillEnabled={controller.selectedSkillEnabled}
+          skillManifest={controller.skillManifest}
+          onSkillManifestChange={controller.setSkillManifest}
+          skillInstructions={controller.skillInstructions}
+          onSkillInstructionsChange={controller.setSkillInstructions}
+          onInstallSkill={controller.installSkill}
+          skillResult={controller.skillResult}
+        />
+        <PluginsPanel
+          plugins={controller.plugins}
+          pluginSource={controller.pluginSource}
+          pluginRef={controller.pluginRef}
+          pluginEnable={controller.pluginEnable}
+          pluginResult={controller.pluginResult}
+          pluginReview={controller.pluginReview}
+          pluginUpdateReviews={controller.pluginUpdateReviews}
+          reviewedCurrentPlugin={controller.reviewedCurrentPlugin}
+          pluginEnableBlockers={controller.pluginEnableBlockers}
+          onPluginSourceChange={controller.setPluginSource}
+          onPluginRefChange={controller.setPluginRef}
+          onPluginEnableChange={controller.setPluginEnable}
+          onReview={controller.reviewPlugin}
+          onInstall={controller.installPlugin}
+          onPluginAction={controller.pluginAction}
+        />
+      </section>
+      {children.capabilities}
     </section>
   );
 }

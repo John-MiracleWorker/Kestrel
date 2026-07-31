@@ -1,6 +1,9 @@
 import type {
   Capability,
+  CapabilityKind,
   CapabilitySnapshot,
+  Plugin,
+  PluginReviewReport,
   Tool,
 } from "../types";
 
@@ -111,4 +114,58 @@ export function replaceCapability(
 
 export function formatCapabilityBlocker(value: string): string {
   return value.replaceAll("_", " ");
+}
+
+export function schemaDefault(
+  schema?: Record<string, unknown>,
+): Record<string, unknown> {
+  const properties = schema?.properties;
+  if (!properties || typeof properties !== "object") return {};
+  return Object.fromEntries(Object.keys(properties).map((key) => [key, ""]));
+}
+
+export function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => String(item)).filter(Boolean)
+    : [];
+}
+
+export function capabilityKindOrder(): CapabilityKind[] {
+  return ["mcp_server", "tool", "skill"];
+}
+
+export function capabilityKindLabel(kind: CapabilityKind): string {
+  if (kind === "mcp_server") return "MCP Servers";
+  if (kind === "skill") return "Skills";
+  return "Tools";
+}
+
+export function capabilityDomId(key: string): string {
+  return `capability-${key.replace(/[^a-zA-Z0-9_-]+/g, "-")}`;
+}
+
+export function pluginReviewName(review: PluginReviewReport): string {
+  return String(review.manifest.id ?? review.source_url);
+}
+
+export function pluginDependencySummary(review: PluginReviewReport): string {
+  const declared = review.dependency_review.declared;
+  if (!declared || typeof declared !== "object" || Array.isArray(declared)) {
+    return "none";
+  }
+  const parts = Object.entries(declared).flatMap(([kind, value]) =>
+    stringArray(value).map((item) => `${kind}:${item}`),
+  );
+  return parts.length ? parts.join(", ") : "none";
+}
+
+export function pluginIsolationSummary(review: PluginReviewReport): string {
+  const mode = String(review.isolation_review.mode ?? "shared");
+  const required = Boolean(review.isolation_review.required);
+  const available = Boolean(review.isolation_review.available);
+  return `${mode}${required ? " required" : ""}${available ? "" : " unavailable"}`;
+}
+
+export function pluginBlockers(plugin: Plugin): string[] {
+  return stringArray(plugin.risk_report.enable_blockers);
 }

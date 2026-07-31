@@ -1,25 +1,13 @@
-import { CalendarClock, Pencil, Play, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { Play, Plus, RefreshCw, ShieldCheck } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { ApiAuthError, ApiResponseError, deleteJson, getJson, postJson, putJson, queryString } from "../api";
-import { ActionError, EmptyState, Field, InlineMeta, Metric, Panel, StatusBadge } from "../components";
+import { ActionError, EmptyState, InlineMeta, Metric, Panel, StatusBadge } from "../components";
 import type { Routine, RoutineDelivery, RoutineOccurrence, RoutineRunNowResult, RoutineStatus } from "../types";
-type RoutineDraft = {
-  name: string;
-  prompt: string;
-  schedule_kind: "once" | "interval" | "cron";
-  start_at_local: string;
-  interval_seconds: string;
-  cron_expression: string;
-  timezone: string;
-  delivery_channel_id: string;
-  delivery_conversation_id: string;
-  delivery_template: string;
-  workspace: string;
-  provider: string;
-  model: string;
-  autonomy_mode: string;
-  misfire_grace_seconds: string;
-};
+import { ChannelsPanel, type AutomateChannelsSlice } from "./ChannelsPanel";
+import { DeliveryHistory } from "./DeliveryHistory";
+import { RoutineEditor, type RoutineDraft } from "./RoutineEditor";
+import { RoutinesList } from "./RoutinesList";
+import "./automate.css";
 
 type RoutineRunNowRequestRecord = {
   idempotencyKey: string;
@@ -38,7 +26,13 @@ type RoutineHistoryRequest = {
   promise: Promise<void>;
 };
 
-export function AutomateWorkspace({ onAuthRequired }: { onAuthRequired: () => void }) {
+export function AutomateWorkspace({
+  onAuthRequired,
+  channelsSlice
+}: {
+  onAuthRequired: () => void;
+  channelsSlice?: AutomateChannelsSlice;
+}) {
   const [status, setStatus] = useState<RoutineStatus | null>(null);
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [selectedRoutineId, setSelectedRoutineId] = useState<string | null>(null);
@@ -455,57 +449,18 @@ export function AutomateWorkspace({ onAuthRequired }: { onAuthRequired: () => vo
       )}
 
       <div className="routine-workbench-grid">
-        <Panel
-          id="routine-definitions"
-          title="Routines"
-          icon={<CalendarClock size={19} />}
-          actions={<StatusBadge value={loading ? "loading" : `${routines.length} total`} />}
-        >
-          <div className="routine-list">
-            {routines.map((routine) => (
-              <article
-                className={`routine-card ${routine.routine_id === selectedRoutineId ? "selected" : ""}`}
-                key={routine.routine_id}
-              >
-                <button type="button" className="routine-select" onClick={() => void chooseRoutine(routine)}>
-                  <span>
-                    <strong>{routine.name}</strong>
-                    <small>{routineScheduleLabel(routine)}</small>
-                  </span>
-                  <StatusBadge value={routine.enabled ? "enabled" : "paused"} />
-                </button>
-                <div className="routine-card-actions">
-                  <button
-                    type="button"
-                    aria-label={`${routine.enabled ? "Pause" : "Enable"} ${routine.name}`}
-                    onClick={() => void toggleRoutine(routine)}
-                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
-                  >
-                    {routine.enabled ? "Pause" : "Enable"}
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Edit ${routine.name}`}
-                    onClick={() => openEditEditor(routine)}
-                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
-                  >
-                    <Pencil size={14} /> Edit
-                  </button>
-                  <button
-                    type="button"
-                    className="btn danger"
-                    aria-label={`Delete ${routine.name}`}
-                    onClick={() => void deleteRoutine(routine)}
-                    disabled={mutationPending || uncertainRoutineIds.has(routine.routine_id)}
-                  >
-                    <Trash2 size={14} /> Delete
-                  </button>
-                </div>
-              </article>
-            ))}
-            {!loading && routines.length === 0 && <EmptyState>No routines yet. Create one to start with a disabled, reviewable definition.</EmptyState>}
-          </div>
-        </Panel>
+        <RoutinesList
+          routines={routines}
+          loading={loading}
+          selectedRoutineId={selectedRoutineId}
+          uncertainRoutineIds={uncertainRoutineIds}
+          mutationPending={mutationPending}
+          onChoose={(routine) => void chooseRoutine(routine)}
+          onToggle={(routine) => void toggleRoutine(routine)}
+          onEdit={openEditEditor}
+          onDelete={(routine) => void deleteRoutine(routine)}
+          scheduleLabel={routineScheduleLabel}
+        />
 
         <Panel
           id="routine-detail"
@@ -578,56 +533,14 @@ export function AutomateWorkspace({ onAuthRequired }: { onAuthRequired: () => vo
                   {!historyLoading && !historyError && history.length === 0 && <EmptyState>No occurrences recorded for this routine.</EmptyState>}
                 </div>
               </section>
-              <section className="routine-history" aria-labelledby="routine-delivery-title">
-                <div className="routine-history-head">
-                  <h3 id="routine-delivery-title">Delivery history</h3>
-                  <StatusBadge value={`${deliveries.length} records`} />
-                </div>
-                <div className="list compact-list">
-                  {deliveries.map((delivery) => (
-                    <article className="data-row" key={delivery.delivery_id}>
-                      <div className="run-title">
-                        <strong>{delivery.destination.channel_id} / {delivery.destination.conversation_id}</strong>
-                        <StatusBadge value={delivery.status} />
-                      </div>
-                      <InlineMeta items={[
-                        `attempt ${delivery.attempt_count}`,
-                        delivery.idempotency_key,
-                        formatRoutineDate(delivery.delivered_at ?? delivery.updated_at)
-                      ]} />
-                      {delivery.error ? <p className="danger-text">{delivery.error}</p> : null}
-                      {["uncertain", "failed", "blocked"].includes(delivery.status) ? (
-                        <div className="page-actions">
-                          <button
-                            type="button"
-                            disabled={mutationPending || !status?.enabled}
-                            onClick={() => void reconcileRoutineDelivery(delivery, "retry")}
-                          >
-                            Retry with same key
-                          </button>
-                          <button
-                            type="button"
-                            disabled={mutationPending || !status?.enabled}
-                            onClick={() => void reconcileRoutineDelivery(delivery, "delivered")}
-                          >
-                            Mark delivered
-                          </button>
-                          <button
-                            type="button"
-                            disabled={mutationPending || !status?.enabled}
-                            onClick={() => void reconcileRoutineDelivery(delivery, "failed")}
-                          >
-                            Mark failed
-                          </button>
-                        </div>
-                      ) : null}
-                    </article>
-                  ))}
-                  {!historyLoading && deliveries.length === 0 ? (
-                    <EmptyState>No delivery attempts recorded for this routine.</EmptyState>
-                  ) : null}
-                </div>
-              </section>
+              <DeliveryHistory
+                deliveries={deliveries}
+                historyLoading={historyLoading}
+                mutationPending={mutationPending}
+                dispatcherEnabled={Boolean(status?.enabled)}
+                formatDate={formatRoutineDate}
+                onReconcile={(delivery, resolution) => void reconcileRoutineDelivery(delivery, resolution)}
+              />
             </div>
           ) : (
             <EmptyState>Select a routine to inspect its schedule and run history.</EmptyState>
@@ -636,83 +549,22 @@ export function AutomateWorkspace({ onAuthRequired }: { onAuthRequired: () => vo
       </div>
 
       {editorMode && (
-        <Panel
-          id="routine-editor"
-          title={editorMode === "edit" ? `Edit ${selectedRoutine?.name ?? "routine"}` : "Create routine"}
-          icon={editorMode === "edit" ? <Pencil size={19} /> : <Plus size={19} />}
-        >
-          <form className="routine-editor-form" aria-label={editorMode === "edit" ? "Edit routine" : "Create routine"} onSubmit={submitRoutine}>
-            <Field label="Routine name">
-              <input required maxLength={200} value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} />
-            </Field>
-            <Field label="Prompt">
-              <textarea required maxLength={20_000} rows={5} value={draft.prompt} onChange={(event) => setDraft((current) => ({ ...current, prompt: event.target.value }))} />
-            </Field>
-            <div className="field-row">
-              <Field label="Schedule">
-                <select value={draft.schedule_kind} onChange={(event) => setDraft((current) => ({ ...current, schedule_kind: event.target.value as "once" | "interval" | "cron" }))}>
-                  <option value="once">Once</option>
-                  <option value="interval">Fixed interval</option>
-                  <option value="cron">Cron / calendar</option>
-                </select>
-              </Field>
-              <Field label={`Start time (${localTimeZone})`} hint="Stored as UTC after submission.">
-                <input type="datetime-local" required value={draft.start_at_local} onChange={(event) => setDraft((current) => ({ ...current, start_at_local: event.target.value }))} />
-              </Field>
-              {draft.schedule_kind === "interval" && (
-                <Field label="Interval seconds" hint="Minimum 60 seconds.">
-                  <input type="number" required min="60" max="31536000" step="1" value={draft.interval_seconds} onChange={(event) => setDraft((current) => ({ ...current, interval_seconds: event.target.value }))} />
-                </Field>
-              )}
-              {draft.schedule_kind === "cron" && (
-                <>
-                  <Field label="Cron expression" hint="Five fields: minute hour day month weekday.">
-                    <input required value={draft.cron_expression} onChange={(event) => setDraft((current) => ({ ...current, cron_expression: event.target.value }))} placeholder="0 9 * * 1-5" />
-                  </Field>
-                  <Field label="IANA timezone" hint="DST is evaluated in this named timezone.">
-                    <input required maxLength={128} value={draft.timezone} onChange={(event) => setDraft((current) => ({ ...current, timezone: event.target.value }))} placeholder="America/Detroit" />
-                  </Field>
-                </>
-              )}
-              <Field label="Misfire grace seconds">
-                <input type="number" required min="0" max="604800" step="1" value={draft.misfire_grace_seconds} onChange={(event) => setDraft((current) => ({ ...current, misfire_grace_seconds: event.target.value }))} />
-              </Field>
-            </div>
-            <div className="field-row">
-              <Field label="Workspace" hint="Blank uses the configured default.">
-                <input maxLength={4096} value={draft.workspace} onChange={(event) => setDraft((current) => ({ ...current, workspace: event.target.value }))} />
-              </Field>
-              <Field label="Provider" hint="Blank uses the configured default.">
-                <input maxLength={256} value={draft.provider} onChange={(event) => setDraft((current) => ({ ...current, provider: event.target.value }))} />
-              </Field>
-              <Field label="Model" hint="Blank uses the configured default.">
-                <input maxLength={256} value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} />
-              </Field>
-              <Field label="Autonomy">
-                <select value={draft.autonomy_mode} onChange={(event) => setDraft((current) => ({ ...current, autonomy_mode: event.target.value }))}>
-                  <option value="background">Safe Auto</option>
-                  <option value="manual">Manual</option>
-                  <option value="autonomous">Autopilot</option>
-                </select>
-              </Field>
-            </div>
-            <div className="field-row">
-              <Field label="Delivery channel" hint="Optional configured channel id.">
-                <input maxLength={128} value={draft.delivery_channel_id} onChange={(event) => setDraft((current) => ({ ...current, delivery_channel_id: event.target.value }))} placeholder="telegram" />
-              </Field>
-              <Field label="Delivery conversation" hint="Required when a channel is selected.">
-                <input maxLength={512} value={draft.delivery_conversation_id} onChange={(event) => setDraft((current) => ({ ...current, delivery_conversation_id: event.target.value }))} placeholder="chat or webhook destination" />
-              </Field>
-              <Field label="Delivery template" hint="Supports {result}, {run_id}, and {run_status}.">
-                <input maxLength={4000} value={draft.delivery_template} onChange={(event) => setDraft((current) => ({ ...current, delivery_template: event.target.value }))} />
-              </Field>
-            </div>
-            <div className="page-actions">
-              <button className="btn primary" type="submit" disabled={mutationPending}>{mutationPending ? "Saving…" : "Save routine"}</button>
-              <button className="btn subtle" type="button" onClick={() => setEditorMode(null)} disabled={mutationPending}>Cancel</button>
-            </div>
-          </form>
-        </Panel>
+        <RoutineEditor
+          mode={editorMode}
+          routineName={selectedRoutine?.name ?? null}
+          draft={draft}
+          localTimeZone={localTimeZone}
+          mutationPending={mutationPending}
+          onDraftChange={setDraft}
+          onSubmit={submitRoutine}
+          onCancel={() => setEditorMode(null)}
+        />
+      )}
+
+      {channelsSlice && (
+        <div className="automate-channels-grid">
+          <ChannelsPanel channelsSlice={channelsSlice} />
+        </div>
       )}
     </section>
   );

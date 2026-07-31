@@ -1299,7 +1299,8 @@ describe("App", () => {
 
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call git.commit/i }));
     expect(screen.getByLabelText("Tool")).toHaveValue("git.commit");
-    const toolArgsInput = screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement;
+    const connectedTools = screen.getByLabelText("Connected Tools");
+    const toolArgsInput = within(connectedTools).getByLabelText("Arguments JSON") as HTMLTextAreaElement;
     const commitArgs = JSON.parse(toolArgsInput.value);
     expect(commitArgs).toMatchObject({ repair_review_id: actionAuthority.reviewId });
     expect(String(commitArgs.message)).toContain(actionAuthority.reviewId);
@@ -1375,7 +1376,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     const panel = await screen.findByLabelText("Repair Patch Review");
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call git.commit/i }));
-    const preparedArgs = JSON.parse((screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement).value);
+    const preparedArgs = JSON.parse((within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON") as HTMLTextAreaElement).value);
 
     fireEvent.click(screen.getByRole("button", { name: /invoke tool/i }));
 
@@ -1463,7 +1464,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     const panel = await screen.findByLabelText("Repair Patch Review");
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));
-    const preparedArgs = JSON.parse((screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement).value);
+    const preparedArgs = JSON.parse((within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON") as HTMLTextAreaElement).value);
 
     fireEvent.click(screen.getByRole("button", { name: /invoke tool/i }));
 
@@ -1891,7 +1892,7 @@ describe("App", () => {
 
     expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
-    fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
+    fireEvent.change(within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON"), {
       target: {
         value: JSON.stringify(
           { repair_review_id: "edited_form_review", message: "edited form state must not be approved" },
@@ -1940,7 +1941,7 @@ describe("App", () => {
 
     expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
-    fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
+    fireEvent.change(within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON"), {
       target: {
         value: JSON.stringify(
           { review_id: "edited_form_review", reason: "edited form state must not be approved" },
