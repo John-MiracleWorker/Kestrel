@@ -32,6 +32,7 @@ import {
   verifyExecutableForLaunch,
   verifyManifestInventory,
   verifyPackagedApplicationDist,
+  waitForCanonicalControl,
 } from "./smoke-dir.mjs";
 
 const sha256 = (character) => character.repeat(64);
@@ -411,6 +412,55 @@ describe("external developer directory smoke contracts", () => {
           new Set(["ready", "schema"]),
         ),
       ).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("waits only for a private zero-byte control publication to finish", async () => {
+    const root = await mkdtemp(
+      join(await realpath(tmpdir()), "kestrel-smoke-publish-"),
+    );
+    const controlRoot = join(root, "directory-smoke-v1");
+    const readyPath = join(controlRoot, "ready.json");
+    const ready = {
+      schema: "kestrel.desktop.directory-smoke-ready.v1",
+      ready: true,
+    };
+    await chmod(root, 0o700);
+    await mkdir(controlRoot, { mode: 0o700 });
+    try {
+      await writeFile(readyPath, Buffer.alloc(0), { mode: 0o600 });
+      await chmod(readyPath, 0o600);
+      const publication = new Promise((resolvePromise, rejectPromise) => {
+        setTimeout(() => {
+          writeFile(readyPath, canonicalSmokeJson(ready)).then(
+            resolvePromise,
+            rejectPromise,
+          );
+        }, 50);
+      });
+      const captured = await waitForCanonicalControl(
+        readyPath,
+        new Set(["ready", "schema"]),
+        ready.schema,
+        Date.now() + 2_000,
+      );
+      await publication;
+      expect(captured.value).toEqual(ready);
+
+      if (process.platform !== "win32") {
+        await writeFile(readyPath, Buffer.alloc(0), { mode: 0o600 });
+        await chmod(readyPath, 0o644);
+        await expect(
+          waitForCanonicalControl(
+            readyPath,
+            new Set(["ready", "schema"]),
+            ready.schema,
+            Date.now() + 2_000,
+          ),
+        ).rejects.toThrow("directory_smoke_file_untrusted");
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }

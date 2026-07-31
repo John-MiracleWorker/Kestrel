@@ -1380,7 +1380,27 @@ async function verifyPackagedEvidence(
   };
 }
 
-async function waitForCanonicalControl(
+async function privateEmptyControlPublicationPending(pathValue) {
+  try {
+    const metadata = await lstat(pathValue);
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isFile() ||
+      metadata.nlink !== 1 ||
+      metadata.size !== 0 ||
+      (process.platform !== "win32" &&
+        (metadata.uid !== process.getuid?.() ||
+          (metadata.mode & 0o777) !== 0o600))
+    ) {
+      return false;
+    }
+    return (await realpath(pathValue)) === resolve(pathValue);
+  } catch {
+    return false;
+  }
+}
+
+export async function waitForCanonicalControl(
   pathValue,
   expectedKeys,
   schema,
@@ -1401,7 +1421,14 @@ async function waitForCanonicalControl(
       }
       return record;
     } catch (error) {
-      if (error?.code !== "ENOENT") {
+      if (
+        error?.code !== "ENOENT" &&
+        !(
+          error instanceof Error &&
+          error.message === "directory_smoke_file_untrusted" &&
+          (await privateEmptyControlPublicationPending(pathValue))
+        )
+      ) {
         throw error;
       }
     }
