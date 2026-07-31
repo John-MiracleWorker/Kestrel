@@ -22,6 +22,7 @@ describe("Settings workspace ownership", () => {
 
   beforeEach(() => {
     requests.length = 0;
+    localStorage.clear();
     window.history.replaceState(null, "", "/#/settings");
     vi.stubGlobal(
       "fetch",
@@ -34,6 +35,7 @@ describe("Settings workspace ownership", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    localStorage.clear();
     window.history.replaceState(null, "", "/");
   });
 
@@ -72,5 +74,31 @@ describe("Settings workspace ownership", () => {
     expect(requests).not.toContain("/api/plugins");
     expect(requests).not.toContain("/api/mcp/servers");
     expect(requests).not.toContain("/api/skills");
+  });
+
+  it("keeps Setup Center permanently routed and avoids general settings inventory", async () => {
+    window.history.replaceState(null, "", "/#/settings/setup");
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Setup Center." }),
+    ).toBeVisible();
+    expect(
+      await screen.findByRole("heading", {
+        name: "Review safety defaults",
+      }),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(requests).toContain("/api/product/setup");
+      expect(requests).toContain("/api/runtime/models");
+      expect(requests).toContain("/api/projects");
+      expect(requests).toContain("/api/secrets");
+      expect(requests).toContain("/api/runtime/settings");
+    });
+    expect(requests).not.toContain("/api/channels");
+    expect(requests).not.toContain("/api/tools");
+    expect(requests).not.toContain("/api/capabilities");
+    expect(window.location.hash).toBe("#/settings/setup");
   });
 });

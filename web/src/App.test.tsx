@@ -2004,6 +2004,42 @@ describe("App", () => {
     expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
   });
 
+  it("shows Desktop memory restart recovery with current launch authority evidence", async () => {
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge();
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+
+    const memoryHeading = screen.getByRole("heading", {
+      name: "Memory",
+    });
+    const memorySection = memoryHeading.closest("section");
+    expect(memorySection).not.toBeNull();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        "Launch-controlled storage recovery",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        "/tmp/memory",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        /quit Kestrel Desktop completely/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        /Changing the memory location is not available in this build/i,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("renders guided Telegram channel setup and webhook controls", async () => {
     const fetchSpy = vi.mocked(fetch);
     channelsPayload = [
@@ -2848,9 +2884,10 @@ describe("App", () => {
     });
   });
 
-  it("runs the setup wizard and saves onboarding to Soul memory", async () => {
+  it("routes first use to the permanent server-backed Setup Center", async () => {
     const fetchSpy = vi.mocked(fetch);
     onboardingProfile = null;
+    localStorage.setItem("kestrel.setup.dismissed", "1");
     setupReadinessPayload = readinessFixture({
       ready: false,
       pass_count: 5,
@@ -2883,56 +2920,45 @@ describe("App", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Meet your Kestrel" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "First-run readiness" })).toBeInTheDocument();
-    expect(screen.getByText("5 pass · 2 warn · 1 fail")).toBeInTheDocument();
-    expect(screen.getByText("Provider configuration")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Setup Center." }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings/setup");
+    expect(
+      await screen.findByRole("heading", {
+        name: "Check the bundled core",
+      }),
+    ).toBeInTheDocument();
     expect(screen.getByText("Workspace")).toBeInTheDocument();
-    expect(screen.getByText("Fix failing setup checks before starting the golden local workflow.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Workspace `/tmp/missing` does not exist."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/nest-agent init/)).not.toBeVisible();
     expect(fetchSpy.mock.calls.some(([path]) => path === "/api/product/setup")).toBe(true);
-    fireEvent.change(screen.getByLabelText("Agent name"), { target: { value: "Northstar" } });
-    fireEvent.change(screen.getByLabelText("Your name"), { target: { value: "Taylor" } });
-    fireEvent.change(screen.getByLabelText("What should it call you?"), { target: { value: "Tay" } });
-    fireEvent.click(screen.getByRole("radio", { name: /creative spark/i }));
-    fireEvent.change(screen.getByLabelText("What are you usually trying to get done?"), {
-      target: { value: "Build Kestrel\nDesign local tools" }
-    });
-    fireEvent.change(screen.getByLabelText("How do you like collaboration to feel?"), {
-      target: { value: "Short plans, direct tradeoffs, live verification." }
-    });
-    fireEvent.change(screen.getByLabelText("Interests or recurring themes"), {
-      target: { value: "Local-first software, thoughtful UI" }
-    });
-    fireEvent.change(screen.getByLabelText("Anything else it should remember?"), {
-      target: { value: "Warm but concrete." }
-    });
-    fireEvent.click(screen.getByRole("button", { name: /save to soul/i }));
+    expect(
+      fetchSpy.mock.calls.some(
+        ([path, init]) =>
+          path === "/api/self/onboarding" && init?.method === "POST",
+      ),
+    ).toBe(false);
 
-    await waitFor(() => {
-      const setupCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/self/onboarding" && init?.method === "POST");
-      expect(setupCall).toBeDefined();
-      expect(
-        setupCall &&
-          requestMatchesLegacyContract(
-            "firstRunSetup",
-            fixtureRequest(setupCall[0], setupCall[1]),
-          ),
-      ).toBe(true);
-      const body = JSON.parse(String(setupCall?.[1]?.body ?? "{}"));
-      expect(body).toMatchObject({
-        agent_name: "Northstar",
-        user_name: "Taylor",
-        preferred_name: "Tay",
-        persona: "spark",
-        working_style: "Short plans, direct tradeoffs, live verification.",
-        communication_notes: "Warm but concrete.",
-        continuous_learning: true
-      });
-      expect(body.goals).toEqual(["Build Kestrel", "Design local tools"]);
-      expect(body.interests).toEqual(["Local-first software", "thoughtful UI"]);
-    });
-    expect(await screen.findByText("Setup saved to Soul memory.")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Meet your Kestrel" })).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Review recovery for Workspace",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Settings." }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings/general");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Setup Center" }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Setup Center." }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings/setup");
   });
 
   it("prompts for an API token after a 401 and sends it on later API calls", async () => {
@@ -3836,6 +3862,22 @@ function payloadFor(path: string): unknown {
         }
       },
       validation_commands: ["python -m pytest -q"]
+    };
+  }
+  if (path === "/api/runtime/settings") {
+    return {
+      settings: {
+        provider: runtimeProviderName,
+        model: runtimeModelName,
+        backend: "memory",
+        memory_dir: "/tmp/memory",
+        workspace: "/tmp/kestrel",
+        stream: false,
+        require_api_auth: false,
+        autonomy_mode: "background",
+        revision: "runtime-revision-1",
+        persisted: false
+      }
     };
   }
   const modelCatalogMatch = path.match(/^\/api\/runtime\/models\?provider=([^&]+)$/);

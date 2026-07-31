@@ -41,7 +41,7 @@ import { AutomateWorkspace } from "./automate/AutomateWorkspace";
 import { ApiAuthError, ApiResponseError, deleteJson, getJson, postJson, putJson, queryString, subscribeJsonEvents } from "./api";
 import { getApiToken, setApiToken } from "./auth";
 import { ConversationPanel } from "./chat/ConversationPanel";
-import { ActionError, EmptyState, Field, InlineMeta, JsonBlock, Metric, Panel, StatusBadge } from "./components";
+import { ActionError, EmptyState, Field, InlineMeta, JsonBlock, Metric, Notice, Panel, StatusBadge } from "./components";
 import {
   ExtendWorkspace,
   useExtendWorkspace,
@@ -56,6 +56,8 @@ import { ProjectsWorkspace } from "./projects/ProjectsWorkspace";
 import { RepairReviewPanel } from "./repair/RepairReviewPanel";
 import { SettingsWorkspace } from "./settings/SettingsWorkspace";
 import { useSettingsWorkspace } from "./settings/settingsController";
+import { SetupCenter } from "./setup/SetupCenter";
+import { hasVisitedSetupCenter } from "./setup/presentation";
 import {
   deriveThreadTitle,
   eventBelongsToRun,
@@ -74,8 +76,6 @@ import type {
   CapabilitySnapshot,
   Channel,
   McpServer,
-  OnboardingProfile,
-  PersonaPreset,
   Plugin,
   PluginReviewReport,
   ProviderModelCatalog,
@@ -88,7 +88,6 @@ import type {
   RoutineStatus,
   RuntimeConfig,
   SelfState,
-  SelfOnboardingSaveResult,
   SelfOnboardingState,
   Session,
   SetupReadinessReport,
@@ -339,58 +338,6 @@ const runEventTypes = [
   "routing.outcome_recorded",
   "routing.outcome_failed"
 ];
-const SETUP_DISMISSED_KEY = "kestrel.setup.dismissed";
-const defaultPersonaPresets: PersonaPreset[] = [
-  {
-    id: "steady",
-    name: "Steady Companion",
-    summary: "Warm, grounded, concise, and quietly capable.",
-    guidance: "Be warm and direct. Keep momentum, explain tradeoffs clearly, and avoid performative enthusiasm."
-  },
-  {
-    id: "mentor",
-    name: "Patient Mentor",
-    summary: "Explains reasoning, teaches patterns, and checks understanding without dragging.",
-    guidance: "Be patient and instructional. Explain the why behind decisions while keeping the next action clear."
-  },
-  {
-    id: "spark",
-    name: "Creative Spark",
-    summary: "More playful, imaginative, and idea-forward while staying useful.",
-    guidance: "Bring more creative options and a livelier voice, but keep answers practical and grounded in evidence."
-  },
-  {
-    id: "operator",
-    name: "Calm Operator",
-    summary: "Precise, terse, and technical for focused execution.",
-    guidance: "Be crisp and operational. Lead with facts, actions, blockers, and verification evidence."
-  }
-];
-
-type SetupDraft = {
-  agent_name: string;
-  user_name: string;
-  preferred_name: string;
-  persona: string;
-  working_style: string;
-  goals_text: string;
-  interests_text: string;
-  communication_notes: string;
-  continuous_learning: boolean;
-};
-
-const emptySetupDraft: SetupDraft = {
-  agent_name: "Kestrel",
-  user_name: "",
-  preferred_name: "",
-  persona: "steady",
-  working_style: "",
-  goals_text: "",
-  interests_text: "",
-  communication_notes: "",
-  continuous_learning: true
-};
-
 const DESKTOP_AUTH_RECOVERY_MESSAGE =
   "The Desktop connection needs to be restored. Retry, or restart Kestrel if its local runtime has stopped.";
 
@@ -681,10 +628,14 @@ export function LegacyWorkbench({
   requestedSection,
   requestedSubroute,
   onRouteSection,
+  onOpenSetup,
+  onOpenMission,
 }: {
   requestedSection?: LegacyWorkbenchSection;
   requestedSubroute?: string;
   onRouteSection?: (section: LegacyWorkbenchSection) => void;
+  onOpenSetup?: () => void;
+  onOpenMission?: () => void;
 }) {
   const desktopRuntime = isDesktopRuntime();
   const [error, setError] = useState<string | null>(null);
@@ -695,9 +646,6 @@ export function LegacyWorkbench({
   const [selfState, setSelfState] = useState<SelfState | null>(null);
   const [onboardingState, setOnboardingState] = useState<SelfOnboardingState | null>(null);
   const [setupReadiness, setSetupReadiness] = useState<SetupReadinessReport | null>(null);
-  const [setupOpen, setSetupOpen] = useState(false);
-  const [setupDismissed, setSetupDismissed] = useState(() => localStorage.getItem(SETUP_DISMISSED_KEY) === "1");
-  const [setupDraft, setSetupDraft] = useState<SetupDraft>(emptySetupDraft);
   const [runs, setRuns] = useState<Run[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
@@ -718,7 +666,7 @@ export function LegacyWorkbench({
   const topbarRef = useRef<HTMLElement | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
   const idleRefreshInFlightRef = useRef(false);
-  const setupDraftHydratedRef = useRef(false);
+  const setupEntryRoutedRef = useRef(false);
   const [activeSection, setActiveSection] =
     useState<LegacyWorkbenchSection>(
       requestedSection ?? DEFAULT_APP_SECTION,
@@ -763,7 +711,9 @@ export function LegacyWorkbench({
   const settingsWorkspace = useSettingsWorkspace({
     enabled:
       apiReady &&
-      (activeSection === "advanced" || activeSection === "settings"),
+      (activeSection === "advanced" ||
+        (activeSection === "settings" &&
+          requestedSubroute !== "setup")),
     includeCapabilities: activeSection === "settings",
     desktopRuntime,
     onError: reportError,
@@ -1081,6 +1031,32 @@ export function LegacyWorkbench({
     }, 0);
   }
 
+  function openSetupCenter() {
+    setNotice(null);
+    setError(null);
+    setActiveSection("settings");
+    if (onOpenSetup) {
+      onOpenSetup();
+      return;
+    }
+    window.location.hash = "#/settings/setup";
+  }
+
+  function openSettingsSection(anchor?: string) {
+    routeToSection("settings");
+    if (anchor) {
+      window.setTimeout(() => scrollToElement(anchor), 0);
+    }
+  }
+
+  function openMissionCommand() {
+    if (onOpenMission) {
+      onOpenMission();
+      return;
+    }
+    routeToSection("mission");
+  }
+
   function selectSessionId(sessionId: string | null) {
     activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
@@ -1146,14 +1122,27 @@ export function LegacyWorkbench({
 
   useEffect(() => {
     if (!onboardingState) return;
-    if (onboardingState.profile && !setupDraftHydratedRef.current) {
-      setSetupDraft(setupDraftFromProfile(onboardingState.profile));
-      setupDraftHydratedRef.current = true;
+    if (
+      onboardingState.completed ||
+      setupEntryRoutedRef.current ||
+      hasVisitedSetupCenter()
+    ) {
+      return;
     }
-    if (!onboardingState.completed && !setupDismissed) {
-      setSetupOpen(true);
+    setupEntryRoutedRef.current = true;
+    if (
+      requestedSection === "settings" &&
+      requestedSubroute === "setup"
+    ) {
+      return;
     }
-  }, [onboardingState, setupDismissed]);
+    openSetupCenter();
+  }, [
+    onboardingState,
+    requestedSection,
+    requestedSubroute,
+    onOpenSetup,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1633,42 +1622,6 @@ export function LegacyWorkbench({
     return Boolean((status as Record<string, unknown>)[key]);
   }
 
-  async function saveSetup(event: FormEvent) {
-    event.preventDefault();
-    await guarded(async () => {
-      const result = await postJson<SelfOnboardingSaveResult>("/api/self/onboarding", {
-        agent_name: setupDraft.agent_name,
-        user_name: setupDraft.user_name,
-        preferred_name: setupDraft.preferred_name,
-        persona: setupDraft.persona,
-        working_style: setupDraft.working_style,
-        goals: splitSetupList(setupDraft.goals_text),
-        interests: splitSetupList(setupDraft.interests_text),
-        communication_notes: setupDraft.communication_notes,
-        continuous_learning: setupDraft.continuous_learning
-      });
-      if (!result.success) {
-        throw new Error(String(result.memory?.error ?? "Setup could not be saved to Soul memory."));
-      }
-      setOnboardingState({
-        completed: result.success,
-        profile: result.profile,
-        personas: result.personas
-      });
-      localStorage.setItem(SETUP_DISMISSED_KEY, "1");
-      setSetupDismissed(true);
-      setSetupOpen(false);
-      setupDraftHydratedRef.current = true;
-      await refreshAll();
-    }, "Setup saved to Soul memory.");
-  }
-
-  function dismissSetup() {
-    localStorage.setItem(SETUP_DISMISSED_KEY, "1");
-    setSetupDismissed(true);
-    setSetupOpen(false);
-  }
-
   const runtimeConfig = runtime as RuntimeConfig | null;
   const runtimeProvider = runtimeConfig?.provider ?? {};
   const runtimeLimits = runtimeConfig?.limits ?? {};
@@ -1703,7 +1656,6 @@ export function LegacyWorkbench({
   const pendingApprovalCount = approvals.filter((approval) => approval.status === "pending").length;
   const oracleShadowLabel = `${events.filter((event) => event.type.includes("oracle") || event.type.includes("routing")).length} observations`;
   const onboardingProfile = onboardingState?.profile ?? null;
-  const personaPresets = onboardingState?.personas?.length ? onboardingState.personas : defaultPersonaPresets;
   const agentDisplayName = String(onboardingProfile?.agent_name || selfState?.identity?.name || "Kestrel");
   const userDisplayName = String(onboardingProfile?.preferred_name || onboardingProfile?.user_name || "");
   const browserAuthPromptOpen = authPromptOpen && !desktopRuntime;
@@ -1834,7 +1786,7 @@ export function LegacyWorkbench({
             <button type="button" className={activeSection === "advanced" ? "active" : ""} onClick={() => routeToSection("advanced")}>Advanced</button>
           </nav>
           <div className="topbar-meta">
-            <button type="button" className="setup-button" onClick={() => setSetupOpen(true)}>
+            <button type="button" className="setup-button" onClick={openSetupCenter}>
               <Sparkles size={14} /> Setup
             </button>
             <span className="status-pill"><span className="status-dot"></span>{simpleStatus.label}</span>
@@ -1979,7 +1931,7 @@ export function LegacyWorkbench({
           notice={notice}
           error={error}
           onAutonomyModeChange={setAutonomyMode}
-          onOpenSetup={() => setSetupOpen(true)}
+          onOpenSetup={openSetupCenter}
           onOpenSettings={() => routeToSection("settings")}
           onRefresh={refreshAll}
           onSubmitMessage={submitConversationMessage}
@@ -2902,7 +2854,27 @@ export function LegacyWorkbench({
             notice={notice}
             onDismissError={() => setError(null)}
             onOpenAdvanced={() => jumpToAdvanced("runtime")}
+            onOpenSetup={openSetupCenter}
             onRefresh={refreshOperatorWorkspace}
+            subroute={requestedSubroute}
+            setupCenter={
+              <SetupCenter
+                navigation={{
+                  openGeneralSettings: () => openSettingsSection(),
+                  openProviderSettings: () =>
+                    openSettingsSection("provider"),
+                  openSafetySettings: () =>
+                    openSettingsSection("permissions"),
+                  openCapabilitiesSettings: () =>
+                    openSettingsSection("capabilities"),
+                  openMemorySettings: () =>
+                    openSettingsSection("memory-storage-recovery"),
+                  openApiAccessSettings: () =>
+                    openSettingsSection("api-access"),
+                  openMission: openMissionCommand,
+                }}
+              />
+            }
           >
 
             <section className="section" id="identity">
@@ -3190,6 +3162,49 @@ export function LegacyWorkbench({
                     <input className="input mono short" type="text" value={String(runtimePaths.memory_dir ?? ".nest/memory")} readOnly />
                   </div>
                 </div>
+                {desktopRuntime && (
+                  <div className="row stacked">
+                    <Notice
+                      id="memory-storage-recovery"
+                      className="settings-storage-recovery"
+                      tabIndex={-1}
+                      variant="caution"
+                      title="Launch-controlled storage recovery"
+                    >
+                      <p>
+                        Kestrel Desktop selected the active memory writer
+                        path before starting the local API. This page can
+                        inspect that authority, but cannot move live memory
+                        or replace it while the writer is running.
+                      </p>
+                      <p>
+                        <strong>Current launch-owned path:</strong>{" "}
+                        <code className="mono">
+                          {String(runtimePaths.memory_dir ?? ".nest/memory")}
+                        </code>
+                      </p>
+                      <ol>
+                        <li>Quit Kestrel Desktop completely so no memory writer remains active.</li>
+                        <li>
+                          Restore this folder&apos;s availability, owner-only
+                          permissions, and free space. Do not move or delete
+                          live <code className="mono">.mv2</code> files.
+                        </li>
+                        <li>
+                          Reopen Kestrel. The Desktop launcher rechecks the
+                          private directory and each Memvid layer before
+                          starting the local API.
+                        </li>
+                        <li>Return to Setup Center and choose Check again.</li>
+                      </ol>
+                      <p>
+                        Changing the memory location is not available in this
+                        build. Kestrel will not claim a path change that the
+                        Desktop launcher did not accept.
+                      </p>
+                    </Notice>
+                  </div>
+                )}
                 <div className="layer-grid settings-layer-grid">
                   {memoryWorkspace.memoryLayers.map((layer) => (
                     <article className="layer-card" key={layer.layer}>
@@ -3516,180 +3531,7 @@ export function LegacyWorkbench({
       )}
     </div>
       )}
-      {setupOpen && (
-        <SetupWizard
-          draft={setupDraft}
-          personas={personaPresets}
-          existingProfile={onboardingProfile}
-          setupReadiness={setupReadiness}
-          userDisplayName={userDisplayName}
-          onChange={setSetupDraft}
-          onSubmit={saveSetup}
-          onClose={dismissSetup}
-        />
-      )}
   </>
-  );
-}
-
-function SetupWizard({
-  draft,
-  personas,
-  existingProfile,
-  setupReadiness,
-  userDisplayName,
-  onChange,
-  onSubmit,
-  onClose
-}: {
-  draft: SetupDraft;
-  personas: PersonaPreset[];
-  existingProfile: OnboardingProfile | null;
-  setupReadiness: SetupReadinessReport | null;
-  userDisplayName: string;
-  onChange: (draft: SetupDraft) => void;
-  onSubmit: (event: FormEvent) => void;
-  onClose: () => void;
-}) {
-  const selectedPersona = personas.find((persona) => persona.id === draft.persona) ?? personas[0] ?? defaultPersonaPresets[0];
-  const update = (patch: Partial<SetupDraft>) => onChange({ ...draft, ...patch });
-  return (
-    <div className="setup-backdrop" role="presentation">
-      <section className="setup-dialog" role="dialog" aria-modal="true" aria-labelledby="setup-title">
-        <header className="setup-head">
-          <div>
-            <p className="page-eyebrow">{existingProfile ? "Soul Setup" : "Welcome"}</p>
-            <h1 id="setup-title">{existingProfile ? "Tune your Kestrel" : "Meet your Kestrel"}</h1>
-            <p>
-              {userDisplayName
-                ? `${userDisplayName}, this profile lives in the Soul layer so your agent can keep the relationship coherent.`
-                : "Name the agent, choose its voice, and give it a first sketch of how you like to work."}
-            </p>
-          </div>
-          <button type="button" aria-label="Close setup" onClick={onClose}>
-            <X size={16} />
-          </button>
-        </header>
-
-        <form className="setup-grid" onSubmit={onSubmit}>
-          <div className="setup-section setup-readiness-panel">
-            <h2>First-run readiness</h2>
-            {setupReadiness ? (
-              <>
-                <div className="readiness-summary">
-                  <StatusBadge value={setupReadiness.ready ? "ready" : "not ready"} />
-                  <span>{setupReadiness.pass_count} pass · {setupReadiness.warn_count} warn · {setupReadiness.fail_count} fail</span>
-                </div>
-                <p className="setup-hint">{setupReadiness.next_action}</p>
-                <div className="readiness-check-list">
-                  {setupReadiness.checks.slice(0, 4).map((check) => (
-                    <article className="readiness-check" key={check.check_id}>
-                      <div>
-                        <strong>{check.title}</strong>
-                        <p>{check.detail}</p>
-                      </div>
-                      <StatusBadge value={check.status} />
-                    </article>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <EmptyState>Setup readiness has not loaded yet.</EmptyState>
-            )}
-          </div>
-
-          <div className="setup-section">
-            <h2>Names</h2>
-            <div className="field-row">
-              <Field label="Agent name">
-                <input value={draft.agent_name} onChange={(event) => update({ agent_name: event.target.value })} />
-              </Field>
-              <Field label="Your name">
-                <input value={draft.user_name} onChange={(event) => update({ user_name: event.target.value })} />
-              </Field>
-              <Field label="What should it call you?">
-                <input value={draft.preferred_name} onChange={(event) => update({ preferred_name: event.target.value })} />
-              </Field>
-            </div>
-          </div>
-
-          <div className="setup-section">
-            <h2>Persona</h2>
-            <div className="persona-grid" role="radiogroup" aria-label="Kestrel persona">
-              {personas.map((persona) => (
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={draft.persona === persona.id}
-                  className={`persona-card ${draft.persona === persona.id ? "active" : ""}`}
-                  key={persona.id}
-                  onClick={() => update({ persona: persona.id })}
-                >
-                  <strong>{persona.name}</strong>
-                  <span>{persona.summary}</span>
-                </button>
-              ))}
-            </div>
-            <p className="setup-hint">{selectedPersona.guidance}</p>
-          </div>
-
-          <div className="setup-section">
-            <h2>Working Together</h2>
-            <Field label="What are you usually trying to get done?">
-              <textarea
-                value={draft.goals_text}
-                onChange={(event) => update({ goals_text: event.target.value })}
-                rows={3}
-                placeholder="Ship Kestrel, build local tools, research product ideas..."
-              />
-            </Field>
-            <Field label="How do you like collaboration to feel?">
-              <textarea
-                value={draft.working_style}
-                onChange={(event) => update({ working_style: event.target.value })}
-                rows={3}
-                placeholder="Short plans, direct tradeoffs, live verification, no fluff..."
-              />
-            </Field>
-          </div>
-
-          <div className="setup-section">
-            <h2>Fun Details</h2>
-            <Field label="Interests or recurring themes">
-              <textarea
-                value={draft.interests_text}
-                onChange={(event) => update({ interests_text: event.target.value })}
-                rows={3}
-                placeholder="Local-first software, thoughtful UI, creative automation..."
-              />
-            </Field>
-            <Field label="Anything else it should remember?">
-              <textarea
-                value={draft.communication_notes}
-                onChange={(event) => update({ communication_notes: event.target.value })}
-                rows={3}
-                placeholder="Tone preferences, pet peeves, project rituals, decision style..."
-              />
-            </Field>
-            <label className="check-row">
-              <input
-                type="checkbox"
-                checked={draft.continuous_learning}
-                onChange={(event) => update({ continuous_learning: event.target.checked })}
-              />
-              <span>Keep adapting from explicit remember requests and confirmed corrections.</span>
-            </label>
-          </div>
-
-          <footer className="setup-actions">
-            <button type="button" className="btn subtle" onClick={onClose}>Later</button>
-            <button type="submit" className="btn primary" disabled={!draft.agent_name.trim()}>
-              <Sparkles size={15} /> Save to Soul
-            </button>
-          </footer>
-        </form>
-      </section>
-    </div>
   );
 }
 
@@ -4051,6 +3893,12 @@ function scrollToElement(id: string) {
   if (typeof target?.scrollIntoView === "function") {
     target.scrollIntoView({ block: "start", behavior: "smooth" });
   }
+  if (
+    target instanceof HTMLElement &&
+    target.hasAttribute("tabindex")
+  ) {
+    target.focus({ preventScroll: true });
+  }
 }
 
 function runtimeSettingsFrom(config: RuntimeConfig | null): Record<string, unknown> {
@@ -4194,28 +4042,6 @@ function capabilityDomId(key: string): string {
 
 function formatCapabilityBlocker(value: string): string {
   return value.replace(/[_:]+/g, " ");
-}
-
-function setupDraftFromProfile(profile: OnboardingProfile): SetupDraft {
-  return {
-    agent_name: profile.agent_name || "Kestrel",
-    user_name: profile.user_name || "",
-    preferred_name: profile.preferred_name || "",
-    persona: profile.persona || "steady",
-    working_style: profile.working_style || "",
-    goals_text: (profile.goals ?? []).join("\n"),
-    interests_text: (profile.interests ?? []).join("\n"),
-    communication_notes: profile.communication_notes || "",
-    continuous_learning: profile.continuous_learning !== false
-  };
-}
-
-function splitSetupList(value: string): string[] {
-  return value
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .slice(0, 6);
 }
 
 function validAutonomyMode(value: unknown, fallback: string): string {

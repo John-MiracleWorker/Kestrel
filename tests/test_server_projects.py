@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,6 +11,200 @@ from fastapi.testclient import TestClient
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.repo_index import RepositoryIndex
 from nested_memvid_agent.server import create_app
+
+
+def test_project_setup_draft_route_returns_reviewable_server_evidence(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    token = "project-draft-owner-token-2d90"
+    monkeypatch.setenv("KESTREL_PROJECT_DRAFT_TOKEN", token)  # type: ignore[attr-defined]
+    headers = {"X-Kestrel-API-Key": token}
+    repository = tmp_path / "draft-repository"
+    repository.mkdir()
+    (repository / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest run", "build": "vite build"}}),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "init", "-b", "trunk"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "add", "package.json"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Kestrel Test",
+            "-c",
+            "user.email=kestrel@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with TestClient(
+        create_app(_config(tmp_path, token_env="KESTREL_PROJECT_DRAFT_TOKEN"))
+    ) as client:
+        assert (
+            client.post(
+                "/api/projects/setup-draft",
+                json={"repository_path": str(repository.resolve())},
+            ).status_code
+            == 401
+        )
+        response = client.post(
+            "/api/projects/setup-draft",
+            headers=headers,
+            json={"repository_path": str(repository.resolve())},
+        )
+
+    assert response.status_code == 200
+    draft = response.json()
+    assert draft["inspection"]["git"]["branch"] == "trunk"
+    assert draft["inspection"]["test_recipes"] == [
+        {"name": "npm test", "command": "npm run test"}
+    ]
+    assert draft["inspection"]["build_recipes"] == [
+        {"name": "npm build", "command": "npm run build"}
+    ]
+    assert draft["create_input"]["provider_policy"] == {
+        "preset": "local_only",
+        "allowed_providers": ["mock"],
+        "allowed_models": ["mock"],
+        "direct_estimated_cost_usd": 0.0,
+    }
+    assert draft["first_mission"]["can_start"] is True
+    assert not (repository / ".nest").exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "provider",
+        "model",
+        "draft_costs",
+        "expected_privacy",
+    ),
+    (
+        ("ollama", "qwen3", {}, "local_required"),
+        (
+            "openai",
+            "gpt-5.5",
+            {
+                "direct_estimated_cost_usd": 0.1,
+                "cost_budget": 0.5,
+            },
+            "approved_cloud",
+        ),
+    ),
+)
+def test_reviewed_setup_draft_admits_the_real_first_mission_preflight(
+    tmp_path: Path,
+    monkeypatch: object,
+    provider: str,
+    model: str,
+    draft_costs: dict[str, float],
+    expected_privacy: str,
+) -> None:
+    token = f"project-live-draft-token-{provider}"
+    token_env = f"KESTREL_PROJECT_DRAFT_{provider.upper()}_TOKEN".replace(
+        "-",
+        "_",
+    )
+    monkeypatch.setenv(token_env, token)  # type: ignore[attr-defined]
+    headers = {"X-Kestrel-API-Key": token}
+    repository = tmp_path / f"{provider}-repository"
+    repository.mkdir()
+    (repository / "README.md").write_text(
+        f"# {provider} project\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Kestrel Test",
+            "-c",
+            "user.email=kestrel@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config = replace(
+        _config(tmp_path, token_env=token_env),
+        provider=provider,
+        model=model,
+    )
+
+    with TestClient(create_app(config)) as client:
+        draft_response = client.post(
+            "/api/projects/setup-draft",
+            headers=headers,
+            json={
+                "repository_path": str(repository.resolve()),
+                **draft_costs,
+            },
+        )
+        assert draft_response.status_code == 200
+        draft = draft_response.json()
+        assert draft["first_mission"]["can_start"] is True
+        assert draft["create_input"]["privacy_class"] == expected_privacy
+
+        created = client.post(
+            "/api/projects",
+            headers=headers,
+            json={
+                "project_id": f"project_{provider.replace('-', '_')}",
+                **draft["create_input"],
+            },
+        )
+        assert created.status_code == 201
+        preflight = client.post(
+            f"/api/projects/{created.json()['project_id']}/mission/preflight",
+            headers=headers,
+            json={
+                "objective": "Explain this repository.",
+                "template_id": "explain_repository",
+            },
+        )
+
+    assert preflight.status_code == 200
+    payload = preflight.json()
+    assert payload["can_start"] is True
+    assert payload["blockers"] == []
 
 
 def test_project_api_create_update_export_import_and_archive(

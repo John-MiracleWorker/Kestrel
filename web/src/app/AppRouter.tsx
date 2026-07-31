@@ -66,6 +66,18 @@ export function AppRouter({
     [commitLocation],
   );
 
+  const routeSetupCenter = useCallback(() => {
+    commitLocation({
+      destination: "settings",
+      subroute: "setup",
+      query: {},
+    });
+  }, [commitLocation]);
+
+  const routeMissionCommand = useCallback(() => {
+    commitLocation(destinationLocation("mission"));
+  }, [commitLocation]);
+
   const content = renderContent ? (
     renderContent(location)
   ) : (
@@ -73,6 +85,8 @@ export function AppRouter({
       requestedSection={legacySectionForLocation(location)}
       requestedSubroute={location.subroute}
       onRouteSection={routeLegacySection}
+      onOpenSetup={routeSetupCenter}
+      onOpenMission={routeMissionCommand}
     />
   );
 

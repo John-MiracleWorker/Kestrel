@@ -1,4 +1,4 @@
-import { Check, RefreshCw } from "lucide-react";
+import { Check, RefreshCw, Sprout } from "lucide-react";
 import type { ReactNode } from "react";
 import { ActionError } from "../components";
 import type { SettingsWorkspaceController } from "./settingsController";
@@ -9,7 +9,10 @@ export function SettingsWorkspace({
   notice,
   onDismissError,
   onOpenAdvanced,
+  onOpenSetup,
   onRefresh,
+  subroute,
+  setupCenter,
   children,
 }: {
   controller: SettingsWorkspaceController;
@@ -17,9 +20,25 @@ export function SettingsWorkspace({
   notice: string | null;
   onDismissError: () => void;
   onOpenAdvanced: () => void;
+  onOpenSetup: () => void;
   onRefresh: () => Promise<void>;
+  subroute?: string;
+  setupCenter: ReactNode;
   children: ReactNode;
 }) {
+  if (subroute === "setup") {
+    return (
+      <section
+        id="settings"
+        className="shell page-shell settings-page settings-setup-page"
+        data-section="settings"
+        aria-label="Settings"
+      >
+        {setupCenter}
+      </section>
+    );
+  }
+
   return (
     <section
       id="settings"
@@ -40,6 +59,13 @@ export function SettingsWorkspace({
           </p>
         </div>
         <div className="page-actions">
+          <button
+            className="btn subtle"
+            type="button"
+            onClick={onOpenSetup}
+          >
+            <Sprout size={15} /> Setup Center
+          </button>
           <button
             className="btn subtle"
             type="button"
