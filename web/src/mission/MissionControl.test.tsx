@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import axe from "axe-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { requestMatchesLegacyContract } from "../testing/apiFixtures";
 import type { Run, TaskGraph } from "../types";
 import { MissionControl } from "./MissionControl";
 import type { MissionLaunch, MissionPreflight, ProjectProfile } from "./types";
@@ -187,11 +188,41 @@ describe("MissionControl", () => {
       `/api/projects/${project.project_id}/mission/preflight`,
       expect.objectContaining({ method: "POST" })
     );
+    const initialPreflightCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input) ===
+          `/api/projects/${project.project_id}/mission/preflight` &&
+        init?.method === "POST" &&
+        !Object.hasOwn(
+          JSON.parse(String(init.body ?? "{}")),
+          "mission_plan",
+        ),
+    );
+    expect(
+      initialPreflightCall &&
+        requestMatchesLegacyContract("missionPreflight", {
+          path: String(initialPreflightCall[0]),
+          method: String(initialPreflightCall[1]?.method ?? "GET"),
+          body: JSON.parse(
+            String(initialPreflightCall[1]?.body ?? "{}"),
+          ),
+        }),
+    ).toBe(true);
     const reboundCall = fetchMock.mock.calls.find(([_input, init]) => {
       const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}"));
       return Array.isArray(body.mission_plan);
     });
     expect(reboundCall).toBeDefined();
+    expect(onLaunch.mock.calls[0]?.[0]).toMatchObject({
+      project: { revision: 1 },
+      preflight: {
+        project_revision: 1,
+        launch_binding: {
+          schema: "kestrel.mission_launch_binding.v1",
+          project_revision: 1,
+        },
+      },
+    });
 
     const report = await axe.run(container);
     expect(report.violations).toEqual([]);

@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { requestMatchesLegacyContract } from "../testing/apiFixtures";
 import { RoutingCenter } from "./RoutingCenter";
 
 const statusPayload = {
@@ -153,6 +154,12 @@ beforeEach(() => {
       if (path === "/api/routing/providers" && method === "POST") {
         return jsonResponse({ ...providerPayload, profile_id: "cloud", display_name: "Cloud account" });
       }
+      if (path === "/api/routing/targets" && method === "POST") {
+        return jsonResponse({
+          ...targetPayload,
+          target_id: "review-worker",
+        });
+      }
       if (path === "/api/routing/targets") return jsonResponse([targetPayload]);
       if (path === "/api/routing/policies") return jsonResponse([policyPayload]);
       if (path === "/api/routing/preview") return jsonResponse(previewPayload);
@@ -296,8 +303,53 @@ describe("RoutingCenter", () => {
         (item) => item.path === "/api/routing/providers" && item.method === "POST"
       );
       expect(request?.body).toMatchObject({ secret_ref: "secret://cloud-key" });
+      expect(
+        request && requestMatchesLegacyContract("providerSave", request),
+      ).toBe(true);
     });
     expect(screen.queryByText("secret://cloud-key")).not.toBeInTheDocument();
+  });
+
+  it("preserves the revision-aware target save contract", async () => {
+    render(<RoutingCenter />);
+    await screen.findAllByText("Local server");
+
+    const targetIdField = screen.getByText("Target ID").closest("label");
+    expect(targetIdField).not.toBeNull();
+    fireEvent.change(targetIdField!.querySelector("input")!, {
+      target: { value: "review-worker" },
+    });
+    const providerField = screen
+      .getByText("Provider profile")
+      .closest("label");
+    expect(providerField).not.toBeNull();
+    fireEvent.change(providerField!.querySelector("select")!, {
+      target: { value: "local" },
+    });
+    const modelField = screen.getByText("Model").closest("label");
+    expect(modelField).not.toBeNull();
+    fireEvent.change(modelField!.querySelector("input")!, {
+      target: { value: "review-model" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save target" }));
+
+    await waitFor(() => {
+      const request = requests.find(
+        (item) =>
+          item.path === "/api/routing/targets" &&
+          item.method === "POST",
+      );
+      expect(
+        request && requestMatchesLegacyContract("targetSave", request),
+      ).toBe(true);
+      expect(request?.body).toMatchObject({
+        target_id: "review-worker",
+        provider_profile_id: "local",
+        provider: "openai-compatible",
+        model: "review-model",
+        expected_revision: null,
+      });
+    });
   });
 });
 

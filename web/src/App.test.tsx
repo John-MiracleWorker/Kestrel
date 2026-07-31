@@ -3,6 +3,15 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import {
+  requestMatchesLegacyContract,
+  type FixtureRequest,
+} from "./testing/apiFixtures";
+import {
+  installFakeDesktopBridge,
+  installFakeDesktopRuntimeMarker,
+  removeFakeDesktopEnvironment,
+} from "./testing/fakeDesktopBridge";
 import type {
   Approval,
   Capability,
@@ -269,61 +278,18 @@ function openAdvancedWorkspace(name: "Routines" | "Routing" | "Settings") {
   fireEvent.click(within(workspaceNav).getByRole("button", { name }));
 }
 
-function installDesktopRuntimeMarker(): void {
-  Object.defineProperty(globalThis, "kestrelDesktopRuntime", {
-    configurable: true,
-    enumerable: false,
-    writable: false,
-    value: Object.freeze({
-      schema: "kestrel.desktop.runtime.v1",
-      baseUrl: "http://127.0.0.1:43123/",
-      generation: 4
-    })
-  });
-}
-
-function installDesktopBridge(
-  openCredentialDialog = vi.fn(async () => ({
-    status: "stored",
-    secretRef: "secret://openai_api_key",
-    validation: "unverified",
-    fingerprint: "sha256:0123456789ab"
-  }))
-): {
-  openCredentialDialog: typeof openCredentialDialog;
-} {
-  const bridge = Object.freeze({
-    connection: async () => ({
-      schema: "kestrel.desktop.connection.v1",
-      state: "ready",
-      generation: 4,
-      baseUrl: "http://127.0.0.1:43123/",
-      profileId: "default",
-      sidecarVersion: "0.5.0",
-      recovery: null
-    }),
-    chooseProjectFolder: async () => ({ status: "cancelled" }),
-    chooseStorageFolder: async () => ({ status: "cancelled" }),
-    exportSupportBundle: async () => ({ status: "cancelled" }),
-    getAppVersion: async () => ({ version: "0.5.0" }),
-    getUpdateStatus: async () => ({
-      schema: "kestrel.desktop.update.v1",
-      state: "unavailable",
-      reason: "not_configured"
-    }),
-    openCredentialDialog,
-    openExternalUrl: async () => ({ opened: true }),
-    performRecoveryAction: async () => ({ accepted: true }),
-    subscribeLifecycle: () => () => undefined,
-    subscribeUpdateStatus: () => () => undefined
-  });
-  Object.defineProperty(globalThis, "kestrelDesktop", {
-    configurable: true,
-    enumerable: false,
-    writable: false,
-    value: bridge
-  });
-  return { openCredentialDialog };
+function fixtureRequest(
+  path: RequestInfo | URL,
+  init?: RequestInit,
+): FixtureRequest {
+  return {
+    path: String(path),
+    method: String(init?.method ?? "GET"),
+    body:
+      typeof init?.body === "string"
+        ? JSON.parse(init.body)
+        : null,
+  };
 }
 
 describe("App", () => {
@@ -503,8 +469,7 @@ describe("App", () => {
     cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
-    Reflect.deleteProperty(globalThis, "kestrelDesktop");
-    Reflect.deleteProperty(globalThis, "kestrelDesktopRuntime");
+    removeFakeDesktopEnvironment();
     sessionStorage.clear();
     localStorage.clear();
   });
@@ -552,6 +517,49 @@ describe("App", () => {
         "No run will start until you inspect the route, permissions, validation, and rollback projection."
       )
     ).toBeInTheDocument();
+  });
+
+  it("preserves the revision-bound mission launch request contract", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+    fireEvent.change(
+      await screen.findByLabelText("Engineering objective"),
+      { target: { value: "Prove the shell refactor keeps mission authority." } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Inspect plan" }));
+    const runMission = await screen.findByRole("button", {
+      name: "Run mission",
+    });
+    await waitFor(() => expect(runMission).toBeEnabled());
+    fireEvent.click(runMission);
+
+    await waitFor(() => {
+      const request = fetchSpy.mock.calls.find(
+        ([path, init]) =>
+          path === "/api/runs" && init?.method === "POST",
+      );
+      expect(request).toBeDefined();
+      expect(
+        request &&
+          requestMatchesLegacyContract(
+            "missionLaunch",
+            fixtureRequest(request[0], request[1]),
+          ),
+      ).toBe(true);
+      expect(JSON.parse(String(request?.[1]?.body ?? "{}"))).toMatchObject({
+        project_id: "project_kestrel",
+        project_revision: 1,
+        mission_template_id: "fix_failing_test",
+        mission_binding: {
+          schema: "kestrel.mission_launch_binding.v1",
+          project_id: "project_kestrel",
+          project_revision: 1,
+        },
+      });
+    });
   });
 
   it("opens the Adaptive Flock Routing Center from primary navigation", async () => {
@@ -775,6 +783,13 @@ describe("App", () => {
         ([path, init]) => path === "/api/routines/morning-review/actions/run-now" && init?.method === "POST"
       );
       expect(request).toBeDefined();
+      expect(
+        request &&
+          requestMatchesLegacyContract(
+            "routineRun",
+            fixtureRequest(request[0], request[1]),
+          ),
+      ).toBe(true);
       const body = JSON.parse(String(request?.[1]?.body ?? "{}"));
       expect(body.expected_revision).toBe(3);
       expect(body.idempotency_key).toMatch(/^[0-9a-f-]{36}$/i);
@@ -1719,6 +1734,13 @@ describe("App", () => {
         ([path, init]) => path === "/api/approvals/approval_1/decision" && init?.method === "POST"
       );
       expect(decisionCall).toBeDefined();
+      expect(
+        decisionCall &&
+          requestMatchesLegacyContract(
+            "approvalDecision",
+            fixtureRequest(decisionCall[0], decisionCall[1]),
+          ),
+      ).toBe(true);
       expect(JSON.parse(String(decisionCall?.[1]?.body ?? "{}"))).toEqual({
         approved: true,
         arguments: pendingApproval.arguments
@@ -1871,6 +1893,13 @@ describe("App", () => {
     await waitFor(() => {
       const saveCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/runtime/settings" && init?.method === "PUT");
       expect(saveCall).toBeDefined();
+      expect(
+        saveCall &&
+          requestMatchesLegacyContract(
+            "settingsSave",
+            fixtureRequest(saveCall[0], saveCall[1]),
+          ),
+      ).toBe(true);
       const body = JSON.parse(String(saveCall?.[1]?.body ?? "{}"));
       expect(body).toMatchObject({
         expected_revision: "runtime-revision-1",
@@ -1976,6 +2005,13 @@ describe("App", () => {
     await waitFor(() => {
       const reviewCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/plugins/review" && init?.method === "POST");
       expect(reviewCall).toBeDefined();
+      expect(
+        reviewCall &&
+          requestMatchesLegacyContract(
+            "extensionReview",
+            fixtureRequest(reviewCall[0], reviewCall[1]),
+          ),
+      ).toBe(true);
       expect(JSON.parse(String(reviewCall?.[1]?.body ?? "{}"))).toEqual({
         source: "owner/repo",
         ref: null
@@ -2020,6 +2056,13 @@ describe("App", () => {
         ([path, init]) => path === "/api/capabilities/tool/memory.search" && init?.method === "PUT"
       );
       expect(mutation).toBeDefined();
+      expect(
+        mutation &&
+          requestMatchesLegacyContract(
+            "capabilityToggle",
+            fixtureRequest(mutation[0], mutation[1]),
+          ),
+      ).toBe(true);
       expect(JSON.parse(String(mutation?.[1]?.body ?? "{}"))).toEqual({ enabled: false, expected_revision: 1 });
     });
     expect(await screen.findByText(/Memory search disabled for future invocations/i)).toBeInTheDocument();
@@ -2304,8 +2347,8 @@ describe("App", () => {
       validation: "unverified" as const,
       fingerprint: "sha256:0123456789ab"
     }));
-    installDesktopRuntimeMarker();
-    installDesktopBridge(openCredentialDialog);
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge({ openCredentialDialog });
     render(<App />);
 
     await screen.findByRole("heading", {
@@ -2362,8 +2405,8 @@ describe("App", () => {
   });
 
   it("removes generic secret mutation controls from the Desktop primary renderer", async () => {
-    installDesktopRuntimeMarker();
-    installDesktopBridge();
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge();
     const fetchSpy = vi.mocked(fetch);
     render(<App />);
 
@@ -2408,8 +2451,8 @@ describe("App", () => {
           "Start an unlocked Linux Secret Service to keep credentials across restarts."
       }
     } as SetupReadinessReport;
-    installDesktopRuntimeMarker();
-    installDesktopBridge();
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge();
     render(<App />);
 
     await screen.findByRole("heading", {
@@ -2690,6 +2733,39 @@ describe("App", () => {
     expect(within(panel).getByText("Mutation actions require exact-call approval and MutationGate review."));
   });
 
+  it("preserves the bounded memory search request contract", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    const sectionIndex = screen.getByRole("navigation", {
+      name: "Advanced section index",
+    });
+    fireEvent.click(
+      within(sectionIndex).getByRole("button", { name: "Memory" }),
+    );
+    fireEvent.change(await screen.findByLabelText("Memory query"), {
+      target: { value: "validated routing evidence" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      const request = fetchSpy.mock.calls.find(([path, init]) =>
+        String(path).startsWith("/api/memory/search?") &&
+        (init?.method ?? "GET") === "GET",
+      );
+      expect(request).toBeDefined();
+      expect(
+        request &&
+          requestMatchesLegacyContract(
+            "memorySearch",
+            fixtureRequest(request[0], request[1]),
+          ),
+      ).toBe(true);
+    });
+  });
+
   it("runs the setup wizard and saves onboarding to Soul memory", async () => {
     const fetchSpy = vi.mocked(fetch);
     onboardingProfile = null;
@@ -2753,6 +2829,13 @@ describe("App", () => {
     await waitFor(() => {
       const setupCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/self/onboarding" && init?.method === "POST");
       expect(setupCall).toBeDefined();
+      expect(
+        setupCall &&
+          requestMatchesLegacyContract(
+            "firstRunSetup",
+            fixtureRequest(setupCall[0], setupCall[1]),
+          ),
+      ).toBe(true);
       const body = JSON.parse(String(setupCall?.[1]?.body ?? "{}"));
       expect(body).toMatchObject({
         agent_name: "Northstar",
@@ -2779,6 +2862,15 @@ describe("App", () => {
     expect(screen.getByText("Locked")).toBeInTheDocument();
     expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
     expect(fetchSpy.mock.calls.map(([path]) => path)).toEqual(["/api/health"]);
+    expect(
+      requestMatchesLegacyContract(
+        "browserTokenPrompt",
+        fixtureRequest(
+          fetchSpy.mock.calls[0][0],
+          fetchSpy.mock.calls[0][1],
+        ),
+      ),
+    ).toBe(true);
 
     fireEvent.change(screen.getByLabelText("API token"), { target: { value: "browser-token" } });
     fireEvent.click(screen.getByRole("button", { name: /save token/i }));
@@ -2795,7 +2887,7 @@ describe("App", () => {
   });
 
   it("shows Desktop connection recovery after a 401 without surfacing a token form", async () => {
-    installDesktopRuntimeMarker();
+    installFakeDesktopRuntimeMarker();
     sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
     const getItem = vi.spyOn(Storage.prototype, "getItem");
     const fetchSpy = vi.mocked(fetch);
@@ -2825,7 +2917,7 @@ describe("App", () => {
   });
 
   it("routes a post-start Mission Control 401 to Desktop recovery", async () => {
-    installDesktopRuntimeMarker();
+    installFakeDesktopRuntimeMarker();
     sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
     const getItem = vi.spyOn(Storage.prototype, "getItem");
     const fetchSpy = vi.mocked(fetch);
@@ -2870,7 +2962,7 @@ describe("App", () => {
   });
 
   it("routes a post-start Routine Workbench 401 to Desktop recovery", async () => {
-    installDesktopRuntimeMarker();
+    installFakeDesktopRuntimeMarker();
     sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
     const getItem = vi.spyOn(Storage.prototype, "getItem");
     const fetchSpy = vi.mocked(fetch);
@@ -2918,7 +3010,7 @@ describe("App", () => {
   });
 
   it("replaces browser token controls with main-managed status in Desktop mode", async () => {
-    installDesktopRuntimeMarker();
+    installFakeDesktopRuntimeMarker();
     sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
     const getItem = vi.spyOn(Storage.prototype, "getItem");
 
@@ -3017,6 +3109,80 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
       ...sessions.filter((session) => session.session_id !== run.session_id)
     ];
     return jsonResponse(run);
+  }
+  const missionPreflightMatch = path.match(
+    /^\/api\/projects\/([^/]+)\/mission\/preflight$/,
+  );
+  if (missionPreflightMatch && init?.method === "POST") {
+    const body = JSON.parse(String(init.body ?? "{}")) as {
+      objective?: string;
+      template_id?: string;
+      mission_plan?: Array<Record<string, unknown>>;
+    };
+    const tasks = body.mission_plan ?? [
+      {
+        task_id: "prove-shell",
+        title: "Prove shell behavior",
+        rationale: "Keep authority and evidence bindings intact.",
+        dependencies: [],
+        acceptance_criteria: ["Contract remains revision-bound"],
+        required_tools: ["file.read"],
+        risk: "low",
+      },
+    ];
+    return jsonResponse({
+      schema: "kestrel.mission_preflight.v1",
+      project_id: decodeURIComponent(missionPreflightMatch[1]),
+      project_revision: 1,
+      project_name: "Kestrel",
+      repository_path: "/tmp/kestrel",
+      objective: body.objective ?? "",
+      template_id: body.template_id ?? "fix_failing_test",
+      branch: "main",
+      working_tree: { state: "clean", summary: "Clean" },
+      route_policy: "Balanced",
+      budget: { currency: "USD", limit: 1.5, estimate: 0.2 },
+      effective_capabilities: ["file.read"],
+      likely_approvals: [],
+      validation_recipes: ["pytest -q"],
+      rollback: "Isolated worktree",
+      index: {
+        freshness: "current",
+        digest: "sha256:index",
+        indexed_at: "2026-05-16T00:00:00Z",
+        detail: "Current",
+      },
+      provider: { status: "pass", detail: "Mock provider ready" },
+      launch_binding: {
+        schema: "kestrel.mission_launch_binding.v1",
+        project_id: decodeURIComponent(missionPreflightMatch[1]),
+        project_revision: 1,
+        objective_digest: "a".repeat(64),
+        template_id: body.template_id ?? "fix_failing_test",
+        config_digest: "b".repeat(64),
+        routing_enabled: false,
+        routing_mode: "off",
+        policy_id: "balanced",
+        policy_revision: 1,
+        inventory_digest: "c".repeat(64),
+        preflight_digest: "d".repeat(64),
+        plan_digest: "e".repeat(64),
+        binding_digest: "f".repeat(64),
+      },
+      checks: [
+        {
+          check_id: "authority",
+          title: "Authority",
+          status: "pass",
+          detail: "Revision and launch binding are current.",
+        },
+      ],
+      tasks,
+      warnings: [],
+      blockers: [],
+      can_start: true,
+      generated_at: "2026-05-16T00:00:00Z",
+    });
   }
   if (path === "/api/routines/status" && routineLoadFailure) {
     return jsonResponse({ detail: routineLoadFailure }, 503);
@@ -3489,6 +3655,8 @@ function payloadFor(path: string): unknown {
       recommendations: []
     };
   }
+  if (path.startsWith("/api/memory/search?")) return [];
+  if (path.startsWith("/api/memory/inspect?")) return {};
   if (path === "/api/memory/layers") return [
     { layer: "working", path: "/tmp/working.mv2", exists: true, ok: true, backend: "InMemoryBackend" },
     { layer: "self", path: "/tmp/self.mv2", exists: true, ok: true, backend: "InMemoryBackend" }
