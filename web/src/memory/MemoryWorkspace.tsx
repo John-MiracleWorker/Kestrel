@@ -1,9 +1,6 @@
 import {
   Brain,
-  Database,
   FileText,
-  Search,
-  ShieldCheck,
   TestTube2,
 } from "lucide-react";
 import {
@@ -30,6 +27,11 @@ import type {
   MemoryHit,
   MemoryLayerStatus,
 } from "../types";
+import { BehaviorDeltaWorkspace } from "./BehaviorDeltaWorkspace";
+import { MemoryHealth } from "./MemoryHealth";
+import { MemorySearch } from "./MemorySearch";
+import { PromotionHistory } from "./PromotionHistory";
+import "./memory.css";
 
 type MemoryWorkspaceOptions = {
   enabled: boolean;
@@ -386,6 +388,7 @@ export function MemoryWorkspace({
     learningValidation,
     lessons,
     memoryHits,
+    memoryInspect,
     memoryLayers,
     memoryQuery,
     packContext,
@@ -407,42 +410,14 @@ export function MemoryWorkspace({
 
   return (
     <section id="memory" className="content-grid wide-left">
-      <Panel title="Memory & Context" icon={<Database size={19} />}>
-        <div className="layer-grid">
-          {memoryLayers.map((layer) => (
-            <div className="layer-chip" key={layer.layer}>
-              <strong>{layer.layer}</strong>
-              <StatusBadge value={layer.ok ? "ok" : "failed"} />
-              <small>{layer.backend}</small>
-            </div>
-          ))}
-        </div>
-        <form onSubmit={searchMemory} className="inline-form">
-          <Field label="Memory query">
-            <input
-              value={memoryQuery}
-              onChange={(event) => setMemoryQuery(event.target.value)}
-            />
-          </Field>
-          <button type="submit">
-            <Search size={15} /> Search
-          </button>
-        </form>
-        <div className="hit-list">
-          {memoryHits.map((hit) => (
-            <div
-              className="data-row"
-              key={`${hit.layer}-${hit.record_id ?? hit.title}`}
-            >
-              <strong>{hit.title}</strong>
-              <InlineMeta
-                items={[hit.layer, hit.kind, hit.score.toFixed(2)]}
-              />
-              <p>{hit.snippet}</p>
-            </div>
-          ))}
-        </div>
-      </Panel>
+      <MemoryHealth layers={memoryLayers} />
+      <MemorySearch
+        memoryQuery={memoryQuery}
+        memoryHits={memoryHits}
+        memoryInspect={memoryInspect}
+        onQueryChange={setMemoryQuery}
+        onSearch={searchMemory}
+      />
 
       <Panel title="Context Pack" icon={<FileText size={19} />}>
         <form onSubmit={packContext} className="stack-form">
@@ -567,135 +542,14 @@ export function MemoryWorkspace({
         {learningResult && <JsonBlock value={learningResult} />}
       </Panel>
 
-      <Panel title="Behavior Deltas Review" icon={<ShieldCheck size={19} />}>
-        <section aria-label="Behavior Deltas Review" className="run-detail">
-          <h3>Behavior Deltas Review</h3>
-          <p className="muted">
-            Mutation actions require exact-call approval and MutationGate
-            review.
-          </p>
-          {behaviorDeltaError && (
-            <p className="danger-text">
-              Behavior delta ledger unavailable: {behaviorDeltaError}
-            </p>
-          )}
-          {behaviorDeltaReport ? (
-            <>
-              <div className="metric-grid">
-                <Metric
-                  label="Total Deltas"
-                  value={behaviorDeltaReport.summary.total_deltas}
-                />
-                <Metric
-                  label="Active"
-                  value={behaviorDeltaReport.summary.active_deltas}
-                />
-                <Metric
-                  label="Useful Rate"
-                  value={formatPercent(
-                    behaviorDeltaReport.summary.useful_rate,
-                  )}
-                />
-                <Metric
-                  label="Never Activated"
-                  value={behaviorDeltaReport.summary.never_activated}
-                />
-              </div>
-
-              <section aria-label="Learning Dashboard" className="run-detail">
-                <h3>Learning Dashboard</h3>
-                <p className="muted">
-                  Read-only rollout telemetry for autonomous learning defaults
-                  and rollback safety.
-                </p>
-                {learningDashboardError && (
-                  <p className="danger-text">
-                    Learning dashboard unavailable: {learningDashboardError}
-                  </p>
-                )}
-                {learningDashboard ? (
-                  <>
-                    <div className="metric-grid">
-                      <Metric
-                        label="Auto-activations"
-                        value={learningDashboard.headline.auto_activations}
-                      />
-                      <Metric
-                        label="Rollbacks"
-                        value={learningDashboard.headline.rollbacks}
-                      />
-                      <Metric
-                        label="FP Rate"
-                        value={formatPercent(
-                          learningDashboard.headline.false_positive_rate,
-                        )}
-                      />
-                      <Metric
-                        label="Activations then rolled back"
-                        value={
-                          learningDashboard.headline
-                            .activations_then_rolled_back
-                        }
-                      />
-                    </div>
-                    <div className="list compact-list">
-                      {learningDashboard.layers.map((layer) => (
-                        <div className="data-row" key={layer.layer}>
-                          <strong>{layer.layer}</strong>
-                          <InlineMeta
-                            items={[
-                              `${layer.activations} activations`,
-                              `${layer.auto_activations} auto`,
-                              `${layer.rollbacks} rollbacks`,
-                            ]}
-                          />
-                          <p>{`False positives ${formatPercent(
-                            layer.false_positive_rate,
-                          )} · rollback avg ${
-                            layer.average_time_to_rollback_hours ?? "n/a"
-                          }h`}</p>
-                        </div>
-                      ))}
-                      {learningDashboard.layers.length === 0 && (
-                        <EmptyState>
-                          No learning dashboard activity recorded.
-                        </EmptyState>
-                      )}
-                    </div>
-                  </>
-                ) : (
-                  <EmptyState>Learning dashboard is loading.</EmptyState>
-                )}
-              </section>
-              <div className="list compact-list">
-                {behaviorDeltaReport.deltas.slice(0, 12).map((delta) => (
-                  <div className="data-row" key={delta.delta_id}>
-                    <strong>{delta.title}</strong>
-                    <InlineMeta
-                      items={[
-                        delta.delta_id,
-                        `${delta.status} · ${delta.kind} · ${delta.risk}`,
-                        `${delta.activation_count} activations`,
-                      ]}
-                    />
-                    <p>{`Useful ${formatPercent(
-                      delta.useful_rate,
-                    )} · Failure ${formatPercent(
-                      delta.failure_rate,
-                    )} · Rollback ${formatPercent(delta.rollback_rate)}`}</p>
-                    <StatusBadge value={delta.target_layer} />
-                  </div>
-                ))}
-                {behaviorDeltaReport.deltas.length === 0 && (
-                  <EmptyState>No behavior deltas recorded.</EmptyState>
-                )}
-              </div>
-            </>
-          ) : (
-            <EmptyState>Behavior delta report is loading.</EmptyState>
-          )}
-        </section>
-      </Panel>
+      <BehaviorDeltaWorkspace
+        report={behaviorDeltaReport}
+        error={behaviorDeltaError}
+      />
+      <PromotionHistory
+        dashboard={learningDashboard}
+        error={learningDashboardError}
+      />
 
       <Panel title="Lessons & Failures" icon={<TestTube2 size={19} />}>
         <h3>Lessons</h3>

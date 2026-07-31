@@ -1025,10 +1025,12 @@ describe("App", () => {
     await screen.findByRole("heading", { name: "Ask Kestrel" });
     fireEvent.click(screen.getByRole("link", { name: "Memory" }));
 
-    expect(await screen.findByRole("heading", { name: "Learning Dashboard" })).toBeInTheDocument();
-    expect(screen.getByText("Auto-activations")).toBeInTheDocument();
-    expect(screen.getByText("Activations then rolled back"));
-    expect(screen.getByText("procedural"));
+    expect(await screen.findByRole("heading", { name: "Promotion history" })).toBeInTheDocument();
+    const promotions = screen.getByLabelText("Promotion history");
+    expect(within(promotions).getByText("procedural")).toBeInTheDocument();
+    expect(within(promotions).getByText("1 activations")).toBeInTheDocument();
+    expect(within(promotions).getByText("1 auto")).toBeInTheDocument();
+    expect(within(promotions).getByText("0 rollbacks")).toBeInTheDocument();
   });
 
   it("surfaces repair patch review validation and rollback state from the task graph", async () => {
@@ -2876,14 +2878,13 @@ describe("App", () => {
     await screen.findByRole("heading", { name: "Ask Kestrel" });
     fireEvent.click(screen.getByRole("link", { name: "Memory" }));
 
-    const panel = await screen.findByLabelText("Behavior Deltas Review");
-    expect(within(panel).getByText("Behavior Deltas Review")).toBeInTheDocument();
+    const panel = await screen.findByLabelText("Behavior deltas");
     expect(within(panel).getByText("Policy-safe workflow")).toBeInTheDocument();
     expect(within(panel).getByText("delta_policy_gate_check")).toBeInTheDocument();
     expect(within(panel).getByText("active · policy · high")).toBeInTheDocument();
     expect(within(panel).getAllByText("1 activations").length).toBeGreaterThan(0);
     expect(within(panel).getByText("Useful 100% · Failure 0% · Rollback 0%")).toBeInTheDocument();
-    expect(within(panel).getByText("Mutation actions require exact-call approval and MutationGate review."));
+    expect(within(panel).getByText(/Mutation actions require exact-call approval and MutationGate review/)).toBeInTheDocument();
   });
 
   it("preserves the bounded memory search request contract", async () => {

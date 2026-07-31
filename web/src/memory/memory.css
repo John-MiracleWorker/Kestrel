@@ -1,0 +1,37 @@
+/* Memory workspace — Wildflower product surface. */
+
+.memory-health,
+.memory-search,
+.memory-promotions,
+.memory-deltas {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.memory-health-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.memory-health-table th {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-strong);
+  color: var(--ink-muted);
+  font-weight: 600;
+  text-align: left;
+}
+
+.memory-health-table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.memory-policy-gate {
+  margin: var(--space-1) 0 0;
+  color: var(--ink-muted);
+  font-size: 0.85rem;
+  font-style: italic;
+}
