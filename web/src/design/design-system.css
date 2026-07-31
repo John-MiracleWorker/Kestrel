@@ -74,6 +74,8 @@
 }
 
 .wf-button-spinner {
+  /* Keyframe-loop allowlist: wf-spin — indefinite status spinner, covered by the
+     global 1ms reduce override in tokens.css; not a --motion-* candidate. */
   animation: wf-spin 900ms linear infinite;
 }
 
@@ -374,6 +376,8 @@
     var(--surface-sunken) 70%
   );
   background-size: 220% 100%;
+  /* Keyframe-loop allowlist: wf-skeleton-shift — indefinite skeleton shimmer,
+     covered by the global 1ms reduce override in tokens.css. */
   animation: wf-skeleton-shift 1.5s ease-in-out infinite;
 }
 

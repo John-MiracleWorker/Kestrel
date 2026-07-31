@@ -29,6 +29,7 @@
   --shadow-offset: 4px 4px 0 rgb(74 32 76 / 28%);
 
   --selected: #d9e987;
+  --on-selected: #2b172c;
   --surface-raised: #fffdf7;
   --surface-sunken: #efe5d2;
   --action-soft: #f8d8ce;
@@ -46,7 +47,7 @@
   --canvas: #17111a;
   --surface: #231b25;
   --ink: #f6ecdf;
-  --muted-ink: #c9bbc7;
+  --muted-ink: #e8dcea;
   --structural: #d7a3cf;
   --action: #ff8b7e;
   --on-action: #2b172c;
@@ -61,7 +62,8 @@
   --shadow: 0 20px 70px rgb(0 0 0 / 46%);
   --shadow-offset: 4px 4px 0 rgb(215 163 207 / 24%);
 
-  --selected: #9fb937;
+  --selected: #556612;
+  --on-selected: #f6ecdf;
   --surface-raised: #302635;
   --surface-sunken: #110d13;
   --action-soft: #4d292a;

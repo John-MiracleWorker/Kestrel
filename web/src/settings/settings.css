@@ -128,7 +128,7 @@
   background: var(--color-surface-muted, #2a2a2a);
   cursor: pointer;
   padding: 0;
-  transition: background 120ms ease;
+  transition: background var(--motion-fast) ease;
 }
 
 .setting-switch[aria-checked="true"] {
@@ -148,7 +148,7 @@
   height: 16px;
   border-radius: 50%;
   background: var(--color-on-accent, #fff);
-  transition: transform 120ms ease;
+  transition: transform var(--motion-fast) ease;
 }
 
 .setting-switch[aria-checked="true"] .setting-switch-thumb {

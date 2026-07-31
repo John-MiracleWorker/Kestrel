@@ -50,7 +50,7 @@
     display: grid; place-items: center;
     color: var(--ink);
     cursor: pointer;
-    transition: border-color .15s;
+    transition: border-color var(--motion-fast);
   }
   .new-chat:hover { border-color: var(--ink); }
 
@@ -67,7 +67,7 @@
     font-size: 13px;
     color: var(--ink);
     outline: none;
-    transition: border-color .15s;
+    transition: border-color var(--motion-fast);
   }
   .rail-search input::placeholder { color: var(--faint); }
   .rail-search input:focus { border-color: var(--ink); }
@@ -106,7 +106,7 @@
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
     align-items: center;
-    transition: background .12s;
+    transition: background var(--motion-fast);
     margin-bottom: 1px;
   }
   .thread-button > span {
@@ -172,7 +172,7 @@
     flex-shrink: 0;
     background: var(--faint);
   }
-  .status-dot-sm.running { background: var(--warn); animation: pulse 1.6s ease-in-out infinite; }
+  .status-dot-sm.running { background: var(--warn); /* Keyframe-loop allowlist: pulse — indefinite status pulse, covered by the global 1ms reduce override in tokens.css. */ animation: pulse 1.6s ease-in-out infinite; }
   .status-dot-sm.waiting { background: var(--accent); }
   .status-dot-sm.done    { background: var(--good); }
   .status-dot-sm.failed  { background: var(--danger); }
@@ -274,7 +274,7 @@
     display: grid; place-items: center;
     cursor: pointer;
     color: var(--muted);
-    transition: color .15s, background .15s, border-color .15s;
+    transition: color var(--motion-fast), background var(--motion-fast), border-color var(--motion-fast);
   }
   .icon-btn:hover { color: var(--ink); background: rgba(21,23,26,0.05); }
   .icon-btn.active {
@@ -391,7 +391,7 @@
     background: var(--rule-strong);
   }
   .act-row.done::before { background: var(--good); }
-  .act-row.run::before  { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); animation: pulse 1.6s ease-in-out infinite; }
+  .act-row.run::before  { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); /* Keyframe-loop allowlist: pulse — indefinite status pulse, covered by the global 1ms reduce override in tokens.css. */ animation: pulse 1.6s ease-in-out infinite; }
   .act-row.fail::before { background: var(--danger); }
   .act-row.info::before { background: var(--ink-soft); }
   .act-icon { color: var(--muted); display: grid; place-items: center; }
@@ -568,6 +568,8 @@
     width: 4px; height: 4px;
     background: var(--muted);
     border-radius: 50%;
+    /* Keyframe-loop allowlist: typing — indefinite typing indicator, covered by the
+       global 1ms reduce override in tokens.css. */
     animation: typing 1.2s infinite ease-in-out both;
   }
   .typing .dots span:nth-child(2) { animation-delay: 0.15s; }
@@ -589,7 +591,7 @@
     border: 1px solid var(--rule-strong);
     border-radius: 14px;
     box-shadow: 0 4px 24px rgba(20,20,20,0.04), 0 1px 0 rgba(20,20,20,0.02);
-    transition: border-color .15s, box-shadow .15s;
+    transition: border-color var(--motion-fast), box-shadow var(--motion-fast);
     overflow: hidden;
   }
   .composer:focus-within {
@@ -639,7 +641,7 @@
     align-items: center;
     gap: 6px;
     cursor: pointer;
-    transition: border-color .15s, background .15s;
+    transition: border-color var(--motion-fast), background var(--motion-fast);
   }
   .chip:hover { border-color: var(--ink); }
   .chip svg { color: var(--muted); }
@@ -656,7 +658,7 @@
     border-radius: 10px;
     display: grid; place-items: center;
     cursor: pointer;
-    transition: background .15s, transform .08s;
+    transition: background var(--motion-fast), transform var(--motion-fast);
   }
   .send:disabled { opacity: 0.35; cursor: not-allowed; }
   .send:not(:disabled):hover { background: #000; }
@@ -714,7 +716,7 @@
     border-radius: 10px;
     padding: 14px 16px;
     cursor: pointer;
-    transition: border-color .15s;
+    transition: border-color var(--motion-fast);
     text-align: left;
     font-family: var(--sans);
     color: var(--ink);
@@ -940,7 +942,7 @@ a { color: inherit; }
   font-family: var(--sans);
   background: transparent;
   color: var(--muted);
-  transition: color 0.15s, background 0.15s;
+  transition: color var(--motion-fast), background var(--motion-fast);
   cursor: pointer;
 }
 .primary-nav button:hover { color: var(--ink); }
@@ -1199,7 +1201,7 @@ a { color: inherit; }
   height: 100%;
   border-radius: 999px;
   background: #d8d3c4;
-  transition: background 0.18s ease;
+  transition: background var(--motion-standard) ease;
   position: relative;
 }
 .toggle .thumb {
@@ -1211,7 +1213,7 @@ a { color: inherit; }
   background: #fff;
   border-radius: 50%;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
-  transition: transform 0.18s ease;
+  transition: transform var(--motion-standard) ease;
 }
 .toggle input:checked ~ .track {
   background: var(--ink);
@@ -1239,7 +1241,7 @@ a { color: inherit; }
   padding: 8px 12px;
   min-width: 200px;
   outline: none;
-  transition: border-color 0.15s, background 0.15s;
+  transition: border-color var(--motion-fast), background var(--motion-fast);
 }
 .input:hover, .select:hover { border-color: var(--ink); }
 .input:focus, .select:focus {
@@ -1314,7 +1316,7 @@ textarea.input {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  transition: border-color 0.15s, background 0.15s;
+  transition: border-color var(--motion-fast), background var(--motion-fast);
 }
 .btn:hover { border-color: var(--ink); }
 .btn.primary {
@@ -2937,7 +2939,7 @@ textarea.input {
   padding: 8px 12px;
   min-width: 0;
   outline: none;
-  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+  transition: border-color var(--motion-fast), background var(--motion-fast), box-shadow var(--motion-fast);
 }
 
 .page-shell textarea,
@@ -2975,7 +2977,7 @@ textarea.input {
   align-items: center;
   justify-content: center;
   gap: 7px;
-  transition: border-color 0.15s, background 0.15s, color 0.15s;
+  transition: border-color var(--motion-fast), background var(--motion-fast), color var(--motion-fast);
 }
 
 .page-shell button:not(.tag):not(.icon-btn):not(.new-chat):not(.send):hover,

@@ -2671,7 +2671,7 @@ export function LegacyWorkbench({
                     <p>Shown on the chat surface and used in run metadata.</p>
                   </div>
                   <div className="row-control">
-                    <input className="input short" type="text" value={runtimeConfig?.name ?? "Kestrel"} readOnly />
+                    <input className="input short" type="text" value={runtimeConfig?.name ?? "Kestrel"} aria-label="Agent name" readOnly />
                   </div>
                 </div>
                 <div className="row">
@@ -2680,7 +2680,7 @@ export function LegacyWorkbench({
                     <p>The level Kestrel starts with for new conversation runs from this browser.</p>
                   </div>
                   <div className="row-control">
-                    <div className="segmented" role="tablist" aria-label="Autonomy mode">
+                    <div className="segmented" role="group" aria-label="Autonomy mode">
                       {autonomyOptions.map((option) => (
                         <button
                           type="button"
@@ -2709,6 +2709,7 @@ export function LegacyWorkbench({
                       type="text"
                       value={workspace}
                       placeholder={String(runtimePaths.workspace ?? ".")}
+                      aria-label="Workspace"
                       onChange={(event) => setWorkspace(event.target.value)}
                     />
                   </div>
@@ -2896,7 +2897,7 @@ export function LegacyWorkbench({
                     <p>Per-request timeout before the provider path fails.</p>
                   </div>
                   <div className="row-control">
-                    <input className="input num" type="number" value={Number(runtimeProvider.timeout_seconds ?? 60)} readOnly />
+                    <input className="input num" type="number" value={Number(runtimeProvider.timeout_seconds ?? 60)} aria-label="Provider timeout in seconds" readOnly />
                     <span className="muted">s</span>
                   </div>
                 </div>
@@ -2916,7 +2917,7 @@ export function LegacyWorkbench({
                     <p>In-memory keeps local tests deterministic; Memvid persists in durable <code className="mono">.mv2</code> files.</p>
                   </div>
                   <div className="row-control">
-                    <div className="segmented" aria-label="Memory backend">
+                    <div className="segmented" role="group" aria-label="Memory backend">
                       {(["In-memory", "Memvid"] as const).map((backend) => (
                         <button
                           type="button"
@@ -2940,7 +2941,7 @@ export function LegacyWorkbench({
                     <p>Where the six layer files live when using the Memvid backend.</p>
                   </div>
                   <div className="row-control">
-                    <input className="input mono short" type="text" value={String(runtimePaths.memory_dir ?? ".nest/memory")} readOnly />
+                    <input className="input mono short" type="text" value={String(runtimePaths.memory_dir ?? ".nest/memory")} aria-label="Memory directory" readOnly />
                   </div>
                 </div>
                 {desktopRuntime && (
@@ -3287,7 +3288,7 @@ export function LegacyWorkbench({
                       <p>Stored only in this browser client and used for authenticated routes.</p>
                     </div>
                     <div className="row-control">
-                      <input className="input mono short" type="password" value={apiTokenDraft} onChange={(event) => setApiTokenDraft(event.target.value)} autoComplete="off" />
+                      <input className="input mono short" type="password" value={apiTokenDraft} onChange={(event) => setApiTokenDraft(event.target.value)} autoComplete="off" aria-label="Browser API token" />
                       <button className="btn" type="submit">Save</button>
                     </div>
                   </form>

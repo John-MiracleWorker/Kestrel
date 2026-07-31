@@ -737,6 +737,8 @@ body:has(.mission-shell) .status-dot {
 }
 
 .spin {
+  /* Keyframe-loop allowlist: mission-spin — indefinite status spinner, covered by
+     the global 1ms reduce override in tokens.css. */
   animation: mission-spin 1s linear infinite;
 }
 
@@ -1075,7 +1077,7 @@ body:has(.mission-shell)
 .mission-template-row button:hover,
 .mission-template-row button.active {
   background: color-mix(in srgb, var(--selected) 34%, var(--surface));
-  color: var(--structural);
+  color: var(--on-selected);
 }
 
 .mission-compose-review {
