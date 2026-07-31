@@ -27,6 +27,7 @@ const roots = [];
 const actualDesktopRoot = fileURLToPath(
   new URL("..", import.meta.url),
 );
+const REAL_BUILDER_TIMEOUT_MS = 20_000;
 
 function canonicalJsonBytes(value) {
   function serialize(current) {
@@ -475,7 +476,20 @@ async function copyDirectorySourceToApplication(invocation, mutate) {
   }
 }
 
-async function runPinnedRealBuilder(invocation, builderOutput) {
+async function runPinnedRealBuilder(
+  invocation,
+  builderOutput,
+  runtime = {},
+) {
+  const timeoutMs =
+    runtime.timeoutMs ?? REAL_BUILDER_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > REAL_BUILDER_TIMEOUT_MS
+  ) {
+    throw new Error("pinned real electron-builder timeout is invalid");
+  }
   const completed = spawnSync(
     process.execPath,
     [
@@ -493,10 +507,22 @@ async function runPinnedRealBuilder(invocation, builderOutput) {
       cwd: invocation.cwd,
       env: invocation.environment,
       encoding: "utf8",
+      killSignal: "SIGKILL",
       maxBuffer: 1024 * 1024,
+      timeout: timeoutMs,
     },
   );
   builderOutput.push(completed.stdout, completed.stderr);
+  if (completed.error?.code === "ETIMEDOUT") {
+    throw new Error(
+      `pinned real electron-builder timed out after ${timeoutMs}ms`,
+    );
+  }
+  if (completed.error !== undefined) {
+    throw new Error(
+      `pinned real electron-builder failed: ${completed.error.message}`,
+    );
+  }
   expect(
     completed.status,
     builderOutput.join("\n").slice(-16 * 1024),
@@ -515,6 +541,36 @@ describe("developer directory bundle", () => {
         rm(root, { recursive: true, force: true })
       ),
     );
+  });
+
+  it("forcibly bounds a stalled pinned real-builder subprocess", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "kestrel-builder-timeout-test-")),
+    );
+    roots.push(root);
+    const blockerPath = join(root, "block-builder.cjs");
+    await writeFile(
+      blockerPath,
+      "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);\n",
+    );
+    const startedAt = Date.now();
+    await expect(
+      runPinnedRealBuilder(
+        {
+          arguments: ["--version"],
+          cwd: actualDesktopRoot,
+          environment: {
+            ...process.env,
+            NODE_OPTIONS: `--require=${blockerPath}`,
+          },
+        },
+        [],
+        { timeoutMs: 100 },
+      ),
+    ).rejects.toThrow(
+      "pinned real electron-builder timed out after 100ms",
+    );
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
   it("emits exact receipt roots and only a current-platform dir invocation", async () => {
