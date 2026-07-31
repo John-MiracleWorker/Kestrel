@@ -54,6 +54,7 @@ import {
   type DesktopSupportBundleResult,
   type DesktopUpdateStatus
 } from "../contracts.js";
+import { isTrustedAppFrameUrl } from "./app-route.js";
 
 type IntrinsicGetter = (this: unknown) => unknown;
 
@@ -433,49 +434,6 @@ function parseWithin<T>(
   return deepFreeze(parsed);
 }
 
-const APP_FRAME_PATHS = new Set(["/", "/index.html"]);
-const APP_FRAME_HASHES = new Set([
-  "",
-  "#mission",
-  "#chat",
-  "#outcomes",
-  "#routines",
-  "#routing",
-  "#advanced",
-  "#settings",
-  "#workspace",
-  "#tools"
-]);
-const MAX_APP_FRAME_URL_CHARACTERS = 256;
-
-function validAppFrameUrl(value: string): boolean {
-  if (
-    value.length > MAX_APP_FRAME_URL_CHARACTERS ||
-    value.includes("\\") ||
-    value.includes("%") ||
-    /[\u0000-\u001f\u007f]/.test(value)
-  ) {
-    return false;
-  }
-  try {
-    const parsed = new URL(value);
-    return (
-      parsed.protocol === "kestrel:" &&
-      parsed.hostname === "app" &&
-      parsed.username === "" &&
-      parsed.password === "" &&
-      parsed.port === "" &&
-      parsed.search === "" &&
-      !(value.includes("#") && parsed.hash === "") &&
-      APP_FRAME_HASHES.has(parsed.hash) &&
-      APP_FRAME_PATHS.has(parsed.pathname) &&
-      parsed.href === value
-    );
-  } catch {
-    return false;
-  }
-}
-
 function validFrameId(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
@@ -550,8 +508,8 @@ export function installDesktopIpc(
       eventFrame.processId === liveMainFrame.processId &&
       eventFrame.routingId === liveMainFrame.routingId &&
       eventFrame.url === liveMainFrame.url &&
-      validAppFrameUrl(eventFrame.url) &&
-      validAppFrameUrl(liveMainFrame.url)
+      isTrustedAppFrameUrl(eventFrame.url) &&
+      isTrustedAppFrameUrl(liveMainFrame.url)
     );
   };
 

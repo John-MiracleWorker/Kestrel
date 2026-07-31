@@ -28,6 +28,7 @@ describe("desktop build boundary", () => {
       "main",
       "main.js",
       "main/api-session.js",
+      "main/app-route.js",
       "main/build-trust.js",
       "main/credential-api.js",
       "main/credential-window.js",

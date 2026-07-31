@@ -106,6 +106,41 @@ describe("desktop renderer window", () => {
     expect(windows[0]?.showCount).toBe(1);
   });
 
+  it("loads a reviewed stable route as the initial private entry", async () => {
+    const entryUrl =
+      "kestrel://app/index.html#/flock/qualification?run_id=run+1";
+    const created = createAppWindow({
+      entryUrl,
+      createWindow: (options) => new FakeWindow(options),
+      installSecurity: () => undefined,
+      bindApiSession: () => undefined,
+      bindDesktopIpc: () => undefined
+    });
+
+    await created.loaded;
+
+    expect(created.window.loadedUrls).toEqual([entryUrl]);
+  });
+
+  it("rejects an unreviewed initial route before creating a renderer", () => {
+    const createWindow = vi.fn(
+      (options: ReturnType<typeof windowOptions>) =>
+        new FakeWindow(options)
+    );
+
+    expect(() =>
+      createAppWindow({
+        entryUrl:
+          "kestrel://app/index.html#/unknown/overview",
+        createWindow,
+        installSecurity: () => undefined,
+        bindApiSession: () => undefined,
+        bindDesktopIpc: () => undefined
+      })
+    ).toThrow("desktop_app_route_untrusted");
+    expect(createWindow).not.toHaveBeenCalled();
+  });
+
   it("loads Mission Command without ever showing it for developer directory smoke", async () => {
     const created = createAppWindow({
       showWhenReady: false,
@@ -143,6 +178,43 @@ describe("desktop renderer window", () => {
     first.destroyed = true;
     expect(controller.openOrFocus()).not.toBe(first);
     expect(windows).toHaveLength(2);
+  });
+
+  it("opens a reviewed deep link in the sole live window without changing routes on ordinary focus", async () => {
+    const createdWith: string[] = [];
+    const controller = createSingleWindowController(
+      (entryUrl) => {
+        createdWith.push(entryUrl);
+        return new FakeWindow(windowOptions());
+      }
+    );
+    const flockRoute =
+      "kestrel://app/index.html#/flock/qualification";
+    const settingsRoute =
+      "kestrel://app/index.html#/settings/updates";
+
+    const first = controller.openOrFocus(flockRoute);
+    controller.openOrFocus(settingsRoute);
+    controller.openOrFocus();
+    await Promise.resolve();
+
+    expect(createdWith).toEqual([flockRoute]);
+    expect(first.loadedUrls).toEqual([settingsRoute]);
+    expect(first.focusCount).toBe(2);
+  });
+
+  it("refuses to navigate the live renderer to an unreviewed route", () => {
+    const controller = createSingleWindowController(
+      () => new FakeWindow(windowOptions())
+    );
+    const first = controller.openOrFocus();
+
+    expect(() =>
+      controller.openOrFocus(
+        "kestrel://app/index.html#/unknown/overview"
+      )
+    ).toThrow("desktop_app_route_untrusted");
+    expect(first.loadedUrls).toEqual([]);
   });
 
   it("quits without registering or opening resource UI when verified startup fails", async () => {

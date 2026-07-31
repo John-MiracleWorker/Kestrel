@@ -294,6 +294,7 @@ function fixtureRequest(
 
 describe("App", () => {
   beforeEach(() => {
+    window.history.replaceState(null, "", "#/mission/history");
     runs = [otherRun, secondRun, baseRun];
     sessions = [
       {
@@ -573,6 +574,27 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /preview decision/i })).toBeInTheDocument();
   });
 
+  it("keeps legacy skip links inside the active stable destination", async () => {
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Ask Kestrel" }),
+    ).toBeInTheDocument();
+    openAdvancedWorkspace("Routing");
+    await screen.findByRole("heading", {
+      name: "Adaptive Flock Routing",
+    });
+    fireEvent.click(
+      screen.getByRole("link", { name: "Skip to workspace" }),
+    );
+
+    expect(window.location.hash).toBe("#/flock/routing");
+    expect(screen.getByRole("main")).toHaveFocus();
+    expect(
+      screen.getByRole("heading", { name: "Adaptive Flock Routing" }),
+    ).toBeInTheDocument();
+  });
+
   it("keeps idle chat polling lightweight", async () => {
     const intervalCallbacks: Array<() => void> = [];
     vi.spyOn(window, "setInterval").mockImplementation((handler: TimerHandler, timeout?: number) => {
@@ -712,7 +734,7 @@ describe("App", () => {
     expect(screen.getByText("Task Capsules")).toBeInTheDocument();
     expect(screen.getByText("Mutation Gate")).toBeInTheDocument();
     expect(screen.getByText("ORACLE Shadow")).toBeInTheDocument();
-    expect(screen.getByText("Memory")).toBeInTheDocument();
+    expect(screen.getAllByText("Memory").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Tools").length).toBeGreaterThan(0);
   });
 
@@ -1270,7 +1292,12 @@ describe("App", () => {
     let preview = screen.getByLabelText("Exact-call approval preview");
     expect(within(preview).getByText("Prepared exact-call request: git.commit")).toBeInTheDocument();
     expect(within(preview).getByText("Invoking this request will create or require approval before execution; it has not run yet.")).toBeInTheDocument();
-    expect(within(preview).getByRole("link", { name: /review prepared request in tool form/i })).toHaveAttribute("href", "#tools");
+    const reviewPreparedRequest = within(preview).getByRole("link", {
+      name: /review prepared request in tool form/i,
+    });
+    expect(reviewPreparedRequest).toHaveAttribute("href", "#tools");
+    fireEvent.click(reviewPreparedRequest);
+    expect(window.location.hash).toBe("#/extend/capabilities");
     expect(within(preview).getByText(new RegExp(actionAuthority.reviewId))).toBeInTheDocument();
 
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));

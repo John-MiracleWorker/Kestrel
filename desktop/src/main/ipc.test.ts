@@ -344,7 +344,7 @@ describe("Desktop main IPC authority", () => {
     });
   });
 
-  it("accepts the canonical root and production hash routes on reviewed app paths", async () => {
+  it("keeps IPC authority across every stable destination and reviewed legacy route", async () => {
     const { authority, handlers } = harness();
     const registered = new FakeWebContents(22);
     authority.bindRenderer(registered);
@@ -352,6 +352,19 @@ describe("Desktop main IPC authority", () => {
 
     const urls = [
       "kestrel://app/",
+      ...[
+        "mission/command",
+        "projects/overview",
+        "memory/layers",
+        "flock/overview",
+        "automate/routines",
+        "extend/catalog",
+        "settings/general"
+      ].flatMap((route) => [
+        `kestrel://app/#/${route}`,
+        `kestrel://app/index.html#/${route}`
+      ]),
+      "kestrel://app/index.html#/flock/qualification?run_id=run+1&task_id=proof%2F2",
       ...["", "index.html"].flatMap((path) =>
         [
           "mission",

@@ -1,6 +1,7 @@
 import type { BrowserWindowConstructorOptions } from "electron";
 import { fileURLToPath } from "node:url";
 import { DESKTOP_APP_ENTRY_URL } from "../contracts.js";
+import { isTrustedAppFrameUrl } from "./app-route.js";
 
 export interface AppWindow {
   readonly webContents: unknown;
@@ -62,12 +63,18 @@ export function windowOptions(): BrowserWindowConstructorOptions {
 }
 
 export function createAppWindow<TWindow extends AppWindow>(dependencies: {
+  entryUrl?: string;
   showWhenReady?: boolean;
   createWindow(options: BrowserWindowConstructorOptions): TWindow;
   installSecurity(webContents: unknown): void;
   bindApiSession(webContents: unknown): void;
   bindDesktopIpc(webContents: unknown): void;
 }): AppWindowResult<TWindow> {
+  const entryUrl =
+    dependencies.entryUrl ?? DESKTOP_APP_ENTRY_URL;
+  if (!isTrustedAppFrameUrl(entryUrl)) {
+    throw new Error("desktop_app_route_untrusted");
+  }
   const window = dependencies.createWindow(windowOptions());
   dependencies.installSecurity(window.webContents);
   dependencies.bindApiSession(window.webContents);
@@ -82,29 +89,39 @@ export function createAppWindow<TWindow extends AppWindow>(dependencies: {
 
   return {
     window,
-    loaded: window.loadURL(DESKTOP_APP_ENTRY_URL)
+    loaded: window.loadURL(entryUrl)
   };
 }
 
 export function createSingleWindowController<TWindow extends AppWindow>(
-  createWindow: () => TWindow
+  createWindow: (entryUrl: string) => TWindow
 ): {
-  openOrFocus(): TWindow;
+  openOrFocus(entryUrl?: string): TWindow;
   current(): TWindow | null;
 } {
   let currentWindow: TWindow | null = null;
 
   return {
-    openOrFocus(): TWindow {
+    openOrFocus(entryUrl?: string): TWindow {
+      const reviewedEntryUrl =
+        entryUrl ?? DESKTOP_APP_ENTRY_URL;
+      if (!isTrustedAppFrameUrl(reviewedEntryUrl)) {
+        throw new Error("desktop_app_route_untrusted");
+      }
       if (currentWindow !== null && !currentWindow.isDestroyed()) {
         if (currentWindow.isMinimized()) {
           currentWindow.restore();
         }
         currentWindow.focus();
+        if (entryUrl !== undefined) {
+          void currentWindow
+            .loadURL(reviewedEntryUrl)
+            .catch(() => undefined);
+        }
         return currentWindow;
       }
 
-      const created = createWindow();
+      const created = createWindow(reviewedEntryUrl);
       currentWindow = created;
       created.once("closed", () => {
         if (currentWindow === created) {

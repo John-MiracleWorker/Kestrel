@@ -4147,3 +4147,205 @@ body:has(.chat-shell[data-active-section="chat"]) .status-dot {
 .repair-diff-row code + code {
   border-left: 1px solid rgb(148 163 184 / 18%);
 }
+
+/* ---------- stable seven-destination application shell ---------- */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.workbench-shell {
+  --workbench-shell-header-height: 64px;
+  display: grid;
+  grid-template-rows: var(--workbench-shell-header-height) minmax(0, 1fr);
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.workbench-shell-header {
+  position: relative;
+  z-index: 50;
+  display: grid;
+  grid-template-columns: minmax(180px, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 22px;
+  min-width: 0;
+  padding: 0 22px;
+  border-bottom: 1px solid var(--rule);
+  background: color-mix(in srgb, var(--paper) 94%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.workbench-shell-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  text-decoration: none;
+}
+
+.workbench-shell-brand > span:last-child {
+  display: grid;
+  line-height: 1.1;
+}
+
+.workbench-shell-brand strong {
+  font-family: var(--serif);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.workbench-shell-brand small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.workbench-shell-brand-mark {
+  display: grid;
+  width: 31px;
+  height: 31px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--rule));
+  border-radius: 50% 46% 52% 43%;
+  background: color-mix(in srgb, var(--accent) 13%, var(--paper));
+  color: var(--accent);
+  font-family: var(--serif);
+  font-weight: 600;
+}
+
+.workbench-destinations {
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  gap: 2px;
+  min-width: 0;
+  height: 100%;
+}
+
+.workbench-destinations a {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 10px;
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.workbench-destinations a:hover {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.workbench-destinations a[aria-current="page"] {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 11%, var(--paper));
+}
+
+.workbench-destinations a[aria-current="page"]::after {
+  position: absolute;
+  right: 10px;
+  bottom: 0;
+  left: 10px;
+  height: 3px;
+  border-radius: 3px 3px 0 0;
+  background: var(--accent);
+  content: "";
+}
+
+.workbench-shell-body,
+.workbench-shell-content {
+  min-width: 0;
+  min-height: 0;
+}
+
+.workbench-shell-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.workbench-shell-body.with-context {
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
+}
+
+.workbench-shell-content {
+  position: relative;
+  overflow: auto;
+}
+
+.workbench-context-rail {
+  min-width: 0;
+  overflow: auto;
+  padding: 18px;
+  border-left: 1px solid var(--rule);
+  background: color-mix(in srgb, var(--paper) 90%, var(--accent) 3%);
+}
+
+.workbench-route-recovery {
+  position: absolute;
+  z-index: 80;
+  top: 10px;
+  left: 50%;
+  width: min(620px, calc(100% - 32px));
+  padding: 10px 14px;
+  transform: translateX(-50%);
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+  font-size: 13px;
+}
+
+.workbench-shell-content .chat-shell {
+  height: calc(
+    100dvh - var(--workbench-shell-header-height) -
+      var(--kestrel-topbar-height, 67px)
+  );
+}
+
+.workbench-shell-content .mission-shell {
+  height: calc(
+    100dvh - var(--workbench-shell-header-height) -
+      var(--kestrel-topbar-height, 59px)
+  );
+}
+
+@media (max-width: 1050px) {
+  .workbench-shell-header {
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 12px;
+    padding: 0 12px;
+  }
+
+  .workbench-shell-brand small,
+  .workbench-destinations a span:not(.sr-only) {
+    display: none;
+  }
+
+  .workbench-destinations a {
+    justify-content: center;
+    min-width: 42px;
+    padding: 0 8px;
+  }
+}

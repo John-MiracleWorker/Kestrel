@@ -286,7 +286,11 @@ export function MissionControl({
   const providerDetail = preflight?.provider.detail ?? "Not inspected";
 
   return (
-    <main className="mission-shell" id="workspace" data-active-section="mission">
+    <div
+      className="mission-shell"
+      id="mission-workspace-root"
+      data-active-section="mission"
+    >
       <aside className="mission-project-rail" aria-label="Projects and recent missions">
         <div className="mission-project-picker">
           <label htmlFor="mission-project">Project</label>
@@ -574,7 +578,7 @@ export function MissionControl({
           Starting creates a project-bound durable run. High-risk exact calls still require approval.
         </p>
       </aside>
-    </main>
+    </div>
   );
 }
 

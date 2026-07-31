@@ -36,6 +36,10 @@ import {
   type AppWindow
 } from "./main/window.js";
 import {
+  canonicalDesktopRouteUrl,
+  selectDesktopDeepLink
+} from "./main/app-route.js";
+import {
   createNodeSupervisorDependencies,
   SidecarSupervisor,
   type NodeSupervisorDependencyInput
@@ -202,8 +206,11 @@ if (!app.requestSingleInstanceLock()) {
   let directorySmokeRequested = false;
   let directorySmokeCycle: DirectorySmokeCycle | null = null;
   let directorySmokeMission: Promise<void> | null = null;
-  const windows = createSingleWindowController(() => {
+  let desktopReady = false;
+  let pendingDesktopRoute = selectDesktopDeepLink(process.argv);
+  const windows = createSingleWindowController((entryUrl) => {
     const created = createAppWindow({
+      entryUrl,
       showWhenReady: !directorySmokeRequested,
       createWindow: (options) =>
         new BrowserWindow(options) as BrowserWindow & AppWindow,
@@ -245,21 +252,40 @@ if (!app.requestSingleInstanceLock()) {
     });
     return created.window;
   });
-  let desktopReady = false;
   let supervisor: SidecarSupervisor | null = null;
   let stoppingForQuit = false;
   let quitAfterStop = false;
 
-  app.on("second-instance", () => {
-    if (desktopReady && !directorySmokeRequested) {
-      windows.openOrFocus();
+  const openOrQueueDesktopWindow = (
+    routeUrl: string | null
+  ): void => {
+    if (routeUrl !== null) {
+      pendingDesktopRoute = routeUrl;
+    }
+    if (!desktopReady || directorySmokeRequested) {
+      return;
+    }
+    const nextRoute = pendingDesktopRoute;
+    pendingDesktopRoute = null;
+    windows.openOrFocus(nextRoute ?? undefined);
+  };
+
+  app.on("second-instance", (_event, commandLine) => {
+    openOrQueueDesktopWindow(
+      selectDesktopDeepLink(commandLine)
+    );
+  });
+
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    const routeUrl = canonicalDesktopRouteUrl(url);
+    if (routeUrl !== null) {
+      openOrQueueDesktopWindow(routeUrl);
     }
   });
 
   app.on("activate", () => {
-    if (desktopReady && !directorySmokeRequested) {
-      windows.openOrFocus();
-    }
+    openOrQueueDesktopWindow(null);
   });
 
   app.on("window-all-closed", () => {
@@ -562,7 +588,11 @@ if (!app.requestSingleInstanceLock()) {
         },
         openWindow() {
           desktopReady = true;
-          windows.openOrFocus();
+          if (directorySmokeRequested) {
+            windows.openOrFocus();
+          } else {
+            openOrQueueDesktopWindow(null);
+          }
         },
         quit() {
           app.quit();
