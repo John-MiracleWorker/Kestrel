@@ -1,7 +1,8 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AppShell } from "./AppShell";
+import { AppShell, useAppShellContextRail } from "./AppShell";
 import { parseAppLocation } from "./destinations";
 
 describe("AppShell", () => {
@@ -67,6 +68,52 @@ describe("AppShell", () => {
     expect(
       screen.getByRole("complementary", { name: "Memory context" }),
     ).toHaveTextContent("Layer evidence");
+  });
+
+  it("lets the active workspace register and remove contextual evidence", () => {
+    setViewport(1440);
+
+    function WorkspaceContext({ enabled }: { enabled: boolean }) {
+      const { portal } = useAppShellContextRail(
+        enabled ? <p>Current mission authority</p> : null,
+      );
+      return (
+        <>
+          <h1>Mission</h1>
+          {portal}
+        </>
+      );
+    }
+
+    function Harness() {
+      const [enabled, setEnabled] = useState(true);
+      return (
+        <AppShell
+          location={parseAppLocation("#/mission/command")}
+          onNavigate={vi.fn()}
+        >
+          <WorkspaceContext enabled={enabled} />
+          <button type="button" onClick={() => setEnabled(false)}>
+            Clear context
+          </button>
+        </AppShell>
+      );
+    }
+
+    render(<Harness />);
+
+    expect(
+      screen.getByRole("complementary", { name: "Mission context" }),
+    ).toHaveTextContent("Current mission authority");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear context" }),
+    );
+    expect(
+      screen.queryByRole("complementary", {
+        name: "Mission context",
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps navigation, main, and context in keyboard document order", () => {

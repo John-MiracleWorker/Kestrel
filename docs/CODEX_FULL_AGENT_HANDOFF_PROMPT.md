@@ -2,6 +2,13 @@
 
 Last updated: 2026-07-19
 
+> **Current GUI-first program continuation (2026-07-31):** Before acting on
+> this older runtime overview, read
+> [`CODEX_GUI_FIRST_IMPLEMENTATION_HANDOFF_2026-07-31.md`](CODEX_GUI_FIRST_IMPLEMENTATION_HANDOFF_2026-07-31.md).
+> It records the authoritative isolated worktree, exact committed HEAD,
+> uncommitted Mission Task 8 files, independent-review blockers, validation
+> evidence, and the remaining Desktop/LAN/Adaptive Flock program order.
+
 You are working inside the Kestrel repository. Kestrel is a local-first, memory-native agent runtime built around Nested Learning-inspired memory layers and Memvid v2 `.mv2` files.
 
 This is not just a RAG layer. The runtime already includes CLI chat, provider adapters, deterministic mock mode, tools, approvals, state, task capsules, controlled behavior deltas, live-learning evals, a FastAPI/web control plane, managed MCP stdio sessions, skills, scheduler slices, durable proactive routines, and safe repair gates. Your job is to harden the next slice without regressing the current contract.

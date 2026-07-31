@@ -52,6 +52,10 @@ export type Approval = {
   tool_name: string;
   arguments: Record<string, unknown>;
   risk: string;
+  principal?: string;
+  expires_at?: string | null;
+  capability_revision?: number;
+  resource_digest?: string;
   status: string;
   decision?: Record<string, unknown> | null;
   result?: Record<string, unknown> | null;

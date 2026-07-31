@@ -1588,7 +1588,7 @@ export function LegacyWorkbench({
 
   async function decideApproval(approval: Approval, approved: boolean) {
     await guarded(async () => {
-      await postJson(`/api/approvals/${approval.approval_id}/decision`, {
+      const updated = await postJson<Approval>(`/api/approvals/${approval.approval_id}/decision`, {
         approved,
         arguments: approval.arguments
       });
@@ -1596,7 +1596,26 @@ export function LegacyWorkbench({
         runId: activeRun?.run_id,
         sessionId: activeRun?.session_id,
       });
-    }, approved ? "Approval accepted." : "Approval denied.");
+      const returnedStatus =
+        updated && typeof updated === "object" && "status" in updated
+          ? String(updated.status)
+          : null;
+      if (approved && returnedStatus !== "approved") {
+        setNotice(
+          returnedStatus === "expired"
+            ? "Approval expired before the decision was recorded."
+            : returnedStatus
+              ? `Approval decision returned status: ${returnedStatus}.`
+              : "Approval decision did not confirm an approved status.",
+        );
+        return;
+      }
+      if (!approved && returnedStatus && returnedStatus !== "denied") {
+        setNotice(`Approval decision returned status: ${returnedStatus}.`);
+        return;
+      }
+      setNotice(approved ? "Approval accepted." : "Approval denied.");
+    });
   }
 
   async function approveTask(task: TaskNode) {
@@ -1858,6 +1877,8 @@ export function LegacyWorkbench({
             setPreparedToolPreview({ name, args });
             jumpToAdvanced("tools");
           }}
+          onDecideApproval={decideApproval}
+          onContinueConversation={submitConversationMessage}
           onAuthRequired={handleAuthRequired}
         />
       ) : activeSection === "outcomes" ? (

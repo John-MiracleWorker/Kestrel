@@ -134,4 +134,41 @@ describe("RepairReviewPanel authority boundaries", () => {
       name: "Prepare exact-call git.commit request"
     })).toBeDisabled();
   });
+
+  it("keeps raw signed repair records collapsed behind evidence disclosure", () => {
+    render(
+      <RepairReviewPanel
+        tasks={[
+          validationTask(),
+          reviewTask({
+            repair_artifact: {
+              schema_version: 1,
+              tool: "repair.review",
+              review_id: reviewId,
+              validation_id: validationId,
+              repair_snapshot: snapshot,
+              commit_gate: {
+                commit_allowed: true,
+                approval_required_before_commit: true
+              }
+            }
+          })
+        ]}
+        allowedPaths={["."]}
+        onPrepareTool={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Repair evidence records")).toBeVisible();
+    const records = screen.getAllByText(/schema_version/);
+    expect(records[0]).not.toBeVisible();
+    expect(records[1]).not.toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Signed review receipt evidence",
+      }),
+    );
+    expect(records[0]).not.toBeVisible();
+    expect(records[1]).toBeVisible();
+  });
 });

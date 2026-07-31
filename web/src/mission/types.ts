@@ -1,5 +1,14 @@
 export type MissionCheckStatus = "pass" | "warn" | "fail" | "unknown";
 
+export type MissionState =
+  | "compose"
+  | "preflight"
+  | "active"
+  | "needs-owner"
+  | "reviewing"
+  | "completed"
+  | "blocked";
+
 export type ProjectRecipe = {
   name: string;
   command: string;

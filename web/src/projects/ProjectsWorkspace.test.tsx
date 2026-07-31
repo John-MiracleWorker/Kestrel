@@ -37,6 +37,8 @@ describe("ProjectsWorkspace", () => {
         onOpenAdvanced={() => undefined}
         onOpenDiagnostics={() => undefined}
         onPrepareTool={() => undefined}
+        onDecideApproval={() => undefined}
+        onContinueConversation={async () => undefined}
         onAuthRequired={() => undefined}
       />,
     );

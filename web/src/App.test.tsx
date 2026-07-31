@@ -509,13 +509,16 @@ describe("App", () => {
     await screen.findByRole("heading", { name: "Ask Kestrel" });
 
     fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "New mission" }),
+    );
 
     expect(await screen.findByRole("heading", { name: "What should Kestrel accomplish?" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Kestrel" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
     expect(
       screen.getByText(
-        "No run will start until you inspect the route, permissions, validation, and rollback projection."
+        "No run can start until Kestrel returns current route, permission, budget, validation, and rollback evidence."
       )
     ).toBeInTheDocument();
   });
@@ -526,13 +529,16 @@ describe("App", () => {
     await screen.findByRole("heading", { name: "Ask Kestrel" });
 
     fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "New mission" }),
+    );
     fireEvent.change(
-      await screen.findByLabelText("Engineering objective"),
+      await screen.findByLabelText("Objective"),
       { target: { value: "Prove the shell refactor keeps mission authority." } },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Inspect plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
     const runMission = await screen.findByRole("button", {
-      name: "Run mission",
+      name: "Start mission",
     });
     await waitFor(() => expect(runMission).toBeEnabled());
     fireEvent.click(runMission);
@@ -1151,7 +1157,13 @@ describe("App", () => {
     expect(within(panel).getByText(`Diff ${repairSnapshot.diff_digest} · src/calculator.py`)).toBeInTheDocument();
     expect(within(panel).getByText(`Candidate ${repairSnapshot.branch} @ ${repairSnapshot.head_sha}`)).toBeInTheDocument();
     expect(within(panel).getByRole("heading", { name: "Unified diff preview" })).toBeInTheDocument();
-    expect(within(panel).getByText(/\+\s+return a \+ b/)).toBeInTheDocument();
+    expect(
+      within(panel).getByText(
+        (_content, element) =>
+          element?.classList.contains("diff-add") === true &&
+          element.textContent === "+  return a + b",
+      ),
+    ).toBeInTheDocument();
     expect(within(panel).getByText(/redacted advisory preview/i)).toBeInTheDocument();
     fireEvent.click(within(panel).getByRole("button", { name: "Split" }));
     expect(within(panel).getByRole("heading", { name: "Split diff preview" })).toBeInTheDocument();
@@ -1804,6 +1816,29 @@ describe("App", () => {
         arguments: pendingApproval.arguments
       });
     });
+  });
+
+  it("reports truthfully when an approval decision returns expired instead of approved", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path.match(/^\/api\/approvals\/approval_1\/decision$/) && init?.method === "POST") {
+        approvals = [];
+        return jsonResponse({ ...pendingApproval, status: "expired", decision: null });
+      }
+      return fetchMock(input, init);
+    });
+    render(<App />);
+
+    const approvalCard = await screen.findByRole("group", {
+      name: /approval for shell.run/i,
+    });
+    fireEvent.click(
+      within(approvalCard).getByRole("button", { name: /approve/i }),
+    );
+
+    expect(await screen.findByText(/approval expired/i)).toBeInTheDocument();
+    expect(screen.queryByText("Approval accepted.")).not.toBeInTheDocument();
   });
 
   it("keeps a committed approval independent from unavailable extension inventory", async () => {
@@ -3033,7 +3068,11 @@ describe("App", () => {
     render(<App />);
     await screen.findByRole("heading", { name: "Ask Kestrel" });
     fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
-    await screen.findByRole("option", { name: "Kestrel" });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Refresh projects" }),
+      ).toBeEnabled(),
+    );
 
     fetchSpy.mockImplementation(async (input, init) => {
       const raw =
