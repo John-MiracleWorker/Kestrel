@@ -8,12 +8,17 @@
 - Task 5A review-clean final SHA and Task 5B base SHA:
   `424378a2d95a32458a61ca077d5a4f5d9e129f2e`
   (`fix: close LAN draft review gaps`)
-- Intended Task 5B subject: `feat: harden LAN model runtime transport`
+- Task 5B feature milestone SHA:
+  `dbbc32b1573a743a694f05a6b2de493c1b7d2de1`
+  (`feat: harden LAN model runtime transport`)
+- Intended bounded review-correction subject:
+  `fix: preserve LAN profile authority invariants`
 - Worktree: `/Volumes/12.45/Codex-Offload/kestrel-gui-first-integration`
 
-The Task 5B final commit identity is external to this report by construction: a
-commit cannot embed its own resulting SHA. The controller will record that exact
-identity in `progress.md` and in the fresh-range review immediately after commit.
+The Task 5B review-correction final commit identity is external to this report by
+construction: a commit cannot embed its own resulting SHA. The controller will
+record that exact identity in `progress.md` and in the fresh-range review
+immediately after commit.
 
 Task 5A changed the 13 authorized source/test files required for strict Task 4
 evidence import, durable LAN-managed drafts, review, mutation fences, routing
@@ -21,7 +26,8 @@ defense, and the two fixed-owner HTTP routes. The feature milestone contained
 11,558 insertions and 123 deletions. Its bounded review correction changed five
 of those files with 738 insertions and 32 deletions.
 
-Task 5B's candidate diff from `424378a2d95a32458a61ca077d5a4f5d9e129f2e`
+Task 5B's feature-milestone diff from
+`424378a2d95a32458a61ca077d5a4f5d9e129f2e`
 contains 20 production source files and 11 test files, plus this report. It adds
 the neutral internal authority type, coherent durable/live resolver, direct LAN
 runtime transport/provider, no-tool agent path, authority propagation and
@@ -38,9 +44,10 @@ Two controller-authorized Task 5B scope expansions were required after review:
   `tests/test_agent_routing_foundation.py` make the narrow routing-context
   correction described below while preserving all explicit and safety floors.
 
-No other scope expansion was accepted. Production and test changes remained
-unstaged while this report was drafted; staging and commit ownership remain with
-the controller.
+No other feature scope expansion was accepted. The bounded review correction
+changes only `src/nested_memvid_agent/routing/ledger_registry.py`,
+`tests/test_lan_discovery_service.py`, and this tracked report; staging and commit
+ownership remain with the controller.
 
 ## Task 5A: strict durable import and review boundary
 
@@ -259,10 +266,10 @@ ordinary-context fixture repair. These changes made fixtures satisfy the frozen
 typed contracts; they did not weaken product assertions or turn an expected RED
 into a permissive test.
 
-### Task 5B GREEN and final focused gates
+### Task 5B feature-milestone GREEN gates
 
 Before the final expiry-equality delta, this exact ten-file gate passed
-`908/908`. The final-head rerun of the same gate included the added equality
+`908/908`. The feature-milestone rerun of the same gate included the added equality
 regression and was:
 
 ```text
@@ -282,7 +289,7 @@ exit 0: 909 passed, 1 warning in 78.41s (0:01:18)
 
 The warning was the same pre-existing Starlette/httpx deprecation.
 
-The final-head 15-file Task 4/5/routing/provider superset included the added
+The feature-milestone 15-file Task 4/5/routing/provider superset included the added
 expiry-equality regression and was:
 
 ```text
@@ -313,11 +320,11 @@ tests/test_agent_routing_foundation.py: 20/20
 reviewer-focused equality set: 6/6
 ```
 
-The full routing test suite also exited 0 at the final candidate HEAD.
+The full routing test suite also exited 0 at the feature milestone.
 
 ## Static and repository-wide verification
 
-Final static receipts:
+Feature-milestone static receipts:
 
 ```text
 ruff check: exit 0, full src/nested_memvid_agent tree and authorized tests
@@ -325,7 +332,7 @@ mypy: exit 0, 20 changed production source files, no issues
 git diff --check: exit 0
 ```
 
-The repository-wide final-head command used the handoff PATH and only the six
+The repository-wide feature-milestone command used the handoff PATH and only the six
 exact documented host-sensitive deselections:
 
 ```text
@@ -372,6 +379,64 @@ A transport/authority-specific audit also exercised 183 runtime-transport tests,
 the central fixes and equality delta, two independent final auditors both returned
 **APPROVE** with no open P0, P1, or P2 finding.
 
+Those pre-commit approvals did not replace the mandatory fresh committed-range
+review. The exact review of
+`424378a2d95a32458a61ca077d5a4f5d9e129f2e..dbbc32b1573a743a694f05a6b2de493c1b7d2de1`
+returned **REQUEST CHANGES** for one P1 authority-family defect: an incomplete
+catalog observed after an installed hardening marker changed from `v1` to absent
+could downgrade only the mentioned target while leaving an omitted enabled
+sibling executable, or could discover the inconsistency only after writes.
+
+The original implementer froze five marker-downgrade regressions. RED was four
+failures plus one same-marker control pass. The correction fans every enabled
+sibling into the exact affected revision set, preserves each omitted sibling's
+remote evidence, clears its marker/review/trust/routing/interface authority,
+invalidates the prior reviewed material, recomputes the unconfirmed material,
+and validates every current/replacement family inside the transaction before the
+commit hook.
+
+The first scoped re-review then found a second P1 in that same correction round:
+when the last enabled target expired during an outage while profile evidence was
+still fresh, the target could become disabled without deriving and writing the
+profile projection. Five outage-family regressions recorded RED as one failure
+plus four controls passing. The correction now overlays planned target mutations
+over the complete family, derives profile enablement/trust from that post-plan
+family, CAS-bumps the profile only when its projection or metadata changes,
+returns only affected targets, and uses the shared whole-family validator before
+the caller's commit hook.
+
+All ten regressions passed after the bounded correction. Two independent
+post-fix audits returned **APPROVE** with high confidence and no P0, P1, or P2
+finding. They independently passed all `251` discovery-service tests, Ruff,
+MyPy, and `git diff --check`; the second audit rehashed unchanged final bytes as:
+
+```text
+src/nested_memvid_agent/routing/ledger_registry.py: 2abb5bcdc222714fef1eb098d04282b74ea3346f38edfb34d8be26d4806e3844
+tests/test_lan_discovery_service.py: 288dc71285a867a66cbff02b3703be42e4d311dc708c3ffac87937c1378028b6
+```
+
+## Review-corrected final verification
+
+The unchanged corrected bytes passed the same exact ten-file and 15-file commands
+recorded above with the ten new regressions included:
+
+```text
+ten-file Task 5 gate: 919 passed, 1 known warning
+15-file Task 4/5/routing/provider superset: 1242 passed, 1 known warning
+```
+
+Final scoped static receipts were Ruff clean for both changed source/test files,
+MyPy clean for `src/nested_memvid_agent/routing/ledger_registry.py`, and
+`git diff --check` clean. The
+repository-wide command recorded above was then repeated against the correction
+with the same six exact deselections and exited 0:
+
+```text
+3826 passed, 81 skipped, 6 deselected, 1 warning in 383.99s (0:06:23)
+```
+
+The warning remained the known pre-existing Starlette/httpx deprecation.
+
 ## Deliberate policy decisions and residual boundaries
 
 - Authority defaults off. Discovery, import, review, health, or a learned route
@@ -411,12 +476,11 @@ the central fixes and equality delta, two independent final auditors both return
 
 ## Handoff
 
-The Task 5B candidate is review-clean under the focused, superset, routing,
-static, and repository-wide gates recorded above. Before finalizing the milestone,
-the controller must stage only the authorized Task 5 paths plus this report,
-commit, record the resulting exact commit identity in `progress.md`, and run the
-fresh exact-commit/range review required by the SDD workflow. This report is not
-an activation, release, or production qualification record. Because
-`.superpowers/sdd/.gitignore` ignores generated SDD artifacts, the controller must
-review this file and use an explicit force-add for this one authorized report path;
-it was intentionally not staged by the report-drafting agent.
+The Task 5B bounded correction is review-clean in its uncommitted final bytes
+under the focused, superset, static, and repository-wide gates recorded above.
+Before finalizing the milestone, the controller must stage only
+`src/nested_memvid_agent/routing/ledger_registry.py`,
+`tests/test_lan_discovery_service.py`, and this already tracked report; commit;
+record the resulting exact identity in `progress.md`;
+and run a fresh exact review of `dbbc32b..correction`. This report is not an
+activation, release, or production qualification record.

@@ -5330,6 +5330,108 @@ def _enabled_task5b_binding(
     return observation, registry, service, provider_id, target_id, enabled
 
 
+def _routing_inventory_snapshot(state: AgentStateStore) -> tuple[tuple[object, ...], ...]:
+    with state._connect() as connection:
+        return tuple(
+            (table, *tuple(row))
+            for table in ("routing_provider_profiles", "routing_model_targets")
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+        )
+
+
+def _enabled_task5b_siblings(
+    state: AgentStateStore,
+    *,
+    scan_id: str,
+    sibling_observed_at: datetime = NOW + timedelta(seconds=1),
+):
+    _observation, registry, _service, provider_id, alpha_id, enabled_alpha = (
+        _enabled_task5b_binding(state, scan_id=scan_id)
+    )
+    gamma_observation = _positive_observation(
+        models=("gamma",),
+        catalog_complete=False,
+    )
+    _row, gamma_scan = _persist_completed_scan(
+        state,
+        scan_id=f"{scan_id}-gamma",
+        observation=gamma_observation,
+        observed_at=sibling_observed_at,
+    )
+    gamma_id = _target_id(provider_id, "gamma")
+    service = _task5b_service(
+        registry,
+        clock=lambda: sibling_observed_at,
+    )
+    imported_gamma = service.import_observation(
+        _import_request(
+            gamma_observation,
+            gamma_scan,
+            profile_revision=enabled_alpha.profile.revision,
+            target_revisions=((gamma_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert imported_gamma.profile is not None
+    gamma = imported_gamma.targets[0]
+    enable_gamma, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=imported_gamma.profile.revision,
+        target_revision=gamma.revision,
+        target_id=gamma_id,
+        protected=gamma.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    enabled_gamma = service.review_lan_target(
+        enable_gamma,
+        authenticated_owner_principal=OWNER,
+    )
+    alpha = registry.get_model_target(alpha_id)
+    gamma = registry.get_model_target(gamma_id)
+    assert alpha is not None and gamma is not None
+    assert alpha.target.enabled is True and gamma.target.enabled is True
+    return registry, provider_id, (alpha_id, gamma_id), enabled_gamma.profile, (alpha, gamma)
+
+
+def _enabled_alpha_with_fresh_disabled_beta(
+    state: AgentStateStore,
+    *,
+    scan_id: str,
+):
+    _observation, registry, _service, provider_id, alpha_id, enabled = (
+        _enabled_task5b_binding(state, scan_id=scan_id)
+    )
+    beta_observation = _positive_observation(
+        models=("beta",),
+        catalog_complete=False,
+    )
+    _row, beta_scan = _persist_completed_scan(
+        state,
+        scan_id=f"{scan_id}-beta-refresh",
+        observation=beta_observation,
+        observed_at=NOW + timedelta(seconds=250),
+    )
+    beta_id = _target_id(provider_id, "beta")
+    refreshed = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=250),
+    ).import_observation(
+        _import_request(
+            beta_observation,
+            beta_scan,
+            profile_revision=enabled.profile.revision,
+            target_revisions=((beta_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert refreshed.profile is not None
+    alpha = registry.get_model_target(alpha_id)
+    beta = registry.get_model_target(beta_id)
+    assert alpha is not None and beta is not None
+    assert alpha.target.enabled is True and beta.target.enabled is False
+    return registry, provider_id, alpha_id, beta_id, refreshed.profile, alpha, beta
+
+
 def test_runtime_interface_binding_digest_preserves_and_clears_with_authority(
     tmp_path: Path,
 ) -> None:
@@ -5497,6 +5599,448 @@ def test_runtime_interface_binding_digest_preserves_and_clears_with_authority(
         ]
         != second_binding
     )
+
+
+def test_incomplete_marker_downgrade_commits_no_mixed_enabled_generation(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    _observation, registry, _service, provider_id, alpha_id, enabled = _enabled_task5b_binding(
+        state, scan_id="scan-before-incomplete-downgrade"
+    )
+    beta_observation = _positive_observation(
+        models=("beta",),
+        catalog_complete=False,
+    )
+    _row, beta_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-incomplete-beta-downgrade",
+        observation=beta_observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    beta_id = _target_id(provider_id, "beta")
+
+    result = LanDiscoveryService(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).import_observation(
+        _import_request(
+            beta_observation,
+            beta_scan,
+            profile_revision=enabled.profile.revision,
+            target_revisions=(
+                (beta_id, 0),
+                (alpha_id, enabled.target.revision),
+            ),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    profile = registry.get_provider_profile(provider_id)
+    alpha = registry.get_model_target(alpha_id)
+    beta = registry.get_model_target(beta_id)
+    assert profile is not None and alpha is not None and beta is not None
+    assert result.affected_target_ids == (beta_id, alpha_id)
+    assert profile.profile.enabled is False
+    assert profile.profile.trust_class == "unconfirmed"
+    assert profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
+    assert all(target.target.enabled is False for target in (alpha, beta))
+    assert all(
+        target.target.metadata["lan_discovery"]["runtime_hardening"] is None
+        for target in (alpha, beta)
+    )
+
+
+def test_incomplete_marker_downgrade_requires_every_enabled_sibling_revision_before_write(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    _observation, registry, _service, provider_id, _alpha_id, enabled = _enabled_task5b_binding(
+        state, scan_id="scan-before-incomplete-missing-cas"
+    )
+    beta_observation = _positive_observation(
+        models=("beta",),
+        catalog_complete=False,
+    )
+    _row, beta_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-incomplete-beta-missing-cas",
+        observation=beta_observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    beta_id = _target_id(provider_id, "beta")
+    before = _routing_inventory_snapshot(state)
+
+    with pytest.raises(LanDiscoveryConflict) as raised:
+        LanDiscoveryService(
+            registry,
+            clock=lambda: NOW + timedelta(seconds=1),
+        ).import_observation(
+            _import_request(
+                beta_observation,
+                beta_scan,
+                profile_revision=enabled.profile.revision,
+                target_revisions=((beta_id, 0),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+
+    assert _routing_inventory_snapshot(state) == before
+    assert "revision" in str(raised.value).lower()
+
+
+def test_incomplete_marker_downgrade_clears_every_omitted_enabled_sibling(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    registry, provider_id, sibling_ids, profile, siblings = _enabled_task5b_siblings(
+        state,
+        scan_id="scan-before-all-sibling-downgrade",
+    )
+    beta_observation = _positive_observation(
+        models=("beta",),
+        catalog_complete=False,
+    )
+    _row, beta_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-incomplete-beta-all-siblings",
+        observation=beta_observation,
+        observed_at=NOW + timedelta(seconds=2),
+    )
+    beta_id = _target_id(provider_id, "beta")
+    prior_materials = {
+        str(target.target.metadata["lan_discovery"]["material_binding_digest"])
+        for target in siblings
+    }
+
+    result = LanDiscoveryService(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=2),
+    ).import_observation(
+        _import_request(
+            beta_observation,
+            beta_scan,
+            profile_revision=profile.revision,
+            target_revisions=(
+                (beta_id, 0),
+                *(
+                    (target_id, target.revision)
+                    for target_id, target in zip(
+                        sibling_ids,
+                        siblings,
+                        strict=True,
+                    )
+                ),
+            ),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    current_profile = registry.get_provider_profile(provider_id)
+    current_siblings = tuple(registry.get_model_target(target_id) for target_id in sibling_ids)
+    assert current_profile is not None and all(target is not None for target in current_siblings)
+    assert result.affected_target_ids == (beta_id, *tuple(sorted(sibling_ids)))
+    assert set(result.invalidated_binding_digests) == prior_materials
+    assert current_profile.profile.enabled is False
+    for target in current_siblings:
+        assert target is not None
+        protected = target.target.metadata["lan_discovery"]
+        assert target.target.enabled is False
+        assert target.target.trust_class == "unconfirmed"
+        assert target.target.role_affinities == ()
+        assert target.target.task_family_affinities == ()
+        assert target.target.health == "unknown"
+        assert protected["runtime_hardening"] is None
+        assert protected["reviewed"] is False
+        assert protected["stale_reasons"] == []
+        assert protected["stale_transition_terminal_receipt_digest"] is None
+        for field in (
+            "reviewed_profile_revision",
+            "reviewed_target_revision",
+            "review_evidence_terminal_receipt_digest",
+            "review_evidence_observation_digest",
+            "reviewed_from_material_binding_digest",
+            "reviewed_material_binding_digest",
+            "review_acknowledged_stale_reasons",
+            "review_acknowledged_stale_transition_terminal_receipt_digest",
+            "review_digest",
+            "privacy_acknowledgement_digest",
+            "reviewed_runtime_interface_binding_digest",
+        ):
+            assert protected[field] is None
+
+
+def test_incomplete_marker_downgrade_post_upsert_failure_rolls_back_every_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.routing.ledger_registry as ledger_registry
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    _observation, registry, _service, provider_id, alpha_id, enabled = _enabled_task5b_binding(
+        state, scan_id="scan-before-incomplete-post-upsert-crash"
+    )
+    beta_observation = _positive_observation(
+        models=("beta",),
+        catalog_complete=False,
+    )
+    _row, beta_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-incomplete-beta-post-upsert-crash",
+        observation=beta_observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    beta_id = _target_id(provider_id, "beta")
+    before = _routing_inventory_snapshot(state)
+    monkeypatch.setattr(
+        ledger_registry,
+        "_before_lan_commit",
+        lambda: (_ for _ in ()).throw(RuntimeError("incomplete downgrade post-upsert crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete downgrade post-upsert crash"):
+        LanDiscoveryService(
+            registry,
+            clock=lambda: NOW + timedelta(seconds=1),
+        ).import_observation(
+            _import_request(
+                beta_observation,
+                beta_scan,
+                profile_revision=enabled.profile.revision,
+                target_revisions=(
+                    (beta_id, 0),
+                    (alpha_id, enabled.target.revision),
+                ),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+
+    assert _routing_inventory_snapshot(state) == before
+
+
+def test_same_marker_incomplete_refresh_keeps_omitted_enabled_target_unchanged(
+    tmp_path: Path,
+) -> None:
+    from nested_memvid_agent.lan_runtime_authority import (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    )
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    _observation, registry, _service, provider_id, alpha_id, enabled = _enabled_task5b_binding(
+        state, scan_id="scan-before-same-marker-incomplete"
+    )
+    alpha_before = registry.get_model_target(alpha_id)
+    assert alpha_before is not None
+    beta_observation = _positive_observation(
+        models=("beta",),
+        catalog_complete=False,
+    )
+    _row, beta_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-same-marker-incomplete-beta",
+        observation=beta_observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    beta_id = _target_id(provider_id, "beta")
+
+    result = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).import_observation(
+        _import_request(
+            beta_observation,
+            beta_scan,
+            profile_revision=enabled.profile.revision,
+            target_revisions=((beta_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    alpha_after = registry.get_model_target(alpha_id)
+    beta = registry.get_model_target(beta_id)
+    assert alpha_after == alpha_before
+    assert beta is not None and beta.target.enabled is False
+    assert result.affected_target_ids == (beta_id,)
+    assert result.profile is not None and result.profile.profile.enabled is True
+    assert (
+        result.profile.profile.metadata["lan_discovery"]["runtime_hardening"]
+        == LAN_OPENAI_RUNTIME_HARDENING_VERSION
+    )
+
+
+def test_outage_last_enabled_target_expiry_updates_fresh_profile_family(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    registry, provider_id, alpha_id, beta_id, profile, alpha, beta = (
+        _enabled_alpha_with_fresh_disabled_beta(
+            state,
+            scan_id="scan-before-last-enabled-outage",
+        )
+    )
+    outage = _outage_observation()
+    _row, outage_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-last-enabled-outage",
+        observation=outage,
+        observed_at=NOW + timedelta(seconds=301),
+    )
+
+    result = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=301),
+    ).import_observation(
+        _import_request(
+            outage,
+            outage_scan,
+            profile_revision=profile.revision,
+            target_revisions=((alpha_id, alpha.revision),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    current_profile = registry.get_provider_profile(provider_id)
+    current_alpha = registry.get_model_target(alpha_id)
+    current_beta = registry.get_model_target(beta_id)
+    assert result.affected_target_ids == (alpha_id,)
+    assert result.profile is not None
+    assert result.profile.revision == profile.revision + 1
+    assert current_profile == result.profile
+    assert current_profile.profile.enabled is False
+    assert current_profile.profile.trust_class == "unconfirmed"
+    assert current_alpha is not None and current_alpha.target.enabled is False
+    assert current_beta == beta
+    assert result.invalidated_binding_digests == (
+        alpha.target.metadata["lan_discovery"]["material_binding_digest"],
+    )
+
+
+def test_outage_expired_target_preserves_profile_when_fresh_enabled_sibling_remains(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    registry, provider_id, sibling_ids, profile, siblings = _enabled_task5b_siblings(
+        state,
+        scan_id="scan-before-fresh-enabled-sibling-outage",
+        sibling_observed_at=NOW + timedelta(seconds=250),
+    )
+    alpha_id, gamma_id = sibling_ids
+    alpha, gamma = siblings
+    outage = _outage_observation()
+    _row, outage_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-fresh-enabled-sibling-outage",
+        observation=outage,
+        observed_at=NOW + timedelta(seconds=301),
+    )
+
+    result = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=301),
+    ).import_observation(
+        _import_request(
+            outage,
+            outage_scan,
+            profile_revision=profile.revision,
+            target_revisions=((alpha_id, alpha.revision),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    current_profile = registry.get_provider_profile(provider_id)
+    current_alpha = registry.get_model_target(alpha_id)
+    current_gamma = registry.get_model_target(gamma_id)
+    assert result.affected_target_ids == (alpha_id,)
+    assert result.profile == profile
+    assert current_profile == profile
+    assert current_profile.profile.enabled is True
+    assert current_profile.profile.trust_class == "operator_confirmed"
+    assert current_alpha is not None and current_alpha.target.enabled is False
+    assert current_gamma == gamma
+
+
+@pytest.mark.parametrize("missing_cas", ("profile", "target"))
+def test_outage_last_enabled_expiry_requires_complete_cas_before_write(
+    tmp_path: Path,
+    missing_cas: str,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    registry, _provider_id_value, alpha_id, _beta_id, profile, alpha, _beta = (
+        _enabled_alpha_with_fresh_disabled_beta(
+            state,
+            scan_id=f"scan-before-last-enabled-{missing_cas}-cas",
+        )
+    )
+    outage = _outage_observation()
+    _row, outage_scan = _persist_completed_scan(
+        state,
+        scan_id=f"scan-last-enabled-{missing_cas}-cas",
+        observation=outage,
+        observed_at=NOW + timedelta(seconds=301),
+    )
+    before = _routing_inventory_snapshot(state)
+
+    with pytest.raises(LanDiscoveryConflict):
+        _task5b_service(
+            registry,
+            clock=lambda: NOW + timedelta(seconds=301),
+        ).import_observation(
+            _import_request(
+                outage,
+                outage_scan,
+                profile_revision=(profile.revision - 1 if missing_cas == "profile" else profile.revision),
+                target_revisions=(
+                    () if missing_cas == "target" else ((alpha_id, alpha.revision),)
+                ),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+
+    assert _routing_inventory_snapshot(state) == before
+
+
+def test_outage_last_enabled_expiry_post_upsert_failure_rolls_back_family(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.routing.ledger_registry as ledger_registry
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    registry, _provider_id_value, alpha_id, _beta_id, profile, alpha, _beta = (
+        _enabled_alpha_with_fresh_disabled_beta(
+            state,
+            scan_id="scan-before-last-enabled-outage-crash",
+        )
+    )
+    outage = _outage_observation()
+    _row, outage_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-last-enabled-outage-crash",
+        observation=outage,
+        observed_at=NOW + timedelta(seconds=301),
+    )
+    before = _routing_inventory_snapshot(state)
+    monkeypatch.setattr(
+        ledger_registry,
+        "_before_lan_commit",
+        lambda: (_ for _ in ()).throw(RuntimeError("last enabled outage post-upsert crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="last enabled outage post-upsert crash"):
+        _task5b_service(
+            registry,
+            clock=lambda: NOW + timedelta(seconds=301),
+        ).import_observation(
+            _import_request(
+                outage,
+                outage_scan,
+                profile_revision=profile.revision,
+                target_revisions=((alpha_id, alpha.revision),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+
+    assert _routing_inventory_snapshot(state) == before
 
 
 def test_marker_downgrade_authority_invalidation_rolls_back_atomically(

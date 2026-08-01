@@ -956,6 +956,12 @@ class RoutingRegistry:
                 if existing_profile is None
                 else existing_profile.profile.metadata["lan_discovery"]
             )
+            runtime_hardening_downgraded = (
+                previous_profile_protected is not None
+                and _validated_runtime_hardening_marker(previous_profile_protected)
+                == LAN_OPENAI_RUNTIME_HARDENING_VERSION
+                and installed_runtime_hardening is None
+            )
             profile_template = _lan_profile_protected(
                 evidence,
                 endpoint_fingerprint=endpoint_fingerprint,
@@ -1087,6 +1093,13 @@ class RoutingRegistry:
                                 sorted(existing_targets)
                                 if endpoint_wide_refresh
                                 else sorted(individually_expired_ids)
+                            ),
+                            *(
+                                sorted(
+                                    target_id
+                                    for target_id, entry in existing_targets.items()
+                                    if runtime_hardening_downgraded and entry.target.enabled
+                                )
                             ),
                         )
                     )
@@ -1276,6 +1289,42 @@ class RoutingRegistry:
                             else ()
                         ),
                     )
+                    if runtime_hardening_downgraded and existing.target.enabled:
+                        downgraded = dict(existing.target.metadata["lan_discovery"])
+                        invalidated_materials.append(str(downgraded["material_binding_digest"]))
+                        downgraded["runtime_hardening"] = installed_runtime_hardening
+                        _clear_lan_review_authority(downgraded)
+                        if reasons:
+                            downgraded.update(
+                                {
+                                    "stale_reason": reasons[0],
+                                    "stale_reasons": list(reasons),
+                                    "stale_transition_terminal_receipt_digest": (
+                                        evidence.terminal_receipt_digest
+                                    ),
+                                }
+                            )
+                            stale_reasons_by_target[target_id] = reasons
+                        downgraded["material_binding_digest"] = _lan_material_binding_digest(
+                            downgraded,
+                            target_id=target_id,
+                            trust_class="unconfirmed",
+                            privacy_acknowledgement_digest=None,
+                            intended_roles=(),
+                            task_family_affinities=(),
+                        )
+                        planned_targets[target_id] = ModelTarget(
+                            **{
+                                **asdict(existing.target),
+                                "enabled": False,
+                                "trust_class": "unconfirmed",
+                                "role_affinities": (),
+                                "task_family_affinities": (),
+                                "health": "unavailable" if reasons else "unknown",
+                                "metadata": {"lan_discovery": downgraded},
+                            }
+                        )
+                        continue
                     stale, invalidated = _lan_mark_target_stale(
                         existing,
                         reasons=reasons,
@@ -1365,24 +1414,7 @@ class RoutingRegistry:
                     )
                     if existing.target.enabled and not target_enabled:
                         invalidated_materials.append(str(old["material_binding_digest"]))
-                        fresh.update(
-                            {
-                                "reviewed": False,
-                                "reviewed_profile_revision": None,
-                                "reviewed_target_revision": None,
-                                "review_evidence_terminal_receipt_digest": None,
-                                "review_evidence_observation_digest": None,
-                                "reviewed_from_material_binding_digest": None,
-                                "reviewed_material_binding_digest": None,
-                                "review_acknowledged_stale_reasons": None,
-                                "review_acknowledged_stale_transition_terminal_receipt_digest": None,
-                                "review_digest": None,
-                                "privacy_acknowledgement_digest": None,
-                                "reviewed_runtime_interface_binding_digest": None,
-                                "intended_roles": [],
-                                "task_family_affinities": [],
-                            }
-                        )
+                        _clear_lan_review_authority(fresh)
                         trust_class = "unconfirmed"
                         roles = ()
                         families = ()
@@ -1475,23 +1507,29 @@ class RoutingRegistry:
                     created_at=target_created_at,
                     updated_at=now_text,
                 )
+            planned_profile_ids = [profile_id]
+            if replacement_entry is not None:
+                planned_profile_ids.append(replacement_entry.profile.profile_id)
+            persisted_profiles: dict[str, ProviderProfileEntry] = {}
+            persisted_targets_by_id: dict[str, ModelTargetEntry] = {}
+            for planned_profile_id in planned_profile_ids:
+                persisted_profile_entry, persisted_target_entries = (
+                    _strict_lan_profile_family(connection, planned_profile_id)
+                )
+                persisted_profiles[planned_profile_id] = persisted_profile_entry
+                persisted_targets_by_id.update(
+                    (entry.target.target_id, entry) for entry in persisted_target_entries
+                )
+            if any(target_id not in persisted_targets_by_id for target_id in affected_ids):
+                raise RuntimeError("LAN inventory write was lost")
+            persisted_profile = persisted_profiles[profile_id]
+            persisted_targets = tuple(
+                persisted_targets_by_id[target_id] for target_id in affected_ids
+            )
             _before_lan_commit()
-            persisted_profile = connection.execute(
-                "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
-                (profile_id,),
-            ).fetchone()
-            persisted_targets = [
-                connection.execute(
-                    "SELECT * FROM routing_model_targets WHERE target_id = ?",
-                    (target_id,),
-                ).fetchone()
-                for target_id in affected_ids
-            ]
-        if persisted_profile is None or any(row is None for row in persisted_targets):
-            raise RuntimeError("LAN inventory write was lost")
         return (
-            _strict_lan_profile_entry(persisted_profile),
-            tuple(_strict_lan_target_entry(row) for row in persisted_targets if row is not None),
+            persisted_profile,
+            persisted_targets,
             expected_observation_digest,
             endpoint_fingerprint,
             False,
@@ -2795,6 +2833,32 @@ def _strict_lan_target_entry(row: sqlite3.Row) -> ModelTargetEntry:
     return entry
 
 
+def _strict_lan_profile_family(
+    connection: sqlite3.Connection,
+    profile_id: str,
+) -> tuple[ProviderProfileEntry, tuple[ModelTargetEntry, ...]]:
+    profile_row = connection.execute(
+        "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
+        (profile_id,),
+    ).fetchone()
+    if profile_row is None:
+        raise RuntimeError("LAN inventory write was lost")
+    profile_entry = _strict_lan_profile_entry(profile_row)
+    target_rows = connection.execute(
+        """
+        SELECT * FROM routing_model_targets
+        WHERE provider_profile_id = ? ORDER BY target_id ASC
+        """,
+        (profile_id,),
+    ).fetchall()
+    target_entries = tuple(_strict_lan_target_entry(row) for row in target_rows)
+    if profile_entry.profile.enabled != any(
+        entry.target.enabled for entry in target_entries
+    ):
+        raise ValueError("LAN managed provider/target enabled state is inconsistent")
+    return profile_entry, target_entries
+
+
 def _validate_lan_affinities(value: object, field: str) -> tuple[str, ...]:
     if type(value) is not list or len(value) > 16:
         raise ValueError(f"LAN {field} must contain at most 16 values")
@@ -3138,14 +3202,7 @@ def _has_reserved_lan_prefix(value: str) -> bool:
     return value.startswith((_LAN_PROFILE_ID_PREFIX, _LAN_TARGET_ID_PREFIX))
 
 
-def _lan_mark_target_stale(
-    entry: ModelTargetEntry,
-    *,
-    reasons: tuple[str, ...],
-    transition_receipt_digest: str,
-) -> tuple[ModelTarget, str]:
-    protected = dict(entry.target.metadata["lan_discovery"])
-    invalidated_material = str(protected["material_binding_digest"])
+def _clear_lan_review_authority(protected: dict[str, Any]) -> None:
     protected.update(
         {
             "reviewed": False,
@@ -3162,6 +3219,21 @@ def _lan_mark_target_stale(
             "reviewed_runtime_interface_binding_digest": None,
             "intended_roles": [],
             "task_family_affinities": [],
+        }
+    )
+
+
+def _lan_mark_target_stale(
+    entry: ModelTargetEntry,
+    *,
+    reasons: tuple[str, ...],
+    transition_receipt_digest: str,
+) -> tuple[ModelTarget, str]:
+    protected = dict(entry.target.metadata["lan_discovery"])
+    invalidated_material = str(protected["material_binding_digest"])
+    _clear_lan_review_authority(protected)
+    protected.update(
+        {
             "stale_reason": reasons[0],
             "stale_reasons": list(reasons),
             "stale_transition_terminal_receipt_digest": transition_receipt_digest,
@@ -3394,16 +3466,6 @@ def _apply_lan_outage(
     ).fetchone()
     if profile_row is None:
         raise ValueError("LAN outage provider profile disappeared")
-    profile_revision = profile_entry.revision
-    profile_created_at = profile_entry.created_at
-    if profile_needs_transition:
-        profile_revision, profile_created_at = _next_revision(
-            "provider_profile",
-            profile_entry.profile.profile_id,
-            profile_row,
-            expected_revision=expected_profile_revision,
-            now=now_text,
-        )
     planned_revisions: dict[str, tuple[int, str]] = {}
     for target in affected_targets:
         target_id = target.target.target_id
@@ -3418,26 +3480,17 @@ def _apply_lan_outage(
             expected_revision=expected_target_revisions[target_id],
             now=now_text,
         )
-    stale_profile = profile_entry.profile
+    profile_protected = dict(protected)
     if profile_needs_transition:
         profile_reasons = _merge_lan_stale_reasons(
             tuple(protected["stale_reasons"]),
             ("freshness_expired",),
         )
-        stale_profile_protected = dict(protected)
-        stale_profile_protected.update(
+        profile_protected.update(
             {
                 "stale_reason": profile_reasons[0],
                 "stale_reasons": list(profile_reasons),
                 "stale_transition_terminal_receipt_digest": (evidence.terminal_receipt_digest),
-            }
-        )
-        stale_profile = ProviderProfile(
-            **{
-                **asdict(profile_entry.profile),
-                "enabled": False,
-                "trust_class": "unconfirmed",
-                "metadata": {"lan_discovery": stale_profile_protected},
             }
         )
     planned_targets: list[ModelTarget] = []
@@ -3458,10 +3511,38 @@ def _apply_lan_outage(
         planned_targets.append(stale)
         invalidated.append(material)
         stale_map.append((target.target.target_id, reasons))
-    if profile_needs_transition:
+    planned_targets_by_id = {target.target_id: target for target in planned_targets}
+    post_plan_targets = tuple(
+        planned_targets_by_id.get(target.target.target_id, target.target)
+        for target in targets
+    )
+    profile_enabled = not profile_protected["stale_reasons"] and any(
+        target.enabled for target in post_plan_targets
+    )
+    profile_trust_class = "operator_confirmed" if profile_enabled else "unconfirmed"
+    profile_needs_write = profile_needs_transition or (
+        profile_entry.profile.enabled != profile_enabled
+        or profile_entry.profile.trust_class != profile_trust_class
+    )
+    planned_profile = ProviderProfile(
+        **{
+            **asdict(profile_entry.profile),
+            "enabled": profile_enabled,
+            "trust_class": profile_trust_class,
+            "metadata": {"lan_discovery": profile_protected},
+        }
+    )
+    if profile_needs_write:
+        profile_revision, profile_created_at = _next_revision(
+            "provider_profile",
+            profile_entry.profile.profile_id,
+            profile_row,
+            expected_revision=expected_profile_revision,
+            now=now_text,
+        )
         _upsert_lan_provider(
             connection,
-            stale_profile,
+            planned_profile,
             revision=profile_revision,
             created_at=profile_created_at,
             updated_at=now_text,
@@ -3475,22 +3556,18 @@ def _apply_lan_outage(
             created_at=created_at,
             updated_at=now_text,
         )
-    persisted_profile_row = connection.execute(
-        "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
-        (profile_entry.profile.profile_id,),
-    ).fetchone()
-    persisted_target_rows = [
-        connection.execute(
-            "SELECT * FROM routing_model_targets WHERE target_id = ?",
-            (target_id,),
-        ).fetchone()
-        for target_id in affected_ids
-    ]
-    if persisted_profile_row is None or any(row is None for row in persisted_target_rows):
+    persisted_profile, persisted_family_targets = _strict_lan_profile_family(
+        connection,
+        profile_entry.profile.profile_id,
+    )
+    persisted_targets_by_id = {
+        entry.target.target_id: entry for entry in persisted_family_targets
+    }
+    if any(target_id not in persisted_targets_by_id for target_id in affected_ids):
         raise RuntimeError("LAN outage expiry write was lost")
     return (
-        _strict_lan_profile_entry(persisted_profile_row),
-        tuple(_strict_lan_target_entry(row) for row in persisted_target_rows if row is not None),
+        persisted_profile,
+        tuple(persisted_targets_by_id[target_id] for target_id in affected_ids),
         endpoint_fingerprint,
         affected_ids,
         tuple(sorted(set(invalidated))),
