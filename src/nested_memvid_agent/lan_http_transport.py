@@ -29,7 +29,6 @@ from nested_memvid_agent.lan_discovery_scope import (
     enumerate_private_interfaces,
 )
 from nested_memvid_agent.lan_mdns import _contains_transport_material
-from nested_memvid_agent.llm.provider_urls import format_numeric_http_authority
 from nested_memvid_agent.security_boundary import redact_text
 
 MAX_HTTP_HEADER_BYTES = 32 * 1024
@@ -225,6 +224,27 @@ class LanProbeModel:
 InterfaceInventoryResolver = Callable[[], CurrentLanInterfaceInventory]
 
 
+def _format_numeric_http_authority(endpoint: ResolvedLanEndpoint) -> str:
+    """Format only the authenticated literal endpoint used by this transport."""
+
+    if type(endpoint) is not ResolvedLanEndpoint:
+        raise TypeError("HTTP authority requires an authenticated LAN endpoint")
+    address = endpoint.address
+    port = endpoint.port
+    if type(address) is not str or "%" in address:
+        raise ValueError("LAN endpoint requires an unzoned literal IP address")
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        raise ValueError("LAN endpoint requires a literal IP address") from None
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("LAN endpoint requires a valid numeric port")
+    literal = str(parsed)
+    if isinstance(parsed, ipaddress.IPv6Address):
+        return f"[{literal}]:{port}"
+    return f"{literal}:{port}"
+
+
 def _open_socket(family: int, kind: int) -> SocketLike:
     return cast(SocketLike, socket.socket(family, kind))
 
@@ -249,8 +269,8 @@ def authenticate_private_scan_scope(scope: PrivateScanScope) -> PrivateScanScope
         ):
             raise error
         canonical_scope = PrivateScanScope.from_request(canonical_interface, scope.network)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise error from exc
+    except (AttributeError, TypeError, ValueError):
+        raise error from None
     if scope != canonical_scope:
         raise error
     return canonical_scope
@@ -268,8 +288,8 @@ def authenticate_lan_source(
     resolver = inventory_resolver or _resolve_current_interface_inventory
     try:
         inventory = resolver()
-    except Exception as exc:
-        raise ValueError("selected LAN interface changed") from exc
+    except Exception:
+        raise ValueError("selected LAN interface changed") from None
     if type(inventory) is not CurrentLanInterfaceInventory:
         raise ValueError("selected LAN interface changed")
     states = inventory.interfaces
@@ -304,8 +324,8 @@ def authenticate_lan_source(
         indices.add(state.interface_index)
         try:
             attached_inventory = tuple(ipaddress.ip_interface(value) for value in state.addresses)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("selected LAN interface changed") from exc
+        except (TypeError, ValueError):
+            raise ValueError("selected LAN interface changed") from None
         if len({str(item.ip) for item in attached_inventory}) != len(attached_inventory):
             raise ValueError("selected LAN interface changed")
         canonical_states.append((state, attached_inventory))
@@ -319,8 +339,8 @@ def authenticate_lan_source(
             display_name=canonical_scope.interface.display_name,
             addresses=selected.addresses,
         )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("selected LAN interface changed") from exc
+    except (TypeError, ValueError):
+        raise ValueError("selected LAN interface changed") from None
     if current_selected.addresses != canonical_scope.interface.addresses or not all(
         _is_eligible_interface_address(item) for item in selected.addresses
     ):
@@ -427,17 +447,17 @@ class DirectLanHttpTransport:
             return True
         except LanTransportError:
             raise
-        except TimeoutError as exc:
-            raise LanTransportError(LanTransportFailure.TCP_TIMEOUT) from exc
-        except ConnectionRefusedError as exc:
-            raise LanTransportError(LanTransportFailure.TCP_REFUSED) from exc
+        except TimeoutError:
+            raise LanTransportError(LanTransportFailure.TCP_TIMEOUT) from None
+        except ConnectionRefusedError:
+            raise LanTransportError(LanTransportFailure.TCP_REFUSED) from None
         except OSError as exc:
             failure = (
                 LanTransportFailure.TCP_UNREACHABLE
                 if exc.errno in {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EADDRNOTAVAIL}
                 else LanTransportFailure.TCP_ERROR
             )
-            raise LanTransportError(failure) from exc
+            raise LanTransportError(failure) from None
         finally:
             if connection is not None:
                 connection.close()
@@ -468,8 +488,8 @@ class DirectLanHttpTransport:
         if model is not None:
             try:
                 canonical_model = LanProbeModel.from_catalog(model.model_id)
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise ValueError("LAN generation model failed canonical validation") from exc
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError("LAN generation model failed canonical validation") from None
             if model != canonical_model:
                 raise ValueError("LAN generation model failed canonical validation")
             model = canonical_model
@@ -531,17 +551,17 @@ class DirectLanHttpTransport:
             raise LanTransportError(
                 exc.failure,
                 request_progress=request_progress,
-            ) from exc
-        except TimeoutError as exc:
+            ) from None
+        except TimeoutError:
             raise LanTransportError(
                 LanTransportFailure.HTTP_TIMEOUT,
                 request_progress=request_progress,
-            ) from exc
-        except OSError as exc:
+            ) from None
+        except OSError:
             raise LanTransportError(
                 LanTransportFailure.HTTP_CONNECT_FAILED,
                 request_progress=request_progress,
-            ) from exc
+            ) from None
         finally:
             if connection is not None:
                 connection.close()
@@ -560,8 +580,8 @@ class DirectLanHttpTransport:
                 canonical_endpoint,
                 self._inventory_resolver,
             )
-        except ValueError as exc:
-            raise LanTransportError(LanTransportFailure.INTERFACE_CHANGED) from exc
+        except ValueError:
+            raise LanTransportError(LanTransportFailure.INTERFACE_CHANGED) from None
         if type(source) is not AuthenticatedLanSource or source != fresh_source:
             raise LanTransportError(LanTransportFailure.INTERFACE_CHANGED)
         return canonical_endpoint, fresh_source
@@ -578,8 +598,8 @@ def _rebuild_endpoint(
         if type(endpoint.address) is not str or "%" in endpoint.address:
             raise error
         rebuilt = ResolvedLanEndpoint.from_scope(scope, endpoint.address, endpoint.port)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise error from exc
+    except (AttributeError, TypeError, ValueError):
+        raise error from None
     if endpoint != rebuilt:
         raise error
     return rebuilt
@@ -628,7 +648,7 @@ def _request_bytes(
         raise ValueError("LAN probe request body exceeds its byte limit")
     headers = [
         f"{method} {route.path} HTTP/1.1",
-        f"Host: {format_numeric_http_authority(endpoint)}",
+        f"Host: {_format_numeric_http_authority(endpoint)}",
         "Accept: application/json",
         "Accept-Encoding: identity",
         "Connection: close",
@@ -679,8 +699,8 @@ def _pin_socket(
                 interface_name.encode("utf-8") + b"\0",
             )
             return
-    except OSError as exc:
-        raise LanTransportError(LanTransportFailure.INTERFACE_PINNING_UNAVAILABLE) from exc
+    except OSError:
+        raise LanTransportError(LanTransportFailure.INTERFACE_PINNING_UNAVAILABLE) from None
     raise LanTransportError(LanTransportFailure.INTERFACE_PINNING_UNAVAILABLE)
 
 
@@ -738,8 +758,8 @@ def _read_response_head(
         try:
             name = raw_name.decode("ascii").lower()
             value = raw_value.decode("ascii").strip()
-        except UnicodeDecodeError as exc:
-            raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED) from exc
+        except UnicodeDecodeError:
+            raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED) from None
         if (
             not name
             or not all(character.isalnum() or character == "-" for character in name)
@@ -779,8 +799,8 @@ def _read_response_body(
             raise LanTransportError(LanTransportFailure.RESPONSE_TOO_LARGE)
         try:
             length = int(canonical_length)
-        except ValueError as exc:
-            raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED) from exc
+        except ValueError:
+            raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED) from None
         if length > MAX_PROBE_RESPONSE_BYTES:
             raise LanTransportError(LanTransportFailure.RESPONSE_TOO_LARGE)
         body = reader.read_exact(length)
@@ -858,8 +878,8 @@ def _read_chunked_body(reader: _BoundedSocketReader) -> bytes:
             raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED)
         try:
             size = int(raw_size, 16)
-        except ValueError as exc:
-            raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED) from exc
+        except ValueError:
+            raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED) from None
         if size < 0 or len(result) + size > MAX_PROBE_RESPONSE_BYTES:
             raise LanTransportError(LanTransportFailure.RESPONSE_TOO_LARGE)
         if size == 0:
@@ -993,8 +1013,8 @@ def _resolve_current_interface_inventory() -> CurrentLanInterfaceInventory:
             index = socket.if_nametoindex(name)
             if index <= 0 or socket.if_indextoname(index) != name:
                 raise ValueError("selected LAN interface identity is invalid")
-        except OSError as exc:
-            raise ValueError("selected LAN interface identity is invalid") from exc
+        except OSError:
+            raise ValueError("selected LAN interface identity is invalid") from None
         states.append(
             CurrentLanInterfaceState(
                 os_identity=interface.os_identity,

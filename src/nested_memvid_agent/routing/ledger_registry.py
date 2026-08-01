@@ -5,12 +5,31 @@ import json
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ..lan_discovery_models import KNOWN_MODEL_SERVICE_PORTS, MAX_ACTIVE_HOSTS
-from ..lan_http_transport import LanProbeModel
+from ..lan_discovery_models import (
+    KNOWN_MODEL_SERVICE_PORTS,
+    MAX_ACTIVE_HOSTS,
+    NetworkInterface,
+    ResolvedLanEndpoint,
+)
+from ..lan_discovery_scope import PrivateScanScope
+from ..lan_http_transport import (
+    AuthenticatedLanSource,
+    CurrentLanInterfaceInventory,
+    InterfaceInventoryResolver,
+    LanProbeModel,
+    _resolve_current_interface_inventory,
+    authenticate_lan_source,
+)
+from ..lan_runtime_authority import (
+    LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    LanRuntimeAuthority,
+    derive_lan_runtime_interface_binding_digest,
+)
 from ..lan_scanner import (
     ApiShape,
     CapabilityName,
@@ -164,6 +183,7 @@ _LAN_TARGET_PROTECTED_KEYS = frozenset(
         "review_acknowledged_stale_transition_terminal_receipt_digest",
         "review_digest",
         "privacy_acknowledgement_digest",
+        "reviewed_runtime_interface_binding_digest",
         "intended_roles",
         "task_family_affinities",
         "stale_reason",
@@ -371,7 +391,12 @@ class RoutingRegistry:
                 "SELECT * FROM routing_model_targets WHERE target_id = ?",
                 (target_id,),
             ).fetchone()
-        return None if row is None else _target_entry_from_row(row)
+        if row is None:
+            return None
+        entry = _target_entry_from_row(row)
+        if _row_has_exact_legacy_runtime_binding_shape(entry):
+            return _strict_lan_target_entry(row)
+        return entry
 
     def list_model_targets(self, *, enabled_only: bool = False) -> list[ModelTargetEntry]:
         sql = "SELECT * FROM routing_model_targets"
@@ -380,7 +405,15 @@ class RoutingRegistry:
         sql += " ORDER BY target_id ASC"
         with self.state._connect() as conn:
             rows = conn.execute(sql).fetchall()
-        return [_target_entry_from_row(row) for row in rows]
+        entries: list[ModelTargetEntry] = []
+        for row in rows:
+            entry = _target_entry_from_row(row)
+            entries.append(
+                _strict_lan_target_entry(row)
+                if _row_has_exact_legacy_runtime_binding_shape(entry)
+                else entry
+            )
+        return entries
 
     def apply_provider_inventory(
         self,
@@ -556,6 +589,195 @@ class RoutingRegistry:
             tuple(_target_entry_from_row(row) for row in persisted_targets if row is not None),
         )
 
+    def resolve_lan_runtime_authority(
+        self,
+        target_id: str,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        interface_inventory_resolver: Callable[[], CurrentLanInterfaceInventory]
+        | None = None,
+    ) -> LanRuntimeAuthority:
+        """Resolve one enabled target from a coherent durable read and fresh interface state."""
+
+        if type(target_id) is not str or _LAN_TARGET_ID_RE.fullmatch(target_id) is None:
+            raise ValueError("LAN runtime target identifier is invalid")
+        runtime_clock = clock or (lambda: datetime.now(UTC))
+        try:
+            now = runtime_clock()
+        except Exception:
+            raise ValueError("LAN runtime clock failed") from None
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
+            raise ValueError("LAN runtime clock must be aware UTC")
+        now = now.astimezone(UTC)
+
+        with self.state._connect() as connection:
+            connection.execute("BEGIN")
+            target_row = connection.execute(
+                "SELECT * FROM routing_model_targets WHERE target_id = ?",
+                (target_id,),
+            ).fetchone()
+            if target_row is None:
+                raise ValueError("LAN runtime target is unavailable")
+            target_entry = _strict_lan_target_entry(target_row)
+            profile_id = target_entry.target.provider_profile_id
+            profile_row = connection.execute(
+                "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+            if profile_row is None:
+                raise ValueError("LAN runtime provider is unavailable")
+            profile_entry = _strict_lan_profile_entry(profile_row)
+            profile_protected = profile_entry.profile.metadata["lan_discovery"]
+            target_protected = target_entry.target.metadata["lan_discovery"]
+
+            if (
+                not profile_entry.profile.enabled
+                or not target_entry.target.enabled
+                or not target_protected["reviewed"]
+                or profile_protected["stale_reasons"]
+                or target_protected["stale_reasons"]
+                or _validated_runtime_hardening_marker(profile_protected)
+                != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+                or _validated_runtime_hardening_marker(target_protected)
+                != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+                or profile_entry.profile.adapter != "lan-openai-compatible"
+                or target_entry.target.provider != "lan-openai-compatible"
+                or target_protected["api_shape"] != ApiShape.OPENAI_COMPATIBLE.value
+            ):
+                raise ValueError("LAN runtime authority is unavailable")
+
+            binding_fields = (
+                "owner_principal",
+                "endpoint_binding_digest",
+                "endpoint_fingerprint",
+                "interface_id",
+                "confirmed_network",
+                "address",
+                "port",
+                "transport_security",
+                "certificate_sha256",
+                "api_shape",
+                "runtime_adapter",
+                "runtime_hardening",
+            )
+            if any(
+                profile_protected[field] != target_protected[field]
+                for field in binding_fields
+            ):
+                raise ValueError("LAN runtime profile and target bindings disagree")
+
+            profile_evidence = load_authenticated_task4_observation(
+                connection,
+                scan_id=profile_protected["scan_id"],
+                endpoint_binding_digest=profile_protected["endpoint_binding_digest"],
+                expected_terminal_receipt_digest=profile_protected["terminal_receipt_digest"],
+                expected_observation_digest=profile_protected["observation_digest"],
+                authenticated_owner_principal=profile_protected["owner_principal"],
+            )
+            target_evidence = load_authenticated_task4_observation(
+                connection,
+                scan_id=target_protected["scan_id"],
+                endpoint_binding_digest=target_protected["endpoint_binding_digest"],
+                expected_terminal_receipt_digest=target_protected["terminal_receipt_digest"],
+                expected_observation_digest=target_protected["observation_digest"],
+                authenticated_owner_principal=target_protected["owner_principal"],
+            )
+            _validate_lan_review_evidence_projection(
+                profile_protected,
+                profile_evidence,
+                now=now,
+            )
+            _validate_lan_review_evidence_projection(
+                target_protected,
+                target_evidence,
+                now=now,
+            )
+            if (
+                target_entry.target.model
+                != target_evidence.observation.selected_model_id
+                or target_protected["capability_claims"]
+                != _lan_capability_claims(
+                    target_evidence,
+                    model_id=target_entry.target.model,
+                )
+            ):
+                raise ValueError("LAN runtime target evidence projection is invalid")
+
+            review_receipt = target_protected[
+                "review_evidence_terminal_receipt_digest"
+            ]
+            review_observation = target_protected["review_evidence_observation_digest"]
+            review_scan_rows = connection.execute(
+                """
+                SELECT scan_id FROM routing_lan_scans
+                WHERE terminal_receipt_digest = ? ORDER BY scan_id ASC
+                """,
+                (review_receipt,),
+            ).fetchall()
+            if len(review_scan_rows) != 1:
+                raise ValueError("LAN runtime review evidence is ambiguous")
+            review_evidence = load_authenticated_task4_observation(
+                connection,
+                scan_id=str(review_scan_rows[0]["scan_id"]),
+                endpoint_binding_digest=target_protected["endpoint_binding_digest"],
+                expected_terminal_receipt_digest=review_receipt,
+                expected_observation_digest=review_observation,
+                authenticated_owner_principal=target_protected["owner_principal"],
+            )
+            if (
+                target_entry.target.model != review_evidence.observation.selected_model_id
+                or review_evidence.observation.capabilities[0].status
+                is not CapabilityObservationStatus.OBSERVED_PASS
+                or review_evidence.observation.capabilities[0].supported is not True
+            ):
+                raise ValueError("LAN runtime review evidence is not generation-capable")
+
+            profile_fresh_until = _parse_lan_timestamp(
+                profile_protected["fresh_until"],
+                "fresh_until",
+            )
+            target_fresh_until = _parse_lan_timestamp(
+                target_protected["fresh_until"],
+                "fresh_until",
+            )
+            fresh_until = min(profile_fresh_until, target_fresh_until)
+            if fresh_until <= now:
+                raise ValueError("LAN runtime authority evidence expired")
+
+        scope, endpoint, source = _authenticate_lan_runtime_source(
+            target_protected,
+            interface_inventory_resolver=interface_inventory_resolver,
+        )
+        runtime_interface_binding = _lan_reviewed_runtime_interface_binding_digest(
+            target_protected,
+            source=source,
+        )
+        if runtime_interface_binding != target_protected[
+            "reviewed_runtime_interface_binding_digest"
+        ]:
+            raise ValueError("LAN runtime interface binding changed")
+
+        return LanRuntimeAuthority(
+            scope=scope,
+            endpoint=endpoint,
+            source_address=source.source_address,
+            os_interface_identity=source.os_identity,
+            interface_index=source.interface_index,
+            provider_profile_id=profile_id,
+            reviewed_target_id=target_id,
+            model_id=target_entry.target.model,
+            api_shape=target_protected["api_shape"],
+            runtime_adapter=target_protected["runtime_adapter"],
+            runtime_hardening_version=target_protected["runtime_hardening"],
+            endpoint_binding_digest=target_protected["endpoint_binding_digest"],
+            endpoint_fingerprint=target_protected["endpoint_fingerprint"],
+            reviewed_material_binding_digest=target_protected[
+                "reviewed_material_binding_digest"
+            ],
+            review_digest=target_protected["review_digest"],
+            fresh_until=_lan_timestamp(fresh_until),
+        )
+
     def apply_lan_import(
         self,
         *,
@@ -568,6 +790,7 @@ class RoutingRegistry:
         replacement: tuple[str, int, str, tuple[str, ...]] | None,
         authenticated_owner_principal: str,
         now: datetime,
+        runtime_hardening_version: str | None = None,
     ) -> tuple[
         ProviderProfileEntry | None,
         tuple[ModelTargetEntry, ...],
@@ -596,6 +819,7 @@ class RoutingRegistry:
         ):
             validate_digest(value, field)
         _validate_canonical_lan_owner(authenticated_owner_principal)
+        _validate_installed_runtime_hardening(runtime_hardening_version)
         now_text = _lan_timestamp(now)
         _validate_exact_expected_revision(expected_profile_revision)
         if type(expected_target_revisions) is not tuple:
@@ -685,6 +909,11 @@ class RoutingRegistry:
             if positive_api_shape is None:
                 raise ValueError("positive LAN evidence requires an API shape")
             runtime_adapter = _lan_runtime_adapter(positive_api_shape)
+            installed_runtime_hardening = (
+                runtime_hardening_version
+                if positive_api_shape is ApiShape.OPENAI_COMPATIBLE
+                else None
+            )
             profile_row = connection.execute(
                 "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
                 (profile_id,),
@@ -731,6 +960,7 @@ class RoutingRegistry:
                 evidence,
                 endpoint_fingerprint=endpoint_fingerprint,
                 runtime_adapter=runtime_adapter,
+                runtime_hardening=installed_runtime_hardening,
             )
             detected_profile_reasons = (
                 ()
@@ -925,6 +1155,7 @@ class RoutingRegistry:
                     evidence,
                     endpoint_fingerprint=endpoint_fingerprint,
                     runtime_adapter=runtime_adapter,
+                    runtime_hardening=installed_runtime_hardening,
                 )
                 detected_replacement_reasons = _lan_endpoint_drift_reasons(
                     old_protected,
@@ -976,6 +1207,7 @@ class RoutingRegistry:
                 evidence,
                 endpoint_fingerprint=endpoint_fingerprint,
                 runtime_adapter=runtime_adapter,
+                runtime_hardening=installed_runtime_hardening,
                 stale_reasons=profile_reasons,
                 transition_receipt_digest=(
                     evidence.terminal_receipt_digest if profile_reasons else None
@@ -1022,6 +1254,7 @@ class RoutingRegistry:
                             target_id=target_id,
                             endpoint_fingerprint=endpoint_fingerprint,
                             runtime_adapter=runtime_adapter,
+                            runtime_hardening=installed_runtime_hardening,
                         )
                         current_reasons = _lan_target_drift_reasons(
                             existing.target.metadata["lan_discovery"],
@@ -1059,6 +1292,7 @@ class RoutingRegistry:
                     target_id=target_id,
                     endpoint_fingerprint=endpoint_fingerprint,
                     runtime_adapter=runtime_adapter,
+                    runtime_hardening=installed_runtime_hardening,
                 )
                 detected_reasons: tuple[str, ...] = ()
                 if existing is not None:
@@ -1100,6 +1334,7 @@ class RoutingRegistry:
                 trust_class = "unconfirmed"
                 roles: tuple[str, ...] = ()
                 families: tuple[str, ...] = ()
+                target_enabled = False
                 health = "unavailable" if reasons else "unknown"
                 if existing is not None and not reasons:
                     old = existing.target.metadata["lan_discovery"]
@@ -1115,6 +1350,7 @@ class RoutingRegistry:
                         "review_acknowledged_stale_transition_terminal_receipt_digest",
                         "review_digest",
                         "privacy_acknowledgement_digest",
+                        "reviewed_runtime_interface_binding_digest",
                         "intended_roles",
                         "task_family_affinities",
                     ):
@@ -1122,6 +1358,34 @@ class RoutingRegistry:
                     trust_class = existing.target.trust_class
                     roles = existing.target.role_affinities
                     families = existing.target.task_family_affinities
+                    target_enabled = (
+                        existing.target.enabled
+                        and fresh["runtime_hardening"]
+                        == LAN_OPENAI_RUNTIME_HARDENING_VERSION
+                    )
+                    if existing.target.enabled and not target_enabled:
+                        invalidated_materials.append(str(old["material_binding_digest"]))
+                        fresh.update(
+                            {
+                                "reviewed": False,
+                                "reviewed_profile_revision": None,
+                                "reviewed_target_revision": None,
+                                "review_evidence_terminal_receipt_digest": None,
+                                "review_evidence_observation_digest": None,
+                                "reviewed_from_material_binding_digest": None,
+                                "reviewed_material_binding_digest": None,
+                                "review_acknowledged_stale_reasons": None,
+                                "review_acknowledged_stale_transition_terminal_receipt_digest": None,
+                                "review_digest": None,
+                                "privacy_acknowledgement_digest": None,
+                                "reviewed_runtime_interface_binding_digest": None,
+                                "intended_roles": [],
+                                "task_family_affinities": [],
+                            }
+                        )
+                        trust_class = "unconfirmed"
+                        roles = ()
+                        families = ()
                 else:
                     if existing is not None:
                         invalidated_materials.append(
@@ -1157,9 +1421,31 @@ class RoutingRegistry:
                     role_affinities=roles,
                     task_family_affinities=families,
                     health=health,
+                    enabled=target_enabled,
                 )
                 if reasons:
                     stale_reasons_by_target[target_id] = reasons
+
+            current_profile_targets = {
+                **{target_id: entry.target for target_id, entry in existing_targets.items()},
+                **{
+                    target_id: target
+                    for target_id, target in planned_targets.items()
+                    if target.provider_profile_id == profile_id
+                },
+            }
+            profile_enabled = not profile_reasons and any(
+                target.enabled for target in current_profile_targets.values()
+            )
+            profile = ProviderProfile(
+                **{
+                    **asdict(profile),
+                    "enabled": profile_enabled,
+                    "trust_class": (
+                        "operator_confirmed" if profile_enabled else "unconfirmed"
+                    ),
+                }
+            )
 
             _upsert_lan_provider(
                 connection,
@@ -1237,8 +1523,10 @@ class RoutingRegistry:
         enabled: bool,
         authenticated_owner_principal: str,
         now: datetime,
+        runtime_hardening_version: str | None = None,
+        interface_inventory_resolver: InterfaceInventoryResolver | None = None,
     ) -> tuple[ProviderProfileEntry, ModelTargetEntry, str, str]:
-        """Atomically record a disabled owner review over one exact LAN preimage."""
+        """Atomically record an owner review over one exact LAN preimage."""
 
         if type(target_id) is not str or _LAN_TARGET_ID_RE.fullmatch(target_id) is None:
             raise ValueError("LAN review target identifier is invalid")
@@ -1278,8 +1566,7 @@ class RoutingRegistry:
             raise ValueError("LAN review task-family affinities are invalid")
         if type(enabled) is not bool:
             raise ValueError("LAN review enabled must be boolean")
-        if enabled:
-            raise ValueError("lan_runtime_hardening_unavailable")
+        _validate_installed_runtime_hardening(runtime_hardening_version)
         if (
             type(trust_class) is not str
             or trust_class != "operator_confirmed"
@@ -1297,6 +1584,12 @@ class RoutingRegistry:
             ).fetchone()
             if target_row is None:
                 raise KeyError(f"Unknown LAN target: {target_id}")
+            if _row_has_exact_legacy_runtime_binding_shape(
+                _target_entry_from_row(target_row)
+            ):
+                raise ValueError(
+                    "lan_runtime_binding_upgrade_requires_positive_reimport"
+                )
             target_entry = _strict_lan_target_entry(target_row)
             profile_id = target_entry.target.provider_profile_id
             profile_row = connection.execute(
@@ -1357,6 +1650,14 @@ class RoutingRegistry:
             ):
                 if profile_protected[field] != target_protected[field]:
                     raise ValueError("LAN profile and target endpoint bindings disagree")
+            if enabled and (
+                runtime_hardening_version != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+                or _validated_runtime_hardening_marker(profile_protected)
+                != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+                or _validated_runtime_hardening_marker(target_protected)
+                != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+            ):
+                raise ValueError("lan_runtime_hardening_unavailable")
             if expected_stale_reasons:
                 endpoint_stale_reasons = tuple(
                     reason
@@ -1427,6 +1728,21 @@ class RoutingRegistry:
                 raise ValueError("LAN review capability claims disagree with evidence")
             if target_entry.target.model not in evidence.observation.catalog:
                 raise ValueError("LAN review model is absent from exact evidence")
+            if enabled and (
+                target_entry.target.model != evidence.observation.selected_model_id
+                or target_protected["capability_claims"][0]
+                != evidence.observation.capabilities[0].to_digest_payload()
+                or not target_entry.target.capability_tags
+            ):
+                raise ValueError("LAN runtime generation capability is not eligible")
+            authenticated_source: AuthenticatedLanSource | None = None
+            if enabled:
+                _scope, _endpoint, authenticated_source = (
+                    _authenticate_lan_runtime_source(
+                        target_protected,
+                        interface_inventory_resolver=interface_inventory_resolver,
+                    )
+                )
             privacy_digest = _lan_privacy_acknowledgement_digest(
                 owner_principal=authenticated_owner_principal,
                 provider_profile_id=profile_id,
@@ -1439,6 +1755,7 @@ class RoutingRegistry:
                 task_family_affinities=task_family_affinities,
                 expected_stale_reasons=expected_stale_reasons,
                 stale_transition_terminal_receipt_digest=transition_receipt,
+                enabled=enabled,
             )
             reviewed_material = _lan_material_binding_digest(
                 target_protected,
@@ -1479,6 +1796,7 @@ class RoutingRegistry:
                     ),
                     "review_digest": review_digest,
                     "privacy_acknowledgement_digest": privacy_digest,
+                    "reviewed_runtime_interface_binding_digest": None,
                     "intended_roles": list(intended_roles),
                     "task_family_affinities": list(task_family_affinities),
                     "stale_reason": None,
@@ -1486,10 +1804,17 @@ class RoutingRegistry:
                     "stale_transition_terminal_receipt_digest": None,
                 }
             )
+            if authenticated_source is not None:
+                reviewed_protected["reviewed_runtime_interface_binding_digest"] = (
+                    _lan_reviewed_runtime_interface_binding_digest(
+                        reviewed_protected,
+                        source=authenticated_source,
+                    )
+                )
             reviewed_target = ModelTarget(
                 **{
                     **asdict(target_entry.target),
-                    "enabled": False,
+                    "enabled": enabled,
                     "trust_class": "operator_confirmed",
                     "role_affinities": intended_roles,
                     "task_family_affinities": task_family_affinities,
@@ -1527,6 +1852,26 @@ class RoutingRegistry:
                         "metadata": {"lan_discovery": cleared_profile_protected},
                     }
                 )
+            sibling_rows = connection.execute(
+                """
+                SELECT * FROM routing_model_targets
+                WHERE provider_profile_id = ? AND target_id != ?
+                ORDER BY target_id ASC
+                """,
+                (profile_id, target_id),
+            ).fetchall()
+            profile_enabled = enabled or any(
+                _strict_lan_target_entry(row).target.enabled for row in sibling_rows
+            )
+            reviewed_profile = ProviderProfile(
+                **{
+                    **asdict(reviewed_profile),
+                    "enabled": profile_enabled,
+                    "trust_class": (
+                        "operator_confirmed" if profile_enabled else "unconfirmed"
+                    ),
+                }
+            )
             profile_revision, profile_created_at = _next_revision(
                 "provider_profile",
                 profile_id,
@@ -1722,11 +2067,58 @@ def _lan_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _authenticate_lan_runtime_source(
+    protected: dict[str, Any],
+    *,
+    interface_inventory_resolver: InterfaceInventoryResolver | None,
+) -> tuple[PrivateScanScope, ResolvedLanEndpoint, AuthenticatedLanSource]:
+    inventory_loader = (
+        interface_inventory_resolver or _resolve_current_interface_inventory
+    )
+    try:
+        inventory = inventory_loader()
+    except Exception:
+        raise ValueError("LAN runtime interface inventory failed") from None
+    if type(inventory) is not CurrentLanInterfaceInventory:
+        raise ValueError("LAN runtime interface inventory is invalid")
+    matching_interfaces: list[NetworkInterface] = []
+    try:
+        for state in inventory.interfaces:
+            interface = NetworkInterface.from_addresses(
+                os_identity=state.os_identity,
+                display_name=state.os_identity,
+                addresses=state.addresses,
+            )
+            if interface.interface_id == protected["interface_id"]:
+                matching_interfaces.append(interface)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("LAN runtime interface inventory is invalid") from None
+    if len(matching_interfaces) != 1:
+        raise ValueError("LAN runtime interface binding changed")
+    try:
+        scope = PrivateScanScope.from_request(
+            matching_interfaces[0],
+            protected["confirmed_network"],
+        )
+        endpoint = ResolvedLanEndpoint.from_scope(
+            scope,
+            protected["address"],
+            protected["port"],
+        )
+        source = authenticate_lan_source(scope, endpoint, lambda: inventory)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("LAN runtime source binding changed") from None
+    if source.interface_id != protected["interface_id"]:
+        raise ValueError("LAN runtime source binding changed")
+    return scope, endpoint, source
+
+
 def _lan_evidence_fields(
     evidence: AuthenticatedLanObservation,
     *,
     endpoint_fingerprint: str,
     runtime_adapter: str,
+    runtime_hardening: str | None,
 ) -> dict[str, Any]:
     observation = evidence.observation
     return {
@@ -1754,7 +2146,7 @@ def _lan_evidence_fields(
             evidence.observed_at + timedelta(seconds=LAN_OBSERVATION_MAX_AGE_SECONDS)
         ),
         "runtime_adapter": runtime_adapter,
-        "runtime_hardening": None,
+        "runtime_hardening": runtime_hardening,
     }
 
 
@@ -1771,6 +2163,7 @@ def _validate_lan_review_evidence_projection(
         evidence,
         endpoint_fingerprint=_lan_endpoint_fingerprint(evidence),
         runtime_adapter=runtime_adapter,
+        runtime_hardening=_validated_runtime_hardening_marker(protected),
     )
     if any(protected[field] != value for field, value in canonical_evidence.items()):
         raise ValueError("LAN review metadata disagrees with durable evidence")
@@ -1787,6 +2180,7 @@ def _lan_profile_protected(
     *,
     endpoint_fingerprint: str,
     runtime_adapter: str,
+    runtime_hardening: str | None,
     stale_reasons: tuple[str, ...] = (),
     transition_receipt_digest: str | None = None,
 ) -> dict[str, Any]:
@@ -1797,6 +2191,7 @@ def _lan_profile_protected(
             evidence,
             endpoint_fingerprint=endpoint_fingerprint,
             runtime_adapter=runtime_adapter,
+            runtime_hardening=runtime_hardening,
         ),
         "stale_reason": stale_reasons[0] if stale_reasons else None,
         "stale_reasons": list(stale_reasons),
@@ -1875,6 +2270,7 @@ def _lan_privacy_acknowledgement_digest(
     task_family_affinities: tuple[str, ...],
     expected_stale_reasons: tuple[str, ...],
     stale_transition_terminal_receipt_digest: str | None,
+    enabled: bool,
 ) -> str:
     return sha256_digest(
         {
@@ -1889,11 +2285,52 @@ def _lan_privacy_acknowledgement_digest(
             "trust_class": "operator_confirmed",
             "intended_roles": list(intended_roles),
             "task_family_affinities": list(task_family_affinities),
-            "enabled": False,
+            "enabled": enabled,
             "privacy_acknowledged": True,
             "expected_stale_reasons": list(expected_stale_reasons),
             "stale_transition_terminal_receipt_digest": (stale_transition_terminal_receipt_digest),
         }
+    )
+
+
+def _lan_reviewed_runtime_interface_binding_digest(
+    protected: dict[str, Any],
+    *,
+    source: AuthenticatedLanSource,
+) -> str:
+    if type(source) is not AuthenticatedLanSource:
+        raise ValueError("LAN reviewed runtime source is invalid")
+    os_identity = source.os_identity
+    if (
+        type(os_identity) is not str
+        or not os_identity
+        or os_identity != os_identity.strip()
+        or len(os_identity.encode("utf-8")) > 256
+        or unicodedata.normalize("NFC", os_identity) != os_identity
+        or any(unicodedata.category(character).startswith("C") for character in os_identity)
+        or source.interface_id != protected["interface_id"]
+    ):
+        raise ValueError("LAN reviewed runtime source is invalid")
+    source_address = normalize_address(source.source_address)
+    if (
+        source_address != source.source_address
+        or isinstance(source.interface_index, bool)
+        or not isinstance(source.interface_index, int)
+        or not 0 < source.interface_index <= 2**31 - 1
+    ):
+        raise ValueError("LAN reviewed runtime source is invalid")
+    return derive_lan_runtime_interface_binding_digest(
+        os_interface_identity=os_identity,
+        source_address=source_address,
+        interface_index=source.interface_index,
+        interface_id=protected["interface_id"],
+        confirmed_network=protected["confirmed_network"],
+        endpoint_binding_digest=protected["endpoint_binding_digest"],
+        endpoint_fingerprint=protected["endpoint_fingerprint"],
+        reviewed_material_binding_digest=protected[
+            "reviewed_material_binding_digest"
+        ],
+        review_digest=protected["review_digest"],
     )
 
 
@@ -1905,6 +2342,7 @@ def _new_lan_target_protected(
     target_id: str,
     endpoint_fingerprint: str,
     runtime_adapter: str,
+    runtime_hardening: str | None,
     stale_reasons: tuple[str, ...] = (),
     transition_receipt_digest: str | None = None,
 ) -> dict[str, Any]:
@@ -1915,6 +2353,7 @@ def _new_lan_target_protected(
             evidence,
             endpoint_fingerprint=endpoint_fingerprint,
             runtime_adapter=runtime_adapter,
+            runtime_hardening=runtime_hardening,
         ),
         "provider_profile_id": provider_profile_id,
         "model_id": model_id,
@@ -1931,6 +2370,7 @@ def _new_lan_target_protected(
         "review_acknowledged_stale_transition_terminal_receipt_digest": None,
         "review_digest": None,
         "privacy_acknowledgement_digest": None,
+        "reviewed_runtime_interface_binding_digest": None,
         "intended_roles": [],
         "task_family_affinities": [],
         "stale_reason": stale_reasons[0] if stale_reasons else None,
@@ -1982,6 +2422,7 @@ def _lan_target_model(
     role_affinities: tuple[str, ...] = (),
     task_family_affinities: tuple[str, ...] = (),
     health: str = "unknown",
+    enabled: bool = False,
 ) -> ModelTarget:
     generation_claimed = protected["capability_claims"][0]["status"] == "observed_pass"
     return ModelTarget(
@@ -1989,7 +2430,7 @@ def _lan_target_model(
         provider_profile_id=provider_profile_id,
         provider=runtime_adapter,
         model=model_id,
-        enabled=False,
+        enabled=enabled,
         locality="local",
         trust_class=trust_class,
         capability_tags=("generation",) if generation_claimed else (),
@@ -2066,6 +2507,24 @@ def _validate_canonical_lan_owner(value: object) -> str:
     return value
 
 
+def _validate_installed_runtime_hardening(value: object) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or value != LAN_OPENAI_RUNTIME_HARDENING_VERSION:
+        raise ValueError("LAN runtime hardening version is not installed")
+    return value
+
+
+def _validated_runtime_hardening_marker(protected: dict[str, Any]) -> str | None:
+    marker = _validate_installed_runtime_hardening(protected["runtime_hardening"])
+    if marker is not None and (
+        protected["api_shape"] != ApiShape.OPENAI_COMPATIBLE.value
+        or protected["runtime_adapter"] != "lan-openai-compatible"
+    ):
+        raise ValueError("LAN runtime hardening marker disagrees with API binding")
+    return marker
+
+
 def _lan_target_drift_reasons(
     previous: dict[str, Any],
     current: dict[str, Any],
@@ -2087,19 +2546,34 @@ def _lan_target_drift_reasons(
     return tuple(reason for reason in _LAN_STALE_REASON_ORDER if reason in reasons)
 
 
-def _strict_lan_metadata(row: sqlite3.Row, *, target: bool) -> dict[str, Any]:
+def _strict_lan_metadata(
+    row: sqlite3.Row,
+    *,
+    target: bool,
+) -> dict[str, Any]:
     raw = row["metadata_json"]
     if type(raw) is not str:
         raise ValueError("LAN managed metadata must be JSON text")
     try:
         metadata = json.loads(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("LAN managed metadata is invalid JSON") from exc
+    except (TypeError, ValueError):
+        raise ValueError("LAN managed metadata is invalid JSON") from None
     if type(metadata) is not dict or set(metadata) != {"lan_discovery"}:
         raise ValueError("LAN managed metadata has an invalid field set")
     if canonical_json(metadata) != raw:
         raise ValueError("LAN managed metadata is not canonical")
     protected = metadata["lan_discovery"]
+    if (
+        target
+        and type(protected) is dict
+        and set(protected)
+        == _LAN_TARGET_PROTECTED_KEYS
+        - {"reviewed_runtime_interface_binding_digest"}
+        and protected.get("runtime_hardening") is None
+        and row["enabled"] == 0
+    ):
+        protected = dict(protected)
+        protected["reviewed_runtime_interface_binding_digest"] = None
     return _validate_lan_protected_metadata(protected, target=target)
 
 
@@ -2194,8 +2668,8 @@ def _validate_lan_protected_metadata(
         raise ValueError("LAN managed transport evidence is invalid")
     try:
         api_shape = ApiShape(protected["api_shape"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("LAN managed API shape is invalid") from exc
+    except (TypeError, ValueError):
+        raise ValueError("LAN managed API shape is invalid") from None
     expected_adapter = _lan_runtime_adapter(api_shape)
     if protected["runtime_adapter"] != expected_adapter:
         raise ValueError("LAN managed runtime adapter does not match API evidence")
@@ -2226,8 +2700,7 @@ def _validate_lan_protected_metadata(
         )
     ):
         raise ValueError("LAN managed stale reasons are invalid")
-    if protected["runtime_hardening"] is not None:
-        raise ValueError("LAN runtime hardening must remain unavailable")
+    _validated_runtime_hardening_marker(protected)
     expected_fingerprint = sha256_digest(
         {
             "schema": "kestrel.lan.endpoint-fingerprint.v1",
@@ -2265,18 +2738,51 @@ def _strict_lan_profile_entry(row: sqlite3.Row) -> ProviderProfileEntry:
         or profile.adapter != protected["runtime_adapter"]
         or profile.base_url != expected_base_url
         or profile.secret_ref is not None
-        or profile.enabled
         or profile.locality != "local"
-        or profile.trust_class != "unconfirmed"
+        or profile.trust_class
+        != ("operator_confirmed" if profile.enabled else "unconfirmed")
         or profile.max_concurrency != 1
+        or (
+            profile.enabled
+            and (
+                protected["stale_reasons"]
+                or _validated_runtime_hardening_marker(protected)
+                != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+            )
+        )
     ):
         raise ValueError("LAN managed provider row is structurally invalid")
     return entry
 
 
+def _row_has_exact_legacy_runtime_binding_shape(entry: ModelTargetEntry) -> bool:
+    metadata = entry.target.metadata
+    if type(metadata) is not dict or set(metadata) != {"lan_discovery"}:
+        return False
+    protected = metadata["lan_discovery"]
+    return (
+        type(protected) is dict
+        and set(protected)
+        == _LAN_TARGET_PROTECTED_KEYS
+        - {"reviewed_runtime_interface_binding_digest"}
+    )
+
+
 def _strict_lan_target_entry(row: sqlite3.Row) -> ModelTargetEntry:
     protected = _strict_lan_metadata(row, target=True)
     entry = _target_entry_from_row(row)
+    if entry.target.metadata != {"lan_discovery": protected}:
+        entry = ModelTargetEntry(
+            target=ModelTarget(
+                **{
+                    **asdict(entry.target),
+                    "metadata": {"lan_discovery": protected},
+                }
+            ),
+            revision=entry.revision,
+            created_at=entry.created_at,
+            updated_at=entry.updated_at,
+        )
     target = entry.target
     _validate_managed_lan_target_model(
         target,
@@ -2324,8 +2830,8 @@ def _validate_managed_lan_target_model(
     model_id = protected["model_id"]
     try:
         canonical_model_id = LanProbeModel.from_catalog(model_id).model_id
-    except (TypeError, ValueError) as exc:
-        raise ValueError("LAN managed model identity is invalid") from exc
+    except (TypeError, ValueError):
+        raise ValueError("LAN managed model identity is invalid") from None
     if canonical_model_id != model_id:
         raise ValueError("LAN managed model identity is invalid")
     intended_roles = _validate_lan_affinities(
@@ -2365,11 +2871,18 @@ def _validate_managed_lan_target_model(
         or target.predicted_success is not None
     ):
         raise ValueError("LAN managed target projection is structurally invalid")
-    if strict_storage_projection and (
-        target.enabled
-        or target.health != ("unavailable" if protected["stale_reasons"] else "unknown")
-    ):
-        raise ValueError("LAN managed target storage state is invalid")
+    if strict_storage_projection:
+        expected_health = "unavailable" if protected["stale_reasons"] else "unknown"
+        if target.health != expected_health:
+            raise ValueError("LAN managed target storage state is invalid")
+        if target.enabled and (
+            not protected["reviewed"]
+            or protected["stale_reasons"]
+            or target.trust_class != "operator_confirmed"
+            or _validated_runtime_hardening_marker(protected)
+            != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+        ):
+            raise ValueError("LAN enabled target storage state is invalid")
 
     raw_capabilities = protected["capability_claims"]
     if type(raw_capabilities) is not list or len(raw_capabilities) != len(CapabilityName):
@@ -2395,13 +2908,15 @@ def _validate_managed_lan_target_model(
                     status=CapabilityObservationStatus(raw_capability["status"]),
                 )
             )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("LAN managed capability claim is invalid") from exc
+        except (TypeError, ValueError):
+            raise ValueError("LAN managed capability claim is invalid") from None
     generation_claimed = (
         capabilities[0].status is CapabilityObservationStatus.OBSERVED_PASS
         and capabilities[0].provenance is CapabilityProvenance.OBSERVED
         and capabilities[0].supported is True
     )
+    if target.enabled and not generation_claimed:
+        raise ValueError("LAN enabled target lacks observed generation capability")
     derived_route = (
         "/v1/chat/completions"
         if protected["api_shape"] == ApiShape.OPENAI_COMPATIBLE.value
@@ -2440,6 +2955,7 @@ def _validate_managed_lan_target_model(
         "reviewed_material_binding_digest",
         "review_digest",
         "privacy_acknowledgement_digest",
+        "reviewed_runtime_interface_binding_digest",
         "review_acknowledged_stale_transition_terminal_receipt_digest",
     ):
         validate_digest(protected[field], field, optional=True)
@@ -2468,6 +2984,7 @@ def _validate_managed_lan_target_model(
         "review_acknowledged_stale_transition_terminal_receipt_digest",
         "review_digest",
         "privacy_acknowledgement_digest",
+        "reviewed_runtime_interface_binding_digest",
     )
     if not reviewed:
         if (
@@ -2500,6 +3017,10 @@ def _validate_managed_lan_target_model(
         )
         or protected["stale_reasons"]
         or protected["stale_transition_terminal_receipt_digest"] is not None
+        or (
+            target.enabled
+            != (protected["reviewed_runtime_interface_binding_digest"] is not None)
+        )
     ):
         raise ValueError("LAN review preimage is incomplete")
     acknowledged_reasons = protected["review_acknowledged_stale_reasons"]
@@ -2529,6 +3050,7 @@ def _validate_managed_lan_target_model(
         stale_transition_terminal_receipt_digest=protected[
             "review_acknowledged_stale_transition_terminal_receipt_digest"
         ],
+        enabled=target.enabled,
     )
     reviewed_material = _lan_material_binding_digest(
         protected,
@@ -2637,6 +3159,7 @@ def _lan_mark_target_stale(
             "review_acknowledged_stale_transition_terminal_receipt_digest": None,
             "review_digest": None,
             "privacy_acknowledgement_digest": None,
+            "reviewed_runtime_interface_binding_digest": None,
             "intended_roles": [],
             "task_family_affinities": [],
             "stale_reason": reasons[0],
@@ -2980,8 +3503,8 @@ def _parse_lan_timestamp(value: object, field: str) -> datetime:
         raise ValueError(f"LAN {field} must be canonical UTC")
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError as exc:
-        raise ValueError(f"LAN {field} is invalid") from exc
+    except ValueError:
+        raise ValueError(f"LAN {field} is invalid") from None
     if parsed.astimezone(UTC).isoformat().replace("+00:00", "Z") != value:
         raise ValueError(f"LAN {field} must be canonical UTC")
     return parsed.astimezone(UTC)

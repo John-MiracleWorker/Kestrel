@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 
 from ..config import AgentConfig
+from ..lan_runtime_authority import LanRuntimeAuthorityResolver
 from .contracts import TaskLike
 from .learned_router import LearnedRouterConfig, build_route_examples, evaluate_shadow
 from .ledger import (
@@ -44,6 +46,8 @@ class DurableRoutingCoordinator:
         policy_id: str = "balanced",
         mode: RoutingMode = "shadow",
         learned_config: LearnedRouterConfig | None = None,
+        lan_runtime_authority_resolver: LanRuntimeAuthorityResolver | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if mode == "off":
             raise ValueError(
@@ -53,6 +57,14 @@ class DurableRoutingCoordinator:
         self.policy_id = policy_id
         self.mode = mode
         self.learned_config = learned_config or LearnedRouterConfig()
+        if lan_runtime_authority_resolver is not None and not callable(
+            lan_runtime_authority_resolver
+        ):
+            raise TypeError("LAN runtime authority resolver must be callable")
+        if clock is not None and not callable(clock):
+            raise TypeError("routing clock must be callable")
+        self.lan_runtime_authority_resolver = lan_runtime_authority_resolver
+        self.clock = clock
 
     def assign(
         self,
@@ -85,6 +97,8 @@ class DurableRoutingCoordinator:
             targets=[entry.target for entry in self.ledger.list_model_targets()],
             policy=policy_entry.policy,
             mode=self.mode,
+            lan_runtime_authority_resolver=self.lan_runtime_authority_resolver,
+            clock=self.clock,
         )
         existing = self.ledger.get_attempt_decision(
             run_id=task.run_id,
@@ -548,7 +562,7 @@ class DurableRoutingCoordinator:
             config=(
                 service.apply_decision(base_config, leased_decision)
                 if existing.actionable
-                else base_config
+                else replace(base_config, lan_runtime_authority=None)
             ),
             executes_selected_target=existing.actionable,
         )
@@ -598,7 +612,7 @@ def _annotate_assignment(
         config=(
             service.apply_decision(base_config, decision)
             if decision.actionable
-            else base_config
+            else replace(base_config, lan_runtime_authority=None)
         ),
         executes_selected_target=decision.actionable,
     )

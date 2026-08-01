@@ -22,6 +22,7 @@ from .desktop_memory_health import (
 )
 from .event_bus import RunEventBus
 from .lan_discovery_service import LanDiscoveryService
+from .lan_runtime_authority import LAN_OPENAI_RUNTIME_HARDENING_VERSION
 from .layers import (
     load_layer_specs,
     prepare_private_memory_artifacts,
@@ -793,7 +794,12 @@ def _create_app(
             secret_resolver=secret_broker.resolve,
         ),
         lan_discovery_service=(
-            LanDiscoveryService(routing_ledger) if lan_mutations_registered else None
+            LanDiscoveryService(
+                routing_ledger,
+                runtime_hardening_version=LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+            )
+            if lan_mutations_registered
+            else None
         ),
         lan_owner_principal=(LAN_MUTATION_OWNER_PRINCIPAL if lan_mutations_registered else None),
     )

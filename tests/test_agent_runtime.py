@@ -20,7 +20,12 @@ from nested_memvid_agent.behavior_delta import (
 from nested_memvid_agent.behavior_delta_ledger import BehaviorDeltaLedger
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.event_log import JsonlEventLog
-from nested_memvid_agent.llm.base import LLMProvider, ProviderError
+from nested_memvid_agent.llm.base import (
+    FallbackLLMProvider,
+    LLMProvider,
+    ProviderCapabilities,
+    ProviderError,
+)
 from nested_memvid_agent.llm.mock import MockLLMProvider
 from nested_memvid_agent.models import (
     EvidenceRef,
@@ -2692,3 +2697,189 @@ def _active_tool_delta(
             replay_scenarios=("tool_preflight",), min_validation_score=0.8
         ),
     )
+
+
+class NoToolsCapturingProvider(LLMProvider):
+    def __init__(self) -> None:
+        self.requests: list[tuple[list[ChatMessage], list[ToolSpec]]] = []
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            name="no-tools",
+            supports_tools=False,
+            supports_native_tools=False,
+            supports_streaming=False,
+            supports_json_mode=False,
+        )
+
+    def generate(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions | None = None,
+    ) -> LLMResponse:
+        del options
+        self.requests.append((list(messages), list(tools)))
+        return LLMResponse(content="tool-free answer")
+
+
+class NativeToolsCapturingProvider(NoToolsCapturingProvider):
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            name="native-tools",
+            supports_tools=True,
+            supports_native_tools=True,
+            supports_streaming=False,
+            supports_json_mode=False,
+        )
+
+
+class HostileNoToolsProvider(NoToolsCapturingProvider):
+    def generate(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions | None = None,
+    ) -> LLMResponse:
+        del options
+        self.requests.append((list(messages), list(tools)))
+        return LLMResponse(
+            content="attempted tool escape",
+            tool_calls=(
+                ToolCall(
+                    name="memory.search",
+                    arguments={"query": "private memory"},
+                ),
+            ),
+            finish_reason="tool_calls",
+        )
+
+
+class ExecutionCountingRegistry(ToolRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.execution_calls: list[ToolCall] = []
+
+    def execute(self, call: ToolCall, context: ToolContext) -> ToolExecution:
+        self.execution_calls.append(call)
+        return super().execute(call, context)
+
+
+def _tool_protocol_agent(
+    tmp_path: Path,
+    provider: LLMProvider,
+) -> NestedMV2Agent:
+    return NestedMV2Agent(
+        AgentDependencies(
+            memory=build_memory_system("memory", tmp_path / "memory"),
+            llm=provider,
+            tools=build_default_tools(),
+            config=AgentConfig(
+                memory_dir=tmp_path / "memory",
+                log_dir=tmp_path / "logs",
+                max_tool_rounds=1,
+            ),
+        )
+    )
+
+
+def test_supports_tools_false_sends_empty_catalog_and_explicit_no_tool_prompt(
+    tmp_path: Path,
+) -> None:
+    provider = NoToolsCapturingProvider()
+    agent = _tool_protocol_agent(tmp_path, provider)
+
+    result = agent.chat("Answer without tools.", session_id="lan-no-tools")
+
+    assert result.assistant_message == "tool-free answer"
+    assert result.tool_executions == ()
+    assert len(provider.requests) == 1
+    messages, tools = provider.requests[0]
+    assert tools == []
+    system_text = "\n".join(item.content for item in messages if item.role == "system")
+    assert "no tools are available" in system_text.lower()
+    assert "memory.search" not in system_text
+    assert "Available tools:" not in system_text
+    assert '"tool_calls"' not in system_text
+
+
+@pytest.mark.parametrize("query", ("/search private memory", "/memory search private memory"))
+def test_no_tools_provider_does_not_execute_direct_search_or_send_tool_followup(
+    tmp_path: Path,
+    query: str,
+) -> None:
+    provider = NoToolsCapturingProvider()
+    agent = _tool_protocol_agent(tmp_path, provider)
+
+    result = agent.chat(query, session_id="lan-no-direct-tool")
+
+    assert result.assistant_message == "tool-free answer"
+    assert result.tool_executions == ()
+    assert len(provider.requests) == 1
+    messages, tools = provider.requests[0]
+    assert tools == []
+    assert all(item.role != "tool" for item in messages)
+    assert all(not item.tool_calls and item.tool_call_id is None for item in messages)
+
+
+def test_no_tools_provider_response_tool_calls_fail_closed_before_registry_execution(
+    tmp_path: Path,
+) -> None:
+    provider = HostileNoToolsProvider()
+    tools = ExecutionCountingRegistry()
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=build_memory_system("memory", tmp_path / "memory"),
+            llm=provider,
+            tools=tools,
+            config=AgentConfig(
+                memory_dir=tmp_path / "memory",
+                log_dir=tmp_path / "logs",
+                max_tool_rounds=1,
+            ),
+        )
+    )
+
+    result = agent.chat("Return a forbidden tool call.", session_id="hostile-no-tools")
+
+    assert result.stop_reason == "provider_error"
+    assert "tool_calls_unsupported" in result.assistant_message
+    assert result.tool_executions == ()
+    assert tools.execution_calls == []
+    assert len(provider.requests) == 1
+    assert provider.requests[0][1] == []
+
+
+def test_default_text_envelope_and_native_tool_paths_keep_existing_catalog_behavior(
+    tmp_path: Path,
+) -> None:
+    text_provider = CapturingSequenceProvider([LLMResponse(content="text answer")])
+    text_agent = _tool_protocol_agent(tmp_path / "text", text_provider)
+    text_agent.chat("Use existing behavior.", session_id="default-tools")
+    text_messages = text_provider.requests[0]
+    text_prompt = "\n".join(item.content for item in text_messages if item.role == "system")
+    assert "Available tools:" in text_prompt
+    assert "memory.search" in text_prompt
+    assert '"tool_calls"' in text_prompt
+
+    native_provider = NativeToolsCapturingProvider()
+    native_agent = _tool_protocol_agent(tmp_path / "native", native_provider)
+    native_agent.chat("Use native behavior.", session_id="native-tools")
+    native_messages, native_tools = native_provider.requests[0]
+    native_prompt = "\n".join(
+        item.content for item in native_messages if item.role == "system"
+    )
+    assert native_tools
+    assert "provider-native function-calling" in native_prompt
+    assert '"tool_calls"' not in native_prompt
+
+
+def test_fallback_supports_tools_is_the_conjunction_of_both_providers() -> None:
+    tool_free = NoToolsCapturingProvider()
+    native = NativeToolsCapturingProvider()
+
+    assert FallbackLLMProvider(native, tool_free).capabilities.supports_tools is False
+    assert FallbackLLMProvider(tool_free, native).capabilities.supports_tools is False
+    assert FallbackLLMProvider(native, native).capabilities.supports_tools is True

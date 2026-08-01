@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -65,6 +65,10 @@ class AdaptiveFlockRunManager(RunManager):
             skills=skills,
             plugins=plugins,
             secret_resolver=secret_resolver,
+            lan_runtime_authority_resolver=(
+                routing_coordinator.lan_runtime_authority_resolver
+            ),
+            lan_runtime_utc_clock=routing_coordinator.clock,
             recover_startup_work=recover_startup_work,
             enforce_single_owner=enforce_single_owner,
             read_only_observer=read_only_observer,
@@ -217,7 +221,7 @@ class AdaptiveFlockRunManager(RunManager):
                 else f"routing.{phase}_failed"
             )
             self.events.publish(run.run_id, event_type, payload)
-            return config
+            return replace(config, lan_runtime_authority=None)
         event_type = (
             "routing.guardrail_blocked"
             if unavailable
@@ -242,7 +246,13 @@ class AdaptiveFlockRunManager(RunManager):
         subagent = self.state.get_subagent_run(subagent_id)
         task_id = subagent.task_id
         if task_id is None:
-            super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
+            super()._run_subagent(
+                thread_key,
+                replace(config, lan_runtime_authority=None),
+                subagent_id,
+                run_id,
+                session_id,
+            )
             return
         task = self.state.get_task_node(task_id)
         run = self.state.get_run(run_id)
@@ -251,7 +261,13 @@ class AdaptiveFlockRunManager(RunManager):
             "failed",
             "cancelled",
         }:
-            super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
+            super()._run_subagent(
+                thread_key,
+                replace(config, lan_runtime_authority=None),
+                subagent_id,
+                run_id,
+                session_id,
+            )
             return
 
         attempt = max(1, task.attempt_count + 1)
@@ -445,7 +461,13 @@ class AdaptiveFlockRunManager(RunManager):
                 else f"routing.{phase}_failed"
             )
             self.events.publish(run_id, event_type, payload)
-            super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
+            super()._run_subagent(
+                thread_key,
+                replace(config, lan_runtime_authority=None),
+                subagent_id,
+                run_id,
+                session_id,
+            )
             return
 
         category = "routing_unavailable" if unavailable else "routing_persistence_failed"

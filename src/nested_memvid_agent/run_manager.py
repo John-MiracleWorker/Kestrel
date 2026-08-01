@@ -48,6 +48,7 @@ from .graph_runtime import (
     criterion_requires_validation_evidence,
     evaluate_turn_review,
 )
+from .lan_runtime_authority import LanRuntimeAuthorityResolver
 from .layers import MemoryCleanupIncompleteError
 from .mcp_manager import MCPManager
 from .models import MemoryLayer
@@ -139,6 +140,8 @@ class RunManager:
         skills: SkillManager,
         plugins: PluginManager | None = None,
         secret_resolver: Callable[[str | None], str | None] | None = None,
+        lan_runtime_authority_resolver: LanRuntimeAuthorityResolver | None = None,
+        lan_runtime_utc_clock: Callable[[], datetime] | None = None,
         recover_startup_work: bool = True,
         enforce_single_owner: bool = False,
         read_only_observer: bool = False,
@@ -148,12 +151,21 @@ class RunManager:
             raise ValueError("read-only observers cannot recover startup work")
         if read_only_observer and enforce_single_owner:
             raise ValueError("read-only observers cannot own the primary runtime")
+        if lan_runtime_authority_resolver is not None and not callable(
+            lan_runtime_authority_resolver
+        ):
+            raise TypeError("LAN runtime authority resolver must be callable")
+        if lan_runtime_utc_clock is not None and not callable(lan_runtime_utc_clock):
+            raise TypeError("LAN runtime UTC clock must be callable")
+        config = replace(config, lan_runtime_authority=None)
         self.config = config
         self.state = state
         self.events = events
         self.mcp = mcp
         self.skills = skills
         self.secret_resolver = secret_resolver
+        self.lan_runtime_authority_resolver = lan_runtime_authority_resolver
+        self.lan_runtime_utc_clock = lan_runtime_utc_clock
         self.read_only_observer = read_only_observer
         self._recover_startup_work = recover_startup_work
         self._runtime_ownership = (
@@ -5888,6 +5900,8 @@ class RunManager:
                 tools=self.build_registry(config),
                 state=self.state,
                 secret_resolver=self.secret_resolver,
+                lan_runtime_authority_resolver=self.lan_runtime_authority_resolver,
+                lan_runtime_utc_clock=self.lan_runtime_utc_clock,
                 close_handler=close_handler,
             )
             agent_constructed = True

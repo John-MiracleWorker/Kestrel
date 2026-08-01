@@ -676,6 +676,347 @@ def test_run_config_snapshot_is_versioned_and_immutable_across_runtime_updates(
     assert not (tmp_path / "snapshot.txt").exists()
 
 
+@pytest.mark.parametrize("inject_resolver", (False, True), ids=("ordinary", "adaptive"))
+def test_build_agent_passes_the_exact_lan_runtime_resolver_only_to_provider_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_resolver: bool,
+) -> None:
+    import nested_memvid_agent.app_factory as app_factory
+
+    config = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        workspace=tmp_path,
+    )
+    state = AgentStateStore(config.state_path)
+    resolver = (lambda target_id: target_id) if inject_resolver else None
+    received: list[tuple[AgentConfig, object, object]] = []
+
+    def capture_provider(
+        received_config: AgentConfig,
+        *,
+        secret_resolver=None,
+        lan_runtime_authority_resolver=None,
+    ) -> MockLLMProvider:
+        received.append(
+            (
+                received_config,
+                secret_resolver,
+                lan_runtime_authority_resolver,
+            )
+        )
+        return MockLLMProvider()
+
+    monkeypatch.setattr(app_factory, "build_llm_provider", capture_provider)
+    agent = app_factory.build_agent(
+        config,
+        state=state,
+        lan_runtime_authority_resolver=resolver,
+    )
+    try:
+        assert received == [(config, None, resolver)]
+        assert agent.config is config
+    finally:
+        agent.close()
+
+
+def test_internal_lan_authority_is_excluded_from_snapshots_restore_and_support_bundle(
+    tmp_path: Path,
+) -> None:
+    import zipfile
+
+    import test_lan_openai_compatible_provider as lan_cases
+
+    from nested_memvid_agent.support_bundle import export_support_bundle
+
+    authority = lan_cases._authority()
+    assigned = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+        lan_runtime_authority=authority,
+    )
+    forbidden = (
+        "lan_runtime_authority",
+        authority.provider_profile_id,
+        authority.reviewed_target_id,
+        authority.endpoint_fingerprint,
+        authority.reviewed_material_binding_digest,
+        authority.review_digest,
+    )
+
+    direct_snapshot = _effective_config_snapshot(assigned, autonomy_mode="manual")
+    rendered_snapshot = json.dumps(direct_snapshot, sort_keys=True)
+    assert all(value not in rendered_snapshot for value in forbidden)
+    restored = AgentConfig.from_mapping(direct_snapshot["effective_config"])
+    assert restored.lan_runtime_authority is None
+
+    bundle = export_support_bundle(
+        assigned,
+        output_path=tmp_path / "authority-support.zip",
+    )
+    with zipfile.ZipFile(bundle.bundle_path) as archive:
+        archive_payload = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert all(value.encode() not in archive_payload for value in forbidden)
+
+
+def test_ordinary_run_manager_clears_lan_authority_from_receipts_events_and_capsule(
+    tmp_path: Path,
+) -> None:
+    import test_lan_openai_compatible_provider as lan_cases
+
+    authority = lan_cases._authority()
+    assigned = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=tmp_path / "state.db",
+        skills_dir=tmp_path / "skills",
+        plugins_dir=tmp_path / "plugins",
+        workspace=tmp_path,
+        enable_task_capsules=True,
+        lan_runtime_authority=authority,
+    )
+    state = AgentStateStore(assigned.state_path)
+    manager = RunManager(
+        config=assigned,
+        state=state,
+        events=RunEventBus(state),
+        mcp=MCPManager(state),
+        skills=SkillManager(assigned.skills_dir, state),
+        lan_runtime_authority_resolver=None,
+    )
+    forbidden = (
+        "lan_runtime_authority",
+        authority.provider_profile_id,
+        authority.reviewed_target_id,
+        authority.endpoint_fingerprint,
+        authority.reviewed_material_binding_digest,
+        authority.review_digest,
+    )
+
+    try:
+        assert manager.lan_runtime_authority_resolver is None
+        assert manager.config.lan_runtime_authority is None
+        run = manager.create_run(message="Complete an authority-free runtime receipt")
+        final = _wait_for_status(manager, run.run_id, {"completed", "failed"})
+        assert final["status"] == "completed"
+        stored = state.get_run(run.run_id)
+        restored = manager._config_for_run(stored)
+        assert restored.lan_runtime_authority is None
+
+        owned_payloads = (
+            stored.config_snapshot,
+            manager.get_run(run.run_id),
+            manager.list_runs(),
+            manager.run_trace(run.run_id),
+            state.list_run_steps(run.run_id),
+        )
+        for payload in owned_payloads:
+            rendered = json.dumps(payload, sort_keys=True, default=str)
+            assert all(value not in rendered for value in forbidden)
+
+        event_log = manager.config.log_dir / "events.jsonl"
+        rendered_log = event_log.read_text(encoding="utf-8")
+        assert rendered_log
+        assert all(value not in rendered_log for value in forbidden)
+
+        capsule_root = manager.config.memory_dir.parent / "runs" / run.run_id
+        capsule_payload = b"\n".join(
+            path.read_bytes() for path in capsule_root.rglob("*") if path.is_file()
+        )
+        assert capsule_payload
+        assert all(value.encode() not in capsule_payload for value in forbidden)
+    finally:
+        assert manager.shutdown()
+
+
+def test_genuine_adaptive_lan_assignment_keeps_typed_authority_only_in_process(
+    tmp_path: Path,
+) -> None:
+    import test_lan_runtime_transport as runtime_cases
+
+    from nested_memvid_agent.event_log import AgentEvent
+    from nested_memvid_agent.lan_http_transport import (
+        CurrentLanInterfaceInventory,
+        CurrentLanInterfaceState,
+    )
+    from nested_memvid_agent.routing.coordinator import DurableRoutingCoordinator
+    from nested_memvid_agent.routing.models import RoutePolicy
+    from nested_memvid_agent.task_capsule import write_run_capsule
+
+    unique_ifindex = 7319
+    (
+        state,
+        registry,
+        _discovery,
+        _scope,
+        _observation,
+        provider_id,
+        target_id,
+        _default_inventory,
+    ) = runtime_cases._enabled_lan_registry(
+        tmp_path,
+        interface_index=unique_ifindex,
+    )
+    if registry.get_policy("balanced") is None:
+        registry.put_policy(RoutePolicy())
+    inventory = CurrentLanInterfaceInventory(
+        (
+            CurrentLanInterfaceState(
+                os_identity="darwin:en7",
+                interface_index=unique_ifindex,
+                addresses=("192.168.50.1/29",),
+            ),
+        )
+    )
+    resolved_authorities: list[object] = []
+
+    def resolver(candidate_id: str):
+        authority = registry.resolve_lan_runtime_authority(
+            candidate_id,
+            clock=lambda: runtime_cases.NOW,
+            interface_inventory_resolver=lambda: inventory,
+        )
+        resolved_authorities.append(authority)
+        return authority
+
+    coordinator = DurableRoutingCoordinator(
+        registry,
+        mode="adaptive",
+        lan_runtime_authority_resolver=resolver,
+        clock=lambda: runtime_cases.NOW,
+    )
+    base = AgentConfig(
+        backend="memory",
+        provider="mock",
+        model="mock",
+        workspace=tmp_path,
+        memory_dir=tmp_path / "memory",
+        log_dir=tmp_path / "logs",
+        state_path=state.path,
+    )
+    snapshot = _effective_config_snapshot(base, autonomy_mode="background")
+    run = state.create_run(
+        run_id="run_adaptive_lan_authority_surface",
+        message="Use the reviewed LAN model for an ordinary bounded task.",
+        session_id="session_adaptive_lan_authority_surface",
+        workspace=str(tmp_path),
+        provider=base.provider,
+        model=base.model,
+        config_revision=str(snapshot["revision"]),
+        config_snapshot=snapshot,
+    )
+    task = state.create_task_node(
+        task_id="task_adaptive_lan_authority_surface",
+        run_id=run.run_id,
+        title="Answer with the reviewed local model",
+        goal="Complete one ordinary generation-only local task.",
+        profile="worker",
+        approved=True,
+        required_tools=(),
+        risk="low",
+        acceptance_criteria=("The task produces a bounded answer.",),
+    )
+
+    durable = coordinator.assign(
+        base,
+        task,
+        subagent_id=None,
+        attempt=1,
+        default_privacy_class="local_required",
+        local_required=True,
+        direct_target_id=target_id,
+    )
+    routed = durable.assignment.config
+    assert durable.assignment.executes_selected_target is True
+    assert resolved_authorities
+    authority = resolved_authorities[-1]
+    assert routed.lan_runtime_authority is authority
+    assert authority.interface_index == unique_ifindex
+    assert authority.provider_profile_id == provider_id
+    assert authority.reviewed_target_id == target_id
+
+    decision_payload = durable.record.to_payload()
+    assert decision_payload["selected_profile_id"] == provider_id
+    assert decision_payload["selected_target_id"] == target_id
+    events = RunEventBus(state)
+    published = events.publish(run.run_id, "routing.assigned", decision_payload)
+    event_log = JsonlEventLog(base.log_dir / "events.jsonl")
+    event_log.append(AgentEvent(type="routing.assigned", payload=decision_payload))
+    capsule_path = write_run_capsule(
+        runs_dir=base.memory_dir.parent / "runs",
+        run_id=run.run_id,
+        objective=run.message,
+        final_response="Adaptive LAN assignment completed.",
+        reusable_lessons=(json.dumps(decision_payload, sort_keys=True),),
+    )
+
+    public_surfaces = (
+        decision_payload,
+        durable.assignment.decision.to_payload(),
+        state.get_run(run.run_id).config_snapshot,
+        state.list_run_steps(run.run_id),
+        {"type": published.type, "payload": published.payload},
+    )
+    rendered_surfaces = "\n".join(
+        json.dumps(payload, sort_keys=True, default=str) for payload in public_surfaces
+    )
+    rendered_log = event_log.path.read_text(encoding="utf-8")
+    capsule_bytes = b"\n".join(
+        path.read_bytes() for path in capsule_path.parent.rglob("*") if path.is_file()
+    )
+    forbidden_keys = (
+        "lan_runtime_authority",
+        "scope",
+        "endpoint",
+        "source_address",
+        "os_interface_identity",
+        "interface_index",
+        "api_shape",
+        "runtime_adapter",
+        "runtime_hardening_version",
+        "endpoint_binding_digest",
+        "endpoint_fingerprint",
+        "reviewed_material_binding_digest",
+        "review_digest",
+        "fresh_until",
+    )
+    forbidden_values = (
+        authority.source_address,
+        authority.endpoint.address,
+        authority.scope.network,
+        authority.os_interface_identity,
+        str(authority.interface_index),
+        authority.endpoint_binding_digest,
+        authority.endpoint_fingerprint,
+        authority.reviewed_material_binding_digest,
+        authority.review_digest,
+        authority.fresh_until,
+    )
+    for key in forbidden_keys:
+        assert f'"{key}"' not in rendered_surfaces
+        assert f'"{key}"' not in rendered_log
+        assert f'"{key}"'.encode() not in capsule_bytes
+    for value in forbidden_values:
+        assert value not in rendered_surfaces
+        assert value not in rendered_log
+        assert value.encode() not in capsule_bytes
+
+
 def test_state_store_terminal_run_states_are_immutable_even_for_same_status(tmp_path: Path) -> None:
     state = AgentStateStore(tmp_path / "state.db")
     for terminal_status in ("completed", "failed", "cancelled"):

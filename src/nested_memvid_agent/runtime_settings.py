@@ -342,6 +342,7 @@ def apply_runtime_settings(config: AgentConfig, settings: RuntimeSettings) -> Ag
         enable_auto_consolidation_shadow=settings.enable_auto_consolidation_shadow,
         enable_auto_consolidation_apply=settings.enable_auto_consolidation_apply,
         enable_diagnosis_to_patch=settings.enable_diagnosis_to_patch,
+        lan_runtime_authority=None,
         # `require_api_auth` is launch-time security policy and must not be
         # overridden by persisted runtime settings.
     )

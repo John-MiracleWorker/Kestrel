@@ -167,15 +167,18 @@ def build_run_manager(
             skills=skills,
             plugins=plugins,
             secret_resolver=secret_resolver,
+            lan_runtime_authority_resolver=None,
             enforce_single_owner=enforce_single_owner,
             auto_start=auto_start,
         )
     else:
+        lan_runtime_authority_resolver = ledger.resolve_lan_runtime_authority
         coordinator = DurableRoutingCoordinator(
             ledger,
             policy_id=active_routing.policy_id,
             mode=active_routing.mode,
             learned_config=active_routing.learned_router_config(),
+            lan_runtime_authority_resolver=lan_runtime_authority_resolver,
         )
         runs = AdaptiveFlockRunManager(
             routing_coordinator=coordinator,

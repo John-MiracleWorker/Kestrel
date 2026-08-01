@@ -123,6 +123,103 @@ def test_planner_guidance_can_enrich_but_not_lower_deterministic_requirements() 
     assert guided.minimum_context_tokens >= baseline.minimum_context_tokens
 
 
+def test_low_complexity_general_contract_does_not_invent_context_requirement() -> None:
+    contract = compile_task_contract(
+        _Task(
+            title="Answer one bounded question",
+            goal="Return one concise answer.",
+            required_tools=(),
+            acceptance_criteria=(),
+            plan={},
+        )
+    )
+
+    assert contract.task_family == "general"
+    assert contract.complexity < 0.5
+    assert contract.minimum_context_tokens is None
+
+
+def test_explicit_context_requirement_remains_hard_for_simple_general_task() -> None:
+    contract = compile_task_contract(
+        _Task(
+            title="Answer one bounded question",
+            goal="Return one concise answer.",
+            required_tools=(),
+            acceptance_criteria=(),
+            plan={},
+        ),
+        planner_guidance={"minimum_context_tokens": 24_000},
+    )
+
+    assert contract.minimum_context_tokens == 24_000
+
+
+def test_high_complexity_general_contract_keeps_context_floor() -> None:
+    contract = compile_task_contract(
+        _Task(
+            title="Answer one bounded question",
+            goal="Return one concise answer.",
+            risk="critical",
+            required_tools=(),
+            acceptance_criteria=(),
+            plan={},
+        )
+    )
+
+    assert contract.task_family == "general"
+    assert contract.complexity >= 0.5
+    assert contract.minimum_context_tokens == 16_000
+
+
+@pytest.mark.parametrize("risk", ("medium", "high"))
+def test_non_low_risk_general_contract_keeps_context_floor(risk: str) -> None:
+    contract = compile_task_contract(
+        _Task(
+            title="Answer one bounded question",
+            goal="Return one concise answer.",
+            risk=risk,
+            required_tools=(),
+            acceptance_criteria=(),
+            plan={},
+        )
+    )
+
+    assert contract.task_family == "general"
+    assert contract.minimum_context_tokens == 16_000
+
+
+def test_low_complexity_non_general_contract_keeps_context_floor() -> None:
+    contract = compile_task_contract(
+        _Task(
+            title="Document one setting",
+            goal="Write one short guide entry.",
+            required_tools=(),
+            acceptance_criteria=(),
+            plan={},
+        )
+    )
+
+    assert contract.task_family == "documentation"
+    assert contract.complexity < 0.5
+    assert contract.minimum_context_tokens == 16_000
+
+
+def test_planner_family_guidance_cannot_remove_initial_context_floor() -> None:
+    contract = compile_task_contract(
+        _Task(
+            title="Document one setting",
+            goal="Write one short guide entry.",
+            required_tools=(),
+            acceptance_criteria=(),
+            plan={},
+        ),
+        planner_guidance={"task_family": "general"},
+    )
+
+    assert contract.task_family == "general"
+    assert contract.minimum_context_tokens == 16_000
+
+
 def test_local_required_contract_rejects_cloud_target() -> None:
     contract = compile_task_contract(_Task(), local_required=True)
     local = _target("local")

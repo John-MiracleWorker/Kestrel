@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -27,7 +28,11 @@ from nested_memvid_agent.lan_discovery_service import (
     LanReviewRequest,
     LanReviewResult,
 )
-from nested_memvid_agent.lan_http_transport import LanRequestRoute
+from nested_memvid_agent.lan_http_transport import (
+    CurrentLanInterfaceInventory,
+    CurrentLanInterfaceState,
+    LanRequestRoute,
+)
 from nested_memvid_agent.lan_scanner import (
     ApiShape,
     CapabilityName,
@@ -115,6 +120,7 @@ TARGET_PROTECTED_KEYS = {
     "review_acknowledged_stale_transition_terminal_receipt_digest",
     "review_digest",
     "privacy_acknowledgement_digest",
+    "reviewed_runtime_interface_binding_digest",
     "intended_roles",
     "task_family_affinities",
     "stale_reason",
@@ -134,11 +140,17 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _scope(*, network: str = "192.168.50.0/29") -> PrivateScanScope:
+def _scope(
+    *,
+    network: str = "192.168.50.0/29",
+    os_identity: str = "test:en0",
+    display_name: str = "renderer text must not become authority",
+    addresses: tuple[str, ...] = ("192.168.50.1/29",),
+) -> PrivateScanScope:
     interface = NetworkInterface.from_addresses(
-        os_identity="test:en0",
-        display_name="renderer text must not become authority",
-        addresses=("192.168.50.1/29",),
+        os_identity=os_identity,
+        display_name=display_name,
+        addresses=addresses,
     )
     return PrivateScanScope.from_request(interface, network)
 
@@ -5189,7 +5201,7 @@ def test_router_emits_closed_reasons_from_structurally_valid_managed_rows(
             [forced_reviewed],
             clock=lambda: NOW,
         )
-    assert "lan_runtime_hardening_unavailable" in unhardened.value.reason_codes
+    assert "lan_binding_invalid" in unhardened.value.reason_codes
     with pytest.raises(RoutingUnavailableError) as unhardened_direct:
         route_task(
             _lan_route_contract(),
@@ -5197,7 +5209,7 @@ def test_router_emits_closed_reasons_from_structurally_valid_managed_rows(
             direct_target_id=forced_reviewed.target_id,
             clock=lambda: NOW,
         )
-    assert "lan_runtime_hardening_unavailable" in unhardened_direct.value.reason_codes
+    assert "lan_binding_invalid" in unhardened_direct.value.reason_codes
 
     stale_state = AgentStateStore(tmp_path / "stale" / "agent.db")
     (
@@ -5244,3 +5256,1251 @@ def test_router_emits_closed_reasons_from_structurally_valid_managed_rows(
             clock=lambda: NOW,
         )
     assert "lan_binding_stale" in stale_direct.value.reason_codes
+
+
+def _task5b_service(
+    registry: RoutingLedger,
+    *,
+    clock=lambda: NOW,
+    interface_inventory_resolver=None,
+) -> LanDiscoveryService:
+    from nested_memvid_agent.lan_runtime_authority import (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    )
+
+    return LanDiscoveryService(
+        registry,
+        clock=clock,
+        runtime_hardening_version=LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+        interface_inventory_resolver=(
+            interface_inventory_resolver
+            or (
+                lambda: CurrentLanInterfaceInventory(
+                    (
+                        CurrentLanInterfaceState(
+                            os_identity="test:en0",
+                            interface_index=7,
+                            addresses=("192.168.50.1/29",),
+                        ),
+                    )
+                )
+            )
+        ),
+    )
+
+
+def _enabled_task5b_binding(
+    state: AgentStateStore,
+    *,
+    scan_id: str,
+):
+    observation = _positive_observation()
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id=scan_id,
+        observation=observation,
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    service = _task5b_service(registry)
+    imported = service.import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert imported.profile is not None
+    target = imported.targets[0]
+    enable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=imported.profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    enabled = service.review_lan_target(
+        enable,
+        authenticated_owner_principal=OWNER,
+    )
+    return observation, registry, service, provider_id, target_id, enabled
+
+
+def test_runtime_interface_binding_digest_preserves_and_clears_with_authority(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation, registry, service, _provider_id_value, target_id, enabled = (
+        _enabled_task5b_binding(state, scan_id="scan-binding-lifecycle")
+    )
+    first_binding = enabled.target.target.metadata["lan_discovery"][
+        "reviewed_runtime_interface_binding_digest"
+    ]
+    assert first_binding is not None
+
+    _row, refresh_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-binding-exact-refresh",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    refreshed = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).import_observation(
+        _import_request(
+            observation,
+            refresh_scan,
+            profile_revision=enabled.profile.revision,
+            target_revisions=((target_id, enabled.target.revision),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    refreshed_target = refreshed.targets[0]
+    assert refreshed_target.target.enabled is True
+    assert (
+        refreshed_target.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        == first_binding
+    )
+
+    disable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=refreshed.profile.revision,
+        target_revision=refreshed_target.revision,
+        target_id=target_id,
+        protected=refreshed_target.target.metadata["lan_discovery"],
+        enabled=False,
+    )
+    disabled = service.review_lan_target(
+        disable,
+        authenticated_owner_principal=OWNER,
+    )
+    assert disabled.target.target.enabled is False
+    assert (
+        disabled.target.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        is None
+    )
+
+    reenable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=disabled.profile.revision,
+        target_revision=disabled.target.revision,
+        target_id=target_id,
+        protected=disabled.target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    reenabled = service.review_lan_target(
+        reenable,
+        authenticated_owner_principal=OWNER,
+    )
+    second_binding = reenabled.target.target.metadata["lan_discovery"][
+        "reviewed_runtime_interface_binding_digest"
+    ]
+    assert second_binding is not None
+    assert second_binding != first_binding
+
+    _row, downgrade_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-binding-marker-downgrade",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=2),
+    )
+    downgraded = LanDiscoveryService(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=2),
+    ).import_observation(
+        _import_request(
+            observation,
+            downgrade_scan,
+            profile_revision=reenabled.profile.revision,
+            target_revisions=((target_id, reenabled.target.revision),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert downgraded.targets[0].target.enabled is False
+    downgraded_target = downgraded.targets[0].target
+    downgraded_protected = downgraded_target.metadata["lan_discovery"]
+    assert reenabled.material_binding_digest in downgraded.invalidated_binding_digests
+    assert downgraded_target.trust_class == "unconfirmed"
+    assert downgraded_target.role_affinities == ()
+    assert downgraded_target.task_family_affinities == ()
+    assert downgraded_protected["reviewed"] is False
+    for field in (
+        "reviewed_profile_revision",
+        "reviewed_target_revision",
+        "review_evidence_terminal_receipt_digest",
+        "review_evidence_observation_digest",
+        "reviewed_from_material_binding_digest",
+        "reviewed_material_binding_digest",
+        "review_acknowledged_stale_reasons",
+        "review_acknowledged_stale_transition_terminal_receipt_digest",
+        "review_digest",
+        "privacy_acknowledgement_digest",
+        "reviewed_runtime_interface_binding_digest",
+    ):
+        assert downgraded_protected[field] is None
+
+    _row, reinstall_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-binding-marker-reinstall",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=3),
+    )
+    assert downgraded.profile is not None
+    reinstalled = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=3),
+    ).import_observation(
+        _import_request(
+            observation,
+            reinstall_scan,
+            profile_revision=downgraded.profile.revision,
+            target_revisions=((target_id, downgraded.targets[0].revision),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert reinstalled.profile is not None
+    reinstalled_target = reinstalled.targets[0]
+    assert reinstalled_target.target.enabled is False
+    assert reinstalled_target.target.trust_class == "unconfirmed"
+    assert reinstalled_target.target.metadata["lan_discovery"]["reviewed"] is False
+    recover, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=reinstalled.profile.revision,
+        target_revision=reinstalled_target.revision,
+        target_id=target_id,
+        protected=reinstalled_target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    recovered = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=3),
+    ).review_lan_target(recover, authenticated_owner_principal=OWNER)
+    assert recovered.target.target.enabled is True
+    assert (
+        recovered.target.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        is not None
+    )
+    assert (
+        recovered.target.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        != second_binding
+    )
+
+
+def test_marker_downgrade_authority_invalidation_rolls_back_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.routing.ledger_registry as ledger_registry
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation, registry, _service, provider_id, target_id, enabled = (
+        _enabled_task5b_binding(state, scan_id="scan-binding-before-downgrade-crash")
+    )
+    _row, downgrade_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-binding-downgrade-crash",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    before_profile = registry.get_provider_profile(provider_id)
+    before_target = registry.get_model_target(target_id)
+    assert before_profile is not None and before_target is not None
+    monkeypatch.setattr(
+        ledger_registry,
+        "_before_lan_commit",
+        lambda: (_ for _ in ()).throw(RuntimeError("downgrade commit crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="downgrade commit crash"):
+        LanDiscoveryService(
+            registry,
+            clock=lambda: NOW + timedelta(seconds=1),
+        ).import_observation(
+            _import_request(
+                observation,
+                downgrade_scan,
+                profile_revision=enabled.profile.revision,
+                target_revisions=((target_id, enabled.target.revision),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+
+    assert registry.get_provider_profile(provider_id) == before_profile
+    assert registry.get_model_target(target_id) == before_target
+
+
+@pytest.mark.parametrize(
+    "invalidation",
+    ("network_drift", "outage_expiry", "replacement"),
+)
+def test_runtime_interface_binding_digest_clears_on_every_stale_transition(
+    tmp_path: Path,
+    invalidation: str,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation, registry, _service, provider_id, target_id, enabled = (
+        _enabled_task5b_binding(
+            state,
+            scan_id=f"scan-binding-before-{invalidation}",
+        )
+    )
+    old_protected = enabled.target.target.metadata["lan_discovery"]
+    assert old_protected["reviewed_runtime_interface_binding_digest"] is not None
+
+    if invalidation == "network_drift":
+        changed_scope = _scope(network="192.168.50.0/30")
+        changed = _positive_observation(scope=changed_scope)
+        observed_at = NOW + timedelta(seconds=1)
+        _row, completed = _persist_completed_scan(
+            state,
+            scan_id="scan-binding-network-drift",
+            observation=changed,
+            scope=changed_scope,
+            observed_at=observed_at,
+        )
+        request = _import_request(
+            changed,
+            completed,
+            profile_revision=enabled.profile.revision,
+            target_revisions=((target_id, enabled.target.revision),),
+        )
+    elif invalidation == "outage_expiry":
+        changed = _outage_observation()
+        observed_at = NOW + timedelta(seconds=301)
+        _row, completed = _persist_completed_scan(
+            state,
+            scan_id="scan-binding-outage-expiry",
+            observation=changed,
+            observed_at=observed_at,
+        )
+        request = _import_request(
+            changed,
+            completed,
+            profile_revision=enabled.profile.revision,
+            target_revisions=((target_id, enabled.target.revision),),
+        )
+    else:
+        changed = _positive_observation(address="192.168.50.3")
+        observed_at = NOW + timedelta(seconds=1)
+        _row, completed = _persist_completed_scan(
+            state,
+            scan_id="scan-binding-replacement",
+            observation=changed,
+            observed_at=observed_at,
+        )
+        new_provider_id = _provider_id(changed.endpoint_binding_digest)
+        new_target_id = _target_id(new_provider_id, "alpha")
+        request = replace(
+            _import_request(
+                changed,
+                completed,
+                profile_revision=0,
+                target_revisions=(
+                    (target_id, enabled.target.revision),
+                    (new_target_id, 0),
+                ),
+            ),
+            replacement=LanReplacementConfirmation(
+                provider_profile_id=provider_id,
+                expected_profile_revision=enabled.profile.revision,
+                expected_endpoint_fingerprint=str(
+                    enabled.profile.profile.metadata["lan_discovery"][
+                        "endpoint_fingerprint"
+                    ]
+                ),
+                expected_material_binding_digests=(
+                    str(old_protected["material_binding_digest"]),
+                ),
+            ),
+        )
+
+    _task5b_service(registry, clock=lambda: observed_at).import_observation(
+        request,
+        authenticated_owner_principal=OWNER,
+    )
+    stale = registry.get_model_target(target_id)
+    assert stale is not None
+    assert stale.target.enabled is False
+    assert stale.target.metadata["lan_discovery"]["stale_reasons"]
+    assert (
+        stale.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        is None
+    )
+
+
+def test_task5b_positive_reimport_upgrades_exact_legacy_task5a_target_shape(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        observation,
+        _scan,
+        _registry,
+        _service,
+        _result,
+        provider_id,
+        (target_id,),
+    ) = _import_first_positive(state, scan_id="scan-legacy-task5a")
+    with state._connect() as connection:
+        row = connection.execute(
+            "SELECT metadata_json FROM routing_model_targets WHERE target_id = ?",
+            (target_id,),
+        ).fetchone()
+        assert row is not None
+        metadata = json.loads(str(row[0]))
+        metadata["lan_discovery"].pop("reviewed_runtime_interface_binding_digest")
+        legacy_json = json.dumps(
+            metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        connection.execute(
+            "UPDATE routing_model_targets SET metadata_json = ? WHERE target_id = ?",
+            (legacy_json, target_id),
+        )
+
+    registry = RoutingLedger(state)
+    profile = registry.get_provider_profile(provider_id)
+    normalized = registry.get_model_target(target_id)
+    assert profile is not None and normalized is not None
+    normalized_protected = normalized.target.metadata["lan_discovery"]
+    assert normalized_protected["reviewed_runtime_interface_binding_digest"] is None
+    with state._connect() as connection:
+        persisted = connection.execute(
+            "SELECT metadata_json FROM routing_model_targets WHERE target_id = ?",
+            (target_id,),
+        ).fetchone()
+    assert persisted is not None and str(persisted[0]) == legacy_json
+
+    blocked_enable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=normalized.revision,
+        target_id=target_id,
+        protected=normalized_protected,
+        enabled=True,
+    )
+    with pytest.raises(
+        LanDiscoveryConflict,
+        match="upgrade_requires_positive_reimport",
+    ):
+        _task5b_service(registry).review_lan_target(
+            blocked_enable,
+            authenticated_owner_principal=OWNER,
+        )
+    blocked_disabled, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=normalized.revision,
+        target_id=target_id,
+        protected=normalized_protected,
+        enabled=False,
+    )
+    with pytest.raises(
+        LanDiscoveryConflict,
+        match="upgrade_requires_positive_reimport",
+    ):
+        _task5b_service(registry).review_lan_target(
+            blocked_disabled,
+            authenticated_owner_principal=OWNER,
+        )
+    with state._connect() as connection:
+        after_review = connection.execute(
+            "SELECT metadata_json FROM routing_model_targets WHERE target_id = ?",
+            (target_id,),
+        ).fetchone()
+    assert after_review is not None and str(after_review[0]) == legacy_json
+
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id="scan-task5b-upgrade",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    upgraded = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=profile.revision,
+            target_revisions=((target_id, normalized.revision),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert upgraded.profile is not None
+    upgraded_target = upgraded.targets[0]
+    upgraded_protected = upgraded_target.target.metadata["lan_discovery"]
+    assert set(upgraded_protected) == TARGET_PROTECTED_KEYS
+    assert upgraded_protected["runtime_hardening"] is not None
+    assert upgraded_protected["reviewed_runtime_interface_binding_digest"] is None
+
+    enable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=upgraded.profile.revision,
+        target_revision=upgraded_target.revision,
+        target_id=target_id,
+        protected=upgraded_protected,
+        enabled=True,
+    )
+    enabled = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).review_lan_target(enable, authenticated_owner_principal=OWNER)
+    assert enabled.target.target.enabled is True
+    assert (
+        enabled.target.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        is not None
+    )
+
+
+@pytest.mark.parametrize("hostile_state", ("marked", "enabled"))
+def test_legacy_runtime_binding_adapter_rejects_non_task5a_rows(
+    tmp_path: Path,
+    hostile_state: str,
+) -> None:
+    from nested_memvid_agent.lan_runtime_authority import (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    )
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        _observation,
+        _scan,
+        _registry,
+        _service,
+        _result,
+        _provider_id,
+        (target_id,),
+    ) = _import_first_positive(state, scan_id=f"scan-legacy-hostile-{hostile_state}")
+    with state._connect() as connection:
+        row = connection.execute(
+            "SELECT metadata_json FROM routing_model_targets WHERE target_id = ?",
+            (target_id,),
+        ).fetchone()
+        assert row is not None
+        metadata = json.loads(str(row[0]))
+        protected = metadata["lan_discovery"]
+        protected.pop("reviewed_runtime_interface_binding_digest")
+        if hostile_state == "marked":
+            protected["runtime_hardening"] = LAN_OPENAI_RUNTIME_HARDENING_VERSION
+        connection.execute(
+            """
+            UPDATE routing_model_targets
+            SET metadata_json = ?, enabled = ?
+            WHERE target_id = ?
+            """,
+            (
+                json.dumps(
+                    metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                1 if hostile_state == "enabled" else 0,
+                target_id,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="protected metadata|field set"):
+        RoutingLedger(state).get_model_target(target_id)
+
+
+def test_task5b_marker_requires_post_install_positive_reimport_before_enable(
+    tmp_path: Path,
+) -> None:
+    from nested_memvid_agent.lan_runtime_authority import (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    )
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        observation,
+        _task5a_scan,
+        registry,
+        _task5a_service,
+        _task5a_result,
+        provider_id,
+        (target_id,),
+    ) = _import_first_positive(state, scan_id="scan-before-runtime-install")
+    before_profile = registry.get_provider_profile(provider_id)
+    before_target = registry.get_model_target(target_id)
+    assert before_profile is not None and before_target is not None
+    assert before_profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
+    assert before_target.target.metadata["lan_discovery"]["runtime_hardening"] is None
+
+    hardened_service = _task5b_service(registry)
+    disabled_review, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=before_profile.revision,
+        target_revision=before_target.revision,
+        target_id=target_id,
+        protected=before_target.target.metadata["lan_discovery"],
+        enabled=False,
+    )
+    disabled = hardened_service.review_lan_target(
+        disabled_review,
+        authenticated_owner_principal=OWNER,
+    )
+    assert disabled.profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
+    assert disabled.target.target.metadata["lan_discovery"]["runtime_hardening"] is None
+    after_disabled_profile = registry.get_provider_profile(provider_id)
+    after_disabled_target = registry.get_model_target(target_id)
+    assert after_disabled_profile is not None and after_disabled_target is not None
+
+    review_only, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=after_disabled_profile.revision,
+        target_revision=after_disabled_target.revision,
+        target_id=target_id,
+        protected=after_disabled_target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    with pytest.raises(
+        LanDiscoveryConflict,
+        match="lan_runtime_hardening_unavailable",
+    ):
+        hardened_service.review_lan_target(
+            review_only,
+            authenticated_owner_principal=OWNER,
+        )
+    assert registry.get_provider_profile(provider_id) == after_disabled_profile
+    assert registry.get_model_target(target_id) == after_disabled_target
+    assert (
+        after_disabled_profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
+    )
+    assert after_disabled_target.target.metadata["lan_discovery"]["runtime_hardening"] is None
+
+    _row, refreshed_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-after-runtime-install",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    refreshed = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).import_observation(
+        _import_request(
+            observation,
+            refreshed_scan,
+            profile_revision=after_disabled_profile.revision,
+            target_revisions=((target_id, after_disabled_target.revision),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert refreshed.profile is not None
+    assert refreshed.profile.profile.metadata["lan_discovery"]["runtime_hardening"] == (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION
+    )
+    assert refreshed.targets[0].target.metadata["lan_discovery"]["runtime_hardening"] == (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION
+    )
+    assert refreshed.profile.profile.enabled is False
+    assert refreshed.targets[0].target.enabled is False
+
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    enable, privacy_digest, reviewed_material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    enabled = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).review_lan_target(enable, authenticated_owner_principal=OWNER)
+    assert enabled.profile.profile.enabled is True
+    assert enabled.target.target.enabled is True
+    assert enabled.target.target.health == "unknown"
+    assert enabled.target.target.metadata["lan_discovery"]["reviewed"] is True
+    assert (
+        enabled.target.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        is not None
+    )
+    assert enabled.privacy_acknowledgement_digest == privacy_digest
+    assert enabled.material_binding_digest == reviewed_material
+
+
+def test_task5b_enable_and_disable_last_target_are_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.routing.ledger_registry as ledger_registry
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation = _positive_observation()
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id="scan-hardened-atomic",
+        observation=observation,
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    service = _task5b_service(registry)
+    service.import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    enable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    before_profile = profile
+    before_target = target
+
+    def crash() -> None:
+        raise RuntimeError("review commit crash")
+
+    monkeypatch.setattr(ledger_registry, "_before_lan_commit", crash)
+    with pytest.raises(RuntimeError, match="review commit crash"):
+        service.review_lan_target(enable, authenticated_owner_principal=OWNER)
+    assert registry.get_provider_profile(provider_id) == before_profile
+    assert registry.get_model_target(target_id) == before_target
+
+    monkeypatch.setattr(ledger_registry, "_before_lan_commit", lambda: None)
+    enabled = service.review_lan_target(enable, authenticated_owner_principal=OWNER)
+    assert enabled.profile.profile.enabled is True
+    assert enabled.target.target.enabled is True
+
+    disable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=enabled.profile.revision,
+        target_revision=enabled.target.revision,
+        target_id=target_id,
+        protected=enabled.target.target.metadata["lan_discovery"],
+        enabled=False,
+    )
+    before_disable_profile = registry.get_provider_profile(provider_id)
+    before_disable_target = registry.get_model_target(target_id)
+    assert before_disable_profile is not None and before_disable_target is not None
+    monkeypatch.setattr(ledger_registry, "_before_lan_commit", crash)
+    with pytest.raises(RuntimeError, match="review commit crash"):
+        service.review_lan_target(disable, authenticated_owner_principal=OWNER)
+    assert registry.get_provider_profile(provider_id) == before_disable_profile
+    assert registry.get_model_target(target_id) == before_disable_target
+
+    monkeypatch.setattr(ledger_registry, "_before_lan_commit", lambda: None)
+    disabled = service.review_lan_target(disable, authenticated_owner_principal=OWNER)
+    assert disabled.target.target.enabled is False
+    assert disabled.profile.profile.enabled is False
+    assert (
+        disabled.target.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        is None
+    )
+
+
+@pytest.mark.parametrize("failure", ("resolver_exception", "wrong_source"))
+def test_enabled_review_inventory_failure_is_closed_and_byte_for_byte_atomic(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    token = f"review-inventory-{failure}-secret"
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation = _positive_observation()
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id=f"scan-review-inventory-{failure}",
+        observation=observation,
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    _task5b_service(registry).import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    enable, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+
+    with state._connect() as connection:
+        before = tuple(
+            tuple(row)
+            for table in ("routing_provider_profiles", "routing_model_targets")
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+        )
+    calls = 0
+
+    def failing_inventory() -> CurrentLanInterfaceInventory:
+        nonlocal calls
+        calls += 1
+        if failure == "resolver_exception":
+            raise RuntimeError(token)
+        return CurrentLanInterfaceInventory(
+            (
+                CurrentLanInterfaceState(
+                    os_identity="test:en0",
+                    interface_index=7,
+                    addresses=("192.168.50.3/29",),
+                ),
+            )
+        )
+
+    with pytest.raises(LanDiscoveryConflict) as raised:
+        _task5b_service(
+            registry,
+            interface_inventory_resolver=failing_inventory,
+        ).review_lan_target(enable, authenticated_owner_principal=OWNER)
+
+    assert calls == 1
+    assert raised.value.__cause__ is None
+    assert token not in "".join(
+        traceback.format_exception(
+            type(raised.value),
+            raised.value,
+            raised.value.__traceback__,
+        )
+    )
+    with state._connect() as connection:
+        after = tuple(
+            tuple(row)
+            for table in ("routing_provider_profiles", "routing_model_targets")
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+        )
+    assert after == before
+    current = registry.get_model_target(target_id)
+    assert current is not None
+    assert current.target.enabled is False
+    assert (
+        current.target.metadata["lan_discovery"][
+            "reviewed_runtime_interface_binding_digest"
+        ]
+        is None
+    )
+
+
+def test_hardening_marker_reimport_obeys_cas_and_commit_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.routing.ledger_registry as ledger_registry
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        observation,
+        _scan,
+        registry,
+        _service,
+        _result,
+        provider_id,
+        (target_id,),
+    ) = _import_first_positive(state, scan_id="scan-pre-marker")
+    before_profile = registry.get_provider_profile(provider_id)
+    before_target = registry.get_model_target(target_id)
+    assert before_profile is not None and before_target is not None
+    _row, refreshed_scan = _persist_completed_scan(
+        state,
+        scan_id="scan-marker-refresh",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    service = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(LanDiscoveryConflict):
+        service.import_observation(
+            _import_request(
+                observation,
+                refreshed_scan,
+                profile_revision=0,
+                target_revisions=((target_id, before_target.revision),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+    assert registry.get_provider_profile(provider_id) == before_profile
+    assert registry.get_model_target(target_id) == before_target
+
+    monkeypatch.setattr(
+        ledger_registry,
+        "_before_lan_commit",
+        lambda: (_ for _ in ()).throw(RuntimeError("marker commit crash")),
+    )
+    with pytest.raises(RuntimeError, match="marker commit crash"):
+        service.import_observation(
+            _import_request(
+                observation,
+                refreshed_scan,
+                profile_revision=before_profile.revision,
+                target_revisions=((target_id, before_target.revision),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+    assert registry.get_provider_profile(provider_id) == before_profile
+    assert registry.get_model_target(target_id) == before_target
+
+
+def test_wrong_or_forged_runtime_hardening_marker_never_enables(
+    tmp_path: Path,
+) -> None:
+    from nested_memvid_agent.lan_runtime_authority import (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    )
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        _observation,
+        _scan,
+        registry,
+        _service,
+        _result,
+        provider_id,
+        (target_id,),
+    ) = _import_first_positive(state, scan_id="scan-forged-marker")
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+
+    with pytest.raises(ValueError, match="runtime hardening|version"):
+        LanDiscoveryService(
+            registry,
+            clock=lambda: NOW,
+            runtime_hardening_version="kestrel.lan.runtime.openai.v0",
+        )
+
+    forged_metadata = json.loads(json.dumps(target.target.metadata))
+    forged_metadata["lan_discovery"]["runtime_hardening"] = (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION + "-forged"
+    )
+    with state._connect() as connection:
+        connection.execute(
+            "UPDATE routing_model_targets SET metadata_json = ? WHERE target_id = ?",
+            (
+                json.dumps(
+                    forged_metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                target_id,
+            ),
+        )
+    forged = registry.get_model_target(target_id)
+    assert forged is not None
+    request, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=forged.revision,
+        target_id=target_id,
+        protected=forged.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    with pytest.raises(LanDiscoveryConflict, match="hardening|binding"):
+        _task5b_service(registry).review_lan_target(
+            request,
+            authenticated_owner_principal=OWNER,
+        )
+    assert registry.get_provider_profile(provider_id) == profile
+
+
+def test_ollama_import_stays_disabled_and_cannot_fallback_to_generic_runtime(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation = _ollama_observation()
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id="scan-ollama-after-runtime-install",
+        observation=observation,
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    service = _task5b_service(registry)
+    imported = service.import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert imported.profile is not None
+    assert imported.profile.profile.adapter == "lan-ollama-compatible"
+    assert imported.profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
+    assert imported.targets[0].target.metadata["lan_discovery"]["runtime_hardening"] is None
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    request, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+
+    with pytest.raises(
+        LanDiscoveryConflict,
+        match="lan_runtime_hardening_unavailable",
+    ):
+        service.review_lan_target(request, authenticated_owner_principal=OWNER)
+    assert registry.get_provider_profile(provider_id) == profile
+    assert registry.get_model_target(target_id) == target
+
+
+@pytest.mark.parametrize(
+    "negative_factory",
+    (_outage_observation, _failed_generation_observation, _empty_catalog_observation),
+    ids=("unreachable", "failed_generation", "empty_catalog"),
+)
+def test_post_install_negative_reimport_does_not_install_marker_or_mutate_authority(
+    tmp_path: Path,
+    negative_factory,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        _positive,
+        _scan,
+        registry,
+        _service,
+        _result,
+        provider_id,
+        (target_id,),
+    ) = _import_first_positive(state, scan_id="scan-before-negative-marker")
+    before_profile = registry.get_provider_profile(provider_id)
+    before_target = registry.get_model_target(target_id)
+    assert before_profile is not None and before_target is not None
+    negative = negative_factory()
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id=f"scan-negative-{negative.failure_category}",
+        observation=negative,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+
+    result = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    ).import_observation(
+        _import_request(
+            negative,
+            completed,
+            profile_revision=before_profile.revision,
+            target_revisions=(),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert result.outage_observed is True
+    assert registry.get_provider_profile(provider_id) == before_profile
+    assert registry.get_model_target(target_id) == before_target
+    assert before_profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
+    assert before_target.target.metadata["lan_discovery"]["runtime_hardening"] is None
+
+
+def test_forged_profile_marker_mismatch_blocks_enable_without_partial_write(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation = _positive_observation()
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id="scan-profile-marker-mismatch",
+        observation=observation,
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    service = _task5b_service(registry)
+    service.import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    forged_profile_metadata = json.loads(json.dumps(profile.profile.metadata))
+    forged_profile_metadata["lan_discovery"]["runtime_hardening"] = (
+        "kestrel.lan.runtime.openai.v0"
+    )
+    with state._connect() as connection:
+        connection.execute(
+            "UPDATE routing_provider_profiles SET metadata_json = ? WHERE profile_id = ?",
+            (
+                json.dumps(
+                    forged_profile_metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                provider_id,
+            ),
+        )
+    forged_profile = registry.get_provider_profile(provider_id)
+    assert forged_profile is not None
+    request, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=forged_profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+
+    with pytest.raises(LanDiscoveryConflict, match="hardening|binding"):
+        service.review_lan_target(request, authenticated_owner_principal=OWNER)
+    assert registry.get_model_target(target_id) == target
+    assert registry.get_provider_profile(provider_id) == forged_profile
+
+
+def test_multi_target_positive_reimport_installs_one_marker_atomically_everywhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.routing.ledger_registry as ledger_registry
+    from nested_memvid_agent.lan_runtime_authority import (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    )
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        observation,
+        _scan,
+        registry,
+        _service,
+        _result,
+        provider_id,
+        target_ids,
+    ) = _import_first_positive(
+        state,
+        scan_id="scan-multi-before-marker",
+        models=("alpha", "beta"),
+    )
+    before_profile = registry.get_provider_profile(provider_id)
+    before_targets = tuple(registry.get_model_target(item) for item in target_ids)
+    assert before_profile is not None and all(item is not None for item in before_targets)
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id="scan-multi-after-marker",
+        observation=observation,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    service = _task5b_service(
+        registry,
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    request = _import_request(
+        observation,
+        completed,
+        profile_revision=before_profile.revision,
+        target_revisions=tuple(
+            (target_id, entry.revision)
+            for target_id, entry in zip(target_ids, before_targets, strict=True)
+            if entry is not None
+        ),
+    )
+    monkeypatch.setattr(
+        ledger_registry,
+        "_before_lan_commit",
+        lambda: (_ for _ in ()).throw(RuntimeError("multi-marker commit crash")),
+    )
+    with pytest.raises(RuntimeError, match="multi-marker commit crash"):
+        service.import_observation(request, authenticated_owner_principal=OWNER)
+    assert registry.get_provider_profile(provider_id) == before_profile
+    assert tuple(registry.get_model_target(item) for item in target_ids) == before_targets
+
+    monkeypatch.setattr(ledger_registry, "_before_lan_commit", lambda: None)
+    result = service.import_observation(request, authenticated_owner_principal=OWNER)
+
+    assert result.profile is not None
+    assert result.profile.profile.metadata["lan_discovery"]["runtime_hardening"] == (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION
+    )
+    assert tuple(item.target.target_id for item in result.targets) == target_ids
+    assert all(
+        item.target.metadata["lan_discovery"]["runtime_hardening"]
+        == LAN_OPENAI_RUNTIME_HARDENING_VERSION
+        for item in result.targets
+    )
+    assert result.profile.revision == before_profile.revision + 1
+    assert tuple(item.revision for item in result.targets) == tuple(
+        entry.revision + 1 for entry in before_targets if entry is not None
+    )
+
+    beta_id = next(item.target.target_id for item in result.targets if item.target.model == "beta")
+    beta = registry.get_model_target(beta_id)
+    current_profile = registry.get_provider_profile(provider_id)
+    assert beta is not None and current_profile is not None
+    before_beta_review = (
+        current_profile,
+        tuple(registry.get_model_target(item) for item in target_ids),
+    )
+    enable_beta, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=current_profile.revision,
+        target_revision=beta.revision,
+        target_id=beta_id,
+        protected=beta.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+    with pytest.raises(LanDiscoveryConflict, match="capability|generation"):
+        service.review_lan_target(enable_beta, authenticated_owner_principal=OWNER)
+    assert registry.get_provider_profile(provider_id) == before_beta_review[0]
+    assert tuple(registry.get_model_target(item) for item in target_ids) == before_beta_review[1]

@@ -80,6 +80,77 @@ def test_revisioned_provider_edit_preserves_omitted_configured_fields(tmp_path: 
         assert build.runs.mcp.shutdown()
 
 
+def test_adaptive_runtime_threads_one_exact_lan_resolver_through_both_run_managers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.run_manager as run_manager_module
+    from nested_memvid_agent.routing.run_manager import AdaptiveFlockRunManager
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    mcp = MCPManager(state)
+    build = build_run_manager(
+        config=AgentConfig(state_path=state.path, workspace=tmp_path),
+        state=state,
+        events=RunEventBus(state),
+        mcp=mcp,
+        skills=SkillManager(tmp_path / "skills", state),
+        auto_start=False,
+        routing_config=AdaptiveFlockRuntimeConfig(
+            enabled=True,
+            mode="constrained",
+        ),
+    )
+    try:
+        assert isinstance(build.runs, AdaptiveFlockRunManager)
+        resolver = build.runs.lan_runtime_authority_resolver
+        assert callable(resolver)
+        assert build.runs.routing_coordinator.lan_runtime_authority_resolver is resolver
+
+        captured: list[object] = []
+        sentinel = object()
+
+        def capture_agent(_config, **kwargs: object):
+            captured.append(kwargs.get("lan_runtime_authority_resolver"))
+            return sentinel
+
+        monkeypatch.setattr(run_manager_module, "build_agent", capture_agent)
+        assert build.runs._build_agent(build.runs.config) is sentinel
+        assert captured == [resolver]
+    finally:
+        assert build.runs.shutdown(timeout_seconds=1.0)
+        assert build.runs.mcp.shutdown()
+
+
+def test_ordinary_runtime_has_no_lan_resolver_and_clears_injected_authority(
+    tmp_path: Path,
+) -> None:
+    import test_lan_openai_compatible_provider as lan_cases
+
+    authority = lan_cases._authority()
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    mcp = MCPManager(state)
+    build = build_run_manager(
+        config=AgentConfig(
+            state_path=state.path,
+            workspace=tmp_path,
+            lan_runtime_authority=authority,
+        ),
+        state=state,
+        events=RunEventBus(state),
+        mcp=mcp,
+        skills=SkillManager(tmp_path / "skills", state),
+        auto_start=False,
+        routing_config=AdaptiveFlockRuntimeConfig(),
+    )
+    try:
+        assert build.runs.lan_runtime_authority_resolver is None
+        assert build.runs.config.lan_runtime_authority is None
+    finally:
+        assert build.runs.shutdown(timeout_seconds=1.0)
+        assert build.runs.mcp.shutdown()
+
+
 def test_explicit_null_clears_provider_fields(tmp_path: Path) -> None:
     client, build, _state = _routing_app(tmp_path)
     try:

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from ..lan_runtime_authority import LAN_OPENAI_RUNTIME_HARDENING_VERSION
 from .ledger_registry import (
     _has_reserved_lan_prefix,
     _lan_is_managed_metadata,
@@ -235,13 +236,16 @@ def managed_lan_target_guard_reasons(
         return ("lan_binding_invalid",)
 
     reasons: list[str] = []
-    if now > fresh_until:
+    if not target.enabled:
+        reasons.append("lan_target_disabled")
+    if now >= fresh_until:
         reasons.append("lan_evidence_expired")
     if stale_reasons:
         reasons.append("lan_binding_stale")
     if not reviewed:
         reasons.append("lan_owner_review_required")
-    reasons.append("lan_runtime_hardening_unavailable")
+    if protected["runtime_hardening"] != LAN_OPENAI_RUNTIME_HARDENING_VERSION:
+        reasons.append("lan_runtime_hardening_unavailable")
     return tuple(reasons)
 
 

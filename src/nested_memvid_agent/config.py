@@ -4,11 +4,12 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .lan_runtime_authority import LanRuntimeAuthority
 from .routine_limits import (
     validate_routine_claim_ttl,
     validate_routine_poll_interval,
@@ -189,6 +190,11 @@ class AgentConfig:
     memory_seal_write_threshold: int = 50
     memory_seal_interval_seconds: float = 10.0
     enabled_tools: tuple[str, ...] = ()
+    lan_runtime_authority: LanRuntimeAuthority | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         # Retain the legacy field for snapshot compatibility, but never permit a
@@ -409,7 +415,9 @@ class AgentConfig:
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> AgentConfig:
-        allowed = {item.name for item in fields(cls)}
+        allowed = {
+            item.name for item in fields(cls) if item.name != "lan_runtime_authority"
+        }
         unknown = sorted(set(raw) - allowed)
         if unknown:
             raise ValueError(f"unsupported agent configuration fields: {', '.join(unknown)}")
@@ -445,6 +453,8 @@ class AgentConfig:
     def to_mapping(self) -> dict[str, Any]:
         rendered: dict[str, Any] = {}
         for item in fields(self):
+            if item.name == "lan_runtime_authority":
+                continue
             value = getattr(self, item.name)
             if isinstance(value, Path):
                 rendered[item.name] = str(value)

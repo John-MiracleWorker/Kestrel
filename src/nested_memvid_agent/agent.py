@@ -368,7 +368,10 @@ class NestedMV2Agent:
                 },
             )
         provider_capabilities = self.llm.capabilities
-        supports_native_tools = provider_capabilities.supports_native_tools
+        supports_tools = provider_capabilities.supports_tools
+        supports_native_tools = (
+            supports_tools and provider_capabilities.supports_native_tools
+        )
         max_discovered_tool_names = (
             max(0, provider_capabilities.native_tool_limit - 1)
             if supports_native_tools
@@ -376,13 +379,14 @@ class NestedMV2Agent:
             and provider_capabilities.native_tool_limit > 0
             else 0
         )
-        initial_tool_specs = self.tools.specs()
+        initial_tool_specs = self.tools.specs() if supports_tools else []
         messages = [
             ChatMessage(role="system", content=self.system_prompt),
             ChatMessage(role="system", content=communication_contract),
             ChatMessage(
                 role="system",
                 content=_tool_protocol_prompt(
+                    supports_tools=supports_tools,
                     supports_native_tools=supports_native_tools,
                     tool_specs=initial_tool_specs,
                     bounded_native_catalog=provider_capabilities.native_tool_limit is not None,
@@ -429,7 +433,9 @@ class NestedMV2Agent:
 
         final_content = ""
         stop_reason = "complete"
-        direct_tool_call = _direct_command_tool_call(user_message)
+        direct_tool_call = (
+            _direct_command_tool_call(user_message) if supports_tools else None
+        )
         for round_index in range(self.config.max_tool_rounds + 1):
             if direct_tool_call is not None and round_index == 0:
                 self._event(
@@ -448,7 +454,7 @@ class NestedMV2Agent:
                     raw={"direct_command": "search"},
                 )
             else:
-                active_tool_specs = self.tools.specs()
+                active_tool_specs = self.tools.specs() if supports_tools else []
                 round_tool_specs = (
                     select_relevant_tool_specs(
                         active_tool_specs,
@@ -533,6 +539,42 @@ class NestedMV2Agent:
                 if _tool_call_requires_sensitive_data_rejection(call)
             )
             response = _sanitize_llm_response(response)
+            if not supports_tools and response.tool_calls:
+                error = _provider_error_payload(
+                    ProviderError(
+                        "Provider returned tool calls despite declaring tools unsupported.",
+                        code="tool_calls_unsupported",
+                        retryable=False,
+                    )
+                )
+                provider_attempts.append(
+                    _provider_attempt_error_receipt(
+                        provider=self.config.provider,
+                        model=self.config.model,
+                        round_index=round_index,
+                        error=error,
+                    )
+                )
+                self._event(
+                    "llm.error",
+                    {"session_id": session, "run_id": active_run_id, **error},
+                )
+                self._event(
+                    "runtime.error",
+                    {"session_id": session, "run_id": active_run_id, **error},
+                )
+                self._event(
+                    "security.tool_call_rejected",
+                    {
+                        "session_id": session,
+                        "run_id": active_run_id,
+                        "reason": "provider_tools_unsupported",
+                        "tool_call_count": len(response.tool_calls),
+                    },
+                )
+                final_content = f"Provider error ({error['code']}): {error['message']}"
+                stop_reason = "provider_error"
+                break
             if direct_tool_call is None or round_index > 0:
                 provider_attempts.append(
                     _provider_attempt_receipt(
@@ -1369,10 +1411,17 @@ def _load_system_prompt() -> str:
 
 def _tool_protocol_prompt(
     *,
+    supports_tools: bool,
     supports_native_tools: bool,
     tool_specs: Sequence[ToolSpec],
     bounded_native_catalog: bool,
 ) -> str:
+    if not supports_tools:
+        return (
+            "## Active Tool Protocol\n"
+            "No tools are available for this request. Answer using ordinary assistant text "
+            "only, and do not request, describe, or simulate a tool invocation."
+        )
     if supports_native_tools:
         catalog_note = (
             "This request may advertise a bounded, relevance-ranked subset; use "

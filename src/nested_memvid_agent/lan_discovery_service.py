@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
+from .lan_http_transport import InterfaceInventoryResolver
+from .lan_runtime_authority import LAN_OPENAI_RUNTIME_HARDENING_VERSION
 from .routing.lan_serialization import (
     LAN_OBSERVATION_MAX_AGE_SECONDS as LAN_OBSERVATION_MAX_AGE_SECONDS,
 )
@@ -212,11 +214,24 @@ class LanDiscoveryService:
         registry: RoutingLedger,
         *,
         clock: Callable[[], datetime] | None = None,
+        runtime_hardening_version: str | None = None,
+        interface_inventory_resolver: InterfaceInventoryResolver | None = None,
     ) -> None:
         if type(registry) is not RoutingLedger:
             raise ValueError("LAN discovery requires the durable routing ledger")
         self.registry = registry
         self._clock = clock or (lambda: datetime.now(UTC))
+        if (
+            runtime_hardening_version is not None
+            and runtime_hardening_version != LAN_OPENAI_RUNTIME_HARDENING_VERSION
+        ):
+            raise ValueError("LAN runtime hardening version is not installed")
+        self._runtime_hardening_version = runtime_hardening_version
+        if interface_inventory_resolver is not None and not callable(
+            interface_inventory_resolver
+        ):
+            raise ValueError("LAN interface inventory resolver must be callable")
+        self._interface_inventory_resolver = interface_inventory_resolver
 
     def import_observation(
         self,
@@ -256,11 +271,12 @@ class LanDiscoveryService:
                 replacement=replacement,
                 authenticated_owner_principal=owner,
                 now=now,
+                runtime_hardening_version=self._runtime_hardening_version,
             )
         except RoutingRevisionConflict as exc:
-            raise LanDiscoveryConflict(str(exc)) from exc
+            raise LanDiscoveryConflict(str(exc)) from None
         except ValueError as exc:
-            raise LanDiscoveryConflict(str(exc)) from exc
+            raise LanDiscoveryConflict(str(exc)) from None
         return LanImportResult(
             profile=result[0],
             targets=result[1],
@@ -280,12 +296,10 @@ class LanDiscoveryService:
     ) -> LanReviewResult:
         if type(request) is not LanReviewRequest:
             raise ValueError("LAN review request must be exactly typed")
-        if request.enabled is True:
-            raise LanDiscoveryConflict("lan_runtime_hardening_unavailable")
         try:
             LanReviewRequest.__post_init__(request)
         except ValueError as exc:
-            raise LanDiscoveryConflict(str(exc)) from exc
+            raise LanDiscoveryConflict(str(exc)) from None
         owner = _validate_canonical_owner(authenticated_owner_principal)
         now = _validate_utc_clock(self._clock())
         try:
@@ -306,11 +320,13 @@ class LanDiscoveryService:
                 enabled=request.enabled,
                 authenticated_owner_principal=owner,
                 now=now,
+                runtime_hardening_version=self._runtime_hardening_version,
+                interface_inventory_resolver=self._interface_inventory_resolver,
             )
         except RoutingRevisionConflict as exc:
-            raise LanDiscoveryConflict(str(exc)) from exc
+            raise LanDiscoveryConflict(str(exc)) from None
         except ValueError as exc:
-            raise LanDiscoveryConflict(str(exc)) from exc
+            raise LanDiscoveryConflict(str(exc)) from None
         return LanReviewResult(
             profile=result[0],
             target=result[1],
@@ -395,8 +411,8 @@ def _validate_stale_reasons(value: object) -> tuple[LanStaleReason, ...]:
         raise ValueError("LAN stale reasons must be unique")
     try:
         ordered = tuple(reason for reason in LAN_STALE_REASON_ORDER if reason in value)
-    except TypeError as exc:
-        raise ValueError("LAN stale reasons are invalid") from exc
+    except TypeError:
+        raise ValueError("LAN stale reasons are invalid") from None
     if value != ordered:
         raise ValueError("LAN stale reasons must use the closed deterministic order")
     return ordered

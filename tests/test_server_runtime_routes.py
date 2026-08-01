@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -68,6 +68,101 @@ def test_runtime_routes_report_health_and_redacted_config(tmp_path, monkeypatch)
     assert payload["feature_flags"]["enable_proactive_routines"] is False
     assert payload["limits"]["max_routines_per_tick"] == 3
     assert "raw-secret-value" not in runtime.text
+
+
+def test_server_composition_installs_shared_lan_runtime_hardening_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nested_memvid_agent.server as server_module
+    import nested_memvid_agent.server_routing_routes as routing_routes
+    from nested_memvid_agent.lan_runtime_authority import (
+        LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+    )
+
+    constructed: list[tuple[object, dict[str, object]]] = []
+    registered: list[object] = []
+
+    class CapturingLanDiscoveryService:
+        def __init__(self, ledger, **kwargs: object) -> None:
+            constructed.append((ledger, dict(kwargs)))
+
+    def capture_routes(_app, **kwargs: object) -> None:
+        registered.append(kwargs.get("lan_discovery_service"))
+
+    monkeypatch.setattr(
+        server_module,
+        "LanDiscoveryService",
+        CapturingLanDiscoveryService,
+    )
+    monkeypatch.setattr(routing_routes, "register_routing_routes", capture_routes)
+    monkeypatch.setenv("KESTREL_SERVER_AUTH", "runtime-token")
+    config = AgentConfig(
+        provider="mock",
+        model="mock",
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+        log_dir=tmp_path / "logs",
+        require_api_auth=True,
+        api_auth_token_env="KESTREL_SERVER_AUTH",
+    )
+
+    with TestClient(server_module.create_app(config)):
+        pass
+
+    assert len(constructed) == 1
+    assert constructed[0][1] == {
+        "runtime_hardening_version": LAN_OPENAI_RUNTIME_HARDENING_VERSION
+    }
+    assert len(registered) == 1
+    assert type(registered[0]) is CapturingLanDiscoveryService
+
+
+def test_runtime_routes_settings_and_restore_surfaces_never_serialize_lan_authority(
+    tmp_path: Path,
+) -> None:
+    import test_lan_openai_compatible_provider as lan_cases
+
+    authority = lan_cases._authority()
+    config = AgentConfig(
+        provider="lan-openai-compatible",
+        model="alpha",
+        base_url="http://192.168.50.8:1234/v1",
+        memory_dir=tmp_path / "memory",
+        state_path=tmp_path / "state.db",
+        log_dir=tmp_path / "logs",
+        lan_runtime_authority=authority,
+    )
+    app = FastAPI()
+    register_runtime_routes(app, active_config=config, state=_FakeState())
+    response = TestClient(app).get("/api/runtime/config")
+
+    assert response.status_code == 200
+    assert "lan_runtime_authority" not in response.text
+    assert authority.reviewed_material_binding_digest not in response.text
+    assert authority.review_digest not in response.text
+    assert authority.source_address not in response.text
+
+    settings = RuntimeSettings.from_config(config)
+    rendered_settings = json.dumps(asdict(settings), sort_keys=True, default=str)
+    assert "lan_runtime_authority" not in rendered_settings
+    assert authority.reviewed_material_binding_digest not in rendered_settings
+    restored = apply_runtime_settings(config, settings)
+    assert restored.lan_runtime_authority is None
+
+    store = RuntimeSettingsStore(tmp_path / "runtime-settings.json")
+    persisted = store.save(
+        replace(
+            settings,
+            provider="mock",
+            model="mock",
+            base_url=None,
+        )
+    )
+    assert authority.reviewed_material_binding_digest not in store.path.read_text()
+    loaded = store.load(config)
+    assert loaded == persisted
+    assert apply_runtime_settings(config, loaded).lan_runtime_authority is None
 
 
 def test_runtime_provider_probe_exposes_explicit_operational_check(tmp_path) -> None:
