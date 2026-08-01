@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -18,6 +19,7 @@ from nested_memvid_agent.lan_http_transport import (
     CurrentLanInterfaceState,
     DirectLanHttpTransport,
     LanProbeModel,
+    LanRequestProgress,
     LanRequestRoute,
     LanTransportError,
     LanTransportFailure,
@@ -573,6 +575,65 @@ def test_generation_request_has_only_the_fixed_route_and_bounded_payload() -> No
     }
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "llama3:8b",
+        "deepseek-r1:8b",
+        "mistral:7b-instruct",
+        "phi4:14b",
+        "gpt-oss:20b",
+        "qwen2.5-coder:7b",
+    ),
+)
+def test_canonical_name_tag_model_reaches_the_exact_generation_body(model_id: str) -> None:
+    sockets = SocketFactory(http_response(200, b'{"response":"OK"}'))
+    scope = scope_fixture()
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+
+    direct_transport(scope, sockets).request(
+        scope,
+        endpoint,
+        source,
+        LanRequestRoute.OLLAMA_GENERATION,
+        deadline=2.0,
+        cancellation=NeverCancelled(),
+        model=LanProbeModel.from_catalog(model_id),
+    )
+
+    _head, payload = sockets.sockets[0].sent.split(b"\r\n\r\n", 1)
+    assert json.loads(payload)["model"] == model_id
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "localhost",
+        "localhost:11434",
+        "localhost/model:8b",
+        "modelbox:11434",
+        "model:1234",
+        "qwen2.5-coder:1234",
+        "qwen2.5-coder:",
+        "qwen2.5-coder:ß",
+        "registry.local/model:8b",
+        "192.168.50.8/model:8b",
+        "[fd00::8]:11434",
+        "https://evil.invalid/model:8b",
+        "user:pass@modelbox:8b",
+        "token=sk-abcdefghijk:8b",
+        "bad\nmodel:8b",
+        unicodedata.normalize("NFD", "modèle:8b"),
+    ),
+)
+def test_name_tag_exception_never_admits_transport_credentials_or_noncanonical_text(
+    model_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="model"):
+        LanProbeModel.from_catalog(model_id)
+
+
 def test_openai_generation_request_has_the_exact_fixed_route_headers_and_body() -> None:
     sockets = SocketFactory(http_response(200, b'{"choices":[{"message":{"content":"OK"}}]}'))
     scope = scope_fixture()
@@ -911,3 +972,278 @@ def test_one_absolute_http_deadline_is_recomputed_before_each_blocking_read(
 
     assert captured.value.failure is LanTransportFailure.HTTP_TIMEOUT
     assert sockets.sockets[0].closed is True
+
+
+def _deadline_response_parts(framing: str, *, split: bool) -> tuple[bytes, ...]:
+    if framing == "content_length":
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"
+        body = b"{}"
+    elif framing == "chunked":
+        head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        body = b"2\r\n{}\r\n0\r\n\r\n"
+    else:
+        assert framing == "eof"
+        head = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+        body = b"{}"
+    return (head, body) if split else (head + body,)
+
+
+@pytest.mark.parametrize("framing", ("content_length", "chunked", "eof"))
+@pytest.mark.parametrize("split", (False, True), ids=("single_read", "split_read"))
+def test_bytes_returned_after_the_absolute_http_deadline_are_never_consumed(
+    framing: str,
+    split: bool,
+) -> None:
+    class MutableClock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    class LateSocket(FakeSocket):
+        def __init__(self, parts: tuple[bytes, ...], clock: MutableClock) -> None:
+            super().__init__()
+            self._parts = list(parts)
+            self._clock = clock
+            self._expire_on_read = len(parts) + (1 if framing == "eof" else 0)
+            self._reads = 0
+
+        def recv(self, size: int) -> bytes:
+            del size
+            self._reads += 1
+            payload = self._parts.pop(0) if self._parts else b""
+            if self._reads == self._expire_on_read:
+                self._clock.now = 2.001
+            return payload
+
+    class LateFactory(SocketFactory):
+        def __init__(self, parts: tuple[bytes, ...], clock: MutableClock) -> None:
+            super().__init__()
+            self._parts = parts
+            self._clock = clock
+
+        def __call__(self, family: int, kind: int) -> FakeSocket:
+            self.calls.append((family, kind))
+            result = LateSocket(self._parts, self._clock)
+            self.sockets.append(result)
+            return result
+
+    clock = MutableClock()
+    sockets = LateFactory(_deadline_response_parts(framing, split=split), clock)
+    scope = scope_fixture()
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+
+    with pytest.raises(LanTransportError) as captured:
+        direct_transport(scope, sockets, clock=clock).request(
+            scope,
+            endpoint,
+            source,
+            LanRequestRoute.OLLAMA_CATALOG,
+            deadline=20.0,
+            cancellation=NeverCancelled(),
+        )
+
+    assert captured.value.failure is LanTransportFailure.HTTP_TIMEOUT
+    assert sockets.sockets[0].closed is True
+
+
+def test_completed_http_framing_gets_one_final_absolute_deadline_check() -> None:
+    class FinalExpiryClock:
+        calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            return 2.001 if self.calls >= 7 else 0.0
+
+    clock = FinalExpiryClock()
+    sockets = SocketFactory(http_response(200, b"{}"))
+    scope = scope_fixture()
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+
+    with pytest.raises(LanTransportError) as captured:
+        direct_transport(scope, sockets, clock=clock).request(
+            scope,
+            endpoint,
+            source,
+            LanRequestRoute.OLLAMA_CATALOG,
+            deadline=20.0,
+            cancellation=NeverCancelled(),
+        )
+
+    assert captured.value.failure is LanTransportFailure.HTTP_TIMEOUT
+    assert sockets.sockets[0].closed is True
+
+
+def test_http_completion_exactly_at_the_absolute_deadline_is_accepted() -> None:
+    class BoundaryClock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    class BoundarySocket(FakeSocket):
+        def __init__(self, response: bytes, clock: BoundaryClock) -> None:
+            super().__init__(response)
+            self._clock = clock
+
+        def recv(self, size: int) -> bytes:
+            payload = super().recv(size)
+            self._clock.now = 2.0
+            return payload
+
+    class BoundaryFactory(SocketFactory):
+        def __init__(self, response: bytes, clock: BoundaryClock) -> None:
+            super().__init__()
+            self._response = response
+            self._clock = clock
+
+        def __call__(self, family: int, kind: int) -> FakeSocket:
+            self.calls.append((family, kind))
+            result = BoundarySocket(self._response, self._clock)
+            self.sockets.append(result)
+            return result
+
+    clock = BoundaryClock()
+    sockets = BoundaryFactory(http_response(200, b"{}"), clock)
+    scope = scope_fixture()
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+
+    response = direct_transport(scope, sockets, clock=clock).request(
+        scope,
+        endpoint,
+        source,
+        LanRequestRoute.OLLAMA_CATALOG,
+        deadline=20.0,
+        cancellation=NeverCancelled(),
+    )
+
+    assert response.body == b"{}"
+    assert sockets.sockets[0].closed is True
+
+
+def test_cancellation_after_recv_wins_before_returned_bytes_are_consumed() -> None:
+    class MutableCancellation:
+        cancelled = False
+
+        def is_cancelled(self) -> bool:
+            return self.cancelled
+
+    class CancellingSocket(FakeSocket):
+        def __init__(self, response: bytes, cancellation: MutableCancellation) -> None:
+            super().__init__(response)
+            self._cancellation = cancellation
+
+        def recv(self, size: int) -> bytes:
+            payload = super().recv(size)
+            self._cancellation.cancelled = True
+            return payload
+
+    class CancellingFactory(SocketFactory):
+        def __init__(self, response: bytes, cancellation: MutableCancellation) -> None:
+            super().__init__()
+            self._response = response
+            self._cancellation = cancellation
+
+        def __call__(self, family: int, kind: int) -> FakeSocket:
+            self.calls.append((family, kind))
+            result = CancellingSocket(self._response, self._cancellation)
+            self.sockets.append(result)
+            return result
+
+    cancellation = MutableCancellation()
+    sockets = CancellingFactory(http_response(200, b"{}"), cancellation)
+    scope = scope_fixture()
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+
+    with pytest.raises(LanTransportError) as captured:
+        direct_transport(scope, sockets).request(
+            scope,
+            endpoint,
+            source,
+            LanRequestRoute.OLLAMA_CATALOG,
+            deadline=2.0,
+            cancellation=cancellation,
+        )
+
+    assert captured.value.failure is LanTransportFailure.CANCELLED
+    assert captured.value.request_progress is LanRequestProgress.REQUEST_SENT
+    assert sockets.sockets[0].closed is True
+
+
+def test_request_failure_progress_is_closed_secret_free_and_tracks_request_boundary() -> None:
+    assert tuple(item.value for item in LanRequestProgress) == (
+        "not_started",
+        "connection_attempted",
+        "request_sent",
+    )
+
+    scope = scope_fixture()
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+    sockets = SocketFactory()
+    with pytest.raises(LanTransportError) as captured:
+        direct_transport(scope, sockets).request(
+            scope,
+            endpoint,
+            source,
+            LanRequestRoute.OLLAMA_CATALOG,
+            deadline=float("inf"),
+            cancellation=NeverCancelled(),
+        )
+    assert captured.value.failure is LanTransportFailure.HTTP_TIMEOUT
+    assert captured.value.request_progress is LanRequestProgress.NOT_STARTED
+    assert sockets.sockets == []
+
+    class FailingSendSocket(FakeSocket):
+        def sendall(self, payload: bytes) -> None:
+            del payload
+            raise OSError("secret sk-abcdefghijk at evil.invalid")
+
+    class FailingSendFactory(SocketFactory):
+        def __call__(self, family: int, kind: int) -> FakeSocket:
+            self.calls.append((family, kind))
+            result = FailingSendSocket()
+            self.sockets.append(result)
+            return result
+
+    sockets = FailingSendFactory()
+
+    with pytest.raises(LanTransportError) as captured:
+        direct_transport(scope, sockets).request(
+            scope,
+            endpoint,
+            source,
+            LanRequestRoute.OLLAMA_CATALOG,
+            deadline=2.0,
+            cancellation=NeverCancelled(),
+        )
+
+    assert captured.value.failure is LanTransportFailure.HTTP_CONNECT_FAILED
+    assert captured.value.request_progress is LanRequestProgress.CONNECTION_ATTEMPTED
+    assert "sk-" not in str(captured.value)
+    assert "evil.invalid" not in str(captured.value)
+    assert sockets.sockets[0].closed is True
+
+    sockets = SocketFactory(b"not-http")
+    with pytest.raises(LanTransportError) as captured:
+        direct_transport(scope, sockets).request(
+            scope,
+            endpoint,
+            source,
+            LanRequestRoute.OLLAMA_CATALOG,
+            deadline=2.0,
+            cancellation=NeverCancelled(),
+        )
+    assert captured.value.failure is LanTransportFailure.HTTP_PROTOCOL_REJECTED
+    assert captured.value.request_progress is LanRequestProgress.REQUEST_SENT
+    assert sockets.sockets[0].closed is True
+
+    with pytest.raises(TypeError, match="progress"):
+        LanTransportError(
+            LanTransportFailure.HTTP_TIMEOUT,
+            request_progress="request_sent",  # type: ignore[arg-type]
+        )

@@ -21,6 +21,7 @@ from nested_memvid_agent.lan_http_transport import (
     CurrentLanInterfaceInventory,
     CurrentLanInterfaceState,
     LanHttpResponse,
+    LanRequestProgress,
     LanRequestRoute,
     LanTransportError,
     LanTransportFailure,
@@ -113,6 +114,10 @@ class RecordingHttpTransport:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def request_progress(value: str) -> LanRequestProgress:
+    return LanRequestProgress(value)
 
 
 def candidate(scope: PrivateScanScope, address: str, port: int) -> LanCandidate:
@@ -564,6 +569,94 @@ def test_malformed_ollama_catalog_is_terminal_and_does_not_fall_through(body: by
     assert all(request[2] is LanRequestRoute.OLLAMA_CATALOG for request in http.requests)
 
 
+@pytest.mark.parametrize(
+    ("api", "body"),
+    (
+        ("ollama", b'{"models":[7]}'),
+        ("openai", b'{"data":[7]}'),
+    ),
+)
+def test_nonempty_untyped_catalog_list_does_not_establish_an_api_shape(
+    api: str,
+    body: bytes,
+) -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    responses: dict[LanRequestRoute, LanHttpResponse | Exception]
+    if api == "ollama":
+        responses = {LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(200, body)}
+    else:
+        responses = {
+            LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(404, b"missing"),
+            LanRequestRoute.OPENAI_CATALOG: LanHttpResponse(200, body),
+        }
+
+    observation = scan(
+        scope,
+        RecordingTcpProbe(),
+        RecordingHttpTransport(responses),
+    )[0]
+
+    assert observation.transport_security is TransportSecurity.PLAIN_HTTP
+    assert observation.api_shape is None
+    assert observation.catalog == ()
+    assert observation.catalog_complete is False
+    assert observation.failure_category is LanFailureCategory.CATALOG_INVALID
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_shape", "expected_catalog", "complete", "failure"),
+    (
+        (
+            b'{"models":[]}',
+            ApiShape.OLLAMA_COMPATIBLE,
+            (),
+            True,
+            LanFailureCategory.CATALOG_EMPTY,
+        ),
+        (
+            b'{"models":[{"name":"safe-model"},7]}',
+            ApiShape.OLLAMA_COMPATIBLE,
+            ("safe-model",),
+            False,
+            None,
+        ),
+        (
+            b'{"models":[{"name":"https://evil.invalid/model"}]}',
+            ApiShape.OLLAMA_COMPATIBLE,
+            (),
+            False,
+            LanFailureCategory.CATALOG_INVALID,
+        ),
+    ),
+)
+def test_api_shape_uses_typed_schema_evidence_independently_from_retained_models(
+    body: bytes,
+    expected_shape: ApiShape,
+    expected_catalog: tuple[str, ...],
+    complete: bool,
+    failure: LanFailureCategory | None,
+) -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    responses: dict[LanRequestRoute, LanHttpResponse | Exception] = {
+        LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(200, body),
+    }
+    if expected_catalog:
+        responses[LanRequestRoute.OLLAMA_GENERATION] = LanHttpResponse(
+            200, b'{"done":true,"response":"OK"}'
+        )
+
+    observation = scan(
+        scope,
+        RecordingTcpProbe(),
+        RecordingHttpTransport(responses),
+    )[0]
+
+    assert observation.api_shape is expected_shape
+    assert observation.catalog == expected_catalog
+    assert observation.catalog_complete is complete
+    assert observation.failure_category is failure
+
+
 def test_deeply_nested_bounded_json_is_a_catalog_failure_not_a_scanner_bug() -> None:
     scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
     body = b'{"models":' + (b"[" * 10_000) + b"0" + (b"]" * 10_000) + b"}"
@@ -728,10 +821,25 @@ def test_transport_failures_map_to_closed_secret_free_categories(
     expected: LanFailureCategory,
 ) -> None:
     scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    progress = (
+        "not_started"
+        if transport_failure
+        in {
+            LanTransportFailure.INTERFACE_CHANGED,
+            LanTransportFailure.INTERFACE_PINNING_UNAVAILABLE,
+        }
+        else (
+            "connection_attempted"
+            if transport_failure is LanTransportFailure.HTTP_CONNECT_FAILED
+            else "request_sent"
+        )
+    )
     http = RecordingHttpTransport(
         {
             LanRequestRoute.OLLAMA_CATALOG: LanTransportError(
-                transport_failure, "secret sk-abcdefghijk at evil.invalid"
+                transport_failure,
+                "secret sk-abcdefghijk at evil.invalid",
+                request_progress=request_progress(progress),
             )
         }
     )
@@ -751,8 +859,8 @@ def test_transport_failures_map_to_closed_secret_free_categories(
         (LanTransportFailure.CANCELLED, LanFailureCategory.CANCELLED, Reachability.NOT_ATTEMPTED),
         (
             LanTransportFailure.DEADLINE_EXCEEDED,
-            LanFailureCategory.SCAN_DEADLINE_EXCEEDED,
-            Reachability.NOT_ATTEMPTED,
+            LanFailureCategory.TCP_TIMEOUT,
+            Reachability.UNREACHABLE,
         ),
         (
             LanTransportFailure.INTERFACE_CHANGED,
@@ -791,6 +899,62 @@ def test_tcp_transport_failures_map_to_exact_closed_observation_categories(
     assert observation.failure_category is expected
     assert observation.reachability is reachability
     assert observation.transport_security is None
+
+
+def test_tcp_deadline_failure_uses_actual_scan_cap_not_the_local_tcp_cap() -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.60.1", 11434)
+
+    class MutableClock:
+        now = 100.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    class DeadlineTcp(RecordingTcpProbe):
+        def __init__(self, clock: MutableClock, completed_at: float) -> None:
+            super().__init__()
+            self._clock = clock
+            self._completed_at = completed_at
+            self.deadlines: list[float] = []
+
+        def tcp_reachable(self, scope, endpoint, source, *, deadline, cancellation):
+            del scope, endpoint, source, cancellation
+            self.deadlines.append(deadline)
+            self._clock.now = self._completed_at
+            raise LanTransportError(LanTransportFailure.DEADLINE_EXCEEDED)
+
+    local_clock = MutableClock()
+    local_tcp = DeadlineTcp(local_clock, 100.751)
+    local = probe_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=145.0,
+        cancellation=ScanCancellation(),
+        clock=local_clock,
+        tcp_probe=local_tcp,
+        http_transport=RecordingHttpTransport({}),
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+    assert local_tcp.deadlines == [100.75]
+    assert local.failure_category is LanFailureCategory.TCP_TIMEOUT
+    assert local.reachability is Reachability.UNREACHABLE
+
+    scan_clock = MutableClock()
+    scan_tcp = DeadlineTcp(scan_clock, 100.501)
+    capped = probe_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=100.5,
+        cancellation=ScanCancellation(),
+        clock=scan_clock,
+        tcp_probe=scan_tcp,
+        http_transport=RecordingHttpTransport({}),
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+    assert scan_tcp.deadlines == [100.5]
+    assert capped.failure_category is LanFailureCategory.SCAN_DEADLINE_EXCEEDED
+    assert capped.reachability is Reachability.NOT_ATTEMPTED
 
 
 def test_output_is_frozen_and_contains_no_raw_network_metadata() -> None:
@@ -882,7 +1046,10 @@ def test_generation_transport_failure_preserves_catalog_and_is_observed_failure(
             LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(
                 200, b'{"models":[{"name":"safe-model"}]}'
             ),
-            LanRequestRoute.OLLAMA_GENERATION: LanTransportError(transport_failure),
+            LanRequestRoute.OLLAMA_GENERATION: LanTransportError(
+                transport_failure,
+                request_progress=request_progress("request_sent"),
+            ),
         }
     )
 
@@ -894,6 +1061,101 @@ def test_generation_transport_failure_preserves_catalog_and_is_observed_failure(
     assert observation.failure_category is expected
     assert observation.capabilities[0].status is CapabilityObservationStatus.OBSERVED_FAILURE
     assert observation.capabilities[0].supported is None
+
+
+@pytest.mark.parametrize(
+    ("transport_failure", "expected_failure"),
+    (
+        (LanTransportFailure.CANCELLED, LanFailureCategory.CANCELLED),
+        (
+            LanTransportFailure.DEADLINE_EXCEEDED,
+            LanFailureCategory.SCAN_DEADLINE_EXCEEDED,
+        ),
+        (LanTransportFailure.HTTP_TIMEOUT, LanFailureCategory.HTTP_TIMEOUT),
+    ),
+)
+@pytest.mark.parametrize(
+    ("progress", "expected_transport"),
+    (
+        ("not_started", None),
+        ("connection_attempted", TransportSecurity.PLAIN_HTTP),
+        ("request_sent", TransportSecurity.PLAIN_HTTP),
+    ),
+)
+def test_catalog_transport_evidence_uses_closed_request_progress(
+    transport_failure: LanTransportFailure,
+    expected_failure: LanFailureCategory,
+    progress: str,
+    expected_transport: TransportSecurity | None,
+) -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    http = RecordingHttpTransport(
+        {
+            LanRequestRoute.OLLAMA_CATALOG: LanTransportError(
+                transport_failure,
+                request_progress=request_progress(progress),
+            )
+        }
+    )
+
+    observation = scan(scope, RecordingTcpProbe(), http)[0]
+
+    assert observation.failure_category is expected_failure
+    assert observation.transport_security is expected_transport
+    assert observation.capabilities[0].status is CapabilityObservationStatus.NOT_RUN
+
+
+@pytest.mark.parametrize(
+    ("transport_failure", "expected_failure"),
+    (
+        (LanTransportFailure.CANCELLED, LanFailureCategory.CANCELLED),
+        (
+            LanTransportFailure.DEADLINE_EXCEEDED,
+            LanFailureCategory.SCAN_DEADLINE_EXCEEDED,
+        ),
+        (LanTransportFailure.HTTP_TIMEOUT, LanFailureCategory.HTTP_TIMEOUT),
+    ),
+)
+@pytest.mark.parametrize(
+    ("progress", "expected_status"),
+    (
+        ("not_started", CapabilityObservationStatus.NOT_RUN),
+        ("connection_attempted", CapabilityObservationStatus.NOT_RUN),
+        ("request_sent", CapabilityObservationStatus.OBSERVED_FAILURE),
+    ),
+)
+def test_generation_observation_uses_send_completion_not_failure_enum_guessing(
+    transport_failure: LanTransportFailure,
+    expected_failure: LanFailureCategory,
+    progress: str,
+    expected_status: CapabilityObservationStatus,
+) -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    http = RecordingHttpTransport(
+        {
+            LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(
+                200, b'{"models":[{"name":"safe-model"}]}'
+            ),
+            LanRequestRoute.OLLAMA_GENERATION: LanTransportError(
+                transport_failure,
+                request_progress=request_progress(progress),
+            ),
+        }
+    )
+
+    observation = scan(scope, RecordingTcpProbe(), http)[0]
+
+    assert observation.failure_category is expected_failure
+    assert observation.transport_security is TransportSecurity.PLAIN_HTTP
+    assert observation.api_shape is ApiShape.OLLAMA_COMPATIBLE
+    assert observation.catalog == ("safe-model",)
+    assert observation.capabilities[0].status is expected_status
+    if expected_status is CapabilityObservationStatus.OBSERVED_FAILURE:
+        assert observation.capability_route == LanRequestRoute.OLLAMA_GENERATION.path
+        assert observation.selected_model_id == "safe-model"
+    else:
+        assert observation.capability_route is None
+        assert observation.selected_model_id is None
 
 
 @pytest.mark.parametrize(
@@ -1122,6 +1384,95 @@ def test_observation_consistency_rejects_impossible_reachability_and_capability_
 
     with pytest.raises(ValueError):
         replace(observation, capabilities=(object(), *observation.capabilities[1:]))
+
+
+def test_pre_api_observation_matrix_requires_exact_transport_evidence() -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.60.1", 11434)
+    response_proven_failures = (
+        LanFailureCategory.CATALOG_NOT_FOUND,
+        LanFailureCategory.HTTP_STATUS_REJECTED,
+        LanFailureCategory.HTTP_PROTOCOL_REJECTED,
+        LanFailureCategory.REDIRECT_REJECTED,
+        LanFailureCategory.RESPONSE_TOO_LARGE,
+        LanFailureCategory.UNSUPPORTED_CONTENT_ENCODING,
+        LanFailureCategory.CATALOG_INVALID,
+    )
+    for failure in response_proven_failures:
+        with pytest.raises(ValueError, match="transport|HTTP|plain"):
+            lan_scanner_module._make_observation(
+                endpoint,
+                reachability=Reachability.REACHABLE,
+                failure_category=failure,
+            )
+        observation = lan_scanner_module._make_observation(
+            endpoint,
+            reachability=Reachability.REACHABLE,
+            transport_security=TransportSecurity.PLAIN_HTTP,
+            failure_category=failure,
+        )
+        assert observation.transport_security is TransportSecurity.PLAIN_HTTP
+
+    for failure in (
+        LanFailureCategory.INTERFACE_DRIFT,
+        LanFailureCategory.INTERFACE_PINNING_UNAVAILABLE,
+    ):
+        with pytest.raises(ValueError, match="transport|interface"):
+            lan_scanner_module._make_observation(
+                endpoint,
+                reachability=Reachability.REACHABLE,
+                transport_security=TransportSecurity.PLAIN_HTTP,
+                failure_category=failure,
+            )
+        observation = lan_scanner_module._make_observation(
+            endpoint,
+            reachability=Reachability.REACHABLE,
+            failure_category=failure,
+        )
+        assert observation.transport_security is None
+
+    for failure in (
+        LanFailureCategory.CANCELLED,
+        LanFailureCategory.SCAN_DEADLINE_EXCEEDED,
+        LanFailureCategory.HTTP_TIMEOUT,
+    ):
+        for transport in (None, TransportSecurity.PLAIN_HTTP):
+            observation = lan_scanner_module._make_observation(
+                endpoint,
+                reachability=Reachability.REACHABLE,
+                transport_security=transport,
+                failure_category=failure,
+            )
+            assert observation.transport_security is transport
+
+
+@pytest.mark.parametrize(
+    "transport_failure",
+    (
+        LanTransportFailure.INTERFACE_CHANGED,
+        LanTransportFailure.INTERFACE_PINNING_UNAVAILABLE,
+    ),
+)
+def test_pre_api_interface_failures_never_claim_plain_http_even_after_connection_progress(
+    transport_failure: LanTransportFailure,
+) -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    http = RecordingHttpTransport(
+        {
+            LanRequestRoute.OLLAMA_CATALOG: LanTransportError(
+                transport_failure,
+                request_progress=request_progress("connection_attempted"),
+            )
+        }
+    )
+
+    observation = scan(scope, RecordingTcpProbe(), http)[0]
+
+    assert observation.transport_security is None
+    assert observation.failure_category in {
+        LanFailureCategory.INTERFACE_DRIFT,
+        LanFailureCategory.INTERFACE_PINNING_UNAVAILABLE,
+    }
 
 
 @pytest.mark.parametrize(

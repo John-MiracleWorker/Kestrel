@@ -56,6 +56,7 @@ _CREDENTIAL_RE = re.compile(
     re.IGNORECASE,
 )
 _CHUNK_SIZE_RE = re.compile(rb"[0-9A-Fa-f]+\Z")
+_LOCALHOST_RE = re.compile(r"(?<![A-Za-z0-9-])localhost(?![A-Za-z0-9-])", re.IGNORECASE)
 
 
 class CancellationToken(Protocol):
@@ -97,6 +98,12 @@ class LanRequestRoute(StrEnum):
         }[self]
 
 
+class LanRequestProgress(StrEnum):
+    NOT_STARTED = "not_started"
+    CONNECTION_ATTEMPTED = "connection_attempted"
+    REQUEST_SENT = "request_sent"
+
+
 class LanTransportFailure(StrEnum):
     CANCELLED = "cancelled"
     DEADLINE_EXCEEDED = "deadline_exceeded"
@@ -135,10 +142,19 @@ _PUBLIC_FAILURE_MESSAGES: dict[LanTransportFailure, str] = {
 class LanTransportError(RuntimeError):
     """A closed failure that deliberately discards hostile exception details."""
 
-    def __init__(self, failure: LanTransportFailure, _untrusted_detail: str | None = None) -> None:
+    def __init__(
+        self,
+        failure: LanTransportFailure,
+        _untrusted_detail: str | None = None,
+        *,
+        request_progress: LanRequestProgress = LanRequestProgress.NOT_STARTED,
+    ) -> None:
         if not isinstance(failure, LanTransportFailure):
             raise TypeError("LAN transport failure must use the closed enum")
+        if type(request_progress) is not LanRequestProgress:
+            raise TypeError("LAN request progress must use the closed enum")
         self.failure = failure
+        self.request_progress = request_progress
         super().__init__(_PUBLIC_FAILURE_MESSAGES[failure])
 
 
@@ -462,6 +478,7 @@ class DirectLanHttpTransport:
         )
         request = _request_bytes(canonical_endpoint, route, model)
         connection: SocketLike | None = None
+        request_progress = LanRequestProgress.NOT_STARTED
         try:
             _remaining(
                 effective_deadline,
@@ -469,6 +486,7 @@ class DirectLanHttpTransport:
                 self._clock,
                 deadline_failure=LanTransportFailure.HTTP_TIMEOUT,
             )
+            request_progress = LanRequestProgress.CONNECTION_ATTEMPTED
             connection = self._socket_factory(family, socket.SOCK_STREAM)
             _pin_socket(connection, family, fresh_source, self._platform_name)
             connection.settimeout(
@@ -486,6 +504,7 @@ class DirectLanHttpTransport:
             connection.connect(destination_sockaddr)
             _set_http_deadline(connection, effective_deadline, cancellation, self._clock)
             connection.sendall(request)
+            request_progress = LanRequestProgress.REQUEST_SENT
             status, headers, initial_body = _read_response_head(
                 connection, effective_deadline, cancellation, self._clock
             )
@@ -501,13 +520,28 @@ class DirectLanHttpTransport:
                 cancellation,
                 self._clock,
             )
+            _check_completed_deadline(
+                effective_deadline,
+                cancellation,
+                self._clock,
+                deadline_failure=LanTransportFailure.HTTP_TIMEOUT,
+            )
             return LanHttpResponse(status, body)
-        except LanTransportError:
-            raise
+        except LanTransportError as exc:
+            raise LanTransportError(
+                exc.failure,
+                request_progress=request_progress,
+            ) from exc
         except TimeoutError as exc:
-            raise LanTransportError(LanTransportFailure.HTTP_TIMEOUT) from exc
+            raise LanTransportError(
+                LanTransportFailure.HTTP_TIMEOUT,
+                request_progress=request_progress,
+            ) from exc
         except OSError as exc:
-            raise LanTransportError(LanTransportFailure.HTTP_CONNECT_FAILED) from exc
+            raise LanTransportError(
+                LanTransportFailure.HTTP_CONNECT_FAILED,
+                request_progress=request_progress,
+            ) from exc
         finally:
             if connection is not None:
                 connection.close()
@@ -663,6 +697,12 @@ def _read_response_head(
             raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED)
         _set_http_deadline(connection, deadline, cancellation, clock)
         chunk = connection.recv(min(4096, MAX_HTTP_HEADER_BYTES + len(delimiter) - len(buffer)))
+        _check_completed_deadline(
+            deadline,
+            cancellation,
+            clock,
+            deadline_failure=LanTransportFailure.HTTP_TIMEOUT,
+        )
         if not chunk:
             raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED)
         buffer.extend(chunk)
@@ -798,6 +838,12 @@ class _BoundedSocketReader:
     def _receive(self, size: int, *, eof_ok: bool = False) -> bytes:
         _set_http_deadline(self._connection, self._deadline, self._cancellation, self._clock)
         chunk = self._connection.recv(max(1, size))
+        _check_completed_deadline(
+            self._deadline,
+            self._cancellation,
+            self._clock,
+            deadline_failure=LanTransportFailure.HTTP_TIMEOUT,
+        )
         if not chunk and not eof_ok:
             raise LanTransportError(LanTransportFailure.HTTP_PROTOCOL_REJECTED)
         self._buffer.extend(chunk)
@@ -882,17 +928,43 @@ def _validate_probe_model_id(value: str) -> str:
         raise ValueError("LAN probe model must use NFC normalization")
     if any(unicodedata.category(character).startswith("C") for character in value):
         raise ValueError("LAN probe model contains control material")
+    contains_transport = _contains_transport_material(
+        value,
+        allowed_dotted_value=None,
+        allow_numeric_version=False,
+    )
+    canonical_name_tag = _is_canonical_model_name_tag(value)
     if (
-        _contains_transport_material(
-            value,
-            allowed_dotted_value=None,
-            allow_numeric_version=False,
-        )
+        _LOCALHOST_RE.search(value)
+        or ((":" in value or contains_transport) and not canonical_name_tag)
         or _CREDENTIAL_RE.search(value)
         or redact_text(value) != value
     ):
         raise ValueError("LAN probe model contains transport or credential material")
     return value
+
+
+def _is_canonical_model_name_tag(value: str) -> bool:
+    if value.count(":") != 1:
+        return False
+    name, tag = value.split(":", 1)
+    if (
+        not name
+        or not tag
+        or name.casefold() == "localhost"
+        or tag.isdecimal()
+        or re.search(r"[A-Za-z]", tag) is None
+    ):
+        return False
+    return not _contains_transport_material(
+        name,
+        allowed_dotted_value=None,
+        allow_numeric_version=False,
+    ) and not _contains_transport_material(
+        tag,
+        allowed_dotted_value=None,
+        allow_numeric_version=False,
+    )
 
 
 def _is_eligible_interface_address(value: str) -> bool:

@@ -35,6 +35,7 @@ from nested_memvid_agent.lan_http_transport import (
     InterfaceInventoryResolver,
     LanHttpResponse,
     LanProbeModel,
+    LanRequestProgress,
     LanRequestRoute,
     LanTransportError,
     LanTransportFailure,
@@ -372,6 +373,7 @@ class LanEndpointObservation:
             LanFailureCategory.HTTP_TIMEOUT,
         }
         generation_failures = {
+            LanFailureCategory.CANCELLED,
             LanFailureCategory.SCAN_DEADLINE_EXCEEDED,
             LanFailureCategory.HTTP_TIMEOUT,
             LanFailureCategory.HTTP_PROTOCOL_REJECTED,
@@ -381,7 +383,26 @@ class LanEndpointObservation:
             LanFailureCategory.GENERATION_REQUEST_FAILED,
             LanFailureCategory.GENERATION_RESPONSE_INVALID,
         }
+        response_proven_failures = {
+            LanFailureCategory.HTTP_PROTOCOL_REJECTED,
+            LanFailureCategory.REDIRECT_REJECTED,
+            LanFailureCategory.RESPONSE_TOO_LARGE,
+            LanFailureCategory.UNSUPPORTED_CONTENT_ENCODING,
+            LanFailureCategory.HTTP_STATUS_REJECTED,
+            LanFailureCategory.CATALOG_NOT_FOUND,
+            LanFailureCategory.CATALOG_INVALID,
+        }
+        interface_failures = {
+            LanFailureCategory.INTERFACE_DRIFT,
+            LanFailureCategory.INTERFACE_PINNING_UNAVAILABLE,
+        }
         if self.reachability is Reachability.REACHABLE:
+            if self.api_shape is None and self.failure_category in response_proven_failures:
+                if self.transport_security is not TransportSecurity.PLAIN_HTTP:
+                    raise ValueError("LAN response failure requires plain HTTP transport evidence")
+            if self.api_shape is None and self.failure_category in interface_failures:
+                if self.transport_security is not None:
+                    raise ValueError("LAN interface failure cannot claim HTTP transport evidence")
             if self.api_shape is None and self.failure_category not in pre_api_failures:
                 raise ValueError("LAN failure does not match the pre-catalog phase")
             if self.api_shape is not None and not self.catalog:
@@ -689,20 +710,28 @@ def probe_lan_endpoint(
             cancellation=cancellation,
         )
     except LanTransportError as exc:
+        tcp_failure = _map_tcp_failure(exc.failure)
+        reachability = (
+            Reachability.NOT_ATTEMPTED
+            if exc.failure
+            in {
+                LanTransportFailure.CANCELLED,
+                LanTransportFailure.INTERFACE_CHANGED,
+                LanTransportFailure.INTERFACE_PINNING_UNAVAILABLE,
+            }
+            else Reachability.UNREACHABLE
+        )
+        if exc.failure is LanTransportFailure.DEADLINE_EXCEEDED:
+            if clock() >= scan_deadline:
+                tcp_failure = LanFailureCategory.SCAN_DEADLINE_EXCEEDED
+                reachability = Reachability.NOT_ATTEMPTED
+            else:
+                tcp_failure = LanFailureCategory.TCP_TIMEOUT
+                reachability = Reachability.UNREACHABLE
         return _make_observation(
             canonical_endpoint,
-            reachability=(
-                Reachability.NOT_ATTEMPTED
-                if exc.failure
-                in {
-                    LanTransportFailure.CANCELLED,
-                    LanTransportFailure.DEADLINE_EXCEEDED,
-                    LanTransportFailure.INTERFACE_CHANGED,
-                    LanTransportFailure.INTERFACE_PINNING_UNAVAILABLE,
-                }
-                else Reachability.UNREACHABLE
-            ),
-            failure_category=_map_tcp_failure(exc.failure),
+            reachability=reachability,
+            failure_category=tcp_failure,
         )
     except Exception:
         return _make_observation(
@@ -784,11 +813,18 @@ def probe_lan_endpoint(
         )
 
     try:
-        models, complete, truncated, invalid_entries = _parse_catalog(
+        models, complete, truncated, invalid_entries, schema_established = _parse_catalog(
             response.body,
             api_shape,
         )
     except ValueError:
+        return _make_observation(
+            canonical_endpoint,
+            reachability=Reachability.REACHABLE,
+            transport_security=transport_security,
+            failure_category=LanFailureCategory.CATALOG_INVALID,
+        )
+    if not schema_established:
         return _make_observation(
             canonical_endpoint,
             reachability=Reachability.REACHABLE,
@@ -883,8 +919,8 @@ def _request_phase(
             endpoint,
             LanFailureCategory.CANCELLED,
             established,
-            http_attempted=False,
-            generation_attempted=False,
+            transport_observed=False,
+            generation_observed=False,
         )
     now = clock()
     if now >= deadline:
@@ -896,8 +932,8 @@ def _request_phase(
                 else LanFailureCategory.HTTP_TIMEOUT
             ),
             established,
-            http_attempted=False,
-            generation_attempted=False,
+            transport_observed=False,
+            generation_observed=False,
         )
     try:
         source = authenticate_lan_source(scope, endpoint, inventory_resolver)
@@ -906,8 +942,8 @@ def _request_phase(
             endpoint,
             LanFailureCategory.INTERFACE_DRIFT,
             established,
-            http_attempted=False,
-            generation_attempted=False,
+            transport_observed=False,
+            generation_observed=False,
         )
     try:
         response = http_transport.request(
@@ -923,17 +959,24 @@ def _request_phase(
         failure = _map_http_failure(exc.failure, generation=model is not None)
         if failure is LanFailureCategory.HTTP_TIMEOUT and clock() >= scan_deadline:
             failure = LanFailureCategory.SCAN_DEADLINE_EXCEEDED
-        request_started = failure not in {
-            LanFailureCategory.CANCELLED,
+        interface_failure = failure in {
             LanFailureCategory.INTERFACE_DRIFT,
             LanFailureCategory.INTERFACE_PINNING_UNAVAILABLE,
         }
+        transport_observed = (
+            exc.request_progress is not LanRequestProgress.NOT_STARTED and not interface_failure
+        )
+        generation_observed = (
+            model is not None
+            and exc.request_progress is LanRequestProgress.REQUEST_SENT
+            and not interface_failure
+        )
         return _phase_failure_observation(
             endpoint,
             failure,
             established,
-            http_attempted=request_started,
-            generation_attempted=model is not None and request_started,
+            transport_observed=transport_observed,
+            generation_observed=generation_observed,
         )
     except Exception:
         return _phase_failure_observation(
@@ -944,8 +987,8 @@ def _request_phase(
                 else LanFailureCategory.HTTP_PROTOCOL_REJECTED
             ),
             established,
-            http_attempted=True,
-            generation_attempted=model is not None,
+            transport_observed=True,
+            generation_observed=False,
         )
     if type(response) is not LanHttpResponse:
         return _phase_failure_observation(
@@ -956,8 +999,8 @@ def _request_phase(
                 else LanFailureCategory.HTTP_PROTOCOL_REJECTED
             ),
             established,
-            http_attempted=True,
-            generation_attempted=model is not None,
+            transport_observed=True,
+            generation_observed=model is not None,
         )
     try:
         canonical_response = LanHttpResponse(response.status_code, response.body)
@@ -970,8 +1013,8 @@ def _request_phase(
                 else LanFailureCategory.HTTP_PROTOCOL_REJECTED
             ),
             established,
-            http_attempted=True,
-            generation_attempted=model is not None,
+            transport_observed=True,
+            generation_observed=model is not None,
         )
     if response != canonical_response:
         return _phase_failure_observation(
@@ -982,8 +1025,8 @@ def _request_phase(
                 else LanFailureCategory.HTTP_PROTOCOL_REJECTED
             ),
             established,
-            http_attempted=True,
-            generation_attempted=model is not None,
+            transport_observed=True,
+            generation_observed=model is not None,
         )
     return canonical_response, TransportSecurity.PLAIN_HTTP
 
@@ -993,20 +1036,20 @@ def _phase_failure_observation(
     failure: LanFailureCategory,
     established: tuple[ApiShape, tuple[str, ...], bool, bool] | None,
     *,
-    http_attempted: bool,
-    generation_attempted: bool,
+    transport_observed: bool,
+    generation_observed: bool,
 ) -> LanEndpointObservation:
     if established is None:
         return _make_observation(
             endpoint,
             reachability=Reachability.REACHABLE,
-            transport_security=TransportSecurity.PLAIN_HTTP if http_attempted else None,
+            transport_security=TransportSecurity.PLAIN_HTTP if transport_observed else None,
             failure_category=failure,
         )
     api_shape, catalog, complete, truncated = established
     capabilities = (
         _capabilities_with_generation(passed=False)
-        if generation_attempted
+        if generation_observed
         else _not_run_capabilities()
     )
     return _make_observation(
@@ -1127,7 +1170,7 @@ def _safe_candidate_display_text(value: str, *, field: str | None) -> bool:
 def _parse_catalog(
     body: bytes,
     api_shape: ApiShape,
-) -> tuple[tuple[str, ...], bool, bool, bool]:
+) -> tuple[tuple[str, ...], bool, bool, bool, bool]:
     payload = _strict_json_object(body)
     key = "models" if api_shape is ApiShape.OLLAMA_COMPATIBLE else "data"
     model_key = "name" if api_shape is ApiShape.OLLAMA_COMPATIBLE else "id"
@@ -1136,6 +1179,7 @@ def _parse_catalog(
         raise ValueError("catalog shape is invalid")
     valid: set[str] = set()
     invalid_entries = False
+    typed_entries = False
     for item in raw_models:
         if type(item) is not dict:
             invalid_entries = True
@@ -1144,6 +1188,7 @@ def _parse_catalog(
         if type(raw_model) is not str:
             invalid_entries = True
             continue
+        typed_entries = True
         try:
             model = LanProbeModel.from_catalog(raw_model).model_id
         except (TypeError, ValueError):
@@ -1157,7 +1202,8 @@ def _parse_catalog(
     truncated = len(ordered) > MAX_DISCOVERED_MODELS
     retained = ordered[:MAX_DISCOVERED_MODELS]
     complete = not invalid_entries and not truncated
-    return retained, complete, truncated, invalid_entries
+    schema_established = not raw_models or typed_entries
+    return retained, complete, truncated, invalid_entries, schema_established
 
 
 def _strict_json_object(body: bytes) -> dict[str, object]:
