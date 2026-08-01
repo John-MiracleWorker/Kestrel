@@ -32,7 +32,11 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     assert locked_versions["build"] == "1.5.0"
     assert locked_versions["keyring"] == "25.7.0"
     keyring_deps = project["optional-dependencies"]["keyring"]
+    lan_discovery_deps = project["optional-dependencies"]["lan-discovery"]
     assert any(str(dep).startswith("keyring>=25.6.0") for dep in keyring_deps)
+    assert lan_discovery_deps == ["psutil==7.2.2", "zeroconf==0.150.0"]
+    assert locked_versions["psutil"] == "7.2.2"
+    assert locked_versions["zeroconf"] == "0.150.0"
     assert "mcp>=1.0,<2" in project["optional-dependencies"]["mcp"]
     assert project["description"].startswith("Kestrel:")
     assert project["scripts"]["kestrel-desktop-sidecar"] == (

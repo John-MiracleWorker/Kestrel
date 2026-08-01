@@ -36,6 +36,10 @@ gemini = ["google-genai>=0.3"]
 server = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.31", "starlette>=1.3.1"]
 mcp = ["mcp>=1.0,<2", "cryptography>=48.0.1", "httplib2>=0.32.0"]
 keyring = ["keyring>=25.6.0"]
+lan-discovery = [
+  "psutil==7.2.2",
+  "zeroconf==0.150.0",
+]
 dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "build==1.5.0", "cryptography>=48.0.1", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "pygments>=2.20.0"]
 
 [dependency-groups]
