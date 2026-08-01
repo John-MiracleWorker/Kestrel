@@ -273,6 +273,15 @@ jobs:
       - name: Build desktop contracts
         run: npm run build
         working-directory: desktop
+      - name: Build web renderer for e2e
+        run: npm ci && npm run build
+        working-directory: web
+      - name: Install Playwright chromium
+        run: npx playwright install chromium --with-deps
+        working-directory: desktop
+      - name: Run installed-renderer e2e journeys
+        run: npm run e2e
+        working-directory: desktop
 
   codeql:
     name: CodeQL

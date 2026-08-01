@@ -666,3 +666,37 @@ def test_desktop_workspace_is_exact_pinned_and_emits_hardened_main() -> None:
     ).read_text(encoding="utf-8")
     assert "const CYCLE_TIMEOUT_MS = 150_000;" in smoke_source
     assert "const CYCLE_TIMEOUT_MS = 60_000;" not in smoke_source
+
+
+def test_desktop_e2e_harness_is_pinned_no_live_provider_and_ci_wired() -> None:
+    """Task 14: the installed-renderer e2e harness stays deterministic.
+
+    Guards the contracts that keep the rendered validation honest:
+    Playwright is pinned, no journey can reach a live provider, motion is
+    disabled via the supported preference (not CSS injection), and CI runs
+    the suite.
+    """
+    pkg = json.loads(
+        (ROOT / "desktop" / "package.json").read_text(encoding="utf-8")
+    )
+    assert pkg["scripts"]["e2e"] == "playwright test --config playwright.config.ts"
+    playwright_dep = pkg["devDependencies"].get("@playwright/test", "")
+    assert playwright_dep and playwright_dep[0].isdigit(), (
+        "@playwright/test must be pinned to an exact version, "
+        f"got {playwright_dep!r}"
+    )
+
+    fixtures = (ROOT / "desktop" / "e2e" / "fixtures.ts").read_text(
+        encoding="utf-8"
+    )
+    # Every mutation outside the deterministic Demo allowlist fails loudly;
+    # nothing falls through to a live provider.
+    assert "e2e_fixture_refused_mutation" in fixtures
+    assert "e2e_fixture_refused_non_api_request" in fixtures
+    # Motion is disabled through the supported storage preference.
+    assert "kestrel.motion.preference.v1" in fixtures
+
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "npm run e2e" in ci
