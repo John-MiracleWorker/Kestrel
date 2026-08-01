@@ -110,6 +110,124 @@ def _lan_table_snapshot(
     return values, canonical_bytes
 
 
+def _install_pre_hardening_nullable_v3_schema(state: AgentStateStore) -> None:
+    statements = (
+        """
+        CREATE TABLE routing_schema_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        INSERT INTO routing_schema_version (id, version, updated_at)
+        VALUES (1, 3, '2026-08-01T00:00:00Z')
+        """,
+        """
+        CREATE TABLE routing_lan_scans (
+            scan_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'draft', 'running', 'cancelling', 'cancelled',
+                    'completed', 'failed', 'interrupted'
+                )
+            ),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            owner_principal TEXT NOT NULL,
+            confirmed_interface_id TEXT NOT NULL,
+            network TEXT NOT NULL,
+            limits_json TEXT NOT NULL,
+            limits_digest TEXT NOT NULL,
+            preview_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            cancel_reason TEXT,
+            terminal_reason TEXT,
+            candidate_count INTEGER CHECK (
+                candidate_count IS NULL OR candidate_count >= 0
+            ),
+            error_count INTEGER CHECK (error_count IS NULL OR error_count >= 0),
+            timeout_count INTEGER CHECK (timeout_count IS NULL OR timeout_count >= 0),
+            terminal_receipt_json TEXT,
+            terminal_receipt_digest TEXT,
+            CHECK (
+                (terminal_receipt_json IS NULL AND terminal_receipt_digest IS NULL)
+                OR
+                (terminal_receipt_json IS NOT NULL
+                 AND terminal_receipt_digest IS NOT NULL)
+            )
+        )
+        """,
+        """
+        CREATE TABLE routing_lan_observations (
+            scan_id TEXT NOT NULL,
+            endpoint_id TEXT NOT NULL,
+            source TEXT NOT NULL CHECK (source IN ('mdns', 'active', 'manual')),
+            interface_id TEXT NOT NULL,
+            address TEXT NOT NULL,
+            port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+            api_shape TEXT,
+            tls_enabled INTEGER NOT NULL CHECK (tls_enabled IN (0, 1)),
+            certificate_sha256 TEXT,
+            catalog_digest TEXT,
+            capability_digest TEXT,
+            public_payload_json TEXT NOT NULL,
+            freshness_timestamp TEXT NOT NULL,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (scan_id, endpoint_id),
+            UNIQUE (scan_id, endpoint_id),
+            FOREIGN KEY (scan_id)
+                REFERENCES routing_lan_scans(scan_id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE routing_lan_scan_events (
+            scan_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (scan_id, sequence),
+            FOREIGN KEY (scan_id)
+                REFERENCES routing_lan_scans(scan_id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TRIGGER trg_routing_lan_scan_id_update_immutable
+        BEFORE UPDATE OF scan_id ON routing_lan_scans
+        WHEN NEW.scan_id <> OLD.scan_id
+        BEGIN
+            SELECT RAISE(ABORT, 'lan_scan_identity_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER trg_routing_lan_pristine_draft_insert_required
+        BEFORE INSERT ON routing_lan_scans
+        WHEN NEW.status <> 'draft'
+          OR NEW.revision <> 1
+          OR NEW.created_at <> NEW.updated_at
+          OR NEW.started_at IS NOT NULL
+          OR NEW.finished_at IS NOT NULL
+          OR NEW.cancel_reason IS NOT NULL
+          OR NEW.terminal_reason IS NOT NULL
+          OR NEW.candidate_count IS NOT NULL
+          OR NEW.error_count IS NOT NULL
+          OR NEW.timeout_count IS NOT NULL
+          OR NEW.terminal_receipt_json IS NOT NULL
+          OR NEW.terminal_receipt_digest IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'lan_scan_insert_requires_pristine_draft');
+        END
+        """,
+    )
+    with state._connect() as connection:
+        for statement in statements:
+            connection.execute(statement)
+
+
 def test_create_scan_persists_canonical_limits_digest_and_enforces_foreign_keys(
     lan_ledger: LanDiscoveryLedger,
     state: AgentStateStore,
@@ -771,6 +889,185 @@ def test_update_or_replace_cannot_rename_draft_over_zero_child_terminal_scan(
     assert lan_ledger.get_scan(draft.scan_id) == draft
 
 
+def test_scan_identity_rejects_valid_id_to_null_update(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    draft = _create_scan(lan_ledger, scan_id="lan_valid_to_null")
+    before_values, before_bytes = _lan_table_snapshot(state, "routing_lan_scans")
+
+    with pytest.raises(sqlite3.IntegrityError, match="lan_scan_identity_immutable"):
+        with state._connect() as connection:
+            connection.execute(
+                "UPDATE routing_lan_scans SET scan_id = NULL WHERE scan_id = ?",
+                (draft.scan_id,),
+            )
+
+    after_values, after_bytes = _lan_table_snapshot(state, "routing_lan_scans")
+    assert after_values == before_values
+    assert after_bytes == before_bytes
+    assert lan_ledger.get_scan(draft.scan_id) == draft
+
+
+def test_pristine_scan_insert_rejects_null_identity(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    source = _create_scan(lan_ledger, scan_id="lan_null_insert_source")
+    before_values, before_bytes = _lan_table_snapshot(state, "routing_lan_scans")
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="lan_scan_insert_requires_pristine_draft",
+    ):
+        with state._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO routing_lan_scans (
+                    scan_id, status, revision, owner_principal,
+                    confirmed_interface_id, network, limits_json, limits_digest,
+                    preview_digest, created_at, updated_at, started_at, finished_at,
+                    cancel_reason, terminal_reason, candidate_count, error_count,
+                    timeout_count, terminal_receipt_json, terminal_receipt_digest
+                )
+                SELECT NULL, status, revision, owner_principal,
+                       confirmed_interface_id, network, limits_json, limits_digest,
+                       preview_digest, created_at, updated_at, started_at, finished_at,
+                       cancel_reason, terminal_reason, candidate_count, error_count,
+                       timeout_count, terminal_receipt_json, terminal_receipt_digest
+                FROM routing_lan_scans WHERE scan_id = ?
+                """,
+                (source.scan_id,),
+            )
+
+    after_values, after_bytes = _lan_table_snapshot(state, "routing_lan_scans")
+    assert after_values == before_values
+    assert after_bytes == before_bytes
+    with state._connect() as connection:
+        null_count = connection.execute(
+            "SELECT COUNT(*) FROM routing_lan_scans WHERE scan_id IS NULL"
+        ).fetchone()
+    assert null_count is not None
+    assert null_count[0] == 0
+
+
+def test_existing_v3_null_scan_identity_guards_upgrade_without_trigger_replacement(
+    tmp_path: Path,
+) -> None:
+    legacy_state = AgentStateStore(tmp_path / "legacy-v3" / "agent.db")
+    _install_pre_hardening_nullable_v3_schema(legacy_state)
+    limits_json = json.dumps(
+        _limits(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    limits_digest = "sha256:" + hashlib.sha256(limits_json.encode("utf-8")).hexdigest()
+
+    with legacy_state._connect() as connection:
+        columns = {
+            str(row[1]): int(row[3])
+            for row in connection.execute(
+                "PRAGMA table_info(routing_lan_scans)"
+            ).fetchall()
+        }
+        assert columns["scan_id"] == 0
+        connection.execute(
+            """
+            INSERT INTO routing_lan_scans (
+                scan_id, status, revision, owner_principal,
+                confirmed_interface_id, network, limits_json, limits_digest,
+                preview_digest, created_at, updated_at
+            ) VALUES (
+                NULL, 'draft', 1, 'owner:test', ?, '192.168.10.0/30', ?, ?, ?,
+                '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z'
+            )
+            """,
+            (INTERFACE_ID, limits_json, limits_digest, PREVIEW_DIGEST),
+        )
+
+    before_values, before_bytes = _lan_table_snapshot(
+        legacy_state,
+        "routing_lan_scans",
+    )
+    assert len(before_values) == 1
+    LanDiscoveryLedger(legacy_state)
+    with legacy_state._connect() as connection:
+        restored_guards = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'trigger'
+                  AND name IN (
+                      'trg_routing_lan_pristine_draft_insert_required',
+                      'trg_routing_lan_scan_id_update_null_safe_immutable',
+                      'trg_routing_lan_scan_id_insert_not_null'
+                  )
+                """
+            ).fetchall()
+        }
+    assert "trg_routing_lan_pristine_draft_insert_required" in restored_guards
+
+    with pytest.raises(sqlite3.IntegrityError, match="lan_scan_identity_immutable"):
+        with legacy_state._connect() as connection:
+            connection.execute(
+                """
+                UPDATE routing_lan_scans
+                SET scan_id = 'lan_legacy_null_reassigned'
+                WHERE scan_id IS NULL
+                """
+            )
+
+    after_values, after_bytes = _lan_table_snapshot(
+        legacy_state,
+        "routing_lan_scans",
+    )
+    assert after_values == before_values
+    assert after_bytes == before_bytes
+
+    with pytest.raises(sqlite3.IntegrityError, match="lan_scan_identity_required"):
+        with legacy_state._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO routing_lan_scans (
+                    scan_id, status, revision, owner_principal,
+                    confirmed_interface_id, network, limits_json, limits_digest,
+                    preview_digest, created_at, updated_at
+                ) VALUES (
+                    NULL, 'draft', 1, 'owner:second', ?, '192.168.10.0/30', ?, ?, ?,
+                    '2026-08-01T00:00:01Z', '2026-08-01T00:00:01Z'
+                )
+                """,
+                (INTERFACE_ID, limits_json, limits_digest, PREVIEW_DIGEST),
+            )
+
+    final_values, final_bytes = _lan_table_snapshot(
+        legacy_state,
+        "routing_lan_scans",
+    )
+    assert final_values == before_values
+    assert final_bytes == before_bytes
+    assert "trg_routing_lan_scan_id_update_null_safe_immutable" in restored_guards
+    assert "trg_routing_lan_scan_id_insert_not_null" in restored_guards
+
+
+def test_fresh_v3_scan_identity_is_explicitly_not_null(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    _create_scan(lan_ledger, scan_id="lan_fresh_not_null")
+    with state._connect() as connection:
+        columns = {
+            str(row[1]): int(row[3])
+            for row in connection.execute(
+                "PRAGMA table_info(routing_lan_scans)"
+            ).fetchall()
+        }
+
+    assert columns["scan_id"] == 1
+
+
 @pytest.mark.parametrize("operation", ["insert", "update"])
 def test_rowid_replace_cannot_delete_zero_child_terminal_scan(
     lan_ledger: LanDiscoveryLedger,
@@ -1325,7 +1622,9 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
         "idx_routing_lan_scan_events_poll",
     } <= indexes
     expected_guards = {
+        "trg_routing_lan_scan_id_insert_not_null",
         "trg_routing_lan_scan_id_update_immutable",
+        "trg_routing_lan_scan_id_update_null_safe_immutable",
         "trg_routing_lan_pristine_draft_insert_required",
         "trg_routing_lan_terminal_scan_id_replace_immutable",
         "trg_routing_lan_terminal_transition_complete",
@@ -1347,6 +1646,10 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
             "DROP TRIGGER trg_routing_lan_terminal_observation_insert_immutable"
         )
         connection.execute("DROP TRIGGER trg_routing_lan_scan_id_update_immutable")
+        connection.execute(
+            "DROP TRIGGER trg_routing_lan_scan_id_update_null_safe_immutable"
+        )
+        connection.execute("DROP TRIGGER trg_routing_lan_scan_id_insert_not_null")
     LanDiscoveryLedger(state)
     with state._connect() as connection:
         restored = {
@@ -1357,7 +1660,9 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
             WHERE type = 'trigger'
               AND name IN (
                   'trg_routing_lan_terminal_observation_insert_immutable',
-                  'trg_routing_lan_scan_id_update_immutable'
+                  'trg_routing_lan_scan_id_update_immutable',
+                  'trg_routing_lan_scan_id_update_null_safe_immutable',
+                  'trg_routing_lan_scan_id_insert_not_null'
               )
             """
             ).fetchall()
@@ -1365,4 +1670,6 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
     assert restored == {
         "trg_routing_lan_terminal_observation_insert_immutable",
         "trg_routing_lan_scan_id_update_immutable",
+        "trg_routing_lan_scan_id_update_null_safe_immutable",
+        "trg_routing_lan_scan_id_insert_not_null",
     }

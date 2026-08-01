@@ -202,7 +202,7 @@ def _apply_routing_schema_v3(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS routing_lan_scans (
-            scan_id TEXT PRIMARY KEY,
+            scan_id TEXT PRIMARY KEY NOT NULL,
             status TEXT NOT NULL CHECK (
                 status IN (
                     'draft', 'running', 'cancelling', 'cancelled',
@@ -296,7 +296,15 @@ def _ensure_routing_schema_v3_guards(conn: sqlite3.Connection) -> None:
         """
         CREATE TRIGGER IF NOT EXISTS trg_routing_lan_scan_id_update_immutable
         BEFORE UPDATE OF scan_id ON routing_lan_scans
-        WHEN NEW.scan_id <> OLD.scan_id
+        WHEN NEW.scan_id IS NOT OLD.scan_id
+        BEGIN
+            SELECT RAISE(ABORT, 'lan_scan_identity_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_scan_id_update_null_safe_immutable
+        BEFORE UPDATE OF scan_id ON routing_lan_scans
+        WHEN NEW.scan_id IS NOT OLD.scan_id
         BEGIN
             SELECT RAISE(ABORT, 'lan_scan_identity_immutable');
         END
@@ -314,9 +322,18 @@ def _ensure_routing_schema_v3_guards(conn: sqlite3.Connection) -> None:
         END
         """,
         """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_scan_id_insert_not_null
+        BEFORE INSERT ON routing_lan_scans
+        WHEN NEW.scan_id IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'lan_scan_identity_required');
+        END
+        """,
+        """
         CREATE TRIGGER IF NOT EXISTS trg_routing_lan_pristine_draft_insert_required
         BEFORE INSERT ON routing_lan_scans
-        WHEN NEW.status <> 'draft'
+        WHEN NEW.scan_id IS NULL
+          OR NEW.status <> 'draft'
           OR NEW.revision <> 1
           OR NEW.created_at <> NEW.updated_at
           OR NEW.started_at IS NOT NULL
