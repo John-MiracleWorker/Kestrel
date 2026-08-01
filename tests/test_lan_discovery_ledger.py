@@ -119,6 +119,35 @@ def test_create_scan_persists_canonical_limits_digest_and_enforces_foreign_keys(
             )
 
 
+@pytest.mark.parametrize(
+    ("field", "lookalike"),
+    [
+        ("max_active_hosts", 256.0),
+        ("known_model_service_ports", (1234.0, 8000, 8080, 11434)),
+    ],
+)
+def test_scan_limits_reject_json_number_lookalikes_with_wrong_exact_types(
+    lan_ledger: LanDiscoveryLedger,
+    field: str,
+    lookalike: object,
+) -> None:
+    limits = _limits()
+    limits[field] = lookalike
+
+    with pytest.raises(ValueError, match="fixed bounded limits"):
+        lan_ledger.create_scan(
+            scan_id="lan_float_limits",
+            owner_principal="owner:test",
+            confirmed_interface_id=INTERFACE_ID,
+            network="192.168.10.0/30",
+            limits=limits,
+            preview_digest=PREVIEW_DIGEST,
+            expected_revision=0,
+        )
+
+    assert lan_ledger.get_scan("lan_float_limits") is None
+
+
 def test_observation_insert_uses_revision_cas_and_unique_endpoint_identity(
     lan_ledger: LanDiscoveryLedger,
 ) -> None:
@@ -581,6 +610,146 @@ def test_sqlite_terminal_guards_reject_direct_scan_observation_and_event_rewrite
     assert len(lan_ledger.list_events(terminal.scan_id)) == 1
 
 
+def test_insert_or_replace_cannot_overwrite_zero_child_terminal_scan(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    draft = _create_scan(lan_ledger, scan_id="lan_replace_terminal")
+    running = lan_ledger.transition_scan(
+        draft.scan_id,
+        "running",
+        expected_revision=draft.revision,
+    )
+    terminal = lan_ledger.transition_scan(
+        running.scan_id,
+        "completed",
+        expected_revision=running.revision,
+        terminal_reason="zero_child_complete",
+        candidate_count=0,
+        error_count=0,
+        timeout_count=0,
+    )
+    assert lan_ledger.list_observations(terminal.scan_id) == []
+    assert lan_ledger.list_events(terminal.scan_id) == []
+    with state._connect() as connection:
+        before = connection.execute(
+            "SELECT * FROM routing_lan_scans WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ).fetchone()
+    assert before is not None
+    before_values = tuple(before)
+    before_bytes = json.dumps(
+        before_values,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal_lan_scan_immutable"):
+        with state._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO routing_lan_scans (
+                    scan_id, status, revision, owner_principal,
+                    confirmed_interface_id, network, limits_json, limits_digest,
+                    preview_digest, created_at, updated_at
+                )
+                SELECT scan_id, 'draft', 1, owner_principal,
+                       confirmed_interface_id, network, limits_json, limits_digest,
+                       preview_digest, '2026-08-02T00:00:00Z',
+                       '2026-08-02T00:00:00Z'
+                FROM routing_lan_scans WHERE scan_id = ?
+                """,
+                (terminal.scan_id,),
+            )
+
+    with state._connect() as connection:
+        after = connection.execute(
+            "SELECT * FROM routing_lan_scans WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ).fetchone()
+    assert after is not None
+    after_values = tuple(after)
+    after_bytes = json.dumps(
+        after_values,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert after_values == before_values
+    assert after_bytes == before_bytes
+    assert lan_ledger.get_scan(terminal.scan_id) == terminal
+
+
+@pytest.mark.parametrize(
+    ("status", "revision", "started_at"),
+    [
+        pytest.param("completed", 1, None, id="terminal_without_receipt"),
+        pytest.param("running", 1, None, id="non_draft_status"),
+        pytest.param("draft", 2, None, id="non_initial_revision"),
+        pytest.param("draft", 1, "2026-08-02T00:00:01Z", id="started_draft"),
+    ],
+)
+def test_direct_scan_insert_requires_pristine_revision_one_draft(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+    status: str,
+    revision: int,
+    started_at: str | None,
+) -> None:
+    source = _create_scan(lan_ledger, scan_id="lan_insert_source")
+
+    with pytest.raises(sqlite3.IntegrityError, match="lan_scan_insert_requires_pristine_draft"):
+        with state._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO routing_lan_scans (
+                    scan_id, status, revision, owner_principal,
+                    confirmed_interface_id, network, limits_json, limits_digest,
+                    preview_digest, created_at, updated_at, started_at
+                )
+                SELECT 'lan_malformed_insert', ?, ?, owner_principal,
+                       confirmed_interface_id, network, limits_json, limits_digest,
+                       preview_digest, created_at, updated_at, ?
+                FROM routing_lan_scans WHERE scan_id = ?
+                """,
+                (status, revision, started_at, source.scan_id),
+            )
+
+    assert lan_ledger.get_scan("lan_malformed_insert") is None
+
+
+def test_direct_terminal_transition_requires_complete_receipt_shape(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    draft = _create_scan(lan_ledger, scan_id="lan_incomplete_terminal")
+    with state._connect() as connection:
+        before = connection.execute(
+            "SELECT * FROM routing_lan_scans WHERE scan_id = ?",
+            (draft.scan_id,),
+        ).fetchone()
+    assert before is not None
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal_lan_scan_evidence_incomplete"):
+        with state._connect() as connection:
+            connection.execute(
+                """
+                UPDATE routing_lan_scans
+                SET status = 'completed', revision = revision + 1
+                WHERE scan_id = ?
+                """,
+                (draft.scan_id,),
+            )
+
+    with state._connect() as connection:
+        after = connection.execute(
+            "SELECT * FROM routing_lan_scans WHERE scan_id = ?",
+            (draft.scan_id,),
+        ).fetchone()
+    assert after is not None
+    assert tuple(after) == tuple(before)
+    assert lan_ledger.get_scan(draft.scan_id) == draft
+
+
 def test_observation_insert_rolls_back_when_revision_update_fails_in_sqlite(
     lan_ledger: LanDiscoveryLedger,
     state: AgentStateStore,
@@ -824,6 +993,9 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
         "idx_routing_lan_scan_events_poll",
     } <= indexes
     expected_guards = {
+        "trg_routing_lan_pristine_draft_insert_required",
+        "trg_routing_lan_terminal_scan_id_replace_immutable",
+        "trg_routing_lan_terminal_transition_complete",
         "trg_routing_lan_terminal_fields_require_terminal",
         "trg_routing_lan_terminal_fields_insert_require_terminal",
         "trg_routing_lan_terminal_scan_update_immutable",

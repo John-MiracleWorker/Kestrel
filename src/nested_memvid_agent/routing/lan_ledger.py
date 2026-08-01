@@ -367,6 +367,12 @@ class LanDiscoveryLedger:
                 timeouts = validate_non_negative_count(timeout_count, "timeout_count")
                 if timeouts > errors:
                     raise ValueError("timeout_count cannot exceed error_count")
+                effective_cancel_reason = normalized_cancel_reason or scan.cancel_reason
+                effective_terminal_reason = normalized_terminal_reason
+                if effective_terminal_reason is None and new_status == "cancelled":
+                    effective_terminal_reason = effective_cancel_reason or "cancelled"
+                if effective_terminal_reason is None:
+                    raise ValueError("terminal_reason is required for a terminal LAN scan")
                 finished_at = now
                 started_at = scan.started_at
                 receipt = self._terminal_receipt(
@@ -375,8 +381,8 @@ class LanDiscoveryLedger:
                     status=new_status,
                     started_at=started_at,
                     finished_at=now,
-                    cancel_reason=normalized_cancel_reason or scan.cancel_reason,
-                    terminal_reason=normalized_terminal_reason,
+                    cancel_reason=effective_cancel_reason,
+                    terminal_reason=effective_terminal_reason,
                     candidate_count=candidates,
                     error_count=errors,
                     timeout_count=timeouts,
@@ -386,6 +392,8 @@ class LanDiscoveryLedger:
                     raise ValueError("terminal LAN receipt exceeds bounded storage")
                 receipt_digest = sha256_digest(receipt)
             else:
+                effective_cancel_reason = normalized_cancel_reason or scan.cancel_reason
+                effective_terminal_reason = None
                 if any(
                     value is not None
                     for value in (
@@ -419,8 +427,8 @@ class LanDiscoveryLedger:
                     now,
                     started_at,
                     finished_at,
-                    normalized_cancel_reason or scan.cancel_reason,
-                    normalized_terminal_reason,
+                    effective_cancel_reason,
+                    effective_terminal_reason,
                     candidates,
                     errors,
                     timeouts,

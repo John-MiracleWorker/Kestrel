@@ -294,6 +294,58 @@ def _ensure_routing_schema_v3_guards(conn: sqlite3.Connection) -> None:
 
     statements = (
         """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_scan_id_replace_immutable
+        BEFORE INSERT ON routing_lan_scans
+        WHEN EXISTS (
+            SELECT 1 FROM routing_lan_scans
+            WHERE scan_id = NEW.scan_id
+              AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_pristine_draft_insert_required
+        BEFORE INSERT ON routing_lan_scans
+        WHEN NEW.status <> 'draft'
+          OR NEW.revision <> 1
+          OR NEW.created_at <> NEW.updated_at
+          OR NEW.started_at IS NOT NULL
+          OR NEW.finished_at IS NOT NULL
+          OR NEW.cancel_reason IS NOT NULL
+          OR NEW.terminal_reason IS NOT NULL
+          OR NEW.candidate_count IS NOT NULL
+          OR NEW.error_count IS NOT NULL
+          OR NEW.timeout_count IS NOT NULL
+          OR NEW.terminal_receipt_json IS NOT NULL
+          OR NEW.terminal_receipt_digest IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'lan_scan_insert_requires_pristine_draft');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_transition_complete
+        BEFORE UPDATE OF
+            status, finished_at, terminal_reason, candidate_count, error_count,
+            timeout_count, terminal_receipt_json, terminal_receipt_digest
+        ON routing_lan_scans
+        WHEN OLD.status NOT IN ('cancelled', 'completed', 'failed', 'interrupted')
+         AND NEW.status IN ('cancelled', 'completed', 'failed', 'interrupted')
+         AND (
+            NEW.finished_at IS NULL
+            OR NEW.terminal_reason IS NULL
+            OR NEW.candidate_count IS NULL
+            OR NEW.error_count IS NULL
+            OR NEW.timeout_count IS NULL
+            OR NEW.terminal_receipt_json IS NULL
+            OR NEW.terminal_receipt_digest IS NULL
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_evidence_incomplete');
+        END
+        """,
+        """
         CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_fields_insert_require_terminal
         BEFORE INSERT ON routing_lan_scans
         WHEN NEW.status NOT IN ('cancelled', 'completed', 'failed', 'interrupted')

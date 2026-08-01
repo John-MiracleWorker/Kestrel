@@ -136,12 +136,12 @@ def bounded_event_public_evidence(value: object) -> dict[str, Any]:
 
 def bounded_scan_limits(value: object) -> dict[str, Any]:
     payload = _require_string_keyed_object(value, "scan limits")
-    expected = json.loads(canonical_json(asdict(LanScanLimits())))
-    normalized = json.loads(canonical_json(payload))
-    if normalized != expected:
+    expected_json = canonical_json(asdict(LanScanLimits()))
+    supplied_json = canonical_json(payload)
+    if supplied_json != expected_json:
         raise ValueError("LAN scan limits must match the fixed bounded limits")
     return _bounded_json_object(
-        normalized,
+        json.loads(expected_json),
         kind="scan limits",
         max_bytes=MAX_LIMITS_BYTES,
     )
