@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from nested_memvid_agent.lan_discovery_models import (
@@ -118,12 +120,44 @@ def test_interface_id_is_deterministic_opaque_and_ignores_display_name() -> None
 @pytest.mark.parametrize("address", ["8.8.8.8", "192.0.2.10", "2001:db8::10"])
 def test_endpoint_primitive_rejects_non_private_addresses(address: str) -> None:
     """Removing private-range admission would permit later probes to bypass scope validation."""
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.0/24",
+    )
     with pytest.raises(ValueError, match="private LAN address"):
-        ResolvedLanEndpoint(
-            interface_id=interface_fixture().interface_id,
-            address=address,
-            port=11434,
-        )
+        ResolvedLanEndpoint.from_scope(scope, address, 11434)
+
+
+def test_endpoint_requires_an_address_in_its_confirmed_scope() -> None:
+    """Dropping scope membership would let a later probe leave the confirmed subnet."""
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.0/24",
+    )
+
+    with pytest.raises(ValueError, match="confirmed scope"):
+        ResolvedLanEndpoint.from_scope(scope, "10.9.8.7", 11434)
+
+
+def test_endpoint_rejects_ports_outside_the_known_active_matrix() -> None:
+    """Allowing arbitrary ports would turn active discovery into a port scanner."""
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.0/24",
+    )
+
+    with pytest.raises(ValueError, match="known model-service ports"):
+        ResolvedLanEndpoint.from_scope(scope, "192.168.1.8", 22)
+
+
+@pytest.mark.parametrize("interface_id", ["sha256:abc", "sha256:" + "A" * 64])
+def test_endpoint_rejects_noncanonical_interface_digests(interface_id: str) -> None:
+    """A prefix-only digest check would permit a forged interface identity."""
+    interface = replace(interface_fixture("192.168.1.7/24"), interface_id=interface_id)
+    scope = PrivateScanScope.from_request(interface, "192.168.1.0/24")
+
+    with pytest.raises(ValueError, match="canonical interface ID"):
+        ResolvedLanEndpoint.from_scope(scope, "192.168.1.8", 11434)
 
 
 def test_preview_binds_the_exact_active_host_count_and_port_matrix() -> None:

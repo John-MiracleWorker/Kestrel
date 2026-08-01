@@ -5,7 +5,12 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nested_memvid_agent.lan_discovery_scope import PrivateScanScope
 
 KNOWN_MODEL_SERVICE_PORTS = (1234, 8000, 8080, 11434)
 MAX_ACTIVE_HOSTS = 256
@@ -25,6 +30,7 @@ _PRIVATE_IPV6_NETWORKS = (
     ipaddress.IPv6Network("fc00::/7"),
     ipaddress.IPv6Network("fe80::/10"),
 )
+_SHA256_IDENTIFIER_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def _sha256_identifier(payload: object) -> str:
@@ -79,7 +85,7 @@ class NetworkInterface:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ResolvedLanEndpoint:
     """A literal endpoint derived only from a confirmed private scope."""
 
@@ -87,19 +93,54 @@ class ResolvedLanEndpoint:
     address: str
     port: int
 
-    def __post_init__(self) -> None:
-        if not self.interface_id.startswith("sha256:"):
+    @classmethod
+    def from_scope(
+        cls,
+        scope: PrivateScanScope,
+        address: str,
+        port: int,
+    ) -> ResolvedLanEndpoint:
+        """Create an endpoint only from a complete server-validated scope."""
+
+        # Avoid an import cycle while still rejecting lookalike renderer values.
+        from nested_memvid_agent.lan_discovery_scope import PrivateScanScope
+
+        if not isinstance(scope, PrivateScanScope):
+            raise ValueError("endpoint requires a confirmed scope")
+        canonical_scope = PrivateScanScope.from_request(scope.interface, scope.network)
+        if scope != canonical_scope:
+            raise ValueError("endpoint requires a confirmed scope")
+        expected_interface_id = NetworkInterface.from_addresses(
+            os_identity=scope.interface.os_identity,
+            display_name=scope.interface.display_name,
+            addresses=scope.interface.addresses,
+        ).interface_id
+        if (
+            _SHA256_IDENTIFIER_RE.fullmatch(scope.interface.interface_id) is None
+            or scope.interface.interface_id != expected_interface_id
+        ):
             raise ValueError("endpoint requires a canonical interface ID")
         try:
-            parsed = ipaddress.ip_address(self.address)
+            parsed = ipaddress.ip_address(address)
         except ValueError as exc:
             raise ValueError("endpoint requires a literal IP address") from exc
         if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast or parsed.is_reserved:
             raise ValueError("endpoint address is not eligible for LAN discovery")
         if not _is_private_lan_address(parsed):
             raise ValueError("endpoint requires a private LAN address")
-        if not 1 <= self.port <= 65535:
-            raise ValueError("endpoint port must be between 1 and 65535")
+        network = ipaddress.ip_network(scope.network, strict=True)
+        if parsed not in network:
+            raise ValueError("endpoint address must belong to the confirmed scope")
+        canonical_address = str(parsed)
+        if isinstance(network, ipaddress.IPv4Network) and canonical_address not in scope.active_hosts:
+            raise ValueError("endpoint address must belong to the confirmed scope")
+        if port not in KNOWN_MODEL_SERVICE_PORTS:
+            raise ValueError("endpoint port must be one of the known model-service ports")
+        endpoint = object.__new__(cls)
+        object.__setattr__(endpoint, "interface_id", scope.interface.interface_id)
+        object.__setattr__(endpoint, "address", canonical_address)
+        object.__setattr__(endpoint, "port", port)
+        return endpoint
 
     @property
     def endpoint_id(self) -> str:

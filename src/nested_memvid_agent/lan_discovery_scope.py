@@ -107,7 +107,7 @@ def preview_private_scope(
     scope = PrivateScanScope.from_request(selected, network)
     limits = LanScanLimits()
     matrix = tuple(
-        ResolvedLanEndpoint(interface_id=selected.interface_id, address=host, port=port)
+        ResolvedLanEndpoint.from_scope(scope, host, port)
         for host in scope.active_hosts
         for port in KNOWN_MODEL_SERVICE_PORTS
     )
