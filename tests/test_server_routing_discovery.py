@@ -36,6 +36,87 @@ from nested_memvid_agent.state_store import AgentStateStore
 LAN_OWNER = "owner:local-runtime:v1"
 
 
+def _real_uvicorn_requests(
+    app: Any,
+    requests: tuple[tuple[str, str, bytes, dict[str, str]], ...],
+) -> tuple[tuple[tuple[int, dict[str, str], bytes], ...], str]:
+    import http.client
+    import io
+    import logging
+    import socket
+    import threading
+    import time
+
+    uvicorn = pytest.importorskip("uvicorn")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            http="h11",
+            lifespan="on",
+            log_config=None,
+            access_log=True,
+        )
+    )
+    access_logger = logging.getLogger("uvicorn.access")
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    previous_level = access_logger.level
+    previous_disabled = access_logger.disabled
+    access_logger.addHandler(handler)
+    access_logger.setLevel(logging.INFO)
+    access_logger.disabled = False
+    failures: list[BaseException] = []
+    results: list[tuple[int, dict[str, str], bytes]] = []
+
+    def run_server() -> None:
+        try:
+            server.run(sockets=[listener])
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    thread = threading.Thread(target=run_server, name="lan-access-log-test-server")
+    try:
+        thread.start()
+        deadline = time.monotonic() + 5.0
+        while not server.started and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started and thread.is_alive()
+        for method, target, body, headers in requests:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+            try:
+                connection.request(method, target, body=body, headers=headers)
+                response = connection.getresponse()
+                response_body = response.read()
+                results.append(
+                    (
+                        response.status,
+                        {name.lower(): value for name, value in response.getheaders()},
+                        response_body,
+                    )
+                )
+            finally:
+                connection.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10.0)
+        listener.close()
+        access_logger.removeHandler(handler)
+        access_logger.setLevel(previous_level)
+        access_logger.disabled = previous_disabled
+        handler.close()
+
+    assert not thread.is_alive()
+    assert failures == []
+    return tuple(results), output.getvalue()
+
+
 def _typed_lan_result_entries(
     *,
     reviewed: bool,
@@ -1520,6 +1601,451 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
         )
         assert authorized_review.status_code in {400, 422}
         assert authorized_review.status_code != 404
+
+
+def test_unauthorized_lan_query_is_redacted_from_real_uvicorn_access_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_env = "KESTREL_LAN_ACCESS_LOG_TOKEN"
+    monkeypatch.setenv(token_env, "lan-access-log-token")
+    root = tmp_path / "access-log"
+    app = create_app(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=True,
+            api_auth_token_env=token_env,
+        )
+    )
+    hostile = "raw-secret-address-192.168.50.2"
+    responses, access_record = _real_uvicorn_requests(
+        app,
+        (
+            (
+                "POST",
+                f"/api/routing/lan/import?address={hostile}",
+                b"{}",
+                {"content-type": "application/json"},
+            ),
+        ),
+    )
+
+    assert responses[0][0] == 401
+    assert "/api/routing/lan/import" in access_record
+    assert hostile not in access_record
+
+
+def test_invalid_lan_review_path_is_redacted_before_real_uvicorn_access_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import (
+        LanDiscoveryService,
+        LanReviewRequest,
+    )
+
+    token = "lan-path-redaction-token"
+    token_env = "KESTREL_LAN_PATH_REDACTION_TOKEN"
+    monkeypatch.setenv(token_env, token)
+    calls: list[LanReviewRequest] = []
+
+    def review_lan_target(
+        _service: LanDiscoveryService,
+        request: LanReviewRequest,
+        *,
+        authenticated_owner_principal: str,
+    ) -> object:
+        assert authenticated_owner_principal == LAN_OWNER
+        calls.append(request)
+        raise KeyError(request.target_id)
+
+    monkeypatch.setattr(LanDiscoveryService, "review_lan_target", review_lan_target)
+    root = tmp_path / "path-redaction"
+    app = create_app(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=True,
+            api_auth_token_env=token_env,
+        )
+    )
+    digest = "sha256:" + "8" * 64
+    review_body = json.dumps(
+        {
+            "expected_profile_revision": 1,
+            "expected_target_revision": 1,
+            "expected_terminal_receipt_digest": digest,
+            "expected_observation_digest": digest,
+            "expected_endpoint_fingerprint": digest,
+            "expected_material_binding_digest": digest,
+            "expected_review_digest": digest,
+            "expected_stale_reasons": [],
+            "trust_class": "operator_confirmed",
+            "intended_roles": [],
+            "task_family_affinities": [],
+            "privacy_acknowledged": True,
+            "enabled": False,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    hostile = "raw-secret-address-192.168.50.2"
+    valid_target_id = "lan-target-" + "8" * 64
+    invalid_path = f"/api/routing/lan/targets/{hostile}/review"
+    responses, access_record = _real_uvicorn_requests(
+        app,
+        (
+            (
+                "POST",
+                invalid_path,
+                review_body,
+                {"content-type": "application/json"},
+            ),
+            (
+                "POST",
+                invalid_path,
+                review_body,
+                {
+                    "content-type": "application/json",
+                    "x-kestrel-api-key": token,
+                },
+            ),
+            (
+                "POST",
+                f"/api/routing/lan/targets/{valid_target_id}/review",
+                review_body,
+                {
+                    "content-type": "application/json",
+                    "x-kestrel-api-key": token,
+                },
+            ),
+        ),
+    )
+
+    assert tuple(status for status, _headers, _body in responses) == (401, 400, 404)
+    assert [request.target_id for request in calls] == [valid_target_id]
+    assert json.loads(responses[1][2]) == {"detail": {"code": "lan_request_rejected"}}
+    assert "location" not in responses[1][1]
+    assert hostile not in access_record
+    for _status, headers, body in responses:
+        assert hostile not in body.decode("utf-8")
+        assert all(hostile not in value for value in headers.values())
+
+
+def test_lan_query_is_closed_and_redacted_for_canonical_and_slash_alias_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import LanDiscoveryService
+
+    token = "lan-query-alias-token"
+    token_env = "KESTREL_LAN_QUERY_ALIAS_TOKEN"
+    monkeypatch.setenv(token_env, token)
+    calls: list[str] = []
+
+    def unreachable(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        calls.append("service")
+        raise AssertionError("query-bearing LAN request reached service")
+
+    monkeypatch.setattr(LanDiscoveryService, "import_observation", unreachable)
+    monkeypatch.setattr(LanDiscoveryService, "review_lan_target", unreachable)
+    root = tmp_path / "query-alias"
+    app = create_app(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=True,
+            api_auth_token_env=token_env,
+        )
+    )
+    hostile = "raw-secret-address-192.168.50.2"
+    target_id = "lan-target-" + "9" * 64
+    paths = (
+        "/api/routing/lan/import",
+        "/api/routing/lan/import/",
+        f"/api/routing/lan/targets/{target_id}/review",
+        f"/api/routing/lan/targets/{target_id}/review/",
+    )
+    requests: list[tuple[str, str, bytes, dict[str, str]]] = []
+    for path in paths:
+        target = f"{path}?address={hostile}"
+        requests.append(
+            (
+                "POST",
+                target,
+                b"{}",
+                {"content-type": "application/json"},
+            )
+        )
+        requests.append(
+            (
+                "POST",
+                target,
+                b"{}",
+                {
+                    "content-type": "application/json",
+                    "x-kestrel-api-key": token,
+                },
+            )
+        )
+    responses, access_record = _real_uvicorn_requests(app, tuple(requests))
+
+    assert tuple(status for status, _headers, _body in responses) == (
+        401,
+        400,
+        401,
+        400,
+        401,
+        400,
+        401,
+        400,
+    )
+    assert calls == []
+    assert hostile not in access_record
+    for index, (_status, headers, body) in enumerate(responses):
+        assert hostile not in body.decode("utf-8")
+        assert all(hostile not in value for value in headers.values())
+        if index % 2 == 1:
+            assert "location" not in headers
+            assert json.loads(body) == {"detail": {"code": "lan_request_rejected"}}
+
+
+@pytest.mark.parametrize(
+    "request_path",
+    (
+        "/api/routing/lan/import",
+        "/api/routing/lan/import/",
+        "/api/routing/lan/targets/lan-target-" + "a" * 64 + "/review",
+        "/api/routing/lan/targets/lan-target-" + "a" * 64 + "/review/",
+    ),
+)
+def test_chunked_lan_body_honors_smaller_configured_global_limit_before_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_path: str,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import (
+        LanDiscoveryService,
+        LanImportRequest,
+        LanImportResult,
+    )
+
+    testclient = pytest.importorskip("fastapi.testclient")
+    token = "lan-chunked-limit-token"
+    token_env = "KESTREL_LAN_CHUNKED_LIMIT_TOKEN"
+    monkeypatch.setenv(token_env, token)
+    calls: list[LanImportRequest] = []
+    profile, target = _typed_lan_result_entries(reviewed=False)
+    digest = "sha256:" + "7" * 64
+    result = LanImportResult(
+        profile=profile,
+        targets=(target,),
+        affected_target_ids=(target.target.target_id,),
+        invalidated_binding_digests=(),
+        stale_reasons_by_target=(),
+        observation_digest=digest,
+        endpoint_fingerprint=digest,
+        outage_observed=False,
+    )
+
+    def import_observation(
+        _service: LanDiscoveryService,
+        request: LanImportRequest,
+        *,
+        authenticated_owner_principal: str,
+    ) -> LanImportResult:
+        assert authenticated_owner_principal == LAN_OWNER
+        calls.append(request)
+        return result
+
+    monkeypatch.setattr(LanDiscoveryService, "import_observation", import_observation)
+    root = tmp_path / "chunked-limit"
+    app = create_app(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=True,
+            api_auth_token_env=token_env,
+            max_request_body_bytes=80,
+        )
+    )
+    body = json.dumps(
+        {
+            "scan_id": "scan-chunked-limit",
+            "endpoint_binding_digest": digest,
+            "expected_terminal_receipt_digest": digest,
+            "expected_observation_digest": digest,
+            "expected_profile_revision": 0,
+            "expected_target_revisions": [],
+            "replacement": None,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert 80 < len(body) < 32 * 1024
+
+    def chunked_body():
+        yield body[:64]
+        yield body[64:]
+
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            request_path,
+            content=chunked_body(),
+            follow_redirects=False,
+            headers={
+                "content-type": "application/json",
+                "x-kestrel-api-key": token,
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": {"code": "lan_request_too_large"}}
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "request_path",
+    (
+        "/api/routing/lan/import/",
+        "/api/routing/lan/targets/lan-target-" + "b" * 64 + "/review/",
+    ),
+)
+def test_chunked_lan_slash_alias_honors_32k_ceiling_before_redirect_or_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_path: str,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import LanDiscoveryService
+
+    testclient = pytest.importorskip("fastapi.testclient")
+    token = "lan-alias-ceiling-token"
+    token_env = "KESTREL_LAN_ALIAS_CEILING_TOKEN"
+    monkeypatch.setenv(token_env, token)
+    calls: list[str] = []
+
+    def unreachable(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        calls.append("service")
+        raise AssertionError("oversized LAN alias request reached service")
+
+    monkeypatch.setattr(LanDiscoveryService, "import_observation", unreachable)
+    monkeypatch.setattr(LanDiscoveryService, "review_lan_target", unreachable)
+    root = tmp_path / "alias-ceiling"
+    app = create_app(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=True,
+            api_auth_token_env=token_env,
+            max_request_body_bytes=64 * 1024,
+        )
+    )
+    body = b"x" * (32 * 1024 + 1)
+
+    def chunked_body():
+        yield body[:16_384]
+        yield body[16_384:]
+
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            request_path,
+            content=chunked_body(),
+            follow_redirects=False,
+            headers={
+                "content-type": "application/json",
+                "x-kestrel-api-key": token,
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": {"code": "lan_request_too_large"}}
+    assert "location" not in response.headers
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "request_path",
+    (
+        "/api/routing/lan/import",
+        "/api/routing/lan/import/",
+        "/api/routing/lan/targets/lan-target-" + "c" * 64 + "/review",
+        "/api/routing/lan/targets/lan-target-" + "c" * 64 + "/review/",
+    ),
+)
+def test_unregistered_lan_shaped_paths_use_ordinary_global_body_ingress_then_404(
+    tmp_path: Path,
+    request_path: str,
+) -> None:
+    testclient = pytest.importorskip("fastapi.testclient")
+    root = tmp_path / "unregistered-body"
+    app = create_app(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=False,
+            max_request_body_bytes=64 * 1024,
+        )
+    )
+    body = b"x" * (32 * 1024 + 1)
+
+    def chunked_body():
+        yield body[:16_384]
+        yield body[16_384:]
+
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            request_path,
+            content=chunked_body(),
+            follow_redirects=False,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+    assert "location" not in response.headers
 
 
 def test_create_app_desktop_launch_registers_lan_mutations_behind_launch_auth(

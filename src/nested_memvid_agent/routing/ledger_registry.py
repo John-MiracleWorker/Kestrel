@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..lan_discovery_models import KNOWN_MODEL_SERVICE_PORTS, MAX_ACTIVE_HOSTS
+from ..lan_http_transport import LanProbeModel
 from ..lan_scanner import (
     ApiShape,
     CapabilityName,
@@ -2138,6 +2139,7 @@ def _validate_lan_protected_metadata(
     if (
         type(scan_id) is not str
         or not scan_id
+        or scan_id != scan_id.strip()
         or len(scan_id) > 128
         or unicodedata.normalize("NFC", scan_id) != scan_id
         or any(unicodedata.category(character).startswith("C") for character in scan_id)
@@ -2320,13 +2322,11 @@ def _validate_managed_lan_target_model(
         protected = target.metadata["lan_discovery"]
     protected = _validate_lan_protected_metadata(protected, target=True)
     model_id = protected["model_id"]
-    if (
-        type(model_id) is not str
-        or not model_id
-        or len(model_id) > 512
-        or unicodedata.normalize("NFC", model_id) != model_id
-        or any(unicodedata.category(character).startswith("C") for character in model_id)
-    ):
+    try:
+        canonical_model_id = LanProbeModel.from_catalog(model_id).model_id
+    except (TypeError, ValueError) as exc:
+        raise ValueError("LAN managed model identity is invalid") from exc
+    if canonical_model_id != model_id:
         raise ValueError("LAN managed model identity is invalid")
     intended_roles = _validate_lan_affinities(
         protected["intended_roles"],
@@ -2339,6 +2339,7 @@ def _validate_managed_lan_target_model(
     if (
         _LAN_TARGET_ID_RE.fullmatch(target.target_id) is None
         or _LAN_PROFILE_ID_RE.fullmatch(target.provider_profile_id) is None
+        or protected["provider_profile_id"] != _lan_profile_id(protected["endpoint_binding_digest"])
         or target.target_id
         != _lan_target_id(protected["provider_profile_id"], protected["model_id"])
         or target.provider_profile_id != protected["provider_profile_id"]

@@ -61,6 +61,17 @@ _LAN_PROFILE_ID_PATTERN = r"^lan-provider-[0-9a-f]{64}$"
 _LAN_TARGET_ID_PATTERN = r"^lan-target-[0-9a-f]{64}$"
 MAX_LAN_MUTATION_BODY_BYTES = 32 * 1024
 LAN_MUTATION_OWNER_PRINCIPAL = "owner:local-runtime:v1"
+LAN_REDACTED_QUERY_SCOPE_KEY = "kestrel.lan_query_present"
+LAN_REJECTED_PATH_SCOPE_KEY = "kestrel.lan_path_rejected"
+_LAN_IMPORT_PATHS = frozenset(
+    {
+        "/api/routing/lan/import",
+        "/api/routing/lan/import/",
+    }
+)
+_LAN_REVIEW_PATH_PREFIX = "/api/routing/lan/targets/"
+_LAN_REVIEW_PATH_SUFFIXES = ("/review", "/review/")
+_LAN_REDACTED_REVIEW_TARGET = "redacted"
 _LAN_FORBIDDEN_IDENTITY_HEADERS = frozenset(
     {
         "x-kestrel-owner-principal",
@@ -69,6 +80,26 @@ _LAN_FORBIDDEN_IDENTITY_HEADERS = frozenset(
     }
 )
 LanAffinityRequest = Annotated[str, Field(min_length=1, max_length=64, strict=True)]
+
+
+def classify_lan_mutation_path(path: str) -> tuple[bool, bool, str]:
+    """Return LAN sensitivity, rejection state, and an access-log-safe path."""
+
+    if type(path) is not str:
+        return False, False, ""
+    if path in _LAN_IMPORT_PATHS:
+        return True, False, path
+    if not path.startswith(_LAN_REVIEW_PATH_PREFIX):
+        return False, False, path
+    for suffix in _LAN_REVIEW_PATH_SUFFIXES:
+        if not path.endswith(suffix):
+            continue
+        target_id = path[len(_LAN_REVIEW_PATH_PREFIX) : -len(suffix)]
+        if re.fullmatch(_LAN_TARGET_ID_PATTERN, target_id) is not None:
+            return True, False, path
+        safe_path = f"{_LAN_REVIEW_PATH_PREFIX}{_LAN_REDACTED_REVIEW_TARGET}{suffix}"
+        return True, True, safe_path
+    return False, False, path
 
 
 def _is_lan_managed_conflict(exc: BaseException) -> bool:
@@ -345,7 +376,11 @@ def register_routing_routes(
         http_request._body = bytes(body)
 
     async def require_bounded_lan_mutation(http_request: Request) -> bytes:
-        if http_request.query_params:
+        if (
+            http_request.scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
+            or http_request.scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
+            or http_request.query_params
+        ):
             raise http_exception(
                 status_code=400,
                 detail={"code": "lan_request_rejected"},

@@ -123,6 +123,59 @@ def _forged_lan_inventory() -> tuple[ProviderProfile, ModelTarget]:
     return profile, target
 
 
+def _imported_managed_lan_target(tmp_path: Path) -> ModelTarget:
+    import test_lan_discovery_service as lan_cases
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        _observation,
+        _scan,
+        registry,
+        _service,
+        _imported,
+        _provider_id,
+        (target_id,),
+    ) = lan_cases._import_first_positive(state)
+    target = registry.get_model_target(target_id)
+    assert target is not None
+    return target.target
+
+
+def _recomputed_managed_lan_candidate(
+    target: ModelTarget,
+    *,
+    provider_profile_id: str | None = None,
+    model_id: str | None = None,
+) -> ModelTarget:
+    import test_lan_discovery_service as lan_cases
+
+    protected = copy.deepcopy(target.metadata["lan_discovery"])
+    if provider_profile_id is not None:
+        protected["provider_profile_id"] = provider_profile_id
+    if model_id is not None:
+        protected["model_id"] = model_id
+    forged_target_id = lan_cases._target_id(
+        protected["provider_profile_id"],
+        protected["model_id"],
+    )
+    protected["material_binding_digest"] = lan_cases._review_material_digest(
+        protected,
+        trust_class=target.trust_class,
+        privacy_acknowledgement_digest=protected["privacy_acknowledgement_digest"],
+        intended_roles=target.role_affinities,
+        task_family_affinities=target.task_family_affinities,
+    )
+    return replace(
+        target,
+        target_id=forged_target_id,
+        provider_profile_id=protected["provider_profile_id"],
+        model=protected["model_id"],
+        enabled=True,
+        health="healthy",
+        metadata={"lan_discovery": protected},
+    )
+
+
 def test_router_and_direct_override_reject_invalid_managed_lan_binding() -> None:
     _profile, target = _forged_lan_inventory()
 
@@ -137,6 +190,76 @@ def test_router_and_direct_override_reject_invalid_managed_lan_binding() -> None
             direct_target_id=target.target_id,
         )
     assert "lan_binding_invalid" in direct.value.reason_codes
+
+
+def test_router_rejects_recomputed_lan_profile_unbound_from_endpoint(
+    tmp_path: Path,
+) -> None:
+    import test_lan_discovery_service as lan_cases
+
+    target = _imported_managed_lan_target(tmp_path)
+    candidate = _recomputed_managed_lan_candidate(
+        target,
+        provider_profile_id="lan-provider-" + "f" * 64,
+    )
+
+    with pytest.raises(RoutingUnavailableError) as raised:
+        route_task(
+            _routing_contract(),
+            [candidate],
+            clock=lambda: lan_cases.NOW,
+        )
+    assert raised.value.reason_codes == ("lan_binding_invalid",)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "http://192.168.50.2:11434/api/generate",
+        "localhost/model",
+        "api-key=credential-like-model-material",
+    ),
+)
+def test_router_rejects_recomputed_task4_invalid_lan_model_identity(
+    tmp_path: Path,
+    model_id: str,
+) -> None:
+    import test_lan_discovery_service as lan_cases
+
+    target = _imported_managed_lan_target(tmp_path)
+    candidate = _recomputed_managed_lan_candidate(target, model_id=model_id)
+
+    with pytest.raises(RoutingUnavailableError) as raised:
+        route_task(
+            _routing_contract(),
+            [candidate],
+            clock=lambda: lan_cases.NOW,
+        )
+    assert raised.value.reason_codes == ("lan_binding_invalid",)
+
+
+def test_router_rejects_whitespace_corrupt_protected_lan_scan_id(
+    tmp_path: Path,
+) -> None:
+    import test_lan_discovery_service as lan_cases
+
+    target = _imported_managed_lan_target(tmp_path)
+    protected = copy.deepcopy(target.metadata["lan_discovery"])
+    protected["scan_id"] = f" {protected['scan_id']}"
+    candidate = replace(
+        target,
+        enabled=True,
+        health="healthy",
+        metadata={"lan_discovery": protected},
+    )
+
+    with pytest.raises(RoutingUnavailableError) as raised:
+        route_task(
+            _routing_contract(),
+            [candidate],
+            clock=lambda: lan_cases.NOW,
+        )
+    assert raised.value.reason_codes == ("lan_binding_invalid",)
 
 
 def test_router_rejects_protected_lan_metadata_on_nonreserved_target() -> None:

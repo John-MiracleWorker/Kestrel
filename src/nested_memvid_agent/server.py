@@ -225,7 +225,10 @@ def _create_app(
         from .server_routine_routes import register_routine_routes
         from .server_routing_routes import (
             LAN_MUTATION_OWNER_PRINCIPAL,
+            LAN_REDACTED_QUERY_SCOPE_KEY,
+            LAN_REJECTED_PATH_SCOPE_KEY,
             MAX_LAN_MUTATION_BODY_BYTES,
+            classify_lan_mutation_path,
             register_routing_routes,
         )
         from .server_runtime_routes import (
@@ -540,22 +543,36 @@ def _create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    lan_mutations_registered = desktop_context is not None or active_config.require_api_auth
     rate_limiter = RequestRateLimiter()
 
-    async def _cache_lan_body_through_sentinel(request: Any) -> None:
+    async def _cache_lan_body_through_sentinel(request: Any, *, limit: int) -> None:
         body = bytearray()
-        sentinel_limit = MAX_LAN_MUTATION_BODY_BYTES + 1
+        sentinel_limit = limit + 1
         async for chunk in request.stream():
             remaining = sentinel_limit - len(body)
             if remaining > 0:
                 body.extend(chunk[:remaining])
-            if len(body) > MAX_LAN_MUTATION_BODY_BYTES or len(chunk) > remaining:
+            if len(body) > limit or len(chunk) > remaining:
                 request._body = bytes(body)
-                raise RequestBodyTooLarge("LAN request body exceeds 32 KiB")
+                raise RequestBodyTooLarge("LAN request body exceeds its byte limit")
         request._body = bytes(body)
 
     @app.middleware("http")  # type: ignore[untyped-decorator]
     async def local_ingress_guard(request: Any, call_next: Any) -> Any:
+        scope = getattr(request, "scope", {})
+        path = str(scope.get("path", "")) if isinstance(scope, dict) else ""
+        method = str(getattr(request, "method", "GET")).upper()
+        lan_mutation_path, lan_path_rejected, safe_path = classify_lan_mutation_path(path)
+        registered_lan_mutation_path = lan_mutations_registered and lan_mutation_path
+        path = safe_path
+        if lan_mutation_path and isinstance(scope, dict):
+            scope[LAN_REDACTED_QUERY_SCOPE_KEY] = bool(scope.get("query_string", b""))
+            scope[LAN_REJECTED_PATH_SCOPE_KEY] = lan_path_rejected
+            scope["query_string"] = b""
+            if lan_path_rejected:
+                scope["path"] = safe_path
+                scope["raw_path"] = safe_path.encode("ascii")
         headers = request_headers(request)
         host = _hostname_from_header(str(headers.get("host", "")))
         trusted_hosts = set(active_config.trusted_hosts)
@@ -575,13 +592,8 @@ def _create_app(
                 return responses_module.JSONResponse(
                     {"detail": "untrusted_origin"}, status_code=403
                 )
-        path = str(getattr(getattr(request, "url", None), "path", ""))
-        method = str(getattr(request, "method", "GET")).upper()
         api_path = path == "/api" or path.startswith("/api/")
         guarded_path = api_path or path == "/metrics"
-        lan_mutation_path = path == "/api/routing/lan/import" or (
-            path.startswith("/api/routing/lan/targets/") and path.endswith("/review")
-        )
         public_telegram_webhook = method == "POST" and path == "/api/channels/telegram/webhook"
         cors_preflight = (
             method == "OPTIONS"
@@ -614,13 +626,25 @@ def _create_app(
                         {"detail": detail},
                         status_code=status_code,
                     )
+            if (
+                registered_lan_mutation_path
+                and isinstance(scope, dict)
+                and (
+                    scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
+                    or scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
+                )
+            ):
+                return responses_module.JSONResponse(
+                    {"detail": {"code": "lan_request_rejected"}},
+                    status_code=400,
+                )
             content_length = str(headers.get("content-length", "")).strip()
             request_body_limit = (
                 min(
                     active_config.max_request_body_bytes,
                     MAX_LAN_MUTATION_BODY_BYTES,
                 )
-                if lan_mutation_path
+                if registered_lan_mutation_path
                 else active_config.max_request_body_bytes
             )
             if content_length:
@@ -629,7 +653,7 @@ def _create_app(
                 except ValueError:
                     ingress_detail: object = (
                         {"code": "lan_request_rejected"}
-                        if lan_mutation_path
+                        if registered_lan_mutation_path
                         else "invalid_content_length"
                     )
                     return responses_module.JSONResponse(
@@ -638,7 +662,7 @@ def _create_app(
                 if request_bytes < 0:
                     ingress_detail = (
                         {"code": "lan_request_rejected"}
-                        if lan_mutation_path
+                        if registered_lan_mutation_path
                         else "invalid_content_length"
                     )
                     return responses_module.JSONResponse(
@@ -647,7 +671,7 @@ def _create_app(
                 if request_bytes > request_body_limit:
                     ingress_detail = (
                         {"code": "lan_request_too_large"}
-                        if lan_mutation_path
+                        if registered_lan_mutation_path
                         else "request_body_too_large"
                     )
                     return responses_module.JSONResponse(
@@ -655,8 +679,11 @@ def _create_app(
                     )
             if method not in {"GET", "HEAD", "OPTIONS"}:
                 try:
-                    if lan_mutation_path:
-                        await _cache_lan_body_through_sentinel(request)
+                    if registered_lan_mutation_path:
+                        await _cache_lan_body_through_sentinel(
+                            request,
+                            limit=request_body_limit,
+                        )
                     else:
                         await _cache_bounded_request_body(
                             request,
@@ -665,7 +692,7 @@ def _create_app(
                 except RequestBodyTooLarge:
                     ingress_detail = (
                         {"code": "lan_request_too_large"}
-                        if lan_mutation_path
+                        if registered_lan_mutation_path
                         else "request_body_too_large"
                     )
                     return responses_module.JSONResponse(
@@ -766,15 +793,9 @@ def _create_app(
             secret_resolver=secret_broker.resolve,
         ),
         lan_discovery_service=(
-            LanDiscoveryService(routing_ledger)
-            if desktop_context is not None or active_config.require_api_auth
-            else None
+            LanDiscoveryService(routing_ledger) if lan_mutations_registered else None
         ),
-        lan_owner_principal=(
-            LAN_MUTATION_OWNER_PRINCIPAL
-            if desktop_context is not None or active_config.require_api_auth
-            else None
-        ),
+        lan_owner_principal=(LAN_MUTATION_OWNER_PRINCIPAL if lan_mutations_registered else None),
     )
     register_routine_routes(
         app,
