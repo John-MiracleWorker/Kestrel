@@ -86,6 +86,30 @@ def _running_scan(ledger: LanDiscoveryLedger, *, scan_id: str = "lan_1"):
     )
 
 
+def _lan_table_snapshot(
+    state: AgentStateStore,
+    table: str,
+) -> tuple[tuple[tuple[object, ...], ...], bytes]:
+    query = {
+        "routing_lan_scans": "SELECT rowid, * FROM routing_lan_scans ORDER BY rowid",
+        "routing_lan_observations": (
+            "SELECT rowid, * FROM routing_lan_observations ORDER BY rowid"
+        ),
+        "routing_lan_scan_events": (
+            "SELECT rowid, * FROM routing_lan_scan_events ORDER BY rowid"
+        ),
+    }[table]
+    with state._connect() as connection:
+        rows = connection.execute(query).fetchall()
+    values = tuple(tuple(row) for row in rows)
+    canonical_bytes = json.dumps(
+        values,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return values, canonical_bytes
+
+
 def test_create_scan_persists_canonical_limits_digest_and_enforces_foreign_keys(
     lan_ledger: LanDiscoveryLedger,
     state: AgentStateStore,
@@ -679,6 +703,314 @@ def test_insert_or_replace_cannot_overwrite_zero_child_terminal_scan(
     assert lan_ledger.get_scan(terminal.scan_id) == terminal
 
 
+def test_update_or_replace_cannot_rename_draft_over_zero_child_terminal_scan(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    terminal_draft = _create_scan(
+        lan_ledger,
+        scan_id="lan_update_replace_terminal",
+    )
+    running = lan_ledger.transition_scan(
+        terminal_draft.scan_id,
+        "running",
+        expected_revision=terminal_draft.revision,
+    )
+    terminal = lan_ledger.transition_scan(
+        running.scan_id,
+        "completed",
+        expected_revision=running.revision,
+        terminal_reason="zero_child_complete",
+        candidate_count=0,
+        error_count=0,
+        timeout_count=0,
+    )
+    draft = _create_scan(lan_ledger, scan_id="lan_update_replace_draft")
+    for scan_id in (terminal.scan_id, draft.scan_id):
+        assert lan_ledger.list_observations(scan_id) == []
+        assert lan_ledger.list_events(scan_id) == []
+
+    with state._connect() as connection:
+        before_rows = connection.execute(
+            "SELECT * FROM routing_lan_scans WHERE scan_id IN (?, ?) ORDER BY scan_id",
+            (terminal.scan_id, draft.scan_id),
+        ).fetchall()
+    before_values = tuple(tuple(row) for row in before_rows)
+    assert len(before_values) == 2
+    before_bytes = json.dumps(
+        before_values,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    with pytest.raises(sqlite3.IntegrityError, match="lan_scan_identity_immutable"):
+        with state._connect() as connection:
+            connection.execute(
+                """
+                UPDATE OR REPLACE routing_lan_scans
+                SET scan_id = ?
+                WHERE scan_id = ?
+                """,
+                (terminal.scan_id, draft.scan_id),
+            )
+
+    with state._connect() as connection:
+        after_rows = connection.execute(
+            "SELECT * FROM routing_lan_scans WHERE scan_id IN (?, ?) ORDER BY scan_id",
+            (terminal.scan_id, draft.scan_id),
+        ).fetchall()
+    after_values = tuple(tuple(row) for row in after_rows)
+    after_bytes = json.dumps(
+        after_values,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert after_values == before_values
+    assert after_bytes == before_bytes
+    assert lan_ledger.get_scan(terminal.scan_id) == terminal
+    assert lan_ledger.get_scan(draft.scan_id) == draft
+
+
+@pytest.mark.parametrize("operation", ["insert", "update"])
+def test_rowid_replace_cannot_delete_zero_child_terminal_scan(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+    operation: str,
+) -> None:
+    terminal_draft = _create_scan(
+        lan_ledger,
+        scan_id=f"lan_rowid_{operation}_terminal",
+    )
+    running = lan_ledger.transition_scan(
+        terminal_draft.scan_id,
+        "running",
+        expected_revision=terminal_draft.revision,
+    )
+    terminal = lan_ledger.transition_scan(
+        running.scan_id,
+        "completed",
+        expected_revision=running.revision,
+        terminal_reason="zero_child_complete",
+        candidate_count=0,
+        error_count=0,
+        timeout_count=0,
+    )
+    draft = _create_scan(
+        lan_ledger,
+        scan_id=f"lan_rowid_{operation}_draft",
+    )
+    for scan_id in (terminal.scan_id, draft.scan_id):
+        assert lan_ledger.list_observations(scan_id) == []
+        assert lan_ledger.list_events(scan_id) == []
+
+    with state._connect() as connection:
+        terminal_rowid = connection.execute(
+            "SELECT rowid FROM routing_lan_scans WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ).fetchone()
+    assert terminal_rowid is not None
+    before_values, before_bytes = _lan_table_snapshot(state, "routing_lan_scans")
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal_lan_scan_immutable"):
+        with state._connect() as connection:
+            if operation == "insert":
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO routing_lan_scans (
+                        rowid, scan_id, status, revision, owner_principal,
+                        confirmed_interface_id, network, limits_json, limits_digest,
+                        preview_digest, created_at, updated_at, started_at, finished_at,
+                        cancel_reason, terminal_reason, candidate_count, error_count,
+                        timeout_count, terminal_receipt_json, terminal_receipt_digest
+                    )
+                    SELECT ?, 'lan_rowid_insert_replacement', status, revision,
+                           owner_principal, confirmed_interface_id, network, limits_json,
+                           limits_digest, preview_digest, created_at, updated_at,
+                           started_at, finished_at, cancel_reason, terminal_reason,
+                           candidate_count, error_count, timeout_count,
+                           terminal_receipt_json, terminal_receipt_digest
+                    FROM routing_lan_scans WHERE scan_id = ?
+                    """,
+                    (terminal_rowid[0], draft.scan_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE OR REPLACE routing_lan_scans
+                    SET rowid = ?
+                    WHERE scan_id = ?
+                    """,
+                    (terminal_rowid[0], draft.scan_id),
+                )
+
+    after_values, after_bytes = _lan_table_snapshot(state, "routing_lan_scans")
+    assert after_values == before_values
+    assert after_bytes == before_bytes
+    assert lan_ledger.get_scan(terminal.scan_id) == terminal
+    assert lan_ledger.get_scan(draft.scan_id) == draft
+    assert lan_ledger.get_scan("lan_rowid_insert_replacement") is None
+
+
+@pytest.mark.parametrize(
+    ("table", "operation"),
+    [
+        pytest.param("routing_lan_observations", "insert", id="observation-insert"),
+        pytest.param("routing_lan_observations", "update", id="observation-update"),
+        pytest.param("routing_lan_scan_events", "insert", id="event-insert"),
+        pytest.param("routing_lan_scan_events", "update", id="event-update"),
+    ],
+)
+def test_rowid_replace_cannot_delete_terminal_child_evidence(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+    table: str,
+    operation: str,
+) -> None:
+    kind = "observation" if table == "routing_lan_observations" else "event"
+    terminal_running = _running_scan(
+        lan_ledger,
+        scan_id=f"lan_rowid_{kind}_{operation}_terminal",
+    )
+    if kind == "observation":
+        lan_ledger.append_observation(
+            terminal_running.scan_id,
+            _observation(),
+            expected_revision=terminal_running.revision,
+        )
+        terminal_current = lan_ledger.get_scan(terminal_running.scan_id)
+        terminal_candidate_count = 1
+    else:
+        lan_ledger.append_event(
+            terminal_running.scan_id,
+            "probe_finished",
+            {"ok": True},
+            expected_revision=terminal_running.revision,
+        )
+        terminal_current = lan_ledger.get_scan(terminal_running.scan_id)
+        terminal_candidate_count = 0
+    assert terminal_current is not None
+    terminal = lan_ledger.transition_scan(
+        terminal_current.scan_id,
+        "completed",
+        expected_revision=terminal_current.revision,
+        terminal_reason="child_evidence_complete",
+        candidate_count=terminal_candidate_count,
+        error_count=0,
+        timeout_count=0,
+    )
+    source = _running_scan(
+        lan_ledger,
+        scan_id=f"lan_rowid_{kind}_{operation}_source",
+    )
+    if operation == "update" and kind == "observation":
+        lan_ledger.append_observation(
+            source.scan_id,
+            _observation(
+                endpoint_id="sha256:" + "6" * 64,
+                address="192.168.10.2",
+            ),
+            expected_revision=source.revision,
+        )
+        source = lan_ledger.get_scan(source.scan_id)
+    elif operation == "update":
+        lan_ledger.append_event(
+            source.scan_id,
+            "probe_started",
+            {"port": 11434},
+            expected_revision=source.revision,
+        )
+        source = lan_ledger.get_scan(source.scan_id)
+    assert source is not None
+
+    if kind == "observation":
+        assert len(lan_ledger.list_observations(terminal.scan_id)) == 1
+        target_key: tuple[object, ...] = (
+            terminal.scan_id,
+            "sha256:" + "3" * 64,
+        )
+        target_query = (
+            "SELECT rowid FROM routing_lan_observations "
+            "WHERE scan_id = ? AND endpoint_id = ?"
+        )
+    else:
+        assert len(lan_ledger.list_events(terminal.scan_id)) == 1
+        target_key = (terminal.scan_id, 1)
+        target_query = (
+            "SELECT rowid FROM routing_lan_scan_events "
+            "WHERE scan_id = ? AND sequence = ?"
+        )
+    with state._connect() as connection:
+        terminal_rowid = connection.execute(target_query, target_key).fetchone()
+    assert terminal_rowid is not None
+    before_values, before_bytes = _lan_table_snapshot(state, table)
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal_lan_scan_immutable"):
+        with state._connect() as connection:
+            if kind == "observation" and operation == "insert":
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO routing_lan_observations (
+                        rowid, scan_id, endpoint_id, source, interface_id, address,
+                        port, api_shape, tls_enabled, certificate_sha256,
+                        catalog_digest, capability_digest, public_payload_json,
+                        freshness_timestamp, error_category, created_at
+                    )
+                    SELECT ?, ?, ?, source, interface_id, address, port, api_shape,
+                           tls_enabled, certificate_sha256, catalog_digest,
+                           capability_digest, public_payload_json,
+                           freshness_timestamp, error_category, created_at
+                    FROM routing_lan_observations
+                    WHERE scan_id = ? AND endpoint_id = ?
+                    """,
+                    (
+                        terminal_rowid[0],
+                        source.scan_id,
+                        "sha256:" + "7" * 64,
+                        *target_key,
+                    ),
+                )
+            elif kind == "observation":
+                connection.execute(
+                    """
+                    UPDATE OR REPLACE routing_lan_observations
+                    SET rowid = ?
+                    WHERE scan_id = ? AND endpoint_id = ?
+                    """,
+                    (
+                        terminal_rowid[0],
+                        source.scan_id,
+                        "sha256:" + "6" * 64,
+                    ),
+                )
+            elif operation == "insert":
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO routing_lan_scan_events (
+                        rowid, scan_id, sequence, event_type, payload_json, created_at
+                    )
+                    SELECT ?, ?, 1, event_type, payload_json, created_at
+                    FROM routing_lan_scan_events
+                    WHERE scan_id = ? AND sequence = ?
+                    """,
+                    (terminal_rowid[0], source.scan_id, *target_key),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE OR REPLACE routing_lan_scan_events
+                    SET rowid = ?
+                    WHERE scan_id = ? AND sequence = 1
+                    """,
+                    (terminal_rowid[0], source.scan_id),
+                )
+
+    after_values, after_bytes = _lan_table_snapshot(state, table)
+    assert after_values == before_values
+    assert after_bytes == before_bytes
+    assert lan_ledger.get_scan(terminal.scan_id) == terminal
+    assert lan_ledger.get_scan(source.scan_id) == source
+
+
 @pytest.mark.parametrize(
     ("status", "revision", "started_at"),
     [
@@ -993,6 +1325,7 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
         "idx_routing_lan_scan_events_poll",
     } <= indexes
     expected_guards = {
+        "trg_routing_lan_scan_id_update_immutable",
         "trg_routing_lan_pristine_draft_insert_required",
         "trg_routing_lan_terminal_scan_id_replace_immutable",
         "trg_routing_lan_terminal_transition_complete",
@@ -1013,13 +1346,23 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
         connection.execute(
             "DROP TRIGGER trg_routing_lan_terminal_observation_insert_immutable"
         )
+        connection.execute("DROP TRIGGER trg_routing_lan_scan_id_update_immutable")
     LanDiscoveryLedger(state)
     with state._connect() as connection:
-        restored = connection.execute(
+        restored = {
+            str(row[0])
+            for row in connection.execute(
             """
-            SELECT 1 FROM sqlite_master
+            SELECT name FROM sqlite_master
             WHERE type = 'trigger'
-              AND name = 'trg_routing_lan_terminal_observation_insert_immutable'
+              AND name IN (
+                  'trg_routing_lan_terminal_observation_insert_immutable',
+                  'trg_routing_lan_scan_id_update_immutable'
+              )
             """
-        ).fetchone()
-    assert restored is not None
+            ).fetchall()
+        }
+    assert restored == {
+        "trg_routing_lan_terminal_observation_insert_immutable",
+        "trg_routing_lan_scan_id_update_immutable",
+    }

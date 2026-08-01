@@ -6183,6 +6183,7 @@ def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA recursive_triggers=ON")
 
 
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:

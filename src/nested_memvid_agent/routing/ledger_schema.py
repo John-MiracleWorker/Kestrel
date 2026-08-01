@@ -294,6 +294,14 @@ def _ensure_routing_schema_v3_guards(conn: sqlite3.Connection) -> None:
 
     statements = (
         """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_scan_id_update_immutable
+        BEFORE UPDATE OF scan_id ON routing_lan_scans
+        WHEN NEW.scan_id <> OLD.scan_id
+        BEGIN
+            SELECT RAISE(ABORT, 'lan_scan_identity_immutable');
+        END
+        """,
+        """
         CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_scan_id_replace_immutable
         BEFORE INSERT ON routing_lan_scans
         WHEN EXISTS (
