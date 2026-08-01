@@ -37,6 +37,8 @@ def ensure_routing_schema(state: AgentStateStore) -> None:
         if current < 3:
             _apply_routing_schema_v3(conn)
             current = 3
+        if current >= 3:
+            _ensure_routing_schema_v3_guards(conn)
         conn.execute(
             """
             INSERT INTO routing_schema_version (id, version, updated_at)
@@ -284,6 +286,150 @@ def _apply_routing_schema_v3(conn: sqlite3.Connection) -> None:
             "routing_lan_scan_events(scan_id, sequence)"
         ),
     ):
+        conn.execute(statement)
+
+
+def _ensure_routing_schema_v3_guards(conn: sqlite3.Connection) -> None:
+    """Install idempotent database-level terminal evidence guards."""
+
+    statements = (
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_fields_insert_require_terminal
+        BEFORE INSERT ON routing_lan_scans
+        WHEN NEW.status NOT IN ('cancelled', 'completed', 'failed', 'interrupted')
+         AND (
+            NEW.finished_at IS NOT NULL
+            OR NEW.terminal_reason IS NOT NULL
+            OR NEW.candidate_count IS NOT NULL
+            OR NEW.error_count IS NOT NULL
+            OR NEW.timeout_count IS NOT NULL
+            OR NEW.terminal_receipt_json IS NOT NULL
+            OR NEW.terminal_receipt_digest IS NOT NULL
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_fields_require_terminal_state');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_fields_require_terminal
+        BEFORE UPDATE OF
+            status, finished_at, terminal_reason, candidate_count, error_count,
+            timeout_count, terminal_receipt_json, terminal_receipt_digest
+        ON routing_lan_scans
+        WHEN NEW.status NOT IN ('cancelled', 'completed', 'failed', 'interrupted')
+         AND (
+            NEW.finished_at IS NOT NULL
+            OR NEW.terminal_reason IS NOT NULL
+            OR NEW.candidate_count IS NOT NULL
+            OR NEW.error_count IS NOT NULL
+            OR NEW.timeout_count IS NOT NULL
+            OR NEW.terminal_receipt_json IS NOT NULL
+            OR NEW.terminal_receipt_digest IS NOT NULL
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_fields_require_terminal_state');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_scan_update_immutable
+        BEFORE UPDATE ON routing_lan_scans
+        WHEN OLD.status IN ('cancelled', 'completed', 'failed', 'interrupted')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_scan_delete_immutable
+        BEFORE DELETE ON routing_lan_scans
+        WHEN OLD.status IN ('cancelled', 'completed', 'failed', 'interrupted')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_observation_insert_immutable
+        BEFORE INSERT ON routing_lan_observations
+        WHEN EXISTS (
+            SELECT 1 FROM routing_lan_scans
+            WHERE scan_id = NEW.scan_id
+              AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_observation_update_immutable
+        BEFORE UPDATE ON routing_lan_observations
+        WHEN EXISTS (
+                SELECT 1 FROM routing_lan_scans
+                WHERE scan_id = OLD.scan_id
+                  AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+             )
+          OR EXISTS (
+                SELECT 1 FROM routing_lan_scans
+                WHERE scan_id = NEW.scan_id
+                  AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_observation_delete_immutable
+        BEFORE DELETE ON routing_lan_observations
+        WHEN EXISTS (
+            SELECT 1 FROM routing_lan_scans
+            WHERE scan_id = OLD.scan_id
+              AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_event_insert_immutable
+        BEFORE INSERT ON routing_lan_scan_events
+        WHEN EXISTS (
+            SELECT 1 FROM routing_lan_scans
+            WHERE scan_id = NEW.scan_id
+              AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_event_update_immutable
+        BEFORE UPDATE ON routing_lan_scan_events
+        WHEN EXISTS (
+                SELECT 1 FROM routing_lan_scans
+                WHERE scan_id = OLD.scan_id
+                  AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+             )
+          OR EXISTS (
+                SELECT 1 FROM routing_lan_scans
+                WHERE scan_id = NEW.scan_id
+                  AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+             )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_lan_terminal_event_delete_immutable
+        BEFORE DELETE ON routing_lan_scan_events
+        WHEN EXISTS (
+            SELECT 1 FROM routing_lan_scans
+            WHERE scan_id = OLD.scan_id
+              AND status IN ('cancelled', 'completed', 'failed', 'interrupted')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_lan_scan_immutable');
+        END
+        """,
+    )
+    for statement in statements:
         conn.execute(statement)
 
 

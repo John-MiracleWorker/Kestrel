@@ -7,8 +7,10 @@ import ipaddress
 import json
 import re
 import sqlite3
+from dataclasses import asdict
 from typing import Any
 
+from ..lan_discovery_models import LanScanLimits
 from .lan_records import (
     SCAN_STATES,
     LanObservationDraft,
@@ -23,20 +25,41 @@ MAX_LIMITS_BYTES = 16_384
 MAX_RECEIPT_BYTES = 1_048_576
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_SECRET_KEYS = {
-    "authorization",
-    "cookie",
-    "password",
-    "secret",
-    "token",
-    "access_token",
-    "refresh_token",
-    "api_key",
-    "apikey",
-    "client_secret",
-    "private_key",
-}
-_SECRET_SUFFIXES = ("_password", "_secret", "_token", "_api_key", "_apikey")
+_OBSERVATION_PUBLIC_FIELDS = frozenset(
+    {
+        "service",
+        "service_version",
+        "model_count",
+        "model_ids",
+        "capabilities",
+        "metadata",
+    }
+)
+_OBSERVATION_METADATA_FIELDS = frozenset(
+    {"display_name", "vendor", "product", "description"}
+)
+_EVENT_PUBLIC_FIELDS = frozenset(
+    {
+        "address",
+        "candidate_count",
+        "completed",
+        "endpoint_id",
+        "error_category",
+        "error_count",
+        "interface_id",
+        "message",
+        "model_count",
+        "network",
+        "ok",
+        "phase",
+        "port",
+        "reason",
+        "source",
+        "status",
+        "timeout_count",
+        "total",
+    }
+)
 
 
 def canonical_json(value: object) -> str:
@@ -57,7 +80,74 @@ def sha256_digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def bounded_public_payload(
+def bounded_observation_public_evidence(value: object) -> dict[str, Any]:
+    payload = _require_string_keyed_object(value, "observation public evidence")
+    unknown = sorted(set(payload) - _OBSERVATION_PUBLIC_FIELDS)
+    if unknown:
+        raise ValueError(
+            "unsupported observation public evidence field: " + ", ".join(unknown)
+        )
+    result: dict[str, Any] = {}
+    for key, item in payload.items():
+        if key in {"service", "service_version"}:
+            result[key] = _bounded_evidence_text(item, key, maximum=128)
+        elif key == "model_count":
+            result[key] = validate_non_negative_count(item, "model_count")
+        elif key in {"model_ids", "capabilities"}:
+            result[key] = _bounded_evidence_text_list(item, key)
+        elif key == "metadata":
+            result[key] = _bounded_observation_metadata(item)
+    return _bounded_json_object(
+        result,
+        kind="observation public evidence",
+        max_bytes=MAX_PUBLIC_PAYLOAD_BYTES,
+    )
+
+
+def bounded_event_public_evidence(value: object) -> dict[str, Any]:
+    payload = _require_string_keyed_object(value, "event public evidence")
+    unknown = sorted(set(payload) - _EVENT_PUBLIC_FIELDS)
+    if unknown:
+        raise ValueError("unsupported event public evidence field: " + ", ".join(unknown))
+    result: dict[str, Any] = {}
+    for key, item in payload.items():
+        if key in {
+            "candidate_count",
+            "completed",
+            "error_count",
+            "model_count",
+            "port",
+            "timeout_count",
+            "total",
+        }:
+            result[key] = validate_non_negative_count(item, key)
+        elif key == "ok":
+            if not isinstance(item, bool):
+                raise ValueError("event public evidence ok must be boolean")
+            result[key] = item
+        else:
+            result[key] = _bounded_evidence_text(item, key, maximum=512)
+    return _bounded_json_object(
+        result,
+        kind="event public evidence",
+        max_bytes=MAX_EVENT_PAYLOAD_BYTES,
+    )
+
+
+def bounded_scan_limits(value: object) -> dict[str, Any]:
+    payload = _require_string_keyed_object(value, "scan limits")
+    expected = json.loads(canonical_json(asdict(LanScanLimits())))
+    normalized = json.loads(canonical_json(payload))
+    if normalized != expected:
+        raise ValueError("LAN scan limits must match the fixed bounded limits")
+    return _bounded_json_object(
+        normalized,
+        kind="scan limits",
+        max_bytes=MAX_LIMITS_BYTES,
+    )
+
+
+def _bounded_json_object(
     value: object,
     *,
     kind: str = "public payload",
@@ -65,8 +155,8 @@ def bounded_public_payload(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"LAN {kind} must be a JSON object")
-    redacted = _redact_json(value, depth=0)
-    encoded = canonical_json(redacted)
+    validated = _validate_json(value, depth=0, kind=kind)
+    encoded = canonical_json(validated)
     if len(encoded.encode("utf-8")) > max_bytes:
         raise ValueError(f"LAN bounded {kind} exceeds {max_bytes} bytes")
     parsed = json.loads(encoded)
@@ -159,7 +249,7 @@ def validate_observation(draft: LanObservationDraft) -> dict[str, Any]:
             "capability_digest",
             optional=True,
         ),
-        "public_payload": bounded_public_payload(draft.public_payload),
+        "public_payload": bounded_observation_public_evidence(draft.public_payload),
         "freshness_timestamp": validate_required_text(
             draft.freshness_timestamp,
             "freshness_timestamp",
@@ -238,26 +328,60 @@ def event_from_row(row: sqlite3.Row) -> LanScanEvent:
     )
 
 
-def _redact_json(value: object, *, depth: int) -> object:
+def _require_string_keyed_object(value: object, kind: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{kind} must be a JSON object")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{kind} requires string keys")
+    return dict(value)
+
+
+def _bounded_evidence_text(value: object, field: str, *, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"public evidence {field} must be text")
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum:
+        raise ValueError(
+            f"public evidence {field} must be between 1 and {maximum} characters"
+        )
+    return normalized
+
+
+def _bounded_evidence_text_list(value: object, field: str) -> list[str]:
+    if not isinstance(value, (list, tuple)) or len(value) > 64:
+        raise ValueError(f"public evidence {field} must be a list of at most 64 strings")
+    return [_bounded_evidence_text(item, field, maximum=256) for item in value]
+
+
+def _bounded_observation_metadata(value: object) -> dict[str, str]:
+    metadata = _require_string_keyed_object(value, "observation public evidence metadata")
+    unknown = sorted(set(metadata) - _OBSERVATION_METADATA_FIELDS)
+    if unknown:
+        raise ValueError(
+            "unsupported observation public evidence metadata field: "
+            + ", ".join(unknown)
+        )
+    return {
+        key: _bounded_evidence_text(item, f"metadata.{key}", maximum=512)
+        for key, item in metadata.items()
+    }
+
+
+def _validate_json(value: object, *, depth: int, kind: str) -> object:
     if depth > 8:
-        raise ValueError("LAN public payload exceeds maximum nesting depth")
+        raise ValueError(f"LAN {kind} exceeds maximum nesting depth")
     if isinstance(value, dict):
         result: dict[str, object] = {}
         for raw_key, item in value.items():
-            key = str(raw_key)
-            normalized = key.strip().lower().replace("-", "_")
-            if normalized in _SECRET_KEYS or any(
-                normalized.endswith(suffix) for suffix in _SECRET_SUFFIXES
-            ):
-                result[key] = "[REDACTED]"
-            else:
-                result[key] = _redact_json(item, depth=depth + 1)
+            if not isinstance(raw_key, str):
+                raise ValueError(f"LAN {kind} requires string keys")
+            result[raw_key] = _validate_json(item, depth=depth + 1, kind=kind)
         return result
     if isinstance(value, (list, tuple)):
-        return [_redact_json(item, depth=depth + 1) for item in value]
+        return [_validate_json(item, depth=depth + 1, kind=kind) for item in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
-    raise ValueError("LAN public payload contains a non-JSON value")
+    raise ValueError(f"LAN {kind} contains a non-JSON value")
 
 
 def _json_object(value: object) -> dict[str, Any]:

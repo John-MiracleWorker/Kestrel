@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import nested_memvid_agent.routing.lan_ledger as lan_ledger_module
 from nested_memvid_agent.lan_discovery_models import LanScanLimits
 from nested_memvid_agent.routing.lan_ledger import LanDiscoveryLedger
 from nested_memvid_agent.routing.lan_records import (
@@ -330,7 +331,7 @@ def test_event_sequences_are_monotonic_per_scan_and_revision_checked(
         )
 
 
-def test_public_payloads_are_bounded_canonical_and_secret_fields_are_redacted(
+def test_public_evidence_schema_preserves_safe_canonical_bounded_metadata(
     lan_ledger: LanDiscoveryLedger,
 ) -> None:
     running = _running_scan(lan_ledger)
@@ -339,16 +340,22 @@ def test_public_payloads_are_bounded_canonical_and_secret_fields_are_redacted(
         _observation(
             public_payload={
                 "service": "ollama",
-                "authorization": "Bearer must-not-persist",
-                "nested": {"api_key": "must-not-persist"},
+                "model_count": 1,
+                "metadata": {
+                    "display_name": "Studio model service",
+                    "vendor": "Ollama",
+                },
             }
         ),
         expected_revision=running.revision,
     )
 
     assert stored.public_payload == {
-        "authorization": "[REDACTED]",
-        "nested": {"api_key": "[REDACTED]"},
+        "metadata": {
+            "display_name": "Studio model service",
+            "vendor": "Ollama",
+        },
+        "model_count": 1,
         "service": "ollama",
     }
     serialized = json.dumps(
@@ -357,11 +364,14 @@ def test_public_payloads_are_bounded_canonical_and_secret_fields_are_redacted(
         separators=(",", ":"),
         ensure_ascii=False,
     )
-    assert "must-not-persist" not in serialized
+    assert serialized == (
+        '{"metadata":{"display_name":"Studio model service","vendor":"Ollama"},'
+        '"model_count":1,"service":"ollama"}'
+    )
 
     current = lan_ledger.get_scan(running.scan_id)
     assert current is not None
-    with pytest.raises(ValueError, match="bounded public payload"):
+    with pytest.raises(ValueError, match="metadata.description"):
         lan_ledger.append_observation(
             running.scan_id,
             replace(
@@ -369,11 +379,394 @@ def test_public_payloads_are_bounded_canonical_and_secret_fields_are_redacted(
                     endpoint_id="sha256:" + "7" * 64,
                     address="192.168.10.2",
                 ),
-                public_payload={"body": "x" * 20_000},
+                public_payload={
+                    "service": "ollama",
+                    "metadata": {"description": "x" * 20_000},
+                },
             ),
             expected_revision=current.revision,
         )
     assert lan_ledger.get_scan(running.scan_id) == current
+
+
+@pytest.mark.parametrize(
+    "unsafe_payload",
+    [
+        {"body": '{"models":[{"name":"raw-provider-response"}]}'},
+        {"set-cookie": "session=must-not-persist"},
+        {"proxy-authorization": "Basic must-not-persist"},
+        {"metadata": {"api_key": "must-not-persist"}},
+        {b"authorization": "Bearer must-not-persist"},
+    ],
+)
+def test_observation_public_evidence_rejects_raw_bodies_credentials_and_non_string_keys(
+    lan_ledger: LanDiscoveryLedger,
+    unsafe_payload: dict[object, object],
+) -> None:
+    running = _running_scan(lan_ledger)
+
+    with pytest.raises(ValueError, match="public evidence|string keys"):
+        lan_ledger.append_observation(
+            running.scan_id,
+            replace(_observation(), public_payload=unsafe_payload),  # type: ignore[arg-type]
+            expected_revision=running.revision,
+        )
+
+    assert lan_ledger.list_observations(running.scan_id) == []
+    assert lan_ledger.get_scan(running.scan_id) == running
+
+
+def test_event_public_evidence_rejects_raw_provider_material(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    running = _running_scan(lan_ledger)
+
+    with pytest.raises(ValueError, match="event public evidence"):
+        lan_ledger.append_event(
+            running.scan_id,
+            "probe_finished",
+            {"body": "raw-provider-response"},
+            expected_revision=running.revision,
+        )
+
+    assert lan_ledger.list_events(running.scan_id) == []
+    assert lan_ledger.get_scan(running.scan_id) == running
+
+
+def test_sqlite_terminal_guards_reject_direct_scan_observation_and_event_rewrites(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    running = _running_scan(lan_ledger)
+    with pytest.raises(sqlite3.IntegrityError, match="terminal_fields_require_terminal_state"):
+        with state._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO routing_lan_scans (
+                    scan_id, status, revision, owner_principal,
+                    confirmed_interface_id, network, limits_json, limits_digest,
+                    preview_digest, created_at, updated_at, terminal_receipt_json,
+                    terminal_receipt_digest
+                )
+                SELECT 'lan_invalid_fields', 'draft', 1, owner_principal,
+                       confirmed_interface_id, network, limits_json, limits_digest,
+                       preview_digest, created_at, updated_at, '{}', ?
+                FROM routing_lan_scans WHERE scan_id = ?
+                """,
+                ("sha256:" + "9" * 64, running.scan_id),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="terminal_fields_require_terminal_state"):
+        with state._connect() as connection:
+            connection.execute(
+                """
+                UPDATE routing_lan_scans
+                SET terminal_receipt_json = '{}', terminal_receipt_digest = ?
+                WHERE scan_id = ?
+                """,
+                ("sha256:" + "9" * 64, running.scan_id),
+            )
+
+    lan_ledger.append_observation(
+        running.scan_id,
+        _observation(),
+        expected_revision=running.revision,
+    )
+    observed = lan_ledger.get_scan(running.scan_id)
+    assert observed is not None
+    lan_ledger.append_event(
+        running.scan_id,
+        "probe_finished",
+        {"ok": True, "port": 11434},
+        expected_revision=observed.revision,
+    )
+    with_event = lan_ledger.get_scan(running.scan_id)
+    assert with_event is not None
+    terminal = lan_ledger.transition_scan(
+        running.scan_id,
+        "completed",
+        expected_revision=with_event.revision,
+        terminal_reason="scan_complete",
+        candidate_count=1,
+        error_count=0,
+        timeout_count=0,
+    )
+    source = _running_scan(lan_ledger, scan_id="lan_source")
+    lan_ledger.append_observation(
+        source.scan_id,
+        _observation(
+            endpoint_id="sha256:" + "8" * 64,
+            address="192.168.10.2",
+        ),
+        expected_revision=source.revision,
+    )
+    source_observed = lan_ledger.get_scan(source.scan_id)
+    assert source_observed is not None
+    lan_ledger.append_event(
+        source.scan_id,
+        "probe_started",
+        {"port": 11434},
+        expected_revision=source_observed.revision,
+    )
+    source_event = lan_ledger.get_scan(source.scan_id)
+    assert source_event is not None
+    lan_ledger.append_event(
+        source.scan_id,
+        "probe_finished",
+        {"ok": True, "port": 11434},
+        expected_revision=source_event.revision,
+    )
+
+    direct_mutations = (
+        (
+            "UPDATE routing_lan_scans SET terminal_reason = 'rewritten' WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ),
+        ("DELETE FROM routing_lan_scans WHERE scan_id = ?", (terminal.scan_id,)),
+        (
+            """
+            INSERT INTO routing_lan_observations (
+                scan_id, endpoint_id, source, interface_id, address, port,
+                api_shape, tls_enabled, certificate_sha256, catalog_digest,
+                capability_digest, public_payload_json, freshness_timestamp,
+                error_category, created_at
+            ) VALUES (?, ?, 'active', ?, '192.168.10.2', 11434, 'ollama', 0,
+                      NULL, NULL, NULL, '{}', '2026-08-01T12:01:00Z', NULL,
+                      '2026-08-01T12:01:00Z')
+            """,
+            (terminal.scan_id, "sha256:" + "8" * 64, INTERFACE_ID),
+        ),
+        (
+            "UPDATE routing_lan_observations SET api_shape = 'rewritten' WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ),
+        (
+            "DELETE FROM routing_lan_observations WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ),
+        (
+            "UPDATE routing_lan_observations SET scan_id = ? WHERE scan_id = ?",
+            (terminal.scan_id, source.scan_id),
+        ),
+        (
+            """
+            INSERT INTO routing_lan_scan_events
+                (scan_id, sequence, event_type, payload_json, created_at)
+            VALUES (?, 2, 'late', '{}', '2026-08-01T12:01:00Z')
+            """,
+            (terminal.scan_id,),
+        ),
+        (
+            "UPDATE routing_lan_scan_events SET event_type = 'rewritten' WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ),
+        (
+            "DELETE FROM routing_lan_scan_events WHERE scan_id = ?",
+            (terminal.scan_id,),
+        ),
+        (
+            """
+            UPDATE routing_lan_scan_events SET scan_id = ?
+            WHERE scan_id = ? AND sequence = 2
+            """,
+            (terminal.scan_id, source.scan_id),
+        ),
+    )
+    for statement, parameters in direct_mutations:
+        with pytest.raises(sqlite3.IntegrityError, match="terminal_lan_scan_immutable"):
+            with state._connect() as connection:
+                connection.execute(statement, parameters)
+
+    assert lan_ledger.get_scan(terminal.scan_id) == terminal
+    assert len(lan_ledger.list_observations(terminal.scan_id)) == 1
+    assert len(lan_ledger.list_events(terminal.scan_id)) == 1
+
+
+def test_observation_insert_rolls_back_when_revision_update_fails_in_sqlite(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    running = _running_scan(lan_ledger)
+    with state._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER test_reject_lan_revision_update
+            BEFORE UPDATE OF revision ON routing_lan_scans
+            WHEN OLD.scan_id = 'lan_1'
+            BEGIN
+                SELECT RAISE(ABORT, 'test_revision_update_rejected');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="test_revision_update_rejected"):
+        lan_ledger.append_observation(
+            running.scan_id,
+            _observation(),
+            expected_revision=running.revision,
+        )
+
+    assert lan_ledger.list_observations(running.scan_id) == []
+    assert lan_ledger.get_scan(running.scan_id) == running
+
+
+def _independent_terminal_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+) -> str:
+    owner = "owner:test"
+    interface_id = INTERFACE_ID
+    network = "192.168.10.0/30"
+    preview_digest = PREVIEW_DIGEST
+    terminal_status = "completed"
+    terminal_reason = "scan_complete"
+    candidate_count = 1
+    error_count = 0
+    timeout_count = 0
+    observation = _observation()
+    timestamps = [
+        "2026-08-01T12:00:00Z",
+        "2026-08-01T12:00:01Z",
+        "2026-08-01T12:00:02Z",
+        "2026-08-01T12:00:03Z",
+    ]
+
+    if variant == "owner":
+        owner = "owner:other"
+    elif variant == "interface":
+        interface_id = "sha256:" + "a" * 64
+        observation = replace(observation, interface_id=interface_id)
+    elif variant == "network":
+        network = "192.168.20.0/30"
+        observation = replace(observation, address="192.168.20.1")
+    elif variant == "preview":
+        preview_digest = "sha256:" + "b" * 64
+    elif variant == "started_at":
+        timestamps[1] = "2026-08-01T12:00:00Z"
+    elif variant == "observation_created_at":
+        timestamps[2] = "2026-08-01T12:00:01Z"
+    elif variant == "finished_at":
+        timestamps[3] = "2026-08-01T12:00:04Z"
+    elif variant == "status":
+        terminal_status = "failed"
+    elif variant == "terminal_reason":
+        terminal_reason = "probe_failure"
+    elif variant == "candidate_count":
+        candidate_count = 2
+    elif variant == "error_count":
+        error_count = 1
+    elif variant == "timeout_count":
+        error_count = 1
+        timeout_count = 1
+    elif variant == "endpoint_id":
+        observation = replace(observation, endpoint_id="sha256:" + "c" * 64)
+    elif variant == "source":
+        observation = replace(observation, source="mdns")
+    elif variant == "address":
+        observation = replace(observation, address="192.168.10.2")
+    elif variant == "port":
+        observation = replace(observation, port=1234)
+    elif variant == "api_shape":
+        observation = replace(observation, api_shape="openai-compatible")
+    elif variant == "tls_evidence":
+        observation = replace(
+            observation,
+            tls_enabled=True,
+            certificate_sha256="sha256:" + "d" * 64,
+        )
+    elif variant == "catalog_digest":
+        observation = replace(observation, catalog_digest="sha256:" + "e" * 64)
+    elif variant == "capability_digest":
+        observation = replace(observation, capability_digest="sha256:" + "f" * 64)
+    elif variant == "public_payload":
+        observation = replace(
+            observation,
+            public_payload={
+                "service": "ollama",
+                "model_count": 1,
+                "metadata": {"display_name": "Changed service"},
+            },
+        )
+    elif variant == "freshness":
+        observation = replace(observation, freshness_timestamp="2026-08-01T11:59:59Z")
+    elif variant == "error_category":
+        observation = replace(observation, error_category="connection_refused")
+
+    clock = iter(timestamps)
+    monkeypatch.setattr(lan_ledger_module, "utc_now", clock.__next__)
+    state = AgentStateStore(tmp_path / variant / "agent.db")
+    ledger = LanDiscoveryLedger(state)
+    draft = ledger.create_scan(
+        scan_id="lan_digest",
+        owner_principal=owner,
+        confirmed_interface_id=interface_id,
+        network=network,
+        limits=_limits(),
+        preview_digest=preview_digest,
+        expected_revision=0,
+    )
+    running = ledger.transition_scan(
+        draft.scan_id,
+        "running",
+        expected_revision=draft.revision,
+    )
+    ledger.append_observation(
+        running.scan_id,
+        observation,
+        expected_revision=running.revision,
+    )
+    observed = ledger.get_scan(running.scan_id)
+    assert observed is not None
+    terminal = ledger.transition_scan(
+        running.scan_id,
+        terminal_status,
+        expected_revision=observed.revision,
+        terminal_reason=terminal_reason,
+        candidate_count=candidate_count,
+        error_count=error_count,
+        timeout_count=timeout_count,
+    )
+    assert terminal.terminal_receipt_digest is not None
+    return terminal.terminal_receipt_digest
+
+
+def test_server_derived_receipt_digest_changes_for_each_load_bearing_evidence_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variants = (
+        "owner",
+        "interface",
+        "network",
+        "preview",
+        "started_at",
+        "observation_created_at",
+        "finished_at",
+        "status",
+        "terminal_reason",
+        "candidate_count",
+        "error_count",
+        "timeout_count",
+        "endpoint_id",
+        "source",
+        "address",
+        "port",
+        "api_shape",
+        "tls_evidence",
+        "catalog_digest",
+        "capability_digest",
+        "public_payload",
+        "freshness",
+        "error_category",
+    )
+    baseline = _independent_terminal_digest(tmp_path, monkeypatch, "baseline")
+    variant_digests = {
+        variant: _independent_terminal_digest(tmp_path, monkeypatch, variant)
+        for variant in variants
+    }
+
+    assert all(digest != baseline for digest in variant_digests.values())
+    assert len(set(variant_digests.values())) == len(variants)
 
 
 def test_invalid_terminal_counts_roll_back_receipt_and_status_atomically(
@@ -420,7 +813,41 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             ).fetchall()
         }
+        triggers = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
     assert {
         "idx_routing_lan_scans_status_updated",
         "idx_routing_lan_scan_events_poll",
     } <= indexes
+    expected_guards = {
+        "trg_routing_lan_terminal_fields_require_terminal",
+        "trg_routing_lan_terminal_fields_insert_require_terminal",
+        "trg_routing_lan_terminal_scan_update_immutable",
+        "trg_routing_lan_terminal_scan_delete_immutable",
+        "trg_routing_lan_terminal_observation_insert_immutable",
+        "trg_routing_lan_terminal_observation_update_immutable",
+        "trg_routing_lan_terminal_observation_delete_immutable",
+        "trg_routing_lan_terminal_event_insert_immutable",
+        "trg_routing_lan_terminal_event_update_immutable",
+        "trg_routing_lan_terminal_event_delete_immutable",
+    }
+    assert expected_guards <= triggers
+
+    with state._connect() as connection:
+        connection.execute(
+            "DROP TRIGGER trg_routing_lan_terminal_observation_insert_immutable"
+        )
+    LanDiscoveryLedger(state)
+    with state._connect() as connection:
+        restored = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name = 'trg_routing_lan_terminal_observation_insert_immutable'
+            """
+        ).fetchone()
+    assert restored is not None

@@ -19,10 +19,9 @@ from .lan_records import (
     LanScanTransitionError,
 )
 from .lan_serialization import (
-    MAX_EVENT_PAYLOAD_BYTES,
-    MAX_LIMITS_BYTES,
     MAX_RECEIPT_BYTES,
-    bounded_public_payload,
+    bounded_event_public_evidence,
+    bounded_scan_limits,
     canonical_json,
     event_from_row,
     normalize_network,
@@ -68,11 +67,7 @@ class LanDiscoveryLedger:
         )
         normalized_preview = validate_digest(preview_digest, "preview_digest")
         normalized_network = normalize_network(network)
-        normalized_limits = bounded_public_payload(
-            limits,
-            kind="limits",
-            max_bytes=MAX_LIMITS_BYTES,
-        )
+        normalized_limits = bounded_scan_limits(limits)
         limits_json = canonical_json(normalized_limits)
         limits_digest = sha256_digest(normalized_limits)
         now = utc_now()
@@ -250,11 +245,7 @@ class LanDiscoveryLedger:
         expected_revision: int | None = None,
     ) -> LanScanEvent:
         normalized_type = validate_required_text(event_type, "event_type", maximum=128)
-        normalized_payload = bounded_public_payload(
-            payload,
-            kind="event payload",
-            max_bytes=MAX_EVENT_PAYLOAD_BYTES,
-        )
+        normalized_payload = bounded_event_public_evidence(payload)
         now = utc_now()
         with self.state._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
