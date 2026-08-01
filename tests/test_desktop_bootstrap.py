@@ -70,7 +70,7 @@ def test_bootstrap_consumes_private_file_without_leaking_secrets(tmp_path: Path)
         "launch_nonce_digest": sha256(b"launch-nonce").hexdigest(),
         "sidecar_version": "0.5.0",
         "state_schema_version": 21,
-        "routing_schema_version": 2,
+        "routing_schema_version": 3,
         "memory_layers": list(_MEMORY_LAYERS),
     }
     serialized = json.dumps(public_payload, sort_keys=True)

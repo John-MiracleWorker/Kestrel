@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -80,19 +82,117 @@ def _configured_ledger(state: AgentStateStore) -> RoutingLedger:
     return ledger
 
 
+def _route_history_digest(state: AgentStateStore) -> str:
+    history: dict[str, list[list[object]]] = {}
+    for table in (
+        "routing_decisions",
+        "routing_outcomes",
+        "routing_shadow_evaluations",
+        "routing_target_calibrations",
+    ):
+        with state._connect() as connection:
+            rows = connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+        history[table] = [list(row) for row in rows]
+    encoded = json.dumps(
+        history,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def test_routing_ledger_uses_additive_schema_and_round_trips_inventory(tmp_path: Path) -> None:
     state, _task = _state_and_task(tmp_path)
 
     ledger = _configured_ledger(state)
 
     assert state.schema_version() >= 19
-    assert ledger.schema_version() == 2
+    assert ledger.schema_version() == 3
     profile = ledger.get_provider_profile("local")
     target = ledger.get_model_target("local-scout")
     policy = ledger.get_policy("balanced")
     assert profile is not None and profile.profile.secret_ref == "secret://routing-local-key"
     assert target is not None and target.target.model == "qwen-coder"
     assert policy is not None and policy.policy.policy_id == "balanced"
+
+
+def test_routing_v2_migrates_to_v3_without_rewriting_route_history(tmp_path: Path) -> None:
+    state, task = _state_and_task(tmp_path)
+    ledger = _configured_ledger(state)
+    coordinator = DurableRoutingCoordinator(ledger, mode="shadow")
+    durable = coordinator.assign(AgentConfig(), task, subagent_id=None, attempt=1)
+    coordinator.mark_started(durable)
+    coordinator.record_outcome(
+        durable,
+        execution_status="complete",
+        validation_passed=True,
+        validation_codes=("accepted",),
+        latency_seconds=0.25,
+        actual_cost_usd=0.01,
+        outcome_labels=("validated_success",),
+    )
+    with state._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO routing_target_calibrations (
+                calibration_key, project_id, target_id, task_family, risk,
+                capability_key, validation_rate, recent_failure_rate,
+                provider_outage_rate, average_cost_usd, average_latency_seconds,
+                cost_coverage, example_count, effective_sample_size, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "route_cal_migration_fixture",
+                None,
+                "local-scout",
+                "repository_inspection",
+                "low",
+                "none",
+                1.0,
+                0.0,
+                0.0,
+                0.01,
+                0.25,
+                1.0,
+                1,
+                1.0,
+                "2026-08-01T00:00:00Z",
+            ),
+        )
+    assert ledger.list_decisions(run_id=task.run_id)
+    assert ledger.list_outcomes(run_id=task.run_id)
+    assert ledger.list_shadows(run_id=task.run_id)
+    assert ledger.list_calibrations()
+
+    with state._connect() as connection:
+        for table in (
+            "routing_lan_scan_events",
+            "routing_lan_observations",
+            "routing_lan_scans",
+        ):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
+        connection.execute(
+            "UPDATE routing_schema_version SET version = 2 WHERE id = 1"
+        )
+    before = _route_history_digest(state)
+
+    migrated = RoutingLedger(state)
+
+    assert migrated.schema_version() == 3
+    assert _route_history_digest(state) == before
+    with state._connect() as connection:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert {
+        "routing_lan_scans",
+        "routing_lan_observations",
+        "routing_lan_scan_events",
+    } <= tables
 
 
 def test_routing_inventory_rejects_raw_secrets_and_secret_bearing_metadata(

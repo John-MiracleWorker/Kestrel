@@ -4,7 +4,7 @@ import sqlite3
 
 from ..state_store import AgentStateStore, utc_now
 
-ROUTING_SCHEMA_VERSION = 2
+ROUTING_SCHEMA_VERSION = 3
 
 
 def ensure_routing_schema(state: AgentStateStore) -> None:
@@ -34,6 +34,9 @@ def ensure_routing_schema(state: AgentStateStore) -> None:
         if current < 2:
             _apply_routing_schema_v2(conn)
             current = 2
+        if current < 3:
+            _apply_routing_schema_v3(conn)
+            current = 3
         conn.execute(
             """
             INSERT INTO routing_schema_version (id, version, updated_at)
@@ -187,6 +190,99 @@ def _apply_routing_schema_v1(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_routing_decisions_task ON routing_decisions(task_id, attempt)",
         "CREATE INDEX IF NOT EXISTS idx_routing_decisions_subagent ON routing_decisions(subagent_id, attempt)",
         "CREATE INDEX IF NOT EXISTS idx_routing_outcomes_run ON routing_outcomes(run_id, created_at)",
+    ):
+        conn.execute(statement)
+
+
+def _apply_routing_schema_v3(conn: sqlite3.Connection) -> None:
+    """Add immutable, owner-confirmed private-LAN discovery evidence."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_lan_scans (
+            scan_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'draft', 'running', 'cancelling', 'cancelled',
+                    'completed', 'failed', 'interrupted'
+                )
+            ),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            owner_principal TEXT NOT NULL,
+            confirmed_interface_id TEXT NOT NULL,
+            network TEXT NOT NULL,
+            limits_json TEXT NOT NULL,
+            limits_digest TEXT NOT NULL,
+            preview_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            cancel_reason TEXT,
+            terminal_reason TEXT,
+            candidate_count INTEGER CHECK (candidate_count IS NULL OR candidate_count >= 0),
+            error_count INTEGER CHECK (error_count IS NULL OR error_count >= 0),
+            timeout_count INTEGER CHECK (timeout_count IS NULL OR timeout_count >= 0),
+            terminal_receipt_json TEXT,
+            terminal_receipt_digest TEXT,
+            CHECK (
+                (terminal_receipt_json IS NULL AND terminal_receipt_digest IS NULL)
+                OR
+                (terminal_receipt_json IS NOT NULL AND terminal_receipt_digest IS NOT NULL)
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_lan_observations (
+            scan_id TEXT NOT NULL,
+            endpoint_id TEXT NOT NULL,
+            source TEXT NOT NULL CHECK (source IN ('mdns', 'active', 'manual')),
+            interface_id TEXT NOT NULL,
+            address TEXT NOT NULL,
+            port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+            api_shape TEXT,
+            tls_enabled INTEGER NOT NULL CHECK (tls_enabled IN (0, 1)),
+            certificate_sha256 TEXT,
+            catalog_digest TEXT,
+            capability_digest TEXT,
+            public_payload_json TEXT NOT NULL,
+            freshness_timestamp TEXT NOT NULL,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (scan_id, endpoint_id),
+            UNIQUE (scan_id, endpoint_id),
+            FOREIGN KEY (scan_id) REFERENCES routing_lan_scans(scan_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_lan_scan_events (
+            scan_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (scan_id, sequence),
+            FOREIGN KEY (scan_id) REFERENCES routing_lan_scans(scan_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    for statement in (
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_lan_scans_status_updated ON "
+            "routing_lan_scans(status, updated_at, scan_id)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_lan_observations_scan_freshness ON "
+            "routing_lan_observations(scan_id, freshness_timestamp, endpoint_id)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_lan_scan_events_poll ON "
+            "routing_lan_scan_events(scan_id, sequence)"
+        ),
     ):
         conn.execute(statement)
 
