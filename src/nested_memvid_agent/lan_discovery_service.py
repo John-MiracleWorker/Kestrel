@@ -1,0 +1,423 @@
+"""Disabled-only import and owner review for authenticated private-LAN evidence."""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Literal
+
+from .routing.lan_serialization import (
+    LAN_OBSERVATION_MAX_AGE_SECONDS as LAN_OBSERVATION_MAX_AGE_SECONDS,
+)
+from .routing.lan_serialization import (
+    LAN_OBSERVATION_MAX_FUTURE_SKEW_SECONDS as LAN_OBSERVATION_MAX_FUTURE_SKEW_SECONDS,
+)
+from .routing.lan_serialization import (
+    validate_digest,
+    validate_required_text,
+)
+from .routing.ledger import RoutingLedger
+from .routing.ledger_records import (
+    ModelTargetEntry,
+    ProviderProfileEntry,
+    RoutingRevisionConflict,
+)
+
+_LAN_PROFILE_ID_RE = re.compile(r"lan-provider-[0-9a-f]{64}\Z")
+_LAN_TARGET_ID_RE = re.compile(r"lan-target-[0-9a-f]{64}\Z")
+_MAX_AFFINITIES = 16
+_MAX_AFFINITY_UTF8_BYTES = 64
+
+LanStaleReason = Literal[
+    "interface_changed",
+    "address_changed",
+    "port_changed",
+    "network_changed",
+    "transport_security_changed",
+    "certificate_changed",
+    "api_shape_changed",
+    "catalog_changed",
+    "model_identity_changed",
+    "model_missing",
+    "capability_changed",
+    "freshness_expired",
+]
+
+LAN_STALE_REASON_ORDER: tuple[LanStaleReason, ...] = (
+    "interface_changed",
+    "network_changed",
+    "address_changed",
+    "port_changed",
+    "transport_security_changed",
+    "certificate_changed",
+    "api_shape_changed",
+    "catalog_changed",
+    "model_identity_changed",
+    "model_missing",
+    "capability_changed",
+    "freshness_expired",
+)
+
+
+class LanDiscoveryConflict(RuntimeError):
+    """A closed failure caused by stale, mismatched, or unauthorized LAN state."""
+
+
+@dataclass(frozen=True)
+class LanExpectedRevision:
+    resource_id: str
+    revision: int
+
+    def __post_init__(self) -> None:
+        _validate_target_id(self.resource_id)
+        _validate_revision(self.revision)
+
+
+@dataclass(frozen=True)
+class LanReplacementConfirmation:
+    provider_profile_id: str
+    expected_profile_revision: int
+    expected_endpoint_fingerprint: str
+    expected_material_binding_digests: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _validate_profile_id(self.provider_profile_id)
+        _validate_revision(self.expected_profile_revision)
+        _validate_exact_digest(
+            self.expected_endpoint_fingerprint,
+            "expected_endpoint_fingerprint",
+        )
+        if type(self.expected_material_binding_digests) is not tuple:
+            raise ValueError("replacement material digests must be an exact tuple")
+        if not self.expected_material_binding_digests:
+            raise ValueError("replacement material digests must not be empty")
+        for digest in self.expected_material_binding_digests:
+            _validate_exact_digest(digest, "expected_material_binding_digest")
+        if len(set(self.expected_material_binding_digests)) != len(
+            self.expected_material_binding_digests
+        ):
+            raise ValueError("replacement material digests must be unique")
+
+
+@dataclass(frozen=True)
+class LanImportRequest:
+    scan_id: str
+    endpoint_binding_digest: str
+    expected_terminal_receipt_digest: str
+    expected_observation_digest: str
+    expected_profile_revision: int
+    expected_target_revisions: tuple[LanExpectedRevision, ...]
+    replacement: LanReplacementConfirmation | None = None
+
+    def __post_init__(self) -> None:
+        _validate_canonical_text(self.scan_id, "scan_id", maximum=128)
+        _validate_exact_digest(self.endpoint_binding_digest, "endpoint_binding_digest")
+        _validate_exact_digest(
+            self.expected_terminal_receipt_digest,
+            "expected_terminal_receipt_digest",
+        )
+        _validate_exact_digest(
+            self.expected_observation_digest,
+            "expected_observation_digest",
+        )
+        _validate_revision(self.expected_profile_revision)
+        if type(self.expected_target_revisions) is not tuple:
+            raise ValueError("expected target revisions must be an exact tuple")
+        if not all(type(item) is LanExpectedRevision for item in self.expected_target_revisions):
+            raise ValueError("expected target revisions must be exactly typed")
+        for item in self.expected_target_revisions:
+            _validate_target_id(item.resource_id)
+            _validate_revision(item.revision)
+        resource_ids = [item.resource_id for item in self.expected_target_revisions]
+        if len(resource_ids) != len(set(resource_ids)):
+            raise ValueError("expected target revisions must be unique")
+        if (
+            self.replacement is not None
+            and type(self.replacement) is not LanReplacementConfirmation
+        ):
+            raise ValueError("replacement confirmation must be exactly typed")
+
+
+@dataclass(frozen=True)
+class LanReviewRequest:
+    target_id: str
+    expected_profile_revision: int
+    expected_target_revision: int
+    expected_terminal_receipt_digest: str
+    expected_observation_digest: str
+    expected_endpoint_fingerprint: str
+    expected_material_binding_digest: str
+    expected_review_digest: str
+    expected_stale_reasons: tuple[LanStaleReason, ...]
+    trust_class: Literal["operator_confirmed"]
+    intended_roles: tuple[str, ...]
+    task_family_affinities: tuple[str, ...]
+    privacy_acknowledged: bool
+    enabled: bool
+
+    def __post_init__(self) -> None:
+        _validate_target_id(self.target_id)
+        _validate_revision(self.expected_profile_revision)
+        _validate_revision(self.expected_target_revision)
+        for field in (
+            "expected_terminal_receipt_digest",
+            "expected_observation_digest",
+            "expected_endpoint_fingerprint",
+            "expected_material_binding_digest",
+            "expected_review_digest",
+        ):
+            _validate_exact_digest(getattr(self, field), field)
+        _validate_stale_reasons(self.expected_stale_reasons)
+        if self.trust_class != "operator_confirmed":
+            raise ValueError("LAN review trust class must be operator_confirmed")
+        _validate_affinities(self.intended_roles, "intended roles")
+        _validate_affinities(
+            self.task_family_affinities,
+            "task-family affinities",
+        )
+        if type(self.privacy_acknowledged) is not bool:
+            raise ValueError("LAN review privacy acknowledgement must be boolean")
+        if type(self.enabled) is not bool:
+            raise ValueError("LAN review enabled must be boolean")
+
+
+@dataclass(frozen=True)
+class LanImportResult:
+    profile: ProviderProfileEntry | None
+    targets: tuple[ModelTargetEntry, ...]
+    affected_target_ids: tuple[str, ...]
+    invalidated_binding_digests: tuple[str, ...]
+    stale_reasons_by_target: tuple[tuple[str, tuple[LanStaleReason, ...]], ...]
+    observation_digest: str
+    endpoint_fingerprint: str | None
+    outage_observed: bool
+
+
+@dataclass(frozen=True)
+class LanReviewResult:
+    profile: ProviderProfileEntry
+    target: ModelTargetEntry
+    material_binding_digest: str
+    privacy_acknowledgement_digest: str
+
+
+class LanDiscoveryService:
+    """Translate authenticated Task 4 evidence into disabled routing drafts."""
+
+    def __init__(
+        self,
+        registry: RoutingLedger,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if type(registry) is not RoutingLedger:
+            raise ValueError("LAN discovery requires the durable routing ledger")
+        self.registry = registry
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    def import_observation(
+        self,
+        request: LanImportRequest,
+        *,
+        authenticated_owner_principal: str,
+    ) -> LanImportResult:
+        if type(request) is not LanImportRequest:
+            raise ValueError("LAN import request must be exactly typed")
+        LanImportRequest.__post_init__(request)
+        if request.replacement is not None:
+            if type(request.replacement) is not LanReplacementConfirmation:
+                raise ValueError("LAN replacement confirmation must be exactly typed")
+            LanReplacementConfirmation.__post_init__(request.replacement)
+        owner = _validate_canonical_owner(authenticated_owner_principal)
+        now = _validate_utc_clock(self._clock())
+        replacement = (
+            None
+            if request.replacement is None
+            else (
+                request.replacement.provider_profile_id,
+                request.replacement.expected_profile_revision,
+                request.replacement.expected_endpoint_fingerprint,
+                request.replacement.expected_material_binding_digests,
+            )
+        )
+        try:
+            result = self.registry.apply_lan_import(
+                scan_id=request.scan_id,
+                endpoint_binding_digest=request.endpoint_binding_digest,
+                expected_terminal_receipt_digest=(request.expected_terminal_receipt_digest),
+                expected_observation_digest=request.expected_observation_digest,
+                expected_profile_revision=request.expected_profile_revision,
+                expected_target_revisions=tuple(
+                    (item.resource_id, item.revision) for item in request.expected_target_revisions
+                ),
+                replacement=replacement,
+                authenticated_owner_principal=owner,
+                now=now,
+            )
+        except RoutingRevisionConflict as exc:
+            raise LanDiscoveryConflict(str(exc)) from exc
+        except ValueError as exc:
+            raise LanDiscoveryConflict(str(exc)) from exc
+        return LanImportResult(
+            profile=result[0],
+            targets=result[1],
+            affected_target_ids=result[5],
+            invalidated_binding_digests=result[6],
+            stale_reasons_by_target=result[7],  # type: ignore[arg-type]
+            observation_digest=result[2],
+            endpoint_fingerprint=result[3],
+            outage_observed=result[4],
+        )
+
+    def review_lan_target(
+        self,
+        request: LanReviewRequest,
+        *,
+        authenticated_owner_principal: str,
+    ) -> LanReviewResult:
+        if type(request) is not LanReviewRequest:
+            raise ValueError("LAN review request must be exactly typed")
+        if request.enabled is True:
+            raise LanDiscoveryConflict("lan_runtime_hardening_unavailable")
+        try:
+            LanReviewRequest.__post_init__(request)
+        except ValueError as exc:
+            raise LanDiscoveryConflict(str(exc)) from exc
+        owner = _validate_canonical_owner(authenticated_owner_principal)
+        now = _validate_utc_clock(self._clock())
+        try:
+            result = self.registry.review_lan_target(
+                target_id=request.target_id,
+                expected_profile_revision=request.expected_profile_revision,
+                expected_target_revision=request.expected_target_revision,
+                expected_terminal_receipt_digest=(request.expected_terminal_receipt_digest),
+                expected_observation_digest=request.expected_observation_digest,
+                expected_endpoint_fingerprint=request.expected_endpoint_fingerprint,
+                expected_material_binding_digest=(request.expected_material_binding_digest),
+                expected_review_digest=request.expected_review_digest,
+                expected_stale_reasons=request.expected_stale_reasons,
+                trust_class=request.trust_class,
+                intended_roles=request.intended_roles,
+                task_family_affinities=request.task_family_affinities,
+                privacy_acknowledged=request.privacy_acknowledged,
+                enabled=request.enabled,
+                authenticated_owner_principal=owner,
+                now=now,
+            )
+        except RoutingRevisionConflict as exc:
+            raise LanDiscoveryConflict(str(exc)) from exc
+        except ValueError as exc:
+            raise LanDiscoveryConflict(str(exc)) from exc
+        return LanReviewResult(
+            profile=result[0],
+            target=result[1],
+            material_binding_digest=result[3],
+            privacy_acknowledgement_digest=result[2],
+        )
+
+
+def _validate_canonical_owner(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("authenticated LAN owner principal is not canonical")
+    owner = validate_required_text(
+        value,
+        "authenticated_owner_principal",
+        maximum=256,
+    )
+    if (
+        owner != value
+        or unicodedata.normalize("NFC", owner) != owner
+        or any(unicodedata.category(character).startswith("C") for character in owner)
+    ):
+        raise ValueError("authenticated LAN owner principal is not canonical")
+    return owner
+
+
+def _validate_canonical_text(value: object, field: str, *, maximum: int) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field} must be exact text")
+    normalized = validate_required_text(value, field, maximum=maximum)
+    if (
+        normalized != value
+        or unicodedata.normalize("NFC", value) != value
+        or any(unicodedata.category(character).startswith("C") for character in value)
+    ):
+        raise ValueError(f"{field} must be canonical text")
+    return value
+
+
+def _validate_exact_digest(value: object, field: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field} must be an exact lowercase sha256 digest")
+    validated = validate_digest(value, field)
+    if validated is None:
+        raise ValueError(f"{field} must be a lowercase sha256 digest")
+    return validated
+
+
+def _validate_utc_clock(value: object) -> datetime:
+    if (
+        type(value) is not datetime
+        or value.tzinfo is None
+        or value.utcoffset() != UTC.utcoffset(value)
+    ):
+        raise ValueError("LAN discovery clock must return an aware UTC datetime")
+    return value
+
+
+def _validate_revision(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("LAN expected revision must be an exact non-negative integer")
+    return value
+
+
+def _validate_profile_id(value: object) -> str:
+    if type(value) is not str or _LAN_PROFILE_ID_RE.fullmatch(value) is None:
+        raise ValueError("LAN provider profile ID is invalid")
+    return value
+
+
+def _validate_target_id(value: object) -> str:
+    if type(value) is not str or _LAN_TARGET_ID_RE.fullmatch(value) is None:
+        raise ValueError("LAN target ID is invalid")
+    return value
+
+
+def _validate_stale_reasons(value: object) -> tuple[LanStaleReason, ...]:
+    if type(value) is not tuple:
+        raise ValueError("LAN stale reasons must be an exact tuple")
+    if any(type(reason) is not str for reason in value):
+        raise ValueError("LAN stale reasons must contain exact text")
+    if len(value) != len(set(value)):
+        raise ValueError("LAN stale reasons must be unique")
+    try:
+        ordered = tuple(reason for reason in LAN_STALE_REASON_ORDER if reason in value)
+    except TypeError as exc:
+        raise ValueError("LAN stale reasons are invalid") from exc
+    if value != ordered:
+        raise ValueError("LAN stale reasons must use the closed deterministic order")
+    return ordered
+
+
+def _validate_affinities(value: object, field: str) -> tuple[str, ...]:
+    if type(value) is not tuple or len(value) > _MAX_AFFINITIES:
+        raise ValueError(f"LAN {field} must be an exact tuple of at most 16 values")
+    normalized: list[str] = []
+    for item in value:
+        if type(item) is not str or not item:
+            raise ValueError(f"LAN {field} values must be non-empty text")
+        if unicodedata.normalize("NFC", item) != item:
+            raise ValueError(f"LAN {field} values must be NFC-normalized")
+        if any(unicodedata.category(character).startswith("C") for character in item):
+            raise ValueError(f"LAN {field} values must not contain control characters")
+        if len(item.encode("utf-8")) > _MAX_AFFINITY_UTF8_BYTES:
+            raise ValueError(f"LAN {field} values must be at most 64 UTF-8 bytes")
+        normalized.append(item)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"LAN {field} values must be unique")
+    if tuple(normalized) != tuple(sorted(normalized)):
+        raise ValueError(f"LAN {field} values must use deterministic order")
+    return tuple(normalized)

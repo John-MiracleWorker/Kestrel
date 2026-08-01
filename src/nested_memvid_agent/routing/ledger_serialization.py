@@ -79,6 +79,10 @@ def _next_revision(
     expected_revision: int | None,
     now: str,
 ) -> tuple[int, str]:
+    if expected_revision is not None and (
+        type(expected_revision) is not int or expected_revision < 0
+    ):
+        raise ValueError("expected revision must be an exact non-negative integer")
     if row is None:
         if expected_revision not in {None, 0}:
             raise RoutingRevisionConflict(resource, resource_id, 0)
@@ -206,12 +210,8 @@ def _target_entry_from_row(row: sqlite3.Row) -> ModelTargetEntry:
             latency_tier=int(row["latency_tier"]),
             operator_priority=int(row["operator_priority"]),
             estimated_cost_usd=_optional_float(row["estimated_cost_usd"]),
-            input_cost_per_million_usd=_optional_float(
-                row["input_cost_per_million_usd"]
-            ),
-            output_cost_per_million_usd=_optional_float(
-                row["output_cost_per_million_usd"]
-            ),
+            input_cost_per_million_usd=_optional_float(row["input_cost_per_million_usd"]),
+            output_cost_per_million_usd=_optional_float(row["output_cost_per_million_usd"]),
             health=str(row["health"]),  # type: ignore[arg-type]
             recent_failure_rate=float(row["recent_failure_rate"]),
             predicted_success=_optional_float(row["predicted_success"]),
@@ -257,12 +257,8 @@ def _decision_entry_from_row(row: sqlite3.Row) -> RouteDecisionEntry:
         score=float(row["score"]),
         predicted_success=_optional_float(row["predicted_success"]),
         estimated_cost_usd=_optional_float(row["estimated_cost_usd"]),
-        input_cost_per_million_usd=_optional_float(
-            row["input_cost_per_million_usd"]
-        ),
-        output_cost_per_million_usd=_optional_float(
-            row["output_cost_per_million_usd"]
-        ),
+        input_cost_per_million_usd=_optional_float(row["input_cost_per_million_usd"]),
+        output_cost_per_million_usd=_optional_float(row["output_cost_per_million_usd"]),
         project_id=_optional_str(row["project_id"]),
         task_family=str(row["task_family"]),
         risk=str(row["risk"]),
@@ -539,7 +535,9 @@ def _validate_outcome_numbers(
         ("changed_file_count", changed_file_count),
         ("retry_count", retry_count),
     ):
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
             raise ValueError(f"{name} must be a non-negative integer")
 
 

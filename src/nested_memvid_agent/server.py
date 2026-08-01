@@ -21,6 +21,7 @@ from .desktop_memory_health import (
     inspect_desktop_memvid_readiness,
 )
 from .event_bus import RunEventBus
+from .lan_discovery_service import LanDiscoveryService
 from .layers import (
     load_layer_specs,
     prepare_private_memory_artifacts,
@@ -222,7 +223,11 @@ def _create_app(
         from .server_product_routes import register_product_routes
         from .server_project_routes import register_project_routes
         from .server_routine_routes import register_routine_routes
-        from .server_routing_routes import register_routing_routes
+        from .server_routing_routes import (
+            LAN_MUTATION_OWNER_PRINCIPAL,
+            MAX_LAN_MUTATION_BODY_BYTES,
+            register_routing_routes,
+        )
         from .server_runtime_routes import (
             register_runtime_routes,
             revoke_disabled_tool_approvals,
@@ -537,6 +542,18 @@ def _create_app(
     )
     rate_limiter = RequestRateLimiter()
 
+    async def _cache_lan_body_through_sentinel(request: Any) -> None:
+        body = bytearray()
+        sentinel_limit = MAX_LAN_MUTATION_BODY_BYTES + 1
+        async for chunk in request.stream():
+            remaining = sentinel_limit - len(body)
+            if remaining > 0:
+                body.extend(chunk[:remaining])
+            if len(body) > MAX_LAN_MUTATION_BODY_BYTES or len(chunk) > remaining:
+                request._body = bytes(body)
+                raise RequestBodyTooLarge("LAN request body exceeds 32 KiB")
+        request._body = bytes(body)
+
     @app.middleware("http")  # type: ignore[untyped-decorator]
     async def local_ingress_guard(request: Any, call_next: Any) -> Any:
         headers = request_headers(request)
@@ -562,6 +579,9 @@ def _create_app(
         method = str(getattr(request, "method", "GET")).upper()
         api_path = path == "/api" or path.startswith("/api/")
         guarded_path = api_path or path == "/metrics"
+        lan_mutation_path = path == "/api/routing/lan/import" or (
+            path.startswith("/api/routing/lan/targets/") and path.endswith("/review")
+        )
         public_telegram_webhook = method == "POST" and path == "/api/channels/telegram/webhook"
         cors_preflight = (
             method == "OPTIONS"
@@ -595,26 +615,61 @@ def _create_app(
                         status_code=status_code,
                     )
             content_length = str(headers.get("content-length", "")).strip()
+            request_body_limit = (
+                min(
+                    active_config.max_request_body_bytes,
+                    MAX_LAN_MUTATION_BODY_BYTES,
+                )
+                if lan_mutation_path
+                else active_config.max_request_body_bytes
+            )
             if content_length:
                 try:
                     request_bytes = int(content_length)
                 except ValueError:
-                    return responses_module.JSONResponse(
-                        {"detail": "invalid_content_length"}, status_code=400
+                    ingress_detail: object = (
+                        {"code": "lan_request_rejected"}
+                        if lan_mutation_path
+                        else "invalid_content_length"
                     )
-                if request_bytes > active_config.max_request_body_bytes:
                     return responses_module.JSONResponse(
-                        {"detail": "request_body_too_large"}, status_code=413
+                        {"detail": ingress_detail}, status_code=400
+                    )
+                if request_bytes < 0:
+                    ingress_detail = (
+                        {"code": "lan_request_rejected"}
+                        if lan_mutation_path
+                        else "invalid_content_length"
+                    )
+                    return responses_module.JSONResponse(
+                        {"detail": ingress_detail}, status_code=400
+                    )
+                if request_bytes > request_body_limit:
+                    ingress_detail = (
+                        {"code": "lan_request_too_large"}
+                        if lan_mutation_path
+                        else "request_body_too_large"
+                    )
+                    return responses_module.JSONResponse(
+                        {"detail": ingress_detail}, status_code=413
                     )
             if method not in {"GET", "HEAD", "OPTIONS"}:
                 try:
-                    await _cache_bounded_request_body(
-                        request,
-                        limit=active_config.max_request_body_bytes,
-                    )
+                    if lan_mutation_path:
+                        await _cache_lan_body_through_sentinel(request)
+                    else:
+                        await _cache_bounded_request_body(
+                            request,
+                            limit=request_body_limit,
+                        )
                 except RequestBodyTooLarge:
+                    ingress_detail = (
+                        {"code": "lan_request_too_large"}
+                        if lan_mutation_path
+                        else "request_body_too_large"
+                    )
                     return responses_module.JSONResponse(
-                        {"detail": "request_body_too_large"},
+                        {"detail": ingress_detail},
                         status_code=413,
                     )
                 client = getattr(request, "client", None)
@@ -661,6 +716,7 @@ def _create_app(
             secret_resolver=secret_broker.resolve,
         ),
     )
+
     def _settings_commit_effects(update: Any) -> dict[str, Any]:
         revoked = revoke_disabled_tool_approvals(
             runs,
@@ -708,6 +764,16 @@ def _create_app(
         http_exception=HTTPException,
         provider_probe_service=ProviderProbeService(
             secret_resolver=secret_broker.resolve,
+        ),
+        lan_discovery_service=(
+            LanDiscoveryService(routing_ledger)
+            if desktop_context is not None or active_config.require_api_auth
+            else None
+        ),
+        lan_owner_principal=(
+            LAN_MUTATION_OWNER_PRINCIPAL
+            if desktop_context is not None or active_config.require_api_auth
+            else None
         ),
     )
     register_routine_routes(

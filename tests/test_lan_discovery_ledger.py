@@ -18,6 +18,8 @@ from nested_memvid_agent.routing.lan_records import (
     LanScanRevisionConflict,
     LanScanTransitionError,
 )
+from nested_memvid_agent.routing.ledger import RoutingLedger
+from nested_memvid_agent.routing.models import ModelTarget, ProviderProfile
 from nested_memvid_agent.state_store import AgentStateStore
 
 INTERFACE_ID = "sha256:" + "1" * 64
@@ -95,9 +97,7 @@ def _lan_table_snapshot(
         "routing_lan_observations": (
             "SELECT rowid, * FROM routing_lan_observations ORDER BY rowid"
         ),
-        "routing_lan_scan_events": (
-            "SELECT rowid, * FROM routing_lan_scan_events ORDER BY rowid"
-        ),
+        "routing_lan_scan_events": ("SELECT rowid, * FROM routing_lan_scan_events ORDER BY rowid"),
     }[table]
     with state._connect() as connection:
         rows = connection.execute(query).fetchall()
@@ -233,9 +233,7 @@ def test_create_scan_persists_canonical_limits_digest_and_enforces_foreign_keys(
     state: AgentStateStore,
 ) -> None:
     scan = _create_scan(lan_ledger)
-    expected_json = json.dumps(
-        _limits(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
+    expected_json = json.dumps(_limits(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     expected_limits = json.loads(expected_json)
     expected_digest = "sha256:" + hashlib.sha256(expected_json.encode("utf-8")).hexdigest()
 
@@ -967,9 +965,7 @@ def test_existing_v3_null_scan_identity_guards_upgrade_without_trigger_replaceme
     with legacy_state._connect() as connection:
         columns = {
             str(row[1]): int(row[3])
-            for row in connection.execute(
-                "PRAGMA table_info(routing_lan_scans)"
-            ).fetchall()
+            for row in connection.execute("PRAGMA table_info(routing_lan_scans)").fetchall()
         }
         assert columns["scan_id"] == 0
         connection.execute(
@@ -1060,9 +1056,7 @@ def test_fresh_v3_scan_identity_is_explicitly_not_null(
     with state._connect() as connection:
         columns = {
             str(row[1]): int(row[3])
-            for row in connection.execute(
-                "PRAGMA table_info(routing_lan_scans)"
-            ).fetchall()
+            for row in connection.execute("PRAGMA table_info(routing_lan_scans)").fetchall()
         }
 
     assert columns["scan_id"] == 1
@@ -1226,15 +1220,13 @@ def test_rowid_replace_cannot_delete_terminal_child_evidence(
             "sha256:" + "3" * 64,
         )
         target_query = (
-            "SELECT rowid FROM routing_lan_observations "
-            "WHERE scan_id = ? AND endpoint_id = ?"
+            "SELECT rowid FROM routing_lan_observations WHERE scan_id = ? AND endpoint_id = ?"
         )
     else:
         assert len(lan_ledger.list_events(terminal.scan_id)) == 1
         target_key = (terminal.scan_id, 1)
         target_query = (
-            "SELECT rowid FROM routing_lan_scan_events "
-            "WHERE scan_id = ? AND sequence = ?"
+            "SELECT rowid FROM routing_lan_scan_events WHERE scan_id = ? AND sequence = ?"
         )
     with state._connect() as connection:
         terminal_rowid = connection.execute(target_query, target_key).fetchone()
@@ -1642,20 +1634,16 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
     assert expected_guards <= triggers
 
     with state._connect() as connection:
-        connection.execute(
-            "DROP TRIGGER trg_routing_lan_terminal_observation_insert_immutable"
-        )
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_observation_insert_immutable")
         connection.execute("DROP TRIGGER trg_routing_lan_scan_id_update_immutable")
-        connection.execute(
-            "DROP TRIGGER trg_routing_lan_scan_id_update_null_safe_immutable"
-        )
+        connection.execute("DROP TRIGGER trg_routing_lan_scan_id_update_null_safe_immutable")
         connection.execute("DROP TRIGGER trg_routing_lan_scan_id_insert_not_null")
     LanDiscoveryLedger(state)
     with state._connect() as connection:
         restored = {
             str(row[0])
             for row in connection.execute(
-            """
+                """
             SELECT name FROM sqlite_master
             WHERE type = 'trigger'
               AND name IN (
@@ -1673,3 +1661,389 @@ def test_schema_v3_application_is_idempotent_and_polling_indexes_exist(
         "trg_routing_lan_scan_id_update_null_safe_immutable",
         "trg_routing_lan_scan_id_insert_not_null",
     }
+
+
+def test_generic_registry_fences_reserved_lan_ids_and_nested_metadata(
+    state: AgentStateStore,
+) -> None:
+    registry = RoutingLedger(state)
+
+    with pytest.raises(ValueError, match="lan.*reserved"):
+        registry.put_provider_profile(
+            ProviderProfile(
+                profile_id="lan-provider-" + "1" * 64,
+                display_name="forged LAN provider",
+                adapter="lan-openai-compatible",
+                locality="local",
+            ),
+            expected_revision=0,
+        )
+    with pytest.raises(ValueError, match="lan.*reserved"):
+        registry.put_provider_profile(
+            ProviderProfile(
+                profile_id="lan-target-" + "1" * 64,
+                display_name="cross-prefix forged LAN provider",
+                adapter="mock",
+            ),
+            expected_revision=0,
+        )
+    with pytest.raises(ValueError, match="lan_discovery"):
+        registry.put_provider_profile(
+            ProviderProfile(
+                profile_id="ordinary-provider",
+                display_name="ordinary",
+                adapter="mock",
+                metadata={"nested": {"lan_discovery": {"managed": True}}},
+            ),
+            expected_revision=0,
+        )
+
+    ordinary = registry.put_provider_profile(
+        ProviderProfile(
+            profile_id="ordinary-provider",
+            display_name="ordinary",
+            adapter="mock",
+            metadata={"purpose": "regression control"},
+        ),
+        expected_revision=0,
+    )
+    assert ordinary.revision == 1
+    with pytest.raises(ValueError, match="lan.*reserved"):
+        registry.put_model_target(
+            ModelTarget(
+                target_id="lan-target-" + "2" * 64,
+                provider_profile_id="ordinary-provider",
+                provider="mock",
+                model="forged",
+            ),
+            expected_revision=0,
+        )
+    with pytest.raises(ValueError, match="lan.*reserved"):
+        registry.put_model_target(
+            ModelTarget(
+                target_id="lan-provider-" + "2" * 64,
+                provider_profile_id="ordinary-provider",
+                provider="mock",
+                model="cross-prefix-forged",
+            ),
+            expected_revision=0,
+        )
+    with pytest.raises(ValueError, match="lan.*reserved"):
+        registry.put_model_target(
+            ModelTarget(
+                target_id="ordinary-cross-provider",
+                provider_profile_id="lan-target-" + "3" * 64,
+                provider="mock",
+                model="cross-prefix-provider",
+            ),
+            expected_revision=0,
+        )
+    with pytest.raises(ValueError, match="lan.*reserved"):
+        registry.apply_provider_inventory(
+            ordinary.profile,
+            expected_profile_revision=ordinary.revision,
+            target_updates=(
+                (
+                    ModelTarget(
+                        target_id="lan-provider-" + "4" * 64,
+                        provider_profile_id=ordinary.profile.profile_id,
+                        provider=ordinary.profile.adapter,
+                        model="inventory-cross-prefix",
+                    ),
+                    0,
+                ),
+            ),
+        )
+    assert registry.get_provider_profile(ordinary.profile.profile_id) == ordinary
+    assert registry.list_model_targets() == []
+
+
+@pytest.mark.parametrize("expected_revision", [False, True, -1, 0.0, "0"])
+def test_generic_registry_revisions_require_exact_nonnegative_ints(
+    state: AgentStateStore,
+    expected_revision: object,
+) -> None:
+    registry = RoutingLedger(state)
+
+    with pytest.raises(ValueError, match="revision"):
+        registry.put_provider_profile(
+            ProviderProfile(
+                profile_id="ordinary-strict-revision",
+                display_name="ordinary",
+                adapter="mock",
+            ),
+            expected_revision=expected_revision,  # type: ignore[arg-type]
+        )
+    assert registry.get_provider_profile("ordinary-strict-revision") is None
+
+
+def test_inventory_rejects_boolean_target_revision_before_mutation(
+    state: AgentStateStore,
+) -> None:
+    registry = RoutingLedger(state)
+    profile = ProviderProfile(
+        profile_id="ordinary-inventory",
+        display_name="ordinary",
+        adapter="mock",
+    )
+    registry.put_provider_profile(profile, expected_revision=0)
+    target = ModelTarget(
+        target_id="ordinary-target",
+        provider_profile_id=profile.profile_id,
+        provider=profile.adapter,
+        model="mock-model",
+    )
+
+    with pytest.raises(ValueError, match="revision"):
+        registry.apply_provider_inventory(
+            profile,
+            expected_profile_revision=1,
+            target_updates=((target, False),),
+        )
+
+    assert registry.get_provider_profile(profile.profile_id).revision == 1  # type: ignore[union-attr]
+    assert registry.get_model_target(target.target_id) is None
+
+
+def test_generic_put_and_inventory_cannot_mutate_existing_lan_managed_profile(
+    state: AgentStateStore,
+) -> None:
+    registry = RoutingLedger(state)
+    profile_id = "lan-provider-" + "a" * 64
+    metadata = {
+        "lan_discovery": {
+            "schema": "kestrel.lan.provider-profile.v1",
+            "managed": True,
+        }
+    }
+    with state._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO routing_provider_profiles (
+                profile_id, display_name, adapter, base_url, secret_ref, enabled,
+                locality, trust_class, max_concurrency, metadata_json, revision,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 0, 'local', 'unconfirmed', 1, ?, 1, ?, ?)
+            """,
+            (
+                profile_id,
+                "LAN managed",
+                "lan-openai-compatible",
+                "http://192.168.50.2:1234/v1",
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                "2026-08-01T12:00:00Z",
+                "2026-08-01T12:00:00Z",
+            ),
+        )
+    before = registry.get_provider_profile(profile_id)
+    assert before is not None
+    proposed = ProviderProfile(
+        profile_id=profile_id,
+        display_name="generic mutation",
+        adapter="lan-openai-compatible",
+        base_url="http://192.168.50.2:1234/v1",
+        enabled=False,
+        locality="local",
+        trust_class="unconfirmed",
+        metadata=metadata,
+    )
+
+    with pytest.raises(ValueError, match="lan.*managed"):
+        registry.put_provider_profile(proposed, expected_revision=before.revision)
+    with pytest.raises(ValueError, match="lan.*managed"):
+        registry.apply_provider_inventory(
+            proposed,
+            expected_profile_revision=before.revision,
+            target_updates=(),
+        )
+
+    assert registry.get_provider_profile(profile_id) == before
+
+
+def _insert_existing_managed_target_under_ordinary_profile(
+    state: AgentStateStore,
+) -> tuple[RoutingLedger, ProviderProfile, ModelTarget]:
+    registry = RoutingLedger(state)
+    profile = ProviderProfile(
+        profile_id="ordinary-target-container",
+        display_name="ordinary container",
+        adapter="mock",
+    )
+    registry.put_provider_profile(profile, expected_revision=0)
+    target = ModelTarget(
+        target_id="lan-target-" + "c" * 64,
+        provider_profile_id=profile.profile_id,
+        provider=profile.adapter,
+        model="managed-model",
+        enabled=False,
+        metadata={
+            "lan_discovery": {
+                "schema": "kestrel.lan.model-target-binding.v1",
+                "managed": True,
+            }
+        },
+    )
+    with state._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO routing_model_targets (
+                target_id, provider_profile_id, provider, model, enabled, locality,
+                trust_class, capability_tags_json, role_affinities_json,
+                task_family_affinities_json, max_context_tokens, supports_tools,
+                supports_json, supports_vision, supports_reasoning, supports_streaming,
+                quality_tier, latency_tier, operator_priority, estimated_cost_usd,
+                input_cost_per_million_usd, output_cost_per_million_usd, health,
+                recent_failure_rate, predicted_success, metadata_json, revision,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, 0, 'cloud', 'unconfirmed', '[]', '[]', '[]', NULL,
+                0, 0, 0, 0, 0, 1, 3, 0, NULL, NULL, NULL, 'unknown', 0.0,
+                NULL, ?, 1, ?, ?
+            )
+            """,
+            (
+                target.target_id,
+                target.provider_profile_id,
+                target.provider,
+                target.model,
+                json.dumps(target.metadata, sort_keys=True, separators=(",", ":")),
+                "2026-08-01T12:00:00Z",
+                "2026-08-01T12:00:00Z",
+            ),
+        )
+    return registry, profile, target
+
+
+def test_generic_target_mutations_fence_existing_managed_target_symmetrically(
+    state: AgentStateStore,
+) -> None:
+    registry, profile, target = _insert_existing_managed_target_under_ordinary_profile(state)
+    before_profile = registry.get_provider_profile(profile.profile_id)
+    before_target = registry.get_model_target(target.target_id)
+    assert before_profile is not None and before_target is not None
+    proposed = replace(target, enabled=True, trust_class="operator_confirmed")
+
+    with pytest.raises(ValueError, match="lan.*managed"):
+        registry.put_model_target(proposed, expected_revision=before_target.revision)
+    with pytest.raises(ValueError, match="lan.*managed"):
+        registry.apply_provider_inventory(
+            profile,
+            expected_profile_revision=before_profile.revision,
+            target_updates=((proposed, before_target.revision),),
+        )
+
+    assert registry.get_provider_profile(profile.profile_id) == before_profile
+    assert registry.get_model_target(target.target_id) == before_target
+
+    ordinary = ModelTarget(
+        target_id="ordinary-control-target",
+        provider_profile_id=profile.profile_id,
+        provider=profile.adapter,
+        model="ordinary-model",
+    )
+    created = registry.put_model_target(ordinary, expected_revision=0)
+    updated = registry.put_model_target(
+        replace(ordinary, enabled=False),
+        expected_revision=created.revision,
+    )
+    assert updated.revision == 2
+
+
+def test_nested_lan_metadata_is_reserved_for_targets_too(state: AgentStateStore) -> None:
+    registry = RoutingLedger(state)
+    profile = registry.put_provider_profile(
+        ProviderProfile(
+            profile_id="nested-target-profile",
+            display_name="ordinary",
+            adapter="mock",
+        ),
+        expected_revision=0,
+    )
+    forged = ModelTarget(
+        target_id="ordinary-looking-target",
+        provider_profile_id=profile.profile.profile_id,
+        provider=profile.profile.adapter,
+        model="forged",
+        metadata={"outer": {"lan_discovery": {"managed": True}}},
+    )
+
+    with pytest.raises(ValueError, match="lan_discovery"):
+        registry.put_model_target(forged, expected_revision=0)
+    assert registry.get_model_target(forged.target_id) is None
+
+    with pytest.raises(ValueError, match="lan_discovery"):
+        registry.apply_provider_inventory(
+            profile.profile,
+            expected_profile_revision=profile.revision,
+            target_updates=((forged, 0),),
+        )
+    assert registry.get_provider_profile(profile.profile.profile_id) == profile
+    assert registry.get_model_target(forged.target_id) is None
+
+
+@pytest.mark.parametrize("expected_revision", [False, True, -1, 0.0, "0"])
+def test_direct_target_revision_is_an_exact_nonnegative_int(
+    state: AgentStateStore,
+    expected_revision: object,
+) -> None:
+    registry = RoutingLedger(state)
+    profile = registry.put_provider_profile(
+        ProviderProfile(
+            profile_id="strict-target-profile",
+            display_name="ordinary",
+            adapter="mock",
+        ),
+        expected_revision=0,
+    )
+    target = ModelTarget(
+        target_id="strict-target",
+        provider_profile_id=profile.profile.profile_id,
+        provider=profile.profile.adapter,
+        model="strict-model",
+    )
+
+    with pytest.raises(ValueError, match="revision"):
+        registry.put_model_target(
+            target,
+            expected_revision=expected_revision,  # type: ignore[arg-type]
+        )
+    assert registry.get_model_target(target.target_id) is None
+
+
+@pytest.mark.parametrize(
+    ("revision_field", "expected_revision"),
+    [(field, value) for field in ("profile", "target") for value in (False, True, -1, 0.0, "0")],
+)
+def test_every_inventory_revision_is_an_exact_nonnegative_int(
+    state: AgentStateStore,
+    revision_field: str,
+    expected_revision: object,
+) -> None:
+    registry = RoutingLedger(state)
+    profile = ProviderProfile(
+        profile_id="strict-inventory-profile",
+        display_name="ordinary",
+        adapter="mock",
+    )
+    persisted = registry.put_provider_profile(profile, expected_revision=0)
+    target = ModelTarget(
+        target_id="strict-inventory-target",
+        provider_profile_id=profile.profile_id,
+        provider=profile.adapter,
+        model="strict-model",
+    )
+    profile_revision: object = persisted.revision
+    target_revision: object = 0
+    if revision_field == "profile":
+        profile_revision = expected_revision
+    else:
+        target_revision = expected_revision
+
+    with pytest.raises(ValueError, match="revision"):
+        registry.apply_provider_inventory(
+            profile,
+            expected_profile_revision=profile_revision,  # type: ignore[arg-type]
+            target_updates=((target, target_revision),),  # type: ignore[arg-type]
+        )
+    assert registry.get_provider_profile(profile.profile_id) == persisted
+    assert registry.get_model_target(target.target_id) is None

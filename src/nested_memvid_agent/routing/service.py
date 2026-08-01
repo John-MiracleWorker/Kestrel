@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 
 from ..config import AgentConfig
 from .contracts import TaskLike, compile_task_contract
+from .ledger_registry import _has_reserved_lan_prefix, _lan_is_managed_metadata
 from .models import (
     AgentTaskContract,
     ModelTarget,
@@ -14,7 +16,12 @@ from .models import (
     RoutePolicy,
     RoutingMode,
 )
-from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
+from .router import (
+    ReviewDiversityContext,
+    RoutingUnavailableError,
+    managed_lan_target_guard_reasons,
+    route_task,
+)
 
 
 @dataclass(frozen=True)
@@ -134,11 +141,27 @@ class AdaptiveFlockRoutingService:
 
     def apply_decision(self, base_config: AgentConfig, decision: RouteDecision) -> AgentConfig:
         target = decision.selected_target
+        lan_reasons = managed_lan_target_guard_reasons(
+            target,
+            now=datetime.now(UTC),
+        )
+        if lan_reasons:
+            raise RoutingUnavailableError(
+                f"selected LAN target is not executable: {target.target_id}",
+                reason_codes=lan_reasons,
+            )
         profile = self.profiles.get(target.provider_profile_id)
         if profile is None:
             raise RoutingUnavailableError(
                 f"selected target references an unknown provider profile: {target.target_id}",
                 reason_codes=("provider_profile_unknown",),
+            )
+        if _has_reserved_lan_prefix(profile.profile_id) or _lan_is_managed_metadata(
+            profile.metadata
+        ):
+            raise RoutingUnavailableError(
+                f"selected provider profile has invalid managed LAN authority: {profile.profile_id}",
+                reason_codes=("lan_binding_invalid",),
             )
         if not profile.enabled:
             raise RoutingUnavailableError(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,13 +17,73 @@ from nested_memvid_agent.provider_probe import (
     ProviderProbeService,
 )
 from nested_memvid_agent.routing.ledger import RoutingLedger
-from nested_memvid_agent.routing.models import AgentTaskContract, ProviderProfile
+from nested_memvid_agent.routing.ledger_records import (
+    ModelTargetEntry,
+    ProviderProfileEntry,
+)
+from nested_memvid_agent.routing.models import (
+    AgentTaskContract,
+    ModelTarget,
+    ProviderProfile,
+)
 from nested_memvid_agent.routing.router import RoutingUnavailableError, route_task
 from nested_memvid_agent.routing.runtime import AdaptiveFlockRuntimeConfig, build_run_manager
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.server_routing_routes import register_routing_routes
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
+
+LAN_OWNER = "owner:local-runtime:v1"
+
+
+def _typed_lan_result_entries(
+    *,
+    reviewed: bool,
+) -> tuple[ProviderProfileEntry, ModelTargetEntry]:
+    provider_id = "lan-provider-" + "1" * 64
+    target_id = "lan-target-" + "2" * 64
+    timestamp = "2026-08-01T12:00:00Z"
+    profile = ProviderProfileEntry(
+        profile=ProviderProfile(
+            profile_id=provider_id,
+            display_name="Private LAN model server",
+            adapter="lan-openai-compatible",
+            base_url="http://raw-evidence-secret.invalid/v1",
+            secret_ref="secret://raw-provider-secret",
+            enabled=False,
+            locality="local",
+            trust_class=("operator_confirmed" if reviewed else "unconfirmed"),
+            metadata={"lan_discovery": {"managed": True}},
+        ),
+        revision=2 if reviewed else 1,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    target = ModelTargetEntry(
+        target=ModelTarget(
+            target_id=target_id,
+            provider_profile_id=provider_id,
+            provider="lan-openai-compatible",
+            model="alpha",
+            enabled=False,
+            locality="local",
+            trust_class=("operator_confirmed" if reviewed else "unconfirmed"),
+            capability_tags=("generation",),
+            role_affinities=("worker",) if reviewed else (),
+            task_family_affinities=("code-repair",) if reviewed else (),
+            health="unknown",
+            metadata={
+                "lan_discovery": {
+                    "managed": True,
+                    "reviewed": reviewed,
+                }
+            },
+        ),
+        revision=2 if reviewed else 1,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    return profile, target
 
 
 def _routing_app(
@@ -57,9 +118,7 @@ def _routing_app(
             fetchable=True,
             error=None if catalog_ok else "catalog unavailable",
             fetched_at="2026-07-28T12:00:00+00:00",
-            catalog_complete=(
-                catalog_complete[0] if catalog_complete is not None else True
-            ),
+            catalog_complete=(catalog_complete[0] if catalog_complete is not None else True),
         )
 
     class Backend:
@@ -118,6 +177,74 @@ def _create_profile(client: Any) -> None:
     assert response.status_code == 200
 
 
+@pytest.mark.parametrize("managed_by", ["reserved_id", "nested_metadata"])
+def test_generic_discovery_fences_lan_profile_before_any_probe_or_write(
+    tmp_path: Path,
+    managed_by: str,
+) -> None:
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    ledger = RoutingLedger(state)
+    profile_id = (
+        "lan-target-" + "a" * 64 if managed_by == "reserved_id" else "ordinary-managed-profile"
+    )
+    metadata = (
+        {"purpose": "reserved-id probe fence"}
+        if managed_by == "reserved_id"
+        else {"nested": {"lan-discovery": {"managed": True}}}
+    )
+    with state._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO routing_provider_profiles (
+                profile_id, display_name, adapter, base_url, secret_ref, enabled,
+                locality, trust_class, max_concurrency, metadata_json, revision,
+                created_at, updated_at
+            ) VALUES (?, 'forged LAN profile', 'mock', NULL, NULL, 0,
+                      'local', 'unconfirmed', 1, ?, 1, ?, ?)
+            """,
+            (
+                profile_id,
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                "2026-08-01T12:00:00Z",
+                "2026-08-01T12:00:00Z",
+            ),
+        )
+    before = ledger.get_provider_profile(profile_id)
+    assert before is not None
+    calls: list[str] = []
+
+    class NeverProbe:
+        def discover(self, *_args: object, **_kwargs: object) -> object:
+            calls.append("probe")
+            raise AssertionError("managed LAN profile reached generic discovery")
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=ledger,
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        provider_probe_service=NeverProbe(),  # type: ignore[arg-type]
+    )
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            "/api/routing/discovery",
+            json={
+                "provider_profile_id": profile_id,
+                "expected_profile_revision": before.revision,
+                "max_models": 1,
+                "timeout_seconds": 1.0,
+                "probe_capabilities": False,
+            },
+        )
+    assert response.status_code == 409
+    assert calls == []
+    assert ledger.get_provider_profile(profile_id) == before
+    assert ledger.list_model_targets() == []
+
+
 def test_discovery_creates_disabled_unconfirmed_target_drafts(tmp_path: Path) -> None:
     models = ["qwen-coder"]
     client, build, _service = _routing_app(tmp_path, models=models)
@@ -146,8 +273,7 @@ def test_discovery_creates_disabled_unconfirmed_target_drafts(tmp_path: Path) ->
         assert draft["supports_json"] is True
         assert draft["metadata"]["discovery"]["stale"] is False
         assert (
-            draft["metadata"]["discovery"]["capabilities"]["generation"]["provenance"]
-            == "observed"
+            draft["metadata"]["discovery"]["capabilities"]["generation"]["provenance"] == "observed"
         )
         assert "secret_ref" not in str(payload)
         assert "local-key" not in str(payload)
@@ -626,3 +752,811 @@ def test_create_app_discovery_resolves_broker_secret_without_exposing_it(
     assert observed_api_keys == [raw_secret]
     assert raw_secret not in discovery.text
     assert "provider-key" not in discovery.text
+
+
+def test_lan_mutation_routes_require_service_and_fixed_principal_as_a_pair(
+    tmp_path: Path,
+) -> None:
+    fastapi = pytest.importorskip("fastapi")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    ledger = RoutingLedger(state)
+
+    with pytest.raises(ValueError, match="both|pair"):
+        register_routing_routes(
+            fastapi.FastAPI(),
+            ledger=ledger,
+            runtime=AdaptiveFlockRuntimeConfig(),
+            http_exception=fastapi.HTTPException,
+            lan_discovery_service=object(),
+        )
+    with pytest.raises(ValueError, match="both|pair"):
+        register_routing_routes(
+            fastapi.FastAPI(),
+            ledger=ledger,
+            runtime=AdaptiveFlockRuntimeConfig(),
+            http_exception=fastapi.HTTPException,
+            lan_owner_principal="owner:local-runtime:v1",
+        )
+    with pytest.raises(ValueError, match="fixed local-runtime owner"):
+        register_routing_routes(
+            fastapi.FastAPI(),
+            ledger=ledger,
+            runtime=AdaptiveFlockRuntimeConfig(),
+            http_exception=fastapi.HTTPException,
+            lan_discovery_service=object(),
+            lan_owner_principal="owner:arbitrary",
+        )
+
+
+def test_lan_mutation_routes_are_absent_when_authenticated_context_is_omitted(
+    tmp_path: Path,
+) -> None:
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+    )
+
+    with testclient.TestClient(app) as client:
+        assert client.post("/api/routing/lan/import", json={}).status_code == 404
+        assert (
+            client.post(
+                "/api/routing/lan/targets/anything/review",
+                json={},
+            ).status_code
+            == 404
+        )
+
+
+def test_lan_import_route_uses_only_fixed_owner_and_rejects_aliases_and_query(
+    tmp_path: Path,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import LanDiscoveryConflict
+
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    calls: list[tuple[object, str]] = []
+
+    class StubService:
+        def import_observation(
+            self,
+            request: object,
+            *,
+            authenticated_owner_principal: str,
+        ) -> object:
+            calls.append((request, authenticated_owner_principal))
+            raise LanDiscoveryConflict("lan_evidence_conflict")
+
+        def review_lan_target(self, request: object, **kwargs: object) -> object:
+            del request, kwargs
+            raise AssertionError("review was not expected")
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        lan_discovery_service=StubService(),
+        lan_owner_principal="owner:local-runtime:v1",
+    )
+    body = {
+        "scan_id": "scan-1",
+        "endpoint_binding_digest": "sha256:" + "1" * 64,
+        "expected_terminal_receipt_digest": "sha256:" + "2" * 64,
+        "expected_observation_digest": "sha256:" + "3" * 64,
+        "expected_profile_revision": 0,
+        "expected_target_revisions": [],
+        "replacement": None,
+    }
+
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            "/api/routing/lan/import",
+            json=body,
+            headers={"X-Ignored-Untrusted-Identity": "some-user"},
+        )
+        assert response.status_code == 409
+        assert response.json() == {"detail": {"code": "lan_evidence_conflict"}}
+        assert calls[-1][1] == "owner:local-runtime:v1"
+
+        for alias in (
+            "X-Kestrel-Owner-Principal",
+            "X-Owner-Principal",
+            "X-Authenticated-Principal",
+        ):
+            count = len(calls)
+            rejected = client.post(
+                "/api/routing/lan/import",
+                json=body,
+                headers={alias: "forged-owner"},
+            )
+            assert rejected.status_code in {400, 409, 422}
+            assert "forged-owner" not in rejected.text
+            assert len(calls) == count
+
+        count = len(calls)
+        rejected_query = client.post(
+            "/api/routing/lan/import?owner_principal=forged-owner",
+            json=body,
+        )
+        assert rejected_query.status_code in {400, 422}
+        assert "forged-owner" not in rejected_query.text
+        assert len(calls) == count
+
+
+def test_lan_import_route_serializes_typed_success_without_raw_evidence(
+    tmp_path: Path,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import (
+        LanImportRequest,
+        LanImportResult,
+    )
+
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    profile, target = _typed_lan_result_entries(reviewed=False)
+    observation_digest = "sha256:" + "3" * 64
+    endpoint_fingerprint = "sha256:" + "4" * 64
+    invalidated_binding = "sha256:" + "5" * 64
+    typed_result = LanImportResult(
+        profile=profile,
+        targets=(target,),
+        observation_digest=observation_digest,
+        endpoint_fingerprint=endpoint_fingerprint,
+        outage_observed=False,
+        affected_target_ids=(target.target.target_id,),
+        invalidated_binding_digests=(invalidated_binding,),
+        stale_reasons_by_target=((target.target.target_id, ("catalog_changed",)),),
+    )
+    calls: list[tuple[LanImportRequest, str]] = []
+
+    class StubService:
+        def import_observation(
+            self,
+            request: LanImportRequest,
+            *,
+            authenticated_owner_principal: str,
+        ) -> LanImportResult:
+            calls.append((request, authenticated_owner_principal))
+            return typed_result
+
+        def review_lan_target(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("review was not expected")
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        lan_discovery_service=StubService(),
+        lan_owner_principal=LAN_OWNER,
+    )
+    body = {
+        "scan_id": "scan-safe-success",
+        "endpoint_binding_digest": observation_digest,
+        "expected_terminal_receipt_digest": observation_digest,
+        "expected_observation_digest": observation_digest,
+        "expected_profile_revision": 0,
+        "expected_target_revisions": [{"resource_id": target.target.target_id, "revision": 0}],
+        "replacement": None,
+    }
+
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            "/api/routing/lan/import",
+            json=body,
+            headers={"X-Ignored-Untrusted-Identity": "raw-forged-owner"},
+        )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    request, owner = calls[0]
+    assert type(request) is LanImportRequest
+    assert request.scan_id == "scan-safe-success"
+    assert owner == LAN_OWNER
+    assert response.json() == {
+        "profile": profile.to_public_payload(),
+        "targets": [target.to_public_payload()],
+        "observation_digest": observation_digest,
+        "endpoint_fingerprint": endpoint_fingerprint,
+        "outage_observed": False,
+        "affected_target_ids": [target.target.target_id],
+        "invalidated_binding_digests": [invalidated_binding],
+        "stale_reasons_by_target": [
+            {
+                "target_id": target.target.target_id,
+                "reasons": ["catalog_changed"],
+            }
+        ],
+    }
+    serialized = response.text
+    assert "raw-evidence-secret" not in serialized
+    assert "raw-provider-secret" not in serialized
+    assert "raw-forged-owner" not in serialized
+    assert "base_url" not in response.json()["profile"]
+    assert "secret_ref" not in response.json()["profile"]
+
+
+def test_lan_routes_reject_oversized_duplicate_or_raw_evidence_without_echo(
+    tmp_path: Path,
+) -> None:
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+
+    class UnreachableService:
+        def import_observation(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("invalid request reached service")
+
+        def review_lan_target(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("invalid request reached service")
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        lan_discovery_service=UnreachableService(),
+        lan_owner_principal="owner:local-runtime:v1",
+    )
+    hostile = "raw-secret-address-192.168.50.2"
+
+    with testclient.TestClient(app) as client:
+        extra = client.post(
+            "/api/routing/lan/import",
+            json={"scan_id": "scan", "address": hostile},
+        )
+        assert extra.status_code in {400, 422}
+        assert hostile not in extra.text
+
+        duplicate = client.post(
+            "/api/routing/lan/import",
+            content=(
+                b'{"scan_id":"a","scan_id":"b",'
+                b'"endpoint_binding_digest":"sha256:' + b"1" * 64 + b'",'
+                b'"expected_terminal_receipt_digest":"sha256:' + b"2" * 64 + b'",'
+                b'"expected_observation_digest":"sha256:' + b"3" * 64 + b'",'
+                b'"expected_profile_revision":0,"expected_target_revisions":[]}'
+            ),
+            headers={"content-type": "application/json"},
+        )
+        assert duplicate.status_code in {400, 422}
+
+        oversized = client.post(
+            "/api/routing/lan/import",
+            content=b"{" + b'"padding":"' + b"x" * (32 * 1024) + b'"}',
+            headers={"content-type": "application/json"},
+        )
+        assert oversized.status_code == 413
+
+        negative_length = client.post(
+            "/api/routing/lan/import",
+            content=b"{}",
+            headers={
+                "content-type": "application/json",
+                "content-length": "-1",
+            },
+        )
+        assert negative_length.status_code == 400
+        assert negative_length.json() == {"detail": {"code": "lan_request_rejected"}}
+
+        deeply_nested = client.post(
+            "/api/routing/lan/import",
+            content=b"[" * 10_000 + b"0" + b"]" * 10_000,
+            headers={"content-type": "application/json"},
+        )
+        assert deeply_nested.status_code == 400
+        assert deeply_nested.json() == {"detail": {"code": "lan_request_invalid_json"}}
+
+
+def test_lan_review_route_binds_path_target_and_fixed_owner_without_echo(
+    tmp_path: Path,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import LanDiscoveryConflict
+
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    calls: list[tuple[object, str]] = []
+
+    class StubService:
+        def import_observation(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("import was not expected")
+
+        def review_lan_target(
+            self,
+            request: object,
+            *,
+            authenticated_owner_principal: str,
+        ) -> object:
+            calls.append((request, authenticated_owner_principal))
+            raise LanDiscoveryConflict("lan_review_conflict")
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        lan_discovery_service=StubService(),
+        lan_owner_principal="owner:local-runtime:v1",
+    )
+    target_id = "lan-target-" + "4" * 64
+    body = {
+        "expected_profile_revision": 1,
+        "expected_target_revision": 1,
+        "expected_terminal_receipt_digest": "sha256:" + "1" * 64,
+        "expected_observation_digest": "sha256:" + "2" * 64,
+        "expected_endpoint_fingerprint": "sha256:" + "3" * 64,
+        "expected_material_binding_digest": "sha256:" + "4" * 64,
+        "expected_review_digest": "sha256:" + "5" * 64,
+        "expected_stale_reasons": [],
+        "trust_class": "operator_confirmed",
+        "intended_roles": ["worker"],
+        "task_family_affinities": ["code-repair"],
+        "privacy_acknowledged": True,
+        "enabled": False,
+    }
+
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            f"/api/routing/lan/targets/{target_id}/review",
+            json=body,
+            headers={"X-Ignored-Untrusted-Identity": "not-an-owner"},
+        )
+        assert response.status_code == 409
+        assert response.json() == {"detail": {"code": "lan_review_conflict"}}
+        request, principal = calls[-1]
+        assert request.target_id == target_id
+        assert principal == "owner:local-runtime:v1"
+
+        count = len(calls)
+        forged_target = client.post(
+            f"/api/routing/lan/targets/{target_id}/review",
+            json={**body, "target_id": "raw-secret-target"},
+        )
+        assert forged_target.status_code in {400, 422}
+        assert "raw-secret-target" not in forged_target.text
+        assert len(calls) == count
+
+        for alias in (
+            "X-Kestrel-Owner-Principal",
+            "X-Owner-Principal",
+            "X-Authenticated-Principal",
+        ):
+            rejected = client.post(
+                f"/api/routing/lan/targets/{target_id}/review",
+                json=body,
+                headers={alias: "raw-forged-owner"},
+            )
+            assert rejected.status_code in {400, 409, 422}
+            assert "raw-forged-owner" not in rejected.text
+        assert len(calls) == count
+
+
+def test_lan_review_route_serializes_typed_success_without_secret_echo(
+    tmp_path: Path,
+) -> None:
+    from nested_memvid_agent.lan_discovery_service import (
+        LanReviewRequest,
+        LanReviewResult,
+    )
+
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    profile, target = _typed_lan_result_entries(reviewed=True)
+    privacy_digest = "sha256:" + "6" * 64
+    material_digest = "sha256:" + "7" * 64
+    typed_result = LanReviewResult(
+        profile=profile,
+        target=target,
+        privacy_acknowledgement_digest=privacy_digest,
+        material_binding_digest=material_digest,
+    )
+    calls: list[tuple[LanReviewRequest, str]] = []
+
+    class StubService:
+        def import_observation(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("import was not expected")
+
+        def review_lan_target(
+            self,
+            request: LanReviewRequest,
+            *,
+            authenticated_owner_principal: str,
+        ) -> LanReviewResult:
+            calls.append((request, authenticated_owner_principal))
+            return typed_result
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        lan_discovery_service=StubService(),
+        lan_owner_principal=LAN_OWNER,
+    )
+    digest = "sha256:" + "3" * 64
+    body = {
+        "expected_profile_revision": 1,
+        "expected_target_revision": 1,
+        "expected_terminal_receipt_digest": digest,
+        "expected_observation_digest": digest,
+        "expected_endpoint_fingerprint": digest,
+        "expected_material_binding_digest": digest,
+        "expected_review_digest": digest,
+        "expected_stale_reasons": [],
+        "trust_class": "operator_confirmed",
+        "intended_roles": ["worker"],
+        "task_family_affinities": ["code-repair"],
+        "privacy_acknowledged": True,
+        "enabled": False,
+    }
+
+    with testclient.TestClient(app) as client:
+        response = client.post(
+            f"/api/routing/lan/targets/{target.target.target_id}/review",
+            json=body,
+            headers={"X-Ignored-Untrusted-Identity": "raw-forged-owner"},
+        )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    request, owner = calls[0]
+    assert type(request) is LanReviewRequest
+    assert request.target_id == target.target.target_id
+    assert owner == LAN_OWNER
+    assert response.json() == {
+        "profile": profile.to_public_payload(),
+        "target": target.to_public_payload(),
+        "privacy_acknowledgement_digest": privacy_digest,
+        "material_binding_digest": material_digest,
+    }
+    serialized = response.text
+    assert "raw-evidence-secret" not in serialized
+    assert "raw-provider-secret" not in serialized
+    assert "raw-forged-owner" not in serialized
+    assert "base_url" not in response.json()["profile"]
+    assert "secret_ref" not in response.json()["profile"]
+
+
+def test_lan_review_route_has_strict_bounded_duplicate_free_redacted_parity(
+    tmp_path: Path,
+) -> None:
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    calls: list[str] = []
+
+    class UnreachableService:
+        def import_observation(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            calls.append("import")
+            raise AssertionError("invalid import reached service")
+
+        def review_lan_target(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            calls.append("review")
+            raise AssertionError("invalid review reached service")
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        lan_discovery_service=UnreachableService(),
+        lan_owner_principal="owner:local-runtime:v1",
+    )
+    target_id = "lan-target-" + "6" * 64
+    digest = "sha256:" + "1" * 64
+    valid_review = {
+        "expected_profile_revision": 1,
+        "expected_target_revision": 1,
+        "expected_terminal_receipt_digest": digest,
+        "expected_observation_digest": digest,
+        "expected_endpoint_fingerprint": digest,
+        "expected_material_binding_digest": digest,
+        "expected_review_digest": digest,
+        "expected_stale_reasons": [],
+        "trust_class": "operator_confirmed",
+        "intended_roles": ["worker"],
+        "task_family_affinities": ["code-repair"],
+        "privacy_acknowledged": True,
+        "enabled": False,
+    }
+    valid_import = {
+        "scan_id": "scan-1",
+        "endpoint_binding_digest": digest,
+        "expected_terminal_receipt_digest": digest,
+        "expected_observation_digest": digest,
+        "expected_profile_revision": 0,
+        "expected_target_revisions": [{"resource_id": target_id, "revision": 0}],
+        "replacement": None,
+    }
+    hostile = "raw-evidence-secret-192.168.50.2"
+
+    with testclient.TestClient(app) as client:
+        query = client.post(
+            f"/api/routing/lan/targets/{target_id}/review?principal={hostile}",
+            json=valid_review,
+        )
+        assert query.status_code in {400, 422}
+        assert hostile not in query.text
+
+        for field in (
+            "owner_principal",
+            "authenticated_owner_principal",
+            "lan_owner_principal",
+            "address",
+            "port",
+            "url",
+            "interface_id",
+            "model_ids",
+            "capabilities",
+            "secret",
+            "provider_adapter",
+            "observation",
+        ):
+            response = client.post(
+                f"/api/routing/lan/targets/{target_id}/review",
+                json={**valid_review, field: hostile},
+            )
+            assert response.status_code in {400, 422}
+            assert hostile not in response.text
+
+        strict_review_cases = (
+            {**valid_review, "expected_profile_revision": True},
+            {**valid_review, "expected_target_revision": 1.0},
+            {**valid_review, "expected_target_revision": "1"},
+            {**valid_review, "expected_profile_revision": -1},
+            {**valid_review, "privacy_acknowledged": 1},
+            {**valid_review, "enabled": "false"},
+            {**valid_review, "expected_review_digest": digest + "\n"},
+            {**valid_review, "intended_roles": ["e\u0301"]},
+            {**valid_review, "task_family_affinities": ["code\nrepair"]},
+        )
+        for body in strict_review_cases:
+            assert (
+                client.post(
+                    f"/api/routing/lan/targets/{target_id}/review",
+                    json=body,
+                ).status_code
+                == 422
+            )
+
+        strict_import_cases = (
+            {**valid_import, "expected_profile_revision": False},
+            {**valid_import, "expected_profile_revision": 0.0},
+            {**valid_import, "expected_profile_revision": "0"},
+            {**valid_import, "expected_profile_revision": -1},
+            {**valid_import, "expected_observation_digest": digest + "\n"},
+            {
+                **valid_import,
+                "expected_target_revisions": [{"resource_id": target_id, "revision": True}],
+            },
+            {
+                **valid_import,
+                "replacement": {
+                    "provider_profile_id": "lan-provider-" + "1" * 64,
+                    "expected_profile_revision": 1.0,
+                    "expected_endpoint_fingerprint": digest,
+                    "expected_material_binding_digests": [digest],
+                },
+            },
+        )
+        for body in strict_import_cases:
+            assert client.post("/api/routing/lan/import", json=body).status_code == 422
+
+        duplicate = client.post(
+            f"/api/routing/lan/targets/{target_id}/review",
+            content=(
+                b'{"expected_profile_revision":1,"expected_profile_revision":2,'
+                b'"expected_target_revision":1}'
+            ),
+            headers={"content-type": "application/json"},
+        )
+        assert duplicate.status_code in {400, 422}
+        invalid_utf8 = client.post(
+            f"/api/routing/lan/targets/{target_id}/review",
+            content=b'{"invalid":"\xff"}',
+            headers={"content-type": "application/json"},
+        )
+        assert invalid_utf8.status_code in {400, 422}
+        for literal in (b"NaN", b"Infinity", b"-Infinity"):
+            nonfinite = client.post(
+                f"/api/routing/lan/targets/{target_id}/review",
+                content=b'{"expected_profile_revision":' + literal + b"}",
+                headers={"content-type": "application/json"},
+            )
+            assert nonfinite.status_code in {400, 422}
+            assert literal.decode() not in nonfinite.text
+        oversized = client.post(
+            f"/api/routing/lan/targets/{target_id}/review",
+            content=b"{" + b'"padding":"' + b"x" * (32 * 1024) + b'"}',
+            headers={"content-type": "application/json"},
+        )
+        assert oversized.status_code == 413
+
+    assert calls == []
+
+
+def test_lan_routes_map_unknown_durable_resources_to_closed_404(tmp_path: Path) -> None:
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+
+    class MissingService:
+        def import_observation(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise KeyError("raw-secret-missing-scan")
+
+        def review_lan_target(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise KeyError("raw-secret-missing-target")
+
+    app = fastapi.FastAPI()
+    register_routing_routes(
+        app,
+        ledger=RoutingLedger(state),
+        runtime=AdaptiveFlockRuntimeConfig(),
+        http_exception=fastapi.HTTPException,
+        lan_discovery_service=MissingService(),
+        lan_owner_principal="owner:local-runtime:v1",
+    )
+    target_id = "lan-target-" + "7" * 64
+    digest = "sha256:" + "1" * 64
+    import_body = {
+        "scan_id": "missing-scan",
+        "endpoint_binding_digest": digest,
+        "expected_terminal_receipt_digest": digest,
+        "expected_observation_digest": digest,
+        "expected_profile_revision": 0,
+        "expected_target_revisions": [],
+        "replacement": None,
+    }
+    review_body = {
+        "expected_profile_revision": 1,
+        "expected_target_revision": 1,
+        "expected_terminal_receipt_digest": digest,
+        "expected_observation_digest": digest,
+        "expected_endpoint_fingerprint": digest,
+        "expected_material_binding_digest": digest,
+        "expected_review_digest": digest,
+        "expected_stale_reasons": [],
+        "trust_class": "operator_confirmed",
+        "intended_roles": [],
+        "task_family_affinities": [],
+        "privacy_acknowledged": True,
+        "enabled": False,
+    }
+
+    with testclient.TestClient(app) as client:
+        missing_import = client.post("/api/routing/lan/import", json=import_body)
+        missing_review = client.post(
+            f"/api/routing/lan/targets/{target_id}/review",
+            json=review_body,
+        )
+    assert missing_import.status_code == 404
+    assert missing_review.status_code == 404
+    assert missing_import.json() == {"detail": {"code": "lan_resource_not_found"}}
+    assert missing_review.json() == {"detail": {"code": "lan_resource_not_found"}}
+    assert "raw-secret" not in missing_import.text
+    assert "raw-secret" not in missing_review.text
+
+
+def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    testclient = pytest.importorskip("fastapi.testclient")
+
+    def config(root: Path, *, authenticated: bool) -> AgentConfig:
+        return AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=authenticated,
+            api_auth_token_env="KESTREL_LAN_ROUTE_TEST_TOKEN",
+        )
+
+    with testclient.TestClient(
+        create_app(config(tmp_path / "unauthenticated", authenticated=False))
+    ) as client:
+        assert client.post("/api/routing/lan/import", json={}).status_code == 404
+        assert (
+            client.post(
+                "/api/routing/lan/targets/missing/review",
+                json={},
+            ).status_code
+            == 404
+        )
+
+    monkeypatch.setenv("KESTREL_LAN_ROUTE_TEST_TOKEN", "lan-route-test-token")
+    with testclient.TestClient(
+        create_app(config(tmp_path / "authenticated", authenticated=True))
+    ) as client:
+        unauthorized = client.post("/api/routing/lan/import", json={})
+        assert unauthorized.status_code == 401
+        unauthorized_review = client.post(
+            "/api/routing/lan/targets/missing/review",
+            json={},
+        )
+        assert unauthorized_review.status_code == 401
+        authorized = client.post(
+            "/api/routing/lan/import",
+            json={},
+            headers={"X-Kestrel-API-Key": "lan-route-test-token"},
+        )
+        assert authorized.status_code in {400, 422}
+        assert authorized.status_code != 404
+        authorized_review = client.post(
+            "/api/routing/lan/targets/missing/review",
+            json={},
+            headers={"X-Kestrel-API-Key": "lan-route-test-token"},
+        )
+        assert authorized_review.status_code in {400, 422}
+        assert authorized_review.status_code != 404
+
+
+def test_create_app_desktop_launch_registers_lan_mutations_behind_launch_auth(
+    tmp_path: Path,
+) -> None:
+    import test_server_desktop_routes as desktop_cases
+
+    testclient = pytest.importorskip("fastapi.testclient")
+    profile_root = tmp_path / "desktop-profile"
+    profile_root.mkdir()
+    launch = desktop_cases._desktop_context(profile_root)
+    app = create_app(
+        desktop_cases._config(profile_root),
+        desktop_context=launch,
+    )
+
+    with testclient.TestClient(app) as client:
+        unauthorized_import = client.post("/api/routing/lan/import", json={})
+        unauthorized_review = client.post(
+            "/api/routing/lan/targets/missing/review",
+            json={},
+        )
+        assert unauthorized_import.status_code == 401
+        assert unauthorized_review.status_code == 401
+
+        headers = {"Authorization": f"Bearer {launch.api_token}"}
+        authorized_import = client.post(
+            "/api/routing/lan/import",
+            json={},
+            headers=headers,
+        )
+        authorized_review = client.post(
+            "/api/routing/lan/targets/missing/review",
+            json={},
+            headers=headers,
+        )
+        assert authorized_import.status_code in {400, 422}
+        assert authorized_review.status_code in {400, 422}
+        assert authorized_import.status_code != 404
+        assert authorized_review.status_code != 404
