@@ -530,6 +530,67 @@ def test_untrusted_txt_and_instance_metadata_fail_closed(hostile_record: MdnsRec
     assert candidates == ()
 
 
+@pytest.mark.parametrize(
+    "transport_material",
+    [
+        "model.dev:11434",
+        "Use 'model.dev' locally.",
+        "user:pass@model.dev",
+        "Model at 192.168.50.20.",
+        "Model at 192.168.50.20:11434.",
+        "Model at fd00::20.",
+        "Model at [fd00::20]:11434.",
+        "llama.cpp",
+    ],
+)
+def test_punctuated_or_embedded_transport_material_is_not_display_evidence(
+    transport_material: str,
+) -> None:
+    candidates, _factory = collect_fake(
+        [record(properties={b"description": transport_material.encode("utf-8")})]
+    )
+
+    assert candidates == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "display_value"),
+    [
+        (b"product", b"llama.cpp"),
+        (b"version", b"1.2.3"),
+        (b"version", b"1.2.3.4"),
+        (b"version", b"v1.2.3.4-beta"),
+        (b"description", b"Fast, local inference."),
+        (b"description", b"Use local inference, e.g. for coding."),
+        (b"description", b"Local, i.e. not cloud-hosted."),
+    ],
+)
+def test_domain_relevant_product_version_and_sentence_punctuation_remain_display_only(
+    field: bytes,
+    display_value: bytes,
+) -> None:
+    candidates, _factory = collect_fake(
+        [record(properties={field: display_value})]
+    )
+
+    assert len(candidates) == 1
+    assert dict(candidates[0].metadata) == {field.decode("ascii"): display_value.decode("ascii")}
+
+
+@pytest.mark.parametrize(
+    "private_ip_version",
+    [b"192.168.50.20", b"v192.168.50.20-beta"],
+)
+def test_numeric_version_syntax_does_not_admit_private_ip_material(
+    private_ip_version: bytes,
+) -> None:
+    candidates, _factory = collect_fake(
+        [record(properties={b"version": private_ip_version})]
+    )
+
+    assert candidates == ()
+
+
 def test_candidate_metadata_is_canonical_bounded_and_immutable() -> None:
     candidates, _factory = collect_fake(
         [
@@ -716,6 +777,278 @@ def test_session_is_closed_when_bounded_wait_raises() -> None:
     assert session.close_calls == 1
 
 
+class CachedDnsRecordFixture:
+    def __init__(
+        self,
+        *,
+        record_type: int,
+        created: float,
+        ttl: int = 1,
+        **fields: object,
+    ) -> None:
+        self.type = record_type
+        self.class_ = 1
+        self.created = created
+        self.ttl = ttl
+        self.expiry_checks: list[float] = []
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+    def is_expired(self, now: float) -> bool:
+        self.expiry_checks.append(now)
+        return self.created + (self.ttl * 1000) <= now
+
+
+class FixedMillisecondClock:
+    def __init__(self, value: float) -> None:
+        self.value = value
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return self.value
+
+
+def cached_record_fixture(
+    *,
+    srv_created: float | None = 1001.0,
+    txt_created: float | None = 1001.0,
+    address_records: tuple[CachedDnsRecordFixture, ...] | None = None,
+) -> tuple[object, str, str, tuple[CachedDnsRecordFixture, ...]]:
+    service_type = "_kestrel-model._tcp.local."
+    instance_name = f"Cached.{service_type}"
+    server = "cached-address.local."
+    records: list[CachedDnsRecordFixture] = []
+    service_bucket: dict[str, CachedDnsRecordFixture] = {}
+    if srv_created is not None:
+        srv = CachedDnsRecordFixture(
+            record_type=33,
+            created=srv_created,
+            port=11434,
+            server=server,
+        )
+        service_bucket["srv"] = srv
+        records.append(srv)
+    if txt_created is not None:
+        txt_entry = b"display_name=Cached fixture"
+        txt = CachedDnsRecordFixture(
+            record_type=16,
+            created=txt_created,
+            text=bytes([len(txt_entry)]) + txt_entry,
+        )
+        service_bucket["txt"] = txt
+        records.append(txt)
+    if address_records is None:
+        address_records = (
+            CachedDnsRecordFixture(
+                record_type=1,
+                created=1001.0,
+                address=bytes((192, 168, 50, 20)),
+                scope_id=None,
+            ),
+        )
+    records.extend(address_records)
+    address_bucket = {
+        f"address-{index}": address for index, address in enumerate(address_records)
+    }
+    zeroconf = SimpleNamespace(
+        cache=SimpleNamespace(
+            cache={
+                instance_name.lower(): service_bucket,
+                server.lower(): address_bucket,
+            }
+        )
+    )
+    return zeroconf, service_type, instance_name, tuple(records)
+
+
+@pytest.mark.parametrize("freshness_created", [999.0, 1000.0], ids=("expired", "boundary"))
+@pytest.mark.parametrize("record_kind", ["srv", "txt", "a", "aaaa"])
+def test_live_listener_excludes_expired_and_boundary_dns_records_before_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    freshness_created: float,
+    record_kind: str,
+) -> None:
+    srv_created = freshness_created if record_kind == "srv" else 1001.0
+    txt_created = freshness_created if record_kind == "txt" else 1001.0
+    if record_kind == "a":
+        addresses = (
+            CachedDnsRecordFixture(
+                record_type=1,
+                created=freshness_created,
+                address=bytes((192, 168, 50, 20)),
+                scope_id=None,
+            ),
+        )
+    elif record_kind == "aaaa":
+        addresses = (
+            CachedDnsRecordFixture(
+                record_type=28,
+                created=freshness_created,
+                address=bytes.fromhex("fd000000000000000000000000000020"),
+                scope_id=None,
+            ),
+        )
+    else:
+        addresses = None
+    zeroconf, service_type, instance_name, _records = cached_record_fixture(
+        srv_created=srv_created,
+        txt_created=txt_created,
+        address_records=addresses,
+    )
+    clock = FixedMillisecondClock(2000.0)
+    monkeypatch.setattr(lan_mdns, "_current_time_millis", clock, raising=False)
+    observed: list[MdnsRecord] = []
+    listener = lan_mdns._LiveListener(  # noqa: SLF001
+        observed.append,
+        MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=41),
+    )
+
+    listener.add_service(zeroconf, service_type, instance_name)
+
+    assert observed == []
+    assert clock.calls == 1
+
+
+@pytest.mark.parametrize("record_kind", ["srv", "txt", "a", "aaaa"])
+def test_live_listener_accepts_just_live_dns_record_with_one_millisecond_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+    record_kind: str,
+) -> None:
+    if record_kind == "a":
+        addresses = (
+            CachedDnsRecordFixture(
+                record_type=1,
+                created=1000.0,
+                address=bytes((192, 168, 50, 20)),
+                scope_id=None,
+            ),
+        )
+    elif record_kind == "aaaa":
+        addresses = (
+            CachedDnsRecordFixture(
+                record_type=28,
+                created=1000.0,
+                address=bytes.fromhex("fd000000000000000000000000000020"),
+                scope_id=None,
+            ),
+        )
+    else:
+        addresses = None
+    zeroconf, service_type, instance_name, records = cached_record_fixture(
+        srv_created=1000.0 if record_kind == "srv" else 1001.0,
+        txt_created=1000.0 if record_kind == "txt" else 1001.0,
+        address_records=addresses,
+    )
+    clock = FixedMillisecondClock(1999.0)
+    monkeypatch.setattr(lan_mdns, "_current_time_millis", clock, raising=False)
+    observed: list[MdnsRecord] = []
+    listener = lan_mdns._LiveListener(  # noqa: SLF001
+        observed.append,
+        MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=41),
+    )
+
+    listener.add_service(zeroconf, service_type, instance_name)
+
+    assert len(observed) == 1
+    assert clock.calls == 1
+    assert {now for cached_record in records for now in cached_record.expiry_checks} == {1999.0}
+
+
+@pytest.mark.parametrize("missing_kind", ["srv", "txt"])
+def test_live_listener_requires_fresh_srv_and_txt_before_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_kind: str,
+) -> None:
+    zeroconf, service_type, instance_name, _records = cached_record_fixture(
+        srv_created=None if missing_kind == "srv" else 1001.0,
+        txt_created=None if missing_kind == "txt" else 1001.0,
+    )
+    clock = FixedMillisecondClock(2000.0)
+    monkeypatch.setattr(lan_mdns, "_current_time_millis", clock, raising=False)
+    observed: list[MdnsRecord] = []
+    listener = lan_mdns._LiveListener(  # noqa: SLF001
+        observed.append,
+        MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=None),
+    )
+
+    listener.add_service(zeroconf, service_type, instance_name)
+
+    assert observed == []
+
+
+@pytest.mark.parametrize(
+    ("expired_kind", "expected_addresses"),
+    [
+        ("a", ("fd00::20",)),
+        ("aaaa", ("192.168.50.20",)),
+    ],
+)
+def test_live_listener_filters_expired_addresses_but_keeps_fresh_mixed_family_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    expired_kind: str,
+    expected_addresses: tuple[str, ...],
+) -> None:
+    addresses = (
+        CachedDnsRecordFixture(
+            record_type=1,
+            created=999.0 if expired_kind == "a" else 1001.0,
+            address=bytes((192, 168, 50, 20)),
+            scope_id=None,
+        ),
+        CachedDnsRecordFixture(
+            record_type=28,
+            created=999.0 if expired_kind == "aaaa" else 1001.0,
+            address=bytes.fromhex("fd000000000000000000000000000020"),
+            scope_id=None,
+        ),
+    )
+    zeroconf, service_type, instance_name, _records = cached_record_fixture(
+        address_records=addresses
+    )
+    clock = FixedMillisecondClock(2000.0)
+    monkeypatch.setattr(lan_mdns, "_current_time_millis", clock, raising=False)
+    observed: list[MdnsRecord] = []
+    listener = lan_mdns._LiveListener(  # noqa: SLF001
+        observed.append,
+        MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=41),
+    )
+
+    listener.add_service(zeroconf, service_type, instance_name)
+
+    assert len(observed) == 1
+    assert observed[0].addresses == expected_addresses
+
+
+@pytest.mark.parametrize("expiry_shape", ["non-callable", "raising", "malformed"])
+def test_live_listener_fails_closed_when_expiry_shape_drifts(
+    monkeypatch: pytest.MonkeyPatch,
+    expiry_shape: str,
+) -> None:
+    zeroconf, service_type, instance_name, records = cached_record_fixture()
+    srv_record = records[0]
+    if expiry_shape == "non-callable":
+        srv_record.is_expired = None  # type: ignore[assignment]
+    elif expiry_shape == "raising":
+        def raise_from_expiry(_now: float) -> bool:
+            raise RuntimeError("expiry shape drift")
+
+        srv_record.is_expired = raise_from_expiry  # type: ignore[method-assign]
+    else:
+        srv_record.is_expired = lambda _now: "not-a-bool"  # type: ignore[method-assign,return-value]
+    clock = FixedMillisecondClock(2000.0)
+    monkeypatch.setattr(lan_mdns, "_current_time_millis", clock, raising=False)
+    observed: list[MdnsRecord] = []
+    listener = lan_mdns._LiveListener(  # noqa: SLF001
+        observed.append,
+        MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=None),
+    )
+
+    listener.add_service(zeroconf, service_type, instance_name)
+
+    assert observed == []
+
+
 def test_live_wrapper_uses_exact_binding_cache_only_reads_and_idempotent_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -743,6 +1076,9 @@ def test_live_wrapper_uses_exact_binding_cache_only_reads_and_idempotent_close(
         class_ = 1
         text = bytes([len(txt_entry)]) + txt_entry
 
+        def is_expired(self, _now: float) -> bool:
+            return False
+
         @property
         def properties(self) -> object:
             raise AssertionError("raw TXT must be validated before properties are exposed")
@@ -759,6 +1095,7 @@ def test_live_wrapper_uses_exact_binding_cache_only_reads_and_idempotent_close(
                             class_=1,
                             port=11434,
                             server=server,
+                            is_expired=lambda _now: False,
                         ),
                         "txt": FakeTxtRecord(),
                     },
@@ -768,6 +1105,7 @@ def test_live_wrapper_uses_exact_binding_cache_only_reads_and_idempotent_close(
                             class_=1,
                             address=bytes((192, 168, 50, 20)),
                             scope_id=None,
+                            is_expired=lambda _now: False,
                         )
                     },
                 }
@@ -1129,6 +1467,7 @@ def test_live_listener_rejects_oversized_address_cache_before_iteration() -> Non
                         class_=1,
                         port=11434,
                         server=server,
+                        is_expired=lambda _now: False,
                     )
                 },
                 server.lower(): oversized,
@@ -1179,8 +1518,14 @@ def test_live_listener_rejects_raw_txt_before_mapping_exposure(raw_txt: bytes) -
                         class_=1,
                         port=11434,
                         server=server,
+                        is_expired=lambda _now: False,
                     ),
-                    "txt": SimpleNamespace(type=16, class_=1, text=raw_txt),
+                    "txt": SimpleNamespace(
+                        type=16,
+                        class_=1,
+                        text=raw_txt,
+                        is_expired=lambda _now: False,
+                    ),
                 },
                 server.lower(): {},
             }

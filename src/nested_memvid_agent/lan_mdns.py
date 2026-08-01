@@ -59,10 +59,32 @@ _DNS_TYPE_SRV = 33
 _DNS_CLASS_IN = 1
 _URL_RE = re.compile(r"(?:[a-z][a-z0-9+.-]*://|\bwww\.)", re.IGNORECASE)
 _HOSTNAME_RE = re.compile(
-    r"(?:^|[\s(])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-    r"(?:[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)\.?(?:$|[\s),])",
+    r"(?<![a-z0-9-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)\.?(?![a-z0-9-])",
     re.IGNORECASE,
 )
+_HOST_PORT_RE = re.compile(
+    r"(?<![a-z0-9-])(?:localhost|[a-z][a-z0-9-]{0,62}|"
+    r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}|\[[0-9a-f:.%]+\])"
+    r":[0-9]{1,5}(?![0-9])",
+    re.IGNORECASE,
+)
+_USERINFO_RE = re.compile(
+    r"(?<!\S)[^\s/@]+(?::[^\s/@]+)?@(?:\[[^\]\s]+\]|[^\s/@]+)",
+    re.IGNORECASE,
+)
+_IPV4_MATERIAL_RE = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
+_IPV6_MATERIAL_RE = re.compile(
+    r"(?<![0-9a-f:])(?:\[[0-9a-f:.%]+\]|"
+    r"[0-9a-f][0-9a-f:.%]*:[0-9a-f:.%]*)(?![0-9a-f:])",
+    re.IGNORECASE,
+)
+_NUMERIC_VERSION_RE = re.compile(
+    r"v?(?P<release>[0-9]+(?:\.[0-9]+)+)"
+    r"(?:[-+][0-9a-z]+(?:[.-][0-9a-z]+)*)?",
+    re.IGNORECASE,
+)
+_PROSE_DOTTED_ABBREVIATIONS = frozenset({"e.g.", "i.e."})
 _CREDENTIAL_RE = re.compile(
     r"(?:\bauthorization\b|\bbearer\s|\bbasic\s|\bapi[ _-]?key\b|"
     r"\bpassword\b|\bsecret\b|\btoken\b|\bsk-[a-z0-9_-]{8,}|"
@@ -489,12 +511,23 @@ def _normalize_txt(properties: Mapping[object, object]) -> dict[str, str]:
             raise ValueError("mDNS TXT must be strict UTF-8") from exc
         if key not in _DISPLAY_TXT_FIELDS:
             raise ValueError("mDNS TXT key is not public display metadata")
-        _validate_display_text(value, max_bytes=_MAX_DISPLAY_VALUE_BYTES)
+        _validate_display_text(
+            value,
+            max_bytes=_MAX_DISPLAY_VALUE_BYTES,
+            allowed_dotted_value="llama.cpp" if key == "product" else None,
+            allow_numeric_version=key == "version",
+        )
         normalized[key] = value
     return normalized
 
 
-def _validate_display_text(value: str, *, max_bytes: int) -> None:
+def _validate_display_text(
+    value: str,
+    *,
+    max_bytes: int,
+    allowed_dotted_value: str | None = None,
+    allow_numeric_version: bool = False,
+) -> None:
     if not value or value != value.strip():
         raise ValueError("mDNS display text must be non-empty and canonical")
     if len(value.encode("utf-8")) > max_bytes:
@@ -503,19 +536,63 @@ def _validate_display_text(value: str, *, max_bytes: int) -> None:
         raise ValueError("mDNS display text must use canonical NFC normalization")
     if any(unicodedata.category(character).startswith("C") for character in value):
         raise ValueError("mDNS display text contains control material")
-    if _URL_RE.search(value) or _HOSTNAME_RE.search(value) or _is_bare_ip_literal(value):
+    if _contains_transport_material(
+        value,
+        allowed_dotted_value=allowed_dotted_value,
+        allow_numeric_version=allow_numeric_version,
+    ):
         raise ValueError("mDNS display text contains transport material")
     if _CREDENTIAL_RE.search(value):
         raise ValueError("mDNS display text contains credential material")
 
 
-def _is_bare_ip_literal(value: str) -> bool:
-    literal = value.partition("%")[0]
-    try:
-        ipaddress.ip_address(literal)
-    except ValueError:
+def _contains_transport_material(
+    value: str,
+    *,
+    allowed_dotted_value: str | None,
+    allow_numeric_version: bool,
+) -> bool:
+    if _URL_RE.search(value) or _USERINFO_RE.search(value) or _HOST_PORT_RE.search(value):
+        return True
+    if allow_numeric_version and _is_allowed_numeric_version(value):
         return False
-    return True
+    if _contains_ip_literal(value):
+        return True
+    if value == allowed_dotted_value:
+        return False
+    return any(
+        match.group().casefold() not in _PROSE_DOTTED_ABBREVIATIONS
+        for match in _HOSTNAME_RE.finditer(value)
+    )
+
+
+def _is_allowed_numeric_version(value: str) -> bool:
+    match = _NUMERIC_VERSION_RE.fullmatch(value)
+    if match is None:
+        return False
+    release = match.group("release")
+    try:
+        possible_address = ipaddress.IPv4Address(release)
+    except ValueError:
+        return True
+    return possible_address.is_global and not possible_address.is_multicast
+
+
+def _contains_ip_literal(value: str) -> bool:
+    for match in _IPV4_MATERIAL_RE.finditer(value):
+        try:
+            ipaddress.IPv4Address(match.group())
+        except ValueError:
+            continue
+        return True
+    for match in _IPV6_MATERIAL_RE.finditer(value):
+        candidate = match.group().strip("[]").rstrip(".").partition("%")[0]
+        try:
+            ipaddress.IPv6Address(candidate)
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 def _normalize_address(raw_address: object, binding: MdnsBinding) -> str:
@@ -592,7 +669,14 @@ class _LiveListener:
 
     def _emit_cached(self, zeroconf: Any, service_type: str, name: str) -> None:
         try:
-            record = _cached_mdns_record(zeroconf, service_type, name, self._binding)
+            now_millis = _current_time_millis()
+            record = _cached_mdns_record(
+                zeroconf,
+                service_type,
+                name,
+                self._binding,
+                now_millis,
+            )
             if record is not None:
                 self._callback(record)
         except Exception:
@@ -678,6 +762,7 @@ def _cached_mdns_record(
     service_type: object,
     name: object,
     binding: MdnsBinding,
+    now_millis: float,
 ) -> MdnsRecord | None:
     if type(service_type) is not str or service_type not in ALLOWED_MODEL_SERVICE_TYPES:
         raise ValueError("live mDNS callback service type is not allowed")
@@ -696,6 +781,7 @@ def _cached_mdns_record(
         for record in service_records
         if getattr(record, "class_", None) == _DNS_CLASS_IN
         and getattr(record, "type", None) in {_DNS_TYPE_SRV, _DNS_TYPE_TXT}
+        and _cache_record_is_fresh(record, now_millis)
     ]
     srv_records = [
         record for record in service_values if getattr(record, "type", None) == _DNS_TYPE_SRV
@@ -703,7 +789,7 @@ def _cached_mdns_record(
     txt_records = [
         record for record in service_values if getattr(record, "type", None) == _DNS_TYPE_TXT
     ]
-    if len(srv_records) != 1 or len(txt_records) > 1:
+    if len(srv_records) != 1 or len(txt_records) != 1:
         return None
 
     srv_record = srv_records[0]
@@ -716,9 +802,7 @@ def _cached_mdns_record(
     ):
         raise ValueError("live mDNS SRV target is invalid")
 
-    properties: Mapping[object, object] = {}
-    if txt_records:
-        properties = _parse_raw_txt(getattr(txt_records[0], "text", None))
+    properties = _parse_raw_txt(getattr(txt_records[0], "text", None))
 
     address_records = _bounded_cache_records(
         zeroconf,
@@ -731,6 +815,8 @@ def _cached_mdns_record(
             getattr(address_record, "class_", None) != _DNS_CLASS_IN
             or getattr(address_record, "type", None) not in {_DNS_TYPE_A, _DNS_TYPE_AAAA}
         ):
+            continue
+        if not _cache_record_is_fresh(address_record, now_millis):
             continue
         raw_address = getattr(address_record, "address", None)
         record_type = getattr(address_record, "type", None)
@@ -748,6 +834,9 @@ def _cached_mdns_record(
         else:
             addresses.append(str(parsed))
 
+    if not addresses:
+        return None
+
     return MdnsRecord(
         service_type=service_type,
         instance_name=name,
@@ -757,6 +846,22 @@ def _cached_mdns_record(
         # The cache target is retained only as ignored display-hostile input.
         hostname=server,
     )
+
+
+def _current_time_millis() -> float:
+    """Return the monotonic millisecond domain used by pinned zeroconf records."""
+
+    return time.monotonic() * 1000
+
+
+def _cache_record_is_fresh(record: Any, now_millis: float) -> bool:
+    is_expired = getattr(record, "is_expired", None)
+    if not callable(is_expired):
+        raise ValueError("live mDNS cache record has no expiry predicate")
+    expired = is_expired(now_millis)
+    if type(expired) is not bool:
+        raise ValueError("live mDNS cache record expiry predicate is malformed")
+    return not expired
 
 
 def _bounded_cache_records(
