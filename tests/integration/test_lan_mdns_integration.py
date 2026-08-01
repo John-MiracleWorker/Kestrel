@@ -46,12 +46,9 @@ def test_controlled_same_host_mdns_adapter_mechanics() -> None:
             address = attached.ip
             if address.is_loopback or address.is_multicast or address.is_reserved:
                 continue
-            # Keep only this exact selected literal in the controlled adapter binding.
-            selected_interface = NetworkInterface.from_addresses(
-                os_identity=discovered.os_identity,
-                display_name=discovered.display_name,
-                addresses=(attached_value,),
-            )
+            # Preserve the complete current OS-owned address tuple. The /32 scope
+            # below remains the exact candidate authority for this fixture.
+            selected_interface = discovered
             selected_address = str(address)
             break
         if selected_interface is not None:

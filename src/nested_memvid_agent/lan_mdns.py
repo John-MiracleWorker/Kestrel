@@ -27,7 +27,10 @@ from nested_memvid_agent.lan_discovery_models import (
     NetworkInterface,
     ResolvedLanEndpoint,
 )
-from nested_memvid_agent.lan_discovery_scope import PrivateScanScope
+from nested_memvid_agent.lan_discovery_scope import (
+    PrivateScanScope,
+    enumerate_private_interfaces,
+)
 
 ALLOWED_MODEL_SERVICE_TYPES = (
     "_ollama._tcp.local.",
@@ -46,10 +49,18 @@ _MAX_DISPLAY_VALUE_BYTES = 300
 _MAX_INSTANCE_NAME_BYTES = 255
 _MAX_ADDRESS_LITERAL_CHARS = 128
 _MAX_TXT_KEY_BYTES = 32
+_MAX_LIVE_SERVICE_RECORDS = 16
+_LIVE_BROWSER_JOIN_SECONDS = 0.25
+_LIVE_CLEANUP_SECONDS = 0.75
+_DNS_TYPE_A = 1
+_DNS_TYPE_TXT = 16
+_DNS_TYPE_AAAA = 28
+_DNS_TYPE_SRV = 33
+_DNS_CLASS_IN = 1
 _URL_RE = re.compile(r"(?:[a-z][a-z0-9+.-]*://|\bwww\.)", re.IGNORECASE)
 _HOSTNAME_RE = re.compile(
     r"(?:^|[\s(])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-    r"(?:local|lan|home|internal|arpa|com|net|org)\.?(?:$|[\s),])",
+    r"(?:[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)\.?(?:$|[\s),])",
     re.IGNORECASE,
 )
 _CREDENTIAL_RE = re.compile(
@@ -74,6 +85,14 @@ class MdnsBinding:
 
     ipv4_addresses: tuple[str, ...]
     ipv6_interface_index: int | None
+
+
+@dataclass(frozen=True)
+class CurrentInterfaceState:
+    """Fresh OS-owned identity evidence used immediately before socket binding."""
+
+    interface_index: int
+    addresses: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -165,7 +184,7 @@ class MdnsAdapterFactory(Protocol):
     ) -> MdnsSession: ...
 
 
-InterfaceIndexResolver = Callable[[str], int]
+InterfaceStateResolver = Callable[[str], CurrentInterfaceState]
 
 
 class _CandidateState:
@@ -238,7 +257,7 @@ def collect_mdns_candidates(
     *,
     adapter_factory: MdnsAdapterFactory | None = None,
     clock: Callable[[], float] = time.monotonic,
-    interface_index_resolver: InterfaceIndexResolver | None = None,
+    interface_state_resolver: InterfaceStateResolver | None = None,
 ) -> tuple[LanCandidate, ...]:
     """Collect one fixed-window, passive set for a canonical owner-confirmed scope."""
 
@@ -246,9 +265,9 @@ def collect_mdns_candidates(
     binding = _binding_for_scope(
         canonical_scope,
         (
-            interface_index_resolver
-            if interface_index_resolver is not None
-            else _resolve_verified_interface_index
+            interface_state_resolver
+            if interface_state_resolver is not None
+            else _resolve_current_interface_state
         ),
     )
     limits = LanScanLimits()
@@ -300,27 +319,50 @@ def _authenticate_scope(scope: PrivateScanScope) -> PrivateScanScope:
 
 def _binding_for_scope(
     scope: PrivateScanScope,
-    interface_index_resolver: InterfaceIndexResolver,
+    interface_state_resolver: InterfaceStateResolver,
 ) -> MdnsBinding:
-    ipv4_addresses: list[str] = []
-    has_ipv6 = False
-    for value in scope.interface.addresses:
-        attached = ipaddress.ip_interface(value)
-        if isinstance(attached, ipaddress.IPv4Interface):
-            ipv4_addresses.append(str(attached.ip))
-        else:
-            has_ipv6 = True
-
     try:
-        resolved_index = interface_index_resolver(scope.interface.os_identity)
+        current_state = interface_state_resolver(scope.interface.os_identity)
+    except ValueError:
+        raise
     except Exception as exc:
-        raise ValueError("mDNS requires a verified numeric interface index") from exc
+        raise ValueError("mDNS requires authenticated current interface state") from exc
+
+    resolved_index = getattr(current_state, "interface_index", None)
     if (
         isinstance(resolved_index, bool)
         or not isinstance(resolved_index, int)
         or resolved_index <= 0
     ):
         raise ValueError("mDNS requires a verified numeric interface index")
+
+    current_addresses = getattr(current_state, "addresses", None)
+    if type(current_addresses) is not tuple or len(current_addresses) > MAX_ACTIVE_HOSTS:
+        raise ValueError("mDNS current selected interface addresses are invalid")
+    try:
+        current_interface = NetworkInterface.from_addresses(
+            os_identity=scope.interface.os_identity,
+            display_name=scope.interface.display_name,
+            addresses=current_addresses,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("mDNS current selected interface addresses are invalid") from exc
+    if not all(
+        _is_eligible_confirmed_interface_address(value)
+        for value in current_interface.addresses
+    ):
+        raise ValueError("mDNS current selected interface addresses are invalid")
+    if current_interface.addresses != scope.interface.addresses:
+        raise ValueError("mDNS current selected interface addresses changed")
+
+    ipv4_addresses: list[str] = []
+    has_ipv6 = False
+    for value in current_interface.addresses:
+        attached = ipaddress.ip_interface(value)
+        if isinstance(attached, ipaddress.IPv4Interface):
+            ipv4_addresses.append(str(attached.ip))
+        else:
+            has_ipv6 = True
     ipv6_interface_index = resolved_index if has_ipv6 else None
 
     return MdnsBinding(
@@ -352,6 +394,27 @@ def _resolve_verified_interface_index(os_identity: str) -> int:
     if index <= 0 or socket.if_indextoname(index) != interface_name:
         raise ValueError("interface index could not be authenticated")
     return index
+
+
+def _resolve_current_interface_state(os_identity: str) -> CurrentInterfaceState:
+    current_interface = next(
+        (
+            interface
+            for interface in enumerate_private_interfaces()
+            if interface.os_identity == os_identity
+        ),
+        None,
+    )
+    if current_interface is None:
+        raise ValueError("mDNS current selected interface addresses changed")
+    try:
+        interface_index = _resolve_verified_interface_index(os_identity)
+    except (OSError, ValueError) as exc:
+        raise ValueError("mDNS requires a verified numeric interface index") from exc
+    return CurrentInterfaceState(
+        interface_index=interface_index,
+        addresses=current_interface.addresses,
+    )
 
 
 def _normalize_record(
@@ -440,10 +503,19 @@ def _validate_display_text(value: str, *, max_bytes: int) -> None:
         raise ValueError("mDNS display text must use canonical NFC normalization")
     if any(unicodedata.category(character).startswith("C") for character in value):
         raise ValueError("mDNS display text contains control material")
-    if _URL_RE.search(value) or _HOSTNAME_RE.search(value):
+    if _URL_RE.search(value) or _HOSTNAME_RE.search(value) or _is_bare_ip_literal(value):
         raise ValueError("mDNS display text contains transport material")
     if _CREDENTIAL_RE.search(value):
         raise ValueError("mDNS display text contains credential material")
+
+
+def _is_bare_ip_literal(value: str) -> bool:
+    literal = value.partition("%")[0]
+    try:
+        ipaddress.ip_address(literal)
+    except ValueError:
+        return False
+    return True
 
 
 def _normalize_address(raw_address: object, binding: MdnsBinding) -> str:
@@ -505,11 +577,9 @@ class _LiveListener:
         self,
         callback: Callable[[MdnsRecord], None],
         binding: MdnsBinding,
-        service_info_factory: Callable[[str, str], Any],
     ) -> None:
         self._callback = callback
         self._binding = binding
-        self._service_info_factory = service_info_factory
 
     def add_service(self, zeroconf: Any, service_type: str, name: str) -> None:
         self._emit_cached(zeroconf, service_type, name)
@@ -522,29 +592,9 @@ class _LiveListener:
 
     def _emit_cached(self, zeroconf: Any, service_type: str, name: str) -> None:
         try:
-            # The pinned zeroconf API populates this value only from its existing
-            # callback cache. It never emits a request or waits for a response.
-            info = self._service_info_factory(service_type, name)
-            if not info.load_from_cache(zeroconf):
-                return
-            raw_addresses = _live_scoped_addresses(info, self._binding)
-            raw_properties = getattr(info, "properties", None)
-            properties: Mapping[object, object]
-            if isinstance(raw_properties, Mapping):
-                properties = raw_properties
-            else:
-                properties = {None: None}
-            self._callback(
-                MdnsRecord(
-                    service_type=service_type,
-                    instance_name=name,
-                    addresses=raw_addresses,
-                    port=getattr(info, "port", None),
-                    properties=properties,
-                    # Retained only as an ignored input to make the trust boundary explicit.
-                    hostname=getattr(info, "server", None),
-                )
-            )
+            record = _cached_mdns_record(zeroconf, service_type, name, self._binding)
+            if record is not None:
+                self._callback(record)
         except Exception:
             # Optional adapter/cache drift is isolated to one callback.
             return
@@ -556,7 +606,9 @@ class _LiveMdnsSession:
         self._browser = browser
         self._wait_event = threading.Event()
         self._close_lock = threading.Lock()
-        self._closed = False
+        self._cleanup_done = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
+        self._cleanup_error: Exception | None = None
 
     def wait(self, seconds: float) -> None:
         bounded = min(max(0.0, seconds), LanScanLimits().mdns_window_seconds)
@@ -564,10 +616,25 @@ class _LiveMdnsSession:
 
     def close(self) -> None:
         with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-        _close_live_resources(self._browser, self._zeroconf)
+            if self._cleanup_thread is None:
+                self._cleanup_thread = threading.Thread(
+                    target=self._cleanup,
+                    name="kestrel-mdns-cleanup",
+                    daemon=True,
+                )
+                self._cleanup_thread.start()
+        if not self._cleanup_done.wait(_LIVE_CLEANUP_SECONDS):
+            raise TimeoutError("live mDNS cleanup did not settle within its bounded window")
+        if self._cleanup_error is not None:
+            raise self._cleanup_error
+
+    def _cleanup(self) -> None:
+        try:
+            _close_live_resources(self._browser, self._zeroconf)
+        except Exception as exc:
+            self._cleanup_error = exc
+        finally:
+            self._cleanup_done.set()
 
 
 def _live_adapter_factory(
@@ -594,73 +661,213 @@ def _live_adapter_factory(
         else:
             ip_version = module.IPVersion.V6Only
         zeroconf = module.Zeroconf(interfaces=interfaces, ip_version=ip_version)
-        listener = _LiveListener(callback, binding, module.ServiceInfo)
+        listener = _LiveListener(callback, binding)
         browser = module.ServiceBrowser(zeroconf, list(service_types), listener)
         return _LiveMdnsSession(zeroconf, browser)
-    except Exception:
+    except Exception as creation_error:
         if browser is not None or zeroconf is not None:
-            _close_live_resources(browser, zeroconf)
+            try:
+                _LiveMdnsSession(zeroconf, browser).close()
+            except Exception as cleanup_error:
+                creation_error.add_note(f"bounded mDNS cleanup also failed: {cleanup_error}")
         raise
 
 
-def _live_scoped_addresses(info: Any, binding: MdnsBinding) -> tuple[object, ...]:
-    parser = getattr(info, "parsed_scoped_addresses", None)
-    if not callable(parser):
-        return ()
-    values = parser()
-    if not isinstance(values, (list, tuple)):
-        return ()
-    normalized: list[object] = []
-    for value in values:
-        if type(value) is not str:
-            normalized.append(value)
+def _cached_mdns_record(
+    zeroconf: Any,
+    service_type: object,
+    name: object,
+    binding: MdnsBinding,
+) -> MdnsRecord | None:
+    if type(service_type) is not str or service_type not in ALLOWED_MODEL_SERVICE_TYPES:
+        raise ValueError("live mDNS callback service type is not allowed")
+    if type(name) is not str or not name or len(name.encode("utf-8")) > (
+        _MAX_INSTANCE_NAME_BYTES + len(service_type.encode("utf-8")) + 1
+    ):
+        raise ValueError("live mDNS callback name is invalid")
+
+    service_records = _bounded_cache_records(
+        zeroconf,
+        name,
+        limit=_MAX_LIVE_SERVICE_RECORDS,
+    )
+    service_values = [
+        record
+        for record in service_records
+        if getattr(record, "class_", None) == _DNS_CLASS_IN
+        and getattr(record, "type", None) in {_DNS_TYPE_SRV, _DNS_TYPE_TXT}
+    ]
+    srv_records = [
+        record for record in service_values if getattr(record, "type", None) == _DNS_TYPE_SRV
+    ]
+    txt_records = [
+        record for record in service_values if getattr(record, "type", None) == _DNS_TYPE_TXT
+    ]
+    if len(srv_records) != 1 or len(txt_records) > 1:
+        return None
+
+    srv_record = srv_records[0]
+    server = getattr(srv_record, "server", None)
+    if (
+        type(server) is not str
+        or not server
+        or len(server.encode("utf-8")) > _MAX_INSTANCE_NAME_BYTES
+        or any(unicodedata.category(character).startswith("C") for character in server)
+    ):
+        raise ValueError("live mDNS SRV target is invalid")
+
+    properties: Mapping[object, object] = {}
+    if txt_records:
+        properties = _parse_raw_txt(getattr(txt_records[0], "text", None))
+
+    address_records = _bounded_cache_records(
+        zeroconf,
+        server,
+        limit=MAX_ACTIVE_HOSTS,
+    )
+    addresses: list[object] = []
+    for address_record in address_records:
+        if (
+            getattr(address_record, "class_", None) != _DNS_CLASS_IN
+            or getattr(address_record, "type", None) not in {_DNS_TYPE_A, _DNS_TYPE_AAAA}
+        ):
             continue
-        literal, separator, zone = value.partition("%")
-        try:
-            parsed = ipaddress.ip_address(literal)
-        except ValueError:
-            normalized.append(value)
+        raw_address = getattr(address_record, "address", None)
+        record_type = getattr(address_record, "type", None)
+        expected_length = 4 if record_type == _DNS_TYPE_A else 16
+        if type(raw_address) is not bytes or len(raw_address) != expected_length:
+            addresses.append(raw_address)
             continue
-        if not isinstance(parsed, ipaddress.IPv6Address) or not parsed.is_link_local:
-            normalized.append(value)
-            continue
-        if not separator or binding.ipv6_interface_index is None:
-            normalized.append(value)
-            continue
-        numeric_zone: int | None = None
-        if zone.isascii() and zone.isdecimal():
-            numeric_zone = int(zone)
+        parsed = ipaddress.ip_address(raw_address)
+        if isinstance(parsed, ipaddress.IPv6Address) and parsed.is_link_local:
+            scope_id = getattr(address_record, "scope_id", None)
+            if isinstance(scope_id, bool) or not isinstance(scope_id, int) or scope_id <= 0:
+                addresses.append(str(parsed))
+            else:
+                addresses.append(f"{parsed}%{scope_id}")
         else:
-            try:
-                numeric_zone = socket.if_nametoindex(zone)
-            except (OSError, ValueError):
-                pass
-        if numeric_zone == binding.ipv6_interface_index:
-            normalized.append(f"{parsed}%{numeric_zone}")
-        else:
-            normalized.append(value)
-    return tuple(normalized)
+            addresses.append(str(parsed))
+
+    return MdnsRecord(
+        service_type=service_type,
+        instance_name=name,
+        addresses=tuple(addresses),
+        port=getattr(srv_record, "port", None),
+        properties=properties,
+        # The cache target is retained only as ignored display-hostile input.
+        hostname=server,
+    )
+
+
+def _bounded_cache_records(
+    zeroconf: Any,
+    key: str,
+    *,
+    limit: int,
+) -> tuple[Any, ...]:
+    cache_owner = getattr(zeroconf, "cache", None)
+    raw_cache = getattr(cache_owner, "cache", None)
+    if not isinstance(raw_cache, Mapping):
+        return ()
+    bucket = raw_cache.get(key.lower())
+    if bucket is None:
+        return ()
+    if not isinstance(bucket, Mapping):
+        raise ValueError("live mDNS cache bucket is not a mapping")
+    if len(bucket) > limit:
+        raise ValueError("live mDNS cache bucket exceeds its record limit")
+
+    records: list[Any] = []
+    for cached_record in bucket.values():
+        if len(records) >= limit:
+            raise ValueError("live mDNS cache bucket changed beyond its record limit")
+        records.append(cached_record)
+    return tuple(records)
+
+
+def _parse_raw_txt(raw_txt: object) -> Mapping[object, object]:
+    if type(raw_txt) is not bytes or len(raw_txt) > MAX_MDNS_METADATA_BYTES:
+        raise ValueError("live mDNS TXT payload exceeds its raw byte limit")
+
+    properties: dict[object, object] = {}
+    offset = 0
+    while offset < len(raw_txt):
+        entry_length = raw_txt[offset]
+        offset += 1
+        end = offset + entry_length
+        if entry_length == 0 or end > len(raw_txt):
+            raise ValueError("live mDNS TXT payload has invalid framing")
+        entry = raw_txt[offset:end]
+        offset = end
+        if len(properties) >= len(_DISPLAY_TXT_FIELDS):
+            raise ValueError("live mDNS TXT payload contains too many entries")
+        raw_key, separator, raw_value = entry.partition(b"=")
+        if (
+            not separator
+            or not raw_key
+            or len(raw_key) > _MAX_TXT_KEY_BYTES
+            or len(raw_value) > _MAX_DISPLAY_VALUE_BYTES
+            or raw_key in properties
+        ):
+            raise ValueError("live mDNS TXT key or value is invalid")
+        properties[raw_key] = raw_value
+    return properties
 
 
 def _close_live_resources(browser: Any | None, zeroconf: Any | None) -> None:
     first_error: Exception | None = None
     if browser is not None:
         try:
-            browser.cancel()
+            _stop_pinned_browser(browser, zeroconf)
         except Exception as exc:
             first_error = exc
-        try:
-            join = getattr(browser, "join", None)
-            if callable(join):
-                join(timeout=LanScanLimits().mdns_window_seconds)
-        except Exception as exc:
-            if first_error is None:
-                first_error = exc
     if zeroconf is not None:
         try:
             zeroconf.close()
         except Exception as exc:
             if first_error is None:
                 first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def _stop_pinned_browser(browser: Any, zeroconf: Any | None) -> None:
+    """Request pinned zeroconf shutdown without its unbounded cancel()."""
+
+    first_error: Exception | None = None
+    try:
+        queue = browser.queue
+        queue.put(None)
+    except Exception as exc:
+        first_error = exc
+
+    try:
+        async_cancel = browser._async_cancel
+        if not callable(async_cancel):
+            raise TypeError("pinned zeroconf browser has no async cancel callback")
+        browser_zeroconf = getattr(browser, "zc", None)
+        loop_owner = browser_zeroconf if browser_zeroconf is not None else zeroconf
+        if loop_owner is None:
+            raise TypeError("pinned zeroconf browser has no event-loop owner")
+        loop = loop_owner.loop
+        is_closed = loop.is_closed
+        if not callable(is_closed) or not is_closed():
+            loop.call_soon_threadsafe(async_cancel)
+    except Exception as exc:
+        if first_error is None:
+            first_error = exc
+
+    try:
+        join = browser.join
+        if not callable(join):
+            raise TypeError("pinned zeroconf browser has no bounded join")
+        join(timeout=_LIVE_BROWSER_JOIN_SECONDS)
+        is_alive = browser.is_alive
+        if not callable(is_alive) or is_alive():
+            raise TimeoutError("live mDNS browser did not stop within its bounded join")
+    except Exception as exc:
+        if first_error is None:
+            first_error = exc
+
     if first_error is not None:
         raise first_error

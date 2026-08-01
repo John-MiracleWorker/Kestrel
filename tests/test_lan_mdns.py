@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
@@ -125,13 +126,17 @@ def collect_fake(
     scope: PrivateScanScope | None = None,
     interface_index: int = 7,
 ) -> tuple[tuple[LanCandidate, ...], FakeAdapterFactory]:
+    selected_scope = scope or scope_fixture()
     clock = ManualClock()
     factory = FakeAdapterFactory(records, clock)
     candidates = collect_mdns_candidates(
-        scope or scope_fixture(),
+        selected_scope,
         adapter_factory=factory,
         clock=clock,
-        interface_index_resolver=lambda _identity: interface_index,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=interface_index,
+            addresses=selected_scope.interface.addresses,
+        ),
     )
     return candidates, factory
 
@@ -237,7 +242,13 @@ def test_ipv4_only_scope_still_authenticates_selected_os_interface_identity() ->
         scope,
         adapter_factory=factory,
         clock=clock,
-        interface_index_resolver=lambda identity: resolved_identities.append(identity) or 19,
+        interface_state_resolver=lambda identity: (
+            resolved_identities.append(identity)
+            or lan_mdns.CurrentInterfaceState(
+                interface_index=19,
+                addresses=scope.interface.addresses,
+            )
+        ),
     )
 
     assert resolved_identities == ["darwin:en9"]
@@ -254,11 +265,42 @@ def test_default_interface_resolver_rejects_a_failed_os_identity_round_trip(
     clock = ManualClock()
     factory = FakeAdapterFactory([], clock)
     monkeypatch.setattr(lan_mdns.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(lan_mdns, "enumerate_private_interfaces", lambda: (scope.interface,))
     monkeypatch.setattr(lan_mdns.socket, "if_nametoindex", lambda _name: 19)
     monkeypatch.setattr(lan_mdns.socket, "if_indextoname", lambda _index: "en8")
 
     with pytest.raises(ValueError, match="verified numeric interface index"):
         collect_mdns_candidates(scope, adapter_factory=factory, clock=clock)
+
+    assert factory.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("scope_addresses", "current_addresses"),
+    [
+        (("192.168.50.7/24",), ("192.168.50.8/24",)),
+        (("192.168.50.7/24",), ("192.168.50.7/24", "10.8.0.7/24")),
+        (("192.168.50.7/24", "10.8.0.7/24"), ("192.168.50.7/24",)),
+    ],
+)
+def test_current_interface_address_move_addition_or_removal_fails_before_factory(
+    scope_addresses: tuple[str, ...],
+    current_addresses: tuple[str, ...],
+) -> None:
+    scope = scope_fixture(*scope_addresses)
+    clock = ManualClock()
+    factory = FakeAdapterFactory([], clock)
+
+    with pytest.raises(ValueError, match="current selected interface addresses changed"):
+        collect_mdns_candidates(
+            scope,
+            adapter_factory=factory,
+            clock=clock,
+            interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                interface_index=7,
+                addresses=current_addresses,
+            ),
+        )
 
     assert factory.calls == 0
 
@@ -293,7 +335,10 @@ def test_forged_scope_is_rejected_before_adapter_creation(forgery: str) -> None:
             scope,
             adapter_factory=factory,
             clock=clock,
-            interface_index_resolver=lambda _identity: 7,
+            interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                interface_index=7,
+                addresses=scope.interface.addresses,
+            ),
         )
 
     assert factory.calls == 0
@@ -327,7 +372,10 @@ def test_canonical_interface_with_an_extra_ineligible_address_fails_before_facto
             scope,
             adapter_factory=factory,
             clock=clock,
-            interface_index_resolver=lambda _identity: 7,
+            interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                interface_index=7,
+                addresses=scope.interface.addresses,
+            ),
         )
 
     assert factory.calls == 0
@@ -352,7 +400,10 @@ def test_interface_address_with_a_broadened_nonprivate_prefix_fails_before_facto
             scope,
             adapter_factory=factory,
             clock=clock,
-            interface_index_resolver=lambda _identity: 7,
+            interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                interface_index=7,
+                addresses=scope.interface.addresses,
+            ),
         )
 
     assert factory.calls == 0
@@ -371,7 +422,10 @@ def test_invalid_ipv6_interface_index_is_rejected_before_adapter_creation(
             scope,
             adapter_factory=factory,
             clock=clock,
-            interface_index_resolver=lambda _identity: interface_index,  # type: ignore[return-value]
+            interface_state_resolver=lambda _identity: SimpleNamespace(
+                interface_index=interface_index,
+                addresses=scope.interface.addresses,
+            ),
         )
 
     assert factory.calls == 0
@@ -381,15 +435,19 @@ def test_invalid_ipv6_interface_index_is_rejected_before_adapter_creation(
 def test_invalid_ipv4_interface_index_is_rejected_before_adapter_creation(
     interface_index: object,
 ) -> None:
+    scope = scope_fixture()
     clock = ManualClock()
     factory = FakeAdapterFactory([], clock)
 
     with pytest.raises(ValueError, match="verified numeric interface index"):
         collect_mdns_candidates(
-            scope_fixture(),
+            scope,
             adapter_factory=factory,
             clock=clock,
-            interface_index_resolver=lambda _identity: interface_index,  # type: ignore[return-value]
+            interface_state_resolver=lambda _identity: SimpleNamespace(
+                interface_index=interface_index,
+                addresses=scope.interface.addresses,
+            ),
         )
 
     assert factory.calls == 0
@@ -448,6 +506,11 @@ def test_duplicate_reconciliation_and_top_k_are_independent_of_callback_order() 
         record(properties={b"token": b"secret"}),
         record(properties={b"display_name": b"Bearer secret"}),
         record(properties={b"display_name": b"https://host.local/api"}),
+        record(properties={b"display_name": b"model.example"}),
+        record(properties={b"display_name": b"model.dev"}),
+        record(properties={b"display_name": b"host.corp"}),
+        record(properties={b"display_name": b"192.168.50.20"}),
+        record(properties={b"display_name": b"fd00::20"}),
         record(properties={b"hostname": b"model.local"}),
         record(properties={"display_name": b"text"}),
         record(properties={b"display_name": "text"}),
@@ -562,10 +625,13 @@ def test_deadline_closes_admissions_before_a_concurrent_callback_is_joined() -> 
         return session
 
     candidates = collect_mdns_candidates(
-        scope_fixture(),
+        (scope := scope_fixture()),
         adapter_factory=factory,
         clock=clock,
-        interface_index_resolver=lambda _identity: 7,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
     )
 
     assert candidates == ()
@@ -640,7 +706,10 @@ def test_session_is_closed_when_bounded_wait_raises() -> None:
             scope_fixture(),
             adapter_factory=factory,
             clock=clock,
-            interface_index_resolver=lambda _identity: 7,
+            interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                interface_index=7,
+                addresses=("192.168.50.7/24",),
+            ),
         )
 
     assert session is not None
@@ -651,56 +720,98 @@ def test_live_wrapper_uses_exact_binding_cache_only_reads_and_idempotent_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
+    service_type = "_kestrel-model._tcp.local."
+    instance_name = f"Cached.{service_type}"
+    server = "must-not-be-authority.local."
+    txt_entry = b"display_name=Cached fixture"
 
     class FakeIPVersion:
         All = "all"
         V4Only = "v4"
         V6Only = "v6"
 
+    class FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Callable[[], None]) -> None:
+            events.append("loop.call_soon_threadsafe")
+            callback()
+
+    class FakeTxtRecord:
+        type = 16
+        class_ = 1
+        text = bytes([len(txt_entry)]) + txt_entry
+
+        @property
+        def properties(self) -> object:
+            raise AssertionError("raw TXT must be validated before properties are exposed")
+
     class FakeZeroconf:
         def __init__(self, *, interfaces: list[str | int], ip_version: object) -> None:
             events.append(("zeroconf", tuple(interfaces), ip_version))
+            self.loop = FakeLoop()
+            self.cache = SimpleNamespace(
+                cache={
+                    instance_name.lower(): {
+                        "srv": SimpleNamespace(
+                            type=33,
+                            class_=1,
+                            port=11434,
+                            server=server,
+                        ),
+                        "txt": FakeTxtRecord(),
+                    },
+                    server.lower(): {
+                        "a": SimpleNamespace(
+                            type=1,
+                            class_=1,
+                            address=bytes((192, 168, 50, 20)),
+                            scope_id=None,
+                        )
+                    },
+                }
+            )
 
         def close(self) -> None:
             events.append("zeroconf.close")
 
-    class FakeServiceInfo:
-        def __init__(self, service_type: str, name: str) -> None:
-            events.append(("service_info", service_type, name))
-            self.port = 11434
-            self.properties = {b"display_name": b"Cached fixture"}
-            self.server = "must-not-be-authority.local."
-
-        def load_from_cache(self, zeroconf: object) -> bool:
-            events.append(("load_from_cache", zeroconf))
-            return True
-
-        def parsed_scoped_addresses(self) -> list[str]:
-            events.append("parsed_scoped_addresses")
-            return ["192.168.50.20"]
-
     class FakeBrowser:
         def __init__(
             self,
-            zeroconf: object,
+            zeroconf: FakeZeroconf,
             service_types: list[str],
             listener: object,
         ) -> None:
             events.append(("browser", zeroconf, tuple(service_types)))
             self.zeroconf = zeroconf
+            self.zc = zeroconf
             self.listener = listener
+            self.queue = SimpleNamespace(put=self._queue_put)
+            self._alive = True
+            self.cancel_called = False
             fake_module.browser = self
 
         def cancel(self) -> None:
-            events.append("browser.cancel")
+            self.cancel_called = True
+            threading.Event().wait(timeout=5.0)
+
+        def _queue_put(self, value: object) -> None:
+            events.append(("browser.queue.put", value))
+            self._alive = False
+
+        def _async_cancel(self) -> None:
+            events.append("browser._async_cancel")
 
         def join(self, *, timeout: float) -> None:
             events.append(("browser.join", timeout))
 
+        def is_alive(self) -> bool:
+            return self._alive
+
     fake_module = SimpleNamespace(
         IPVersion=FakeIPVersion,
         Zeroconf=FakeZeroconf,
-        ServiceInfo=FakeServiceInfo,
         ServiceBrowser=FakeBrowser,
         browser=None,
     )
@@ -727,29 +838,363 @@ def test_live_wrapper_uses_exact_binding_cache_only_reads_and_idempotent_close(
     assert fake_module.browser is not None
     fake_module.browser.listener.add_service(
         fake_module.browser.zeroconf,
-        "_kestrel-model._tcp.local.",
-        "Cached._kestrel-model._tcp.local.",
+        service_type,
+        instance_name,
     )
     assert observed == [
         MdnsRecord(
-            service_type="_kestrel-model._tcp.local.",
-            instance_name="Cached._kestrel-model._tcp.local.",
+            service_type=service_type,
+            instance_name=instance_name,
             addresses=("192.168.50.20",),
             port=11434,
             properties={b"display_name": b"Cached fixture"},
-            hostname="must-not-be-authority.local.",
+            hostname=server,
         )
     ]
-    assert any(event[0] == "load_from_cache" for event in events if isinstance(event, tuple))
 
     session.close()
     session.close()
 
-    assert events[-3:] == [
-        "browser.cancel",
-        ("browser.join", 2.5),
+    assert fake_module.browser.cancel_called is False
+    assert events[-5:] == [
+        ("browser.queue.put", None),
+        "loop.call_soon_threadsafe",
+        "browser._async_cancel",
+        ("browser.join", 0.25),
         "zeroconf.close",
     ]
+
+
+def test_collection_never_calls_pinned_blocking_browser_cancel() -> None:
+    events: list[object] = []
+    cancel_release = threading.Event()
+
+    class FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Callable[[], None]) -> None:
+            callback()
+
+    class FakeZeroconf:
+        loop = FakeLoop()
+
+        def close(self) -> None:
+            events.append("zeroconf.close")
+
+    class FakeBrowser:
+        def __init__(self) -> None:
+            self.zc = FakeZeroconf()
+            self.queue = SimpleNamespace(put=self._queue_put)
+            self.alive = True
+            self.cancel_called = False
+
+        def _queue_put(self, value: object) -> None:
+            assert value is None
+            self.alive = False
+
+        def _async_cancel(self) -> None:
+            events.append("browser._async_cancel")
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.25
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def cancel(self) -> None:
+            self.cancel_called = True
+            cancel_release.wait(timeout=5.0)
+
+    browser = FakeBrowser()
+    scope = scope_fixture()
+
+    class ExpiredClock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            return 100.0 if self.calls == 1 else 103.0
+
+    started = time.monotonic()
+    candidates = collect_mdns_candidates(
+        scope,
+        adapter_factory=lambda _binding, _types, _callback: lan_mdns._LiveMdnsSession(  # noqa: SLF001
+            browser.zc,
+            browser,
+        ),
+        clock=ExpiredClock(),
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+    elapsed = time.monotonic() - started
+
+    assert candidates == ()
+    assert browser.cancel_called is False
+    assert elapsed < 1.0
+    assert events == ["browser._async_cancel", "zeroconf.close"]
+
+
+def test_cleanup_timeout_keeps_admissions_closed_and_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_join = threading.Event()
+    join_started = threading.Event()
+    close_calls = 0
+    queue_put_calls = 0
+    captured_callback: Callable[[MdnsRecord], None] | None = None
+    session: lan_mdns._LiveMdnsSession | None = None  # noqa: SLF001
+
+    class FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Callable[[], None]) -> None:
+            callback()
+
+    class FakeZeroconf:
+        loop = FakeLoop()
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    class StuckBrowser:
+        def __init__(self, zeroconf: FakeZeroconf) -> None:
+            self.zc = zeroconf
+            self.queue = SimpleNamespace(put=self._queue_put)
+            self.alive = True
+
+        def _queue_put(self, value: object) -> None:
+            nonlocal queue_put_calls
+            assert value is None
+            queue_put_calls += 1
+
+        def _async_cancel(self) -> None:
+            return
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.25
+            join_started.set()
+            assert release_join.wait(timeout=5.0)
+            self.alive = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def cancel(self) -> None:
+            raise AssertionError("bounded cleanup must never call browser.cancel()")
+
+    normalization_calls = 0
+    real_normalize_record = lan_mdns._normalize_record  # noqa: SLF001
+
+    def track_normalization(
+        callback_record: MdnsRecord,
+        callback_scope: PrivateScanScope,
+        callback_binding: MdnsBinding,
+    ) -> tuple[LanCandidate, ...]:
+        nonlocal normalization_calls
+        normalization_calls += 1
+        return real_normalize_record(callback_record, callback_scope, callback_binding)
+
+    monkeypatch.setattr(lan_mdns, "_normalize_record", track_normalization)
+    scope = scope_fixture()
+
+    class ExpiredClockForCleanup:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            return 100.0 if self.calls == 1 else 103.0
+
+    def factory(
+        _binding: MdnsBinding,
+        _service_types: tuple[str, ...],
+        callback: Callable[[MdnsRecord], None],
+    ) -> lan_mdns._LiveMdnsSession:  # noqa: SLF001
+        nonlocal captured_callback, session
+        captured_callback = callback
+        zeroconf = FakeZeroconf()
+        session = lan_mdns._LiveMdnsSession(zeroconf, StuckBrowser(zeroconf))  # noqa: SLF001
+        return session
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="cleanup did not settle within its bounded window",
+        ):
+            collect_mdns_candidates(
+                scope,
+                adapter_factory=factory,
+                clock=ExpiredClockForCleanup(),
+                interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                    interface_index=7,
+                    addresses=scope.interface.addresses,
+                ),
+            )
+        elapsed = time.monotonic() - started
+        assert join_started.is_set()
+        assert elapsed < 1.0
+        assert session is not None
+        assert session._cleanup_thread is not None  # noqa: SLF001
+        assert session._cleanup_thread.daemon is True  # noqa: SLF001
+
+        assert captured_callback is not None
+        captured_callback(record(instance="Too late"))
+        assert normalization_calls == 0
+        assert close_calls == 0
+    finally:
+        release_join.set()
+
+    assert session is not None
+    assert session._cleanup_done.wait(timeout=1.0)  # noqa: SLF001
+    session.close()
+    session.close()
+    assert queue_put_calls == 1
+    assert close_calls == 1
+
+
+def test_pinned_browser_shape_drift_closes_zeroconf_and_fails_visible() -> None:
+    close_calls = 0
+
+    class FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Callable[[], None]) -> None:
+            callback()
+
+    class FakeZeroconf:
+        loop = FakeLoop()
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    class DriftedBrowser:
+        def __init__(self, zeroconf: FakeZeroconf) -> None:
+            self.zc = zeroconf
+
+        def _async_cancel(self) -> None:
+            return
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.25
+
+        def is_alive(self) -> bool:
+            return False
+
+    zeroconf = FakeZeroconf()
+    session = lan_mdns._LiveMdnsSession(zeroconf, DriftedBrowser(zeroconf))  # noqa: SLF001
+
+    with pytest.raises(AttributeError, match="queue"):
+        session.close()
+    with pytest.raises(AttributeError, match="queue"):
+        session.close()
+
+    assert close_calls == 1
+    assert session._cleanup_thread is not None  # noqa: SLF001
+    assert session._cleanup_thread.daemon is True  # noqa: SLF001
+
+
+def test_live_listener_rejects_oversized_address_cache_before_iteration() -> None:
+    class OversizedBucket(Mapping[object, object]):
+        iterated = False
+
+        def __len__(self) -> int:
+            return MAX_ACTIVE_HOSTS + 1
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.iterated = True
+            raise AssertionError("oversized address cache must not be iterated")
+
+        def __getitem__(self, _key: object) -> object:
+            raise KeyError
+
+    service_type = "_kestrel-model._tcp.local."
+    instance_name = f"Cached.{service_type}"
+    server = "cached-address.local."
+    oversized = OversizedBucket()
+    zeroconf = SimpleNamespace(
+        cache=SimpleNamespace(
+            cache={
+                instance_name.lower(): {
+                    "srv": SimpleNamespace(
+                        type=33,
+                        class_=1,
+                        port=11434,
+                        server=server,
+                    )
+                },
+                server.lower(): oversized,
+            }
+        )
+    )
+    observed: list[MdnsRecord] = []
+    listener = lan_mdns._LiveListener(  # noqa: SLF001
+        observed.append,
+        MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=None),
+    )
+
+    listener.add_service(zeroconf, service_type, instance_name)
+
+    assert observed == []
+    assert oversized.iterated is False
+
+
+@pytest.mark.parametrize(
+    "raw_txt",
+    [
+        b"x" * (MAX_MDNS_METADATA_BYTES + 1),
+        b"".join(
+            bytes([len(entry)]) + entry
+            for entry in (
+                b"display_name=a",
+                b"description=b",
+                b"vendor=c",
+                b"product=d",
+                b"version=e",
+                b"sixth=f",
+            )
+        ),
+        b"\x05abc",
+    ],
+    ids=("oversized", "too-many", "malformed"),
+)
+def test_live_listener_rejects_raw_txt_before_mapping_exposure(raw_txt: bytes) -> None:
+    service_type = "_kestrel-model._tcp.local."
+    instance_name = f"Cached.{service_type}"
+    server = "cached-address.local."
+    zeroconf = SimpleNamespace(
+        cache=SimpleNamespace(
+            cache={
+                instance_name.lower(): {
+                    "srv": SimpleNamespace(
+                        type=33,
+                        class_=1,
+                        port=11434,
+                        server=server,
+                    ),
+                    "txt": SimpleNamespace(type=16, class_=1, text=raw_txt),
+                },
+                server.lower(): {},
+            }
+        )
+    )
+    observed: list[MdnsRecord] = []
+    listener = lan_mdns._LiveListener(  # noqa: SLF001
+        observed.append,
+        MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=None),
+    )
+
+    listener.add_service(zeroconf, service_type, instance_name)
+
+    assert observed == []
 
 
 def test_live_wrapper_closes_partial_zeroconf_when_browser_creation_fails(
@@ -772,7 +1217,6 @@ def test_live_wrapper_closes_partial_zeroconf_when_browser_creation_fails(
     fake_module = SimpleNamespace(
         IPVersion=SimpleNamespace(All="all", V4Only="v4", V6Only="v6"),
         Zeroconf=FakeZeroconf,
-        ServiceInfo=object,
         ServiceBrowser=FailingBrowser,
     )
     monkeypatch.setattr(lan_mdns.importlib, "import_module", lambda _name: fake_module)
