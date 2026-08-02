@@ -319,6 +319,30 @@ def test_hostile_or_public_name_shapes_fail_before_dns(host: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "host",
+    [
+        "sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+        "sk-proj-abcdefghijklmnopqrstuvwxyz123456.local",
+    ],
+)
+def test_credential_shaped_names_fail_without_reaching_dns_or_error_text(host: str) -> None:
+    interface = interface_fixture()
+    resolver = RecordingResolver(("192.168.50.8",))
+
+    with pytest.raises(ValueError) as captured:
+        preview_manual_host(
+            interface.interface_id,
+            host,
+            5001,
+            interfaces=(interface,),
+            resolver=resolver,
+        )
+
+    assert resolver.calls == []
+    assert host not in str(captured.value)
+
+
+@pytest.mark.parametrize(
     "answers",
     [
         ["192.168.50.8"],

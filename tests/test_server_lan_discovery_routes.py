@@ -469,12 +469,14 @@ class _AsgiConnection:
         *,
         headers: tuple[tuple[bytes, bytes], ...] = (),
         body_chunks: tuple[bytes, ...] = (),
+        response_start_error: OSError | None = None,
     ) -> None:
         self._app = app
         self._path, _separator, query = path.partition("?")
         self._query_string = query.encode("ascii")
         self._request_headers = headers
         self._disconnect = asyncio.Event()
+        self._response_start_error = response_start_error
         self._request_messages = [
             {
                 "type": "http.request",
@@ -498,6 +500,8 @@ class _AsgiConnection:
         self.messages.append(dict(message))
         if message["type"] == "http.response.start":
             self._started.set()
+            if self._response_start_error is not None:
+                raise self._response_start_error
         elif message["type"] == "http.response.body" and message.get("body"):
             self._body_sent.set()
 
@@ -2990,6 +2994,55 @@ def test_sse_route_limit_releases_exactly_once_on_all_transport_endings(
     assert "raw-private-stream-event" not in caplog.text
     assert "raw-private-stream-manager-error" not in caplog.text
     assert "raw-private-stream-get-error" not in caplog.text
+
+
+def test_sse_response_start_send_failures_release_every_stream_lease() -> None:
+    async def exercise() -> None:
+        manager = _ObservableStreamManager(count=9)
+        app = _route_app(manager)
+        records_before = dict(manager.records)
+        events_before = {
+            scan_id: tuple(events) for scan_id, events in manager.durable_events.items()
+        }
+
+        for scan_id in manager.scan_ids[:4]:
+            failed = _AsgiConnection(
+                app,
+                f"/api/routing/lan/scans/{scan_id}/events",
+                response_start_error=OSError("test-owned-response-start-disconnect"),
+            )
+            assert await failed.start() == 200
+            error = await failed.wait_allowing_error()
+            assert error is not None
+            assert type(error).__name__ == "ClientDisconnect"
+
+        live: list[_AsgiConnection] = []
+        try:
+            for scan_id in manager.scan_ids[4:8]:
+                connection = _AsgiConnection(
+                    app,
+                    f"/api/routing/lan/scans/{scan_id}/events",
+                )
+                assert await connection.start() == 200
+                live.append(connection)
+
+            rejected = _AsgiConnection(
+                app,
+                f"/api/routing/lan/scans/{manager.scan_ids[8]}/events",
+            )
+            assert await rejected.start() == 429
+            await rejected.wait()
+            assert rejected.json_body() == {"detail": {"code": "lan_event_stream_limit"}}
+        finally:
+            await _cleanup_connections(live)
+
+        assert manager.records == records_before
+        assert {
+            scan_id: tuple(events) for scan_id, events in manager.durable_events.items()
+        } == events_before
+        assert manager.cancel_calls == 0
+
+    _run_bounded(exercise(), timeout=5.0)
 
 
 def test_sse_route_limit_is_atomic_under_eight_connection_race() -> None:

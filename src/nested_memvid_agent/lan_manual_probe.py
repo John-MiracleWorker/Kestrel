@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from itertools import islice
 
 from nested_memvid_agent.lan_discovery_models import MAX_ACTIVE_HOSTS, NetworkInterface
+from nested_memvid_agent.security_boundary import redact_text
 
 MAX_MANUAL_RESOLVED_ADDRESSES = 16
 
@@ -161,6 +162,8 @@ def _parse_literal(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address 
 def _validate_local_hostname(host: str) -> None:
     error = ValueError("manual host must be a canonical local name")
     if not host or len(host.encode("ascii", errors="ignore")) != len(host) or len(host) > 253:
+        raise error
+    if redact_text(host) != host:
         raise error
     labels = host.split(".")
     if any(_LOCAL_LABEL_RE.fullmatch(label) is None for label in labels) or "localhost" in labels:

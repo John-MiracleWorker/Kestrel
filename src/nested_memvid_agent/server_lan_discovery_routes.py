@@ -16,6 +16,7 @@ from typing import Any, cast
 
 from fastapi import Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.types import Receive, Scope, Send
 
 from .lan_discovery_models import LanScanLimits
 from .lan_scan_manager import (
@@ -198,6 +199,34 @@ class _StreamLeases:
             if self._active <= 0:
                 return
             self._active -= 1
+
+
+class _LeaseBoundResponse(Response):
+    """Release a stream lease across the response's complete ASGI lifecycle."""
+
+    def __init__(
+        self,
+        response: Response,
+        *,
+        release: Callable[[], None],
+    ) -> None:
+        super().__init__(
+            content=b"",
+            status_code=response.status_code,
+            media_type=response.media_type,
+            background=response.background,
+        )
+        self.raw_headers = list(response.raw_headers)
+        self._response = response
+        self._release = release
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self._response.background is None:
+            self._response.background = self.background
+        try:
+            await self._response(scope, receive, send)
+        finally:
+            self._release()
 
 
 def _error(http_exception: type[Exception], status: int, code: str) -> Exception:
@@ -998,7 +1027,7 @@ def register_lan_discovery_routes(
                 release()
 
         try:
-            return streaming_response(
+            response = streaming_response(
                 stream(),
                 media_type="text/event-stream",
                 headers={
@@ -1006,6 +1035,9 @@ def register_lan_discovery_routes(
                     "X-Accel-Buffering": "no",
                 },
             )
+            if not isinstance(response, Response):
+                raise TypeError("LAN streaming response factory returned a non-response")
+            return _LeaseBoundResponse(response, release=release)
         except BaseException:
             release()
             raise
