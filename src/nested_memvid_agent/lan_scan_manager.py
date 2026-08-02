@@ -10,14 +10,17 @@ from __future__ import annotations
 import builtins
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import threading
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import Executor, Future
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from itertools import islice
 from math import isfinite
 from uuid import uuid4
 
@@ -44,7 +47,10 @@ from nested_memvid_agent.lan_scanner import (
     ScanCancellation,
     scan_lan_scope,
 )
-from nested_memvid_agent.routing.lan_ledger import LanDiscoveryLedger
+from nested_memvid_agent.routing.lan_ledger import (
+    LanDiscoveryLedger,
+    LanScanObservationPage,
+)
 from nested_memvid_agent.routing.lan_records import (
     LanObservationDraft,
     LanScanEvent,
@@ -60,6 +66,17 @@ LAN_PREVIEW_TTL_SECONDS = 30.0
 LAN_PREVIEW_CONTRACT_VERSION = "kestrel.lan.preview-authorization.v1"
 LAN_SERVER_VERSION = "kestrel-local-runtime-v1"
 _PREVIEW_DIGEST_SCHEMA = "kestrel.lan.preview-authorization.v1"
+_MAX_INTERFACE_COUNT = 64
+_MAX_INTERFACE_ADDRESS_COUNT = 64
+_MAX_INTERFACE_DISPLAY_NAME_BYTES = 256
+_PRIVATE_IPV4_INTERFACE_NETWORKS = tuple(
+    ipaddress.IPv4Network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
+)
+_PRIVATE_IPV6_INTERFACE_NETWORKS = (
+    ipaddress.IPv6Network("fc00::/7"),
+    ipaddress.IPv6Network("fe80::/10"),
+)
 _TIMEOUT_FAILURES = frozenset(
     {
         LanFailureCategory.TCP_TIMEOUT,
@@ -94,6 +111,7 @@ class _AuthorizationContext:
     authorization: LanPreviewAuthorization
     interface: NetworkInterface
     inventory_authority: tuple[tuple[str, str, tuple[str, ...]], ...]
+    bound_scan_id: str | None = None
 
 
 @dataclass
@@ -231,6 +249,13 @@ class LanScanManager:
             self._admission_open = True
             return interrupted
 
+    def interfaces(self) -> tuple[NetworkInterface, ...]:
+        """Return one bounded, canonical inventory under the operation lock."""
+
+        with self._lock:
+            self._require_admission()
+            return self._canonical_inventory()
+
     def preview(self, interface_id: str, network: str) -> LanPreviewAuthorization:
         with self._lock:
             self._require_admission()
@@ -291,6 +316,35 @@ class LanScanManager:
                 expected_revision=0,
             )
 
+    def create_draft_for_preview(
+        self,
+        preview_digest: str,
+        *,
+        expected_revision: int,
+    ) -> LanScanRecord:
+        """Create the single draft bound to the current retained preview digest."""
+
+        with self._lock:
+            self._require_admission()
+            context = self._authorization_for_digest_locked(preview_digest)
+            if context.bound_scan_id is not None:
+                raise LanPreviewAuthorizationError("LAN preview already created a draft")
+            authorization = context.authorization
+            draft = self._ledger.create_scan(
+                scan_id=self._scan_id_factory(),
+                owner_principal=LAN_OWNER_PRINCIPAL,
+                confirmed_interface_id=context.interface.interface_id,
+                network=authorization.preview.network,
+                limits=canonical_scan_limits(),
+                preview_digest=authorization.preview_digest,
+                expected_revision=expected_revision,
+            )
+            self._authorizations[id(authorization)] = replace(
+                context,
+                bound_scan_id=draft.scan_id,
+            )
+            return draft
+
     def start(
         self,
         scan_id: str,
@@ -300,92 +354,35 @@ class LanScanManager:
         preview_digest: str,
     ) -> LanScanRecord:
         with self._lock:
-            self._require_admission()
-            context = self._validate_authorization(authorization)
-            if preview_digest != authorization.preview_digest:
-                raise LanPreviewAuthorizationError("LAN preview digest does not match authority")
-            inventory = self._canonical_inventory()
-            if _inventory_authority(inventory) != context.inventory_authority:
-                raise LanPreviewAuthorizationError("LAN interface inventory changed")
-            selected = next(
-                (item for item in inventory if item.interface_id == context.interface.interface_id),
-                None,
-            )
-            if selected is None or _interface_authority(selected) != _interface_authority(
-                context.interface
-            ):
-                raise LanPreviewAuthorizationError("LAN interface changed")
-            current_preview = preview_private_scope(
-                selected.interface_id,
-                authorization.preview.network,
-                interfaces=inventory,
-            )
-            if current_preview != authorization.preview:
-                raise LanPreviewAuthorizationError("LAN interface preview changed")
-            self._validate_authorization(authorization)
-            preview_event = self._preview_event(authorization)
-            try:
-                claimed = self._ledger.claim_scan_start(
-                    scan_id,
-                    owner_principal=LAN_OWNER_PRINCIPAL,
-                    expected_revision=expected_revision,
-                    preview_digest=preview_digest,
-                    authorized_preview_digest=authorization.preview_digest,
-                    preview_event=preview_event,
-                )
-            except RuntimeError as exc:
-                if str(exc) == "lan_scan_owner_already_active":
-                    raise LanScanAdmissionConflict("LAN owner already has an active scan") from None
-                raise
-
-            started = self._monotonic_clock()
-            if (
-                isinstance(started, bool)
-                or not isinstance(started, (int, float))
-                or not isfinite(float(started))
-            ):
-                terminal = self._ledger.commit_scan_terminal(
-                    scan_id,
-                    owner_principal=LAN_OWNER_PRINCIPAL,
-                    expected_revision=claimed.revision,
-                    status="failed",
-                    terminal_reason="worker_error",
-                    cancel_reason=None,
-                    observations=(),
-                    mdns_status=authorization.mdns_availability.value,
-                    planned_count=0,
-                    admitted_count=0,
-                    completed_count=0,
-                    error_category_counts={},
-                    timeout_count=0,
-                    evidence_complete=True,
-                    unknown_inflight_count=0,
-                )
-                return terminal
-            scope = PrivateScanScope.from_request(selected, current_preview.network)
-            handle = _ActiveScan(
-                scan_id=scan_id,
-                scope=scope,
+            return self._start_locked(
+                scan_id,
+                expected_revision=expected_revision,
                 authorization=authorization,
-                cancellation=ScanCancellation(),
-                revision=claimed.revision,
-                absolute_deadline=float(started) + TOTAL_SCAN_DEADLINE_SECONDS,
-                mdns_status=authorization.mdns_availability,
+                preview_digest=preview_digest,
+                consume_authorization=False,
             )
-            self._active_scans[scan_id] = handle
-            executor = self._executor
-            if executor is None:
-                self._active_scans.pop(scan_id, None)
-                raise RuntimeError("LAN lifecycle executor is unavailable")
-            try:
-                handle.future = executor.submit(self._run_controller, handle)
-            except BaseException:
-                self._finalize_with_retry_locked(handle, failure="worker_error")
-                durable = self._ledger.get_scan(scan_id)
-                if durable is None or not durable.is_terminal:
-                    raise RuntimeError("LAN scan worker submission failed") from None
-                return durable
-            return claimed
+
+    def start_for_preview(
+        self,
+        scan_id: str,
+        *,
+        expected_revision: int,
+        preview_digest: str,
+    ) -> LanScanRecord:
+        """Start only the draft bound to the exact live route preview authority."""
+
+        with self._lock:
+            self._require_admission()
+            context = self._authorization_for_digest_locked(preview_digest)
+            if context.bound_scan_id != scan_id:
+                raise LanPreviewAuthorizationError("LAN preview is bound to another draft")
+            return self._start_locked(
+                scan_id,
+                expected_revision=expected_revision,
+                authorization=context.authorization,
+                preview_digest=preview_digest,
+                consume_authorization=True,
+            )
 
     def cancel(
         self,
@@ -405,6 +402,9 @@ class LanScanManager:
             if handle is not None:
                 handle.revision = cancelled.revision
                 handle.cancellation.cancel()
+            for key, context in tuple(self._authorizations.items()):
+                if context.bound_scan_id == scan_id:
+                    self._authorizations.pop(key, None)
             return cancelled
 
     def get(self, scan_id: str) -> LanScanRecord | None:
@@ -416,6 +416,18 @@ class LanScanManager:
     def list(self, *, status: str | None = None, limit: int = 200) -> list[LanScanRecord]:
         return self._ledger.list_scans(
             status=status,
+            owner_principal=LAN_OWNER_PRINCIPAL,
+            limit=limit,
+        )
+
+    def observation_page(
+        self,
+        scan_id: str,
+        *,
+        limit: int,
+    ) -> LanScanObservationPage | None:
+        return self._ledger.read_scan_observation_page(
+            scan_id,
             owner_principal=LAN_OWNER_PRINCIPAL,
             limit=limit,
         )
@@ -537,6 +549,104 @@ class LanScanManager:
         with self._lock:
             self._reconcile_finished_locked()
             return len(self._active_scans)
+
+    def _start_locked(
+        self,
+        scan_id: str,
+        *,
+        expected_revision: int,
+        authorization: LanPreviewAuthorization,
+        preview_digest: str,
+        consume_authorization: bool,
+    ) -> LanScanRecord:
+        self._require_admission()
+        context = self._validate_authorization(authorization)
+        if preview_digest != authorization.preview_digest:
+            raise LanPreviewAuthorizationError("LAN preview digest does not match authority")
+        inventory = self._canonical_inventory()
+        if _inventory_authority(inventory) != context.inventory_authority:
+            raise LanPreviewAuthorizationError("LAN interface inventory changed")
+        selected = next(
+            (item for item in inventory if item.interface_id == context.interface.interface_id),
+            None,
+        )
+        if selected is None or _interface_authority(selected) != _interface_authority(
+            context.interface
+        ):
+            raise LanPreviewAuthorizationError("LAN interface changed")
+        current_preview = preview_private_scope(
+            selected.interface_id,
+            authorization.preview.network,
+            interfaces=inventory,
+        )
+        if current_preview != authorization.preview:
+            raise LanPreviewAuthorizationError("LAN interface preview changed")
+        self._validate_authorization(authorization)
+        preview_event = self._preview_event(authorization)
+        try:
+            claimed = self._ledger.claim_scan_start(
+                scan_id,
+                owner_principal=LAN_OWNER_PRINCIPAL,
+                expected_revision=expected_revision,
+                preview_digest=preview_digest,
+                authorized_preview_digest=authorization.preview_digest,
+                preview_event=preview_event,
+            )
+        except RuntimeError as exc:
+            if str(exc) == "lan_scan_owner_already_active":
+                raise LanScanAdmissionConflict("LAN owner already has an active scan") from None
+            raise
+        if consume_authorization:
+            self._authorizations.pop(id(authorization), None)
+
+        started = self._monotonic_clock()
+        if (
+            isinstance(started, bool)
+            or not isinstance(started, (int, float))
+            or not isfinite(float(started))
+        ):
+            terminal = self._ledger.commit_scan_terminal(
+                scan_id,
+                owner_principal=LAN_OWNER_PRINCIPAL,
+                expected_revision=claimed.revision,
+                status="failed",
+                terminal_reason="worker_error",
+                cancel_reason=None,
+                observations=(),
+                mdns_status=authorization.mdns_availability.value,
+                planned_count=0,
+                admitted_count=0,
+                completed_count=0,
+                error_category_counts={},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+            )
+            return terminal
+        scope = PrivateScanScope.from_request(selected, current_preview.network)
+        handle = _ActiveScan(
+            scan_id=scan_id,
+            scope=scope,
+            authorization=authorization,
+            cancellation=ScanCancellation(),
+            revision=claimed.revision,
+            absolute_deadline=float(started) + TOTAL_SCAN_DEADLINE_SECONDS,
+            mdns_status=authorization.mdns_availability,
+        )
+        self._active_scans[scan_id] = handle
+        executor = self._executor
+        if executor is None:
+            self._active_scans.pop(scan_id, None)
+            raise RuntimeError("LAN lifecycle executor is unavailable")
+        try:
+            handle.future = executor.submit(self._run_controller, handle)
+        except BaseException:
+            self._finalize_with_retry_locked(handle, failure="worker_error")
+            durable = self._ledger.get_scan(scan_id)
+            if durable is None or not durable.is_terminal:
+                raise RuntimeError("LAN scan worker submission failed") from None
+            return durable
+        return claimed
 
     def _run_controller(self, handle: _ActiveScan) -> None:
         failure: str | None = None
@@ -883,6 +993,22 @@ class LanScanManager:
             raise LanPreviewAuthorizationError("LAN preview authorization digest changed")
         return context
 
+    def _authorization_for_digest_locked(
+        self,
+        preview_digest: object,
+    ) -> _AuthorizationContext:
+        if type(preview_digest) is not str:
+            raise LanPreviewAuthorizationError("LAN preview digest must be exact")
+        contexts = tuple(
+            context
+            for context in self._authorizations.values()
+            if context.authorization.preview_digest == preview_digest
+        )
+        if len(contexts) != 1:
+            self._prune_authorizations_locked(self._now_utc())
+            raise LanPreviewAuthorizationError("LAN preview digest is not live")
+        return self._validate_authorization(contexts[0].authorization)
+
     def _prune_authorizations_locked(self, now: datetime) -> None:
         for key, context in tuple(self._authorizations.items()):
             if now >= context.authorization.expires_at:
@@ -907,21 +1033,53 @@ class LanScanManager:
         }
 
     def _canonical_inventory(self) -> tuple[NetworkInterface, ...]:
-        raw = tuple(self._interface_enumerator())
+        raw = tuple(islice(iter(self._interface_enumerator()), _MAX_INTERFACE_COUNT + 1))
+        if len(raw) > _MAX_INTERFACE_COUNT:
+            raise ValueError("LAN interface inventory exceeds its fixed limit")
         canonical: list[NetworkInterface] = []
         for interface in raw:
             if type(interface) is not NetworkInterface:
                 raise ValueError("LAN interface inventory must be exactly typed")
-            rebuilt = NetworkInterface.from_addresses(
-                os_identity=interface.os_identity,
-                display_name=interface.display_name,
-                addresses=interface.addresses,
-            )
+            if type(interface.os_identity) is not str or type(interface.display_name) is not str:
+                raise ValueError("LAN interface inventory contains invalid text")
+            if type(interface.addresses) is not tuple:
+                raise ValueError("LAN interface inventory addresses must be exact")
+            if len(interface.addresses) > _MAX_INTERFACE_ADDRESS_COUNT:
+                raise ValueError("LAN interface address inventory exceeds its fixed limit")
+            try:
+                display_bytes = interface.display_name.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("LAN interface display name is invalid") from None
+            if (
+                not interface.display_name
+                or len(display_bytes) > _MAX_INTERFACE_DISPLAY_NAME_BYTES
+                or unicodedata.normalize("NFC", interface.display_name) != interface.display_name
+                or any(
+                    unicodedata.category(character).startswith("C")
+                    for character in interface.display_name
+                )
+            ):
+                raise ValueError("LAN interface display name is invalid")
+            if any(
+                type(address) is not str or not _is_private_interface_address(address)
+                for address in interface.addresses
+            ):
+                raise ValueError("LAN interface address is invalid")
+            try:
+                rebuilt = NetworkInterface.from_addresses(
+                    os_identity=interface.os_identity,
+                    display_name=interface.display_name,
+                    addresses=interface.addresses,
+                )
+            except (TypeError, ValueError):
+                raise ValueError("LAN interface inventory is invalid") from None
             if rebuilt != interface:
                 raise ValueError("LAN interface inventory is not canonical")
             canonical.append(rebuilt)
         canonical.sort(key=lambda item: item.interface_id)
-        if len({item.interface_id for item in canonical}) != len(canonical):
+        if len({item.interface_id for item in canonical}) != len(canonical) or len(
+            {item.os_identity for item in canonical}
+        ) != len(canonical):
             raise ValueError("LAN interface inventory contains duplicates")
         return tuple(canonical)
 
@@ -959,6 +1117,18 @@ def _inventory_authority(
     inventory: tuple[NetworkInterface, ...],
 ) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
     return tuple(_interface_authority(interface) for interface in inventory)
+
+
+def _is_private_interface_address(value: str) -> bool:
+    try:
+        attached = ipaddress.ip_interface(value)
+    except ValueError:
+        return False
+    if isinstance(attached, ipaddress.IPv4Interface):
+        return any(
+            attached.network.subnet_of(network) for network in _PRIVATE_IPV4_INTERFACE_NETWORKS
+        )
+    return any(attached.network.subnet_of(network) for network in _PRIVATE_IPV6_INTERFACE_NETWORKS)
 
 
 def _cleanup_is_quiescent(cleanup: object) -> bool:

@@ -4,10 +4,11 @@ import hashlib
 import json
 import sqlite3
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread, current_thread
 
 import pytest
 
@@ -4055,3 +4056,266 @@ def test_every_inventory_revision_is_an_exact_nonnegative_int(
         )
     assert registry.get_provider_profile(profile.profile_id) == persisted
     assert registry.get_model_target(target.target_id) is None
+
+
+def test_route_observation_snapshot_is_deterministic_bounded_and_reports_exact_total(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "e" * 32)
+    revision = scan.revision
+    for index in (3, 1, 2):
+        lan_ledger.append_observation(
+            scan.scan_id,
+            _observation(endpoint_id="sha256:" + f"{index:064x}"),
+            expected_revision=revision,
+        )
+        current = lan_ledger.get_scan(scan.scan_id)
+        assert current is not None
+        revision = current.revision
+
+    snapshot = lan_ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=2,
+    )
+
+    assert snapshot is not None
+    assert snapshot.scan == lan_ledger.get_scan(scan.scan_id)
+    assert snapshot.total_count == 3
+    assert snapshot.truncated is True
+    assert tuple(item.endpoint_id for item in snapshot.observations) == (
+        "sha256:" + f"{1:064x}",
+        "sha256:" + f"{2:064x}",
+    )
+
+
+@pytest.mark.parametrize("limit", [True, False, 0, -1, 201, 1.0, "2"])
+def test_route_observation_snapshot_rejects_non_exact_or_unbounded_limits(
+    lan_ledger: LanDiscoveryLedger,
+    limit: object,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "f" * 32)
+
+    with pytest.raises(ValueError, match="observation.*limit"):
+        lan_ledger.read_scan_observation_page(
+            scan.scan_id,
+            owner_principal="owner:test",
+            limit=limit,  # type: ignore[arg-type]
+        )
+
+
+def test_route_observation_snapshot_is_one_sqlite_read_transaction_during_writer_commit(
+    state: AgentStateStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    scan = _create_scan(ledger, scan_id="lan_" + "9" * 32)
+    revision = scan.revision
+    for index in (2, 1):
+        ledger.append_observation(
+            scan.scan_id,
+            _observation(endpoint_id="sha256:" + f"{index:064x}"),
+            expected_revision=revision,
+        )
+        current = ledger.get_scan(scan.scan_id)
+        assert current is not None
+        revision = current.revision
+    before = ledger.get_scan(scan.scan_id)
+    assert before is not None
+
+    read_snapshot = ledger.read_scan_observation_page
+    reader_thread = current_thread()
+    first_relevant_result_read = Event()
+    writer_done = Event()
+    writer_errors: list[BaseException] = []
+    hook_fired = Event()
+    transaction_active = False
+    transaction_order: list[str] = []
+    real_connect = state._connect
+
+    class CursorProxy:
+        def __init__(self, cursor: sqlite3.Cursor, *, relevant_select: bool = False) -> None:
+            self._cursor = cursor
+            self._relevant_select = relevant_select
+
+        def _after_result_consumed(self, has_result: bool) -> None:
+            if not self._relevant_select or not has_result or hook_fired.is_set():
+                return
+            hook_fired.set()
+            first_relevant_result_read.set()
+            if not writer_done.wait(timeout=2.0):
+                raise AssertionError("snapshot writer did not commit after first relevant result")
+
+        def execute(self, sql: str, parameters=()):
+            relevant_select = _before_execute(sql)
+            self._cursor.execute(sql, parameters)
+            _after_execute(sql)
+            self._relevant_select = relevant_select
+            return self
+
+        def fetchone(self):
+            row = self._cursor.fetchone()
+            self._after_result_consumed(row is not None)
+            return row
+
+        def fetchall(self):
+            first = self._cursor.fetchone()
+            if first is None:
+                return []
+            self._after_result_consumed(True)
+            return [first, *self._cursor.fetchall()]
+
+        def fetchmany(self, size: int | None = None):
+            rows = self._cursor.fetchmany() if size is None else self._cursor.fetchmany(size)
+            self._after_result_consumed(bool(rows))
+            return rows
+
+        def __iter__(self):
+            for row in self._cursor:
+                self._after_result_consumed(True)
+                yield row
+
+        def __getattr__(self, name: str):
+            return getattr(self._cursor, name)
+
+    def _statement_kind(sql: str) -> tuple[bool, bool, bool]:
+        normalized = " ".join(sql.strip().rstrip(";").lower().split())
+        explicit_begin = normalized == "begin" or normalized.startswith("begin ")
+        transaction_end = normalized in {"commit", "end", "rollback"} or normalized.startswith(
+            ("commit ", "end ", "rollback ")
+        )
+        relevant_select = "select" in normalized and any(
+            table in normalized for table in ("routing_lan_scans", "routing_lan_observations")
+        )
+        return explicit_begin, transaction_end, relevant_select
+
+    def _before_execute(sql: str) -> bool:
+        explicit_begin, _transaction_end, relevant_select = _statement_kind(sql)
+        if relevant_select:
+            transaction_order.append("select")
+            if not transaction_active:
+                raise AssertionError(
+                    "explicit BEGIN must complete before the first LAN snapshot SELECT"
+                )
+        if explicit_begin:
+            transaction_order.append("begin_requested")
+        return relevant_select
+
+    def _after_execute(sql: str) -> None:
+        nonlocal transaction_active
+        explicit_begin, transaction_end, _relevant_select = _statement_kind(sql)
+        if explicit_begin:
+            transaction_active = True
+            transaction_order.append("begin_completed")
+        elif transaction_end:
+            transaction_active = False
+            transaction_order.append("transaction_ended")
+
+    class ConnectionProxy:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, parameters=()):
+            relevant_select = _before_execute(sql)
+            cursor = self._connection.execute(sql, parameters)
+            _after_execute(sql)
+            return CursorProxy(cursor, relevant_select=relevant_select)
+
+        def cursor(self, *args, **kwargs):
+            return CursorProxy(self._connection.cursor(*args, **kwargs))
+
+        def commit(self) -> None:
+            self._connection.commit()
+            _after_execute("COMMIT")
+
+        def rollback(self) -> None:
+            self._connection.rollback()
+            _after_execute("ROLLBACK")
+
+        def __getattr__(self, name: str):
+            return getattr(self._connection, name)
+
+    @contextmanager
+    def hooked_connect():
+        nonlocal transaction_active
+        with real_connect() as connection:
+            if current_thread() is reader_thread:
+                transaction_active = False
+                try:
+                    yield ConnectionProxy(connection)
+                finally:
+                    transaction_active = False
+            else:
+                yield connection
+
+    monkeypatch.setattr(state, "_connect", hooked_connect)
+
+    def writer() -> None:
+        try:
+            if not first_relevant_result_read.wait(timeout=2.0):
+                raise AssertionError("snapshot reader never consumed a relevant result")
+            ledger.append_observation(
+                scan.scan_id,
+                _observation(endpoint_id="sha256:" + f"{3:064x}"),
+                expected_revision=before.revision,
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced in controller thread
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    thread = Thread(target=writer, name="task7-snapshot-writer", daemon=True)
+    thread.start()
+    try:
+        snapshot = read_snapshot(
+            scan.scan_id,
+            owner_principal="owner:test",
+            limit=1,
+        )
+    finally:
+        first_relevant_result_read.set()
+        writer_done.set()
+        thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert hook_fired.is_set()
+    assert "begin_requested" in transaction_order
+    assert "begin_completed" in transaction_order
+    assert "select" in transaction_order
+    assert transaction_order.index("begin_requested") < transaction_order.index("begin_completed")
+    assert transaction_order.index("begin_completed") < transaction_order.index("select")
+    assert writer_errors == []
+    assert snapshot is not None
+    assert snapshot.scan == before
+    assert snapshot.total_count == 2
+    assert snapshot.truncated is True
+    assert tuple(item.endpoint_id for item in snapshot.observations) == ("sha256:" + f"{1:064x}",)
+
+    after = ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=3,
+    )
+    assert after is not None
+    assert after.scan.revision == before.revision + 1
+    assert after.total_count == 3
+
+
+def test_route_observation_snapshot_hides_foreign_owner_record_and_rows(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "8" * 32)
+    lan_ledger.append_observation(
+        scan.scan_id,
+        _observation(endpoint_id="sha256:" + "8" * 64),
+        expected_revision=scan.revision,
+    )
+
+    assert (
+        lan_ledger.read_scan_observation_page(
+            scan.scan_id,
+            owner_principal="owner:local-runtime:v1",
+            limit=200,
+        )
+        is None
+    )

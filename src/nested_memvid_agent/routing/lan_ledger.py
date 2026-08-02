@@ -6,6 +6,7 @@ import ipaddress
 import json
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
 from time import monotonic
@@ -61,6 +62,16 @@ def _validate_exact_owner_principal(value: object) -> str:
     if type(value) is not str or owner != value:
         raise ValueError("LAN owner principal must be exact")
     return owner
+
+
+@dataclass(frozen=True)
+class LanScanObservationPage:
+    """One owner-qualified, revision-consistent scan detail snapshot."""
+
+    scan: LanScanRecord
+    observations: tuple[LanObservationRecord, ...]
+    total_count: int
+    truncated: bool
 
 
 class LanDiscoveryLedger:
@@ -297,6 +308,64 @@ class LanDiscoveryLedger:
                 (scan_id,),
             ).fetchall()
         return [observation_from_row(row) for row in rows]
+
+    def read_scan_observation_page(
+        self,
+        scan_id: str,
+        *,
+        owner_principal: str,
+        limit: int,
+    ) -> LanScanObservationPage | None:
+        """Read scan metadata, observation count, and one ordered page atomically."""
+
+        owner = _validate_exact_owner_principal(owner_principal)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("LAN observation page limit must be between 1 and 200")
+        with self.state._connect() as connection:
+            # A deferred read transaction fixes the WAL snapshot at the first
+            # SELECT while still allowing concurrent writers to commit.
+            connection.execute("BEGIN")
+            scan_row = connection.execute(
+                """
+                SELECT * FROM routing_lan_scans
+                WHERE scan_id = ? AND owner_principal = ?
+                """,
+                (scan_id, owner),
+            ).fetchone()
+            if scan_row is None:
+                return None
+            count_row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM routing_lan_observations AS observation
+                INNER JOIN routing_lan_scans AS scan
+                    ON scan.scan_id = observation.scan_id
+                WHERE scan.scan_id = ? AND scan.owner_principal = ?
+                """,
+                (scan_id, owner),
+            ).fetchone()
+            if count_row is None:
+                raise RuntimeError("lan_observation_page_count_lost")
+            rows = connection.execute(
+                """
+                SELECT observation.*
+                FROM routing_lan_observations AS observation
+                INNER JOIN routing_lan_scans AS scan
+                    ON scan.scan_id = observation.scan_id
+                WHERE scan.scan_id = ? AND scan.owner_principal = ?
+                ORDER BY observation.endpoint_id ASC
+                LIMIT ?
+                """,
+                (scan_id, owner, limit),
+            ).fetchall()
+        total_count = int(count_row[0])
+        observations = tuple(observation_from_row(row) for row in rows)
+        return LanScanObservationPage(
+            scan=scan_from_row(scan_row),
+            observations=observations,
+            total_count=total_count,
+            truncated=total_count > len(observations),
+        )
 
     def append_event(
         self,

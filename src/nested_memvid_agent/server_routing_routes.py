@@ -69,9 +69,26 @@ _LAN_IMPORT_PATHS = frozenset(
         "/api/routing/lan/import/",
     }
 )
+_LAN_STATIC_PATHS = frozenset(
+    {
+        "/api/routing/lan/interfaces",
+        "/api/routing/lan/interfaces/",
+        "/api/routing/lan/preview",
+        "/api/routing/lan/preview/",
+        "/api/routing/lan/scans",
+        "/api/routing/lan/scans/",
+        "/api/routing/lan/manual-probe",
+        "/api/routing/lan/manual-probe/",
+        *_LAN_IMPORT_PATHS,
+    }
+)
+_LAN_SCAN_PATH_PATTERN = re.compile(
+    r"^/api/routing/lan/scans/lan_[0-9a-f]{32}(?:/?|/(?:start|cancel|events)/?)$"
+)
+_LAN_NAMESPACE_PREFIX = "/api/routing/lan"
+_LAN_REDACTED_PATH = "/api/routing/lan/redacted"
 _LAN_REVIEW_PATH_PREFIX = "/api/routing/lan/targets/"
 _LAN_REVIEW_PATH_SUFFIXES = ("/review", "/review/")
-_LAN_REDACTED_REVIEW_TARGET = "redacted"
 _LAN_FORBIDDEN_IDENTITY_HEADERS = frozenset(
     {
         "x-kestrel-owner-principal",
@@ -87,19 +104,189 @@ def classify_lan_mutation_path(path: str) -> tuple[bool, bool, str]:
 
     if type(path) is not str:
         return False, False, ""
-    if path in _LAN_IMPORT_PATHS:
+    if path in _LAN_STATIC_PATHS or _LAN_SCAN_PATH_PATTERN.fullmatch(path) is not None:
         return True, False, path
-    if not path.startswith(_LAN_REVIEW_PATH_PREFIX):
-        return False, False, path
-    for suffix in _LAN_REVIEW_PATH_SUFFIXES:
-        if not path.endswith(suffix):
-            continue
-        target_id = path[len(_LAN_REVIEW_PATH_PREFIX) : -len(suffix)]
-        if re.fullmatch(_LAN_TARGET_ID_PATTERN, target_id) is not None:
-            return True, False, path
-        safe_path = f"{_LAN_REVIEW_PATH_PREFIX}{_LAN_REDACTED_REVIEW_TARGET}{suffix}"
-        return True, True, safe_path
+    if path.startswith(_LAN_REVIEW_PATH_PREFIX):
+        for suffix in _LAN_REVIEW_PATH_SUFFIXES:
+            if not path.endswith(suffix):
+                continue
+            target_id = path[len(_LAN_REVIEW_PATH_PREFIX) : -len(suffix)]
+            if re.fullmatch(_LAN_TARGET_ID_PATTERN, target_id) is not None:
+                return True, False, path
+            return True, True, _LAN_REDACTED_PATH
+    if path == _LAN_NAMESPACE_PREFIX or path.startswith(_LAN_NAMESPACE_PREFIX + "/"):
+        return True, True, _LAN_REDACTED_PATH
     return False, False, path
+
+
+def _lan_request_is_rejected(http_request: Request) -> bool:
+    if (
+        http_request.scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
+        or http_request.scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
+        or bool(http_request.query_params)
+    ):
+        return True
+    raw_headers = http_request.scope.get("headers", ())
+    return any(
+        isinstance(name, bytes)
+        and name.decode("latin-1").lower() in _LAN_FORBIDDEN_IDENTITY_HEADERS
+        for name, _value in raw_headers
+    )
+
+
+async def _cache_bounded_lan_request_body(http_request: Request) -> bytes:
+    body = bytearray()
+    sentinel_limit = MAX_LAN_MUTATION_BODY_BYTES + 1
+    async for chunk in http_request.stream():
+        remaining = sentinel_limit - len(body)
+        if remaining > 0:
+            body.extend(chunk[:remaining])
+        if len(body) > MAX_LAN_MUTATION_BODY_BYTES or len(chunk) > remaining:
+            http_request._body = bytes(body)
+            raise RequestBodyTooLarge("LAN request body exceeds 32 KiB")
+    http_request._body = bytes(body)
+    return bytes(body)
+
+
+async def _require_lan_get_request(
+    http_request: Request,
+    *,
+    http_exception: Callable[..., Exception],
+    query_error_code: str = "lan_request_rejected",
+) -> None:
+    if (
+        http_request.scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
+        or http_request.scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
+    ):
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    if http_request.query_params:
+        raise http_exception(status_code=400, detail={"code": query_error_code})
+    raw_headers = http_request.scope.get("headers", ())
+    if any(
+        isinstance(name, bytes)
+        and name.decode("latin-1").lower() in _LAN_FORBIDDEN_IDENTITY_HEADERS
+        for name, _value in raw_headers
+    ):
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    header_names = [
+        name.decode("latin-1").lower() for name, _value in raw_headers if isinstance(name, bytes)
+    ]
+    if "transfer-encoding" in header_names:
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    content_lengths = [
+        value
+        for name, value in raw_headers
+        if isinstance(name, bytes) and name.decode("latin-1").lower() == "content-length"
+    ]
+    if len(content_lengths) > 1:
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    if content_lengths:
+        try:
+            declared = int(content_lengths[0].decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise http_exception(
+                status_code=400,
+                detail={"code": "lan_request_rejected"},
+            ) from exc
+        if declared != 0:
+            raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    try:
+        body = await _cache_bounded_lan_request_body(http_request)
+    except RequestBodyTooLarge as exc:
+        raise http_exception(
+            status_code=400,
+            detail={"code": "lan_request_rejected"},
+        ) from exc
+    if body:
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+
+
+def _reject_lan_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_lan_nonfinite_constant(value: str) -> object:
+    del value
+    raise ValueError("non-finite JSON constant")
+
+
+def _lan_json_nesting_exceeds(raw_body: bytes, *, maximum: int = 64) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw_body:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in {0x5B, 0x7B}:
+            depth += 1
+            if depth > maximum:
+                return True
+        elif byte in {0x5D, 0x7D}:
+            depth -= 1
+    return False
+
+
+async def _parse_lan_json_request(
+    http_request: Request,
+    model_type: type[BaseModel],
+    *,
+    http_exception: Callable[..., Exception],
+) -> BaseModel:
+    if _lan_request_is_rejected(http_request):
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    content_length = http_request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise http_exception(
+                status_code=400,
+                detail={"code": "lan_request_rejected"},
+            ) from exc
+        if declared_length < 0:
+            raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+        if declared_length > MAX_LAN_MUTATION_BODY_BYTES:
+            raise http_exception(status_code=413, detail={"code": "lan_request_too_large"})
+    try:
+        raw_body = await _cache_bounded_lan_request_body(http_request)
+    except RequestBodyTooLarge as exc:
+        raise http_exception(
+            status_code=413,
+            detail={"code": "lan_request_too_large"},
+        ) from exc
+    try:
+        if _lan_json_nesting_exceeds(raw_body):
+            raise ValueError("JSON nesting exceeds the LAN request limit")
+        payload = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=_reject_lan_duplicate_keys,
+            parse_constant=_reject_lan_nonfinite_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise http_exception(
+            status_code=400,
+            detail={"code": "lan_request_invalid_json"},
+        ) from exc
+    try:
+        return model_type.model_validate(payload, strict=True)
+    except ValidationError as exc:
+        raise http_exception(
+            status_code=422,
+            detail={"code": "lan_request_invalid"},
+        ) from exc
 
 
 def _is_lan_managed_conflict(exc: BaseException) -> bool:
@@ -363,101 +550,18 @@ def register_routing_routes(
         raise ValueError("LAN mutation routes require the fixed local-runtime owner")
     discovery_service = provider_probe_service or ProviderProbeService()
 
-    async def cache_bounded_lan_request_body(http_request: Request) -> None:
-        body = bytearray()
-        sentinel_limit = MAX_LAN_MUTATION_BODY_BYTES + 1
-        async for chunk in http_request.stream():
-            remaining = sentinel_limit - len(body)
-            if remaining > 0:
-                body.extend(chunk[:remaining])
-            if len(body) > MAX_LAN_MUTATION_BODY_BYTES or len(chunk) > remaining:
-                http_request._body = bytes(body)
-                raise RequestBodyTooLarge("LAN request body exceeds 32 KiB")
-        http_request._body = bytes(body)
-
-    async def require_bounded_lan_mutation(http_request: Request) -> bytes:
-        if (
-            http_request.scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
-            or http_request.scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
-            or http_request.query_params
-        ):
-            raise http_exception(
-                status_code=400,
-                detail={"code": "lan_request_rejected"},
-            )
-        if any(header in http_request.headers for header in _LAN_FORBIDDEN_IDENTITY_HEADERS):
-            raise http_exception(
-                status_code=400,
-                detail={"code": "lan_request_rejected"},
-            )
-        content_length = http_request.headers.get("content-length")
-        if content_length is not None:
-            try:
-                declared_length = int(content_length)
-            except ValueError as exc:
-                raise http_exception(
-                    status_code=400,
-                    detail={"code": "lan_request_rejected"},
-                ) from exc
-            if declared_length < 0:
-                raise http_exception(
-                    status_code=400,
-                    detail={"code": "lan_request_rejected"},
-                )
-            if declared_length > MAX_LAN_MUTATION_BODY_BYTES:
-                raise http_exception(
-                    status_code=413,
-                    detail={"code": "lan_request_too_large"},
-                )
-        try:
-            await cache_bounded_lan_request_body(http_request)
-        except RequestBodyTooLarge as exc:
-            raise http_exception(
-                status_code=413,
-                detail={"code": "lan_request_too_large"},
-            ) from exc
-        return bytes(http_request._body)
-
-    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        value: dict[str, object] = {}
-        for key, item in pairs:
-            if key in value:
-                raise ValueError("duplicate JSON key")
-            value[key] = item
-        return value
-
-    def reject_nonfinite_constant(value: str) -> object:
-        del value
-        raise ValueError("non-finite JSON constant")
-
     async def parse_lan_request(
         http_request: Request,
         model_type: type[LanImportRouteRequest] | type[LanReviewRouteRequest],
     ) -> LanImportRouteRequest | LanReviewRouteRequest:
-        raw_body = await require_bounded_lan_mutation(http_request)
-        try:
-            payload = json.loads(
-                raw_body.decode("utf-8"),
-                object_pairs_hook=reject_duplicate_keys,
-                parse_constant=reject_nonfinite_constant,
-            )
-        except (
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-            RecursionError,
-            ValueError,
-        ) as exc:
-            raise http_exception(
-                status_code=400,
-                detail={"code": "lan_request_invalid_json"},
-            ) from exc
-        try:
-            return model_type.model_validate(payload, strict=True)
-        except ValidationError as exc:
-            raise http_exception(
-                status_code=422,
-                detail={"code": "lan_request_invalid"},
-            ) from exc
+        parsed = await _parse_lan_json_request(
+            http_request,
+            model_type,
+            http_exception=http_exception,
+        )
+        if not isinstance(parsed, (LanImportRouteRequest, LanReviewRouteRequest)):
+            raise RuntimeError("LAN parser returned the wrong request type")
+        return parsed
 
     async def parse_lan_import_request(
         http_request: Request,

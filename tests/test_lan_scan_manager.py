@@ -5,12 +5,13 @@ import hashlib
 import inspect
 import json
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
-from threading import Barrier, Event, Thread
+from threading import Barrier, Event, Lock, Thread
 from typing import Any
 
 import pytest
@@ -29,7 +30,11 @@ from nested_memvid_agent.lan_scanner import (
     scan_lan_scope,
 )
 from nested_memvid_agent.routing.lan_ledger import LanDiscoveryLedger
-from nested_memvid_agent.routing.lan_records import LanScanRevisionConflict
+from nested_memvid_agent.routing.lan_records import (
+    LanObservationDraft,
+    LanScanRecord,
+    LanScanRevisionConflict,
+)
 from nested_memvid_agent.state_store import AgentStateStore
 
 FIXED_OWNER = "owner:local-runtime:v1"
@@ -107,6 +112,7 @@ def _manager(
     monotonic_clock: Any | None = None,
     precommit_hook: Any | None = None,
     scan_id: str = "lan_task6",
+    scan_id_factory: Any | None = None,
 ) -> tuple[Any, AgentStateStore, LanDiscoveryLedger, NetworkInterface]:
     task6 = _task6()
     interface = _interface()
@@ -126,7 +132,7 @@ def _manager(
         scanner=scanner,
         utc_clock=utc,
         monotonic_clock=monotonic,
-        scan_id_factory=lambda: scan_id,
+        scan_id_factory=(scan_id_factory or (lambda: scan_id)),
     )
     return manager, state, ledger, interface
 
@@ -1723,3 +1729,902 @@ def test_no_tool_routine_scheduler_startup_or_flock_module_can_start_a_scan(
                 ):
                     violations.append(f"{path.name}:{node.lineno}:start")
     assert violations == []
+
+
+def test_interfaces_is_lifecycle_gated_and_uses_one_canonical_injected_inventory(
+    tmp_path: Path,
+) -> None:
+    first = NetworkInterface.from_addresses(
+        os_identity="darwin:en91",
+        display_name="Secondary fixture",
+        addresses=("192.168.91.1/30",),
+    )
+    second = NetworkInterface.from_addresses(
+        os_identity="darwin:en90",
+        display_name="Primary fixture",
+        addresses=("192.168.90.1/30",),
+    )
+    calls = 0
+
+    def enumerate_fixture() -> tuple[NetworkInterface, ...]:
+        nonlocal calls
+        calls += 1
+        return first, second
+
+    manager, _state, _ledger, _interface_value = _manager(
+        tmp_path,
+        interface_enumerator=enumerate_fixture,
+    )
+    with pytest.raises(RuntimeError, match="has not started"):
+        manager.interfaces()
+    assert calls == 0
+
+    _start_lifecycle(manager)
+    try:
+        interfaces = manager.interfaces()
+        assert interfaces == tuple(sorted((first, second), key=lambda item: item.interface_id))
+        assert calls == 1
+        assert "owner_principal" not in inspect.signature(manager.interfaces).parameters
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_interfaces_fails_closed_above_its_fixed_bound(tmp_path: Path) -> None:
+    consumed = 0
+
+    def enumerate_fixture() -> Iterator[NetworkInterface]:
+        nonlocal consumed
+        for index in range(65):
+            consumed += 1
+            yield NetworkInterface.from_addresses(
+                os_identity=f"darwin:fixture-{index}",
+                display_name=f"Fixture {index}",
+                addresses=("192.168.90.1/30",),
+            )
+        raise AssertionError("interface enumeration consumed beyond the fixed limit sentinel")
+
+    manager, _state, _ledger, _interface_value = _manager(
+        tmp_path,
+        interface_enumerator=enumerate_fixture,
+    )
+    _start_lifecycle(manager)
+    try:
+        with pytest.raises(ValueError, match="interface.*limit"):
+            manager.interfaces()
+        assert consumed == 65
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_interfaces_rejects_unbounded_or_nonprivate_public_projection(
+    tmp_path: Path,
+) -> None:
+    canonical = _interface()
+    multibyte_display = "é" * 129
+    assert len(multibyte_display) <= 256
+    assert len(multibyte_display.encode("utf-8")) > 256
+    excessive_addresses = tuple(
+        f"10.{(index // (254 * 254)) % 254}.{(index // 254) % 254}.{index % 254 + 1}/8"
+        for index in range(65)
+    )
+    cases = (
+        replace(
+            canonical,
+            display_name="x" * 257,
+        ),
+        replace(canonical, display_name=multibyte_display),
+        replace(canonical, display_name="Control\ncharacter"),
+        replace(canonical, display_name="Cafe\u0301"),
+        replace(canonical, interface_id="sha256:" + "0" * 64),
+        NetworkInterface.from_addresses(
+            os_identity="darwin:too-many-addresses",
+            display_name="Too many addresses",
+            addresses=excessive_addresses,
+        ),
+        NetworkInterface.from_addresses(
+            os_identity="darwin:public-address",
+            display_name="Public address",
+            addresses=("8.8.8.8/32",),
+        ),
+        replace(canonical, addresses=(" 192.168.90.1/30",)),
+    )
+
+    for index, interface in enumerate(cases):
+        case_root = tmp_path / f"case-{index}"
+        case_root.mkdir()
+        manager, _state, _ledger, _interface_value = _manager(
+            case_root,
+            interface_enumerator=lambda interface=interface: (interface,),
+        )
+        _start_lifecycle(manager)
+        try:
+            with pytest.raises(ValueError, match="interface"):
+                manager.interfaces()
+        finally:
+            assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+@pytest.mark.parametrize("duplicate_kind", ("canonical_id", "os_identity"))
+def test_interfaces_reject_duplicate_canonical_id_or_os_identity(
+    tmp_path: Path,
+    duplicate_kind: str,
+) -> None:
+    first = _interface()
+    second = (
+        first
+        if duplicate_kind == "canonical_id"
+        else NetworkInterface.from_addresses(
+            os_identity=first.os_identity,
+            display_name="Same OS interface with drifted addresses",
+            addresses=("192.168.91.1/30",),
+        )
+    )
+    assert second.interface_id == first.interface_id or second.os_identity == first.os_identity
+    manager, _state, _ledger, _interface_value = _manager(
+        tmp_path,
+        interface_enumerator=lambda: (first, second),
+    )
+    _start_lifecycle(manager)
+    try:
+        with pytest.raises(ValueError, match="interface.*duplicate"):
+            manager.interfaces()
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_interface_enumeration_and_canonicalization_hold_manager_operation_lock(
+    tmp_path: Path,
+) -> None:
+    first = NetworkInterface.from_addresses(
+        os_identity="darwin:lock-first",
+        display_name="Lock first",
+        addresses=("192.168.90.1/30",),
+    )
+    second = NetworkInterface.from_addresses(
+        os_identity="darwin:lock-second",
+        display_name="Lock second",
+        addresses=("192.168.91.1/30",),
+    )
+    block_enumerator = False
+    enumeration_entered = Event()
+    enumeration_release = Event()
+
+    def enumerate_fixture() -> tuple[NetworkInterface, ...]:
+        if block_enumerator:
+            enumeration_entered.set()
+            if not enumeration_release.wait(timeout=2.0):
+                raise AssertionError("interface enumeration release timed out")
+        return second, first
+
+    manager, _state, _ledger, _interface_value = _manager(
+        tmp_path,
+        interface_enumerator=enumerate_fixture,
+        scan_id="lan_" + "0" * 32,
+    )
+    _start_lifecycle(manager)
+    authorization = manager.preview(first.interface_id, "192.168.90.0/30")
+    block_enumerator = True
+    mutation_attempted = Event()
+    mutation_finished = Event()
+    completions: list[str] = []
+    failures: list[BaseException] = []
+    completion_lock = Lock()
+
+    def read_interfaces() -> None:
+        try:
+            result = manager.interfaces()
+            assert result == tuple(sorted((first, second), key=lambda item: item.interface_id))
+            with completion_lock:
+                completions.append("interfaces")
+        except BaseException as exc:  # noqa: BLE001 - surfaced in controller thread
+            failures.append(exc)
+
+    def create_draft() -> None:
+        try:
+            mutation_attempted.set()
+            manager.create_draft_for_preview(
+                authorization.preview_digest,
+                expected_revision=0,
+            )
+            with completion_lock:
+                completions.append("draft")
+        except BaseException as exc:  # noqa: BLE001 - surfaced in controller thread
+            failures.append(exc)
+        finally:
+            mutation_finished.set()
+
+    reader = Thread(target=read_interfaces, name="task7-interface-lock-reader", daemon=True)
+    mutation = Thread(target=create_draft, name="task7-interface-lock-mutation", daemon=True)
+    try:
+        reader.start()
+        if not enumeration_entered.wait(timeout=1.0):
+            reader.join(timeout=1.0)
+            if failures:
+                raise failures[0]
+            raise AssertionError("manager never entered the blocking interface enumerator")
+        mutation.start()
+        assert mutation_attempted.wait(timeout=1.0)
+        assert mutation_finished.wait(timeout=0.1) is False
+        assert completions == []
+        enumeration_release.set()
+        reader.join(timeout=2.0)
+        mutation.join(timeout=2.0)
+        assert not reader.is_alive() and not mutation.is_alive()
+        assert failures == []
+        assert sorted(completions) == ["draft", "interfaces"]
+    finally:
+        enumeration_release.set()
+        reader.join(timeout=1.0)
+        if mutation.ident is not None:
+            mutation.join(timeout=1.0)
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_digest_route_seam_binds_one_draft_and_consumes_authority_after_start(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        scanner=lambda *_args, **_kwargs: (),
+        scan_id="lan_" + "a" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft_for_preview(
+            authorization.preview_digest,
+            expected_revision=0,
+        )
+        assert draft.revision == 1
+        assert draft.preview_digest == authorization.preview_digest
+
+        before = ledger.get_scan(draft.scan_id)
+        with pytest.raises(task7.LanPreviewAuthorizationError):
+            manager.create_draft_for_preview(
+                authorization.preview_digest,
+                expected_revision=0,
+            )
+        assert ledger.get_scan(draft.scan_id) == before
+
+        started = manager.start_for_preview(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            preview_digest=authorization.preview_digest,
+        )
+        assert started.status == "running"
+        _wait_for_terminal(manager, draft.scan_id)
+
+        with pytest.raises(task7.LanPreviewAuthorizationError):
+            manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=started.revision,
+                preview_digest=authorization.preview_digest,
+            )
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_digest_route_seam_rejects_creation_aliases_and_replaced_preview_without_writes(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        scan_id="lan_" + "b" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        replaced = manager.preview(interface.interface_id, "192.168.90.0/30")
+        current = manager.preview(interface.interface_id, "192.168.90.0/31")
+        assert manager.list() == []
+
+        for digest in (replaced.preview_digest, "sha256:" + "f" * 64):
+            with pytest.raises(task7.LanPreviewAuthorizationError):
+                manager.create_draft_for_preview(
+                    digest,
+                    expected_revision=0,
+                )
+            assert manager.list() == []
+
+        with pytest.raises(LanScanRevisionConflict):
+            manager.create_draft_for_preview(
+                current.preview_digest,
+                expected_revision=True,
+            )
+        assert manager.list() == []
+
+        live_draft = manager.create_draft_for_preview(
+            current.preview_digest,
+            expected_revision=0,
+        )
+        assert live_draft.preview_digest == current.preview_digest
+        assert manager.get(live_draft.scan_id) == live_draft
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_digest_route_seam_allows_exactly_one_draft_creation_winner(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        scan_id="lan_" + "e" * 32,
+    )
+    _start_lifecycle(manager)
+    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+    start_gate = Barrier(3, timeout=2.0)
+    records: list[object] = []
+    failures: list[BaseException] = []
+    outcome_lock = Lock()
+
+    def create() -> None:
+        try:
+            start_gate.wait()
+            result = manager.create_draft_for_preview(
+                authorization.preview_digest,
+                expected_revision=0,
+            )
+            with outcome_lock:
+                records.append(result)
+        except BaseException as exc:  # noqa: BLE001 - exact losing type asserted below
+            with outcome_lock:
+                failures.append(exc)
+
+    threads = tuple(
+        Thread(
+            target=create,
+            name=f"task7-create-{index}",
+            daemon=True,
+        )
+        for index in range(2)
+    )
+    try:
+        for thread in threads:
+            thread.start()
+        start_gate.wait()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(records) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], task7.LanPreviewAuthorizationError)
+        assert len(manager.list()) == 1
+    finally:
+        start_gate.abort()
+        for thread in threads:
+            thread.join(timeout=1.0)
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_digest_route_seam_consumes_start_authority_only_after_committed_claim(
+    tmp_path: Path,
+) -> None:
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        scanner=lambda *_args, **_kwargs: (),
+        scan_id="lan_" + "f" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft_for_preview(
+            authorization.preview_digest,
+            expected_revision=0,
+        )
+        with pytest.raises(LanScanRevisionConflict):
+            manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=draft.revision + 1,
+                preview_digest=authorization.preview_digest,
+            )
+
+        started = manager.start_for_preview(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            preview_digest=authorization.preview_digest,
+        )
+        assert started.status == "running"
+        assert _wait_for_terminal(manager, draft.scan_id).status == "completed"
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_digest_start_rejects_wrong_scan_substitution_and_keeps_original_usable(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        scanner=lambda *_args, **_kwargs: (),
+        scan_id="lan_" + "1" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        original = manager.create_draft_for_preview(
+            authorization.preview_digest,
+            expected_revision=0,
+        )
+        substituted = ledger.create_scan(
+            scan_id="lan_" + "2" * 32,
+            owner_principal=FIXED_OWNER,
+            confirmed_interface_id=interface.interface_id,
+            network=authorization.preview.network,
+            limits=task7.canonical_scan_limits(),
+            preview_digest=authorization.preview_digest,
+            expected_revision=0,
+        )
+        original_before = ledger.get_scan(original.scan_id)
+        substituted_before = ledger.get_scan(substituted.scan_id)
+
+        with pytest.raises(task7.LanPreviewAuthorizationError):
+            manager.start_for_preview(
+                substituted.scan_id,
+                expected_revision=substituted.revision,
+                preview_digest=authorization.preview_digest,
+            )
+        assert ledger.get_scan(original.scan_id) == original_before
+        assert ledger.get_scan(substituted.scan_id) == substituted_before
+        assert ledger.list_events(substituted.scan_id) == []
+
+        started = manager.start_for_preview(
+            original.scan_id,
+            expected_revision=original.revision,
+            preview_digest=authorization.preview_digest,
+        )
+        assert started.status == "running"
+        assert _wait_for_terminal(manager, original.scan_id).status == "completed"
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_replacement_preview_after_draft_invalidates_bound_start_without_writes(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+    scan_ids = iter(("lan_" + "3" * 32, "lan_" + "4" * 32))
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        scanner=lambda *_args, **_kwargs: (),
+        scan_id_factory=lambda: next(scan_ids),
+    )
+    _start_lifecycle(manager)
+    try:
+        original = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft_for_preview(
+            original.preview_digest,
+            expected_revision=0,
+        )
+        replacement = manager.preview(interface.interface_id, "192.168.90.0/31")
+        assert replacement.preview_digest != original.preview_digest
+        before = ledger.get_scan(draft.scan_id)
+
+        with pytest.raises(task7.LanPreviewAuthorizationError):
+            manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=draft.revision,
+                preview_digest=original.preview_digest,
+            )
+        assert ledger.get_scan(draft.scan_id) == before
+        assert ledger.list_events(draft.scan_id) == []
+
+        replacement_draft = manager.create_draft_for_preview(
+            replacement.preview_digest,
+            expected_revision=0,
+        )
+        started = manager.start_for_preview(
+            replacement_draft.scan_id,
+            expected_revision=replacement_draft.revision,
+            preview_digest=replacement.preview_digest,
+        )
+        assert started.status == "running"
+        assert _wait_for_terminal(manager, replacement_draft.scan_id).status == "completed"
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_digest_start_expiry_equality_is_zero_write(tmp_path: Path) -> None:
+    task7 = _task6()
+    utc = MutableUtcClock()
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        utc_clock=utc,
+        scan_id="lan_" + "4" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft_for_preview(
+            authorization.preview_digest,
+            expected_revision=0,
+        )
+        before = ledger.get_scan(draft.scan_id)
+        utc.value = authorization.expires_at
+
+        with pytest.raises(task7.LanPreviewAuthorizationError):
+            manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=draft.revision,
+                preview_digest=authorization.preview_digest,
+            )
+        assert ledger.get_scan(draft.scan_id) == before
+        assert ledger.list_events(draft.scan_id) == []
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_digest_start_interface_inventory_drift_is_zero_write(tmp_path: Path) -> None:
+    task7 = _task6()
+    original = _interface()
+    changed = NetworkInterface.from_addresses(
+        os_identity=original.os_identity,
+        display_name=original.display_name,
+        addresses=("192.168.90.1/31",),
+    )
+    inventory: list[tuple[NetworkInterface, ...]] = [(original,)]
+    manager, _state, ledger, _interface_value = _manager(
+        tmp_path,
+        interface_enumerator=lambda: inventory[0],
+        scan_id="lan_" + "5" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.preview(original.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft_for_preview(
+            authorization.preview_digest,
+            expected_revision=0,
+        )
+        before = ledger.get_scan(draft.scan_id)
+        inventory[0] = (changed,)
+
+        with pytest.raises(task7.LanPreviewAuthorizationError):
+            manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=draft.revision,
+                preview_digest=authorization.preview_digest,
+            )
+        assert ledger.get_scan(draft.scan_id) == before
+        assert ledger.list_events(draft.scan_id) == []
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_concurrent_digest_starts_have_one_claim_event_and_one_executor_submission(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+    scanner_entered = Event()
+    scanner_release = Event()
+
+    def scanner(*_args: Any, **_kwargs: Any) -> tuple[()]:
+        scanner_entered.set()
+        if not scanner_release.wait(timeout=2.0):
+            raise AssertionError("digest start scanner release timed out")
+        return ()
+
+    class CountingExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=17, thread_name_prefix="task7-start-race")
+            self.submit_calls = 0
+            self._submit_lock = Lock()
+
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+            with self._submit_lock:
+                self.submit_calls += 1
+            return super().submit(fn, *args, **kwargs)
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        mdns_availability=lambda: task7.MdnsAvailability.UNAVAILABLE,
+        scanner=scanner,
+        scan_id="lan_" + "6" * 32,
+    )
+    executor = CountingExecutor()
+    manager.start_lifecycle(executor)
+    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+    draft = manager.create_draft_for_preview(
+        authorization.preview_digest,
+        expected_revision=0,
+    )
+    start_gate = Barrier(3, timeout=2.0)
+    outcomes: list[LanScanRecord] = []
+    failures: list[BaseException] = []
+    outcome_lock = Lock()
+
+    def start() -> None:
+        try:
+            start_gate.wait()
+            result = manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=draft.revision,
+                preview_digest=authorization.preview_digest,
+            )
+            with outcome_lock:
+                outcomes.append(result)
+        except BaseException as exc:  # noqa: BLE001 - exact losing type asserted below
+            with outcome_lock:
+                failures.append(exc)
+
+    threads = tuple(
+        Thread(target=start, name=f"task7-start-{index}", daemon=True) for index in range(2)
+    )
+    try:
+        for thread in threads:
+            thread.start()
+        start_gate.wait()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(outcomes) == 1 and outcomes[0].status == "running"
+        assert len(failures) == 1
+        assert isinstance(failures[0], task7.LanPreviewAuthorizationError)
+        assert scanner_entered.wait(timeout=1.0)
+        assert executor.submit_calls == 1
+        assert [event.event_type for event in ledger.list_events(draft.scan_id)] == ["scan_started"]
+    finally:
+        start_gate.abort()
+        scanner_release.set()
+        for thread in threads:
+            thread.join(timeout=1.0)
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_active_slot_preclaim_failure_retains_digest_authority_for_retry(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        scanner=lambda *_args, **_kwargs: (),
+        scan_id="lan_" + "7" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft_for_preview(
+            authorization.preview_digest,
+            expected_revision=0,
+        )
+        blocker = ledger.create_scan(
+            scan_id="lan_" + "8" * 32,
+            owner_principal=FIXED_OWNER,
+            confirmed_interface_id=interface.interface_id,
+            network="192.168.90.0/30",
+            limits=task7.canonical_scan_limits(),
+            preview_digest=authorization.preview_digest,
+            expected_revision=0,
+        )
+        preview = authorization.preview
+        preview_event = {
+            "schema": "kestrel.lan.scan-preview.v1",
+            "owner_principal": FIXED_OWNER,
+            "interface_id": preview.interface_id,
+            "network": preview.network,
+            "limits": asdict(preview.limits),
+            "active_host_count": preview.active_host_count,
+            "passive_or_manual_only": preview.passive_or_manual_only,
+            "port_count": len(preview.port_matrix),
+            "mdns_status": authorization.mdns_availability.value,
+            "server_version": authorization.server_version,
+            "contract_version": authorization.contract_version,
+            "preview_digest": authorization.preview_digest,
+            "expires_at": _utc_text(authorization.expires_at),
+        }
+        blocker = ledger.claim_scan_start(
+            blocker.scan_id,
+            owner_principal=FIXED_OWNER,
+            expected_revision=blocker.revision,
+            preview_digest=authorization.preview_digest,
+            authorized_preview_digest=authorization.preview_digest,
+            preview_event=preview_event,
+        )
+        assert [event.event_type for event in ledger.list_events(blocker.scan_id)] == [
+            "scan_started"
+        ]
+
+        with pytest.raises(task7.LanScanAdmissionConflict):
+            manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=draft.revision,
+                preview_digest=authorization.preview_digest,
+            )
+        assert ledger.get_scan(draft.scan_id) == draft
+        assert ledger.list_events(draft.scan_id) == []
+
+        ledger.commit_scan_terminal(
+            blocker.scan_id,
+            owner_principal=FIXED_OWNER,
+            expected_revision=blocker.revision,
+            status="completed",
+            terminal_reason="scan_complete",
+            cancel_reason=None,
+            observations=(),
+            mdns_status=authorization.mdns_availability.value,
+            planned_count=0,
+            admitted_count=0,
+            completed_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+        assert [event.event_type for event in ledger.list_events(blocker.scan_id)] == [
+            "scan_started",
+            "scan_completed",
+        ]
+        started = manager.start_for_preview(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            preview_digest=authorization.preview_digest,
+        )
+        assert started.status == "running"
+        assert _wait_for_terminal(manager, draft.scan_id).status == "completed"
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_executor_rejection_after_claim_consumes_digest_authority(
+    tmp_path: Path,
+) -> None:
+    task7 = _task6()
+
+    class RejectingExecutor:
+        def __init__(self) -> None:
+            self.submit_calls = 0
+            self.shutdown_calls = 0
+
+        def submit(self, *_args: Any, **_kwargs: Any) -> None:
+            self.submit_calls += 1
+            raise RuntimeError("injected executor rejection")
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is True
+            assert cancel_futures is False
+            self.shutdown_calls += 1
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        mdns_availability=lambda: task7.MdnsAvailability.UNAVAILABLE,
+        scan_id="lan_" + "9" * 32,
+    )
+    executor = RejectingExecutor()
+    manager.start_lifecycle(executor)
+    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+    draft = manager.create_draft_for_preview(
+        authorization.preview_digest,
+        expected_revision=0,
+    )
+
+    terminal = manager.start_for_preview(
+        draft.scan_id,
+        expected_revision=draft.revision,
+        preview_digest=authorization.preview_digest,
+    )
+    assert terminal.status == "failed"
+    assert executor.submit_calls == 1
+    assert [event.event_type for event in ledger.list_events(draft.scan_id)] == [
+        "scan_started",
+        "scan_failed",
+    ]
+    with pytest.raises(task7.LanPreviewAuthorizationError):
+        manager.start_for_preview(
+            draft.scan_id,
+            expected_revision=terminal.revision,
+            preview_digest=authorization.preview_digest,
+        )
+    assert manager.shutdown(timeout_seconds=1.0) is True
+    assert executor.shutdown_calls == 1
+
+
+def test_draft_cancel_invalidates_digest_start_authority(tmp_path: Path) -> None:
+    task7 = _task6()
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        scan_id="lan_" + "a" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft_for_preview(
+            authorization.preview_digest,
+            expected_revision=0,
+        )
+        cancelled = manager.cancel(draft.scan_id, expected_revision=draft.revision)
+        assert cancelled.status == "cancelled"
+
+        with pytest.raises(task7.LanPreviewAuthorizationError):
+            manager.start_for_preview(
+                draft.scan_id,
+                expected_revision=cancelled.revision,
+                preview_digest=authorization.preview_digest,
+            )
+        assert ledger.get_scan(draft.scan_id) == cancelled
+        assert [event.event_type for event in ledger.list_events(draft.scan_id)] == [
+            "scan_cancelled"
+        ]
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_observation_page_is_fixed_owner_deterministic_and_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task7 = _task6()
+    manager, _state, ledger, interface = _manager(tmp_path)
+    _start_lifecycle(manager)
+    owned = ledger.create_scan(
+        scan_id="lan_" + "c" * 32,
+        owner_principal=FIXED_OWNER,
+        confirmed_interface_id=interface.interface_id,
+        network="192.168.90.0/30",
+        limits=task7.canonical_scan_limits(),
+        preview_digest="sha256:" + "c" * 64,
+        expected_revision=0,
+    )
+    foreign = ledger.create_scan(
+        scan_id="lan_" + "d" * 32,
+        owner_principal="owner:foreign",
+        confirmed_interface_id=interface.interface_id,
+        network="192.168.90.0/30",
+        limits=task7.canonical_scan_limits(),
+        preview_digest="sha256:" + "d" * 64,
+        expected_revision=0,
+    )
+
+    def observation(index: int) -> LanObservationDraft:
+        return LanObservationDraft(
+            endpoint_id="sha256:" + f"{index:064x}",
+            source="active",
+            interface_id=interface.interface_id,
+            address="192.168.90.2",
+            port=11434,
+            api_shape=None,
+            tls_enabled=False,
+            certificate_sha256=None,
+            catalog_digest=None,
+            capability_digest=None,
+            public_payload={"model_count": index},
+            freshness_timestamp="2026-08-01T12:00:00Z",
+            error_category="tcp_refused",
+        )
+
+    owned_revision = owned.revision
+    for index in (3, 1, 2):
+        ledger.append_observation(
+            owned.scan_id,
+            observation(index),
+            expected_revision=owned_revision,
+        )
+        current = ledger.get_scan(owned.scan_id)
+        assert current is not None
+        owned_revision = current.revision
+    ledger.append_observation(
+        foreign.scan_id,
+        observation(4),
+        expected_revision=foreign.revision,
+    )
+    owned_snapshot = ledger.get_scan(owned.scan_id)
+    assert owned_snapshot is not None
+
+    def forbidden_split_read(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("manager detail must use the atomic ledger snapshot seam")
+
+    monkeypatch.setattr(ledger, "get_scan", forbidden_split_read)
+    monkeypatch.setattr(ledger, "list_observations", forbidden_split_read)
+
+    try:
+        page = manager.observation_page(owned.scan_id, limit=2)
+        assert page is not None
+        assert page.scan == owned_snapshot
+        assert page.total_count == 3
+        assert page.truncated is True
+        assert tuple(item.endpoint_id for item in page.observations) == (
+            "sha256:" + f"{1:064x}",
+            "sha256:" + f"{2:064x}",
+        )
+        assert manager.observation_page(foreign.scan_id, limit=2) is None
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True

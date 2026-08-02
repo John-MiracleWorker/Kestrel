@@ -193,6 +193,7 @@ def _create_app(
         )
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_engineering_routes import register_engineering_routes
+        from .server_lan_discovery_routes import register_lan_discovery_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_mission_routes import (
             evaluate_mission_preflight,
@@ -825,6 +826,13 @@ def _create_app(
         ),
         lan_owner_principal=(LAN_MUTATION_OWNER_PRINCIPAL if lan_mutations_registered else None),
     )
+    if lan_mutations_registered:
+        register_lan_discovery_routes(
+            app,
+            scan_manager=lan_scan_manager,
+            http_exception=HTTPException,
+            streaming_response=StreamingResponse,
+        )
     register_routine_routes(
         app,
         active_config=lambda: active_config,

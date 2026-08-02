@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1547,7 +1548,31 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import nested_memvid_agent.server as server_module
+
     testclient = pytest.importorskip("fastapi.testclient")
+    from nested_memvid_agent.lan_discovery_models import NetworkInterface
+    from nested_memvid_agent.lan_scan_manager import LanScanManager as RealLanScanManager
+
+    interface = NetworkInterface.from_addresses(
+        os_identity="darwin:route-registration-fixture",
+        display_name="Route registration fixture",
+        addresses=("192.168.92.1/30",),
+    )
+    enumeration_calls = 0
+
+    def enumerate_fixture() -> tuple[NetworkInterface, ...]:
+        nonlocal enumeration_calls
+        enumeration_calls += 1
+        return (interface,)
+
+    def manager_factory(*, ledger: Any) -> RealLanScanManager:
+        return RealLanScanManager(
+            ledger=ledger,
+            interface_enumerator=enumerate_fixture,
+        )
+
+    monkeypatch.setattr(server_module, "LanScanManager", manager_factory)
 
     def config(root: Path, *, authenticated: bool) -> AgentConfig:
         return AgentConfig(
@@ -1564,9 +1589,20 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
             api_auth_token_env="KESTREL_LAN_ROUTE_TEST_TOKEN",
         )
 
+    def lan_manifest(app: Any) -> Counter[tuple[str, str]]:
+        return Counter(
+            (method, route.path)
+            for route in app.routes
+            if getattr(route, "path", "").startswith("/api/routing/lan")
+            for method in getattr(route, "methods", ())
+        )
+
     with testclient.TestClient(
         create_app(config(tmp_path / "unauthenticated", authenticated=False))
     ) as client:
+        assert lan_manifest(client.app) == Counter()
+        assert client.get("/api/routing/lan/interfaces").status_code == 404
+        assert client.post("/api/routing/lan/preview", json={}).status_code == 404
         assert client.post("/api/routing/lan/import", json={}).status_code == 404
         assert (
             client.post(
@@ -1575,11 +1611,21 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
             ).status_code
             == 404
         )
+    assert enumeration_calls == 0
 
     monkeypatch.setenv("KESTREL_LAN_ROUTE_TEST_TOKEN", "lan-route-test-token")
     with testclient.TestClient(
         create_app(config(tmp_path / "authenticated", authenticated=True))
     ) as client:
+        unauthorized_interfaces = client.get("/api/routing/lan/interfaces")
+        assert unauthorized_interfaces.status_code == 401
+        unauthorized_preview = client.post(
+            "/api/routing/lan/preview",
+            content=b"\xff",
+            headers={"content-type": "application/json"},
+        )
+        assert unauthorized_preview.status_code == 401
+        assert enumeration_calls == 0
         unauthorized = client.post("/api/routing/lan/import", json={})
         assert unauthorized.status_code == 401
         unauthorized_review = client.post(
@@ -1601,6 +1647,33 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
         )
         assert authorized_review.status_code in {400, 422}
         assert authorized_review.status_code != 404
+        authorized_interfaces = client.get(
+            "/api/routing/lan/interfaces",
+            headers={"X-Kestrel-API-Key": "lan-route-test-token"},
+        )
+        assert authorized_interfaces.status_code == 200
+        assert enumeration_calls == 1
+        assert all(
+            "os_identity" not in item and "owner_principal" not in item
+            for item in authorized_interfaces.json()
+        )
+        assert lan_manifest(client.app) == Counter(
+            {
+                ("GET", "/api/routing/lan/interfaces"): 1,
+                ("POST", "/api/routing/lan/preview"): 1,
+                ("POST", "/api/routing/lan/scans"): 1,
+                ("POST", "/api/routing/lan/scans/{scan_id}/start"): 1,
+                ("GET", "/api/routing/lan/scans"): 1,
+                ("GET", "/api/routing/lan/scans/{scan_id}"): 1,
+                ("POST", "/api/routing/lan/scans/{scan_id}/cancel"): 1,
+                ("GET", "/api/routing/lan/scans/{scan_id}/events"): 1,
+                ("POST", "/api/routing/lan/import"): 1,
+                ("POST", "/api/routing/lan/targets/{target_id}/review"): 1,
+            }
+        )
+        assert not any(
+            path == "/api/routing/lan/manual-probe" for _method, path in lan_manifest(client.app)
+        )
 
 
 def test_unauthorized_lan_query_is_redacted_from_real_uvicorn_access_log(
@@ -1746,6 +1819,129 @@ def test_invalid_lan_review_path_is_redacted_before_real_uvicorn_access_log(
         assert all(hostile not in value for value in headers.values())
 
 
+def test_invalid_lan_scan_paths_are_redacted_before_auth_for_every_dynamic_suffix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nested_memvid_agent.lan_scan_manager import LanScanManager
+
+    token = "lan-scan-path-redaction-token"
+    token_env = "KESTREL_LAN_SCAN_PATH_REDACTION_TOKEN"
+    monkeypatch.setenv(token_env, token)
+    root = tmp_path / "scan-path-redaction"
+    app = create_app(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            state_path=root / "state" / "agent.db",
+            memory_dir=root / "memory",
+            log_dir=root / "logs",
+            workspace=root,
+            skills_dir=root / "skills",
+            plugins_dir=root / "plugins",
+            secret_store_path=root / "secrets" / "vault.json",
+            require_api_auth=True,
+            api_auth_token_env=token_env,
+        )
+    )
+    hostile = "raw-secret-scan-192.168.50.2"
+    encoded_hostile = "%72aw-secret-encoded-192.168.50.3"
+    decoded_encoded_hostile = "raw-secret-encoded-192.168.50.3"
+    valid_scan_id = "lan_" + "a" * 32
+    uppercase_scan_id = "lan_" + "A" * 32
+    nonhex_scan_id = "lan_" + "g" * 32
+    short_scan_id = "lan_" + "b" * 31
+    long_scan_id = "lan_" + "c" * 33
+    wrong_separator_scan_id = "lan-" + "d" * 32
+    wrong_prefix_scan_id = "scan_" + "e" * 32
+    paths = (
+        ("GET", f"/api/routing/lan/scans/{hostile}"),
+        ("GET", f"/api/routing/lan/scans/{hostile}/"),
+        ("POST", f"/api/routing/lan/scans/{hostile}/start"),
+        ("POST", f"/api/routing/lan/scans/{hostile}/start/"),
+        ("POST", f"/api/routing/lan/scans/{hostile}/cancel"),
+        ("POST", f"/api/routing/lan/scans/{hostile}/cancel/"),
+        ("GET", f"/api/routing/lan/scans/{hostile}/events"),
+        ("GET", f"/api/routing/lan/scans/{hostile}/events/"),
+        ("GET", f"/api/routing/lan/scans/{encoded_hostile}"),
+        ("POST", f"/api/routing/lan/scans/{encoded_hostile}/start"),
+        ("GET", f"/api/routing/lan/scans/{uppercase_scan_id}"),
+        ("POST", f"/api/routing/lan/scans/{nonhex_scan_id}/start/"),
+        ("POST", f"/api/routing/lan/scans/{short_scan_id}/cancel"),
+        ("GET", f"/api/routing/lan/scans/{long_scan_id}/events/"),
+        ("GET", f"/api/routing/lan/scans/{wrong_separator_scan_id}/"),
+        ("POST", f"/api/routing/lan/scans/{wrong_prefix_scan_id}/start"),
+        ("GET", f"/api/routing/lan/{hostile}"),
+        ("POST", f"/api/routing/lan/scans-near/{hostile}"),
+        ("GET", f"/api/routing/lan/scans/{valid_scan_id}/unknown/{hostile}"),
+    )
+    manager_calls: list[str] = []
+
+    def unreachable_manager(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        manager_calls.append("manager")
+        raise AssertionError("malformed LAN scan path reached its manager")
+
+    for method_name in (
+        "get",
+        "observation_page",
+        "start_for_preview",
+        "cancel",
+        "events",
+    ):
+        monkeypatch.setattr(LanScanManager, method_name, unreachable_manager)
+
+    requests: list[tuple[str, str, bytes, dict[str, str]]] = []
+    for method, path in paths:
+        body = b"{}" if method == "POST" else b""
+        content_headers = {"content-type": "application/json"} if body else {}
+        requests.append((method, path, body, content_headers))
+        requests.append(
+            (
+                method,
+                path,
+                body,
+                {
+                    **content_headers,
+                    "x-kestrel-api-key": token,
+                },
+            )
+        )
+
+    responses, access_record = _real_uvicorn_requests(app, tuple(requests))
+
+    assert tuple(status for status, _headers, _body in responses) == tuple(
+        status for _path in paths for status in (401, 400)
+    )
+    assert hostile not in access_record
+    assert encoded_hostile not in access_record
+    assert decoded_encoded_hostile not in access_record
+    lookalikes = (
+        uppercase_scan_id,
+        nonhex_scan_id,
+        short_scan_id,
+        long_scan_id,
+        wrong_separator_scan_id,
+        wrong_prefix_scan_id,
+    )
+    assert all(value not in access_record for value in lookalikes)
+    assert manager_calls == []
+    for index, (_status, headers, body) in enumerate(responses):
+        response_text = body.decode("utf-8")
+        assert hostile not in response_text
+        assert encoded_hostile not in response_text
+        assert decoded_encoded_hostile not in response_text
+        assert all(hostile not in value for value in headers.values())
+        assert all(encoded_hostile not in value for value in headers.values())
+        assert all(decoded_encoded_hostile not in value for value in headers.values())
+        for lookalike in lookalikes:
+            assert lookalike not in response_text
+            assert all(lookalike not in value for value in headers.values())
+        if index % 2 == 1:
+            assert "location" not in headers
+            assert json.loads(body) == {"detail": {"code": "lan_request_rejected"}}
+
+
 def test_lan_query_is_closed_and_redacted_for_canonical_and_slash_alias_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1782,45 +1978,59 @@ def test_lan_query_is_closed_and_redacted_for_canonical_and_slash_alias_paths(
     )
     hostile = "raw-secret-address-192.168.50.2"
     target_id = "lan-target-" + "9" * 64
-    paths = (
-        "/api/routing/lan/import",
-        "/api/routing/lan/import/",
-        f"/api/routing/lan/targets/{target_id}/review",
-        f"/api/routing/lan/targets/{target_id}/review/",
+    scan_id = "lan_" + "9" * 32
+    routes = (
+        ("GET", "/api/routing/lan/interfaces"),
+        ("GET", "/api/routing/lan/interfaces/"),
+        ("POST", "/api/routing/lan/preview"),
+        ("POST", "/api/routing/lan/preview/"),
+        ("POST", "/api/routing/lan/scans"),
+        ("POST", "/api/routing/lan/scans/"),
+        ("GET", "/api/routing/lan/scans"),
+        ("GET", "/api/routing/lan/scans/"),
+        ("GET", f"/api/routing/lan/scans/{scan_id}"),
+        ("GET", f"/api/routing/lan/scans/{scan_id}/"),
+        ("POST", f"/api/routing/lan/scans/{scan_id}/start"),
+        ("POST", f"/api/routing/lan/scans/{scan_id}/start/"),
+        ("POST", f"/api/routing/lan/scans/{scan_id}/cancel"),
+        ("POST", f"/api/routing/lan/scans/{scan_id}/cancel/"),
+        ("GET", f"/api/routing/lan/scans/{scan_id}/events"),
+        ("GET", f"/api/routing/lan/scans/{scan_id}/events/"),
+        ("POST", "/api/routing/lan/manual-probe"),
+        ("POST", "/api/routing/lan/manual-probe/"),
+        ("POST", "/api/routing/lan/import"),
+        ("POST", "/api/routing/lan/import/"),
+        ("POST", f"/api/routing/lan/targets/{target_id}/review"),
+        ("POST", f"/api/routing/lan/targets/{target_id}/review/"),
     )
     requests: list[tuple[str, str, bytes, dict[str, str]]] = []
-    for path in paths:
+    for method, path in routes:
         target = f"{path}?address={hostile}"
+        body = b"{}" if method == "POST" else b""
+        content_headers = {"content-type": "application/json"} if body else {}
         requests.append(
             (
-                "POST",
+                method,
                 target,
-                b"{}",
-                {"content-type": "application/json"},
+                body,
+                content_headers,
             )
         )
         requests.append(
             (
-                "POST",
+                method,
                 target,
-                b"{}",
+                body,
                 {
-                    "content-type": "application/json",
+                    **content_headers,
                     "x-kestrel-api-key": token,
                 },
             )
         )
     responses, access_record = _real_uvicorn_requests(app, tuple(requests))
 
-    assert tuple(status for status, _headers, _body in responses) == (
-        401,
-        400,
-        401,
-        400,
-        401,
-        400,
-        401,
-        400,
+    assert tuple(status for status, _headers, _body in responses) == tuple(
+        status for _route in routes for status in (401, 400)
     )
     assert calls == []
     assert hostile not in access_record
@@ -1835,6 +2045,16 @@ def test_lan_query_is_closed_and_redacted_for_canonical_and_slash_alias_paths(
 @pytest.mark.parametrize(
     "request_path",
     (
+        "/api/routing/lan/preview",
+        "/api/routing/lan/preview/",
+        "/api/routing/lan/scans",
+        "/api/routing/lan/scans/",
+        "/api/routing/lan/scans/lan_" + "a" * 32 + "/start",
+        "/api/routing/lan/scans/lan_" + "a" * 32 + "/start/",
+        "/api/routing/lan/scans/lan_" + "a" * 32 + "/cancel",
+        "/api/routing/lan/scans/lan_" + "a" * 32 + "/cancel/",
+        "/api/routing/lan/manual-probe",
+        "/api/routing/lan/manual-probe/",
         "/api/routing/lan/import",
         "/api/routing/lan/import/",
         "/api/routing/lan/targets/lan-target-" + "a" * 64 + "/review",
@@ -1935,6 +2155,11 @@ def test_chunked_lan_body_honors_smaller_configured_global_limit_before_service(
 @pytest.mark.parametrize(
     "request_path",
     (
+        "/api/routing/lan/preview/",
+        "/api/routing/lan/scans/",
+        "/api/routing/lan/scans/lan_" + "b" * 32 + "/start/",
+        "/api/routing/lan/scans/lan_" + "b" * 32 + "/cancel/",
+        "/api/routing/lan/manual-probe/",
         "/api/routing/lan/import/",
         "/api/routing/lan/targets/lan-target-" + "b" * 64 + "/review/",
     ),
@@ -2002,6 +2227,16 @@ def test_chunked_lan_slash_alias_honors_32k_ceiling_before_redirect_or_service(
 @pytest.mark.parametrize(
     "request_path",
     (
+        "/api/routing/lan/preview",
+        "/api/routing/lan/preview/",
+        "/api/routing/lan/scans",
+        "/api/routing/lan/scans/",
+        "/api/routing/lan/scans/lan_" + "c" * 32 + "/start",
+        "/api/routing/lan/scans/lan_" + "c" * 32 + "/start/",
+        "/api/routing/lan/scans/lan_" + "c" * 32 + "/cancel",
+        "/api/routing/lan/scans/lan_" + "c" * 32 + "/cancel/",
+        "/api/routing/lan/manual-probe",
+        "/api/routing/lan/manual-probe/",
         "/api/routing/lan/import",
         "/api/routing/lan/import/",
         "/api/routing/lan/targets/lan-target-" + "c" * 64 + "/review",
@@ -2063,15 +2298,24 @@ def test_create_app_desktop_launch_registers_lan_mutations_behind_launch_auth(
     )
 
     with testclient.TestClient(app) as client:
+        unauthorized_interfaces = client.get("/api/routing/lan/interfaces")
+        unauthorized_preview = client.post("/api/routing/lan/preview", json={})
         unauthorized_import = client.post("/api/routing/lan/import", json={})
         unauthorized_review = client.post(
             "/api/routing/lan/targets/missing/review",
             json={},
         )
+        assert unauthorized_interfaces.status_code == 401
+        assert unauthorized_preview.status_code == 401
         assert unauthorized_import.status_code == 401
         assert unauthorized_review.status_code == 401
 
         headers = {"Authorization": f"Bearer {launch.api_token}"}
+        authorized_preview = client.post(
+            "/api/routing/lan/preview",
+            json={},
+            headers=headers,
+        )
         authorized_import = client.post(
             "/api/routing/lan/import",
             json={},
@@ -2082,7 +2326,9 @@ def test_create_app_desktop_launch_registers_lan_mutations_behind_launch_auth(
             json={},
             headers=headers,
         )
+        assert authorized_preview.status_code in {400, 422}
         assert authorized_import.status_code in {400, 422}
         assert authorized_review.status_code in {400, 422}
+        assert authorized_preview.status_code != 404
         assert authorized_import.status_code != 404
         assert authorized_review.status_code != 404
