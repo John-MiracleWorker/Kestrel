@@ -4745,7 +4745,7 @@ def test_manual_create_and_claim_is_one_revision_two_transaction_with_exact_even
         schema_version = connection.execute(
             "SELECT version FROM routing_schema_version WHERE id = 1"
         ).fetchone()
-    assert schema_version is not None and schema_version["version"] == 3
+    assert schema_version is not None and schema_version["version"] == 4
     assert bounded_scan_preview_event(_preview_event()) == expected_automatic_event
     assert hashlib.sha256(automatic_event_bytes).hexdigest() == (AUTOMATIC_PREVIEW_EVENT_SHA256)
 

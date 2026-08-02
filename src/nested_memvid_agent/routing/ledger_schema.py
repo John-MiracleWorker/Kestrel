@@ -4,7 +4,7 @@ import sqlite3
 
 from ..state_store import AgentStateStore, utc_now
 
-ROUTING_SCHEMA_VERSION = 3
+ROUTING_SCHEMA_VERSION = 4
 
 
 def ensure_routing_schema(state: AgentStateStore) -> None:
@@ -39,6 +39,11 @@ def ensure_routing_schema(state: AgentStateStore) -> None:
             current = 3
         if current >= 3:
             _ensure_routing_schema_v3_guards(conn)
+        if current < 4:
+            _apply_routing_schema_v4(conn)
+            current = 4
+        if current >= 4:
+            _ensure_routing_schema_v4_guards(conn)
         conn.execute(
             """
             INSERT INTO routing_schema_version (id, version, updated_at)
@@ -606,4 +611,387 @@ def _apply_routing_schema_v2(conn: sqlite3.Connection) -> None:
             "routing_target_calibrations(project_id, task_family, risk, capability_key, target_id)"
         ),
     ):
+        conn.execute(statement)
+
+
+def _apply_routing_schema_v4(conn: sqlite3.Connection) -> None:
+    """Add Flock qualification and activation grant tables.
+
+    The migration is intentionally additive: existing v1-v3 decisions,
+    outcomes, and LAN evidence rows are never rewritten. ``routing_decisions``
+    only gains nullable activation columns.
+    """
+
+    decisions_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'routing_decisions'"
+    ).fetchone()
+    decision_columns = (
+        {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(routing_decisions)").fetchall()
+        }
+        if decisions_table is not None
+        else set()
+    )
+    for column, ddl in (
+        ("activation_grant_id", "activation_grant_id TEXT"),
+        ("activation_receipt_id", "activation_receipt_id TEXT"),
+        (
+            "activation_effective",
+            "activation_effective INTEGER CHECK (activation_effective IN (0, 1))",
+        ),
+        ("activation_reason", "activation_reason TEXT"),
+    ):
+        if column not in decision_columns and decisions_table is not None:
+            conn.execute(f"ALTER TABLE routing_decisions ADD COLUMN {ddl}")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_qualification_runs (
+            run_id TEXT PRIMARY KEY NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'draft', 'ready', 'running', 'pausing', 'paused',
+                    'cancelled', 'failed', 'completed'
+                )
+            ),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            owner_principal TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            scope_digest TEXT NOT NULL,
+            corpus_json TEXT NOT NULL,
+            corpus_digest TEXT NOT NULL,
+            target_json TEXT NOT NULL,
+            target_digest TEXT NOT NULL,
+            price_json TEXT NOT NULL,
+            price_digest TEXT NOT NULL,
+            policy_json TEXT NOT NULL,
+            policy_digest TEXT NOT NULL,
+            learned_json TEXT NOT NULL,
+            learned_digest TEXT NOT NULL,
+            project_authority_json TEXT NOT NULL,
+            project_authority_digest TEXT NOT NULL,
+            build_json TEXT NOT NULL,
+            build_digest TEXT NOT NULL,
+            thresholds_json TEXT NOT NULL,
+            thresholds_digest TEXT NOT NULL,
+            max_spend_micros INTEGER NOT NULL CHECK (max_spend_micros >= 0),
+            effective_stop_cap_micros INTEGER NOT NULL
+                CHECK (effective_stop_cap_micros >= 0),
+            actual_spend_micros INTEGER NOT NULL CHECK (actual_spend_micros >= 0),
+            unresolved_reserve_micros INTEGER NOT NULL
+                CHECK (unresolved_reserve_micros >= 0),
+            inflight_reserve_micros INTEGER NOT NULL
+                CHECK (inflight_reserve_micros >= 0),
+            attempt_ceiling_micros INTEGER NOT NULL
+                CHECK (attempt_ceiling_micros >= 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            terminal_reason TEXT,
+            CHECK (effective_stop_cap_micros <= max_spend_micros),
+            CHECK (attempt_ceiling_micros <= max_spend_micros),
+            CHECK (
+                (
+                    status IN ('cancelled', 'failed', 'completed')
+                    AND finished_at IS NOT NULL
+                    AND terminal_reason IS NOT NULL
+                )
+                OR
+                (
+                    status NOT IN ('cancelled', 'failed', 'completed')
+                    AND finished_at IS NULL
+                    AND terminal_reason IS NULL
+                )
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_qualification_cases (
+            case_id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            task_family TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            task_contract_digest TEXT NOT NULL,
+            acceptance_plan_digest TEXT NOT NULL,
+            repository_digest TEXT NOT NULL,
+            privacy_eligible INTEGER NOT NULL CHECK (privacy_eligible IN (0, 1)),
+            scope_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (run_id, item_id),
+            FOREIGN KEY (run_id)
+                REFERENCES routing_qualification_runs(run_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_qualification_attempts (
+            attempt_id TEXT PRIMARY KEY NOT NULL,
+            case_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'reserved', 'running', 'completed',
+                    'failed', 'cancelled', 'ambiguous'
+                )
+            ),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            target_id TEXT NOT NULL,
+            target_digest TEXT NOT NULL,
+            routing_decision_id TEXT,
+            routing_lease_id TEXT,
+            provider_receipts_json TEXT NOT NULL,
+            usage_json TEXT,
+            reservation_micros INTEGER NOT NULL CHECK (reservation_micros >= 0),
+            actual_cost_micros INTEGER
+                CHECK (actual_cost_micros IS NULL OR actual_cost_micros >= 0),
+            unresolved_cost_micros INTEGER NOT NULL
+                CHECK (unresolved_cost_micros >= 0),
+            validation_passed INTEGER
+                CHECK (validation_passed IS NULL OR validation_passed IN (0, 1)),
+            validation_codes_json TEXT NOT NULL,
+            failure_category TEXT,
+            guardrail_state TEXT NOT NULL CHECK (guardrail_state IN ('clear', 'violated')),
+            evidence_refs_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            UNIQUE (case_id, attempt_number),
+            FOREIGN KEY (case_id)
+                REFERENCES routing_qualification_cases(case_id) ON DELETE RESTRICT,
+            FOREIGN KEY (run_id)
+                REFERENCES routing_qualification_runs(run_id) ON DELETE RESTRICT,
+            FOREIGN KEY (routing_decision_id)
+                REFERENCES routing_decisions(decision_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_qualification_events (
+            run_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, sequence),
+            FOREIGN KEY (run_id)
+                REFERENCES routing_qualification_runs(run_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_qualification_receipts (
+            receipt_id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL,
+            attempt_id TEXT,
+            receipt_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (run_id)
+                REFERENCES routing_qualification_runs(run_id) ON DELETE RESTRICT,
+            FOREIGN KEY (attempt_id)
+                REFERENCES routing_qualification_attempts(attempt_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_activation_grants (
+            grant_id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            scope_digest TEXT NOT NULL,
+            policy_id TEXT NOT NULL,
+            policy_revision INTEGER NOT NULL CHECK (policy_revision >= 1),
+            qualification_receipt_id TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (run_id)
+                REFERENCES routing_qualification_runs(run_id) ON DELETE RESTRICT,
+            FOREIGN KEY (qualification_receipt_id)
+                REFERENCES routing_qualification_receipts(receipt_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_activation_transitions (
+            transition_id TEXT PRIMARY KEY NOT NULL,
+            grant_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            transition_type TEXT NOT NULL CHECK (
+                transition_type IN ('activated', 'suspended', 'resumed', 'revoked')
+            ),
+            reason TEXT NOT NULL,
+            receipt_id TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (grant_id, sequence),
+            FOREIGN KEY (grant_id)
+                REFERENCES routing_activation_grants(grant_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    for statement in (
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_qualification_cases_run ON "
+            "routing_qualification_cases(run_id, case_id)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_qualification_attempts_case ON "
+            "routing_qualification_attempts(case_id, attempt_number)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_qualification_attempts_run ON "
+            "routing_qualification_attempts(run_id, status)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_qualification_receipts_run ON "
+            "routing_qualification_receipts(run_id, created_at)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_activation_transitions_grant ON "
+            "routing_activation_transitions(grant_id, sequence)"
+        ),
+    ):
+        conn.execute(statement)
+
+
+def _ensure_routing_schema_v4_guards(conn: sqlite3.Connection) -> None:
+    """Install idempotent immutability guards for v4 evidence tables."""
+
+    statements = (
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_receipt_update_immutable
+        BEFORE UPDATE ON routing_qualification_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'qualification_receipt_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_receipt_delete_immutable
+        BEFORE DELETE ON routing_qualification_receipts
+        BEGIN
+            SELECT RAISE(ABORT, 'qualification_receipt_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_activation_grant_update_immutable
+        BEFORE UPDATE ON routing_activation_grants
+        BEGIN
+            SELECT RAISE(ABORT, 'activation_grant_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_activation_grant_delete_immutable
+        BEFORE DELETE ON routing_activation_grants
+        BEGIN
+            SELECT RAISE(ABORT, 'activation_grant_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_activation_transition_update_immutable
+        BEFORE UPDATE ON routing_activation_transitions
+        BEGIN
+            SELECT RAISE(ABORT, 'activation_transition_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_activation_transition_delete_immutable
+        BEFORE DELETE ON routing_activation_transitions
+        BEGIN
+            SELECT RAISE(ABORT, 'activation_transition_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_run_update_immutable
+        BEFORE UPDATE ON routing_qualification_runs
+        WHEN OLD.status IN ('cancelled', 'failed', 'completed')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_run_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_run_delete_immutable
+        BEFORE DELETE ON routing_qualification_runs
+        WHEN OLD.status IN ('cancelled', 'failed', 'completed')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_run_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_case_insert_immutable
+        BEFORE INSERT ON routing_qualification_cases
+        WHEN EXISTS (
+            SELECT 1 FROM routing_qualification_runs
+            WHERE run_id = NEW.run_id
+              AND status IN ('cancelled', 'failed', 'completed')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_run_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_attempt_insert_immutable
+        BEFORE INSERT ON routing_qualification_attempts
+        WHEN EXISTS (
+            SELECT 1 FROM routing_qualification_runs
+            WHERE run_id = NEW.run_id
+              AND status IN ('cancelled', 'failed', 'completed')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_run_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_event_insert_immutable
+        BEFORE INSERT ON routing_qualification_events
+        WHEN EXISTS (
+            SELECT 1 FROM routing_qualification_runs
+            WHERE run_id = NEW.run_id
+              AND status IN ('cancelled', 'failed', 'completed')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_run_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_receipt_insert_immutable
+        BEFORE INSERT ON routing_qualification_receipts
+        WHEN EXISTS (
+            SELECT 1 FROM routing_qualification_runs
+            WHERE run_id = NEW.run_id
+              AND status IN ('cancelled', 'failed', 'completed')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_run_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_attempt_update_immutable
+        BEFORE UPDATE ON routing_qualification_attempts
+        WHEN OLD.status IN ('completed', 'failed', 'cancelled', 'ambiguous')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_attempt_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_qualification_terminal_attempt_delete_immutable
+        BEFORE DELETE ON routing_qualification_attempts
+        WHEN OLD.status IN ('completed', 'failed', 'cancelled', 'ambiguous')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal_qualification_attempt_immutable');
+        END
+        """,
+    )
+    for statement in statements:
         conn.execute(statement)

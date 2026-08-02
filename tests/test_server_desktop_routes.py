@@ -813,7 +813,7 @@ def test_desktop_readiness_is_auth_and_nonce_digest_bound(tmp_path: Path) -> Non
         "launch_nonce_digest": sha256(b"launch-nonce").hexdigest(),
         "sidecar_version": "0.5.0",
         "state_schema_version": 21,
-        "routing_schema_version": 3,
+        "routing_schema_version": 4,
         "memory_layers": list(_MEMORY_LAYERS),
     }
     assert "desktop-token" not in response.text
