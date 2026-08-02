@@ -310,6 +310,17 @@ describe("RoutingCenter", () => {
     expect(screen.queryByText("secret://cloud-key")).not.toBeInTheDocument();
   });
 
+  it("links LAN-discovered targets to the explicit discovery workspace", async () => {
+    render(<RoutingCenter />);
+    await screen.findAllByText("Local server");
+
+    const link = screen.getByRole("link", { name: /discover lan models/i });
+    expect(link).toHaveAttribute("href", "#/flock/lan");
+    expect(
+      screen.getByText(/LAN targets are reviewed and enabled in LAN discovery/i),
+    ).toBeVisible();
+  });
+
   it("preserves the revision-aware target save contract", async () => {
     render(<RoutingCenter />);
     await screen.findAllByText("Local server");

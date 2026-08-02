@@ -41,7 +41,13 @@ describe("FlockWorkspace", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("does not imply that LAN discovery has scanned or trusted a model", () => {
+  it("does not call discovery endpoints merely by opening the LAN workspace", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createFixtureFetch((request) => requests.push(request.path)),
+    );
+
     render(
       <FlockWorkspace
         subroute="lan"
@@ -57,7 +63,13 @@ describe("FlockWorkspace", () => {
     ).toBeVisible();
     expect(screen.getByText(/no LAN scan has run/i)).toBeVisible();
     expect(
-      screen.queryByRole("button", { name: /scan|trust|enable/i }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Scan network" }),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(requests).not.toContain("/api/routing/lan/interfaces");
+      expect(
+        requests.some((path) => path.includes("/lan/scans")),
+      ).toBe(false);
+    });
   });
 });

@@ -1,7 +1,8 @@
-import { Bird, Network, ShieldCheck } from "lucide-react";
+import { Bird, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import { StatusBadge } from "../components";
 import { RoutingCenter } from "../routing/RoutingCenter";
+import { LanDiscoveryPanel } from "./lan/LanDiscoveryPanel";
 
 export function FlockWorkspace({
   subroute,
@@ -26,13 +27,7 @@ export function FlockWorkspace({
     );
   }
   if (subroute === "lan" || subroute === "discovery") {
-    return (
-      <DependencySurface
-        title="LAN model discovery"
-        detail="LAN discovery is not available in this build. No LAN scan has run, and Kestrel has not trusted or enabled any network model."
-        icon={<Network size={20} />}
-      />
-    );
+    return <LanDiscoveryPanel onError={onError} onNotice={onNotice} />;
   }
 
   return (
@@ -55,8 +50,8 @@ export function FlockWorkspace({
             </a>
             <a className="data-row" href="#/flock/lan">
               <strong>LAN model discovery</strong>
-              <StatusBadge value="unavailable" />
-              <span>Requires the explicit private-network discovery service.</span>
+              <StatusBadge value="available" />
+              <span>Explicit owner-confirmed private-network discovery.</span>
             </a>
           </div>
         </section>
