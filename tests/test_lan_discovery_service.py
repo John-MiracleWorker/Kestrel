@@ -6,11 +6,13 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta, timezone
+from importlib import import_module
 from pathlib import Path
 from threading import Event
 
 import pytest
 
+import nested_memvid_agent.routing.lan_serialization as lan_serialization_module
 from nested_memvid_agent.lan_discovery_models import (
     NetworkInterface,
     ResolvedLanEndpoint,
@@ -78,6 +80,8 @@ PROFILE_PROTECTED_KEYS = {
     "capability_digest",
     "observed_at",
     "fresh_until",
+    "observation_source",
+    "endpoint_kind",
     "runtime_adapter",
     "runtime_hardening",
     "stale_reason",
@@ -107,6 +111,8 @@ TARGET_PROTECTED_KEYS = {
     "capability_claims",
     "observed_at",
     "fresh_until",
+    "observation_source",
+    "endpoint_kind",
     "runtime_adapter",
     "runtime_hardening",
     "material_binding_digest",
@@ -194,6 +200,127 @@ def _positive_observation(
     )
 
 
+def _manual_endpoint_type():
+    """Resolve the Task 7A type lazily so this file collects on the frozen base."""
+
+    return import_module("nested_memvid_agent.lan_discovery_models").ManualLanEndpoint
+
+
+def _manual_limits(port: int = 5001) -> dict[str, object]:
+    return {
+        "mode": "manual",
+        "exact_port": port,
+        "max_active_hosts": 1,
+        "max_scan_concurrency": 1,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 262144,
+        "max_discovered_models": 8,
+        "mdns_enabled": False,
+    }
+
+
+def _automatic_limits() -> dict[str, object]:
+    return {
+        "known_model_service_ports": [1234, 8000, 8080, 11434],
+        "max_active_hosts": 256,
+        "max_scan_concurrency": 16,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 262144,
+        "max_discovered_models": 8,
+        "mdns_window_seconds": 2.5,
+    }
+
+
+def _manual_preview_contract_version() -> str:
+    value = import_module(
+        "nested_memvid_agent.lan_scan_manager"
+    ).LAN_MANUAL_PREVIEW_CONTRACT_VERSION
+    assert value == "kestrel.lan.manual-preview-authorization.v1"
+    return value
+
+
+def _manual_server_version() -> str:
+    value = import_module("nested_memvid_agent.lan_scan_manager").LAN_SERVER_VERSION
+    assert value == "kestrel-local-runtime-v1"
+    return value
+
+
+def _manual_scope(
+    *,
+    network: str = "192.168.50.2/32",
+    os_identity: str = "test:en0",
+    addresses: tuple[str, ...] = ("192.168.50.1/29",),
+) -> PrivateScanScope:
+    return _scope(
+        network=network,
+        os_identity=os_identity,
+        addresses=addresses,
+    )
+
+
+def _manual_observation(
+    *,
+    scope: PrivateScanScope | None = None,
+    address: str = "192.168.50.2",
+    port: int = 5001,
+    api_shape: ApiShape = ApiShape.OPENAI_COMPATIBLE,
+    models: tuple[str, ...] = ("alpha",),
+):
+    active_scope = scope or _manual_scope()
+    endpoint = _manual_endpoint_type().from_exact_scope(active_scope, address, port)
+    route = (
+        LanRequestRoute.OPENAI_GENERATION.path
+        if api_shape is ApiShape.OPENAI_COMPATIBLE
+        else LanRequestRoute.OLLAMA_GENERATION.path
+    )
+    return _make_observation(
+        endpoint,
+        reachability=Reachability.REACHABLE,
+        transport_security=TransportSecurity.PLAIN_HTTP,
+        api_shape=api_shape,
+        catalog=models,
+        catalog_complete=True,
+        catalog_truncated=False,
+        capabilities=_capabilities(),
+        capability_route=route,
+        selected_model_id=models[0],
+        failure_category=None,
+    )
+
+
+def _manual_preview_event(
+    scope: PrivateScanScope,
+    *,
+    port: int = 5001,
+) -> dict[str, object]:
+    limits = _manual_limits(port)
+    return {
+        "schema": "kestrel.lan.scan-preview.manual.v1",
+        "mode": "manual",
+        "endpoint_kind": "manual",
+        "observation_source": "manual",
+        "owner_principal": OWNER,
+        "interface_id": scope.interface.interface_id,
+        "network": scope.network,
+        "limits": limits,
+        "active_host_count": 1,
+        "passive_or_manual_only": True,
+        "port_count": 1,
+        "exact_port": port,
+        "mdns_status": "unavailable",
+        "server_version": _manual_server_version(),
+        "contract_version": _manual_preview_contract_version(),
+        "preview_digest": PREVIEW_DIGEST,
+        "expires_at": "2099-08-01T12:00:30Z",
+        "confirmed": True,
+        "privacy_acknowledged": True,
+    }
+
+
 def _outage_observation(*, scope: PrivateScanScope | None = None):
     active_scope = scope or _scope()
     endpoint = ResolvedLanEndpoint.from_scope(active_scope, "192.168.50.2", 1234)
@@ -271,6 +398,7 @@ def _persist_completed_scan(
     scope: PrivateScanScope | None = None,
     observed_at: datetime = NOW,
     owner_principal: str = OWNER,
+    source: str = "active",
 ):
     active_scope = scope or _scope()
     ledger = LanDiscoveryLedger(state)
@@ -304,7 +432,7 @@ def _persist_completed_scan(
             observation,
             scope=active_scope,
             freshness_timestamp=observed_at.isoformat().replace("+00:00", "Z"),
-            source="active",
+            source=source,
         ),
         expected_revision=running.revision,
     )
@@ -403,6 +531,62 @@ def _persist_completed_scan_v2(
     persisted = tuple(ledger.list_observations(scan_id))
     assert len(persisted) == len(drafts)
     return persisted, completed
+
+
+def _persist_completed_manual_scan(
+    state: AgentStateStore,
+    *,
+    scan_id: str,
+    observation,
+    scope: PrivateScanScope | None = None,
+    observed_at: datetime = NOW,
+):
+    """Persist Task 7B evidence only through the receipt-authenticated public APIs."""
+
+    active_scope = scope or _manual_scope()
+    port = observation.endpoint.port
+    limits = _manual_limits(port)
+    ledger = LanDiscoveryLedger(state)
+    running = ledger.create_and_claim_manual_scan(
+        scan_id=scan_id,
+        owner_principal=OWNER,
+        confirmed_interface_id=active_scope.interface.interface_id,
+        network=active_scope.network,
+        limits=limits,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event=_manual_preview_event(active_scope, port=port),
+        expected_revision=0,
+    )
+    assert running.status == "running"
+    assert running.revision == 2
+    draft = lan_observation_to_draft(
+        observation,
+        scope=active_scope,
+        freshness_timestamp=observed_at.isoformat().replace("+00:00", "Z"),
+        source="manual",
+    )
+    completed = ledger.commit_scan_terminal(
+        running.scan_id,
+        owner_principal=OWNER,
+        expected_revision=running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=(draft,),
+        mdns_status="unavailable",
+        planned_count=1,
+        admitted_count=1,
+        completed_count=1,
+        error_category_counts={},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+    rows = tuple(ledger.list_observations(scan_id))
+    assert len(rows) == 1
+    assert completed.terminal_receipt_digest is not None
+    return rows[0], completed
 
 
 def _unchecked_clone(value, **changes: object):
@@ -552,6 +736,155 @@ def _rewrite_terminal_receipt(
     LanDiscoveryLedger(state)
 
 
+def _rewrite_scan_limits_and_receipt(
+    state: AgentStateStore,
+    scan_id: str,
+    limits: dict[str, object],
+) -> str:
+    ledger = LanDiscoveryLedger(state)
+    scan = ledger.get_scan(scan_id)
+    assert scan is not None and scan.terminal_receipt is not None
+    receipt = json.loads(json.dumps(scan.terminal_receipt))
+    limits_digest = _digest(limits)
+    receipt["limits"] = limits
+    receipt["limits_digest"] = limits_digest
+    receipt_json = json.dumps(
+        receipt,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    receipt_digest = _digest(receipt)
+    limits_json = json.dumps(
+        limits,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    with state._connect() as connection:
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_scan_update_immutable")
+        connection.execute(
+            """
+            UPDATE routing_lan_scans
+            SET limits_json = ?, limits_digest = ?,
+                terminal_receipt_json = ?, terminal_receipt_digest = ?
+            WHERE scan_id = ?
+            """,
+            (limits_json, limits_digest, receipt_json, receipt_digest, scan_id),
+        )
+    LanDiscoveryLedger(state)
+    return receipt_digest
+
+
+def _rewrite_scan_started_event(
+    state: AgentStateStore,
+    scan_id: str,
+    *,
+    mutate,
+) -> None:
+    with state._connect() as connection:
+        row = connection.execute(
+            """
+            SELECT sequence, payload_json FROM routing_lan_scan_events
+            WHERE scan_id = ? AND event_type = 'scan_started'
+            """,
+            (scan_id,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(str(row["payload_json"]))
+        mutate(payload)
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_event_update_immutable")
+        connection.execute(
+            """
+            UPDATE routing_lan_scan_events SET payload_json = ?
+            WHERE scan_id = ? AND sequence = ?
+            """,
+            (
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                scan_id,
+                row["sequence"],
+            ),
+        )
+    LanDiscoveryLedger(state)
+
+
+def _rewrite_scan_started_event_row(
+    state: AgentStateStore,
+    scan_id: str,
+    *,
+    sequence: int | None = None,
+    created_at: str | None = None,
+) -> None:
+    with state._connect() as connection:
+        row = connection.execute(
+            """
+            SELECT sequence, created_at FROM routing_lan_scan_events
+            WHERE scan_id = ? AND event_type = 'scan_started'
+            """,
+            (scan_id,),
+        ).fetchone()
+        assert row is not None
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_event_update_immutable")
+        connection.execute(
+            """
+            UPDATE routing_lan_scan_events
+            SET sequence = ?, created_at = ?
+            WHERE scan_id = ? AND sequence = ?
+            """,
+            (
+                row["sequence"] if sequence is None else sequence,
+                row["created_at"] if created_at is None else created_at,
+                scan_id,
+                row["sequence"],
+            ),
+        )
+    LanDiscoveryLedger(state)
+
+
+def _rewrite_scan_started_at_encoding(state: AgentStateStore, scan_id: str) -> None:
+    ledger = LanDiscoveryLedger(state)
+    scan = ledger.get_scan(scan_id)
+    assert scan is not None and scan.started_at is not None and scan.terminal_receipt is not None
+    forged_started_at = scan.started_at.replace("+00:00", "Z")
+    assert forged_started_at != scan.started_at
+    receipt = json.loads(json.dumps(scan.terminal_receipt))
+    receipt["started_at"] = forged_started_at
+    receipt_json = json.dumps(
+        receipt,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    with state._connect() as connection:
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_scan_update_immutable")
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_event_update_immutable")
+        connection.execute(
+            """
+            UPDATE routing_lan_scans
+            SET started_at = ?, terminal_receipt_json = ?, terminal_receipt_digest = ?
+            WHERE scan_id = ?
+            """,
+            (forged_started_at, receipt_json, _digest(receipt), scan_id),
+        )
+        connection.execute(
+            """
+            UPDATE routing_lan_scan_events SET created_at = ?
+            WHERE scan_id = ? AND event_type = 'scan_started'
+            """,
+            (forged_started_at, scan_id),
+        )
+    LanDiscoveryLedger(state)
+
+
 def _rewrite_observation_and_membership(
     state: AgentStateStore,
     scan_id: str,
@@ -622,6 +955,27 @@ def _rewrite_observation_and_membership(
     LanDiscoveryLedger(state)
 
 
+def _endpoint_fingerprint_digest(protected: dict[str, object]) -> str:
+    preimage = {
+        "schema": "kestrel.lan.endpoint-fingerprint.v1",
+        "endpoint_binding_digest": protected["endpoint_binding_digest"],
+        "interface_id": protected["interface_id"],
+        "confirmed_network": protected["confirmed_network"],
+        "address": protected["address"],
+        "port": protected["port"],
+        "transport_security": protected["transport_security"],
+        "certificate_sha256": protected["certificate_sha256"],
+        "api_shape": protected["api_shape"],
+    }
+    if (
+        protected.get("observation_source") == "manual"
+        or protected.get("endpoint_kind") == "manual"
+    ):
+        preimage["observation_source"] = protected["observation_source"]
+        preimage["endpoint_kind"] = protected["endpoint_kind"]
+    return _digest(preimage)
+
+
 def _review_material_digest(
     protected: dict[str, object],
     *,
@@ -630,33 +984,38 @@ def _review_material_digest(
     intended_roles: tuple[str, ...],
     task_family_affinities: tuple[str, ...],
 ) -> str:
-    return _digest(
-        {
-            "schema": "kestrel.lan.material-binding.v1",
-            "provider_profile_id": protected["provider_profile_id"],
-            "target_id": _target_id(
-                str(protected["provider_profile_id"]),
-                str(protected["model_id"]),
-            ),
-            "endpoint_fingerprint": protected["endpoint_fingerprint"],
-            "endpoint_binding_digest": protected["endpoint_binding_digest"],
-            "interface_id": protected["interface_id"],
-            "confirmed_network": protected["confirmed_network"],
-            "address": protected["address"],
-            "port": protected["port"],
-            "transport_security": protected["transport_security"],
-            "certificate_sha256": protected["certificate_sha256"],
-            "api_shape": protected["api_shape"],
-            "model_id": protected["model_id"],
-            "catalog_digest": protected["catalog_digest"],
-            "capability_digest": protected["capability_digest"],
-            "capability_claims": protected["capability_claims"],
-            "trust_class": trust_class,
-            "privacy_acknowledgement_digest": privacy_acknowledgement_digest,
-            "intended_roles": list(intended_roles),
-            "task_family_affinities": list(task_family_affinities),
-        }
-    )
+    preimage = {
+        "schema": "kestrel.lan.material-binding.v1",
+        "provider_profile_id": protected["provider_profile_id"],
+        "target_id": _target_id(
+            str(protected["provider_profile_id"]),
+            str(protected["model_id"]),
+        ),
+        "endpoint_fingerprint": protected["endpoint_fingerprint"],
+        "endpoint_binding_digest": protected["endpoint_binding_digest"],
+        "interface_id": protected["interface_id"],
+        "confirmed_network": protected["confirmed_network"],
+        "address": protected["address"],
+        "port": protected["port"],
+        "transport_security": protected["transport_security"],
+        "certificate_sha256": protected["certificate_sha256"],
+        "api_shape": protected["api_shape"],
+        "model_id": protected["model_id"],
+        "catalog_digest": protected["catalog_digest"],
+        "capability_digest": protected["capability_digest"],
+        "capability_claims": protected["capability_claims"],
+        "trust_class": trust_class,
+        "privacy_acknowledgement_digest": privacy_acknowledgement_digest,
+        "intended_roles": list(intended_roles),
+        "task_family_affinities": list(task_family_affinities),
+    }
+    if (
+        protected.get("observation_source") == "manual"
+        or protected.get("endpoint_kind") == "manual"
+    ):
+        preimage["observation_source"] = protected["observation_source"]
+        preimage["endpoint_kind"] = protected["endpoint_kind"]
+    return _digest(preimage)
 
 
 def _exact_review_request(
@@ -6447,6 +6806,113 @@ def test_runtime_interface_binding_digest_clears_on_every_stale_transition(
     )
 
 
+@pytest.mark.parametrize("resource", ("profile", "target"))
+@pytest.mark.parametrize("missing_field", ("observation_source", "endpoint_kind"))
+@pytest.mark.parametrize("operation", ("read", "review", "runtime"))
+def test_partial_legacy_source_or_kind_metadata_fails_closed_without_writes(
+    tmp_path: Path,
+    resource: str,
+    missing_field: str,
+    operation: str,
+) -> None:
+    state = AgentStateStore(tmp_path / operation / resource / missing_field / "agent.db")
+    (
+        _observation,
+        _scan,
+        registry,
+        _service,
+        _result,
+        provider_id,
+        (target_id,),
+    ) = _import_first_positive(
+        state,
+        scan_id=f"scan-partial-legacy-{resource}-{missing_field}",
+    )
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    review, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=False,
+    )
+
+    table, id_column, resource_id = {
+        "profile": ("routing_provider_profiles", "profile_id", provider_id),
+        "target": ("routing_model_targets", "target_id", target_id),
+    }[resource]
+    surviving_field = (
+        "endpoint_kind" if missing_field == "observation_source" else "observation_source"
+    )
+    with state._connect() as connection:
+        row = connection.execute(
+            f"SELECT metadata_json FROM {table} WHERE {id_column} = ?",
+            (resource_id,),
+        ).fetchone()
+        assert row is not None
+        metadata = json.loads(str(row[0]))
+        protected = metadata["lan_discovery"]
+        protected["observation_source"] = "active"
+        protected["endpoint_kind"] = "automatic"
+        protected.pop(missing_field)
+        assert missing_field not in protected
+        assert protected[surviving_field] in {"active", "automatic"}
+        connection.execute(
+            f"UPDATE {table} SET metadata_json = ? WHERE {id_column} = ?",
+            (
+                json.dumps(
+                    metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+                resource_id,
+            ),
+        )
+
+    before = _routing_inventory_snapshot(state)
+    error_pattern = "protected metadata.*field set"
+    inventory_calls = 0
+
+    def forbidden_inventory() -> CurrentLanInterfaceInventory:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        raise AssertionError("partial legacy metadata must fail before inventory")
+
+    if operation == "read":
+        if resource == "profile":
+            assert registry.get_model_target(target_id) == target
+            with pytest.raises(ValueError, match=error_pattern):
+                registry.get_provider_profile(provider_id)
+        else:
+            assert registry.get_provider_profile(provider_id) == profile
+            with pytest.raises(ValueError, match=error_pattern):
+                registry.get_model_target(target_id)
+    elif operation == "review":
+        service = _task5b_service(
+            registry,
+            interface_inventory_resolver=forbidden_inventory,
+        )
+        with pytest.raises(LanDiscoveryConflict, match=error_pattern):
+            service.review_lan_target(
+                review,
+                authenticated_owner_principal=OWNER,
+            )
+    else:
+        with pytest.raises(ValueError, match=error_pattern):
+            registry.resolve_lan_runtime_authority(
+                target_id,
+                clock=lambda: NOW,
+                interface_inventory_resolver=forbidden_inventory,
+            )
+    assert inventory_calls == 0
+    assert _routing_inventory_snapshot(state) == before
+
+
 def test_task5b_positive_reimport_upgrades_exact_legacy_task5a_target_shape(
     tmp_path: Path,
 ) -> None:
@@ -6467,7 +6933,11 @@ def test_task5b_positive_reimport_upgrades_exact_legacy_task5a_target_shape(
         ).fetchone()
         assert row is not None
         metadata = json.loads(str(row[0]))
+        legacy_endpoint_binding_digest = metadata["lan_discovery"]["endpoint_binding_digest"]
+        legacy_material_binding_digest = metadata["lan_discovery"]["material_binding_digest"]
         metadata["lan_discovery"].pop("reviewed_runtime_interface_binding_digest")
+        metadata["lan_discovery"].pop("observation_source", None)
+        metadata["lan_discovery"].pop("endpoint_kind", None)
         legacy_json = json.dumps(
             metadata,
             sort_keys=True,
@@ -6479,19 +6949,50 @@ def test_task5b_positive_reimport_upgrades_exact_legacy_task5a_target_shape(
             "UPDATE routing_model_targets SET metadata_json = ? WHERE target_id = ?",
             (legacy_json, target_id),
         )
+        profile_row = connection.execute(
+            "SELECT metadata_json FROM routing_provider_profiles WHERE profile_id = ?",
+            (provider_id,),
+        ).fetchone()
+        assert profile_row is not None
+        profile_metadata = json.loads(str(profile_row[0]))
+        profile_metadata["lan_discovery"].pop("observation_source", None)
+        profile_metadata["lan_discovery"].pop("endpoint_kind", None)
+        legacy_profile_json = json.dumps(
+            profile_metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        connection.execute(
+            "UPDATE routing_provider_profiles SET metadata_json = ? WHERE profile_id = ?",
+            (legacy_profile_json, provider_id),
+        )
 
     registry = RoutingLedger(state)
     profile = registry.get_provider_profile(provider_id)
     normalized = registry.get_model_target(target_id)
     assert profile is not None and normalized is not None
+    normalized_profile_protected = profile.profile.metadata["lan_discovery"]
     normalized_protected = normalized.target.metadata["lan_discovery"]
+    assert normalized_profile_protected["observation_source"] == "active"
+    assert normalized_profile_protected["endpoint_kind"] == "automatic"
+    assert normalized_protected["observation_source"] == "active"
+    assert normalized_protected["endpoint_kind"] == "automatic"
+    assert normalized_protected["endpoint_binding_digest"] == legacy_endpoint_binding_digest
+    assert normalized_protected["material_binding_digest"] == legacy_material_binding_digest
     assert normalized_protected["reviewed_runtime_interface_binding_digest"] is None
     with state._connect() as connection:
         persisted = connection.execute(
             "SELECT metadata_json FROM routing_model_targets WHERE target_id = ?",
             (target_id,),
         ).fetchone()
+        persisted_profile = connection.execute(
+            "SELECT metadata_json FROM routing_provider_profiles WHERE profile_id = ?",
+            (provider_id,),
+        ).fetchone()
     assert persisted is not None and str(persisted[0]) == legacy_json
+    assert persisted_profile is not None and str(persisted_profile[0]) == legacy_profile_json
 
     blocked_enable, _privacy, _material = _exact_review_request(
         owner=OWNER,
@@ -6530,7 +7031,13 @@ def test_task5b_positive_reimport_upgrades_exact_legacy_task5a_target_shape(
             "SELECT metadata_json FROM routing_model_targets WHERE target_id = ?",
             (target_id,),
         ).fetchone()
+        profile_after_review = connection.execute(
+            "SELECT metadata_json FROM routing_provider_profiles WHERE profile_id = ?",
+            (provider_id,),
+        ).fetchone()
     assert after_review is not None and str(after_review[0]) == legacy_json
+    assert profile_after_review is not None
+    assert str(profile_after_review[0]) == legacy_profile_json
 
     _row, completed = _persist_completed_scan(
         state,
@@ -6551,9 +7058,16 @@ def test_task5b_positive_reimport_upgrades_exact_legacy_task5a_target_shape(
         authenticated_owner_principal=OWNER,
     )
     assert upgraded.profile is not None
+    upgraded_profile_protected = upgraded.profile.profile.metadata["lan_discovery"]
     upgraded_target = upgraded.targets[0]
     upgraded_protected = upgraded_target.target.metadata["lan_discovery"]
+    assert upgraded_profile_protected["observation_source"] == "active"
+    assert upgraded_profile_protected["endpoint_kind"] == "automatic"
     assert set(upgraded_protected) == TARGET_PROTECTED_KEYS
+    assert upgraded_protected["observation_source"] == "active"
+    assert upgraded_protected["endpoint_kind"] == "automatic"
+    assert upgraded_protected["endpoint_binding_digest"] == legacy_endpoint_binding_digest
+    assert upgraded_protected["material_binding_digest"] == legacy_material_binding_digest
     assert upgraded_protected["runtime_hardening"] is not None
     assert upgraded_protected["reviewed_runtime_interface_binding_digest"] is None
 
@@ -7091,6 +7605,648 @@ def test_ollama_import_stays_disabled_and_cannot_fallback_to_generic_runtime(
         match="lan_runtime_hardening_unavailable",
     ):
         service.review_lan_target(request, authenticated_owner_principal=OWNER)
+    assert registry.get_provider_profile(provider_id) == profile
+    assert registry.get_model_target(target_id) == target
+
+
+def test_task7b_manual_loader_authenticates_receipt_bound_source_before_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scope = _manual_scope()
+    observation = _manual_observation(scope=scope)
+    row, completed = _persist_completed_manual_scan(
+        state,
+        scan_id="scan-task7b-manual-loader",
+        observation=observation,
+        scope=scope,
+    )
+    assert completed.terminal_receipt_digest is not None
+
+    with state._connect() as connection:
+        authenticated = load_authenticated_task4_observation(
+            connection,
+            scan_id=completed.scan_id,
+            endpoint_binding_digest=observation.endpoint_binding_digest,
+            expected_terminal_receipt_digest=completed.terminal_receipt_digest,
+            expected_observation_digest=observation.observation_digest,
+            authenticated_owner_principal=OWNER,
+        )
+
+    assert authenticated.source == "manual"
+    assert type(authenticated.observation.endpoint) is _manual_endpoint_type()
+    assert authenticated.observation.endpoint.kind == "manual"
+    assert authenticated.observation.endpoint.port == 5001
+    assert authenticated.confirmed_network == "192.168.50.2/32"
+
+    with state._connect() as connection:
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_observation_update_immutable")
+        connection.execute(
+            """
+            UPDATE routing_lan_observations
+            SET source = 'active'
+            WHERE scan_id = ? AND endpoint_id = ?
+            """,
+            (completed.scan_id, row.endpoint_id),
+        )
+
+    reconstruction_calls = 0
+
+    def forbidden_reconstruction(*_args: object, **_kwargs: object) -> object:
+        nonlocal reconstruction_calls
+        reconstruction_calls += 1
+        raise AssertionError("receipt membership must authenticate source first")
+
+    for name in (
+        "validate_observation",
+        "_validate_task4_draft_preimage",
+        "_task4_observation_from_row",
+        "_make_observation",
+    ):
+        monkeypatch.setattr(
+            lan_serialization_module,
+            name,
+            forbidden_reconstruction,
+        )
+    with state._connect() as connection:
+        with pytest.raises(ValueError, match="receipt|membership"):
+            load_authenticated_task4_observation(
+                connection,
+                scan_id=completed.scan_id,
+                endpoint_binding_digest=observation.endpoint_binding_digest,
+                expected_terminal_receipt_digest=completed.terminal_receipt_digest,
+                expected_observation_digest=observation.observation_digest,
+                authenticated_owner_principal=OWNER,
+            )
+    assert reconstruction_calls == 0
+
+
+@pytest.mark.parametrize(
+    "authority_mismatch",
+    (
+        "manual_limits_port",
+        "manual_limits_automatic_source",
+        "automatic_limits_manual_source",
+    ),
+)
+def test_task7b_loader_and_import_bind_limits_to_authenticated_endpoint_authority(
+    tmp_path: Path,
+    authority_mismatch: str,
+) -> None:
+    state = AgentStateStore(tmp_path / authority_mismatch / "agent.db")
+    if authority_mismatch == "manual_limits_automatic_source":
+        scope = _scope()
+        observation = _positive_observation(scope=scope)
+        _rows, completed = _persist_completed_scan_v2(
+            state,
+            scan_id=f"scan-{authority_mismatch}",
+            observations=(observation,),
+            scope=scope,
+        )
+        forged_limits = _manual_limits(1234)
+    else:
+        scope = _manual_scope()
+        observation = _manual_observation(scope=scope)
+        _row, completed = _persist_completed_manual_scan(
+            state,
+            scan_id=f"scan-{authority_mismatch}",
+            observation=observation,
+            scope=scope,
+        )
+        forged_limits = (
+            _manual_limits(5002)
+            if authority_mismatch == "manual_limits_port"
+            else _automatic_limits()
+        )
+    receipt_digest = _rewrite_scan_limits_and_receipt(
+        state,
+        completed.scan_id,
+        forged_limits,
+    )
+
+    with (
+        state._connect() as connection,
+        pytest.raises(
+            ValueError,
+            match="limits|manual|source|kind|port|event",
+        ),
+    ):
+        load_authenticated_task4_observation(
+            connection,
+            scan_id=completed.scan_id,
+            endpoint_binding_digest=observation.endpoint_binding_digest,
+            expected_terminal_receipt_digest=receipt_digest,
+            expected_observation_digest=observation.observation_digest,
+            authenticated_owner_principal=OWNER,
+        )
+
+    current = LanDiscoveryLedger(state).get_scan(completed.scan_id)
+    assert current is not None and current.terminal_receipt_digest == receipt_digest
+    target_id = _target_id(_provider_id(observation.endpoint_binding_digest), "alpha")
+    with pytest.raises(LanDiscoveryConflict):
+        LanDiscoveryService(RoutingLedger(state), clock=lambda: NOW).import_observation(
+            _import_request(
+                observation,
+                current,
+                profile_revision=0,
+                target_revisions=((target_id, 0),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+    assert RoutingLedger(state).list_provider_profiles() == []
+    assert RoutingLedger(state).list_model_targets() == []
+
+
+@pytest.mark.parametrize(
+    "event_mismatch",
+    ("network", "port_and_limits", "source", "kind"),
+)
+def test_task7b_manual_loader_and_import_bind_start_event_to_authenticated_authority(
+    tmp_path: Path,
+    event_mismatch: str,
+) -> None:
+    state = AgentStateStore(tmp_path / event_mismatch / "agent.db")
+    scope = _manual_scope()
+    observation = _manual_observation(scope=scope)
+    _row, completed = _persist_completed_manual_scan(
+        state,
+        scan_id=f"scan-manual-event-{event_mismatch}",
+        observation=observation,
+        scope=scope,
+    )
+
+    def mutate(payload: dict[str, object]) -> None:
+        if event_mismatch == "network":
+            payload["network"] = "192.168.50.3/32"
+        elif event_mismatch == "port_and_limits":
+            payload["exact_port"] = 5002
+            payload["limits"] = _manual_limits(5002)
+        elif event_mismatch == "source":
+            payload["observation_source"] = "active"
+        else:
+            payload["endpoint_kind"] = "automatic"
+
+    _rewrite_scan_started_event(state, completed.scan_id, mutate=mutate)
+
+    assert completed.terminal_receipt_digest is not None
+    with (
+        state._connect() as connection,
+        pytest.raises(
+            ValueError,
+            match="event|manual|source|kind|network|port|limits",
+        ),
+    ):
+        load_authenticated_task4_observation(
+            connection,
+            scan_id=completed.scan_id,
+            endpoint_binding_digest=observation.endpoint_binding_digest,
+            expected_terminal_receipt_digest=completed.terminal_receipt_digest,
+            expected_observation_digest=observation.observation_digest,
+            authenticated_owner_principal=OWNER,
+        )
+
+    target_id = _target_id(_provider_id(observation.endpoint_binding_digest), "alpha")
+    with pytest.raises(LanDiscoveryConflict):
+        LanDiscoveryService(RoutingLedger(state), clock=lambda: NOW).import_observation(
+            _import_request(
+                observation,
+                completed,
+                profile_revision=0,
+                target_revisions=((target_id, 0),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+    assert RoutingLedger(state).list_provider_profiles() == []
+    assert RoutingLedger(state).list_model_targets() == []
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "server_version",
+        "contract_version",
+        "expires_at",
+        "started_at_encoding",
+        "start_sequence",
+        "start_created_at",
+        "terminal_mdns_status",
+        "terminal_counts",
+    ),
+)
+def test_task7b_manual_loader_rejects_recomputed_nonexact_lifecycle_evidence(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    state = AgentStateStore(tmp_path / forgery / "agent.db")
+    scope = _manual_scope()
+    observation = _manual_observation(scope=scope)
+    _row, completed = _persist_completed_manual_scan(
+        state,
+        scan_id=f"scan-manual-lifecycle-{forgery}",
+        observation=observation,
+        scope=scope,
+    )
+
+    if forgery in {"server_version", "contract_version", "expires_at"}:
+
+        def mutate_start(payload: dict[str, object]) -> None:
+            if forgery == "server_version":
+                payload["server_version"] = "kestrel-local-runtime-v2"
+            elif forgery == "contract_version":
+                payload["contract_version"] = "kestrel.lan.manual-preview-authorization.v2"
+            else:
+                with state._connect() as connection:
+                    started_at = connection.execute(
+                        "SELECT started_at FROM routing_lan_scans WHERE scan_id = ?",
+                        (completed.scan_id,),
+                    ).fetchone()["started_at"]
+                assert type(started_at) is str
+                payload["expires_at"] = started_at.replace("+00:00", "Z")
+
+        _rewrite_scan_started_event(state, completed.scan_id, mutate=mutate_start)
+    elif forgery == "start_sequence":
+        _rewrite_scan_started_event_row(state, completed.scan_id, sequence=3)
+    elif forgery == "started_at_encoding":
+        _rewrite_scan_started_at_encoding(state, completed.scan_id)
+    elif forgery == "start_created_at":
+        _rewrite_scan_started_event_row(
+            state,
+            completed.scan_id,
+            created_at="2099-08-01T12:00:00+00:00",
+        )
+    else:
+
+        def mutate_receipt(receipt: dict[str, object]) -> None:
+            if forgery == "terminal_mdns_status":
+                receipt["mdns_status"] = "available"
+            else:
+                receipt["planned_count"] = 2
+
+        _rewrite_terminal_receipt(
+            state,
+            completed.scan_id,
+            mutate=mutate_receipt,
+            recompute_digest=True,
+        )
+
+    forged = LanDiscoveryLedger(state).get_scan(completed.scan_id)
+    assert forged is not None and forged.terminal_receipt_digest is not None
+    with (
+        state._connect() as connection,
+        pytest.raises(ValueError, match="manual|start|preview|version|expiration|mDNS|count"),
+    ):
+        load_authenticated_task4_observation(
+            connection,
+            scan_id=forged.scan_id,
+            endpoint_binding_digest=observation.endpoint_binding_digest,
+            expected_terminal_receipt_digest=forged.terminal_receipt_digest,
+            expected_observation_digest=observation.observation_digest,
+            authenticated_owner_principal=OWNER,
+        )
+
+
+def test_task7b_observation_projection_requires_source_and_endpoint_kind_to_agree() -> None:
+    manual_scope = _manual_scope()
+    manual = _manual_observation(scope=manual_scope)
+    with pytest.raises(ValueError, match="source|kind|manual|automatic"):
+        lan_observation_to_draft(
+            manual,
+            scope=manual_scope,
+            freshness_timestamp="2026-08-01T12:00:00Z",
+            source="active",
+        )
+
+    automatic_scope = _scope()
+    automatic = _positive_observation(scope=automatic_scope)
+    with pytest.raises(ValueError, match="source|kind|manual|automatic"):
+        lan_observation_to_draft(
+            automatic,
+            scope=automatic_scope,
+            freshness_timestamp="2026-08-01T12:00:00Z",
+            source="manual",
+        )
+
+
+def test_task7b_automatic_binding_digest_bytes_remain_v1_compatible(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        _observation,
+        _scan,
+        registry,
+        service,
+        _imported,
+        provider_id,
+        (target_id,),
+    ) = _import_first_positive(state, scan_id="scan-task7b-automatic-digest-compat")
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    protected = target.target.metadata["lan_discovery"]
+
+    assert protected.get("observation_source", "active") == "active"
+    assert protected.get("endpoint_kind", "automatic") == "automatic"
+    assert protected["endpoint_fingerprint"] == (
+        "sha256:710f27d898f47ef2d7e65aab6d7f324a8ce39c1f32ec0b3fbd8baeeb3664e1a5"
+    )
+    assert _endpoint_fingerprint_digest(protected) == protected["endpoint_fingerprint"]
+    assert protected["material_binding_digest"] == (
+        "sha256:4426eb4158fdd43f417eea3371a43e693258654cac8082aa755d21e5adb5f28c"
+    )
+    assert (
+        _review_material_digest(
+            protected,
+            trust_class="unconfirmed",
+            privacy_acknowledgement_digest=None,
+            intended_roles=(),
+            task_family_affinities=(),
+        )
+        == protected["material_binding_digest"]
+    )
+
+    request, privacy_digest, reviewed_material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=protected,
+    )
+    assert privacy_digest == (
+        "sha256:d9505217906e0aca8467fc89b1973fce7fcf32ed59ec5c27f02690d6f0701249"
+    )
+    assert reviewed_material == (
+        "sha256:f1bdc81c344616d4bc37f7fa3c38cec5b559e6d1c9234b0e9ada5c4b5bc79b84"
+    )
+
+    reviewed = service.review_lan_target(
+        request,
+        authenticated_owner_principal=OWNER,
+    )
+    assert reviewed.material_binding_digest == reviewed_material
+
+
+def test_task7b_mdns_automatic_binding_digest_bytes_remain_v1_compatible(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    observation = _positive_observation()
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id="scan-task7b-mdns-automatic-digest-compat",
+        observation=observation,
+        source="mdns",
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    service = _task5b_service(registry)
+    imported = service.import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert imported.profile is not None
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    protected = target.target.metadata["lan_discovery"]
+
+    assert protected["observation_source"] == "mdns"
+    assert protected["endpoint_kind"] == "automatic"
+    assert protected["endpoint_fingerprint"] == (
+        "sha256:710f27d898f47ef2d7e65aab6d7f324a8ce39c1f32ec0b3fbd8baeeb3664e1a5"
+    )
+    assert _endpoint_fingerprint_digest(protected) == protected["endpoint_fingerprint"]
+    assert protected["material_binding_digest"] == (
+        "sha256:4426eb4158fdd43f417eea3371a43e693258654cac8082aa755d21e5adb5f28c"
+    )
+    assert (
+        _review_material_digest(
+            protected,
+            trust_class="unconfirmed",
+            privacy_acknowledgement_digest=None,
+            intended_roles=(),
+            task_family_affinities=(),
+        )
+        == protected["material_binding_digest"]
+    )
+
+    request, privacy_digest, reviewed_material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=protected,
+    )
+    assert privacy_digest == (
+        "sha256:d9505217906e0aca8467fc89b1973fce7fcf32ed59ec5c27f02690d6f0701249"
+    )
+    assert reviewed_material == (
+        "sha256:f1bdc81c344616d4bc37f7fa3c38cec5b559e6d1c9234b0e9ada5c4b5bc79b84"
+    )
+
+    reviewed = service.review_lan_target(
+        request,
+        authenticated_owner_principal=OWNER,
+    )
+    assert reviewed.material_binding_digest == reviewed_material
+
+
+def test_task7b_manual_unusual_port_import_is_disabled_until_exact_review(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scope = _manual_scope()
+    observation = _manual_observation(scope=scope, port=5001)
+    _row, completed = _persist_completed_manual_scan(
+        state,
+        scan_id="scan-task7b-manual-review",
+        observation=observation,
+        scope=scope,
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    service = _task5b_service(registry)
+
+    imported = service.import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert imported.profile is not None
+    assert imported.profile.profile.enabled is False
+    assert imported.profile.profile.trust_class == "unconfirmed"
+    assert imported.profile.profile.secret_ref is None
+    assert imported.profile.profile.base_url == "http://192.168.50.2:5001/v1"
+    assert imported.targets[0].target.enabled is False
+    assert imported.targets[0].target.trust_class == "unconfirmed"
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    profile_protected = profile.profile.metadata["lan_discovery"]
+    protected = target.target.metadata["lan_discovery"]
+    assert profile_protected["observation_source"] == "manual"
+    assert profile_protected["endpoint_kind"] == "manual"
+    assert protected["observation_source"] == "manual"
+    assert protected["endpoint_kind"] == "manual"
+    assert protected["port"] == 5001
+    assert protected["endpoint_fingerprint"] == (
+        "sha256:5c45013ffacb08ca06ddf1ee1895c67b754834c71ede9ee24475e50460c39771"
+    )
+    assert _endpoint_fingerprint_digest(protected) == protected["endpoint_fingerprint"]
+    assert protected["material_binding_digest"] == (
+        "sha256:0a4f49afd9dda49085d2ca109c103da74bce824c500edf1340488ee9c566a82d"
+    )
+    assert (
+        _review_material_digest(
+            protected,
+            trust_class="unconfirmed",
+            privacy_acknowledgement_digest=None,
+            intended_roles=(),
+            task_family_affinities=(),
+        )
+        == protected["material_binding_digest"]
+    )
+
+    review, privacy_digest, material_digest = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=protected,
+        enabled=True,
+    )
+    with state._connect() as connection:
+        target_row = connection.execute(
+            "SELECT metadata_json FROM routing_model_targets WHERE target_id = ?",
+            (target_id,),
+        ).fetchone()
+    assert target_row is not None
+    original_target_json = str(target_row[0])
+    for field_name, forged_value in (
+        ("observation_source", "active"),
+        ("endpoint_kind", "automatic"),
+    ):
+        forged_target = json.loads(original_target_json)
+        forged_target["lan_discovery"][field_name] = forged_value
+        with state._connect() as connection:
+            connection.execute(
+                "UPDATE routing_model_targets SET metadata_json = ? WHERE target_id = ?",
+                (
+                    json.dumps(
+                        forged_target,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ),
+                    target_id,
+                ),
+            )
+        with pytest.raises(LanDiscoveryConflict, match="source|kind|binding|evidence"):
+            service.review_lan_target(
+                review,
+                authenticated_owner_principal=OWNER,
+            )
+        with state._connect() as connection:
+            connection.execute(
+                "UPDATE routing_model_targets SET metadata_json = ? WHERE target_id = ?",
+                (original_target_json, target_id),
+            )
+        assert registry.get_provider_profile(provider_id) == profile
+        assert registry.get_model_target(target_id) == target
+
+    invalid_reviews = (
+        replace(review, expected_target_revision=target.revision + 1),
+        replace(review, privacy_acknowledged=False),
+        replace(review, expected_review_digest="sha256:" + "0" * 64),
+    )
+    for invalid in invalid_reviews:
+        with pytest.raises(LanDiscoveryConflict):
+            service.review_lan_target(
+                invalid,
+                authenticated_owner_principal=OWNER,
+            )
+        assert registry.get_provider_profile(provider_id) == profile
+        assert registry.get_model_target(target_id) == target
+
+    reviewed = service.review_lan_target(
+        review,
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert reviewed.profile.profile.enabled is True
+    assert reviewed.target.target.enabled is True
+    assert reviewed.target.target.trust_class == "operator_confirmed"
+    assert reviewed.privacy_acknowledgement_digest == privacy_digest
+    assert reviewed.material_binding_digest == material_digest
+    reviewed_protected = reviewed.target.target.metadata["lan_discovery"]
+    assert reviewed_protected["observation_source"] == "manual"
+    assert reviewed_protected["endpoint_kind"] == "manual"
+    assert reviewed_protected["port"] == 5001
+    assert reviewed_protected["reviewed_runtime_interface_binding_digest"] is not None
+
+
+def test_task7b_manual_ollama_unusual_port_cannot_be_enabled(tmp_path: Path) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scope = _manual_scope()
+    observation = _manual_observation(
+        scope=scope,
+        port=5001,
+        api_shape=ApiShape.OLLAMA_COMPATIBLE,
+    )
+    _row, completed = _persist_completed_manual_scan(
+        state,
+        scan_id="scan-task7b-manual-ollama",
+        observation=observation,
+        scope=scope,
+    )
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    registry = RoutingLedger(state)
+    service = _task5b_service(registry)
+    imported = service.import_observation(
+        _import_request(
+            observation,
+            completed,
+            profile_revision=0,
+            target_revisions=((target_id, 0),),
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+    assert imported.profile is not None
+    assert imported.profile.profile.enabled is False
+    assert imported.targets[0].target.enabled is False
+    profile = registry.get_provider_profile(provider_id)
+    target = registry.get_model_target(target_id)
+    assert profile is not None and target is not None
+    review, _privacy, _material = _exact_review_request(
+        owner=OWNER,
+        profile_revision=profile.revision,
+        target_revision=target.revision,
+        target_id=target_id,
+        protected=target.target.metadata["lan_discovery"],
+        enabled=True,
+    )
+
+    with pytest.raises(
+        LanDiscoveryConflict,
+        match="lan_runtime_hardening_unavailable|OpenAI|eligible",
+    ):
+        service.review_lan_target(review, authenticated_owner_principal=OWNER)
+
     assert registry.get_provider_profile(provider_id) == profile
     assert registry.get_model_target(target_id) == target
 

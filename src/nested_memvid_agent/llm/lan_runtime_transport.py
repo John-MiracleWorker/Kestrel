@@ -75,17 +75,11 @@ _PUBLIC_FAILURE_MESSAGES: dict[LanRuntimeTransportFailure, str] = {
     LanRuntimeTransportFailure.INTERFACE_PINNING_UNAVAILABLE: (
         "selected interface cannot be pinned"
     ),
-    LanRuntimeTransportFailure.REQUEST_TOO_LARGE: (
-        "LAN runtime request exceeded the byte limit"
-    ),
-    LanRuntimeTransportFailure.RESPONSE_TOO_LARGE: (
-        "LAN runtime response exceeded the byte limit"
-    ),
+    LanRuntimeTransportFailure.REQUEST_TOO_LARGE: ("LAN runtime request exceeded the byte limit"),
+    LanRuntimeTransportFailure.RESPONSE_TOO_LARGE: ("LAN runtime response exceeded the byte limit"),
     LanRuntimeTransportFailure.HTTP_CONNECT_FAILED: "LAN runtime connection failed",
     LanRuntimeTransportFailure.HTTP_TIMEOUT: "LAN runtime request timed out",
-    LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED: (
-        "LAN HTTP response framing was rejected"
-    ),
+    LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED: ("LAN HTTP response framing was rejected"),
     LanRuntimeTransportFailure.HTTP_STATUS_REJECTED: "LAN HTTP status was rejected",
     LanRuntimeTransportFailure.REDIRECT_REJECTED: "LAN HTTP redirect was rejected",
     LanRuntimeTransportFailure.UNSUPPORTED_CONTENT_ENCODING: (
@@ -120,8 +114,7 @@ class LanRuntimeChatRequest:
         return {
             "model": self.model_id,
             "messages": [
-                {"role": message.role, "content": message.content}
-                for message in self.messages
+                {"role": message.role, "content": message.content} for message in self.messages
             ],
             "stream": False,
             "temperature": self.temperature,
@@ -169,7 +162,10 @@ class DirectLanRuntimeTransport:
         timeout_seconds: float,
         cancellation: CancellationToken,
     ) -> bytes:
-        assigned = authenticate_lan_runtime_authority(authority)
+        try:
+            assigned = authenticate_lan_runtime_authority(authority)
+        except Exception:
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.AUTHORITY_CHANGED) from None
         body = _canonical_request_body(assigned, request)
         request_bytes = _request_bytes(assigned, body)
         _require_not_cancelled(cancellation)
@@ -207,9 +203,7 @@ class DirectLanRuntimeTransport:
                 or source.interface_index != current.interface_index
                 or source.interface_id != current.scope.interface.interface_id
             ):
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.AUTHORITY_CHANGED
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.AUTHORITY_CHANGED)
             _set_deadline(connection, deadline, cancellation, self._monotonic_clock)
             connection.sendall(request_bytes)
 
@@ -220,17 +214,11 @@ class DirectLanRuntimeTransport:
                 self._monotonic_clock,
             )
             if 100 <= status <= 199:
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
             if 300 <= status <= 399:
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.REDIRECT_REJECTED
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.REDIRECT_REJECTED)
             if status != 200:
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.HTTP_STATUS_REJECTED
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_STATUS_REJECTED)
             response_body = _read_response_body(
                 connection,
                 headers,
@@ -244,13 +232,9 @@ class DirectLanRuntimeTransport:
         except LanRuntimeTransportError:
             raise
         except TimeoutError:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_TIMEOUT
-            ) from None
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_TIMEOUT) from None
         except OSError:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_CONNECT_FAILED
-            ) from None
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_CONNECT_FAILED) from None
         finally:
             if connection is not None:
                 try:
@@ -268,9 +252,7 @@ class DirectLanRuntimeTransport:
             candidate = self._authority_resolver(previous.reviewed_target_id)
             current = authenticate_lan_runtime_authority(candidate)
         except Exception:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.AUTHORITY_CHANGED
-            ) from None
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.AUTHORITY_CHANGED) from None
         if not _same_binding(previous, current):
             raise LanRuntimeTransportError(LanRuntimeTransportFailure.AUTHORITY_CHANGED)
         if current.fresh_until_datetime < previous.fresh_until_datetime:
@@ -292,9 +274,7 @@ class DirectLanRuntimeTransport:
                 self._inventory_resolver,
             )
         except Exception:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.INTERFACE_CHANGED
-            ) from None
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.INTERFACE_CHANGED) from None
         if (
             source.source_address != authority.source_address
             or source.os_identity != authority.os_interface_identity
@@ -328,14 +308,8 @@ def _read_utc_clock(clock: Callable[[], datetime]) -> datetime:
     try:
         value = clock()
     except Exception:
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.AUTHORITY_EXPIRED
-        ) from None
-    if (
-        type(value) is not datetime
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.AUTHORITY_EXPIRED) from None
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise LanRuntimeTransportError(LanRuntimeTransportFailure.AUTHORITY_EXPIRED)
     return value.astimezone(UTC)
 
@@ -344,14 +318,8 @@ def _read_monotonic_clock(clock: Callable[[], float]) -> float:
     try:
         value = clock()
     except Exception:
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.DEADLINE_EXCEEDED
-        ) from None
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-    ):
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.DEADLINE_EXCEEDED) from None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise LanRuntimeTransportError(LanRuntimeTransportFailure.DEADLINE_EXCEEDED)
     return float(value)
 
@@ -371,8 +339,7 @@ def _same_binding(left: LanRuntimeAuthority, right: LanRuntimeAuthority) -> bool
         and left.runtime_hardening_version == right.runtime_hardening_version
         and left.endpoint_binding_digest == right.endpoint_binding_digest
         and left.endpoint_fingerprint == right.endpoint_fingerprint
-        and left.reviewed_material_binding_digest
-        == right.reviewed_material_binding_digest
+        and left.reviewed_material_binding_digest == right.reviewed_material_binding_digest
         and left.review_digest == right.review_digest
     )
 
@@ -402,9 +369,7 @@ def _canonical_request_body(
             or message.tool_calls
         ):
             raise ValueError("LAN runtime messages cannot carry tool metadata")
-        canonical_messages.append(
-            {"role": message.role, "content": message.content}
-        )
+        canonical_messages.append({"role": message.role, "content": message.content})
     temperature = request.temperature
     if temperature is not None and (
         isinstance(temperature, bool)
@@ -483,11 +448,7 @@ def _socket_authority(
             (str(source), 0),
             (str(destination), authority.endpoint.port),
         )
-    zone = (
-        authority.interface_index
-        if destination.is_link_local or source.is_link_local
-        else 0
-    )
+    zone = authority.interface_index if destination.is_link_local or source.is_link_local else 0
     return (
         socket.AF_INET6,
         (str(source), 0, 0, zone),
@@ -504,11 +465,7 @@ def _pin_socket(
     try:
         if platform_name == "Darwin":
             level = socket.IPPROTO_IP if family == socket.AF_INET else socket.IPPROTO_IPV6
-            option = (
-                _DARWIN_IP_BOUND_IF
-                if family == socket.AF_INET
-                else _DARWIN_IPV6_BOUND_IF
-            )
+            option = _DARWIN_IP_BOUND_IF if family == socket.AF_INET else _DARWIN_IPV6_BOUND_IF
             connection.setsockopt(level, option, authority.interface_index)
             return
         if platform_name == "Linux" and hasattr(socket, "SO_BINDTODEVICE"):
@@ -523,9 +480,7 @@ def _pin_socket(
         raise LanRuntimeTransportError(
             LanRuntimeTransportFailure.INTERFACE_PINNING_UNAVAILABLE
         ) from None
-    raise LanRuntimeTransportError(
-        LanRuntimeTransportFailure.INTERFACE_PINNING_UNAVAILABLE
-    )
+    raise LanRuntimeTransportError(LanRuntimeTransportFailure.INTERFACE_PINNING_UNAVAILABLE)
 
 
 def _interface_name(os_identity: str, platform_name: str) -> str:
@@ -606,24 +561,16 @@ def _read_response_head(
     delimiter = b"\r\n\r\n"
     while delimiter not in buffer:
         if len(buffer) > MAX_HTTP_HEADER_BYTES:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         _set_deadline(connection, deadline, cancellation, clock)
-        chunk = connection.recv(
-            min(4096, MAX_HTTP_HEADER_BYTES + len(delimiter) - len(buffer))
-        )
+        chunk = connection.recv(min(4096, MAX_HTTP_HEADER_BYTES + len(delimiter) - len(buffer)))
         _check_completed_deadline(deadline, cancellation, clock)
         if not chunk:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         buffer.extend(chunk)
     head, initial_body = bytes(buffer).split(delimiter, 1)
     if len(head) > MAX_HTTP_HEADER_BYTES:
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-        )
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
     lines = head.split(b"\r\n")
     if (
         not lines
@@ -632,9 +579,7 @@ def _read_response_head(
         or len(lines[0]) > MAX_HTTP_STATUS_LINE_BYTES
         or any(not line or len(line) > MAX_HTTP_HEADER_LINE_BYTES for line in lines[1:])
     ):
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-        )
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
     status_parts = lines[0].split(b" ", 2)
     if (
         len(status_parts) < 2
@@ -643,20 +588,14 @@ def _read_response_head(
         or not status_parts[1].isdigit()
         or any(byte < 0x20 or byte == 0x7F for byte in lines[0])
     ):
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-        )
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
     status = int(status_parts[1])
     if not 100 <= status <= 599:
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-        )
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
     headers: dict[str, str] = {}
     for raw_line in lines[1:]:
         if raw_line[:1] in {b" ", b"\t"} or b":" not in raw_line:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         raw_name, raw_value = raw_line.split(b":", 1)
         try:
             name = raw_name.decode("ascii").lower()
@@ -671,9 +610,7 @@ def _read_response_head(
             or name in headers
             or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
         ):
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         headers[name] = value
     return status, headers, initial_body
 
@@ -690,45 +627,29 @@ def _read_response_body(
     content_length = headers.get("content-length")
     content_encoding = headers.get("content-encoding")
     if content_encoding is not None and content_encoding.lower() != "identity":
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.UNSUPPORTED_CONTENT_ENCODING
-        )
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.UNSUPPORTED_CONTENT_ENCODING)
     if transfer_encoding is not None and content_length is not None:
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-        )
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
     reader = _BoundedSocketReader(connection, initial, deadline, cancellation, clock)
     if transfer_encoding is not None:
         if transfer_encoding.lower() != "chunked":
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         return _read_chunked_body(reader)
     if content_length is not None:
         if not content_length.isascii() or not content_length.isdecimal():
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         canonical_length = content_length.lstrip("0") or "0"
         if len(canonical_length) > len(str(MAX_LAN_RUNTIME_RESPONSE_BYTES)):
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.RESPONSE_TOO_LARGE
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.RESPONSE_TOO_LARGE)
         length = int(canonical_length)
         if length > MAX_LAN_RUNTIME_RESPONSE_BYTES:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.RESPONSE_TOO_LARGE
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.RESPONSE_TOO_LARGE)
         body = reader.read_exact(length)
         if reader.buffered_bytes:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         return body
     if headers.get("connection", "").lower() != "close":
-        raise LanRuntimeTransportError(
-            LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-        )
+        raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
     return reader.read_until_close(MAX_LAN_RUNTIME_RESPONSE_BYTES)
 
 
@@ -761,24 +682,18 @@ class _BoundedSocketReader:
     def read_line(self, max_bytes: int) -> bytes:
         while b"\r\n" not in self._buffer:
             if len(self._buffer) > max_bytes:
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
             self._receive(min(4096, max_bytes + 2 - len(self._buffer)))
         line, remainder = bytes(self._buffer).split(b"\r\n", 1)
         self._buffer = bytearray(remainder)
         if len(line) > max_bytes:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         return line
 
     def read_until_close(self, max_bytes: int) -> bytes:
         while True:
             if len(self._buffer) > max_bytes:
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.RESPONSE_TOO_LARGE
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.RESPONSE_TOO_LARGE)
             chunk = self._receive(
                 min(65536, max_bytes + 1 - len(self._buffer)),
                 eof_ok=True,
@@ -800,9 +715,7 @@ class _BoundedSocketReader:
             self._clock,
         )
         if not chunk and not eof_ok:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         self._buffer.extend(chunk)
         return chunk
 
@@ -812,31 +725,19 @@ def _read_chunked_body(reader: _BoundedSocketReader) -> bytes:
     while True:
         raw_size = reader.read_line(MAX_HTTP_CHUNK_LINE_BYTES)
         if _CHUNK_SIZE_RE.fullmatch(raw_size) is None:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
         canonical_size = raw_size.lstrip(b"0") or b"0"
         if len(canonical_size) > len(f"{MAX_LAN_RUNTIME_RESPONSE_BYTES:x}"):
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.RESPONSE_TOO_LARGE
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.RESPONSE_TOO_LARGE)
         size = int(canonical_size, 16)
         if len(result) + size > MAX_LAN_RUNTIME_RESPONSE_BYTES:
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.RESPONSE_TOO_LARGE
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.RESPONSE_TOO_LARGE)
         if size == 0:
             if reader.read_line(MAX_HTTP_HEADER_LINE_BYTES) != b"":
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
             if reader.buffered_bytes:
-                raise LanRuntimeTransportError(
-                    LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-                )
+                raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)
             return bytes(result)
         result.extend(reader.read_exact(size))
         if reader.read_exact(2) != b"\r\n":
-            raise LanRuntimeTransportError(
-                LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED
-            )
+            raise LanRuntimeTransportError(LanRuntimeTransportFailure.HTTP_PROTOCOL_REJECTED)

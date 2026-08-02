@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
 import threading
@@ -13,15 +14,19 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
-from fastapi import Request
+from fastapi import Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .lan_discovery_models import LanScanLimits
 from .lan_scan_manager import (
+    LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
     LAN_OWNER_PRINCIPAL,
+    LAN_SERVER_VERSION,
+    LanManualPreviewConflict,
     LanPreviewAuthorization,
     LanPreviewAuthorizationError,
     LanScanAdmissionConflict,
+    canonical_manual_scan_limits,
 )
 from .routing.lan_records import (
     LanObservationRecord,
@@ -59,6 +64,15 @@ _MAX_EVENT_SEQUENCE = 2**63 - 1
 _MAX_STREAMS = 4
 _HEARTBEAT_SECONDS = 15.0
 _POLL_SECONDS = 0.25
+LAN_MANUAL_PREVIEW_SCHEMA = "kestrel.lan.manual-preview.v1"
+_MANUAL_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
+)
+_MANUAL_IPV6_NETWORKS = (
+    ipaddress.IPv6Network("fc00::/7"),
+    ipaddress.IPv6Network("fe80::/10"),
+)
 
 
 class _PreviewRequest(BaseModel):
@@ -112,6 +126,61 @@ class _CancelScanRequest(BaseModel):
         return self
 
 
+class _ManualProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = Field(min_length=1, max_length=16, strict=True)
+    interface_id: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        strict=True,
+    )
+    host: str | None = Field(default=None, min_length=1, max_length=253, strict=True)
+    port: int | None = Field(default=None, ge=1, le=65535, strict=True)
+    expected_revision: int | None = Field(default=None, strict=True)
+    preview_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        strict=True,
+    )
+    selected_address: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        strict=True,
+    )
+    confirmed: bool | None = Field(default=None, strict=True)
+    privacy_acknowledged: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def require_exact_discriminator_shape(self) -> _ManualProbeRequest:
+        supplied = set(self.model_fields_set)
+        if self.mode == "preview":
+            if supplied != {"mode", "interface_id", "host", "port"}:
+                raise ValueError("manual preview request has an invalid field set")
+            if self.interface_id is None or self.host is None or self.port is None:
+                raise ValueError("manual preview request has missing authority")
+        elif self.mode == "confirm":
+            if supplied != {
+                "mode",
+                "expected_revision",
+                "preview_digest",
+                "selected_address",
+                "confirmed",
+                "privacy_acknowledged",
+            }:
+                raise ValueError("manual confirm request has an invalid field set")
+            if type(self.expected_revision) is not int or self.expected_revision != 0:
+                raise ValueError("manual confirm revision must be exact zero")
+            if self.preview_digest is None or self.selected_address is None:
+                raise ValueError("manual confirm request has missing authority")
+            if self.confirmed is not True or self.privacy_acknowledged is not True:
+                raise ValueError("manual confirm requires exact consent")
+        else:
+            raise ValueError("manual probe mode is invalid")
+        return self
+
+
 class _StreamLeases:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -155,6 +224,21 @@ def _utc_text(value: object) -> str:
 def _bounded_limits(value: object) -> dict[str, object]:
     if type(value) is not dict:
         raise ValueError("LAN limits are invalid")
+    if value.get("mode") == "manual":
+        port = value.get("exact_port")
+        if type(port) is not int or value != canonical_manual_scan_limits(port):
+            raise ValueError("LAN limits are invalid")
+        parsed_manual = json.loads(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+        if type(parsed_manual) is not dict:
+            raise ValueError("LAN limits are invalid")
+        return cast(dict[str, object], parsed_manual)
     allowed = set(asdict(LanScanLimits()))
     if any(type(key) is not str for key in value) or not set(value).issubset(allowed):
         raise ValueError("LAN limits are invalid")
@@ -244,6 +328,69 @@ def _preview_payload(authorization: LanPreviewAuthorization) -> dict[str, object
     }
 
 
+def _manual_preview_payload(authorization: object) -> dict[str, object]:
+    interface_id = getattr(authorization, "interface_id", None)
+    port = getattr(authorization, "port", None)
+    addresses = getattr(authorization, "resolved_addresses", None)
+    preview_digest = getattr(authorization, "preview_digest", None)
+    issued_at = getattr(authorization, "issued_at", None)
+    expires_at = getattr(authorization, "expires_at", None)
+    server_version = getattr(authorization, "server_version", None)
+    contract_version = getattr(authorization, "contract_version", None)
+    requires_confirmation = getattr(authorization, "requires_confirmation", None)
+    if (
+        type(interface_id) is not str
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", interface_id) is None
+        or type(port) is not int
+        or not 1 <= port <= 65_535
+        or type(addresses) is not tuple
+        or not 1 <= len(addresses) <= 16
+        or type(preview_digest) is not str
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", preview_digest) is None
+        or server_version != LAN_SERVER_VERSION
+        or contract_version != LAN_MANUAL_PREVIEW_CONTRACT_VERSION
+        or requires_confirmation is not True
+    ):
+        raise ValueError("manual LAN preview projection is invalid")
+    canonical_addresses: list[str] = []
+    for value in addresses:
+        if type(value) is not str or len(value) > 64 or "%" in value:
+            raise ValueError("manual LAN preview projection is invalid")
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            raise ValueError("manual LAN preview projection is invalid") from None
+        eligible = (
+            any(address in network for network in _MANUAL_IPV4_NETWORKS)
+            if isinstance(address, ipaddress.IPv4Address)
+            else any(address in network for network in _MANUAL_IPV6_NETWORKS)
+        )
+        if (
+            str(address) != value
+            or address.is_unspecified
+            or address.is_loopback
+            or address.is_multicast
+            or address.is_reserved
+            or not eligible
+        ):
+            raise ValueError("manual LAN preview projection is invalid")
+        canonical_addresses.append(value)
+    if tuple(sorted(set(canonical_addresses))) != addresses:
+        raise ValueError("manual LAN preview projection is invalid")
+    return {
+        "schema": LAN_MANUAL_PREVIEW_SCHEMA,
+        "interface_id": interface_id,
+        "port": port,
+        "resolved_addresses": canonical_addresses,
+        "preview_digest": preview_digest,
+        "issued_at": _utc_text(issued_at),
+        "expires_at": _utc_text(expires_at),
+        "server_version": server_version,
+        "contract_version": contract_version,
+        "requires_confirmation": True,
+    }
+
+
 def _validate_timestamp(value: object) -> str:
     if type(value) is not str or len(value.encode("utf-8")) > 64:
         raise ValueError("LAN event timestamp is invalid")
@@ -284,12 +431,17 @@ def _terminal_payload(event_type: str, value: object) -> dict[str, object]:
         )
         or (
             expected_status == "failed"
-            and reason in {"worker_error", "deadline_expired"}
-            and cancel is None
+            and (
+                (
+                    reason == "worker_error"
+                    and cancel in {None, "owner_cancelled", "shutdown_cancelled"}
+                )
+                or (reason == "deadline_expired" and cancel is None)
+            )
         )
         or (
             expected_status == "interrupted"
-            and reason == "startup_interrupted"
+            and reason in {"startup_interrupted", "worker_interrupted"}
             and cancel in {None, "owner_cancelled", "shutdown_cancelled"}
         )
     )
@@ -302,7 +454,12 @@ def _terminal_payload(event_type: str, value: object) -> dict[str, object]:
     }
 
 
-def _public_event(event: LanScanEvent, *, scan_id: str) -> dict[str, object]:
+def _public_event(
+    event: LanScanEvent,
+    *,
+    scan_id: str,
+    scan_record: LanScanRecord,
+) -> dict[str, object]:
     event_scan_id = event.scan_id
     sequence = event.sequence
     event_type = event.event_type
@@ -320,6 +477,17 @@ def _public_event(event: LanScanEvent, *, scan_id: str) -> dict[str, object]:
         bounded = bounded_scan_preview_event(durable_payload)
         if bounded.get("owner_principal") != LAN_OWNER_PRINCIPAL:
             raise ValueError("LAN event owner is invalid")
+        if bounded.get("schema") == "kestrel.lan.scan-preview.manual.v1":
+            manual_bindings = {
+                "interface_id": scan_record.confirmed_interface_id,
+                "network": scan_record.network,
+                "limits": _bounded_limits(scan_record.limits),
+                "preview_digest": scan_record.preview_digest,
+                "server_version": LAN_SERVER_VERSION,
+                "contract_version": LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+            }
+            if any(bounded.get(field) != value for field, value in manual_bindings.items()):
+                raise ValueError("manual LAN start event disagrees with scan")
         payload = {
             key: value for key, value in bounded.items() if key not in {"schema", "owner_principal"}
         }
@@ -332,9 +500,22 @@ def _public_event(event: LanScanEvent, *, scan_id: str) -> dict[str, object]:
         reason = durable_payload.get("reason")
         if type(reason) is not str or reason not in {"owner_cancelled", "shutdown_cancelled"}:
             raise ValueError("LAN cancel event is invalid")
+        if reason != scan_record.cancel_reason or scan_record.status not in {
+            "cancelling",
+            "cancelled",
+            "failed",
+            "interrupted",
+        }:
+            raise ValueError("LAN cancel event disagrees with scan")
         payload = {"reason": reason}
     else:
         payload = _terminal_payload(event_type, durable_payload)
+        if (
+            payload["status"] != scan_record.status
+            or payload["terminal_reason"] != scan_record.terminal_reason
+            or payload["cancel_reason"] != scan_record.cancel_reason
+        ):
+            raise ValueError("LAN terminal event disagrees with scan")
     public = {
         "scan_id": scan_id,
         "sequence": sequence,
@@ -360,6 +541,7 @@ def _validated_frames(
     events: object,
     *,
     scan_id: str,
+    scan_record: LanScanRecord,
     after_sequence: int,
     terminal_status: str | None = None,
 ) -> tuple[tuple[str, ...], int, str | None]:
@@ -378,7 +560,7 @@ def _validated_frames(
     for event in typed_events:
         if terminal_status is not None:
             raise ValueError("LAN event follows a terminal event")
-        public = _public_event(event, scan_id=scan_id)
+        public = _public_event(event, scan_id=scan_id, scan_record=scan_record)
         sequence = public["sequence"]
         if type(sequence) is not int or sequence <= cursor:
             raise ValueError("LAN event sequence is invalid")
@@ -440,7 +622,7 @@ def register_lan_discovery_routes(
     streaming_response: Callable[..., Any],
     stream_runtime: object | None = None,
 ) -> None:
-    """Register the eight Task 7A automatic-discovery routes exactly once."""
+    """Register the automatic routes plus the strict Task 7B manual route."""
 
     runtime = stream_runtime or SimpleNamespace(
         monotonic_clock=time.monotonic,
@@ -495,6 +677,61 @@ def register_lan_discovery_routes(
             raise _error(http_exception, 409, "lan_preview_conflict") from exc
         except ValueError as exc:
             raise _error(http_exception, 400, "lan_scope_invalid") from exc
+        except Exception as exc:
+            if isinstance(exc, http_exception):
+                raise
+            raise _error(http_exception, 503, "lan_scan_unavailable") from None
+
+    @app.post("/api/routing/lan/manual-probe")  # type: ignore[untyped-decorator]
+    async def manual_probe(request: Request, response: Response) -> dict[str, object]:
+        parsed = await parse(request, _ManualProbeRequest)
+        assert isinstance(parsed, _ManualProbeRequest)
+        if parsed.mode == "preview":
+            assert parsed.interface_id is not None
+            assert parsed.host is not None
+            assert parsed.port is not None
+            try:
+                authorization = await _manager_call(
+                    scan_manager.manual_preview,
+                    parsed.interface_id,
+                    parsed.host,
+                    parsed.port,
+                )
+            except LanManualPreviewConflict as exc:
+                raise _error(http_exception, 409, "lan_manual_preview_conflict") from exc
+            except ValueError as exc:
+                raise _error(http_exception, 400, "lan_manual_host_rejected") from exc
+            except Exception as exc:
+                if isinstance(exc, http_exception):
+                    raise
+                raise _error(http_exception, 503, "lan_scan_unavailable") from None
+            try:
+                return _manual_preview_payload(authorization)
+            except Exception:
+                raise _error(http_exception, 503, "lan_scan_unavailable") from None
+
+        assert parsed.preview_digest is not None
+        assert parsed.selected_address is not None
+        assert parsed.expected_revision is not None
+        assert parsed.confirmed is True
+        assert parsed.privacy_acknowledged is True
+        try:
+            record = await _manager_call(
+                scan_manager.confirm_manual,
+                parsed.preview_digest,
+                parsed.selected_address,
+                expected_revision=parsed.expected_revision,
+                confirmed=parsed.confirmed,
+                privacy_acknowledged=parsed.privacy_acknowledged,
+            )
+            response.status_code = 202
+            return _scan_payload(record)
+        except LanManualPreviewConflict as exc:
+            raise _error(http_exception, 409, "lan_manual_preview_conflict") from exc
+        except LanScanAdmissionConflict as exc:
+            raise _error(http_exception, 409, "lan_scan_active_conflict") from exc
+        except (LanScanRevisionConflict, ValueError) as exc:
+            raise _error(http_exception, 409, "lan_manual_preview_conflict") from exc
         except Exception as exc:
             if isinstance(exc, http_exception):
                 raise
@@ -630,9 +867,14 @@ def register_lan_discovery_routes(
                 after_sequence=cursor,
                 limit=_MAX_EVENT_BATCH,
             )
+            refreshed = await _manager_call(scan_manager.get, identifier)
+            if refreshed is None:
+                raise ValueError("LAN scan disappeared during event refresh")
+            record = refreshed
             initial_frames, initial_cursor, initial_terminal = _validated_frames(
                 initial,
                 scan_id=identifier,
+                scan_record=record,
                 after_sequence=cursor,
             )
             record_terminal = bool(getattr(record, "is_terminal", False))
@@ -661,6 +903,7 @@ def register_lan_discovery_routes(
             event_terminal = initial_terminal
             terminal_record_seen = record_terminal
             terminal_record_status = record_status if record_terminal else None
+            scan_record = record
             frames = initial_frames
             try:
                 last_heartbeat = float(monotonic_clock())
@@ -674,9 +917,14 @@ def register_lan_discovery_routes(
                             after_sequence=current_cursor,
                             limit=_MAX_EVENT_BATCH,
                         )
+                        refreshed = await _manager_call(scan_manager.get, identifier)
+                        if refreshed is None:
+                            return
+                        scan_record = refreshed
                         final_frames, current_cursor, event_terminal = _validated_frames(
                             final_events,
                             scan_id=identifier,
+                            scan_record=scan_record,
                             after_sequence=current_cursor,
                             terminal_status=event_terminal,
                         )
@@ -691,9 +939,14 @@ def register_lan_discovery_routes(
                             after_sequence=current_cursor,
                             limit=_MAX_EVENT_BATCH,
                         )
+                        refreshed = await _manager_call(scan_manager.get, identifier)
+                        if refreshed is None:
+                            return
+                        scan_record = refreshed
                         final_frames, current_cursor, event_terminal = _validated_frames(
                             final_events,
                             scan_id=identifier,
+                            scan_record=scan_record,
                             after_sequence=current_cursor,
                         )
                         if event_terminal is not None and event_terminal != terminal_record_status:
@@ -720,14 +973,16 @@ def register_lan_discovery_routes(
                         after_sequence=current_cursor,
                         limit=_MAX_EVENT_BATCH,
                     )
-                    next_frames, current_cursor, event_terminal = _validated_frames(
-                        next_events,
-                        scan_id=identifier,
-                        after_sequence=current_cursor,
-                    )
                     current = await _manager_call(scan_manager.get, identifier)
                     if current is None:
                         return
+                    scan_record = current
+                    next_frames, current_cursor, event_terminal = _validated_frames(
+                        next_events,
+                        scan_id=identifier,
+                        scan_record=scan_record,
+                        after_sequence=current_cursor,
+                    )
                     current_terminal = bool(getattr(current, "is_terminal", False))
                     current_status = getattr(current, "status", None)
                     if event_terminal is not None and event_terminal != current_status:

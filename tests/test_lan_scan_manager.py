@@ -4,19 +4,24 @@ import ast
 import hashlib
 import inspect
 import json
+import logging
+import socket
 import time
+import urllib.request
+from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from pathlib import Path
-from threading import Barrier, Event, Lock, Thread
+from threading import Barrier, Event, Lock, Thread, current_thread
 from typing import Any
 
 import pytest
 
 from nested_memvid_agent.lan_discovery_models import NetworkInterface, ResolvedLanEndpoint
+from nested_memvid_agent.lan_discovery_scope import PrivateScanScope
 from nested_memvid_agent.lan_http_transport import (
     CurrentLanInterfaceInventory,
     CurrentLanInterfaceState,
@@ -25,6 +30,7 @@ from nested_memvid_agent.lan_http_transport import (
 )
 from nested_memvid_agent.lan_scanner import (
     LanFailureCategory,
+    LanScanProgress,
     Reachability,
     _make_observation,
     scan_lan_scope,
@@ -38,10 +44,82 @@ from nested_memvid_agent.routing.lan_records import (
 from nested_memvid_agent.state_store import AgentStateStore
 
 FIXED_OWNER = "owner:local-runtime:v1"
+PREVIEW_DIGEST = "sha256:" + "b" * 64
 
 
 def _task6() -> Any:
     return import_module("nested_memvid_agent.lan_scan_manager")
+
+
+def _manual_endpoint_type() -> type[Any]:
+    return import_module("nested_memvid_agent.lan_discovery_models").ManualLanEndpoint
+
+
+def _manual_conflict_type() -> type[Exception]:
+    return _task6().LanManualPreviewConflict
+
+
+def _manual_limits(port: int) -> dict[str, object]:
+    return {
+        "mode": "manual",
+        "exact_port": port,
+        "max_active_hosts": 1,
+        "max_scan_concurrency": 1,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 256 * 1024,
+        "max_discovered_models": 8,
+        "mdns_enabled": False,
+    }
+
+
+def _manual_preview_event(
+    interface: NetworkInterface,
+    *,
+    address: str,
+    port: int,
+    preview_digest: str = PREVIEW_DIGEST,
+    expires_at: str = "2099-08-01T12:00:30Z",
+) -> dict[str, object]:
+    suffix = 32 if ":" not in address else 128
+    return {
+        "schema": "kestrel.lan.scan-preview.manual.v1",
+        "mode": "manual",
+        "endpoint_kind": "manual",
+        "observation_source": "manual",
+        "owner_principal": FIXED_OWNER,
+        "interface_id": interface.interface_id,
+        "network": f"{address}/{suffix}",
+        "limits": _manual_limits(port),
+        "active_host_count": 1,
+        "passive_or_manual_only": True,
+        "port_count": 1,
+        "exact_port": port,
+        "mdns_status": "unavailable",
+        "server_version": _task6().LAN_SERVER_VERSION,
+        "contract_version": _task6().LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+        "preview_digest": preview_digest,
+        "expires_at": expires_at,
+        "confirmed": True,
+        "privacy_acknowledged": True,
+    }
+
+
+def _manual_probe_result(
+    _scope: object,
+    endpoint: object,
+    *,
+    scan_deadline: float,
+    cancellation: object,
+    clock: object,
+) -> object:
+    del scan_deadline, cancellation, clock
+    return _make_observation(
+        endpoint,
+        reachability=Reachability.UNREACHABLE,
+        failure_category=LanFailureCategory.TCP_REFUSED,
+    )
 
 
 class MutableUtcClock:
@@ -108,6 +186,8 @@ def _manager(
     mdns_availability: Any | None = None,
     mdns_collector: Any | None = None,
     scanner: Any | None = None,
+    manual_resolver: Any | None = None,
+    manual_scanner: Any | None = None,
     utc_clock: MutableUtcClock | None = None,
     monotonic_clock: Any | None = None,
     precommit_hook: Any | None = None,
@@ -124,6 +204,11 @@ def _manager(
         precommit_hook=precommit_hook,
     )
     monotonic = monotonic_clock or MutableMonotonicClock()
+    manual_options: dict[str, object] = {}
+    if manual_resolver is not None:
+        manual_options["manual_resolver"] = manual_resolver
+    if manual_scanner is not None:
+        manual_options["manual_scanner"] = manual_scanner
     manager = task6.LanScanManager(
         ledger=ledger,
         interface_enumerator=(interface_enumerator or (lambda: (interface,))),
@@ -133,6 +218,7 @@ def _manager(
         utc_clock=utc,
         monotonic_clock=monotonic,
         scan_id_factory=(scan_id_factory or (lambda: scan_id)),
+        **manual_options,
     )
     return manager, state, ledger, interface
 
@@ -244,6 +330,34 @@ def test_shutdown_before_lifecycle_start_permanently_fences_recovery_and_executo
     assert manager.is_quiescent() is True
     with pytest.raises(RuntimeError, match="has not started"):
         manager.preview(interface.interface_id, "192.168.90.0/30")
+
+
+def test_started_idle_lifecycle_shutdown_with_zero_timeout_remains_immediate(
+    tmp_path: Path,
+) -> None:
+    manager, _state, _ledger, _interface = _manager(tmp_path)
+
+    class SpyExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=17, thread_name_prefix="task6-idle-zero-shutdown")
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+
+        def shutdown(
+            self,
+            wait: bool = True,
+            *,
+            cancel_futures: bool = False,
+        ) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    executor = SpyExecutor()
+    manager.start_lifecycle(executor)
+    try:
+        assert manager.shutdown(timeout_seconds=0.0) is True
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+    assert executor.shutdown_calls == [(True, False)]
 
 
 def test_recovery_failure_retry_owns_and_shuts_down_the_replacement_executor(
@@ -668,6 +782,78 @@ def test_rejected_controller_submission_returns_the_durable_failed_record(
     assert terminal.terminal_reason == "worker_error"
     assert terminal.terminal_receipt is not None
     assert terminal.terminal_receipt["terminal_reason"] == "worker_error"
+    assert manager.controller_count == 0
+    assert manager.shutdown(timeout_seconds=1.0) is True
+    assert executor.shutdown_calls == 1
+
+
+@pytest.mark.parametrize("mode", ("automatic", "manual"))
+def test_submit_boundary_reraises_base_exception_after_durable_terminalization(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    class BaseRejectingExecutor:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        def submit(self, *_args: Any, **_kwargs: Any) -> None:
+            raise SystemExit("raw-secret-submit-system-exit")
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is True
+            assert cancel_futures is False
+            self.shutdown_calls += 1
+
+    scan_id = "lan_" + "2" * 32
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        scan_id=scan_id,
+    )
+    executor = BaseRejectingExecutor()
+    manager.start_lifecycle(executor)
+    if mode == "automatic":
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft(authorization)
+        scan_id = draft.scan_id
+
+        def submit_scan() -> object:
+            return manager.start(
+                draft.scan_id,
+                expected_revision=draft.revision,
+                authorization=authorization,
+                preview_digest=authorization.preview_digest,
+            )
+
+    else:
+        manual_authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+
+        def submit_scan() -> object:
+            return manager.confirm_manual(
+                manual_authorization.preview_digest,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+
+    with pytest.raises(SystemExit, match="raw-secret-submit-system-exit"):
+        submit_scan()
+
+    terminal = ledger.get_scan(scan_id)
+    assert terminal is not None
+    assert terminal.status == "failed"
+    assert terminal.terminal_reason == "worker_error"
+    assert terminal.terminal_receipt is not None
+    assert "raw-secret-submit-system-exit" not in json.dumps(
+        terminal.terminal_receipt,
+        sort_keys=True,
+    )
+    assert ledger.list_scans(status="running", owner_principal=FIXED_OWNER) == []
     assert manager.controller_count == 0
     assert manager.shutdown(timeout_seconds=1.0) is True
     assert executor.shutdown_calls == 1
@@ -1411,7 +1597,7 @@ def test_manager_passes_one_executor_and_one_absolute_deadline_through_all_phase
     original_terminal = ledger.commit_scan_terminal
 
     def claim(*args: Any, **kwargs: Any) -> Any:
-        assert monotonic.calls == []
+        assert monotonic.calls == [100.0]
         claimed = original_claim(*args, **kwargs)
         seen["durable_claim"] = True
         return claimed
@@ -1642,6 +1828,310 @@ def test_worker_exception_is_code_only_and_scan_never_imports_provider_or_target
         assert "192.168.90.2" not in durable_text
     finally:
         assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_automatic_worker_base_exception_terminalizes_failed_without_false_completion(
+    tmp_path: Path,
+) -> None:
+    def fail(*_args: Any, **_kwargs: Any) -> tuple[()]:
+        raise SystemExit("raw-secret-automatic-system-exit")
+
+    manager, _state, ledger, interface = _manager(tmp_path, scanner=fail)
+    _start_lifecycle(manager)
+    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+    draft = manager.create_draft(authorization)
+    manager.start(
+        draft.scan_id,
+        expected_revision=draft.revision,
+        authorization=authorization,
+        preview_digest=authorization.preview_digest,
+    )
+    try:
+        terminal = _wait_for_terminal(manager, draft.scan_id)
+
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["evidence_complete"] is True
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (0, 0, 0)
+        assert [event.event_type for event in ledger.list_events(draft.scan_id)] == [
+            "scan_started",
+            "scan_failed",
+        ]
+        assert "raw-secret-automatic-system-exit" not in json.dumps(
+            terminal.terminal_receipt,
+            sort_keys=True,
+        )
+        assert manager.controller_count == 0
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+    assert ledger.list_scans(status="running", owner_principal=FIXED_OWNER) == []
+
+
+def test_automatic_worker_gap_interrupts_and_fences_until_shared_executor_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_entered = Event()
+    release_child = Event()
+    shutdown_helper_waiting_to_return = Event()
+    release_shutdown_helper = Event()
+    captured_cancellation: list[Any] = []
+
+    class SpyThreadPoolExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=17, thread_name_prefix="task6-worker-gap")
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+            self.shutdown_entered = Event()
+            self.shutdown_finished = Event()
+
+        def shutdown(
+            self,
+            wait: bool = True,
+            *,
+            cancel_futures: bool = False,
+        ) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+            self.shutdown_entered.set()
+            try:
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+            finally:
+                self.shutdown_finished.set()
+
+    def child_work() -> None:
+        child_entered.set()
+        release_child.wait()
+
+    def fail_after_admission(*_args: Any, **kwargs: Any) -> tuple[()]:
+        progress = kwargs["progress"]
+        executor = kwargs["executor"]
+        cancellation = kwargs["cancellation"]
+        progress(
+            LanScanProgress(
+                phase="planned",
+                planned_count=1,
+                admitted_count=0,
+                completed_count=0,
+                observation=None,
+            )
+        )
+        executor.submit(child_work)
+        assert child_entered.wait(timeout=2.0)
+        progress(
+            LanScanProgress(
+                phase="admitted",
+                planned_count=1,
+                admitted_count=1,
+                completed_count=0,
+                observation=None,
+            )
+        )
+        captured_cancellation.append(cancellation)
+        raise SystemExit("raw-secret-automatic-gap-exit")
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        scanner=fail_after_admission,
+        scan_id="lan_" + "e" * 32,
+    )
+    executor = SpyThreadPoolExecutor()
+    manager.start_lifecycle(executor)
+    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+    draft = manager.create_draft(authorization)
+    try:
+        manager.start(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            authorization=authorization,
+            preview_digest=authorization.preview_digest,
+        )
+        terminal = _wait_for_terminal(manager, draft.scan_id, timeout=1.0)
+
+        assert terminal.status == "interrupted"
+        assert terminal.terminal_reason == "worker_interrupted"
+        assert terminal.cancel_reason is None
+        assert terminal.terminal_receipt is not None
+        receipt = terminal.terminal_receipt
+        assert receipt["evidence_complete"] is False
+        assert receipt["unknown_inflight_count"] == 1
+        assert (
+            receipt["planned_count"],
+            receipt["admitted_count"],
+            receipt["completed_count"],
+            receipt["persisted_observation_count"],
+        ) == (1, 1, 0, 0)
+        assert ledger.list_observations(draft.scan_id) == []
+        assert [event.event_type for event in ledger.list_events(draft.scan_id)] == [
+            "scan_started",
+            "scan_progress",
+            "scan_progress",
+            "scan_interrupted",
+        ]
+        assert captured_cancellation and captured_cancellation[0].is_cancelled() is True
+        assert "raw-secret-automatic-gap-exit" not in json.dumps(receipt, sort_keys=True)
+        with pytest.raises(RuntimeError, match="admission.*closed"):
+            manager.preview(interface.interface_id, "192.168.90.0/30")
+        assert manager.retained_controller_ids() == (draft.scan_id,)
+        assert manager.is_quiescent() is False
+
+        shutdown_executor = manager._shutdown_executor
+
+        def pause_shutdown_helper_before_return(executor_to_shutdown: object) -> None:
+            shutdown_executor(executor_to_shutdown)
+            shutdown_helper_waiting_to_return.set()
+            release_shutdown_helper.wait()
+
+        monkeypatch.setattr(manager, "_shutdown_executor", pause_shutdown_helper_before_return)
+
+        shutdown_results: list[bool | None] = [None, None]
+        shutdown_returned = (Event(), Event())
+        shutdown_callers_ready = Barrier(3)
+
+        def bounded_shutdown(index: int) -> None:
+            try:
+                shutdown_callers_ready.wait(timeout=1.0)
+                shutdown_results[index] = manager.shutdown(timeout_seconds=0.01)
+            finally:
+                shutdown_returned[index].set()
+
+        shutdown_threads = tuple(
+            Thread(
+                target=bounded_shutdown,
+                args=(index,),
+                name=f"task6-bounded-shutdown-{index}",
+            )
+            for index in range(2)
+        )
+        for shutdown_thread in shutdown_threads:
+            shutdown_thread.start()
+        try:
+            shutdown_callers_ready.wait(timeout=1.0)
+            assert executor.shutdown_entered.wait(timeout=1.0)
+            assert all(item.wait(timeout=0.25) for item in shutdown_returned)
+            assert shutdown_results == [False, False]
+            assert executor.shutdown_calls == [(True, False)]
+            assert executor.shutdown_finished.is_set() is False
+            assert manager.get(draft.scan_id) == terminal
+            with pytest.raises(RuntimeError, match="admission.*closed"):
+                manager.preview(interface.interface_id, "192.168.90.0/30")
+            assert manager.retained_controller_ids() == (draft.scan_id,)
+            assert manager.controller_count == 1
+            assert manager.is_quiescent() is False
+        finally:
+            release_child.set()
+            for shutdown_thread in shutdown_threads:
+                shutdown_thread.join(timeout=2.0)
+        assert all(not item.is_alive() for item in shutdown_threads)
+        assert executor.shutdown_finished.wait(timeout=2.0)
+        assert shutdown_helper_waiting_to_return.wait(timeout=2.0)
+        assert manager.is_quiescent() is False
+        assert manager.shutdown(timeout_seconds=0.01) is False
+        release_shutdown_helper.set()
+        assert manager.shutdown(timeout_seconds=1.0) is True
+        assert executor.shutdown_calls == [(True, False)]
+        assert manager.retained_controller_ids() == ()
+        assert manager.controller_count == 0
+        assert manager.is_quiescent() is True
+    finally:
+        release_child.set()
+        release_shutdown_helper.set()
+        assert manager.shutdown(timeout_seconds=2.0) is True
+    assert manager.is_quiescent() is True
+
+
+def test_worker_gap_executor_shutdown_failure_is_exactly_once_and_retains_fence(
+    tmp_path: Path,
+) -> None:
+    child_entered = Event()
+    release_child = Event()
+
+    class FailingShutdownExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=17, thread_name_prefix="task6-shutdown-failure")
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+
+        def shutdown(
+            self,
+            wait: bool = True,
+            *,
+            cancel_futures: bool = False,
+        ) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+            raise RuntimeError("injected LAN executor shutdown failure")
+
+        def close_for_test(self) -> None:
+            super().shutdown(wait=True, cancel_futures=False)
+
+    def child_work() -> None:
+        child_entered.set()
+        release_child.wait()
+
+    def fail_after_admission(*_args: Any, **kwargs: Any) -> tuple[()]:
+        progress = kwargs["progress"]
+        executor = kwargs["executor"]
+        progress(
+            LanScanProgress(
+                phase="planned",
+                planned_count=1,
+                admitted_count=0,
+                completed_count=0,
+                observation=None,
+            )
+        )
+        executor.submit(child_work)
+        assert child_entered.wait(timeout=2.0)
+        progress(
+            LanScanProgress(
+                phase="admitted",
+                planned_count=1,
+                admitted_count=1,
+                completed_count=0,
+                observation=None,
+            )
+        )
+        raise SystemExit("raw-secret-shutdown-failure-gap")
+
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        scanner=fail_after_admission,
+        scan_id="lan_" + "d" * 32,
+    )
+    executor = FailingShutdownExecutor()
+    manager.start_lifecycle(executor)
+    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+    draft = manager.create_draft(authorization)
+    try:
+        manager.start(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            authorization=authorization,
+            preview_digest=authorization.preview_digest,
+        )
+        terminal = _wait_for_terminal(manager, draft.scan_id, timeout=1.0)
+        assert terminal.status == "interrupted"
+        assert terminal.terminal_reason == "worker_interrupted"
+
+        with pytest.raises(RuntimeError, match="^injected LAN executor shutdown failure$"):
+            manager.shutdown(timeout_seconds=1.0)
+        assert executor.shutdown_calls == [(True, False)]
+        assert manager.get(draft.scan_id) == terminal
+        assert manager.retained_controller_ids() == (draft.scan_id,)
+        assert manager.controller_count == 1
+        assert manager.is_quiescent() is False
+
+        with pytest.raises(RuntimeError, match="^injected LAN executor shutdown failure$"):
+            manager.shutdown(timeout_seconds=1.0)
+        assert executor.shutdown_calls == [(True, False)]
+        assert manager.retained_controller_ids() == (draft.scan_id,)
+        assert manager.is_quiescent() is False
+    finally:
+        release_child.set()
+        executor.close_for_test()
 
 
 def test_successful_worker_persists_evidence_only_and_never_imports_inventory(
@@ -2628,3 +3118,2427 @@ def test_observation_page_is_fixed_owner_deterministic_and_bounded(
         assert manager.observation_page(foreign.scan_id, limit=2) is None
     finally:
         assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_manual_preview_digest_independently_binds_every_authority_field(
+    tmp_path: Path,
+) -> None:
+    task6 = _task6()
+    clock = MutableUtcClock()
+    selected = NetworkInterface.from_addresses(
+        os_identity="darwin:en-manual-digest",
+        display_name="Manual digest selected",
+        addresses=("192.168.90.1/29", "fd00::1/64"),
+    )
+    secondary = NetworkInterface.from_addresses(
+        os_identity="darwin:en-manual-secondary",
+        display_name="Manual digest secondary",
+        addresses=("10.90.0.1/24",),
+    )
+    canonical_inventory = tuple(sorted((selected, secondary), key=lambda item: item.interface_id))
+    resolver_calls: list[str] = []
+    scanned_endpoints: list[object] = []
+
+    def manual_resolver(host: str) -> tuple[str, ...]:
+        resolver_calls.append(host)
+        return ("192.168.90.3", "192.168.90.2")
+
+    def manual_scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        scanned_endpoints.append(endpoint)
+        return _manual_probe_result(scope, endpoint, **kwargs)
+
+    manager, _state, _ledger, _interface_value = _manager(
+        tmp_path,
+        interface_enumerator=lambda: (secondary, selected),
+        manual_resolver=manual_resolver,
+        manual_scanner=manual_scanner,
+        utc_clock=clock,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            selected.interface_id,
+            "model-box.local",
+            5001,
+        )
+        assert authorization.resolved_addresses == (
+            "192.168.90.2",
+            "192.168.90.3",
+        )
+        assert resolver_calls == ["model-box.local"]
+        assert (
+            task6.LAN_MANUAL_PREVIEW_CONTRACT_VERSION
+            == "kestrel.lan.manual-preview-authorization.v1"
+        )
+        retained = asdict(authorization)
+        assert not hasattr(authorization, "host")
+        assert {key for key in retained if "host" in key} == {"host_input_digest"}
+        assert retained["host_input_digest"] == authorization.host_input_digest
+        assert "model-box.local" not in repr(authorization)
+        assert "model-box.local" not in repr(retained)
+        inventory_authority = [
+            {
+                "interface_id": item.interface_id,
+                "os_identity": item.os_identity,
+                "addresses": list(item.addresses),
+            }
+            for item in canonical_inventory
+        ]
+        arguments: dict[str, object] = {
+            "owner_principal": FIXED_OWNER,
+            "interface": selected,
+            "inventory_authority": inventory_authority,
+            "host_input_digest": authorization.host_input_digest,
+            "port": 5001,
+            "resolved_addresses": ("192.168.90.2", "192.168.90.3"),
+            "issued_at": authorization.issued_at,
+            "expires_at": authorization.expires_at,
+            "server_version": task6.LAN_SERVER_VERSION,
+            "contract_version": task6.LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+            "limits": _manual_limits(5001),
+        }
+
+        def independent_payload(values: dict[str, object]) -> dict[str, object]:
+            interface = values["interface"]
+            assert type(interface) is NetworkInterface
+            return {
+                "schema": "kestrel.lan.manual-preview-authorization.v1",
+                "owner_principal": values["owner_principal"],
+                "interface": {
+                    "interface_id": interface.interface_id,
+                    "os_identity": interface.os_identity,
+                    "addresses": list(interface.addresses),
+                },
+                "inventory_authority": values["inventory_authority"],
+                "host_input_digest": values["host_input_digest"],
+                "port": values["port"],
+                "resolved_addresses": list(values["resolved_addresses"]),
+                "issued_at": _utc_text(values["issued_at"]),
+                "expires_at": _utc_text(values["expires_at"]),
+                "server_version": values["server_version"],
+                "contract_version": values["contract_version"],
+                "limits": values["limits"],
+            }
+
+        payload = independent_payload(arguments)
+        expected = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        assert authorization.preview_digest == expected
+        assert task6.manual_preview_authorization_digest(**arguments) == expected
+
+        mutated_interface = NetworkInterface.from_addresses(
+            os_identity=selected.os_identity,
+            display_name=selected.display_name,
+            addresses=("192.168.90.1/30", "fd00::1/64"),
+        )
+        mutations = {
+            "owner_principal": "owner:lookalike",
+            "interface": mutated_interface,
+            "inventory_authority": [
+                *inventory_authority,
+                {
+                    "interface_id": "sha256:" + "9" * 64,
+                    "os_identity": "darwin:en-injected",
+                    "addresses": ["10.99.0.1/24"],
+                },
+            ],
+            "host_input_digest": "sha256:" + "8" * 64,
+            "port": 5002,
+            "resolved_addresses": ("192.168.90.2", "192.168.90.4"),
+            "issued_at": authorization.issued_at + timedelta(microseconds=1),
+            "expires_at": authorization.expires_at + timedelta(microseconds=1),
+            "server_version": "kestrel-mutated",
+            "contract_version": "kestrel.lan.manual-preview-authorization.v999",
+            "limits": {**_manual_limits(5001), "max_scan_concurrency": 2},
+        }
+        for field, value in mutations.items():
+            mutated_arguments = {**arguments, field: value}
+            mutated_payload = independent_payload(mutated_arguments)
+            mutated_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        mutated_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            assert mutated_digest != expected, field
+            try:
+                production_digest = task6.manual_preview_authorization_digest(**mutated_arguments)
+            except (TypeError, ValueError):
+                continue
+            assert production_digest != expected, field
+
+        with pytest.raises(_manual_conflict_type()):
+            manager.confirm_manual(
+                authorization.preview_digest,
+                "192.168.90.4",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.3",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert started.network == "192.168.90.3/32"
+        terminal = _wait_for_terminal(manager, started.scan_id)
+        assert terminal.status == "completed"
+        assert terminal.network == "192.168.90.3/32"
+        assert resolver_calls == ["model-box.local"]
+        assert len(scanned_endpoints) == 1
+        endpoint = scanned_endpoints[0]
+        assert type(endpoint) is _manual_endpoint_type()
+        assert (endpoint.kind, endpoint.address, endpoint.port) == (
+            "manual",
+            "192.168.90.3",
+            5001,
+        )
+        observations = _ledger.list_observations(started.scan_id)
+        assert len(observations) == 1
+        assert (
+            observations[0].source,
+            observations[0].address,
+            observations[0].port,
+        ) == ("manual", "192.168.90.3", 5001)
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+@pytest.mark.parametrize(
+    "host",
+    (
+        "8.8.8.8",
+        "127.0.0.1",
+        "224.0.0.1",
+        "0.0.0.0",
+        "192.0.2.1",
+        "192.168.91.2",
+    ),
+    ids=(
+        "public",
+        "loopback",
+        "multicast",
+        "unspecified",
+        "reserved-documentation",
+        "private-out-of-interface",
+    ),
+)
+def test_manual_preview_rejects_ineligible_literals_before_any_work_or_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    host: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    boundary_calls: list[str] = []
+
+    def forbidden_resolver(_host: str) -> tuple[str, ...]:
+        boundary_calls.append("resolver")
+        raise AssertionError("invalid literal reached the resolver")
+
+    def forbidden_scanner(*_args: object, **_kwargs: object) -> object:
+        boundary_calls.append("scanner")
+        raise AssertionError("invalid literal reached the scanner")
+
+    def forbidden_boundary(*_args: object, **_kwargs: object) -> object:
+        boundary_calls.append("direct-boundary")
+        raise AssertionError("invalid literal crossed a direct network boundary")
+
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_boundary)
+    monkeypatch.setattr(socket, "socket", forbidden_boundary)
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden_boundary)
+    monkeypatch.setattr(
+        import_module("nested_memvid_agent.lan_scanner"),
+        "probe_manual_lan_endpoint",
+        forbidden_boundary,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        import_module("nested_memvid_agent.lan_manual_probe"),
+        "probe_manual_lan_endpoint",
+        forbidden_boundary,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _task6(),
+        "probe_manual_lan_endpoint",
+        forbidden_boundary,
+        raising=False,
+    )
+
+    manager, state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=forbidden_resolver,
+        manual_scanner=forbidden_scanner,
+    )
+    executor = _start_lifecycle(manager)
+
+    def forbidden_submit(*_args: object, **_kwargs: object) -> object:
+        boundary_calls.append("executor")
+        raise AssertionError("invalid literal reached executor submission")
+
+    monkeypatch.setattr(executor, "submit", forbidden_submit)
+    try:
+        with pytest.raises((TypeError, ValueError)):
+            manager.manual_preview(interface.interface_id, host, 5001)
+
+        assert boundary_calls == []
+        assert manager.list() == []
+        assert ledger.list_scans(owner_principal=FIXED_OWNER) == []
+        with state._connect() as connection:
+            assert {
+                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "routing_lan_scans",
+                    "routing_lan_observations",
+                    "routing_lan_scan_events",
+                )
+            } == {
+                "routing_lan_scans": 0,
+                "routing_lan_observations": 0,
+                "routing_lan_scan_events": 0,
+            }
+        assert host not in caplog.text
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_sequential_manual_preview_replacement_leaves_only_one_live_authorization(
+    tmp_path: Path,
+) -> None:
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=_manual_probe_result,
+        scan_id="lan_" + "0" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        replaced = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        current = manager.manual_preview(
+            interface.interface_id,
+            "192.168.90.2",
+            5002,
+        )
+        assert current.preview_digest != replaced.preview_digest
+
+        with pytest.raises(_manual_conflict_type()):
+            manager.confirm_manual(
+                replaced.preview_digest,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+        started = manager.confirm_manual(
+            current.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+        assert [item.scan_id for item in manager.list()] == [started.scan_id]
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_admission_fails_before_start_and_after_shutdown_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    boundary_calls: Counter[str] = Counter()
+
+    def resolver(_host: str) -> tuple[str, ...]:
+        boundary_calls["resolver"] += 1
+        raise AssertionError("closed manual admission invoked the resolver")
+
+    def scanner(*_args: object, **_kwargs: object) -> object:
+        boundary_calls["scanner"] += 1
+        raise AssertionError("closed manual admission invoked the scanner")
+
+    class CountingExecutor:
+        def submit(self, *_args: object, **_kwargs: object) -> None:
+            boundary_calls["executor_submit"] += 1
+            raise AssertionError("closed manual admission submitted work")
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is True
+            assert cancel_futures is False
+            boundary_calls["executor_shutdown"] += 1
+
+    manager, state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=resolver,
+        manual_scanner=scanner,
+    )
+
+    def durable_row_counts() -> tuple[int, int, int]:
+        with state._connect() as connection:
+            return tuple(
+                int(connection.execute(query).fetchone()[0])
+                for query in (
+                    "SELECT COUNT(*) FROM routing_lan_scans",
+                    "SELECT COUNT(*) FROM routing_lan_observations",
+                    "SELECT COUNT(*) FROM routing_lan_scan_events",
+                )
+            )  # type: ignore[return-value]
+
+    before = durable_row_counts()
+    with pytest.raises(RuntimeError, match="^LAN lifecycle has not started$"):
+        manager.manual_preview(interface.interface_id, "model-box.local", 5001)
+    with pytest.raises(RuntimeError, match="^LAN lifecycle has not started$"):
+        manager.confirm_manual(
+            PREVIEW_DIGEST,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+
+    executor = CountingExecutor()
+    assert manager.start_lifecycle(executor) == []
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+    with pytest.raises(RuntimeError, match="^LAN scan admission is closed$"):
+        manager.manual_preview(interface.interface_id, "model-box.local", 5001)
+    with pytest.raises(RuntimeError, match="^LAN scan admission is closed$"):
+        manager.confirm_manual(
+            PREVIEW_DIGEST,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+
+    assert durable_row_counts() == before == (0, 0, 0)
+    assert ledger.list_scans(owner_principal=FIXED_OWNER) == []
+    assert boundary_calls == Counter({"executor_shutdown": 1})
+
+
+def test_manual_authorization_is_restart_local_and_shutdown_permanently_closes_admission(
+    tmp_path: Path,
+) -> None:
+    task6 = _task6()
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=_manual_probe_result,
+    )
+    _start_lifecycle(manager)
+    authorization = manager.manual_preview(
+        interface.interface_id,
+        "model-box.local",
+        5001,
+    )
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+    with pytest.raises((RuntimeError, _manual_conflict_type())):
+        manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+    assert ledger.list_scans(owner_principal=FIXED_OWNER) == []
+
+    restarted = task6.LanScanManager(
+        ledger=ledger,
+        interface_enumerator=lambda: (interface,),
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=_manual_probe_result,
+        scan_id_factory=lambda: "lan_" + "1" * 32,
+    )
+    _start_lifecycle(restarted)
+    try:
+        with pytest.raises(_manual_conflict_type()):
+            restarted.confirm_manual(
+                authorization.preview_digest,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+        assert restarted.list() == []
+        fresh = restarted.manual_preview(
+            interface.interface_id,
+            "192.168.90.2",
+            5001,
+        )
+        started = restarted.confirm_manual(
+            fresh.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert _wait_for_terminal(restarted, started.scan_id).status == "completed"
+    finally:
+        assert restarted.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_preview_rechecks_complete_inventory_after_blocked_dns_without_competing_preview(
+    tmp_path: Path,
+) -> None:
+    selected = _interface()
+    inventory = [selected]
+    resolver_entered = Event()
+    release_resolver = Event()
+    enumeration_calls = 0
+
+    def enumerate_inventory() -> tuple[NetworkInterface, ...]:
+        nonlocal enumeration_calls
+        enumeration_calls += 1
+        return tuple(inventory)
+
+    def resolver(host: str) -> tuple[str, ...]:
+        assert host == "model-box.local"
+        resolver_entered.set()
+        assert release_resolver.wait(timeout=2.0)
+        return ("192.168.90.2",)
+
+    manager, _state, ledger, _interface_value = _manager(
+        tmp_path,
+        interface_enumerator=enumerate_inventory,
+        manual_resolver=resolver,
+        manual_scanner=_manual_probe_result,
+    )
+    _start_lifecycle(manager)
+    results: list[object] = []
+    failures: list[BaseException] = []
+
+    def preview() -> None:
+        try:
+            results.append(
+                manager.manual_preview(
+                    selected.interface_id,
+                    "model-box.local",
+                    5001,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - exact conflict asserted
+            failures.append(exc)
+
+    thread = Thread(target=preview, name="task7b-dns-inventory-drift", daemon=True)
+    try:
+        thread.start()
+        assert resolver_entered.wait(timeout=1.0)
+        inventory.append(
+            NetworkInterface.from_addresses(
+                os_identity="darwin:en-unrelated-drift",
+                display_name="Unrelated drift fixture",
+                addresses=("10.92.0.1/24",),
+            )
+        )
+        release_resolver.set()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert results == []
+        assert len(failures) == 1
+        assert isinstance(failures[0], _manual_conflict_type())
+        assert "model-box.local" not in str(failures[0])
+        assert enumeration_calls >= 2
+        assert ledger.list_scans(owner_principal=FIXED_OWNER) == []
+        with pytest.raises(_manual_conflict_type()):
+            manager.confirm_manual(
+                PREVIEW_DIGEST,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+        assert ledger.list_scans(owner_principal=FIXED_OWNER) == []
+    finally:
+        release_resolver.set()
+        thread.join(timeout=1.0)
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_default_manual_resolver_uses_one_getaddrinfo_call_and_ignores_proxy_http_probe_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def getaddrinfo(*args: object, **kwargs: object) -> list[tuple[object, ...]]:
+        calls.append((*args, kwargs))
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("192.168.90.2", 0),
+            )
+        ]
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("manual preview crossed HTTP, socket, or probe boundary")
+
+    monkeypatch.setenv("HTTP_PROXY", "http://raw-secret-proxy.invalid:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://raw-secret-proxy.invalid:8080")
+    monkeypatch.setenv("ALL_PROXY", "socks5://raw-secret-proxy.invalid:1080")
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(
+        import_module("nested_memvid_agent.lan_scanner"),
+        "probe_manual_lan_endpoint",
+        forbidden,
+        raising=False,
+    )
+    manager, _state, ledger, interface = _manager(tmp_path)
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        assert authorization.resolved_addresses == ("192.168.90.2",)
+        assert len(calls) == 1
+        assert calls[0][0] == "model-box.local"
+        assert ledger.list_scans(owner_principal=FIXED_OWNER) == []
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_default_manual_scanner_wires_exact_endpoint_probe_signature_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task6 = _task6()
+    calls: list[dict[str, object]] = []
+
+    def probe(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        calls.append(
+            {
+                "scope": scope,
+                "endpoint": endpoint,
+                "scan_deadline": scan_deadline,
+                "cancellation": cancellation,
+                "clock": clock,
+            }
+        )
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    monkeypatch.setattr(
+        task6,
+        "probe_manual_lan_endpoint",
+        probe,
+        raising=False,
+    )
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "2" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+        assert len(calls) == 1
+        assert type(calls[0]["endpoint"]) is _manual_endpoint_type()
+        assert calls[0]["scan_deadline"] == 145.0
+        assert callable(calls[0]["clock"])
+        assert calls[0]["cancellation"] is not None
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_preview_resolves_outside_manager_lock_and_stale_generation_cannot_win(
+    tmp_path: Path,
+) -> None:
+    resolver_entered = Event()
+    release_resolver = Event()
+
+    def resolver(host: str) -> tuple[str, ...]:
+        assert host == "model-box.local"
+        resolver_entered.set()
+        assert release_resolver.wait(timeout=2.0)
+        return ("192.168.90.2",)
+
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=resolver,
+        manual_scanner=_manual_probe_result,
+        scan_id="lan_" + "1" * 32,
+    )
+    _start_lifecycle(manager)
+    first_results: list[object] = []
+    first_failures: list[BaseException] = []
+
+    def first_preview() -> None:
+        try:
+            first_results.append(
+                manager.manual_preview(interface.interface_id, "model-box.local", 5001)
+            )
+        except BaseException as exc:  # noqa: BLE001 - losing type is asserted
+            first_failures.append(exc)
+
+    first = Thread(target=first_preview, name="task7b-manual-preview-first", daemon=True)
+    lock_reader_done = Event()
+    lock_reader_values: list[object] = []
+
+    def read_interfaces() -> None:
+        lock_reader_values.append(manager.interfaces())
+        lock_reader_done.set()
+
+    reader = Thread(target=read_interfaces, name="task7b-manual-preview-reader", daemon=True)
+    try:
+        first.start()
+        assert resolver_entered.wait(timeout=1.0)
+
+        # DNS may block, but it must not retain the operation lock or fence reads.
+        reader.start()
+        assert lock_reader_done.wait(timeout=0.5)
+        assert lock_reader_values == [(interface,)]
+
+        current = manager.manual_preview(interface.interface_id, "192.168.90.1", 5001)
+        assert current.resolved_addresses == ("192.168.90.1",)
+        release_resolver.set()
+        first.join(timeout=2.0)
+        assert not first.is_alive()
+        assert first_results == []
+        assert len(first_failures) == 1
+        assert isinstance(first_failures[0], _manual_conflict_type())
+
+        started = manager.confirm_manual(
+            current.preview_digest,
+            "192.168.90.1",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert started.status == "running"
+        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+    finally:
+        release_resolver.set()
+        first.join(timeout=1.0)
+        if reader.ident is not None:
+            reader.join(timeout=1.0)
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+@pytest.mark.parametrize(
+    ("digest", "address", "revision", "confirmed", "privacy", "conflict"),
+    (
+        (PREVIEW_DIGEST, "192.168.90.2", True, True, True, False),
+        (PREVIEW_DIGEST, "192.168.90.2", 1, True, True, False),
+        (PREVIEW_DIGEST, "192.168.90.2", 0, False, True, False),
+        (PREVIEW_DIGEST, "192.168.90.2", 0, 1, True, False),
+        (PREVIEW_DIGEST, "192.168.90.2", 0, True, False, False),
+        (PREVIEW_DIGEST, "192.168.90.2", 0, True, 1, False),
+        ("sha256:" + "f" * 64, "192.168.90.2", 0, True, True, True),
+        (PREVIEW_DIGEST, "192.168.90.1", 0, True, True, True),
+        (PREVIEW_DIGEST, "192.168.090.002", 0, True, True, True),
+    ),
+    ids=(
+        "bool-cas",
+        "nonzero-cas",
+        "unconfirmed",
+        "coerced-confirmation",
+        "privacy-not-acknowledged",
+        "coerced-privacy",
+        "digest-substitution",
+        "address-substitution",
+        "noncanonical-address",
+    ),
+)
+def test_manual_confirm_requires_exact_consent_and_cached_authority_without_writes(
+    tmp_path: Path,
+    digest: str,
+    address: str,
+    revision: object,
+    confirmed: object,
+    privacy: object,
+    conflict: bool,
+) -> None:
+    resolver_calls: list[str] = []
+
+    def resolver(host: str) -> tuple[str, ...]:
+        resolver_calls.append(host)
+        return ("192.168.90.2",)
+
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=resolver,
+        manual_scanner=_manual_probe_result,
+        scan_id="lan_" + "2" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        requested_digest = authorization.preview_digest if digest == PREVIEW_DIGEST else digest
+        expected_error = (
+            _manual_conflict_type()
+            if conflict
+            else (TypeError, ValueError, LanScanRevisionConflict)
+        )
+        with pytest.raises(expected_error):
+            manager.confirm_manual(
+                requested_digest,
+                address,
+                expected_revision=revision,
+                confirmed=confirmed,
+                privacy_acknowledged=privacy,
+            )
+
+        assert resolver_calls == ["model-box.local"]
+        assert manager.list() == []
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+        assert resolver_calls == ["model-box.local"]
+        assert [item.scan_id for item in manager.list()] == [started.scan_id]
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_manual_confirm_never_reresolves_and_consumes_authority_only_after_commit(
+    tmp_path: Path,
+) -> None:
+    resolver_calls: list[str] = []
+
+    def resolver(host: str) -> tuple[str, ...]:
+        resolver_calls.append(host)
+        return ("192.168.90.2",)
+
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=resolver,
+        manual_scanner=_manual_probe_result,
+        scan_id="lan_" + "3" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert resolver_calls == ["model-box.local"]
+        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+
+        with pytest.raises(_manual_conflict_type()):
+            manager.confirm_manual(
+                authorization.preview_digest,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+        assert resolver_calls == ["model-box.local"]
+        assert len(manager.list()) == 1
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+@pytest.mark.parametrize("failure", ("expiry", "selected-interface", "complete-inventory"))
+def test_manual_confirm_expiry_or_complete_inventory_drift_is_zero_write(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    clock = MutableUtcClock()
+    selected = _interface()
+    inventory = [selected]
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        interface_enumerator=lambda: tuple(inventory),
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=_manual_probe_result,
+        utc_clock=clock,
+        scan_id="lan_" + "4" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        if failure == "expiry":
+            clock.advance(float(_task6().LAN_PREVIEW_TTL_SECONDS))
+        elif failure == "selected-interface":
+            inventory[:] = [_interface(address="192.168.90.1/31")]
+        else:
+            inventory.append(
+                NetworkInterface.from_addresses(
+                    os_identity="darwin:en91",
+                    display_name="Unexpected second interface",
+                    addresses=("10.91.0.1/24",),
+                )
+            )
+
+        with pytest.raises(_manual_conflict_type()):
+            manager.confirm_manual(
+                authorization.preview_digest,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+        assert manager.list() == []
+    finally:
+        assert manager.shutdown(timeout_seconds=1.0) is True
+
+
+def test_concurrent_manual_confirmation_has_one_claim_submission_and_cancel_lifecycle(
+    tmp_path: Path,
+) -> None:
+    scanner_entered = Event()
+    scanner_release = Event()
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        scanner_entered.set()
+        assert scanner_release.wait(timeout=2.0) or cancellation.is_cancelled()
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    manager, _state, _ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        scan_id="lan_" + "5" * 32,
+    )
+
+    class CountingExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=17, thread_name_prefix="task7b-counting")
+            self.submit_calls = 0
+            self._submit_lock = Lock()
+
+        def submit(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def,override]
+            with self._submit_lock:
+                self.submit_calls += 1
+            return super().submit(*args, **kwargs)
+
+    executor = CountingExecutor()
+    manager.start_lifecycle(executor)
+    authorization = manager.manual_preview(interface.interface_id, "model-box.local", 5001)
+    gate = Barrier(3, timeout=2.0)
+    records: list[LanScanRecord] = []
+    failures: list[BaseException] = []
+    outcomes_lock = Lock()
+
+    def confirm() -> None:
+        try:
+            gate.wait()
+            record = manager.confirm_manual(
+                authorization.preview_digest,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+            with outcomes_lock:
+                records.append(record)
+        except BaseException as exc:  # noqa: BLE001 - losing type is asserted
+            with outcomes_lock:
+                failures.append(exc)
+
+    threads = tuple(
+        Thread(target=confirm, name=f"task7b-confirm-{index}", daemon=True) for index in range(2)
+    )
+    try:
+        for thread in threads:
+            thread.start()
+        gate.wait()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(records) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], _manual_conflict_type())
+        assert scanner_entered.wait(timeout=1.0)
+        assert executor.submit_calls == 1
+        assert len(manager.list()) == 1
+
+        current = manager.get(records[0].scan_id)
+        assert current is not None and current.status == "running"
+        cancelling = manager.cancel(current.scan_id, expected_revision=current.revision)
+        assert cancelling.status == "cancelling"
+        scanner_release.set()
+        terminal = _wait_for_terminal(manager, current.scan_id)
+        assert terminal.status == "cancelled"
+        assert manager.is_quiescent() is True
+    finally:
+        scanner_release.set()
+        gate.abort()
+        for thread in threads:
+            thread.join(timeout=1.0)
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_active_slot_conflict_strands_no_draft_and_keeps_preview_retryable(
+    tmp_path: Path,
+) -> None:
+    first_scanner_entered = Event()
+    release_scanner = Event()
+    calls = 0
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_scanner_entered.set()
+            assert release_scanner.wait(timeout=2.0)
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    first_scan_id = "lan_" + "6" * 32
+    contested_scan_id = "lan_" + "7" * 32
+    fallback_scan_id = "lan_" + "8" * 32
+    identifiers = iter((first_scan_id, contested_scan_id, fallback_scan_id))
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        scan_id_factory=lambda: next(identifiers),
+    )
+    _start_lifecycle(manager)
+    try:
+        first = manager.manual_preview(interface.interface_id, "192.168.90.2", 5001)
+        running = manager.confirm_manual(
+            first.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert first_scanner_entered.wait(timeout=1.0)
+
+        second = manager.manual_preview(interface.interface_id, "192.168.90.1", 5002)
+        with pytest.raises(_task6().LanScanAdmissionConflict):
+            manager.confirm_manual(
+                second.preview_digest,
+                "192.168.90.1",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+        assert [item.scan_id for item in manager.list()] == [running.scan_id]
+        assert ledger.get_scan(contested_scan_id) is None
+        assert ledger.list_events(contested_scan_id) == []
+
+        current = manager.get(running.scan_id)
+        assert current is not None
+        manager.cancel(current.scan_id, expected_revision=current.revision)
+        release_scanner.set()
+        assert _wait_for_terminal(manager, current.scan_id).status == "cancelled"
+
+        retried = manager.confirm_manual(
+            second.preview_digest,
+            "192.168.90.1",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert retried.scan_id in {contested_scan_id, fallback_scan_id}
+        unused_scan_id = (
+            fallback_scan_id if retried.scan_id == contested_scan_id else contested_scan_id
+        )
+        assert ledger.get_scan(unused_scan_id) is None
+        assert ledger.list_events(unused_scan_id) == []
+        assert _wait_for_terminal(manager, retried.scan_id).status == "completed"
+        assert {item.scan_id for item in manager.list()} == {running.scan_id, retried.scan_id}
+    finally:
+        release_scanner.set()
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_scan_uses_shared_executor_deadline_skips_mdns_and_persists_manual_source(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    mdns_calls: list[str] = []
+    scanner_calls = 0
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        captured.update(
+            {
+                "scope": scope,
+                "endpoint": endpoint,
+                "scan_deadline": scan_deadline,
+                "cancellation": cancellation,
+                "clock": clock,
+                "thread_name": current_thread().name,
+            }
+        )
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        mdns_collector=lambda *_args, **_kwargs: mdns_calls.append("mdns"),
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "8" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+        assert terminal.status == "completed"
+        assert mdns_calls == []
+        assert scanner_calls == 1
+        assert captured["scan_deadline"] == 145.0
+        assert str(captured["thread_name"]).startswith("task6-test-lan")
+        assert type(captured["endpoint"]) is _manual_endpoint_type()
+        assert captured["clock"] is not None
+        assert captured["cancellation"] is not None
+
+        observations = ledger.list_observations(started.scan_id)
+        assert len(observations) == 1
+        assert observations[0].source == "manual"
+        assert (observations[0].address, observations[0].port) == (
+            "192.168.90.2",
+            5001,
+        )
+        event = manager.events(started.scan_id)[0]
+        assert event.event_type == "scan_started"
+        assert event.payload == {
+            "schema": "kestrel.lan.scan-preview.manual.v1",
+            "mode": "manual",
+            "endpoint_kind": "manual",
+            "observation_source": "manual",
+            "owner_principal": FIXED_OWNER,
+            "interface_id": interface.interface_id,
+            "network": "192.168.90.2/32",
+            "limits": _manual_limits(5001),
+            "active_host_count": 1,
+            "passive_or_manual_only": True,
+            "port_count": 1,
+            "exact_port": 5001,
+            "mdns_status": "unavailable",
+            "server_version": _task6().LAN_SERVER_VERSION,
+            "contract_version": _task6().LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+            "preview_digest": authorization.preview_digest,
+            "expires_at": _utc_text(authorization.expires_at),
+            "confirmed": True,
+            "privacy_acknowledged": True,
+        }
+        assert "model-box.local" not in json.dumps(event.payload, sort_keys=True)
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["mdns_status"] == "unavailable"
+        assert terminal.terminal_receipt["limits"] == _manual_limits(5001)
+        assert terminal.terminal_receipt["planned_count"] == 1
+        assert terminal.terminal_receipt["admitted_count"] == 1
+        assert terminal.terminal_receipt["completed_count"] == 1
+        progress = [
+            item.payload
+            for item in manager.events(started.scan_id)
+            if item.event_type == "scan_progress"
+        ]
+        assert [
+            (
+                item["planned_count"],
+                item["admitted_count"],
+                item["completed_count"],
+            )
+            for item in progress
+        ] == [(1, 0, 0), (1, 1, 0), (1, 1, 1)]
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_automatic_monotonic_exception_precedes_claim_and_preserves_authorization(
+    tmp_path: Path,
+) -> None:
+    clock_calls = 0
+
+    def monotonic_clock() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 1:
+            raise RuntimeError("injected automatic monotonic outage")
+        return 100.0
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        scanner=lambda *_args, **_kwargs: (),
+        monotonic_clock=monotonic_clock,
+        scan_id="lan_" + "3" * 32,
+    )
+    _start_lifecycle(manager)
+    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+    draft = manager.create_draft(authorization)
+    try:
+        with pytest.raises(RuntimeError, match="injected automatic monotonic outage"):
+            manager.start(
+                draft.scan_id,
+                expected_revision=draft.revision,
+                authorization=authorization,
+                preview_digest=authorization.preview_digest,
+            )
+
+        assert ledger.get_scan(draft.scan_id) == draft
+        assert ledger.list_events(draft.scan_id) == []
+        assert ledger.list_scans(status="running", owner_principal=FIXED_OWNER) == []
+        assert manager.controller_count == 0
+
+        started = manager.start(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            authorization=authorization,
+            preview_digest=authorization.preview_digest,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+        assert terminal.status == "completed"
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+    assert ledger.list_scans(status="running", owner_principal=FIXED_OWNER) == []
+
+
+def test_manual_monotonic_exception_precedes_claim_and_preserves_authorization(
+    tmp_path: Path,
+) -> None:
+    clock_calls = 0
+    scanner_calls = 0
+    scan_id = "lan_" + "4" * 32
+
+    def monotonic_clock() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 1:
+            raise RuntimeError("injected monotonic outage")
+        return 100.0
+
+    def scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        return _manual_probe_result(scope, endpoint, **kwargs)
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=monotonic_clock,
+        scan_id=scan_id,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+
+        with pytest.raises(RuntimeError, match="injected monotonic outage"):
+            manager.confirm_manual(
+                authorization.preview_digest,
+                "192.168.90.2",
+                expected_revision=0,
+                confirmed=True,
+                privacy_acknowledged=True,
+            )
+
+        assert ledger.get_scan(scan_id) is None
+        assert ledger.list_events(scan_id) == []
+        assert ledger.list_scans(status="running", owner_principal=FIXED_OWNER) == []
+        assert scanner_calls == 0
+
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+        assert scanner_calls == 1
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_probe_begins_only_after_durable_admission_progress(
+    tmp_path: Path,
+) -> None:
+    scan_id = "lan_" + "5" * 32
+    progress_visible_at_probe: list[tuple[int, int, int]] = []
+
+    def scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        progress_visible_at_probe.extend(
+            (
+                int(event.payload["planned_count"]),
+                int(event.payload["admitted_count"]),
+                int(event.payload["completed_count"]),
+            )
+            for event in ledger.list_events(scan_id)
+            if event.event_type == "scan_progress"
+        )
+        return _manual_probe_result(scope, endpoint, **kwargs)
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id=scan_id,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert terminal.status == "completed"
+        assert progress_visible_at_probe == [(1, 0, 0), (1, 1, 0)]
+        assert [
+            (
+                event.payload["planned_count"],
+                event.payload["admitted_count"],
+                event.payload["completed_count"],
+            )
+            for event in ledger.list_events(scan_id)
+            if event.event_type == "scan_progress"
+        ] == [(1, 0, 0), (1, 1, 0), (1, 1, 1)]
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_admission_persistence_failure_prevents_probe_and_terminalizes(
+    tmp_path: Path,
+) -> None:
+    progress_attempts = 0
+    scanner_calls = 0
+
+    def fail_admission_progress(operation: str) -> None:
+        nonlocal progress_attempts
+        if operation != "record_scan_progress":
+            return
+        progress_attempts += 1
+        if progress_attempts == 2:
+            raise RuntimeError("injected admission persistence failure")
+
+    def scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        return _manual_probe_result(scope, endpoint, **kwargs)
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        precommit_hook=fail_admission_progress,
+        scan_id="lan_" + "6" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert scanner_calls == 0
+        assert progress_attempts == 2
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.terminal_receipt is not None
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 0, 0)
+        assert [
+            (
+                event.payload["planned_count"],
+                event.payload["admitted_count"],
+                event.payload["completed_count"],
+            )
+            for event in ledger.list_events(started.scan_id)
+            if event.event_type == "scan_progress"
+        ] == [(1, 0, 0)]
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_planned_persistence_failure_restores_zero_counts_and_terminalizes(
+    tmp_path: Path,
+) -> None:
+    progress_attempts = 0
+    scanner_calls = 0
+
+    def fail_planned_progress(operation: str) -> None:
+        nonlocal progress_attempts
+        if operation != "record_scan_progress":
+            return
+        progress_attempts += 1
+        if progress_attempts == 1:
+            raise RuntimeError("injected planned persistence failure")
+
+    def scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        return _manual_probe_result(scope, endpoint, **kwargs)
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        precommit_hook=fail_planned_progress,
+        scan_id="lan_" + "c" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert scanner_calls == 0
+        assert progress_attempts == 1
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.terminal_receipt is not None
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (0, 0, 0)
+        assert [
+            event
+            for event in ledger.list_events(started.scan_id)
+            if event.event_type == "scan_progress"
+        ] == []
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_manual_scanner_exception_terminalizes_with_explicit_incomplete_evidence(
+    tmp_path: Path,
+) -> None:
+    scanner_calls = 0
+
+    def scanner(*_args: object, **_kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        raise RuntimeError("raw-secret-injected-scanner-failure")
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "7" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert scanner_calls == 1
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["evidence_complete"] is False
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 1, 0)
+        assert ledger.list_observations(started.scan_id) == []
+        assert [
+            (
+                event.payload["planned_count"],
+                event.payload["admitted_count"],
+                event.payload["completed_count"],
+            )
+            for event in ledger.list_events(started.scan_id)
+            if event.event_type == "scan_progress"
+        ] == [(1, 0, 0), (1, 1, 0)]
+        assert "raw-secret-injected-scanner-failure" not in json.dumps(
+            terminal.terminal_receipt,
+            sort_keys=True,
+        )
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_manual_observation_conversion_failure_preserves_admitted_evidence_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner_calls = 0
+    task6 = _task6()
+
+    def scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        return _manual_probe_result(scope, endpoint, **kwargs)
+
+    def fail_conversion(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("raw-secret-observation-conversion-failure")
+
+    monkeypatch.setattr(task6, "lan_observation_to_draft", fail_conversion)
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "d" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert scanner_calls == 1
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["evidence_complete"] is False
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 1, 0)
+        assert ledger.list_observations(started.scan_id) == []
+        assert "raw-secret-observation-conversion-failure" not in json.dumps(
+            terminal.terminal_receipt,
+            sort_keys=True,
+        )
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_manual_worker_base_exception_after_admission_terminalizes_incomplete_failure(
+    tmp_path: Path,
+) -> None:
+    scanner_calls = 0
+
+    def scanner(*_args: object, **_kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        raise SystemExit("raw-secret-manual-system-exit")
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "a" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert scanner_calls == 1
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["evidence_complete"] is False
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 1, 0)
+        assert ledger.list_observations(started.scan_id) == []
+        assert "raw-secret-manual-system-exit" not in json.dumps(
+            terminal.terminal_receipt,
+            sort_keys=True,
+        )
+        assert manager.controller_count == 0
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+    assert ledger.list_scans(status="running", owner_principal=FIXED_OWNER) == []
+
+
+def test_manual_completion_read_failure_retains_typed_evidence_and_terminalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fail_next_worker_read = False
+    failed_reads = 0
+
+    def scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        nonlocal fail_next_worker_read
+        observation = _manual_probe_result(scope, endpoint, **kwargs)
+        fail_next_worker_read = True
+        return observation
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "b" * 32,
+    )
+    durable_get = ledger.get_scan
+
+    def transient_worker_read(scan_id: str) -> Any:
+        nonlocal fail_next_worker_read, failed_reads
+        if fail_next_worker_read and current_thread().name.startswith("task6-test-lan"):
+            fail_next_worker_read = False
+            failed_reads += 1
+            raise RuntimeError("raw-secret-transient-ledger-read")
+        return durable_get(scan_id)
+
+    monkeypatch.setattr(ledger, "get_scan", transient_worker_read)
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert failed_reads == 1
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["evidence_complete"] is True
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 1, 1)
+        observations = ledger.list_observations(started.scan_id)
+        assert len(observations) == 1
+        assert observations[0].source == "manual"
+        assert "raw-secret-transient-ledger-read" not in json.dumps(
+            terminal.terminal_receipt,
+            sort_keys=True,
+        )
+        assert manager.controller_count == 0
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+    assert ledger.list_scans(status="running", owner_principal=FIXED_OWNER) == []
+
+
+def test_manual_scanner_exception_after_cancel_fails_without_weakening_cancelled_receipts(
+    tmp_path: Path,
+) -> None:
+    scanner_calls = 0
+
+    def scanner(*_args: object, **_kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        current = ledger.get_scan("lan_" + "9" * 32)
+        assert current is not None
+        manager.cancel(current.scan_id, expected_revision=current.revision)
+        raise RuntimeError("raw-secret-after-cancel")
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "9" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert scanner_calls == 1
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert terminal.cancel_reason == "owner_cancelled"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["evidence_complete"] is False
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 1, 0)
+        assert ledger.list_observations(started.scan_id) == []
+        assert [event.event_type for event in ledger.list_events(started.scan_id)][-2:] == [
+            "scan_cancel_requested",
+            "scan_failed",
+        ]
+        assert "raw-secret-after-cancel" not in json.dumps(
+            terminal.terminal_receipt,
+            sort_keys=True,
+        )
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_manual_cancel_before_admission_persistence_never_invokes_scanner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner_calls = 0
+
+    def scanner(scope: object, endpoint: object, **kwargs: object) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        return _manual_probe_result(scope, endpoint, **kwargs)
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "8" * 32,
+    )
+    original_record_progress = manager._record_progress
+    cancelled_before_admission = False
+
+    def cancel_then_record(handle: Any, progress: Any) -> Any:
+        nonlocal cancelled_before_admission
+        if progress.phase == "admitted" and not cancelled_before_admission:
+            current = ledger.get_scan(handle.scan_id)
+            assert current is not None
+            manager.cancel(handle.scan_id, expected_revision=current.revision)
+            cancelled_before_admission = True
+        return original_record_progress(handle, progress)
+
+    monkeypatch.setattr(manager, "_record_progress", cancel_then_record)
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert cancelled_before_admission is True
+        assert scanner_calls == 0
+        assert terminal.status == "cancelled"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["evidence_complete"] is True
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 0, 0)
+        assert [
+            (
+                event.payload["planned_count"],
+                event.payload["admitted_count"],
+                event.payload["completed_count"],
+            )
+            for event in ledger.list_events(started.scan_id)
+            if event.event_type == "scan_progress"
+        ] == [(1, 0, 0)]
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_manual_ipv6_preview_confirm_uses_exact_128_authority_and_durable_bindings(
+    tmp_path: Path,
+) -> None:
+    selected = _interface(address="fe80::7/64")
+    captured: dict[str, object] = {}
+
+    def forbidden_resolver(_host: str) -> tuple[str, ...]:
+        raise AssertionError("literal IPv6 preview must not invoke DNS")
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        captured.update(
+            {
+                "scope": scope,
+                "endpoint": endpoint,
+                "scan_deadline": scan_deadline,
+                "cancellation": cancellation,
+                "clock": clock,
+            }
+        )
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    manager, _state, ledger, _default_interface = _manager(
+        tmp_path,
+        interface_enumerator=lambda: (selected,),
+        manual_resolver=forbidden_resolver,
+        manual_scanner=scanner,
+        monotonic_clock=MutableMonotonicClock(),
+        scan_id="lan_" + "d" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            selected.interface_id,
+            "fe80::8",
+            5001,
+        )
+        assert authorization.resolved_addresses == ("fe80::8",)
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "fe80::8",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert started.network == terminal.network == "fe80::8/128"
+        assert started.limits == terminal.limits == _manual_limits(5001)
+        scope = captured["scope"]
+        endpoint = captured["endpoint"]
+        assert type(scope) is PrivateScanScope
+        assert scope.interface == selected
+        assert scope.network == "fe80::8/128"
+        assert type(endpoint) is _manual_endpoint_type()
+        assert (endpoint.kind, endpoint.address, endpoint.port) == (
+            "manual",
+            "fe80::8",
+            5001,
+        )
+        assert captured["scan_deadline"] == 145.0
+
+        observations = ledger.list_observations(started.scan_id)
+        assert len(observations) == 1
+        assert (observations[0].source, observations[0].address, observations[0].port) == (
+            "manual",
+            "fe80::8",
+            5001,
+        )
+        events = manager.events(started.scan_id)
+        assert events[0].event_type == "scan_started"
+        assert events[0].payload == _manual_preview_event(
+            selected,
+            address="fe80::8",
+            port=5001,
+            preview_digest=authorization.preview_digest,
+            expires_at=_utc_text(authorization.expires_at),
+        )
+        progress = [item.payload for item in events if item.event_type == "scan_progress"]
+        assert [
+            (
+                item["planned_count"],
+                item["admitted_count"],
+                item["completed_count"],
+            )
+            for item in progress
+        ] == [(1, 0, 0), (1, 1, 0), (1, 1, 1)]
+        assert terminal.status == "completed"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["limits"] == _manual_limits(5001)
+        assert terminal.terminal_receipt["mdns_status"] == "unavailable"
+        assert (
+            terminal.terminal_receipt["planned_count"],
+            terminal.terminal_receipt["admitted_count"],
+            terminal.terminal_receipt["completed_count"],
+        ) == (1, 1, 1)
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_manual_mixed_family_preview_selects_one_ipv6_member_without_reresolution(
+    tmp_path: Path,
+) -> None:
+    selected = NetworkInterface.from_addresses(
+        os_identity="darwin:en-manual-dual-stack",
+        display_name="Manual dual-stack selected",
+        addresses=("192.168.90.1/29", "fd00::1/64"),
+    )
+    resolver_calls: list[str] = []
+    scanner_calls: list[tuple[object, object]] = []
+
+    def resolver(host: str) -> tuple[str, ...]:
+        resolver_calls.append(host)
+        return ("fd00::8", "192.168.90.2")
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        scanner_calls.append((scope, endpoint))
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    manager, _state, ledger, _default_interface = _manager(
+        tmp_path,
+        interface_enumerator=lambda: (selected,),
+        manual_resolver=resolver,
+        manual_scanner=scanner,
+        scan_id="lan_" + "e" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            selected.interface_id,
+            "model-box.local",
+            5001,
+        )
+        assert authorization.resolved_addresses == ("192.168.90.2", "fd00::8")
+        assert resolver_calls == ["model-box.local"]
+
+        started = manager.confirm_manual(
+            authorization.preview_digest,
+            "fd00::8",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, started.scan_id)
+
+        assert started.network == terminal.network == "fd00::8/128"
+        assert resolver_calls == ["model-box.local"]
+        assert len(scanner_calls) == 1
+        scope, endpoint = scanner_calls[0]
+        assert type(scope) is PrivateScanScope
+        assert scope.interface == selected
+        assert scope.network == "fd00::8/128"
+        assert type(endpoint) is _manual_endpoint_type()
+        assert (endpoint.kind, endpoint.address, endpoint.port) == (
+            "manual",
+            "fd00::8",
+            5001,
+        )
+
+        observations = ledger.list_observations(started.scan_id)
+        assert len(observations) == 1
+        assert (
+            observations[0].source,
+            observations[0].address,
+            observations[0].port,
+        ) == ("manual", "fd00::8", 5001)
+        events = manager.events(started.scan_id)
+        assert events[0].event_type == "scan_started"
+        assert events[0].payload == _manual_preview_event(
+            selected,
+            address="fd00::8",
+            port=5001,
+            preview_digest=authorization.preview_digest,
+            expires_at=_utc_text(authorization.expires_at),
+        )
+        assert terminal.status == "completed"
+        assert [item.scan_id for item in manager.list()] == [started.scan_id]
+        assert (
+            ledger.list_scans(
+                status="draft",
+                owner_principal=FIXED_OWNER,
+            )
+            == []
+        )
+        assert {item.scan_id for item in events} == {started.scan_id}
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        assert manager.is_quiescent() is True
+
+
+def test_manual_worker_observes_shared_shutdown_cancellation_and_reaches_quiescence(
+    tmp_path: Path,
+) -> None:
+    scanner_entered = Event()
+    cancellation_observed = Event()
+    emergency_release = Event()
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        scanner_entered.set()
+        while not cancellation.is_cancelled() and not emergency_release.wait(0.01):
+            pass
+        if cancellation.is_cancelled():
+            cancellation_observed.set()
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        scan_id="lan_" + "9" * 32,
+    )
+    _start_lifecycle(manager)
+    shutdown_complete = False
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        running = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        assert scanner_entered.wait(timeout=1.0)
+
+        assert manager.shutdown(timeout_seconds=2.0) is True
+        shutdown_complete = True
+        assert cancellation_observed.is_set()
+        terminal = ledger.get_scan(running.scan_id)
+        assert terminal is not None
+        assert terminal.status == "cancelled"
+        assert terminal.cancel_reason == "shutdown_cancelled"
+        assert manager.is_quiescent() is True
+    finally:
+        emergency_release.set()
+        if not shutdown_complete:
+            assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_terminal_precommit_deadline_crossing_rolls_back_and_retries_expired(
+    tmp_path: Path,
+) -> None:
+    clock = MutableMonotonicClock()
+    terminal_hook_calls = 0
+    scanner_calls = 0
+
+    def cross_deadline(operation: str) -> None:
+        nonlocal terminal_hook_calls
+        if operation != "commit_scan_terminal":
+            return
+        terminal_hook_calls += 1
+        if terminal_hook_calls == 1:
+            clock.value = 145.0
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        monotonic_clock=clock,
+        precommit_hook=cross_deadline,
+        scan_id="lan_" + "b" * 32,
+    )
+    _start_lifecycle(manager)
+    try:
+        authorization = manager.manual_preview(
+            interface.interface_id,
+            "model-box.local",
+            5001,
+        )
+        running = manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+        terminal = _wait_for_terminal(manager, running.scan_id)
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "deadline_expired"
+        assert terminal_hook_calls == 2
+        assert scanner_calls == 1
+        assert [item.event_type for item in ledger.list_events(running.scan_id)][-1] == (
+            "scan_failed"
+        )
+        assert not any(
+            item.event_type == "scan_completed" for item in ledger.list_events(running.scan_id)
+        )
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["limits"] == _manual_limits(5001)
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True
+
+
+def test_manual_executor_rejection_terminalizes_committed_claim_and_consumes_authority(
+    tmp_path: Path,
+) -> None:
+    scanner_calls = 0
+
+    def scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        nonlocal scanner_calls
+        scanner_calls += 1
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    class RejectingExecutor:
+        def __init__(self) -> None:
+            self.submit_calls = 0
+            self.shutdown_calls = 0
+
+        def submit(self, *_args: object, **_kwargs: object) -> None:
+            self.submit_calls += 1
+            raise RuntimeError("raw-secret-manual-executor-rejection")
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is True
+            assert cancel_futures is False
+            self.shutdown_calls += 1
+
+    manager, _state, ledger, interface = _manager(
+        tmp_path,
+        manual_resolver=lambda _host: ("192.168.90.2",),
+        manual_scanner=scanner,
+        scan_id="lan_" + "c" * 32,
+    )
+    executor = RejectingExecutor()
+    manager.start_lifecycle(executor)
+    authorization = manager.manual_preview(
+        interface.interface_id,
+        "model-box.local",
+        5001,
+    )
+
+    terminal = manager.confirm_manual(
+        authorization.preview_digest,
+        "192.168.90.2",
+        expected_revision=0,
+        confirmed=True,
+        privacy_acknowledged=True,
+    )
+
+    assert terminal.status == "failed"
+    assert terminal.terminal_reason == "worker_error"
+    assert executor.submit_calls == 1
+    assert scanner_calls == 0
+    assert ledger.list_scans(status="draft") == []
+    assert [item.event_type for item in ledger.list_events(terminal.scan_id)] == [
+        "scan_started",
+        "scan_failed",
+    ]
+    with pytest.raises(_manual_conflict_type()):
+        manager.confirm_manual(
+            authorization.preview_digest,
+            "192.168.90.2",
+            expected_revision=0,
+            confirmed=True,
+            privacy_acknowledged=True,
+        )
+    assert manager.shutdown(timeout_seconds=1.0) is True
+    assert executor.shutdown_calls == 1
+
+
+def test_restart_recovery_interrupts_manual_claim_without_resolver_probe_or_submission(
+    tmp_path: Path,
+) -> None:
+    task6 = _task6()
+    state = AgentStateStore(tmp_path / "manual-recovery" / "agent.db")
+    ledger = LanDiscoveryLedger(state)
+    interface = _interface()
+    running = ledger.create_and_claim_manual_scan(
+        scan_id="lan_" + "a" * 32,
+        owner_principal=FIXED_OWNER,
+        confirmed_interface_id=interface.interface_id,
+        network="192.168.90.2/32",
+        limits=_manual_limits(5001),
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event=_manual_preview_event(
+            interface,
+            address="192.168.90.2",
+            port=5001,
+        ),
+        expected_revision=0,
+    )
+    calls: list[str] = []
+
+    def manual_scanner(
+        scope: object,
+        endpoint: object,
+        *,
+        scan_deadline: float,
+        cancellation: object,
+        clock: object,
+    ) -> object:
+        calls.append("manual-scanner")
+        return _manual_probe_result(
+            scope,
+            endpoint,
+            scan_deadline=scan_deadline,
+            cancellation=cancellation,
+            clock=clock,
+        )
+
+    manager = task6.LanScanManager(
+        ledger=ledger,
+        interface_enumerator=lambda: calls.append("interfaces") or (interface,),
+        mdns_availability=(
+            lambda: calls.append("mdns-availability") or task6.MdnsAvailability.AVAILABLE
+        ),
+        mdns_collector=lambda *_args, **_kwargs: calls.append("mdns"),
+        scanner=lambda *_args, **_kwargs: calls.append("automatic-scanner"),
+        manual_resolver=lambda _host: calls.append("resolver") or ("192.168.90.2",),
+        manual_scanner=manual_scanner,
+        scan_id_factory=lambda: "unused",
+    )
+    executor = ThreadPoolExecutor(
+        max_workers=17,
+        thread_name_prefix="task7b-manual-recovery",
+    )
+    try:
+        recovered = manager.start_lifecycle(executor)
+        assert [item.scan_id for item in recovered] == [running.scan_id]
+        interrupted = manager.get(running.scan_id)
+        assert interrupted is not None
+        assert interrupted.status == "interrupted"
+        assert interrupted.terminal_receipt is not None
+        assert interrupted.terminal_receipt["limits"] == _manual_limits(5001)
+        assert interrupted.terminal_receipt["mdns_status"] == "unavailable"
+        events = manager.events(running.scan_id)
+        assert events[0].payload == _manual_preview_event(
+            interface,
+            address="192.168.90.2",
+            port=5001,
+        )
+        assert events[-1].event_type == "scan_interrupted"
+        assert calls == []
+        assert manager.is_quiescent() is True
+    finally:
+        assert manager.shutdown(timeout_seconds=2.0) is True

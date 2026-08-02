@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from nested_memvid_agent.lan_discovery_models import (
+    ManualLanEndpoint,
     NetworkInterface,
     ResolvedLanEndpoint,
 )
@@ -77,7 +78,7 @@ class LanRuntimeAuthority:
     """Internal-only, canonical snapshot authorizing one direct LAN request."""
 
     scope: PrivateScanScope
-    endpoint: ResolvedLanEndpoint
+    endpoint: ResolvedLanEndpoint | ManualLanEndpoint
     source_address: str
     os_interface_identity: str
     interface_index: int
@@ -123,10 +124,14 @@ def derive_lan_runtime_provider_profile_id(endpoint_binding_digest: str) -> str:
     return "lan-provider-" + digest.removeprefix("sha256:")
 
 
-def derive_lan_runtime_endpoint_binding_digest(endpoint: ResolvedLanEndpoint) -> str:
+def derive_lan_runtime_endpoint_binding_digest(
+    endpoint: ResolvedLanEndpoint | ManualLanEndpoint,
+) -> str:
     """Recompute the Task 4 endpoint-binding digest from its literal destination."""
 
-    if type(endpoint) is not ResolvedLanEndpoint:
+    if type(endpoint) not in {ResolvedLanEndpoint, ManualLanEndpoint}:
+        raise LanRuntimeAuthorityError("LAN runtime endpoint binding is invalid")
+    if type(endpoint) is ManualLanEndpoint and endpoint.kind != "manual":
         raise LanRuntimeAuthorityError("LAN runtime endpoint binding is invalid")
     return _sha256_digest(
         {
@@ -149,6 +154,8 @@ def derive_lan_runtime_interface_binding_digest(
     endpoint_fingerprint: str,
     reviewed_material_binding_digest: str,
     review_digest: str,
+    observation_source: str = "active",
+    endpoint_kind: str = "automatic",
 ) -> str:
     """Bind one reviewed runtime source/interface tuple to its exact review."""
 
@@ -159,8 +166,7 @@ def derive_lan_runtime_interface_binding_digest(
         or len(os_interface_identity.encode("utf-8")) > 256
         or unicodedata.normalize("NFC", os_interface_identity) != os_interface_identity
         or any(
-            unicodedata.category(character).startswith("C")
-            for character in os_interface_identity
+            unicodedata.category(character).startswith("C") for character in os_interface_identity
         )
     ):
         raise LanRuntimeAuthorityError("LAN runtime interface identity is invalid")
@@ -177,7 +183,19 @@ def derive_lan_runtime_interface_binding_digest(
         network = ipaddress.ip_network(confirmed_network, strict=True)
     except (TypeError, ValueError):
         raise LanRuntimeAuthorityError("LAN runtime confirmed network is invalid") from None
-    if str(network) != confirmed_network or source not in network:
+    if (
+        observation_source not in {"active", "mdns", "manual"}
+        or endpoint_kind not in {"automatic", "manual"}
+        or (observation_source == "manual") != (endpoint_kind == "manual")
+    ):
+        raise LanRuntimeAuthorityError("LAN runtime endpoint provenance is invalid")
+    manual_endpoint = endpoint_kind == "manual"
+    if (
+        str(network) != confirmed_network
+        or source.version != network.version
+        or (manual_endpoint and network.prefixlen != network.max_prefixlen)
+        or (not manual_endpoint and source not in network)
+    ):
         raise LanRuntimeAuthorityError("LAN runtime confirmed network is invalid")
     for digest in (
         endpoint_binding_digest,
@@ -186,20 +204,26 @@ def derive_lan_runtime_interface_binding_digest(
         review_digest,
     ):
         _require_digest(digest)
-    return _sha256_digest(
-        {
-            "schema": "kestrel.lan.reviewed-runtime-interface-binding.v1",
-            "os_interface_identity": os_interface_identity,
-            "source_address": source_address,
-            "interface_index": interface_index,
-            "interface_id": interface_id,
-            "confirmed_network": confirmed_network,
-            "endpoint_binding_digest": endpoint_binding_digest,
-            "endpoint_fingerprint": endpoint_fingerprint,
-            "reviewed_material_binding_digest": reviewed_material_binding_digest,
-            "review_digest": review_digest,
-        }
-    )
+    preimage = {
+        "schema": "kestrel.lan.reviewed-runtime-interface-binding.v1",
+        "os_interface_identity": os_interface_identity,
+        "source_address": source_address,
+        "interface_index": interface_index,
+        "interface_id": interface_id,
+        "confirmed_network": confirmed_network,
+        "endpoint_binding_digest": endpoint_binding_digest,
+        "endpoint_fingerprint": endpoint_fingerprint,
+        "reviewed_material_binding_digest": reviewed_material_binding_digest,
+        "review_digest": review_digest,
+    }
+    if manual_endpoint:
+        preimage.update(
+            {
+                "observation_source": observation_source,
+                "endpoint_kind": endpoint_kind,
+            }
+        )
+    return _sha256_digest(preimage)
 
 
 def derive_lan_runtime_authority_interface_binding_digest(
@@ -218,6 +242,8 @@ def derive_lan_runtime_authority_interface_binding_digest(
         endpoint_fingerprint=current.endpoint_fingerprint,
         reviewed_material_binding_digest=current.reviewed_material_binding_digest,
         review_digest=current.review_digest,
+        observation_source=("manual" if type(current.endpoint) is ManualLanEndpoint else "active"),
+        endpoint_kind=current.endpoint.kind,
     )
 
 
@@ -264,13 +290,22 @@ def _rebuild_authority(value: LanRuntimeAuthority) -> None:
         if value.scope != normalized_scope:
             raise error
 
-        if type(value.endpoint) is not ResolvedLanEndpoint:
+        if type(value.endpoint) is ManualLanEndpoint:
+            normalized_endpoint: ResolvedLanEndpoint | ManualLanEndpoint = (
+                ManualLanEndpoint.from_exact_scope(
+                    normalized_scope,
+                    value.endpoint.address,
+                    value.endpoint.port,
+                )
+            )
+        elif type(value.endpoint) is ResolvedLanEndpoint:
+            normalized_endpoint = ResolvedLanEndpoint.from_scope(
+                normalized_scope,
+                value.endpoint.address,
+                value.endpoint.port,
+            )
+        else:
             raise error
-        normalized_endpoint = ResolvedLanEndpoint.from_scope(
-            normalized_scope,
-            value.endpoint.address,
-            value.endpoint.port,
-        )
         if value.endpoint != normalized_endpoint:
             raise error
 
@@ -282,7 +317,9 @@ def _rebuild_authority(value: LanRuntimeAuthority) -> None:
             raise error
         if source.version != ipaddress.ip_address(normalized_endpoint.address).version:
             raise error
-        if source not in ipaddress.ip_network(normalized_scope.network, strict=True):
+        if type(normalized_endpoint) is ResolvedLanEndpoint and source not in ipaddress.ip_network(
+            normalized_scope.network, strict=True
+        ):
             raise error
 
         if (
@@ -370,7 +407,7 @@ def _require_canonical_model_id(value: object) -> None:
     ):
         raise LanRuntimeAuthorityError("LAN runtime model ID is not canonical")
     contains_transport = _contains_transport_material(value)
-    if ((":" in value or contains_transport) and not _is_canonical_model_name_tag(value)):
+    if (":" in value or contains_transport) and not _is_canonical_model_name_tag(value):
         raise LanRuntimeAuthorityError("LAN runtime model ID contains transport material")
 
 

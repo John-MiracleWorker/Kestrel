@@ -7,12 +7,14 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
+from importlib import import_module
 from pathlib import Path
 from threading import Barrier, Event, Thread, current_thread
 
 import pytest
 
 import nested_memvid_agent.routing.lan_ledger as lan_ledger_module
+import nested_memvid_agent.routing.lan_serialization as lan_serialization_module
 from nested_memvid_agent.lan_discovery_models import (
     LanScanLimits,
     NetworkInterface,
@@ -32,13 +34,26 @@ from nested_memvid_agent.routing.lan_records import (
     LanScanRevisionConflict,
     LanScanTransitionError,
 )
-from nested_memvid_agent.routing.lan_serialization import lan_observation_to_draft
+from nested_memvid_agent.routing.lan_serialization import (
+    bounded_scan_preview_event,
+    lan_observation_to_draft,
+    load_authenticated_task4_observation,
+    observation_membership_digest,
+)
 from nested_memvid_agent.routing.ledger import RoutingLedger
 from nested_memvid_agent.routing.models import ModelTarget, ProviderProfile
 from nested_memvid_agent.state_store import AgentStateStore
 
 INTERFACE_ID = "sha256:" + "1" * 64
 PREVIEW_DIGEST = "sha256:" + "2" * 64
+AUTOMATIC_PREVIEW_EVENT_SHA256 = "be2dea706540f5428c625526319115eb204364c1faa6d6bed05ef7baa99f12f6"
+AUTOMATIC_MEMBERSHIP_DIGEST = (
+    "sha256:94c28c9a0dcfeecfe442edb8074a084487ceea3945cb768f55f5ce88e6014b56"
+)
+
+
+def _task6():
+    return import_module("nested_memvid_agent.lan_scan_manager")
 
 
 @pytest.fixture
@@ -53,6 +68,21 @@ def lan_ledger(state: AgentStateStore) -> LanDiscoveryLedger:
 
 def _limits() -> dict[str, object]:
     return asdict(LanScanLimits())
+
+
+def _manual_limits(port: int = 5001) -> dict[str, object]:
+    return {
+        "mode": "manual",
+        "exact_port": port,
+        "max_active_hosts": 1,
+        "max_scan_concurrency": 1,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 256 * 1024,
+        "max_discovered_models": 8,
+        "mdns_enabled": False,
+    }
 
 
 def _preview_event() -> dict[str, object]:
@@ -73,6 +103,38 @@ def _preview_event() -> dict[str, object]:
     }
 
 
+def _manual_preview_event(
+    *,
+    port: int = 5001,
+    address: str = "192.168.10.1",
+    owner: str = "owner:test",
+    interface_id: str = INTERFACE_ID,
+    expires_at: str = "2099-08-01T12:00:30Z",
+) -> dict[str, object]:
+    suffix = 32 if ":" not in address else 128
+    return {
+        "schema": "kestrel.lan.scan-preview.manual.v1",
+        "mode": "manual",
+        "endpoint_kind": "manual",
+        "observation_source": "manual",
+        "owner_principal": owner,
+        "interface_id": interface_id,
+        "network": f"{address}/{suffix}",
+        "limits": _manual_limits(port),
+        "active_host_count": 1,
+        "passive_or_manual_only": True,
+        "port_count": 1,
+        "exact_port": port,
+        "mdns_status": "unavailable",
+        "server_version": _task6().LAN_SERVER_VERSION,
+        "contract_version": _task6().LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+        "preview_digest": PREVIEW_DIGEST,
+        "expires_at": expires_at,
+        "confirmed": True,
+        "privacy_acknowledged": True,
+    }
+
+
 def _create_scan(
     ledger: LanDiscoveryLedger,
     *,
@@ -85,6 +147,39 @@ def _create_scan(
         network="192.168.10.0/30",
         limits=_limits(),
         preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+
+
+def _create_and_claim_manual(
+    ledger: LanDiscoveryLedger,
+    *,
+    scan_id: str = "lan_manual",
+    owner: str = "owner:test",
+    interface_id: str = INTERFACE_ID,
+    address: str = "192.168.10.1",
+    port: int = 5001,
+    preview_event: dict[str, object] | None = None,
+):
+    suffix = 32 if ":" not in address else 128
+    return ledger.create_and_claim_manual_scan(
+        scan_id=scan_id,
+        owner_principal=owner,
+        confirmed_interface_id=interface_id,
+        network=f"{address}/{suffix}",
+        limits=_manual_limits(port),
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event=(
+            _manual_preview_event(
+                port=port,
+                address=address,
+                owner=owner,
+                interface_id=interface_id,
+            )
+            if preview_event is None
+            else preview_event
+        ),
         expected_revision=0,
     )
 
@@ -128,6 +223,26 @@ def _task4_observation(
         scope=scope,
         freshness_timestamp="2026-08-01T12:00:00Z",
         source="active",
+    )
+
+
+def _manual_task4_observation(
+    scope: PrivateScanScope,
+    address: str,
+    port: int,
+) -> LanObservationDraft:
+    endpoint_type = import_module("nested_memvid_agent.lan_discovery_models").ManualLanEndpoint
+    endpoint = endpoint_type.from_exact_scope(scope, address, port)
+    observation = _make_observation(
+        endpoint,
+        reachability=Reachability.UNREACHABLE,
+        failure_category=LanFailureCategory.TCP_REFUSED,
+    )
+    return lan_observation_to_draft(
+        observation,
+        scope=scope,
+        freshness_timestamp="2026-08-01T12:00:00Z",
+        source="manual",
     )
 
 
@@ -4319,3 +4434,1231 @@ def test_route_observation_snapshot_hides_foreign_owner_record_and_rows(
         )
         is None
     )
+
+
+def test_manual_create_and_claim_is_one_revision_two_transaction_with_exact_event(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    automatic_event = bounded_scan_preview_event(_preview_event())
+    automatic_event_bytes = json.dumps(
+        automatic_event,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    expected_automatic_event = json.loads(
+        json.dumps(_preview_event(), sort_keys=True, separators=(",", ":"))
+    )
+    assert automatic_event == expected_automatic_event
+    assert hashlib.sha256(automatic_event_bytes).hexdigest() == (AUTOMATIC_PREVIEW_EVENT_SHA256)
+
+    running = _create_and_claim_manual(ledger, scan_id="lan_manual_atomic")
+
+    assert running.status == "running"
+    assert running.revision == 2
+    assert running.network == "192.168.10.1/32"
+    assert running.limits == _manual_limits(5001)
+    events = ledger.list_events(running.scan_id)
+    assert len(events) == 1
+    assert (events[0].sequence, events[0].event_type, events[0].payload) == (
+        1,
+        "scan_started",
+        _manual_preview_event(),
+    )
+    assert ledger.list_scans(status="draft") == []
+    with state._connect() as connection:
+        schema_version = connection.execute(
+            "SELECT version FROM routing_schema_version WHERE id = 1"
+        ).fetchone()
+    assert schema_version is not None and schema_version["version"] == 3
+    assert bounded_scan_preview_event(_preview_event()) == expected_automatic_event
+    assert hashlib.sha256(automatic_event_bytes).hexdigest() == (AUTOMATIC_PREVIEW_EVENT_SHA256)
+
+
+@pytest.mark.parametrize("operation", ("observation", "event", "transition"))
+def test_manual_v2_scan_rejects_each_legacy_mutation_path_without_writes(
+    state: AgentStateStore,
+    operation: str,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _create_and_claim_manual(
+        ledger,
+        scan_id=f"lan_manual_legacy_{operation}",
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="manual.*v2|specialized.*lifecycle"):
+        if operation == "observation":
+            ledger.append_observation(
+                running.scan_id,
+                replace(_observation(), source="manual", port=5001),
+                expected_revision=running.revision,
+            )
+        elif operation == "event":
+            ledger.append_event(
+                running.scan_id,
+                "probe_started",
+                {"port": 5001},
+                expected_revision=running.revision,
+            )
+        else:
+            ledger.transition_scan(
+                running.scan_id,
+                "failed",
+                expected_revision=running.revision,
+                terminal_reason="worker_error",
+                candidate_count=0,
+                error_count=0,
+                timeout_count=0,
+            )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+
+
+def test_automatic_legacy_append_rejects_manual_source_without_writes(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _running_scan(ledger, scan_id="lan_automatic_manual_source")
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="automatic.*manual"):
+        ledger.append_observation(
+            running.scan_id,
+            replace(_observation(), source="manual"),
+            expected_revision=running.revision,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+
+
+def test_automatic_scan_rejects_incomplete_worker_evidence_without_writes(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _running_scan(
+        ledger,
+        scan_id="lan_automatic_incomplete_worker",
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="manual|incomplete"):
+        ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status="failed",
+            terminal_reason="worker_error",
+            cancel_reason=None,
+            observations=(),
+            mdns_status="available",
+            planned_count=1,
+            admitted_count=1,
+            completed_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=False,
+            unknown_inflight_count=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+    assert ledger.list_events(running.scan_id) == []
+
+
+@pytest.mark.parametrize("cancel_before_interrupt", (False, True))
+def test_returned_automatic_worker_gap_derives_interruption_from_durable_evidence(
+    state: AgentStateStore,
+    cancel_before_interrupt: bool,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _running_scan(
+        ledger,
+        scan_id=f"lan_automatic_returned_gap_{int(cancel_before_interrupt)}",
+    )
+    current = ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        planned_count=2,
+        admitted_count=1,
+        completed_count=0,
+        persisted_observation_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        mdns_status="available",
+    )
+    if cancel_before_interrupt:
+        current = ledger.request_scan_cancel(
+            current.scan_id,
+            owner_principal="owner:test",
+            expected_revision=current.revision,
+            cancel_reason="owner_cancelled",
+        )
+
+    terminal = ledger.interrupt_returned_automatic_worker_gap(
+        current.scan_id,
+        owner_principal="owner:test",
+        expected_revision=current.revision,
+    )
+
+    assert terminal.status == "interrupted"
+    assert terminal.terminal_reason == "worker_interrupted"
+    assert terminal.cancel_reason == ("owner_cancelled" if cancel_before_interrupt else None)
+    assert terminal.terminal_receipt is not None
+    receipt = terminal.terminal_receipt
+    assert (
+        receipt["planned_count"],
+        receipt["admitted_count"],
+        receipt["completed_count"],
+        receipt["persisted_observation_count"],
+    ) == (2, 1, 0, 0)
+    assert receipt["error_category_counts"] == {}
+    assert receipt["evidence_complete"] is False
+    assert receipt["unknown_inflight_count"] == 1
+    assert ledger.list_observations(terminal.scan_id) == []
+    terminal_event = ledger.list_events(terminal.scan_id)[-1]
+    assert terminal_event.event_type == "scan_interrupted"
+    assert terminal_event.payload == {
+        "schema": "kestrel.lan.scan-terminal.v2",
+        "status": "interrupted",
+        "terminal_reason": "worker_interrupted",
+        "cancel_reason": terminal.cancel_reason,
+    }
+
+
+@pytest.mark.parametrize("authority", ("manual", "settled"))
+def test_returned_automatic_worker_gap_rejects_wrong_or_settled_authority_atomically(
+    state: AgentStateStore,
+    authority: str,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    if authority == "manual":
+        running = _create_and_claim_manual(
+            ledger,
+            scan_id="lan_returned_gap_manual",
+        )
+        current = ledger.record_scan_progress(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            planned_count=1,
+            admitted_count=1,
+            completed_count=0,
+            persisted_observation_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            mdns_status="unavailable",
+        )
+    else:
+        running = _running_scan(ledger, scan_id="lan_returned_gap_settled")
+        current = ledger.record_scan_progress(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            planned_count=1,
+            admitted_count=0,
+            completed_count=0,
+            persisted_observation_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            mdns_status="available",
+        )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="automatic|gap|admitted"):
+        ledger.interrupt_returned_automatic_worker_gap(
+            current.scan_id,
+            owner_principal="owner:test",
+            expected_revision=current.revision,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(current.scan_id) == current
+
+
+def test_running_terminal_rejects_non_null_cancel_reason_without_writes(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _running_scan(ledger, scan_id="lan_running_terminal_cancel_injection")
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="cancel"):
+        ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status="failed",
+            terminal_reason="worker_error",
+            cancel_reason="owner_cancelled",
+            observations=(),
+            mdns_status="available",
+            planned_count=0,
+            admitted_count=0,
+            completed_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+
+
+@pytest.mark.parametrize("supplied_reason", (None, "shutdown_cancelled"))
+def test_cancelling_worker_failure_requires_exact_durable_cancel_reason_without_writes(
+    state: AgentStateStore,
+    supplied_reason: str | None,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _create_and_claim_manual(
+        ledger,
+        scan_id=f"lan_manual_cancel_substitution_{supplied_reason}",
+    )
+    planned = ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        planned_count=1,
+        admitted_count=0,
+        completed_count=0,
+        persisted_observation_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        mdns_status="unavailable",
+    )
+    admitted = ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=planned.revision,
+        planned_count=1,
+        admitted_count=1,
+        completed_count=0,
+        persisted_observation_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        mdns_status="unavailable",
+    )
+    cancelling = ledger.request_scan_cancel(
+        admitted.scan_id,
+        owner_principal="owner:test",
+        expected_revision=admitted.revision,
+        cancel_reason="owner_cancelled",
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="cancel"):
+        ledger.commit_scan_terminal(
+            cancelling.scan_id,
+            owner_principal="owner:test",
+            expected_revision=cancelling.revision,
+            status="failed",
+            terminal_reason="worker_error",
+            cancel_reason=supplied_reason,
+            observations=(),
+            mdns_status="unavailable",
+            planned_count=1,
+            admitted_count=1,
+            completed_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=False,
+            unknown_inflight_count=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(cancelling.scan_id) == cancelling
+
+
+def test_worker_failure_terminalizes_returned_call_without_inventing_typed_evidence(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _create_and_claim_manual(
+        ledger,
+        scan_id="lan_manual_worker_evidence_gap",
+    )
+    planned = ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        planned_count=1,
+        admitted_count=0,
+        completed_count=0,
+        persisted_observation_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        mdns_status="unavailable",
+    )
+    admitted = ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=planned.revision,
+        planned_count=1,
+        admitted_count=1,
+        completed_count=0,
+        persisted_observation_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        mdns_status="unavailable",
+    )
+
+    terminal = ledger.commit_scan_terminal(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=admitted.revision,
+        status="failed",
+        terminal_reason="worker_error",
+        cancel_reason=None,
+        observations=(),
+        mdns_status="unavailable",
+        planned_count=1,
+        admitted_count=1,
+        completed_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        evidence_complete=False,
+        unknown_inflight_count=0,
+    )
+
+    assert terminal.status == "failed"
+    assert terminal.terminal_receipt is not None
+    assert terminal.terminal_receipt["evidence_complete"] is False
+    assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+    assert (
+        terminal.terminal_receipt["planned_count"],
+        terminal.terminal_receipt["admitted_count"],
+        terminal.terminal_receipt["completed_count"],
+    ) == (1, 1, 0)
+    assert ledger.list_observations(running.scan_id) == []
+    assert [event.event_type for event in ledger.list_events(running.scan_id)] == [
+        "scan_started",
+        "scan_progress",
+        "scan_progress",
+        "scan_failed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "terminal_reason", "evidence_complete", "counts"),
+    (
+        ("completed", "scan_complete", False, (1, 1, 0)),
+        ("failed", "deadline_expired", False, (1, 1, 0)),
+        ("failed", "worker_error", False, (0, 0, 0)),
+        ("failed", "worker_error", True, (1, 1, 0)),
+    ),
+)
+def test_incomplete_terminal_evidence_is_limited_to_worker_failure_evidence_gaps(
+    state: AgentStateStore,
+    status: str,
+    terminal_reason: str,
+    evidence_complete: bool,
+    counts: tuple[int, int, int],
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _create_and_claim_manual(
+        ledger,
+        scan_id=(
+            f"lan_manual_incomplete_{status}_{terminal_reason}_{int(evidence_complete)}_{counts[0]}"
+        ),
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError):
+        ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status=status,
+            terminal_reason=terminal_reason,
+            cancel_reason=None,
+            observations=(),
+            mdns_status="unavailable",
+            planned_count=counts[0],
+            admitted_count=counts[1],
+            completed_count=counts[2],
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=evidence_complete,
+            unknown_inflight_count=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+
+
+@pytest.mark.parametrize(
+    ("planned_count", "admitted_count", "completed_count"),
+    (
+        (2, 0, 0),
+        (2, 2, 0),
+    ),
+)
+def test_manual_progress_rejects_multi_endpoint_counts_without_writes(
+    state: AgentStateStore,
+    planned_count: int,
+    admitted_count: int,
+    completed_count: int,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _create_and_claim_manual(
+        ledger,
+        scan_id=f"lan_manual_multi_progress_{admitted_count}",
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="manual.*one|singleton"):
+        ledger.record_scan_progress(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            planned_count=planned_count,
+            admitted_count=admitted_count,
+            completed_count=completed_count,
+            persisted_observation_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            mdns_status="unavailable",
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+    assert [event.event_type for event in ledger.list_events(running.scan_id)] == ["scan_started"]
+
+
+@pytest.mark.parametrize(
+    (
+        "planned_count",
+        "admitted_count",
+        "completed_count",
+        "persisted_observation_count",
+    ),
+    (
+        pytest.param(0, 0, 0, 0, id="spurious-zero-progress"),
+        pytest.param(1, 1, 1, 0, id="completed-without-durable-observation"),
+    ),
+)
+def test_manual_progress_rejects_non_lifecycle_singleton_shapes_without_writes(
+    state: AgentStateStore,
+    planned_count: int,
+    admitted_count: int,
+    completed_count: int,
+    persisted_observation_count: int,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _create_and_claim_manual(
+        ledger,
+        scan_id=(
+            "lan_manual_bad_singleton_progress_"
+            f"{planned_count}_{admitted_count}_{completed_count}_"
+            f"{persisted_observation_count}"
+        ),
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="manual.*one|lifecycle"):
+        ledger.record_scan_progress(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            planned_count=planned_count,
+            admitted_count=admitted_count,
+            completed_count=completed_count,
+            persisted_observation_count=persisted_observation_count,
+            error_category_counts={},
+            timeout_count=0,
+            mdns_status="unavailable",
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+    assert [event.event_type for event in ledger.list_events(running.scan_id)] == ["scan_started"]
+
+
+@pytest.mark.parametrize(
+    (
+        "status",
+        "terminal_reason",
+        "cancel_reason",
+        "evidence_complete",
+        "counts",
+    ),
+    (
+        ("completed", "scan_complete", None, True, (0, 0, 0)),
+        ("completed", "scan_complete", None, True, (1, 0, 0)),
+        ("failed", "worker_error", None, True, (2, 0, 0)),
+        ("failed", "deadline_expired", None, True, (2, 0, 0)),
+        ("failed", "worker_error", None, False, (2, 1, 0)),
+        ("cancelled", "owner_cancelled", "owner_cancelled", True, (2, 0, 0)),
+    ),
+)
+def test_manual_terminal_rejects_partial_completion_or_multi_endpoint_counts_atomically(
+    state: AgentStateStore,
+    status: str,
+    terminal_reason: str,
+    cancel_reason: str | None,
+    evidence_complete: bool,
+    counts: tuple[int, int, int],
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    current = _create_and_claim_manual(
+        ledger,
+        scan_id=(
+            f"lan_manual_terminal_{status}_{terminal_reason}_{counts[0]}_{counts[1]}_{counts[2]}"
+        ),
+    )
+    if status == "cancelled":
+        current = ledger.request_scan_cancel(
+            current.scan_id,
+            owner_principal="owner:test",
+            expected_revision=current.revision,
+            cancel_reason="owner_cancelled",
+        )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="manual.*one|singleton|completed"):
+        ledger.commit_scan_terminal(
+            current.scan_id,
+            owner_principal="owner:test",
+            expected_revision=current.revision,
+            status=status,
+            terminal_reason=terminal_reason,
+            cancel_reason=cancel_reason,
+            observations=(),
+            mdns_status="unavailable",
+            planned_count=counts[0],
+            admitted_count=counts[1],
+            completed_count=counts[2],
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=evidence_complete,
+            unknown_inflight_count=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(current.scan_id) == current
+
+
+@pytest.mark.parametrize(
+    ("change", "field", "value"),
+    (
+        ("mutate", "mode", "automatic"),
+        ("mutate", "exact_port", 65536),
+        ("mutate", "max_active_hosts", 2),
+        ("mutate", "max_scan_concurrency", 2),
+        ("mutate", "tcp_connect_timeout_seconds", 0.8),
+        ("mutate", "http_probe_timeout_seconds", 2.1),
+        ("mutate", "total_scan_deadline_seconds", 46.0),
+        ("mutate", "max_probe_response_bytes", 256 * 1024 + 1),
+        ("mutate", "max_discovered_models", 9),
+        ("mutate", "mdns_enabled", True),
+        ("missing", "mode", None),
+        ("missing", "exact_port", None),
+        ("missing", "max_active_hosts", None),
+        ("missing", "max_scan_concurrency", None),
+        ("missing", "tcp_connect_timeout_seconds", None),
+        ("missing", "http_probe_timeout_seconds", None),
+        ("missing", "total_scan_deadline_seconds", None),
+        ("missing", "max_probe_response_bytes", None),
+        ("missing", "max_discovered_models", None),
+        ("missing", "mdns_enabled", None),
+        ("extra", "known_model_service_ports", [5001]),
+    ),
+)
+def test_manual_create_claim_rejects_each_noncanonical_limit_shape_atomically(
+    state: AgentStateStore,
+    change: str,
+    field: str,
+    value: object,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    before = _lan_state_bytes(state)
+    limits = _manual_limits()
+    if change == "missing":
+        limits.pop(field)
+    else:
+        limits[field] = value
+    event = _manual_preview_event()
+    event["limits"] = limits
+    if change == "mutate" and field in {"mode", "exact_port"}:
+        event[field] = value
+    if change == "mutate" and field == "max_active_hosts":
+        event["active_host_count"] = value
+    if change == "mutate" and field == "mdns_enabled":
+        event["mdns_status"] = "available"
+
+    with pytest.raises((TypeError, ValueError)):
+        ledger.create_and_claim_manual_scan(
+            scan_id="lan_manual_noncanonical_limits",
+            owner_principal="owner:test",
+            confirmed_interface_id=INTERFACE_ID,
+            network="192.168.10.1/32",
+            limits=limits,
+            preview_digest=PREVIEW_DIGEST,
+            authorized_preview_digest=PREVIEW_DIGEST,
+            preview_event=event,
+            expected_revision=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan("lan_manual_noncanonical_limits") is None
+
+
+@pytest.mark.parametrize("operation", ("progress", "terminal"))
+@pytest.mark.parametrize(
+    ("scan_mode", "variant"),
+    (
+        ("manual", "active-source"),
+        ("manual", "mdns-source"),
+        ("manual", "automatic-kind"),
+        ("manual", "wrong-address-network"),
+        ("manual", "wrong-interface"),
+        ("manual", "wrong-exact-port"),
+        ("automatic", "manual-source-unusual-port"),
+        ("automatic", "manual-kind-active-source"),
+        ("automatic", "manual-kind-known-port"),
+    ),
+)
+def test_progress_and_terminal_reject_cross_mode_or_manual_binding_mismatch_atomically(
+    state: AgentStateStore,
+    operation: str,
+    scan_mode: str,
+    variant: str,
+) -> None:
+    interface = NetworkInterface.from_addresses(
+        os_identity="darwin:en-cross-mode",
+        display_name="Cross-mode fixture",
+        addresses=("192.168.10.254/24",),
+    )
+    ledger = LanDiscoveryLedger(state)
+    if scan_mode == "manual":
+        exact_port = 11434 if variant == "automatic-kind" else 5001
+        scope = PrivateScanScope.from_request(interface, "192.168.10.1/32")
+        running = _create_and_claim_manual(
+            ledger,
+            scan_id=f"lan_manual_{operation}_{variant}",
+            interface_id=interface.interface_id,
+            address="192.168.10.1",
+            port=exact_port,
+        )
+        valid = _manual_task4_observation(scope, "192.168.10.1", exact_port)
+        if variant == "active-source":
+            observation = replace(valid, source="active")
+        elif variant == "mdns-source":
+            observation = replace(valid, source="mdns")
+        elif variant == "automatic-kind":
+            observation = replace(
+                _task4_observation(scope, "192.168.10.1", 11434),
+                source="manual",
+            )
+        elif variant == "wrong-address-network":
+            other_scope = PrivateScanScope.from_request(interface, "192.168.10.2/32")
+            observation = _manual_task4_observation(
+                other_scope,
+                "192.168.10.2",
+                exact_port,
+            )
+        elif variant == "wrong-interface":
+            other_interface = NetworkInterface.from_addresses(
+                os_identity="darwin:en-cross-mode-other",
+                display_name="Cross-mode other fixture",
+                addresses=("192.168.10.253/24",),
+            )
+            other_scope = PrivateScanScope.from_request(
+                other_interface,
+                "192.168.10.1/32",
+            )
+            observation = _manual_task4_observation(
+                other_scope,
+                "192.168.10.1",
+                exact_port,
+            )
+        else:
+            observation = _manual_task4_observation(
+                scope,
+                "192.168.10.1",
+                5002,
+            )
+        mdns_status = "unavailable"
+    else:
+        automatic_network = (
+            "192.168.10.1/32" if variant == "manual-kind-known-port" else "192.168.10.0/30"
+        )
+        scope = PrivateScanScope.from_request(interface, automatic_network)
+        draft = ledger.create_scan(
+            scan_id=f"lan_automatic_{operation}_{variant}",
+            owner_principal="owner:test",
+            confirmed_interface_id=interface.interface_id,
+            network=scope.network,
+            limits=_limits(),
+            preview_digest=PREVIEW_DIGEST,
+            expected_revision=0,
+        )
+        running = ledger.claim_scan_start(
+            draft.scan_id,
+            owner_principal="owner:test",
+            expected_revision=draft.revision,
+            preview_digest=PREVIEW_DIGEST,
+            authorized_preview_digest=PREVIEW_DIGEST,
+            preview_event={
+                **_preview_event(),
+                "interface_id": interface.interface_id,
+                "network": scope.network,
+                "active_host_count": len(scope.active_hosts),
+                "passive_or_manual_only": scope.passive_or_manual_only,
+            },
+        )
+        manual_port = 11434 if variant == "manual-kind-known-port" else 5001
+        exact_scope = (
+            scope
+            if variant == "manual-kind-known-port"
+            else PrivateScanScope.from_request(interface, "192.168.10.1/32")
+        )
+        manual = _manual_task4_observation(
+            exact_scope,
+            "192.168.10.1",
+            manual_port,
+        )
+        observation = (
+            replace(manual, source="active") if variant == "manual-kind-active-source" else manual
+        )
+        mdns_status = "available"
+
+    before = _lan_state_bytes(state)
+    with pytest.raises((TypeError, ValueError)):
+        if operation == "progress":
+            ledger.record_scan_progress(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                planned_count=1,
+                admitted_count=1,
+                completed_count=1,
+                persisted_observation_count=1,
+                error_category_counts={"tcp_refused": 1},
+                timeout_count=0,
+                mdns_status=mdns_status,
+                observations=(observation,),
+            )
+        else:
+            ledger.commit_scan_terminal(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                status="completed",
+                terminal_reason="scan_complete",
+                cancel_reason=None,
+                observations=(observation,),
+                mdns_status=mdns_status,
+                planned_count=1,
+                admitted_count=1,
+                completed_count=1,
+                error_category_counts={"tcp_refused": 1},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+            )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(running.scan_id) == running
+
+
+@pytest.mark.parametrize("failure", ("precommit", "expiry-crossing"))
+def test_manual_create_claim_precommit_or_expiry_crossing_rolls_back_row_and_event(
+    state: AgentStateStore,
+    failure: str,
+) -> None:
+    current = [datetime(2026, 8, 1, 12, 0, tzinfo=UTC)]
+
+    def precommit(operation: str) -> None:
+        assert operation == "create_and_claim_manual_scan"
+        if failure == "precommit":
+            raise RuntimeError("raw-secret-injected-crash")
+        current[0] += timedelta(seconds=31)
+
+    ledger = LanDiscoveryLedger(
+        state,
+        utc_clock=lambda: current[0],
+        precommit_hook=precommit,
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises((RuntimeError, ValueError)):
+        _create_and_claim_manual(
+            ledger,
+            scan_id="lan_manual_rollback",
+            preview_event=_manual_preview_event(expires_at="2026-08-01T12:00:30Z"),
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan("lan_manual_rollback") is None
+    assert ledger.list_events("lan_manual_rollback") == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("schema", "kestrel.lan.scan-preview.v1"),
+        ("mode", "automatic"),
+        ("endpoint_kind", "automatic"),
+        ("observation_source", "active"),
+        ("owner_principal", "owner:other"),
+        ("interface_id", "sha256:" + "8" * 64),
+        ("network", "192.168.10.2/32"),
+        ("active_host_count", 2),
+        ("passive_or_manual_only", False),
+        ("port_count", 2),
+        ("exact_port", 5002),
+        ("mdns_status", "available"),
+        ("server_version", "kestrel-forged"),
+        ("contract_version", "kestrel.lan.preview-authorization.v1"),
+        ("preview_digest", "sha256:" + "9" * 64),
+        ("confirmed", False),
+        ("privacy_acknowledged", False),
+    ),
+)
+def test_manual_create_claim_rejects_event_mode_kind_source_port_or_consent_mismatch(
+    state: AgentStateStore,
+    field: str,
+    value: object,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError):
+        _create_and_claim_manual(
+            ledger,
+            scan_id="lan_manual_mismatch",
+            preview_event={**_manual_preview_event(), field: value},
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan("lan_manual_mismatch") is None
+
+
+def test_manual_create_claim_rejects_limits_or_digest_alias_without_a_draft(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    before = _lan_state_bytes(state)
+    event = _manual_preview_event()
+    hostile_calls = (
+        {
+            "limits": {**_manual_limits(5001), "exact_port": 5002},
+            "preview_digest": PREVIEW_DIGEST,
+            "authorized_preview_digest": PREVIEW_DIGEST,
+            "expected_revision": 0,
+        },
+        {
+            "limits": _manual_limits(5001),
+            "preview_digest": "sha256:" + "9" * 64,
+            "authorized_preview_digest": PREVIEW_DIGEST,
+            "expected_revision": 0,
+        },
+        {
+            "limits": _manual_limits(5001),
+            "preview_digest": PREVIEW_DIGEST,
+            "authorized_preview_digest": PREVIEW_DIGEST,
+            "expected_revision": True,
+        },
+    )
+    for values in hostile_calls:
+        with pytest.raises((LanScanRevisionConflict, TypeError, ValueError)):
+            ledger.create_and_claim_manual_scan(
+                scan_id="lan_manual_alias",
+                owner_principal="owner:test",
+                confirmed_interface_id=INTERFACE_ID,
+                network="192.168.10.1/32",
+                preview_event=event,
+                **values,
+            )
+        assert _lan_state_bytes(state) == before
+        assert ledger.get_scan("lan_manual_alias") is None
+
+
+def test_manual_active_slot_conflict_rolls_back_both_creation_revisions(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    active = _running_scan(ledger, scan_id="lan_existing_active")
+    assert active.status == "running"
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(RuntimeError, match="owner.*active|already_active"):
+        _create_and_claim_manual(ledger, scan_id="lan_manual_blocked")
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan("lan_manual_blocked") is None
+    assert ledger.list_events("lan_manual_blocked") == []
+
+
+def test_concurrent_manual_create_claims_have_one_running_winner_and_no_losing_draft(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "manual-race" / "agent.db")
+    ledgers = (LanDiscoveryLedger(state), LanDiscoveryLedger(state))
+    gate = Barrier(3, timeout=2.0)
+    records: list[object] = []
+    failures: list[BaseException] = []
+
+    def claim(index: int) -> None:
+        try:
+            gate.wait()
+            records.append(
+                _create_and_claim_manual(ledgers[index], scan_id=f"lan_manual_race_{index}")
+            )
+        except BaseException as exc:  # noqa: BLE001 - losing type is asserted below
+            failures.append(exc)
+
+    threads = tuple(
+        Thread(target=claim, args=(index,), name=f"task7b-ledger-race-{index}", daemon=True)
+        for index in range(2)
+    )
+    try:
+        for thread in threads:
+            thread.start()
+        gate.wait()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(records) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], RuntimeError)
+        scans = ledgers[0].list_scans(owner_principal="owner:test")
+        assert len(scans) == 1
+        assert scans[0].status == "running" and scans[0].revision == 2
+        assert ledgers[0].list_scans(status="draft") == []
+        assert [event.event_type for event in ledgers[0].list_events(scans[0].scan_id)] == [
+            "scan_started"
+        ]
+    finally:
+        gate.abort()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+
+def test_manual_terminal_receipt_binds_durable_manual_source_and_unusual_port(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _create_and_claim_manual(ledger, scan_id="lan_manual_source", port=65535)
+    observation = LanObservationDraft(
+        endpoint_id="sha256:" + "8" * 64,
+        source="manual",
+        interface_id=INTERFACE_ID,
+        address="192.168.10.1",
+        port=65535,
+        api_shape=None,
+        tls_enabled=False,
+        certificate_sha256=None,
+        catalog_digest=None,
+        capability_digest=None,
+        public_payload={"model_count": 0},
+        freshness_timestamp="2026-08-01T12:00:01Z",
+        error_category="tcp_refused",
+    )
+
+    terminal = ledger.commit_scan_terminal(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=(observation,),
+        mdns_status="unavailable",
+        planned_count=1,
+        admitted_count=1,
+        completed_count=1,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+
+    rows = ledger.list_observations(running.scan_id)
+    assert len(rows) == 1
+    assert rows[0].source == "manual"
+    assert rows[0].port == 65535
+    assert terminal.terminal_receipt is not None
+    assert terminal.terminal_receipt["limits"] == _manual_limits(65535)
+    assert terminal.terminal_receipt["mdns_status"] == "unavailable"
+    assert terminal.terminal_receipt["observation_count"] == 1
+
+
+def test_authenticated_loader_conditionally_binds_manual_source_and_kind_but_keeps_automatic_membership_bytes(
+    state: AgentStateStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interface = NetworkInterface.from_addresses(
+        os_identity="darwin:en-manual-membership",
+        display_name="Manual membership fixture",
+        addresses=("192.168.10.254/24",),
+    )
+    manual_scope = PrivateScanScope.from_request(interface, "192.168.10.1/32")
+    manual_observation = _manual_task4_observation(
+        manual_scope,
+        "192.168.10.1",
+        5001,
+    )
+    ledger = LanDiscoveryLedger(state)
+    manual_running = _create_and_claim_manual(
+        ledger,
+        scan_id="lan_manual_authenticated_membership",
+        interface_id=interface.interface_id,
+        preview_event=_manual_preview_event(
+            port=5001,
+            address="192.168.10.1",
+            interface_id=interface.interface_id,
+        ),
+    )
+    manual_terminal = ledger.commit_scan_terminal(
+        manual_running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=manual_running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=(manual_observation,),
+        mdns_status="unavailable",
+        planned_count=1,
+        admitted_count=1,
+        completed_count=1,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+    assert manual_terminal.terminal_receipt_digest is not None
+    manual_observation_digest = str(manual_observation.public_payload["observation_digest"])
+    with state._connect() as connection:
+        authenticated_manual = load_authenticated_task4_observation(
+            connection,
+            scan_id=manual_terminal.scan_id,
+            endpoint_binding_digest=manual_observation.endpoint_id,
+            expected_terminal_receipt_digest=(manual_terminal.terminal_receipt_digest),
+            expected_observation_digest=manual_observation_digest,
+            authenticated_owner_principal="owner:test",
+        )
+    assert authenticated_manual.source == "manual"
+    assert authenticated_manual.observation.endpoint.kind == "manual"
+
+    automatic_scope = PrivateScanScope.from_request(
+        interface,
+        "192.168.10.0/30",
+    )
+    automatic_observation = _task4_observation(
+        automatic_scope,
+        "192.168.10.1",
+        11434,
+    )
+    assert observation_membership_digest((automatic_observation,)) == (AUTOMATIC_MEMBERSHIP_DIGEST)
+    automatic_draft = ledger.create_scan(
+        scan_id="lan_automatic_membership_control",
+        owner_principal="owner:test",
+        confirmed_interface_id=interface.interface_id,
+        network=automatic_scope.network,
+        limits=_limits(),
+        preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+    automatic_running = ledger.claim_scan_start(
+        automatic_draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=automatic_draft.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event={
+            **_preview_event(),
+            "interface_id": interface.interface_id,
+            "network": automatic_scope.network,
+        },
+    )
+    automatic_terminal = ledger.commit_scan_terminal(
+        automatic_running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=automatic_running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=(automatic_observation,),
+        mdns_status="available",
+        planned_count=1,
+        admitted_count=1,
+        completed_count=1,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+    assert automatic_terminal.terminal_receipt_digest is not None
+    automatic_observation_digest = str(automatic_observation.public_payload["observation_digest"])
+    with state._connect() as connection:
+        authenticated_automatic = load_authenticated_task4_observation(
+            connection,
+            scan_id=automatic_terminal.scan_id,
+            endpoint_binding_digest=automatic_observation.endpoint_id,
+            expected_terminal_receipt_digest=(automatic_terminal.terminal_receipt_digest),
+            expected_observation_digest=automatic_observation_digest,
+            authenticated_owner_principal="owner:test",
+        )
+    assert authenticated_automatic.observation.endpoint.kind == "automatic"
+
+    with state._connect() as connection:
+        connection.execute("DROP TRIGGER trg_routing_lan_terminal_observation_update_immutable")
+        connection.execute(
+            """
+            UPDATE routing_lan_observations
+            SET source = 'active'
+            WHERE scan_id = ? AND endpoint_id = ?
+            """,
+            (manual_terminal.scan_id, manual_observation.endpoint_id),
+        )
+        connection.execute(
+            """
+            UPDATE routing_lan_observations
+            SET source = 'manual'
+            WHERE scan_id = ? AND endpoint_id = ?
+            """,
+            (automatic_terminal.scan_id, automatic_observation.endpoint_id),
+        )
+
+    reconstruction_calls = 0
+
+    def forbidden_reconstruction(*_args: object, **_kwargs: object) -> object:
+        nonlocal reconstruction_calls
+        reconstruction_calls += 1
+        raise AssertionError("receipt membership must authenticate source first")
+
+    monkeypatch.setattr(
+        lan_serialization_module,
+        "_task4_observation_from_row",
+        forbidden_reconstruction,
+    )
+    with state._connect() as connection:
+        with pytest.raises(ValueError, match="receipt|membership"):
+            load_authenticated_task4_observation(
+                connection,
+                scan_id=manual_terminal.scan_id,
+                endpoint_binding_digest=manual_observation.endpoint_id,
+                expected_terminal_receipt_digest=(manual_terminal.terminal_receipt_digest),
+                expected_observation_digest=manual_observation_digest,
+                authenticated_owner_principal="owner:test",
+            )
+    assert reconstruction_calls == 0
+    with state._connect() as connection:
+        with pytest.raises(ValueError, match="receipt|membership"):
+            load_authenticated_task4_observation(
+                connection,
+                scan_id=automatic_terminal.scan_id,
+                endpoint_binding_digest=automatic_observation.endpoint_id,
+                expected_terminal_receipt_digest=(automatic_terminal.terminal_receipt_digest),
+                expected_observation_digest=automatic_observation_digest,
+                authenticated_owner_principal="owner:test",
+            )
+    assert reconstruction_calls == 0

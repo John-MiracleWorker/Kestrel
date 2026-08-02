@@ -11,13 +11,14 @@ import unicodedata
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from ..lan_discovery_models import (
     KNOWN_MODEL_SERVICE_PORTS,
     MAX_ACTIVE_HOSTS,
     MAX_DISCOVERED_MODELS,
     LanScanLimits,
+    ManualLanEndpoint,
     ResolvedLanEndpoint,
 )
 from ..lan_discovery_scope import PrivateScanScope
@@ -90,6 +91,9 @@ _TASK4_OBSERVATION_SCHEMA = "kestrel.lan.durable-observation.v1"
 LAN_SCAN_RECEIPT_V2_SCHEMA = "kestrel.lan.scan-receipt.v2"
 LAN_OBSERVATION_MEMBERSHIP_SCHEMA = "kestrel.lan.observation-membership.v1"
 LAN_SCAN_PREVIEW_EVENT_SCHEMA = "kestrel.lan.scan-preview.v1"
+LAN_MANUAL_SCAN_PREVIEW_EVENT_SCHEMA = "kestrel.lan.scan-preview.manual.v1"
+_LAN_MANUAL_PREVIEW_CONTRACT_VERSION = "kestrel.lan.manual-preview-authorization.v1"
+_LAN_SERVER_VERSION = "kestrel-local-runtime-v1"
 LAN_SCAN_PROGRESS_EVENT_SCHEMA = "kestrel.lan.scan-progress.v1"
 LAN_SCAN_TERMINAL_EVENT_SCHEMA = "kestrel.lan.scan-terminal.v2"
 LAN_MDNS_STATUSES = frozenset({"available", "unavailable", "timed_out"})
@@ -102,6 +106,7 @@ LAN_TERMINAL_REASONS = frozenset(
         "deadline_expired",
         "worker_error",
         "startup_interrupted",
+        "worker_interrupted",
     }
 )
 _TASK4_OBSERVATION_PUBLIC_FIELDS = frozenset(
@@ -140,6 +145,7 @@ class AuthenticatedLanObservation:
     confirmed_network: str
     terminal_receipt_digest: str
     observed_at: datetime
+    source: LanObservationSource
     observation: LanEndpointObservation
 
 
@@ -218,14 +224,23 @@ def observation_membership_digest(
                     **values,
                 }
             )
-        existing = members.get(endpoint_id)
-        if existing is not None and existing != observation_digest:
+        member: dict[str, str] = {
+            "endpoint_id": endpoint_id,
+            "observation_digest": observation_digest,
+        }
+        if draft.source == "manual":
+            member.update(
+                {
+                    "observation_source": "manual",
+                    "endpoint_kind": "manual",
+                }
+            )
+        prior_member = members.get(endpoint_id)
+        canonical_member = canonical_json(member)
+        if prior_member is not None and prior_member != canonical_member:
             raise ValueError(f"conflicting LAN observation endpoint: {endpoint_id}")
-        members[endpoint_id] = observation_digest
-    ordered = [
-        {"endpoint_id": endpoint_id, "observation_digest": members[endpoint_id]}
-        for endpoint_id in sorted(members)
-    ]
+        members[endpoint_id] = canonical_member
+    ordered = [json.loads(members[endpoint_id]) for endpoint_id in sorted(members)]
     return sha256_digest(
         {
             "schema": LAN_OBSERVATION_MEMBERSHIP_SCHEMA,
@@ -237,6 +252,8 @@ def observation_membership_digest(
 
 def bounded_scan_preview_event(value: object) -> dict[str, Any]:
     payload = _require_string_keyed_object(value, "scan preview event")
+    if payload.get("schema") == LAN_MANUAL_SCAN_PREVIEW_EVENT_SCHEMA:
+        return _bounded_manual_scan_preview_event(payload)
     expected = {
         "schema",
         "owner_principal",
@@ -290,6 +307,89 @@ def bounded_scan_preview_event(value: object) -> dict[str, Any]:
     return _bounded_json_object(
         result,
         kind="scan preview event",
+        max_bytes=MAX_EVENT_PAYLOAD_BYTES,
+    )
+
+
+def _bounded_manual_scan_preview_event(payload: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "schema",
+        "mode",
+        "endpoint_kind",
+        "observation_source",
+        "owner_principal",
+        "interface_id",
+        "network",
+        "limits",
+        "active_host_count",
+        "passive_or_manual_only",
+        "port_count",
+        "exact_port",
+        "mdns_status",
+        "server_version",
+        "contract_version",
+        "preview_digest",
+        "expires_at",
+        "confirmed",
+        "privacy_acknowledged",
+    }
+    if set(payload) != expected:
+        raise ValueError("LAN manual scan preview event has an invalid field set")
+    if (
+        payload["mode"] != "manual"
+        or payload["endpoint_kind"] != "manual"
+        or payload["observation_source"] != "manual"
+        or payload["active_host_count"] != 1
+        or payload["passive_or_manual_only"] is not True
+        or payload["port_count"] != 1
+        or payload["mdns_status"] != "unavailable"
+        or payload["confirmed"] is not True
+        or payload["privacy_acknowledged"] is not True
+    ):
+        raise ValueError("LAN manual scan preview event binding is invalid")
+    interface_id = validate_digest(payload["interface_id"], "interface_id")
+    preview_digest = validate_digest(payload["preview_digest"], "preview_digest")
+    if interface_id is None or preview_digest is None:
+        raise ValueError("LAN manual preview digest binding is invalid")
+    limits = bounded_scan_limits(payload["limits"])
+    exact_port = payload["exact_port"]
+    if type(exact_port) is not int or not 1 <= exact_port <= 65535:
+        raise ValueError("LAN manual scan port is invalid")
+    if limits.get("mode") != "manual" or limits.get("exact_port") != exact_port:
+        raise ValueError("LAN manual scan preview limits do not match exact port")
+    network = normalize_network(payload["network"])
+    parsed_network = ipaddress.ip_network(network, strict=True)
+    if parsed_network.prefixlen != parsed_network.max_prefixlen:
+        raise ValueError("LAN manual scan network must be an exact host scope")
+    return _bounded_json_object(
+        {
+            "schema": LAN_MANUAL_SCAN_PREVIEW_EVENT_SCHEMA,
+            "mode": "manual",
+            "endpoint_kind": "manual",
+            "observation_source": "manual",
+            "owner_principal": validate_required_text(
+                payload["owner_principal"], "owner_principal", maximum=256
+            ),
+            "interface_id": interface_id,
+            "network": network,
+            "limits": limits,
+            "active_host_count": 1,
+            "passive_or_manual_only": True,
+            "port_count": 1,
+            "exact_port": exact_port,
+            "mdns_status": "unavailable",
+            "server_version": validate_required_text(
+                payload["server_version"], "server_version", maximum=128
+            ),
+            "contract_version": validate_required_text(
+                payload["contract_version"], "contract_version", maximum=128
+            ),
+            "preview_digest": preview_digest,
+            "expires_at": _normalize_observation_timestamp(payload["expires_at"]),
+            "confirmed": True,
+            "privacy_acknowledged": True,
+        },
+        kind="manual scan preview event",
         max_bytes=MAX_EVENT_PAYLOAD_BYTES,
     )
 
@@ -396,11 +496,26 @@ def lan_observation_to_draft(
     canonical_scope = PrivateScanScope.from_request(scope.interface, scope.network)
     if canonical_scope != scope:
         raise ValueError("LAN adapter scope is not canonical")
-    canonical_endpoint = ResolvedLanEndpoint.from_scope(
-        canonical_scope,
-        observation.endpoint.address,
-        observation.endpoint.port,
-    )
+    if type(observation.endpoint) is ResolvedLanEndpoint:
+        if source == "manual":
+            raise ValueError("LAN observation source and endpoint kind disagree")
+        canonical_endpoint: ResolvedLanEndpoint | ManualLanEndpoint = (
+            ResolvedLanEndpoint.from_scope(
+                canonical_scope,
+                observation.endpoint.address,
+                observation.endpoint.port,
+            )
+        )
+    elif type(observation.endpoint) is ManualLanEndpoint:
+        if source != "manual":
+            raise ValueError("LAN observation source and endpoint kind disagree")
+        canonical_endpoint = ManualLanEndpoint.from_exact_scope(
+            canonical_scope,
+            observation.endpoint.address,
+            observation.endpoint.port,
+        )
+    else:
+        raise ValueError("LAN observation endpoint kind is invalid")
     if canonical_endpoint != observation.endpoint:
         raise ValueError("LAN observation endpoint does not match confirmed scope")
     if source not in {"mdns", "active", "manual"}:
@@ -559,26 +674,12 @@ def load_authenticated_task4_observation(
         """,
         (scan_id,),
     ).fetchall()
-    receipt_observations = [
-        _strict_observation_receipt_payload(row, scan_id=scan_id) for row in observation_rows
-    ]
-    durable_observations = [observation_from_row(row) for row in observation_rows]
-    authenticated_observations: dict[str, tuple[LanEndpointObservation, datetime]] = {}
-    for row in observation_rows:
-        raw_payload = _strict_json_object(
-            row["public_payload_json"],
-            "observation public payload",
-        )
-        if raw_payload.get("schema") != _TASK4_OBSERVATION_SCHEMA:
-            raise ValueError("LAN terminal receipt contains non-Task-4 evidence")
-        endpoint_id = str(row["endpoint_id"])
-        if endpoint_id in authenticated_observations:
-            raise ValueError("LAN terminal receipt contains duplicate endpoint evidence")
-        authenticated_observations[endpoint_id] = _task4_observation_from_row(
-            row,
-            expected_interface_id=interface_id,
-            expected_network=network,
-        )
+    try:
+        receipt_observations = [
+            _strict_observation_receipt_payload(row, scan_id=scan_id) for row in observation_rows
+        ]
+    except (TypeError, ValueError):
+        raise ValueError("LAN terminal receipt observation membership is invalid") from None
     candidate_count = validate_non_negative_count(
         scan_row["candidate_count"],
         "candidate_count",
@@ -594,6 +695,7 @@ def load_authenticated_task4_observation(
     )
     if canonical_json(stored_receipt) != str(scan_row["terminal_receipt_json"]):
         raise ValueError("durable LAN terminal receipt is not canonical")
+    started_at = _strict_optional_text(scan_row["started_at"], "started_at")
     if stored_receipt.get("schema") == LAN_SCAN_RECEIPT_V2_SCHEMA:
         receipt = _validated_v2_terminal_receipt(
             stored_receipt,
@@ -604,7 +706,7 @@ def load_authenticated_task4_observation(
             limits=limits,
             limits_digest=str(scan_row["limits_digest"]),
             preview_digest=preview_digest,
-            started_at=_strict_optional_text(scan_row["started_at"], "started_at"),
+            started_at=started_at,
             finished_at=validate_required_text(
                 scan_row["finished_at"],
                 "finished_at",
@@ -618,7 +720,7 @@ def load_authenticated_task4_observation(
             candidate_count=candidate_count,
             error_count=error_count,
             timeout_count=timeout_count,
-            observations=durable_observations,
+            observations=receipt_observations,
         )
     else:
         receipt = {
@@ -630,7 +732,7 @@ def load_authenticated_task4_observation(
             "limits": limits,
             "limits_digest": str(scan_row["limits_digest"]),
             "preview_digest": preview_digest,
-            "started_at": _strict_optional_text(scan_row["started_at"], "started_at"),
+            "started_at": started_at,
             "finished_at": validate_required_text(
                 scan_row["finished_at"],
                 "finished_at",
@@ -661,12 +763,57 @@ def load_authenticated_task4_observation(
     ):
         raise ValueError("LAN terminal receipt digest does not match")
 
+    _authenticate_scan_authority_bindings(
+        connection,
+        scan_id=scan_id,
+        owner_principal=owner_principal,
+        interface_id=interface_id,
+        network=network,
+        limits=limits,
+        preview_digest=preview_digest,
+        observations=receipt_observations,
+        started_at=started_at,
+        terminal_receipt=receipt,
+    )
+
+    # Authenticate the receipt's durable membership (including manual source/kind)
+    # before reconstructing any typed endpoint.  This keeps a forged source from
+    # selecting a different endpoint authority class ahead of receipt validation.
+    authenticated_observations: dict[
+        str, tuple[LanObservationSource, LanEndpointObservation, datetime]
+    ] = {}
+    for row in observation_rows:
+        raw_payload = _strict_json_object(
+            row["public_payload_json"],
+            "observation public payload",
+        )
+        if raw_payload.get("schema") != _TASK4_OBSERVATION_SCHEMA:
+            raise ValueError("LAN terminal receipt contains non-Task-4 evidence")
+        endpoint_id = str(row["endpoint_id"])
+        if endpoint_id in authenticated_observations:
+            raise ValueError("LAN terminal receipt contains duplicate endpoint evidence")
+        raw_source = str(row["source"])
+        if raw_source not in {"mdns", "active", "manual"}:
+            raise ValueError("durable LAN observation source is invalid")
+        source = cast(LanObservationSource, raw_source)
+        observation, observed_at = _task4_observation_from_row(
+            row,
+            expected_interface_id=interface_id,
+            expected_network=network,
+            expected_source=source,
+        )
+        authenticated_observations[endpoint_id] = (
+            source,
+            observation,
+            observed_at,
+        )
+
     matching_rows = [
         row for row in observation_rows if str(row["endpoint_id"]) == endpoint_binding_digest
     ]
     if len(matching_rows) != 1 or endpoint_binding_digest not in authenticated_observations:
         raise KeyError(f"Unknown LAN observation endpoint: {endpoint_binding_digest}")
-    observation, observed_at = authenticated_observations[endpoint_binding_digest]
+    source, observation, observed_at = authenticated_observations[endpoint_binding_digest]
     if observation.observation_digest != expected_observation_digest:
         raise ValueError("LAN observation digest does not match request")
     return AuthenticatedLanObservation(
@@ -675,6 +822,7 @@ def load_authenticated_task4_observation(
         confirmed_network=network,
         terminal_receipt_digest=stored_receipt_digest,
         observed_at=observed_at,
+        source=source,
         observation=observation,
     )
 
@@ -696,7 +844,7 @@ def _validated_v2_terminal_receipt(
     candidate_count: int,
     error_count: int,
     timeout_count: int,
-    observations: list[LanObservationRecord],
+    observations: list[dict[str, Any]],
 ) -> dict[str, Any]:
     expected_fields = {
         "schema",
@@ -781,10 +929,9 @@ def _validated_v2_terminal_receipt(
     error_counts = bounded_error_category_counts(receipt["error_category_counts"])
     durable_error_counts: dict[str, int] = {}
     for observation in observations:
-        if observation.error_category is not None:
-            durable_error_counts[observation.error_category] = (
-                durable_error_counts.get(observation.error_category, 0) + 1
-            )
+        error_category = observation["error_category"]
+        if error_category is not None:
+            durable_error_counts[error_category] = durable_error_counts.get(error_category, 0) + 1
     durable_error_counts = dict(sorted(durable_error_counts.items()))
     durable_timeout_count = sum(
         count
@@ -801,7 +948,11 @@ def _validated_v2_terminal_receipt(
         receipt["observation_membership_digest"],
         "observation_membership_digest",
     )
-    if membership != observation_membership_digest(observations):
+    try:
+        durable_membership = _raw_observation_membership_digest(observations)
+    except (TypeError, ValueError):
+        raise ValueError("LAN terminal receipt observation membership is invalid") from None
+    if membership != durable_membership:
         raise ValueError("durable LAN v2 observation membership does not match rows")
     if type(receipt["evidence_complete"]) is not bool or not receipt["evidence_complete"]:
         raise ValueError("durable completed LAN v2 receipt must have complete evidence")
@@ -833,40 +984,69 @@ def _strict_observation_receipt_payload(
 ) -> dict[str, Any]:
     if str(row["scan_id"]) != scan_id:
         raise ValueError("durable LAN observation scan identity is inconsistent")
-    source = str(row["source"])
-    if source not in {"mdns", "active", "manual"}:
+    source = row["source"]
+    if type(source) is not str or source not in {"mdns", "active", "manual"}:
         raise ValueError("durable LAN observation source is invalid")
     if type(row["tls_enabled"]) is not int or row["tls_enabled"] not in {0, 1}:
         raise ValueError("durable LAN observation TLS flag is invalid")
-    draft = LanObservationDraft(
-        endpoint_id=str(row["endpoint_id"]),
-        source=source,  # type: ignore[arg-type]
-        interface_id=str(row["interface_id"]),
-        address=str(row["address"]),
-        port=row["port"],
-        api_shape=_strict_optional_text(row["api_shape"], "api_shape"),
-        tls_enabled=bool(row["tls_enabled"]),
-        certificate_sha256=_strict_optional_text(
+    port = row["port"]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("durable LAN observation port is invalid")
+    tls_enabled = bool(row["tls_enabled"])
+    certificate = validate_digest(
+        _strict_optional_text(
             row["certificate_sha256"],
             "certificate_sha256",
         ),
-        catalog_digest=_strict_optional_text(row["catalog_digest"], "catalog_digest"),
-        capability_digest=_strict_optional_text(
-            row["capability_digest"],
-            "capability_digest",
-        ),
-        public_payload=_strict_json_object(
+        "certificate_sha256",
+        optional=True,
+    )
+    if certificate is not None and not tls_enabled:
+        raise ValueError("certificate evidence requires TLS")
+    public_payload = bounded_observation_public_evidence(
+        _strict_json_object(
             row["public_payload_json"],
             "observation public payload",
-        ),
-        freshness_timestamp=str(row["freshness_timestamp"]),
-        error_category=_strict_optional_text(
-            row["error_category"],
-            "error_category",
-        ),
+        )
     )
-    values = validate_observation(draft)
-    if canonical_json(values["public_payload"]) != str(row["public_payload_json"]):
+    values: dict[str, Any] = {
+        "endpoint_id": validate_digest(row["endpoint_id"], "endpoint_id"),
+        "source": source,
+        "interface_id": validate_digest(row["interface_id"], "interface_id"),
+        "address": normalize_address(str(row["address"])),
+        "port": port,
+        "api_shape": validate_optional_text(
+            _strict_optional_text(row["api_shape"], "api_shape"),
+            "api_shape",
+            maximum=128,
+        ),
+        "tls_enabled": tls_enabled,
+        "certificate_sha256": certificate,
+        "catalog_digest": validate_digest(
+            _strict_optional_text(row["catalog_digest"], "catalog_digest"),
+            "catalog_digest",
+            optional=True,
+        ),
+        "capability_digest": validate_digest(
+            _strict_optional_text(
+                row["capability_digest"],
+                "capability_digest",
+            ),
+            "capability_digest",
+            optional=True,
+        ),
+        "public_payload": public_payload,
+        "freshness_timestamp": _normalize_observation_timestamp(row["freshness_timestamp"]),
+        "error_category": validate_optional_text(
+            _strict_optional_text(
+                row["error_category"],
+                "error_category",
+            ),
+            "error_category",
+            maximum=128,
+        ),
+    }
+    if canonical_json(public_payload) != str(row["public_payload_json"]):
         raise ValueError("durable LAN observation payload is not canonical")
     created_at = validate_required_text(row["created_at"], "created_at", maximum=64)
     return {
@@ -876,11 +1056,167 @@ def _strict_observation_receipt_payload(
     }
 
 
+def _raw_observation_membership_digest(
+    observations: list[dict[str, Any]],
+) -> str:
+    members: dict[str, str] = {}
+    for observation in observations:
+        endpoint_id = str(observation["endpoint_id"])
+        payload = observation["public_payload"]
+        if type(payload) is dict and payload.get("schema") == _TASK4_OBSERVATION_SCHEMA:
+            observation_digest = validate_digest(
+                payload.get("observation_digest"),
+                "observation_digest",
+            )
+            assert observation_digest is not None
+        else:
+            projection = {
+                key: value
+                for key, value in observation.items()
+                if key not in {"scan_id", "created_at"}
+            }
+            observation_digest = sha256_digest(
+                {
+                    "schema": "kestrel.lan.observation-projection.v1",
+                    **projection,
+                }
+            )
+        member: dict[str, str] = {
+            "endpoint_id": endpoint_id,
+            "observation_digest": observation_digest,
+        }
+        if observation["source"] == "manual":
+            member.update(
+                {
+                    "observation_source": "manual",
+                    "endpoint_kind": "manual",
+                }
+            )
+        prior_member = members.get(endpoint_id)
+        canonical_member = canonical_json(member)
+        if prior_member is not None and prior_member != canonical_member:
+            raise ValueError(f"conflicting LAN observation endpoint: {endpoint_id}")
+        members[endpoint_id] = canonical_member
+    ordered = [json.loads(members[endpoint_id]) for endpoint_id in sorted(members)]
+    return sha256_digest(
+        {
+            "schema": LAN_OBSERVATION_MEMBERSHIP_SCHEMA,
+            "count": len(ordered),
+            "members": ordered,
+        }
+    )
+
+
+def _authenticate_scan_authority_bindings(
+    connection: sqlite3.Connection,
+    *,
+    scan_id: str,
+    owner_principal: str,
+    interface_id: str,
+    network: str,
+    limits: dict[str, Any],
+    preview_digest: str | None,
+    observations: list[dict[str, Any]],
+    started_at: str | None,
+    terminal_receipt: dict[str, Any],
+) -> None:
+    manual_limits = limits.get("mode") == "manual"
+    exact_port = limits.get("exact_port") if manual_limits else None
+    if manual_limits and (type(exact_port) is not int or len(observations) != 1):
+        raise ValueError("manual LAN limits do not match durable observation authority")
+    if manual_limits:
+        if terminal_receipt.get("schema") != LAN_SCAN_RECEIPT_V2_SCHEMA:
+            raise ValueError("manual LAN scan requires a v2 terminal receipt")
+        if terminal_receipt.get("mdns_status") != "unavailable":
+            raise ValueError("manual LAN terminal mDNS status must be unavailable")
+        exact_singleton_counts = (
+            "planned_count",
+            "admitted_count",
+            "completed_count",
+            "persisted_observation_count",
+            "observation_count",
+        )
+        if any(
+            type(terminal_receipt.get(field)) is not int or terminal_receipt.get(field) != 1
+            for field in exact_singleton_counts
+        ):
+            raise ValueError("manual LAN terminal counts must all be exact one")
+    for observation in observations:
+        payload = observation["public_payload"]
+        if type(payload) is not dict or payload.get("schema") != _TASK4_OBSERVATION_SCHEMA:
+            raise ValueError("LAN terminal receipt contains non-Task-4 evidence")
+        source = observation["source"]
+        manual_payload = (
+            payload.get("observation_source") == "manual"
+            and payload.get("endpoint_kind") == "manual"
+        )
+        if manual_limits:
+            if source != "manual" or not manual_payload or observation["port"] != exact_port:
+                raise ValueError("manual LAN limits do not match observation source, kind, or port")
+        elif source == "manual" or manual_payload:
+            raise ValueError("automatic LAN limits reject manual observation authority")
+
+    started_rows = connection.execute(
+        """
+        SELECT sequence, payload_json, created_at FROM routing_lan_scan_events
+        WHERE scan_id = ? AND event_type = 'scan_started'
+        ORDER BY sequence ASC
+        """,
+        (scan_id,),
+    ).fetchall()
+    if manual_limits:
+        if len(started_rows) != 1:
+            raise ValueError("manual LAN scan requires one exact start event")
+        started_row = started_rows[0]
+        if (
+            type(started_row["sequence"]) is not int
+            or started_row["sequence"] != 1
+            or type(started_row["created_at"]) is not str
+            or started_row["created_at"] != started_at
+        ):
+            raise ValueError("manual LAN scan start event authority is invalid")
+        raw_event = started_row["payload_json"]
+        event = bounded_scan_preview_event(
+            _strict_json_object(raw_event, "manual scan start event")
+        )
+        if canonical_json(event) != str(raw_event):
+            raise ValueError("manual LAN scan start event is not canonical")
+        expected = {
+            "schema": LAN_MANUAL_SCAN_PREVIEW_EVENT_SCHEMA,
+            "mode": "manual",
+            "endpoint_kind": "manual",
+            "observation_source": "manual",
+            "owner_principal": owner_principal,
+            "interface_id": interface_id,
+            "network": network,
+            "limits": limits,
+            "exact_port": exact_port,
+            "server_version": _LAN_SERVER_VERSION,
+            "contract_version": _LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+            "preview_digest": preview_digest,
+        }
+        if any(event.get(field) != value for field, value in expected.items()):
+            raise ValueError("manual LAN scan start event disagrees with durable authority")
+        try:
+            authenticated_start = _parse_canonical_durable_utc(started_at)
+            preview_expiration = _parse_canonical_utc(event["expires_at"])
+        except (TypeError, ValueError):
+            raise ValueError("manual LAN preview expiration is invalid") from None
+        if preview_expiration <= authenticated_start:
+            raise ValueError("manual LAN preview expiration must follow authenticated start")
+    else:
+        for row in started_rows:
+            event = _strict_json_object(row["payload_json"], "scan start event")
+            if event.get("schema") == LAN_MANUAL_SCAN_PREVIEW_EVENT_SCHEMA:
+                raise ValueError("automatic LAN limits reject a manual start event")
+
+
 def _task4_observation_from_row(
     row: sqlite3.Row,
     *,
     expected_interface_id: str,
     expected_network: str,
+    expected_source: LanObservationSource,
 ) -> tuple[LanEndpointObservation, datetime]:
     payload = bounded_observation_public_evidence(
         _strict_json_object(row["public_payload_json"], "Task 4 observation")
@@ -912,9 +1248,20 @@ def _task4_observation_from_row(
     ):
         raise ValueError("LAN observation address is not an active host")
     port = row["port"]
-    if type(port) is not int or port not in KNOWN_MODEL_SERVICE_PORTS:
-        raise ValueError("LAN observation port is not a known model-service port")
-    endpoint = object.__new__(ResolvedLanEndpoint)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("LAN observation port is invalid")
+    if expected_source == "manual":
+        if (
+            parsed_network.prefixlen != parsed_network.max_prefixlen
+            or parsed_network.network_address != parsed_address
+        ):
+            raise ValueError("manual LAN observation requires an exact confirmed host scope")
+        endpoint: ResolvedLanEndpoint | ManualLanEndpoint = object.__new__(ManualLanEndpoint)
+        object.__setattr__(endpoint, "kind", "manual")
+    else:
+        if port not in KNOWN_MODEL_SERVICE_PORTS:
+            raise ValueError("LAN observation port is not a known model-service port")
+        endpoint = object.__new__(ResolvedLanEndpoint)
     object.__setattr__(endpoint, "interface_id", interface_id)
     object.__setattr__(endpoint, "address", address)
     object.__setattr__(endpoint, "port", port)
@@ -971,7 +1318,7 @@ def _task4_observation_from_row(
 
 
 def _task4_public_payload(observation: LanEndpointObservation) -> dict[str, Any]:
-    return {
+    payload = {
         "schema": _TASK4_OBSERVATION_SCHEMA,
         "endpoint_binding_digest": observation.endpoint_binding_digest,
         "observation_digest": observation.observation_digest,
@@ -992,6 +1339,14 @@ def _task4_public_payload(observation: LanEndpointObservation) -> dict[str, Any]
             observation.failure_category.value if observation.failure_category is not None else None
         ),
     }
+    if type(observation.endpoint) is ManualLanEndpoint:
+        payload.update(
+            {
+                "observation_source": "manual",
+                "endpoint_kind": "manual",
+            }
+        )
+    return payload
 
 
 def _parse_canonical_utc(value: str) -> datetime:
@@ -1005,6 +1360,22 @@ def _parse_canonical_utc(value: str) -> datetime:
         raise ValueError("LAN evidence timestamp must be UTC")
     if parsed.astimezone(UTC).isoformat().replace("+00:00", "Z") != value:
         raise ValueError("LAN evidence timestamp must be canonical UTC")
+    return parsed.astimezone(UTC)
+
+
+def _parse_canonical_durable_utc(value: object) -> datetime:
+    if type(value) is not str or len(value) > 64 or not value.endswith("+00:00"):
+        raise ValueError("durable LAN timestamp must use canonical UTC storage encoding")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("durable LAN timestamp is invalid") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != UTC.utcoffset(parsed)
+        or parsed.astimezone(UTC).isoformat() != value
+    ):
+        raise ValueError("durable LAN timestamp must use canonical UTC storage encoding")
     return parsed.astimezone(UTC)
 
 
@@ -1042,8 +1413,17 @@ def _strict_json_object(value: object, field: str) -> dict[str, Any]:
 def _bounded_task4_observation_public_evidence(
     payload: dict[str, object],
 ) -> dict[str, Any]:
-    if set(payload) != _TASK4_OBSERVATION_PUBLIC_FIELDS:
+    fields = set(payload)
+    manual_fields = {"observation_source", "endpoint_kind"}
+    if fields not in {
+        _TASK4_OBSERVATION_PUBLIC_FIELDS,
+        _TASK4_OBSERVATION_PUBLIC_FIELDS | manual_fields,
+    }:
         raise ValueError("Task 4 observation public evidence has an invalid field set")
+    if manual_fields.issubset(fields) and (
+        payload["observation_source"] != "manual" or payload["endpoint_kind"] != "manual"
+    ):
+        raise ValueError("Task 4 observation source and endpoint kind are invalid")
     if payload["schema"] != _TASK4_OBSERVATION_SCHEMA:
         raise ValueError("Task 4 observation public evidence schema is invalid")
     validate_digest(payload["endpoint_binding_digest"], "endpoint_binding_digest")  # type: ignore[arg-type]
@@ -1137,10 +1517,47 @@ def bounded_scan_limits(value: object) -> dict[str, Any]:
     payload = _require_string_keyed_object(value, "scan limits")
     expected_json = canonical_json(asdict(LanScanLimits()))
     supplied_json = canonical_json(payload)
-    if supplied_json != expected_json:
+    if supplied_json == expected_json:
+        return _bounded_json_object(
+            json.loads(expected_json),
+            kind="scan limits",
+            max_bytes=MAX_LIMITS_BYTES,
+        )
+    manual_fields = {
+        "mode",
+        "exact_port",
+        "max_active_hosts",
+        "max_scan_concurrency",
+        "tcp_connect_timeout_seconds",
+        "http_probe_timeout_seconds",
+        "total_scan_deadline_seconds",
+        "max_probe_response_bytes",
+        "max_discovered_models",
+        "mdns_enabled",
+    }
+    if set(payload) != manual_fields:
         raise ValueError("LAN scan limits must match the fixed bounded limits")
+    exact_port = payload["exact_port"]
+    expected_manual = {
+        "mode": "manual",
+        "exact_port": exact_port,
+        "max_active_hosts": 1,
+        "max_scan_concurrency": 1,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 256 * 1024,
+        "max_discovered_models": 8,
+        "mdns_enabled": False,
+    }
+    if (
+        type(exact_port) is not int
+        or not 1 <= exact_port <= 65535
+        or canonical_json(payload) != canonical_json(expected_manual)
+    ):
+        raise ValueError("LAN manual scan limits must match the fixed bounded limits")
     return _bounded_json_object(
-        json.loads(expected_json),
+        expected_manual,
         kind="scan limits",
         max_bytes=MAX_LIMITS_BYTES,
     )
@@ -1267,7 +1684,12 @@ def validate_observation(draft: LanObservationDraft) -> dict[str, Any]:
 
 def _validate_task4_draft_preimage(values: dict[str, Any]) -> None:
     payload = values["public_payload"]
-    if values["port"] not in KNOWN_MODEL_SERVICE_PORTS:
+    manual_payload = (
+        payload.get("observation_source") == "manual" and payload.get("endpoint_kind") == "manual"
+    )
+    if (values["source"] == "manual") != manual_payload:
+        raise ValueError("LAN Task 4 observation source and endpoint kind disagree")
+    if not manual_payload and values["port"] not in KNOWN_MODEL_SERVICE_PORTS:
         raise ValueError("LAN Task 4 draft port is not a known model-service port")
     address = ipaddress.ip_address(values["address"])
     private_scope = (
@@ -1283,7 +1705,11 @@ def _validate_task4_draft_preimage(values: dict[str, Any]) -> None:
         or address.is_reserved
     ):
         raise ValueError("LAN Task 4 draft endpoint is not eligible")
-    endpoint = object.__new__(ResolvedLanEndpoint)
+    if manual_payload:
+        endpoint: ResolvedLanEndpoint | ManualLanEndpoint = object.__new__(ManualLanEndpoint)
+        object.__setattr__(endpoint, "kind", "manual")
+    else:
+        endpoint = object.__new__(ResolvedLanEndpoint)
     object.__setattr__(endpoint, "interface_id", values["interface_id"])
     object.__setattr__(endpoint, "address", values["address"])
     object.__setattr__(endpoint, "port", values["port"])

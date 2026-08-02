@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import NoReturn, Protocol
 
-from nested_memvid_agent.lan_discovery_models import KNOWN_MODEL_SERVICE_PORTS
+from nested_memvid_agent.lan_discovery_models import (
+    KNOWN_MODEL_SERVICE_PORTS,
+    ManualLanEndpoint,
+)
 from nested_memvid_agent.lan_runtime_authority import (
     LanRuntimeAuthority,
     LanRuntimeAuthorityResolver,
@@ -245,7 +248,10 @@ def _require_exact_base_url(base_url: object, authority: LanRuntimeAuthority) ->
         parsed = ipaddress.ip_address(address)
     except ValueError:
         raise ValueError("LAN provider authority has an invalid literal endpoint") from None
-    if str(parsed) != address or authority.endpoint.port not in KNOWN_MODEL_SERVICE_PORTS:
+    if str(parsed) != address or (
+        type(authority.endpoint) is not ManualLanEndpoint
+        and authority.endpoint.port not in KNOWN_MODEL_SERVICE_PORTS
+    ):
         raise ValueError("LAN provider authority has a noncanonical endpoint")
     numeric_authority = (
         f"[{address}]:{authority.endpoint.port}"

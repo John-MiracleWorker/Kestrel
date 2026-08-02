@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
+from importlib import import_module
 
 import pytest
 
@@ -55,6 +56,58 @@ def _authority(
     )
     scope = PrivateScanScope.from_request(interface, network)
     endpoint = ResolvedLanEndpoint.from_scope(scope, destination_address, 1234)
+    endpoint_binding_digest = derive_lan_runtime_endpoint_binding_digest(endpoint)
+    provider_profile_id = derive_lan_runtime_provider_profile_id(endpoint_binding_digest)
+    reviewed_target_id = derive_lan_runtime_target_id(provider_profile_id, model_id)
+    return LanRuntimeAuthority(
+        scope=scope,
+        endpoint=endpoint,
+        source_address=source_address,
+        os_interface_identity="darwin:en7",
+        interface_index=7,
+        provider_profile_id=provider_profile_id,
+        reviewed_target_id=reviewed_target_id,
+        model_id=model_id,
+        api_shape="openai_compatible",
+        runtime_adapter="lan-openai-compatible",
+        runtime_hardening_version=LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+        endpoint_binding_digest=endpoint_binding_digest,
+        endpoint_fingerprint="sha256:" + "3" * 64,
+        reviewed_material_binding_digest=material_digest,
+        review_digest=review_digest,
+        fresh_until=fresh_until,
+    )
+
+
+def _manual_endpoint_type():
+    """Resolve the Task 7A type lazily so frozen-base collection remains useful."""
+
+    return import_module("nested_memvid_agent.lan_discovery_models").ManualLanEndpoint
+
+
+def _manual_authority(
+    *,
+    model_id: str = "alpha",
+    interface_address: str = "192.168.50.7/24",
+    network: str = "192.168.50.8/32",
+    destination_address: str = "192.168.50.8",
+    source_address: str = "192.168.50.7",
+    port: int = 5001,
+    material_digest: str = "sha256:" + "4" * 64,
+    review_digest: str = "sha256:" + "5" * 64,
+    fresh_until: str = "2026-08-01T12:05:00Z",
+) -> LanRuntimeAuthority:
+    interface = NetworkInterface.from_addresses(
+        os_identity="darwin:en7",
+        display_name="darwin:en7",
+        addresses=(interface_address,),
+    )
+    scope = PrivateScanScope.from_request(interface, network)
+    endpoint = _manual_endpoint_type().from_exact_scope(
+        scope,
+        destination_address,
+        port,
+    )
     endpoint_binding_digest = derive_lan_runtime_endpoint_binding_digest(endpoint)
     provider_profile_id = derive_lan_runtime_provider_profile_id(endpoint_binding_digest)
     reviewed_target_id = derive_lan_runtime_target_id(provider_profile_id, model_id)
@@ -737,7 +790,7 @@ def test_options_and_message_containers_require_exact_types() -> None:
 @pytest.mark.parametrize(
     "body",
     (
-        b"\xef\xbb\xbf{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}",
+        b'\xef\xbb\xbf{"choices":[{"message":{"content":"ok"}}]}',
         b'{"choices":[{"message":{"content":NaN}}]}',
         b'{"choices":[{"message":{"content":Infinity}}]}',
         b'[{"choices":[{"message":{"content":"ok"}}]}]',
@@ -757,11 +810,7 @@ def test_bom_nonfinite_wrong_root_and_excessive_depth_are_closed(body: bytes) ->
 
 
 def test_unrelated_oversized_json_integer_is_a_closed_provider_error() -> None:
-    body = (
-        b'{"unrelated":'
-        + (b"9" * 5000)
-        + b',"choices":[{"message":{"content":"ok"}}]}'
-    )
+    body = b'{"unrelated":' + (b"9" * 5000) + b',"choices":[{"message":{"content":"ok"}}]}'
     provider, _resolver, transport = _provider(transport=RecordingTransport(body))
 
     with pytest.raises(ProviderError) as raised:
@@ -806,3 +855,104 @@ def test_provider_never_logs_raw_response_identity_body_transport_or_resolver_to
     rendered = caplog.text
     for token in (identity, body_token, transport_token, resolver_token):
         assert token not in rendered
+
+
+def test_task7b_provider_accepts_exact_manual_unusual_port_authority() -> None:
+    authority = _manual_authority(port=5001)
+    provider, resolver, transport = _provider(
+        authority=authority,
+        resolver=Resolver(authority),
+        transport=RecordingTransport(),
+        base_url="http://192.168.50.8:5001/v1",
+    )
+    resolver.calls.clear()
+
+    result = provider.generate(
+        _messages(),
+        [],
+        LLMOptions(timeout_seconds=17, max_retries=99, temperature=0.4),
+    )
+
+    assert result.content == "LAN answer"
+    assert result.raw is None
+    assert resolver.calls == [authority.reviewed_target_id]
+    assert len(transport.calls) == 1
+    resolved, request, timeout = transport.calls[0]
+    assert resolved is authority
+    assert type(resolved.endpoint) is _manual_endpoint_type()
+    assert resolved.endpoint.kind == "manual"
+    assert resolved.endpoint.port == 5001
+    assert request.model_id == "alpha"
+    assert timeout == 17
+
+
+def test_task7b_provider_rejects_automatic_kind_on_unusual_manual_port() -> None:
+    manual = _manual_authority(port=5001)
+    automatic_endpoint = object.__new__(ResolvedLanEndpoint)
+    for field_name in ("interface_id", "address", "port"):
+        object.__setattr__(
+            automatic_endpoint,
+            field_name,
+            getattr(manual.endpoint, field_name),
+        )
+    forged = _unchecked_authority(manual, endpoint=automatic_endpoint)
+    resolver = Resolver(forged)
+    transport = RecordingTransport()
+
+    with pytest.raises((TypeError, ValueError, ProviderError)):
+        _provider(
+            authority=forged,
+            resolver=resolver,
+            transport=transport,
+            base_url="http://192.168.50.8:5001/v1",
+        )
+
+    assert resolver.calls == []
+    assert transport.calls == []
+
+
+def test_task7b_manual_provider_failure_is_retry_free_and_secret_free() -> None:
+    authority = _manual_authority(port=5001)
+    transport = RecordingTransport(failure=RuntimeError("secret-upstream-body"))
+    provider, resolver, _transport = _provider(
+        authority=authority,
+        resolver=Resolver(authority),
+        transport=transport,
+        base_url="http://192.168.50.8:5001/v1",
+    )
+    resolver.calls.clear()
+
+    with pytest.raises(ProviderError) as raised:
+        provider.generate(
+            _messages(),
+            [],
+            LLMOptions(timeout_seconds=60, max_retries=99),
+        )
+
+    assert raised.value.code == "lan_transport_failed"
+    assert "secret" not in str(raised.value).lower()
+    assert resolver.calls == [authority.reviewed_target_id]
+    assert len(transport.calls) == 1
+
+
+def test_task7b_manual_provider_rejects_credentials_headers_retries_and_fallbacks() -> None:
+    authority = _manual_authority(port=5001)
+    kwargs = {
+        "model": "alpha",
+        "base_url": "http://192.168.50.8:5001/v1",
+        "authority": authority,
+        "authority_resolver": Resolver(authority),
+        "transport": RecordingTransport(),
+        "timeout_seconds": 60,
+        "temperature": None,
+        "utc_clock": lambda: NOW,
+    }
+    for extra in (
+        {"api_key": "secret"},
+        {"api_key_env": "LAN_SECRET"},
+        {"headers": {"X-Token": "secret"}},
+        {"max_retries": 1},
+        {"fallback_provider": "openai-compatible"},
+    ):
+        with pytest.raises(TypeError):
+            LanOpenAICompatibleProvider(**kwargs, **extra)  # type: ignore[arg-type]

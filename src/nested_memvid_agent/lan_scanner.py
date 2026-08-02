@@ -26,6 +26,7 @@ from nested_memvid_agent.lan_discovery_models import (
     TCP_CONNECT_TIMEOUT_SECONDS,
     TOTAL_SCAN_DEADLINE_SECONDS,
     LanScanLimits,
+    ManualLanEndpoint,
     ResolvedLanEndpoint,
 )
 from nested_memvid_agent.lan_discovery_scope import PrivateScanScope
@@ -54,6 +55,8 @@ _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DISPLAY_METADATA_FIELDS = frozenset(
     {"display_name", "description", "vendor", "product", "version"}
 )
+
+LanEndpointAuthority = ResolvedLanEndpoint | ManualLanEndpoint
 
 
 class Reachability(StrEnum):
@@ -211,7 +214,7 @@ class LanCapabilityEvidence:
 
 @dataclass(frozen=True)
 class LanEndpointObservation:
-    endpoint: ResolvedLanEndpoint
+    endpoint: LanEndpointAuthority
     endpoint_binding_digest: str
     reachability: Reachability
     transport_security: TransportSecurity | None
@@ -229,7 +232,7 @@ class LanEndpointObservation:
     observation_digest: str
 
     def __post_init__(self) -> None:
-        if type(self.endpoint) is not ResolvedLanEndpoint:
+        if type(self.endpoint) not in {ResolvedLanEndpoint, ManualLanEndpoint}:
             raise ValueError("LAN observation requires a typed endpoint")
         if type(self.reachability) is not Reachability:
             raise ValueError("LAN observation reachability is invalid")
@@ -493,7 +496,7 @@ class LanTcpProbe(Protocol):
     def tcp_reachable(
         self,
         scope: PrivateScanScope,
-        endpoint: ResolvedLanEndpoint,
+        endpoint: LanEndpointAuthority,
         source: AuthenticatedLanSource,
         *,
         deadline: float,
@@ -505,7 +508,7 @@ class LanHttpTransport(Protocol):
     def request(
         self,
         scope: PrivateScanScope,
-        endpoint: ResolvedLanEndpoint,
+        endpoint: LanEndpointAuthority,
         source: AuthenticatedLanSource,
         route: LanRequestRoute,
         *,
@@ -786,6 +789,8 @@ def probe_lan_endpoint(
     """Probe one canonical endpoint while sharing one absolute HTTP phase deadline."""
 
     canonical_scope = authenticate_private_scan_scope(scope)
+    if type(endpoint) is not ResolvedLanEndpoint:
+        raise ValueError("LAN scanner requires an automatic endpoint")
     canonical_endpoint = ResolvedLanEndpoint.from_scope(
         canonical_scope,
         endpoint.address,
@@ -793,6 +798,68 @@ def probe_lan_endpoint(
     )
     if endpoint != canonical_endpoint:
         raise ValueError("LAN endpoint does not match its confirmed scope")
+    return _probe_canonical_lan_endpoint(
+        canonical_scope,
+        canonical_endpoint,
+        scan_deadline=scan_deadline,
+        cancellation=cancellation,
+        clock=clock,
+        tcp_probe=tcp_probe,
+        http_transport=http_transport,
+        interface_inventory_resolver=interface_inventory_resolver,
+    )
+
+
+def probe_manual_lan_endpoint(
+    scope: PrivateScanScope,
+    endpoint: ManualLanEndpoint,
+    *,
+    scan_deadline: float,
+    cancellation: CancellationToken,
+    clock: Callable[[], float],
+    tcp_probe: LanTcpProbe | None = None,
+    http_transport: LanHttpTransport | None = None,
+    interface_inventory_resolver: InterfaceInventoryResolver | None = None,
+) -> LanEndpointObservation:
+    """Probe exactly one owner-confirmed manual endpoint with no port expansion."""
+
+    canonical_scope = authenticate_private_scan_scope(scope)
+    if type(endpoint) is not ManualLanEndpoint:
+        raise ValueError("manual LAN scanner requires a manual endpoint")
+    canonical_endpoint = ManualLanEndpoint.from_exact_scope(
+        canonical_scope,
+        endpoint.address,
+        endpoint.port,
+    )
+    if endpoint != canonical_endpoint:
+        raise ValueError("manual LAN endpoint does not match its exact scope")
+    direct = DirectLanHttpTransport(
+        clock=clock,
+        inventory_resolver=interface_inventory_resolver,
+    )
+    return _probe_canonical_lan_endpoint(
+        canonical_scope,
+        canonical_endpoint,
+        scan_deadline=scan_deadline,
+        cancellation=cancellation,
+        clock=clock,
+        tcp_probe=tcp_probe if tcp_probe is not None else direct,
+        http_transport=http_transport if http_transport is not None else direct,
+        interface_inventory_resolver=interface_inventory_resolver,
+    )
+
+
+def _probe_canonical_lan_endpoint(
+    canonical_scope: PrivateScanScope,
+    canonical_endpoint: LanEndpointAuthority,
+    *,
+    scan_deadline: float,
+    cancellation: CancellationToken,
+    clock: Callable[[], float],
+    tcp_probe: LanTcpProbe,
+    http_transport: LanHttpTransport,
+    interface_inventory_resolver: InterfaceInventoryResolver | None,
+) -> LanEndpointObservation:
     if cancellation.is_cancelled():
         return _make_observation(
             canonical_endpoint,
@@ -1019,7 +1086,7 @@ def probe_lan_endpoint(
 
 def _request_phase(
     scope: PrivateScanScope,
-    endpoint: ResolvedLanEndpoint,
+    endpoint: LanEndpointAuthority,
     route: LanRequestRoute,
     *,
     deadline: float,
@@ -1149,7 +1216,7 @@ def _request_phase(
 
 
 def _phase_failure_observation(
-    endpoint: ResolvedLanEndpoint,
+    endpoint: LanEndpointAuthority,
     failure: LanFailureCategory,
     established: tuple[ApiShape, tuple[str, ...], bool, bool] | None,
     *,
@@ -1422,7 +1489,7 @@ def _map_http_failure(
 
 
 def _make_observation(
-    endpoint: ResolvedLanEndpoint,
+    endpoint: LanEndpointAuthority,
     *,
     reachability: Reachability,
     transport_security: TransportSecurity | None = None,
@@ -1492,7 +1559,7 @@ def _sha256(payload: Mapping[str, object]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
-def _endpoint_binding_digest(endpoint: ResolvedLanEndpoint) -> str:
+def _endpoint_binding_digest(endpoint: LanEndpointAuthority) -> str:
     return _sha256(
         {
             "address": endpoint.address,
@@ -1504,7 +1571,7 @@ def _endpoint_binding_digest(endpoint: ResolvedLanEndpoint) -> str:
 
 
 def _catalog_digest(
-    endpoint: ResolvedLanEndpoint,
+    endpoint: LanEndpointAuthority,
     endpoint_binding_digest: str,
     api_shape: ApiShape | None,
     complete: bool,

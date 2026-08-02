@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import socket
 import unicodedata
 import urllib.parse
 import urllib.request
+from importlib import import_module
 
 import pytest
 
@@ -32,6 +34,12 @@ from nested_memvid_agent.llm.provider_urls import format_numeric_http_authority
 class NeverCancelled:
     def is_cancelled(self) -> bool:
         return False
+
+
+class HostilePort(int):
+    def __format__(self, format_spec: str) -> str:
+        del format_spec
+        raise AssertionError("hostile port formatting crossed validation")
 
 
 class FakeSocket:
@@ -112,6 +120,10 @@ def current_inventory(
     return CurrentLanInterfaceInventory((selected, *extra))
 
 
+def manual_endpoint_type():
+    return import_module("nested_memvid_agent.lan_discovery_models").ManualLanEndpoint
+
+
 def direct_transport(
     scope: PrivateScanScope,
     sockets: SocketFactory,
@@ -149,6 +161,58 @@ def test_numeric_http_authority_accepts_only_an_authenticated_endpoint_value() -
             format_numeric_http_authority(hostile)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    ("transport-authority", "socket-authority", "request-authority"),
+)
+def test_every_transport_authority_rejects_int_subclass_port_before_use(
+    boundary: str,
+) -> None:
+    module = import_module("nested_memvid_agent.lan_http_transport")
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.50.7/24", "192.168.50.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.50.8", 5001)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+    forged = object.__new__(manual_type)
+    object.__setattr__(forged, "kind", "manual")
+    object.__setattr__(forged, "interface_id", endpoint.interface_id)
+    object.__setattr__(forged, "address", endpoint.address)
+    object.__setattr__(forged, "port", HostilePort(5001))
+
+    with pytest.raises(ValueError, match="port"):
+        if boundary == "transport-authority":
+            module._format_numeric_http_authority(forged)
+        elif boundary == "socket-authority":
+            module._socket_authority(forged, source)
+        else:
+            module._request_bytes(forged, LanRequestRoute.OLLAMA_CATALOG, None)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("transport-authority", "socket-authority", "request-authority"),
+)
+def test_every_automatic_transport_authority_rejects_int_subclass_port_before_use(
+    boundary: str,
+) -> None:
+    module = import_module("nested_memvid_agent.lan_http_transport")
+    scope = scope_fixture()
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+    forged = object.__new__(ResolvedLanEndpoint)
+    object.__setattr__(forged, "interface_id", endpoint.interface_id)
+    object.__setattr__(forged, "address", endpoint.address)
+    object.__setattr__(forged, "port", HostilePort(11434))
+
+    with pytest.raises(ValueError, match="port"):
+        if boundary == "transport-authority":
+            module._format_numeric_http_authority(forged)
+        elif boundary == "socket-authority":
+            module._socket_authority(forged, source)
+        else:
+            module._request_bytes(forged, LanRequestRoute.OLLAMA_CATALOG, None)
+
+
 def test_source_authentication_rebuilds_endpoint_and_rejects_interface_drift() -> None:
     scope = scope_fixture()
     endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
@@ -169,6 +233,20 @@ def test_source_authentication_rebuilds_endpoint_and_rejects_interface_drift() -
     object.__setattr__(forged, "port", endpoint.port)
     with pytest.raises(ValueError, match="confirmed scope|private LAN"):
         authenticate_lan_source(scope, forged, lambda: current_inventory(scope))
+
+
+def test_manual_source_authentication_accepts_only_the_exact_manual_host_authority() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.50.7/24", "192.168.50.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.50.8", 5001)
+
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+
+    assert (source.interface_id, source.source_address, source.interface_index) == (
+        scope.interface.interface_id,
+        "192.168.50.7",
+        7,
+    )
 
 
 def test_source_selection_uses_unique_longest_prefix_and_preserves_os_provenance() -> None:
@@ -342,6 +420,217 @@ def test_direct_transport_maps_fresh_inventory_drift_before_reconnect() -> None:
         )
 
     assert captured.value.failure is LanTransportFailure.INTERFACE_CHANGED
+    assert sockets.sockets == []
+
+
+@pytest.mark.parametrize(
+    ("port", "expected_request"),
+    [
+        (
+            5001,
+            b"GET /api/tags HTTP/1.1\r\n"
+            b"Host: 192.168.50.8:5001\r\n"
+            b"Accept: application/json\r\n"
+            b"Accept-Encoding: identity\r\n"
+            b"Connection: close\r\n"
+            b"User-Agent: Kestrel-LAN-Discovery/1\r\n\r\n",
+        ),
+        (
+            11434,
+            b"GET /api/tags HTTP/1.1\r\n"
+            b"Host: 192.168.50.8:11434\r\n"
+            b"Accept: application/json\r\n"
+            b"Accept-Encoding: identity\r\n"
+            b"Connection: close\r\n"
+            b"User-Agent: Kestrel-LAN-Discovery/1\r\n\r\n",
+        ),
+    ],
+)
+def test_direct_manual_transport_uses_one_literal_port_without_dns(
+    monkeypatch: pytest.MonkeyPatch,
+    port: int,
+    expected_request: bytes,
+) -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.50.7/24", "192.168.50.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.50.8", port)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+    sockets = SocketFactory(http_response(200, b"{}"))
+
+    def forbidden_dns(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("manual transport must never resolve a hostname")
+
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_dns)
+    monkeypatch.setattr(socket, "gethostbyname", forbidden_dns)
+
+    response = direct_transport(scope, sockets).request(
+        scope,
+        endpoint,
+        source,
+        LanRequestRoute.OLLAMA_CATALOG,
+        deadline=2.0,
+        cancellation=NeverCancelled(),
+    )
+
+    assert (response.status_code, response.body) == (200, b"{}")
+    assert sockets.sockets[0].bound == ("192.168.50.7", 0)
+    assert sockets.sockets[0].connected == ("192.168.50.8", port)
+    assert sockets.sockets[0].sent == expected_request
+
+
+def test_direct_manual_ipv6_link_local_transport_is_bracketed_source_bound_and_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("fe80::7/64", "fe80::8/128")
+    endpoint = manual_type.from_exact_scope(scope, "fe80::8", 5001)
+    source = authenticate_lan_source(
+        scope,
+        endpoint,
+        lambda: current_inventory(scope, index=23),
+    )
+    sockets = SocketFactory(http_response(200, b"{}"))
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("manual transport crossed the literal direct-socket boundary")
+
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    monkeypatch.setattr(socket, "gethostbyname", forbidden)
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden)
+
+    response = direct_transport(scope, sockets, index=23).request(
+        scope,
+        endpoint,
+        source,
+        LanRequestRoute.OLLAMA_CATALOG,
+        deadline=2.0,
+        cancellation=NeverCancelled(),
+    )
+
+    assert (response.status_code, response.body) == (200, b"{}")
+    assert sockets.calls == [(socket.AF_INET6, socket.SOCK_STREAM)]
+    assert sockets.sockets[0].bound == ("fe80::7", 0, 0, 23)
+    assert sockets.sockets[0].connected == ("fe80::8", 5001, 0, 23)
+    assert sockets.sockets[0].socket_options == [(socket.IPPROTO_IPV6, 125, 23)]
+    assert sockets.sockets[0].sent == (
+        b"GET /api/tags HTTP/1.1\r\n"
+        b"Host: [fe80::8]:5001\r\n"
+        b"Accept: application/json\r\n"
+        b"Accept-Encoding: identity\r\n"
+        b"Connection: close\r\n"
+        b"User-Agent: Kestrel-LAN-Discovery/1\r\n\r\n"
+    )
+
+
+@pytest.mark.parametrize("authority_kind", ["automatic", "manual"])
+def test_direct_transport_reauthenticates_fresh_inventory_before_every_connect(
+    authority_kind: str,
+) -> None:
+    if authority_kind == "automatic":
+        scope = scope_fixture("192.168.50.7/24", "192.168.50.0/24")
+        endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.50.8", 11434)
+    else:
+        scope = scope_fixture("192.168.50.7/24", "192.168.50.8/32")
+        endpoint = manual_endpoint_type().from_exact_scope(scope, "192.168.50.8", 5001)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+    drifted = CurrentLanInterfaceInventory(
+        (CurrentLanInterfaceState(scope.interface.os_identity, 7, ("192.168.50.9/24",)),)
+    )
+    inventories = iter((current_inventory(scope), drifted))
+    resolver_calls = 0
+
+    def resolve_inventory() -> CurrentLanInterfaceInventory:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return next(inventories)
+
+    sockets = SocketFactory()
+    transport = DirectLanHttpTransport(
+        socket_factory=sockets,
+        clock=lambda: 0.0,
+        inventory_resolver=resolve_inventory,
+        platform_name="Darwin",
+    )
+
+    assert transport.tcp_reachable(
+        scope,
+        endpoint,
+        source,
+        deadline=0.75,
+        cancellation=NeverCancelled(),
+    )
+    with pytest.raises(LanTransportError) as captured:
+        transport.request(
+            scope,
+            endpoint,
+            source,
+            LanRequestRoute.OLLAMA_CATALOG,
+            deadline=2.0,
+            cancellation=NeverCancelled(),
+        )
+
+    assert captured.value.failure is LanTransportFailure.INTERFACE_CHANGED
+    assert resolver_calls == 2
+    assert len(sockets.sockets) == 1
+    assert sockets.sockets[0].sent == b""
+
+
+def test_direct_transport_rebuilds_forged_manual_authority_before_socket() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.50.7/24", "192.168.50.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.50.8", 5001)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+    forged = object.__new__(manual_type)
+    object.__setattr__(forged, "kind", "manual")
+    object.__setattr__(forged, "interface_id", endpoint.interface_id)
+    object.__setattr__(forged, "address", "8.8.8.8")
+    object.__setattr__(forged, "port", endpoint.port)
+    sockets = SocketFactory()
+
+    with pytest.raises((LanTransportError, TypeError, ValueError)):
+        direct_transport(scope, sockets).tcp_reachable(
+            scope,
+            forged,
+            source,
+            deadline=0.75,
+            cancellation=NeverCancelled(),
+        )
+
+    assert sockets.sockets == []
+
+
+@pytest.mark.parametrize("request_kind", ["tcp", "http"])
+def test_direct_transport_rejects_forged_manual_kind_before_each_connect(
+    request_kind: str,
+) -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.50.7/24", "192.168.50.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.50.8", 5001)
+    source = authenticate_lan_source(scope, endpoint, lambda: current_inventory(scope))
+    forged = copy.copy(endpoint)
+    object.__setattr__(forged, "kind", "automatic")
+    sockets = SocketFactory()
+    transport = direct_transport(scope, sockets)
+
+    with pytest.raises((LanTransportError, TypeError, ValueError)):
+        if request_kind == "tcp":
+            transport.tcp_reachable(
+                scope,
+                forged,
+                source,
+                deadline=0.75,
+                cancellation=NeverCancelled(),
+            )
+        else:
+            transport.request(
+                scope,
+                forged,
+                source,
+                LanRequestRoute.OLLAMA_CATALOG,
+                deadline=2.0,
+                cancellation=NeverCancelled(),
+            )
+
     assert sockets.sockets == []
 
 

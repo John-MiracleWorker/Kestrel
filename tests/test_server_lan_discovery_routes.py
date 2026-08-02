@@ -47,12 +47,31 @@ ALLOWED_EVENT_TYPES = (
 INTERFACE = NetworkInterface.from_addresses(
     os_identity="darwin:en90",
     display_name="Deterministic LAN fixture",
-    addresses=("192.168.90.1/30",),
+    addresses=("192.168.90.1/29",),
 )
 
 
 def _task7_routes() -> Any:
     return import_module("nested_memvid_agent.server_lan_discovery_routes")
+
+
+def _task6() -> Any:
+    return import_module("nested_memvid_agent.lan_scan_manager")
+
+
+def _manual_limits(port: int = 5001) -> dict[str, object]:
+    return {
+        "mode": "manual",
+        "exact_port": port,
+        "max_active_hosts": 1,
+        "max_scan_concurrency": 1,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 256 * 1024,
+        "max_discovered_models": 8,
+        "mdns_enabled": False,
+    }
 
 
 def _scan(
@@ -92,6 +111,14 @@ def _scan(
             {"raw_private_receipt": "must-never-cross-the-route"} if terminal else None
         ),
         terminal_receipt_digest=("sha256:" + "d" * 64 if terminal else None),
+    )
+
+
+def _manual_scan(selected_address: str = "192.168.90.2") -> LanScanRecord:
+    return replace(
+        _scan(status="running", revision=2),
+        network=f"{selected_address}/32",
+        limits=_manual_limits(5001),
     )
 
 
@@ -190,6 +217,56 @@ def _public_event_payload(event_type: str) -> dict[str, object]:
     return payload
 
 
+def _manual_private_event_payload(port: int = 5001) -> dict[str, object]:
+    return {
+        "schema": "kestrel.lan.scan-preview.manual.v1",
+        "mode": "manual",
+        "endpoint_kind": "manual",
+        "observation_source": "manual",
+        "owner_principal": FIXED_OWNER,
+        "interface_id": INTERFACE.interface_id,
+        "network": "192.168.90.2/32",
+        "limits": _manual_limits(port),
+        "active_host_count": 1,
+        "passive_or_manual_only": True,
+        "port_count": 1,
+        "exact_port": port,
+        "mdns_status": "unavailable",
+        "server_version": LAN_SERVER_VERSION,
+        "contract_version": _task6().LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+        "preview_digest": PREVIEW_DIGEST,
+        "expires_at": "2026-08-01T12:00:30Z",
+        "confirmed": True,
+        "privacy_acknowledged": True,
+    }
+
+
+def _manual_public_event_payload(port: int = 5001) -> dict[str, object]:
+    private = _manual_private_event_payload(port)
+    return {
+        key: private[key]
+        for key in (
+            "mode",
+            "endpoint_kind",
+            "observation_source",
+            "interface_id",
+            "network",
+            "limits",
+            "active_host_count",
+            "passive_or_manual_only",
+            "port_count",
+            "exact_port",
+            "mdns_status",
+            "server_version",
+            "contract_version",
+            "preview_digest",
+            "expires_at",
+            "confirmed",
+            "privacy_acknowledged",
+        )
+    }
+
+
 def _event(
     sequence: int,
     event_type: str = "scan_completed",
@@ -252,6 +329,58 @@ class RouteManager:
     def preview(self, interface_id: str, network: str) -> LanPreviewAuthorization:
         self.calls.append(("preview", interface_id, network))
         return self.authorization
+
+    def manual_preview(self, interface_id: str, host: str, port: int) -> object:
+        self.calls.append(("manual-preview", interface_id, host, port))
+        now = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        return SimpleNamespace(
+            schema=_task7_routes().LAN_MANUAL_PREVIEW_SCHEMA,
+            interface_id=interface_id,
+            port=port,
+            resolved_addresses=("192.168.90.2", "192.168.90.3"),
+            preview_digest=PREVIEW_DIGEST,
+            issued_at=now,
+            expires_at=now + timedelta(seconds=30),
+            server_version=LAN_SERVER_VERSION,
+            contract_version=_task6().LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+            requires_confirmation=True,
+            host="raw-private-manual-host.local",
+            host_input_digest="sha256:" + "7" * 64,
+            owner_principal=FIXED_OWNER,
+            interface=INTERFACE,
+            inventory_authority=(
+                {
+                    "interface_id": INTERFACE.interface_id,
+                    "os_identity": INTERFACE.os_identity,
+                    "addresses": list(INTERFACE.addresses),
+                },
+            ),
+            os_identity=INTERFACE.os_identity,
+        )
+
+    def confirm_manual(
+        self,
+        preview_digest: str,
+        selected_address: str,
+        *,
+        expected_revision: int,
+        confirmed: bool,
+        privacy_acknowledged: bool,
+    ) -> LanScanRecord:
+        self.calls.append(
+            (
+                "manual-confirm",
+                preview_digest,
+                selected_address,
+                expected_revision,
+                confirmed,
+                privacy_acknowledged,
+            )
+        )
+        if selected_address not in {"192.168.90.2", "192.168.90.3"}:
+            raise _task6().LanManualPreviewConflict("raw-secret-nonmember-address")
+        self.record = _manual_scan(selected_address)
+        return self.record
 
     def create_draft_for_preview(
         self,
@@ -490,6 +619,9 @@ def _assert_no_private_authority(payload: object) -> None:
     assert "darwin:en90" not in encoded
     assert 'terminal_receipt"' not in encoded
     assert "must-never-cross-the-route" not in encoded
+    assert "raw-private-manual-host.local" not in encoded
+    assert "host_input_digest" not in encoded
+    assert "inventory_authority" not in encoded
 
 
 def test_automatic_routes_project_only_bounded_public_manager_results() -> None:
@@ -581,6 +713,378 @@ def test_automatic_routes_project_only_bounded_public_manager_results() -> None:
     assert ("cancel", SCAN_ID, 4) in manager.calls
 
 
+def test_manual_probe_preview_and_confirm_have_exact_safe_public_shapes() -> None:
+    manager = RouteManager()
+    with _route_client(manager) as client:
+        preview = client.post(
+            "/api/routing/lan/manual-probe",
+            json={
+                "mode": "preview",
+                "interface_id": INTERFACE.interface_id,
+                "host": "model-box.local",
+                "port": 5001,
+            },
+        )
+        nonmember = client.post(
+            "/api/routing/lan/manual-probe",
+            json={
+                "mode": "confirm",
+                "expected_revision": 0,
+                "preview_digest": PREVIEW_DIGEST,
+                "selected_address": "192.168.90.4",
+                "confirmed": True,
+                "privacy_acknowledged": True,
+            },
+        )
+        confirmed = client.post(
+            "/api/routing/lan/manual-probe",
+            json={
+                "mode": "confirm",
+                "expected_revision": 0,
+                "preview_digest": PREVIEW_DIGEST,
+                "selected_address": "192.168.90.3",
+                "confirmed": True,
+                "privacy_acknowledged": True,
+            },
+        )
+
+    assert preview.status_code == 200
+    assert _task7_routes().LAN_MANUAL_PREVIEW_SCHEMA == ("kestrel.lan.manual-preview.v1")
+    assert preview.json() == {
+        "schema": _task7_routes().LAN_MANUAL_PREVIEW_SCHEMA,
+        "interface_id": INTERFACE.interface_id,
+        "port": 5001,
+        "resolved_addresses": ["192.168.90.2", "192.168.90.3"],
+        "preview_digest": PREVIEW_DIGEST,
+        "issued_at": "2026-08-01T12:00:00Z",
+        "expires_at": "2026-08-01T12:00:30Z",
+        "server_version": LAN_SERVER_VERSION,
+        "contract_version": _task6().LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+        "requires_confirmation": True,
+    }
+    assert confirmed.status_code == 202
+    assert nonmember.status_code == 409
+    assert nonmember.json() == {"detail": {"code": "lan_manual_preview_conflict"}}
+    assert "192.168.90.4" not in nonmember.text
+    assert confirmed.json()["status"] == "running"
+    assert confirmed.json()["revision"] == 2
+    assert confirmed.json()["network"] == "192.168.90.3/32"
+    assert confirmed.json()["limits"] == _manual_limits(5001)
+    assert "observations" not in confirmed.json()
+    for payload in (preview.json(), nonmember.json(), confirmed.json()):
+        _assert_no_private_authority(payload)
+        encoded = json.dumps(payload, sort_keys=True)
+        assert "model-box.local" not in encoded
+        assert "192.168.90.4" not in encoded
+        assert '"probe":' not in encoded
+    assert manager.calls == [
+        ("manual-preview", INTERFACE.interface_id, "model-box.local", 5001),
+        (
+            "manual-confirm",
+            PREVIEW_DIGEST,
+            "192.168.90.4",
+            0,
+            True,
+            True,
+        ),
+        (
+            "manual-confirm",
+            PREVIEW_DIGEST,
+            "192.168.90.3",
+            0,
+            True,
+            True,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {},
+        {"mode": "unknown"},
+        {
+            "mode": "preview",
+            "interface_id": INTERFACE.interface_id,
+            "host": "model-box.local",
+            "port": 5001,
+            "selected_address": "192.168.90.2",
+        },
+        {
+            "mode": "preview",
+            "interface_id": INTERFACE.interface_id,
+            "host": "model-box.local",
+            "port": 5001,
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": True,
+        },
+        {
+            "mode": "preview",
+            "interface_id": INTERFACE.interface_id,
+            "host": "model-box.local",
+            "port": 5001,
+            "owner_principal": FIXED_OWNER,
+        },
+        {
+            "mode": "preview",
+            "interface_id": INTERFACE.interface_id,
+            "host": "model-box.local",
+            "port": 5001,
+            "limits": _manual_limits(5001),
+        },
+        {
+            "mode": "preview",
+            "interface_id": INTERFACE.interface_id,
+            "host": "model-box.local",
+            "port": 5001,
+            "unexpected": True,
+        },
+        {
+            "mode": "confirm",
+            "interface_id": INTERFACE.interface_id,
+            "host": "model-box.local",
+            "port": 5001,
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": True,
+            "interface_id": INTERFACE.interface_id,
+            "host": "model-box.local",
+            "port": 5001,
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": True,
+            "network": "192.168.90.2/32",
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": True,
+            "limits": _manual_limits(5001),
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": True,
+            "unexpected": True,
+        },
+        *(
+            {
+                "mode": "preview",
+                "interface_id": INTERFACE.interface_id,
+                "host": "model-box.local",
+                "port": port,
+            }
+            for port in (False, True, 0, 65536, 5001.0, "5001")
+        ),
+        *(
+            {
+                "mode": "confirm",
+                "expected_revision": revision,
+                "preview_digest": PREVIEW_DIGEST,
+                "selected_address": "192.168.90.2",
+                "confirmed": True,
+                "privacy_acknowledged": True,
+            }
+            for revision in (False, True, -1, 1, 0.0, "0")
+        ),
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": False,
+            "privacy_acknowledged": True,
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": 1,
+            "privacy_acknowledged": True,
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": False,
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": 1,
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": "b" * 64,
+            "selected_address": "192.168.90.2",
+            "confirmed": True,
+            "privacy_acknowledged": True,
+        },
+        {
+            "mode": "confirm",
+            "expected_revision": 0,
+            "preview_digest": PREVIEW_DIGEST,
+            "selected_address": 1234,
+            "confirmed": True,
+            "privacy_acknowledged": True,
+        },
+    ),
+)
+def test_manual_probe_discriminator_and_authority_fields_are_strict(
+    payload: dict[str, object],
+) -> None:
+    manager = RouteManager()
+    with _route_client(manager) as client:
+        response = client.post("/api/routing/lan/manual-probe", json=payload)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "lan_request_invalid"}}
+    assert manager.calls == []
+
+
+def test_manual_probe_maps_host_conflict_active_slot_and_unavailable_errors_without_echo(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    class HostRejected(RouteManager):
+        def manual_preview(self, interface_id: str, host: str, port: int) -> object:
+            del interface_id, host, port
+            raise ValueError("raw-secret-host-model-box.local")
+
+    class PreviewConflict(RouteManager):
+        def confirm_manual(self, *args: object, **kwargs: object) -> LanScanRecord:
+            del args, kwargs
+            raise _task6().LanManualPreviewConflict("raw-secret-address-192.168.90.2")
+
+    class ActiveConflict(RouteManager):
+        def confirm_manual(self, *args: object, **kwargs: object) -> LanScanRecord:
+            del args, kwargs
+            raise LanScanAdmissionConflict("raw-secret-active-scan")
+
+    class ResolverUnavailable(RouteManager):
+        def manual_preview(self, interface_id: str, host: str, port: int) -> object:
+            del interface_id, host, port
+            raise RuntimeError("raw-secret-resolver-failure")
+
+    preview_body = {
+        "mode": "preview",
+        "interface_id": INTERFACE.interface_id,
+        "host": "model-box.local",
+        "port": 5001,
+    }
+    confirm_body = {
+        "mode": "confirm",
+        "expected_revision": 0,
+        "preview_digest": PREVIEW_DIGEST,
+        "selected_address": "192.168.90.2",
+        "confirmed": True,
+        "privacy_acknowledged": True,
+    }
+    cases = (
+        (HostRejected(), preview_body, 400, "lan_manual_host_rejected"),
+        (PreviewConflict(), confirm_body, 409, "lan_manual_preview_conflict"),
+        (ActiveConflict(), confirm_body, 409, "lan_scan_active_conflict"),
+        (ResolverUnavailable(), preview_body, 503, "lan_scan_unavailable"),
+    )
+    for manager, body, expected_status, expected_code in cases:
+        with _route_client(manager) as client:
+            response = client.post("/api/routing/lan/manual-probe", json=body)
+        assert response.status_code == expected_status
+        assert response.json() == {"detail": {"code": expected_code}}
+        assert "raw-secret" not in response.text
+        assert "model-box.local" not in response.text
+        assert "192.168.90.2" not in response.text
+
+    assert "raw-secret" not in caplog.text
+    assert "model-box.local" not in caplog.text
+    assert "192.168.90.2" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "host",
+    (
+        "8.8.8.8",
+        "127.0.0.1",
+        "224.0.0.1",
+        "0.0.0.0",
+        "192.0.2.1",
+        "192.168.91.2",
+    ),
+    ids=(
+        "public",
+        "loopback",
+        "multicast",
+        "unspecified",
+        "reserved-documentation",
+        "private-out-of-interface",
+    ),
+)
+def test_manual_probe_maps_ineligible_literal_rejection_to_fixed_safe_400(
+    host: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    class LiteralRejected(RouteManager):
+        def manual_preview(
+            self,
+            interface_id: str,
+            requested_host: str,
+            port: int,
+        ) -> object:
+            self.calls.append(("manual-preview", interface_id, requested_host, port))
+            raise ValueError(f"raw-secret-ineligible-literal:{requested_host}")
+
+    manager = LiteralRejected()
+    with _route_client(manager) as client:
+        response = client.post(
+            "/api/routing/lan/manual-probe",
+            json={
+                "mode": "preview",
+                "interface_id": INTERFACE.interface_id,
+                "host": host,
+                "port": 5001,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "lan_manual_host_rejected"}}
+    assert host not in response.text
+    assert "raw-secret" not in response.text
+    assert host not in caplog.text
+    assert "raw-secret" not in caplog.text
+    assert manager.calls == [
+        ("manual-preview", INTERFACE.interface_id, host, 5001),
+    ]
+
+
 def test_route_projection_enforces_100_scan_and_200_observation_caps_on_oversupply() -> None:
     class OversupplyingManager(RouteManager):
         def __init__(self) -> None:
@@ -662,6 +1166,18 @@ def test_route_projection_enforces_100_scan_and_200_observation_caps_on_oversupp
         (
             "/api/routing/lan/preview",
             b"[" * 2_000 + b"0" + b"]" * 2_000,
+            400,
+            "lan_request_invalid_json",
+        ),
+        (
+            "/api/routing/lan/manual-probe",
+            b'{"mode":"preview","mode":"confirm","host":"raw-secret"}',
+            400,
+            "lan_request_invalid_json",
+        ),
+        (
+            "/api/routing/lan/manual-probe",
+            b'{"mode":"preview","host":"\xff"}',
             400,
             "lan_request_invalid_json",
         ),
@@ -751,6 +1267,8 @@ def test_route_projection_enforces_100_scan_and_200_observation_caps_on_oversupp
         "invalid-utf8",
         "nonfinite",
         "excessive-nesting",
+        "manual-duplicate-key",
+        "manual-invalid-utf8",
         "array",
         "null",
         "extra-field",
@@ -900,6 +1418,28 @@ def test_every_lan_request_rejects_identity_alias_query_get_body_and_oversize_fi
         ),
         (
             "POST",
+            "/api/routing/lan/manual-probe",
+            {
+                "mode": "preview",
+                "interface_id": INTERFACE.interface_id,
+                "host": "model-box.local",
+                "port": 5001,
+            },
+        ),
+        (
+            "POST",
+            "/api/routing/lan/manual-probe",
+            {
+                "mode": "confirm",
+                "expected_revision": 0,
+                "preview_digest": PREVIEW_DIGEST,
+                "selected_address": "192.168.90.2",
+                "confirmed": True,
+                "privacy_acknowledged": True,
+            },
+        ),
+        (
+            "POST",
             "/api/routing/lan/scans",
             {
                 "preview_digest": PREVIEW_DIGEST,
@@ -938,6 +1478,15 @@ def test_every_lan_request_rejects_identity_alias_query_get_body_and_oversize_fi
                     kwargs["json"] = body
                 forged.append(client.request(method, path, **kwargs))
         query = client.get("/api/routing/lan/scans?owner_principal=raw-secret-owner")
+        manual_query = client.post(
+            "/api/routing/lan/manual-probe?host=raw-secret-owner",
+            json={
+                "mode": "preview",
+                "interface_id": INTERFACE.interface_id,
+                "host": "model-box.local",
+                "port": 5001,
+            },
+        )
         get_bodies = [
             client.request(
                 "GET",
@@ -958,7 +1507,7 @@ def test_every_lan_request_rejects_identity_alias_query_get_body_and_oversize_fi
             headers={"content-type": "application/json"},
         )
 
-    for response in (*forged, query, *get_bodies):
+    for response in (*forged, query, manual_query, *get_bodies):
         assert response.status_code == 400
         assert response.json() == {"detail": {"code": "lan_request_rejected"}}
         assert "raw-secret-owner" not in response.text
@@ -1250,6 +1799,112 @@ def test_sse_replays_strictly_after_cursor_with_canonical_bounded_frames_and_hea
     assert maximum_cursor.text() == ""
 
 
+def test_sse_replays_safe_manual_start_projection_then_drains_terminal_event() -> None:
+    manager = RouteManager()
+    manager.record = replace(
+        _scan(status="completed", revision=4),
+        network="192.168.90.2/32",
+        limits=_manual_limits(5001),
+    )
+    manual_started = _event(
+        1,
+        "scan_started",
+        payload=_manual_private_event_payload(),
+    )
+    completed = _event(2, "scan_completed")
+    manager.durable_events = [manual_started, completed]
+
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+    )
+
+    assert status == 200
+    assert response.text().endswith("\n\n")
+    frames = [item for item in response.text().split("\n\n") if item]
+    assert len(frames) == 2
+    assert [frame.splitlines()[1] for frame in frames] == [
+        "event: scan_started",
+        "event: scan_completed",
+    ]
+    first_data = next(line for line in frames[0].splitlines() if line.startswith("data: "))
+    projected = json.loads(first_data.removeprefix("data: "))
+    assert projected == {
+        "scan_id": SCAN_ID,
+        "sequence": 1,
+        "event_type": "scan_started",
+        "payload": _manual_public_event_payload(),
+        "created_at": manual_started.created_at,
+    }
+    assert first_data == "data: " + json.dumps(
+        projected,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    _assert_no_private_authority(projected)
+    _assert_no_private_authority(response.text())
+    assert "model-box.local" not in response.text()
+    assert "host_input_digest" not in response.text()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("schema", "kestrel.lan.scan-preview.v1"),
+        ("mode", "automatic"),
+        ("endpoint_kind", "automatic"),
+        ("observation_source", "active"),
+        ("interface_id", "sha256:" + "9" * 64),
+        ("interface_id", "sha256:ABC"),
+        ("network", "192.168.90.0/29"),
+        ("limits", {**_manual_limits(), "max_active_hosts": 2}),
+        ("active_host_count", 2),
+        ("passive_or_manual_only", False),
+        ("port_count", 2),
+        ("exact_port", 5002),
+        ("mdns_status", "available"),
+        ("server_version", "raw-secret-server-version"),
+        ("contract_version", "kestrel.lan.preview-authorization.v1"),
+        ("preview_digest", "sha256:" + "9" * 64),
+        ("preview_digest", "sha256:ABC"),
+        ("expires_at", "raw-secret-expiry"),
+        ("owner_principal", "owner:lookalike"),
+        ("confirmed", False),
+        ("privacy_acknowledged", False),
+    ),
+)
+def test_sse_fails_closed_before_streaming_damaged_manual_start_fields(
+    field: str,
+    value: object,
+) -> None:
+    manager = RouteManager()
+    manager.record = replace(
+        _scan(status="completed", revision=4),
+        network="192.168.90.2/32",
+        limits=_manual_limits(5001),
+    )
+    manager.durable_events = [
+        _event(
+            1,
+            "scan_started",
+            payload={**_manual_private_event_payload(), field: value},
+        ),
+        _event(2, "scan_completed"),
+    ]
+
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+    )
+
+    assert status == 409
+    assert response.json_body() == {"detail": {"code": "lan_event_invalid"}}
+    assert "raw-secret" not in response.text()
+    assert "model-box.local" not in response.text()
+    assert "192.168.90.2" not in response.text()
+
+
 @pytest.mark.parametrize("event_type", ALLOWED_EVENT_TYPES)
 def test_sse_projects_each_allowed_durable_event_to_an_explicit_public_envelope(
     event_type: str,
@@ -1368,6 +2023,183 @@ def test_sse_replays_fixed_shutdown_cancel_events_after_runtime_restart() -> Non
     _assert_no_private_authority(response_text)
 
 
+@pytest.mark.parametrize("cancel_reason", ("owner_cancelled", "shutdown_cancelled"))
+def test_sse_replays_failed_worker_event_after_canonical_prior_cancel(
+    cancel_reason: str,
+) -> None:
+    manager = RouteManager(terminal=True)
+    manager.record = replace(
+        _scan(status="failed", revision=5),
+        cancel_reason=cancel_reason,
+    )
+    manager.durable_events = [
+        _event(1, "scan_started"),
+        _event(
+            2,
+            "scan_cancel_requested",
+            payload={"reason": cancel_reason},
+        ),
+        _event(
+            3,
+            "scan_failed",
+            payload={
+                "schema": "kestrel.lan.scan-terminal.v2",
+                "status": "failed",
+                "terminal_reason": "worker_error",
+                "cancel_reason": cancel_reason,
+            },
+        ),
+    ]
+
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+    )
+    response_text = response.text()
+
+    assert status == 200
+    frames = [item for item in response_text.split("\n\n") if item]
+    assert [frame.splitlines()[1] for frame in frames] == [
+        "event: scan_started",
+        "event: scan_cancel_requested",
+        "event: scan_failed",
+    ]
+    terminal = json.loads(
+        next(line for line in frames[-1].splitlines() if line.startswith("data: ")).removeprefix(
+            "data: "
+        )
+    )
+    assert terminal["payload"] == {
+        "status": "failed",
+        "terminal_reason": "worker_error",
+        "cancel_reason": cancel_reason,
+    }
+    _assert_no_private_authority(response_text)
+
+
+@pytest.mark.parametrize(
+    ("record", "durable_events"),
+    (
+        pytest.param(
+            _scan(status="failed", revision=5),
+            (
+                _event(
+                    1,
+                    "scan_failed",
+                    payload={
+                        "schema": "kestrel.lan.scan-terminal.v2",
+                        "status": "failed",
+                        "terminal_reason": "deadline_expired",
+                        "cancel_reason": None,
+                    },
+                ),
+            ),
+            id="terminal-reason",
+        ),
+        pytest.param(
+            replace(
+                _scan(status="failed", revision=5),
+                cancel_reason="owner_cancelled",
+            ),
+            (
+                _event(
+                    1,
+                    "scan_failed",
+                    payload={
+                        "schema": "kestrel.lan.scan-terminal.v2",
+                        "status": "failed",
+                        "terminal_reason": "worker_error",
+                        "cancel_reason": "shutdown_cancelled",
+                    },
+                ),
+            ),
+            id="terminal-cancel-authority",
+        ),
+        pytest.param(
+            replace(
+                _scan(status="failed", revision=5),
+                cancel_reason="owner_cancelled",
+            ),
+            (
+                _event(
+                    1,
+                    "scan_cancel_requested",
+                    payload={"reason": "shutdown_cancelled"},
+                ),
+                _event(
+                    2,
+                    "scan_failed",
+                    payload={
+                        "schema": "kestrel.lan.scan-terminal.v2",
+                        "status": "failed",
+                        "terminal_reason": "worker_error",
+                        "cancel_reason": "owner_cancelled",
+                    },
+                ),
+            ),
+            id="cancel-request-authority",
+        ),
+    ),
+)
+def test_sse_rejects_canonical_terminal_history_that_disagrees_with_scan_record(
+    record: LanScanRecord,
+    durable_events: tuple[LanScanEvent, ...],
+) -> None:
+    manager = RouteManager(terminal=True)
+    manager.record = record
+    manager.durable_events = list(durable_events)
+
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+    )
+
+    assert status == 409
+    assert response.json_body() == {"detail": {"code": "lan_event_invalid"}}
+    assert "worker_error" not in response.text()
+    assert "deadline_expired" not in response.text()
+    assert "owner_cancelled" not in response.text()
+    assert "shutdown_cancelled" not in response.text()
+
+
+def test_sse_projects_returned_worker_interruption_bound_to_durable_record() -> None:
+    manager = RouteManager(terminal=True)
+    manager.record = replace(
+        _scan(status="interrupted", revision=5),
+        terminal_reason="worker_interrupted",
+    )
+    manager.durable_events = [
+        _event(
+            1,
+            "scan_interrupted",
+            payload={
+                "schema": "kestrel.lan.scan-terminal.v2",
+                "status": "interrupted",
+                "terminal_reason": "worker_interrupted",
+                "cancel_reason": None,
+            },
+        )
+    ]
+
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+    )
+
+    assert status == 200
+    assert response.text().count("event: scan_interrupted\n") == 1
+    payload = json.loads(
+        next(
+            line for line in response.text().splitlines() if line.startswith("data: ")
+        ).removeprefix("data: ")
+    )["payload"]
+    assert payload == {
+        "status": "interrupted",
+        "terminal_reason": "worker_interrupted",
+        "cancel_reason": None,
+    }
+
+
 @pytest.mark.parametrize(
     ("durable_events", "terminal_status", "private_marker"),
     (
@@ -1456,6 +2288,68 @@ def test_sse_replays_fixed_shutdown_cancel_events_after_runtime_restart() -> Non
             "completed",
             "worker_error",
             id="terminal-event-status",
+        ),
+        pytest.param(
+            (
+                _event(1, "scan_started"),
+                _event(
+                    2,
+                    "scan_failed",
+                    payload={
+                        **_private_event_payload("scan_failed"),
+                        "cancel_reason": "raw-private-terminal-cancel",
+                    },
+                ),
+            ),
+            "failed",
+            "raw-private-terminal-cancel",
+            id="failed-terminal-arbitrary-cancel",
+        ),
+        pytest.param(
+            (
+                _event(1, "scan_started"),
+                _event(
+                    2,
+                    "scan_cancel_requested",
+                    payload={"reason": "owner_cancelled"},
+                ),
+                _event(
+                    3,
+                    "scan_failed",
+                    payload={
+                        "schema": "kestrel.lan.scan-terminal.v2",
+                        "status": "failed",
+                        "terminal_reason": "deadline_expired",
+                        "cancel_reason": "owner_cancelled",
+                    },
+                ),
+            ),
+            "failed",
+            "deadline_expired",
+            id="failed-deadline-owner-cancel",
+        ),
+        pytest.param(
+            (
+                _event(1, "scan_started"),
+                _event(
+                    2,
+                    "scan_cancel_requested",
+                    payload={"reason": "shutdown_cancelled"},
+                ),
+                _event(
+                    3,
+                    "scan_failed",
+                    payload={
+                        "schema": "kestrel.lan.scan-terminal.v2",
+                        "status": "failed",
+                        "terminal_reason": "deadline_expired",
+                        "cancel_reason": "shutdown_cancelled",
+                    },
+                ),
+            ),
+            "failed",
+            "deadline_expired",
+            id="failed-deadline-shutdown-cancel",
         ),
         pytest.param(
             (
@@ -1695,6 +2589,127 @@ def test_registered_sse_endpoint_performs_a_terminal_second_drain() -> None:
     assert manager.event_calls >= 2
     assert response.text().count("id: 7\n") == 1
     assert "event: scan_completed\n" in response.text()
+
+
+def test_sse_preflight_refreshes_record_after_initial_terminal_event_race() -> None:
+    running = _scan(status="running", revision=2)
+    terminal = _scan(status="completed", revision=4)
+    final_event = _event(7)
+
+    class InitialTerminalRaceManager:
+        def __init__(self) -> None:
+            self.record = running
+            self.calls: list[tuple[object, ...]] = []
+
+        def get(self, scan_id: str) -> LanScanRecord:
+            self.calls.append(("get", scan_id))
+            return self.record
+
+        def events(
+            self,
+            scan_id: str,
+            *,
+            after_sequence: int = 0,
+            limit: int = 500,
+        ) -> list[LanScanEvent]:
+            self.calls.append(("events", scan_id, after_sequence, limit))
+            self.record = terminal
+            return [final_event] if after_sequence < final_event.sequence else []
+
+    manager = InitialTerminalRaceManager()
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+        headers=((b"last-event-id", b"6"),),
+    )
+
+    assert status == 200
+    assert response.text().count("id: 7\n") == 1
+    assert response.text().count("event: scan_completed\n") == 1
+    assert manager.calls[:3] == [
+        ("get", SCAN_ID),
+        ("events", SCAN_ID, 6, 500),
+        ("get", SCAN_ID),
+    ]
+
+
+@pytest.mark.parametrize("event_cancel_reason", ("owner_cancelled", "shutdown_cancelled"))
+def test_sse_later_terminal_batch_binds_to_refreshed_record_before_emission(
+    event_cancel_reason: str,
+) -> None:
+    async def exercise() -> tuple[int, str, list[tuple[object, ...]]]:
+        class LaterTerminalRaceManager:
+            def __init__(self) -> None:
+                self.record = _scan(status="running", revision=2)
+                self.calls: list[tuple[object, ...]] = []
+                self.event_calls = 0
+
+            def get(self, scan_id: str) -> LanScanRecord:
+                self.calls.append(("get", scan_id))
+                return self.record
+
+            def events(
+                self,
+                scan_id: str,
+                *,
+                after_sequence: int = 0,
+                limit: int = 500,
+            ) -> list[LanScanEvent]:
+                self.calls.append(("events", scan_id, after_sequence, limit))
+                self.event_calls += 1
+                if self.event_calls != 2:
+                    return []
+                self.record = replace(
+                    _scan(status="failed", revision=5),
+                    cancel_reason="owner_cancelled",
+                )
+                return [
+                    _event(
+                        3,
+                        "scan_failed",
+                        payload={
+                            "schema": "kestrel.lan.scan-terminal.v2",
+                            "status": "failed",
+                            "terminal_reason": "worker_error",
+                            "cancel_reason": event_cancel_reason,
+                        },
+                    )
+                ]
+
+        async def immediate_sleep(_seconds: float) -> None:
+            await asyncio.sleep(0)
+
+        manager = LaterTerminalRaceManager()
+        app = _route_app(
+            manager,
+            stream_runtime=SimpleNamespace(
+                monotonic_clock=lambda: 0.0,
+                sleep=immediate_sleep,
+            ),
+        )
+        connection = _AsgiConnection(
+            app,
+            f"/api/routing/lan/scans/{SCAN_ID}/events",
+        )
+        status = await connection.start()
+        await connection.wait()
+        return status, connection.text(), manager.calls
+
+    status, response_text, calls = _run_bounded(exercise())
+
+    assert status == 200
+    if event_cancel_reason == "owner_cancelled":
+        assert response_text.count("event: scan_failed\n") == 1
+    else:
+        assert "event: scan_failed\n" not in response_text
+        assert "shutdown_cancelled" not in response_text
+    assert [call[0] for call in calls[:5]] == [
+        "get",
+        "events",
+        "get",
+        "events",
+        "get",
+    ]
 
 
 def test_sse_terminal_replay_drains_every_bounded_page_through_the_terminal() -> None:
@@ -2177,7 +3192,7 @@ def test_sse_route_heartbeat_boundary_and_disconnect_after_empty_poll_are_observ
     _run_bounded(exercise_disconnect())
 
 
-def test_standalone_automatic_route_registration_is_exact_and_excludes_7b_boundaries() -> None:
+def test_standalone_discovery_route_registration_adds_one_manual_route_without_duplicates() -> None:
     fastapi = pytest.importorskip("fastapi")
     responses = pytest.importorskip("starlette.responses")
     app = fastapi.FastAPI()
@@ -2204,9 +3219,9 @@ def test_standalone_automatic_route_registration_is_exact_and_excludes_7b_bounda
             ("GET", "/api/routing/lan/scans/{scan_id}"): 1,
             ("POST", "/api/routing/lan/scans/{scan_id}/cancel"): 1,
             ("GET", "/api/routing/lan/scans/{scan_id}/events"): 1,
+            ("POST", "/api/routing/lan/manual-probe"): 1,
         }
     )
-    assert not any("manual-probe" in path for _method, path in manifest)
     assert not any(path.endswith("/import") for _method, path in manifest)
     assert not any(path.endswith("/review") for _method, path in manifest)
 

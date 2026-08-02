@@ -21,6 +21,7 @@ from nested_memvid_agent.lan_discovery_models import (
     MAX_ACTIVE_HOSTS,
     MAX_PROBE_RESPONSE_BYTES,
     TCP_CONNECT_TIMEOUT_SECONDS,
+    ManualLanEndpoint,
     NetworkInterface,
     ResolvedLanEndpoint,
 )
@@ -222,23 +223,31 @@ class LanProbeModel:
 
 
 InterfaceInventoryResolver = Callable[[], CurrentLanInterfaceInventory]
+LanEndpointAuthority = ResolvedLanEndpoint | ManualLanEndpoint
 
 
-def _format_numeric_http_authority(endpoint: ResolvedLanEndpoint) -> str:
+def _validated_endpoint_port(endpoint: LanEndpointAuthority) -> int:
+    port = endpoint.port
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("LAN endpoint requires a valid numeric port")
+    return port
+
+
+def _format_numeric_http_authority(endpoint: LanEndpointAuthority) -> str:
     """Format only the authenticated literal endpoint used by this transport."""
 
-    if type(endpoint) is not ResolvedLanEndpoint:
+    if type(endpoint) not in {ResolvedLanEndpoint, ManualLanEndpoint}:
         raise TypeError("HTTP authority requires an authenticated LAN endpoint")
+    if type(endpoint) is ManualLanEndpoint and endpoint.kind != "manual":
+        raise ValueError("HTTP authority requires an authenticated LAN endpoint")
     address = endpoint.address
-    port = endpoint.port
+    port = _validated_endpoint_port(endpoint)
     if type(address) is not str or "%" in address:
         raise ValueError("LAN endpoint requires an unzoned literal IP address")
     try:
         parsed = ipaddress.ip_address(address)
     except ValueError:
         raise ValueError("LAN endpoint requires a literal IP address") from None
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-        raise ValueError("LAN endpoint requires a valid numeric port")
     literal = str(parsed)
     if isinstance(parsed, ipaddress.IPv6Address):
         return f"[{literal}]:{port}"
@@ -278,7 +287,7 @@ def authenticate_private_scan_scope(scope: PrivateScanScope) -> PrivateScanScope
 
 def authenticate_lan_source(
     scope: PrivateScanScope,
-    endpoint: ResolvedLanEndpoint,
+    endpoint: LanEndpointAuthority,
     inventory_resolver: InterfaceInventoryResolver | None = None,
 ) -> AuthenticatedLanSource:
     """Choose one unique longest-prefix source from a fresh full inventory."""
@@ -348,6 +357,7 @@ def authenticate_lan_source(
 
     destination = ipaddress.ip_address(canonical_endpoint.address)
     confirmed_network = ipaddress.ip_network(canonical_scope.network, strict=True)
+    manual_authority = type(canonical_endpoint) is ManualLanEndpoint
     candidates: list[tuple[int, str]] = []
     for value in selected.addresses:
         selected_attached = ipaddress.ip_interface(value)
@@ -357,12 +367,14 @@ def authenticate_lan_source(
             and isinstance(confirmed_network, ipaddress.IPv4Network)
             and confirmed_network.subnet_of(selected_attached.network)
             and destination in selected_attached.network
+            and (manual_authority or selected_attached.ip in confirmed_network)
         ) or (
             isinstance(destination, ipaddress.IPv6Address)
             and isinstance(selected_attached, ipaddress.IPv6Interface)
             and isinstance(confirmed_network, ipaddress.IPv6Network)
             and confirmed_network.subnet_of(selected_attached.network)
             and destination in selected_attached.network
+            and (manual_authority or selected_attached.ip in confirmed_network)
         ):
             candidates.append((selected_attached.network.prefixlen, str(selected_attached.ip)))
     if not candidates:
@@ -405,7 +417,7 @@ class DirectLanHttpTransport:
     def tcp_reachable(
         self,
         scope: PrivateScanScope,
-        endpoint: ResolvedLanEndpoint,
+        endpoint: LanEndpointAuthority,
         source: AuthenticatedLanSource,
         *,
         deadline: float,
@@ -465,7 +477,7 @@ class DirectLanHttpTransport:
     def request(
         self,
         scope: PrivateScanScope,
-        endpoint: ResolvedLanEndpoint,
+        endpoint: LanEndpointAuthority,
         source: AuthenticatedLanSource,
         route: LanRequestRoute,
         *,
@@ -569,9 +581,9 @@ class DirectLanHttpTransport:
     def _authority(
         self,
         scope: PrivateScanScope,
-        endpoint: ResolvedLanEndpoint,
+        endpoint: LanEndpointAuthority,
         source: AuthenticatedLanSource,
-    ) -> tuple[ResolvedLanEndpoint, AuthenticatedLanSource]:
+    ) -> tuple[LanEndpointAuthority, AuthenticatedLanSource]:
         canonical_scope = authenticate_private_scan_scope(scope)
         canonical_endpoint = _rebuild_endpoint(canonical_scope, endpoint)
         try:
@@ -589,15 +601,22 @@ class DirectLanHttpTransport:
 
 def _rebuild_endpoint(
     scope: PrivateScanScope,
-    endpoint: ResolvedLanEndpoint,
-) -> ResolvedLanEndpoint:
+    endpoint: LanEndpointAuthority,
+) -> LanEndpointAuthority:
     error = ValueError("LAN transport requires an endpoint in the confirmed scope")
-    if type(endpoint) is not ResolvedLanEndpoint:
+    if type(endpoint) not in {ResolvedLanEndpoint, ManualLanEndpoint}:
         raise error
     try:
         if type(endpoint.address) is not str or "%" in endpoint.address:
             raise error
-        rebuilt = ResolvedLanEndpoint.from_scope(scope, endpoint.address, endpoint.port)
+        if type(endpoint) is ResolvedLanEndpoint:
+            rebuilt: LanEndpointAuthority = ResolvedLanEndpoint.from_scope(
+                scope, endpoint.address, endpoint.port
+            )
+        else:
+            if endpoint.kind != "manual":
+                raise error
+            rebuilt = ManualLanEndpoint.from_exact_scope(scope, endpoint.address, endpoint.port)
     except (AttributeError, TypeError, ValueError):
         raise error from None
     if endpoint != rebuilt:
@@ -606,10 +625,11 @@ def _rebuild_endpoint(
 
 
 def _request_bytes(
-    endpoint: ResolvedLanEndpoint,
+    endpoint: LanEndpointAuthority,
     route: LanRequestRoute,
     model: LanProbeModel | None,
 ) -> bytes:
+    _validated_endpoint_port(endpoint)
     body = b""
     if route is LanRequestRoute.OLLAMA_CATALOG:
         method = "GET"
@@ -660,22 +680,23 @@ def _request_bytes(
 
 
 def _socket_authority(
-    endpoint: ResolvedLanEndpoint,
+    endpoint: LanEndpointAuthority,
     source: AuthenticatedLanSource,
 ) -> tuple[int, object, object]:
+    port = _validated_endpoint_port(endpoint)
     destination = ipaddress.ip_address(endpoint.address)
     source_address = ipaddress.ip_address(source.source_address)
     if type(destination) is not type(source_address):
         raise ValueError("LAN source and destination address families differ")
     if isinstance(destination, ipaddress.IPv4Address):
-        return socket.AF_INET, (str(source_address), 0), (str(destination), endpoint.port)
+        return socket.AF_INET, (str(source_address), 0), (str(destination), port)
     zone = (
         source.interface_index if destination.is_link_local or source_address.is_link_local else 0
     )
     return (
         socket.AF_INET6,
         (str(source_address), 0, 0, zone),
-        (str(destination), endpoint.port, 0, zone),
+        (str(destination), port, 0, zone),
     )
 
 

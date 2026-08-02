@@ -6,6 +6,7 @@ import json
 import threading
 import unicodedata
 from dataclasses import FrozenInstanceError, replace
+from importlib import import_module
 
 import pytest
 
@@ -67,6 +68,14 @@ def current_inventory(scope: PrivateScanScope) -> CurrentLanInterfaceInventory:
             ),
         )
     )
+
+
+def manual_endpoint_type():
+    return import_module("nested_memvid_agent.lan_discovery_models").ManualLanEndpoint
+
+
+def probe_manual_lan_endpoint(*args, **kwargs):
+    return lan_scanner_module.probe_manual_lan_endpoint(*args, **kwargs)
 
 
 class RecordingTcpProbe:
@@ -188,6 +197,373 @@ def test_passive_ipv6_candidate_contributes_only_an_exact_known_port_endpoint() 
     scan(scope, tcp, http, candidates=(candidate(scope, "fd00::8", 11434),))
 
     assert tcp.destinations == [("fd00::8", 11434)]
+
+
+@pytest.mark.parametrize(
+    ("interface_address", "network", "address", "port", "source_address"),
+    [
+        ("192.168.60.7/24", "192.168.60.8/32", "192.168.60.8", 5001, "192.168.60.7"),
+        (
+            "192.168.60.7/24",
+            "192.168.60.8/32",
+            "192.168.60.8",
+            11434,
+            "192.168.60.7",
+        ),
+        ("fe80::7/64", "fe80::8/128", "fe80::8", 5001, "fe80::7"),
+    ],
+)
+def test_manual_scanner_probes_one_exact_endpoint_without_expanding_a_port_matrix(
+    interface_address: str,
+    network: str,
+    address: str,
+    port: int,
+    source_address: str,
+) -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture(interface_address, network)
+    endpoint = manual_type.from_exact_scope(scope, address, port)
+    tcp = RecordingTcpProbe()
+    http = RecordingHttpTransport(
+        {
+            LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(
+                200,
+                b'{"models":[{"name":"safe-model"}]}',
+            ),
+            LanRequestRoute.OLLAMA_GENERATION: LanHttpResponse(
+                200,
+                b'{"response":"OK","done":true}',
+            ),
+        }
+    )
+
+    observation = probe_manual_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=145.0,
+        cancellation=ScanCancellation(),
+        clock=lambda: 100.0,
+        tcp_probe=tcp,
+        http_transport=http,
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+
+    assert type(observation.endpoint) is manual_type
+    assert observation.endpoint.kind == "manual"
+    assert tcp.destinations == [(address, port)]
+    assert [item.source_address for item in tcp.sources] == [source_address]
+    assert [
+        (address, request_port, route) for address, request_port, route, _model in http.requests
+    ] == [
+        (address, port, LanRequestRoute.OLLAMA_CATALOG),
+        (address, port, LanRequestRoute.OLLAMA_GENERATION),
+    ]
+    assert observation.reachability is Reachability.REACHABLE
+    assert observation.failure_category is None
+
+
+def test_manual_scanner_rejects_automatic_endpoint_authority_before_transport() -> None:
+    scope = scope_fixture("192.168.60.7/24", "192.168.60.8/32")
+    automatic = ResolvedLanEndpoint.from_scope(scope, "192.168.60.8", 11434)
+    tcp = RecordingTcpProbe()
+    http = RecordingHttpTransport({})
+
+    with pytest.raises((TypeError, ValueError), match="manual"):
+        probe_manual_lan_endpoint(
+            scope,
+            automatic,
+            scan_deadline=145.0,
+            cancellation=ScanCancellation(),
+            clock=lambda: 100.0,
+            tcp_probe=tcp,
+            http_transport=http,
+            interface_inventory_resolver=lambda: current_inventory(scope),
+        )
+
+    assert tcp.destinations == []
+    assert http.requests == []
+
+
+def test_automatic_scanner_rejects_manual_endpoint_authority_before_transport() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.60.7/24", "192.168.60.8/32")
+    manual = manual_type.from_exact_scope(scope, "192.168.60.8", 11434)
+    tcp = RecordingTcpProbe()
+    http = RecordingHttpTransport({})
+
+    with pytest.raises((TypeError, ValueError), match="endpoint|known model-service ports"):
+        probe_lan_endpoint(
+            scope,
+            manual,
+            scan_deadline=145.0,
+            cancellation=ScanCancellation(),
+            clock=lambda: 100.0,
+            tcp_probe=tcp,
+            http_transport=http,
+            interface_inventory_resolver=lambda: current_inventory(scope),
+        )
+
+    assert tcp.destinations == []
+    assert http.requests == []
+
+
+def test_cancelled_manual_endpoint_retains_manual_provenance_without_transport() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("fd00::7/64", "fd00::8/128")
+    endpoint = manual_type.from_exact_scope(scope, "fd00::8", 5001)
+    cancellation = ScanCancellation()
+    cancellation.cancel()
+    tcp = RecordingTcpProbe()
+    http = RecordingHttpTransport({})
+
+    observation = probe_manual_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=145.0,
+        cancellation=cancellation,
+        clock=lambda: 100.0,
+        tcp_probe=tcp,
+        http_transport=http,
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+
+    assert type(observation.endpoint) is manual_type
+    assert observation.endpoint.kind == "manual"
+    assert observation.reachability is Reachability.NOT_ATTEMPTED
+    assert observation.failure_category is LanFailureCategory.CANCELLED
+    assert tcp.destinations == []
+    assert http.requests == []
+
+
+def test_expired_manual_endpoint_admits_no_transport() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.60.7/24", "192.168.60.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.60.8", 5001)
+    tcp = RecordingTcpProbe()
+    http = RecordingHttpTransport({})
+
+    observation = probe_manual_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=100.0,
+        cancellation=ScanCancellation(),
+        clock=lambda: 100.0,
+        tcp_probe=tcp,
+        http_transport=http,
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+
+    assert observation.endpoint.kind == "manual"
+    assert observation.reachability is Reachability.NOT_ATTEMPTED
+    assert observation.failure_category is LanFailureCategory.SCAN_DEADLINE_EXCEEDED
+    assert tcp.destinations == []
+    assert http.requests == []
+
+
+def test_manual_endpoint_shares_the_capped_absolute_deadline_across_all_phases() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.60.7/24", "192.168.60.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.60.8", 5001)
+
+    class MutableClock:
+        now = 100.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = MutableClock()
+
+    class AdvancingTcpProbe(RecordingTcpProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deadlines: list[float] = []
+
+        def tcp_reachable(self, *args, deadline: float, **kwargs):
+            self.deadlines.append(deadline)
+            clock.now = 100.1
+            return super().tcp_reachable(*args, deadline=deadline, **kwargs)
+
+    class AdvancingHttpTransport(RecordingHttpTransport):
+        def request(self, *args, deadline: float, **kwargs):
+            response = super().request(*args, deadline=deadline, **kwargs)
+            clock.now += 0.1
+            return response
+
+    tcp = AdvancingTcpProbe()
+    http = AdvancingHttpTransport(
+        {
+            LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(
+                200,
+                b'{"models":[{"name":"safe-model"}]}',
+            ),
+            LanRequestRoute.OLLAMA_GENERATION: LanHttpResponse(
+                200,
+                b'{"response":"OK","done":true}',
+            ),
+        }
+    )
+
+    observation = probe_manual_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=100.5,
+        cancellation=ScanCancellation(),
+        clock=clock,
+        tcp_probe=tcp,
+        http_transport=http,
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+
+    assert tcp.deadlines == [100.5]
+    assert http.deadlines == [100.5, 100.5]
+    assert [request[2] for request in http.requests] == [
+        LanRequestRoute.OLLAMA_CATALOG,
+        LanRequestRoute.OLLAMA_GENERATION,
+    ]
+    assert observation.reachability is Reachability.REACHABLE
+    assert observation.failure_category is None
+
+
+def test_manual_endpoint_reuses_one_roomy_http_phase_deadline_after_tcp() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.60.7/24", "192.168.60.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.60.8", 5001)
+
+    class MutableClock:
+        now = 100.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = MutableClock()
+
+    class AdvancingTcpProbe(RecordingTcpProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deadlines: list[float] = []
+
+        def tcp_reachable(self, *args, deadline: float, **kwargs):
+            self.deadlines.append(deadline)
+            clock.now = 100.1
+            return super().tcp_reachable(*args, deadline=deadline, **kwargs)
+
+    class AdvancingHttpTransport(RecordingHttpTransport):
+        def request(self, *args, deadline: float, **kwargs):
+            response = super().request(*args, deadline=deadline, **kwargs)
+            clock.now += 0.1
+            return response
+
+    tcp = AdvancingTcpProbe()
+    http = AdvancingHttpTransport(
+        {
+            LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(
+                200,
+                b'{"models":[{"name":"safe-model"}]}',
+            ),
+            LanRequestRoute.OLLAMA_GENERATION: LanHttpResponse(
+                200,
+                b'{"response":"OK","done":true}',
+            ),
+        }
+    )
+
+    observation = probe_manual_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=145.0,
+        cancellation=ScanCancellation(),
+        clock=clock,
+        tcp_probe=tcp,
+        http_transport=http,
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+
+    assert tcp.deadlines == [100.75]
+    assert http.deadlines == [102.1, 102.1]
+    assert [request[2] for request in http.requests] == [
+        LanRequestRoute.OLLAMA_CATALOG,
+        LanRequestRoute.OLLAMA_GENERATION,
+    ]
+    assert observation.reachability is Reachability.REACHABLE
+    assert observation.failure_category is None
+
+
+def test_manual_unusual_port_openai_fallback_uses_one_exact_request_sequence() -> None:
+    manual_type = manual_endpoint_type()
+    scope = scope_fixture("192.168.60.7/24", "192.168.60.8/32")
+    endpoint = manual_type.from_exact_scope(scope, "192.168.60.8", 5001)
+
+    class MutableClock:
+        now = 100.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = MutableClock()
+
+    class AdvancingTcpProbe(RecordingTcpProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deadlines: list[float] = []
+
+        def tcp_reachable(self, *args, deadline: float, **kwargs):
+            self.deadlines.append(deadline)
+            clock.now = 100.1
+            return super().tcp_reachable(*args, deadline=deadline, **kwargs)
+
+    class AdvancingHttpTransport(RecordingHttpTransport):
+        def request(self, *args, deadline: float, **kwargs):
+            response = super().request(*args, deadline=deadline, **kwargs)
+            clock.now += 0.1
+            return response
+
+    tcp = AdvancingTcpProbe()
+    http = AdvancingHttpTransport(
+        {
+            LanRequestRoute.OLLAMA_CATALOG: LanHttpResponse(404, b"missing"),
+            LanRequestRoute.OPENAI_CATALOG: LanHttpResponse(
+                200,
+                b'{"data":[{"id":"safe-model"}]}',
+            ),
+            LanRequestRoute.OPENAI_GENERATION: LanHttpResponse(
+                200,
+                b'{"choices":[{"message":{"content":"OK"}}]}',
+            ),
+        }
+    )
+
+    observation = probe_manual_lan_endpoint(
+        scope,
+        endpoint,
+        scan_deadline=145.0,
+        cancellation=ScanCancellation(),
+        clock=clock,
+        tcp_probe=tcp,
+        http_transport=http,
+        interface_inventory_resolver=lambda: current_inventory(scope),
+    )
+
+    assert tcp.destinations == [("192.168.60.8", 5001)]
+    assert tcp.deadlines == [100.75]
+    assert http.requests == [
+        ("192.168.60.8", 5001, LanRequestRoute.OLLAMA_CATALOG, None),
+        ("192.168.60.8", 5001, LanRequestRoute.OPENAI_CATALOG, None),
+        ("192.168.60.8", 5001, LanRequestRoute.OPENAI_GENERATION, "safe-model"),
+    ]
+    assert http.deadlines == [102.1, 102.1, 102.1]
+    assert observation.endpoint == endpoint
+    assert observation.api_shape is ApiShape.OPENAI_COMPATIBLE
+    assert observation.catalog == ("safe-model",)
+    assert observation.selected_model_id == "safe-model"
+    generation, *untested = observation.capabilities
+    assert generation.capability is CapabilityName.GENERATION
+    assert generation.status is CapabilityObservationStatus.OBSERVED_PASS
+    assert generation.provenance is CapabilityProvenance.OBSERVED
+    assert generation.supported is True
+    assert all(item.status is CapabilityObservationStatus.NOT_RUN for item in untested)
+    assert all(item.provenance is CapabilityProvenance.NOT_RUN for item in untested)
+    assert all(item.supported is None for item in untested)
+    assert observation.failure_category is None
 
 
 @pytest.mark.parametrize(

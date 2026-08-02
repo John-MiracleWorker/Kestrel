@@ -22,18 +22,26 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from math import isfinite
+from typing import cast
 from uuid import uuid4
 
 from nested_memvid_agent.lan_discovery_models import (
     TOTAL_SCAN_DEADLINE_SECONDS,
     LanScanLimits,
     LanScanPreview,
+    ManualLanEndpoint,
     NetworkInterface,
 )
 from nested_memvid_agent.lan_discovery_scope import (
     PrivateScanScope,
     enumerate_private_interfaces,
     preview_private_scope,
+)
+from nested_memvid_agent.lan_manual_probe import (
+    ManualHostResolver,
+    ManualLanPreview,
+    default_manual_host_resolver,
+    preview_manual_host,
 )
 from nested_memvid_agent.lan_mdns import (
     MdnsAvailability,
@@ -45,6 +53,7 @@ from nested_memvid_agent.lan_scanner import (
     LanFailureCategory,
     LanScanProgress,
     ScanCancellation,
+    probe_manual_lan_endpoint,
     scan_lan_scope,
 )
 from nested_memvid_agent.routing.lan_ledger import (
@@ -64,8 +73,11 @@ from nested_memvid_agent.routing.lan_serialization import (
 LAN_OWNER_PRINCIPAL = "owner:local-runtime:v1"
 LAN_PREVIEW_TTL_SECONDS = 30.0
 LAN_PREVIEW_CONTRACT_VERSION = "kestrel.lan.preview-authorization.v1"
+LAN_MANUAL_PREVIEW_CONTRACT_VERSION = "kestrel.lan.manual-preview-authorization.v1"
 LAN_SERVER_VERSION = "kestrel-local-runtime-v1"
 _PREVIEW_DIGEST_SCHEMA = "kestrel.lan.preview-authorization.v1"
+_MANUAL_PREVIEW_DIGEST_SCHEMA = "kestrel.lan.manual-preview-authorization.v1"
+_MANUAL_SCAN_PREVIEW_EVENT_SCHEMA = "kestrel.lan.scan-preview.manual.v1"
 _MAX_INTERFACE_COUNT = 64
 _MAX_INTERFACE_ADDRESS_COUNT = 64
 _MAX_INTERFACE_DISPLAY_NAME_BYTES = 256
@@ -94,6 +106,10 @@ class LanScanAdmissionConflict(RuntimeError):
     """Another scan already owns the one active slot for the local owner."""
 
 
+class LanManualPreviewConflict(ValueError):
+    """A manual preview is stale, substituted, consumed, or otherwise no longer exact."""
+
+
 @dataclass(frozen=True)
 class LanPreviewAuthorization:
     owner_principal: str
@@ -114,11 +130,34 @@ class _AuthorizationContext:
     bound_scan_id: str | None = None
 
 
+@dataclass(frozen=True)
+class LanManualPreviewAuthorization:
+    owner_principal: str
+    interface_id: str
+    port: int
+    resolved_addresses: tuple[str, ...]
+    host_input_digest: str
+    preview_digest: str
+    issued_at: datetime
+    expires_at: datetime
+    server_version: str
+    contract_version: str
+    requires_confirmation: bool = True
+
+
+@dataclass(frozen=True)
+class _ManualAuthorizationContext:
+    authorization: LanManualPreviewAuthorization
+    interface: NetworkInterface
+    inventory_authority: tuple[tuple[str, str, tuple[str, ...]], ...]
+    generation: int
+
+
 @dataclass
 class _ActiveScan:
     scan_id: str
     scope: PrivateScanScope
-    authorization: LanPreviewAuthorization
+    authorization: LanPreviewAuthorization | LanManualPreviewAuthorization
     cancellation: ScanCancellation
     revision: int
     absolute_deadline: float
@@ -134,12 +173,34 @@ class _ActiveScan:
     controller_finished: threading.Event = field(default_factory=threading.Event)
     pending_failure: str | None = None
     progress_persistence_failed: bool = False
+    evidence_complete: bool = True
+    mode: str = "automatic"
+    manual_endpoint: ManualLanEndpoint | None = None
 
 
 def canonical_scan_limits() -> dict[str, object]:
     """Return a fresh canonical ledger projection of the fixed LAN limits."""
 
     return asdict(LanScanLimits())
+
+
+def canonical_manual_scan_limits(port: int) -> dict[str, object]:
+    """Return the exact one-host limits bound to a manual destination port."""
+
+    if type(port) is not int or not 1 <= port <= 65_535:
+        raise ValueError("manual LAN port must be an exact integer between 1 and 65535")
+    return {
+        "mode": "manual",
+        "exact_port": port,
+        "max_active_hosts": 1,
+        "max_scan_concurrency": 1,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 256 * 1024,
+        "max_discovered_models": 8,
+        "mdns_enabled": False,
+    }
 
 
 def preview_authorization_digest(
@@ -187,6 +248,100 @@ def preview_authorization_digest(
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def manual_preview_authorization_digest(
+    *,
+    owner_principal: str,
+    interface: NetworkInterface,
+    inventory_authority: object,
+    host_input_digest: str,
+    port: int,
+    resolved_addresses: tuple[str, ...],
+    issued_at: datetime,
+    expires_at: datetime,
+    server_version: str,
+    contract_version: str,
+    limits: dict[str, object],
+) -> str:
+    """Bind every field granting one restart-local exact manual scan."""
+
+    if type(interface) is not NetworkInterface:
+        raise ValueError("manual LAN preview requires an exact interface")
+    canonical_inventory = _manual_inventory_payload(inventory_authority)
+    selected_interface: dict[str, object] = {
+        "interface_id": interface.interface_id,
+        "os_identity": interface.os_identity,
+        "addresses": list(interface.addresses),
+    }
+    if canonical_inventory.count(selected_interface) != 1:
+        raise ValueError("manual LAN preview interface is not in inventory authority")
+    if (
+        type(owner_principal) is not str
+        or owner_principal != owner_principal.strip()
+        or not owner_principal
+    ):
+        raise ValueError("manual LAN preview owner is invalid")
+    if (
+        type(host_input_digest) is not str
+        or not host_input_digest.startswith("sha256:")
+        or len(host_input_digest) != 71
+        or any(character not in "0123456789abcdef" for character in host_input_digest[7:])
+    ):
+        raise ValueError("manual LAN host digest is invalid")
+    if type(resolved_addresses) is not tuple or not resolved_addresses:
+        raise ValueError("manual LAN preview addresses are invalid")
+    canonical_addresses: list[str] = []
+    for value in resolved_addresses:
+        if type(value) is not str:
+            raise ValueError("manual LAN preview addresses are invalid")
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            raise ValueError("manual LAN preview addresses are invalid") from None
+        if str(address) != value:
+            raise ValueError("manual LAN preview addresses are invalid")
+        canonical_addresses.append(value)
+    if tuple(sorted(set(canonical_addresses))) != resolved_addresses:
+        raise ValueError("manual LAN preview addresses are invalid")
+    canonical_limits = canonical_manual_scan_limits(port)
+    if type(limits) is not dict or limits != canonical_limits:
+        raise ValueError("manual LAN preview limits are invalid")
+    if (
+        type(issued_at) is not datetime
+        or type(expires_at) is not datetime
+        or issued_at.tzinfo is None
+        or expires_at.tzinfo is None
+        or expires_at <= issued_at
+    ):
+        raise ValueError("manual LAN preview timestamps are invalid")
+    if type(server_version) is not str or type(contract_version) is not str:
+        raise ValueError("manual LAN preview versions are invalid")
+    payload = {
+        "schema": _MANUAL_PREVIEW_DIGEST_SCHEMA,
+        "owner_principal": owner_principal,
+        "interface": {
+            "interface_id": interface.interface_id,
+            "os_identity": interface.os_identity,
+            "addresses": list(interface.addresses),
+        },
+        "inventory_authority": canonical_inventory,
+        "host_input_digest": host_input_digest,
+        "port": port,
+        "resolved_addresses": list(resolved_addresses),
+        "issued_at": _utc_text(issued_at),
+        "expires_at": _utc_text(expires_at),
+        "server_version": server_version,
+        "contract_version": contract_version,
+        "limits": canonical_limits,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 class LanScanManager:
     """Coordinate durable LAN scan authority without importing discovered targets."""
 
@@ -198,6 +353,8 @@ class LanScanManager:
         mdns_availability: Callable[[], MdnsAvailability] | None = None,
         mdns_collector: Callable[..., MdnsCollection] | None = None,
         scanner: Callable[..., tuple[LanEndpointObservation, ...]] | None = None,
+        manual_resolver: ManualHostResolver | None = None,
+        manual_scanner: Callable[..., LanEndpointObservation] | None = None,
         utc_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         scan_id_factory: Callable[[], str] | None = None,
@@ -209,14 +366,23 @@ class LanScanManager:
         self._mdns_availability = mdns_availability or _default_mdns_availability
         self._mdns_collector = mdns_collector or collect_mdns_candidates
         self._scanner = scanner or scan_lan_scope
+        self._manual_resolver = manual_resolver or default_manual_host_resolver
+        self._manual_scanner = manual_scanner or probe_manual_lan_endpoint
         self._utc_clock = utc_clock or (lambda: datetime.now(UTC))
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._scan_id_factory = scan_id_factory or (lambda: f"lan_{uuid4().hex}")
         self._lock = threading.RLock()
         self._authorizations: dict[int, _AuthorizationContext] = {}
+        self._manual_authorization: _ManualAuthorizationContext | None = None
+        self._manual_preview_generation = 0
         self._active_scans: dict[str, _ActiveScan] = {}
+        self._worker_interruption_fences: set[str] = set()
         self._executor: Executor | None = None
         self._executor_shutdown = False
+        self._executor_shutdown_started = False
+        self._executor_shutdown_complete = threading.Event()
+        self._executor_shutdown_error: BaseException | None = None
+        self._executor_shutdown_thread: threading.Thread | None = None
         self._lifecycle_started = False
         self._admission_open = False
         self._shutdown_requested = False
@@ -236,6 +402,10 @@ class LanScanManager:
                 raise RuntimeError("LAN lifecycle already started")
             self._executor = executor
             self._executor_shutdown = False
+            self._executor_shutdown_started = False
+            self._executor_shutdown_complete.clear()
+            self._executor_shutdown_error = None
+            self._executor_shutdown_thread = None
             try:
                 interrupted = self._ledger.interrupt_active_scans(
                     owner_principal=LAN_OWNER_PRINCIPAL
@@ -301,6 +471,187 @@ class LanScanManager:
                 inventory_authority=_inventory_authority(inventory),
             )
             return authorization
+
+    def manual_preview(
+        self,
+        interface_id: str,
+        host: str,
+        port: int,
+    ) -> LanManualPreviewAuthorization:
+        """Resolve one owner-entered local host without retaining the raw input."""
+
+        with self._lock:
+            self._require_admission()
+            inventory = self._canonical_inventory()
+            inventory_authority = _inventory_authority(inventory)
+            self._manual_preview_generation += 1
+            generation = self._manual_preview_generation
+            self._manual_authorization = None
+            resolver = self._manual_resolver
+
+        preview = preview_manual_host(
+            interface_id,
+            host,
+            port,
+            interfaces=inventory,
+            resolver=resolver,
+        )
+        if type(preview) is not ManualLanPreview:
+            raise ValueError("manual LAN preview helper returned an invalid result")
+
+        with self._lock:
+            self._require_admission()
+            if generation != self._manual_preview_generation:
+                raise LanManualPreviewConflict("manual LAN preview was replaced")
+            current_inventory = self._canonical_inventory()
+            if _inventory_authority(current_inventory) != inventory_authority:
+                raise LanManualPreviewConflict("manual LAN interface inventory changed")
+            selected = next(
+                (item for item in current_inventory if item.interface_id == preview.interface_id),
+                None,
+            )
+            if selected is None:
+                raise LanManualPreviewConflict("manual LAN interface changed")
+            issued_at = self._now_utc()
+            expires_at = issued_at + timedelta(seconds=LAN_PREVIEW_TTL_SECONDS)
+            limits = canonical_manual_scan_limits(preview.port)
+            digest = manual_preview_authorization_digest(
+                owner_principal=LAN_OWNER_PRINCIPAL,
+                interface=selected,
+                inventory_authority=_inventory_payload(current_inventory),
+                host_input_digest=preview.host_input_digest,
+                port=preview.port,
+                resolved_addresses=preview.resolved_addresses,
+                issued_at=issued_at,
+                expires_at=expires_at,
+                server_version=LAN_SERVER_VERSION,
+                contract_version=LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+                limits=limits,
+            )
+            authorization = LanManualPreviewAuthorization(
+                owner_principal=LAN_OWNER_PRINCIPAL,
+                interface_id=selected.interface_id,
+                port=preview.port,
+                resolved_addresses=preview.resolved_addresses,
+                host_input_digest=preview.host_input_digest,
+                preview_digest=digest,
+                issued_at=issued_at,
+                expires_at=expires_at,
+                server_version=LAN_SERVER_VERSION,
+                contract_version=LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+            )
+            self._manual_authorization = _ManualAuthorizationContext(
+                authorization=authorization,
+                interface=selected,
+                inventory_authority=inventory_authority,
+                generation=generation,
+            )
+            return authorization
+
+    def confirm_manual(
+        self,
+        preview_digest: str,
+        selected_address: str,
+        *,
+        expected_revision: int,
+        confirmed: bool,
+        privacy_acknowledged: bool,
+    ) -> LanScanRecord:
+        """Atomically claim and submit one selected literal from a live preview."""
+
+        if type(expected_revision) is not int or expected_revision != 0:
+            raise ValueError("initial manual LAN revision must be exact zero")
+        if confirmed is not True or type(confirmed) is not bool:
+            raise ValueError("manual LAN scan must be explicitly confirmed")
+        if privacy_acknowledged is not True or type(privacy_acknowledged) is not bool:
+            raise ValueError("manual LAN privacy must be explicitly acknowledged")
+        if type(selected_address) is not str:
+            raise LanManualPreviewConflict("manual LAN address is invalid")
+        try:
+            parsed_address = ipaddress.ip_address(selected_address)
+        except ValueError:
+            raise LanManualPreviewConflict("manual LAN address is invalid") from None
+        if str(parsed_address) != selected_address:
+            raise LanManualPreviewConflict("manual LAN address is invalid")
+
+        with self._lock:
+            self._require_admission()
+            context = self._validate_manual_authorization_locked(preview_digest)
+            authorization = context.authorization
+            if selected_address not in authorization.resolved_addresses:
+                raise LanManualPreviewConflict("manual LAN address is not authorized")
+            inventory = self._canonical_inventory()
+            if _inventory_authority(inventory) != context.inventory_authority:
+                raise LanManualPreviewConflict("manual LAN interface inventory changed")
+            selected = next(
+                (item for item in inventory if item.interface_id == context.interface.interface_id),
+                None,
+            )
+            if selected is None or _interface_authority(selected) != _interface_authority(
+                context.interface
+            ):
+                raise LanManualPreviewConflict("manual LAN interface changed")
+            self._validate_manual_authorization_locked(preview_digest)
+            suffix = 32 if isinstance(parsed_address, ipaddress.IPv4Address) else 128
+            network = f"{selected_address}/{suffix}"
+            scope = PrivateScanScope.from_request(selected, network)
+            endpoint = ManualLanEndpoint.from_exact_scope(
+                scope,
+                selected_address,
+                authorization.port,
+            )
+            preview_event = self._manual_preview_event(
+                authorization,
+                network=scope.network,
+            )
+            started = self._numeric_monotonic()
+            scan_id = self._scan_id_factory()
+            try:
+                claimed = self._ledger.create_and_claim_manual_scan(
+                    scan_id=scan_id,
+                    owner_principal=LAN_OWNER_PRINCIPAL,
+                    confirmed_interface_id=selected.interface_id,
+                    network=scope.network,
+                    limits=canonical_manual_scan_limits(authorization.port),
+                    preview_digest=preview_digest,
+                    authorized_preview_digest=authorization.preview_digest,
+                    preview_event=preview_event,
+                    expected_revision=expected_revision,
+                )
+            except RuntimeError as exc:
+                if str(exc) == "lan_scan_owner_already_active":
+                    raise LanScanAdmissionConflict("LAN owner already has an active scan") from None
+                raise
+            self._manual_authorization = None
+            handle = _ActiveScan(
+                scan_id=scan_id,
+                scope=scope,
+                authorization=authorization,
+                cancellation=ScanCancellation(),
+                revision=claimed.revision,
+                absolute_deadline=float(started) + TOTAL_SCAN_DEADLINE_SECONDS,
+                mdns_status=MdnsAvailability.UNAVAILABLE,
+                mode="manual",
+                manual_endpoint=endpoint,
+            )
+            self._active_scans[scan_id] = handle
+            executor = self._executor
+            if executor is None:
+                self._active_scans.pop(scan_id, None)
+                raise RuntimeError("LAN lifecycle executor is unavailable")
+            try:
+                handle.future = executor.submit(self._run_controller, handle)
+            except BaseException as exc:
+                self._finalize_with_retry_locked(handle, failure="worker_error")
+                durable = self._ledger.get_scan(scan_id)
+                if durable is None or not durable.is_terminal:
+                    if not isinstance(exc, Exception):
+                        raise
+                    raise RuntimeError("LAN scan worker submission failed") from None
+                if not isinstance(exc, Exception):
+                    raise
+                return durable
+            return claimed
 
     def create_draft(self, authorization: LanPreviewAuthorization) -> LanScanRecord:
         with self._lock:
@@ -492,6 +843,8 @@ class LanScanManager:
             self._shutdown_requested = True
             self._admission_open = False
             self._authorizations.clear()
+            self._manual_authorization = None
+            self._manual_preview_generation += 1
             for handle in tuple(self._active_scans.values()):
                 current = self._ledger.get_scan(handle.scan_id)
                 if current is not None and current.owner_principal == LAN_OWNER_PRINCIPAL:
@@ -505,34 +858,113 @@ class LanScanManager:
                     handle.revision = current.revision
                 handle.cancellation.cancel()
 
+        executor: Executor | None = None
+        shutdown_thread: threading.Thread | None = None
+        synchronous_shutdown = False
         while True:
             with self._lock:
                 self._reconcile_finished_locked()
                 if not self._active_scans:
                     executor = self._executor
-                    should_shutdown = executor is not None and not self._executor_shutdown
+                    if executor is None:
+                        return True
+                    shutdown_thread = self._executor_shutdown_thread
+                    if self._executor_shutdown and shutdown_thread is None:
+                        return True
+                    if not self._executor_shutdown_started:
+                        if self._worker_interruption_fences:
+                            self._start_executor_shutdown_locked(executor)
+                            shutdown_thread = self._executor_shutdown_thread
+                        else:
+                            self._executor_shutdown_started = True
+                            synchronous_shutdown = True
                     break
             remaining = shutdown_deadline - time.monotonic()
             if remaining <= 0:
                 return False
             time.sleep(min(0.005, remaining))
 
-        if should_shutdown:
+        if synchronous_shutdown:
             assert executor is not None
-            executor.shutdown(wait=True, cancel_futures=False)
+            error: BaseException | None = None
+            try:
+                executor.shutdown(wait=True, cancel_futures=False)
+            except BaseException as exc:
+                error = exc
             with self._lock:
+                if error is None:
+                    self._executor_shutdown = True
+                    self._worker_interruption_fences.clear()
+                else:
+                    self._executor_shutdown_error = error
+                self._executor_shutdown_complete.set()
+            if error is not None:
+                raise error
+            return True
+
+        remaining = shutdown_deadline - time.monotonic()
+        if remaining > 0:
+            self._executor_shutdown_complete.wait(timeout=remaining)
+        if not self._executor_shutdown_complete.is_set():
+            return False
+        if shutdown_thread is not None:
+            shutdown_thread.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+            if shutdown_thread.is_alive():
+                return False
+            with self._lock:
+                if self._executor_shutdown_thread is shutdown_thread:
+                    self._executor_shutdown_thread = None
+        with self._lock:
+            if self._executor_shutdown_error is not None:
+                raise self._executor_shutdown_error
+            return self._executor_shutdown
+
+    def _start_executor_shutdown_locked(self, executor: Executor) -> None:
+        if self._executor_shutdown_started:
+            return
+        shutdown_thread = threading.Thread(
+            target=self._shutdown_executor,
+            args=(executor,),
+            name="kestrel-lan-executor-shutdown",
+            daemon=True,
+        )
+        self._executor_shutdown_started = True
+        self._executor_shutdown_thread = shutdown_thread
+        try:
+            shutdown_thread.start()
+        except BaseException:
+            self._executor_shutdown_started = False
+            self._executor_shutdown_thread = None
+            raise
+
+    def _shutdown_executor(self, executor: Executor) -> None:
+        error: BaseException | None = None
+        try:
+            executor.shutdown(wait=True, cancel_futures=False)
+        except BaseException as exc:
+            error = exc
+        with self._lock:
+            if error is None:
                 self._executor_shutdown = True
-        return True
+                self._worker_interruption_fences.clear()
+            else:
+                self._executor_shutdown_error = error
+            self._executor_shutdown_complete.set()
 
     def is_quiescent(self) -> bool:
         with self._lock:
             self._reconcile_finished_locked()
-            return not self._active_scans
+            shutdown_thread = self._executor_shutdown_thread
+            return (
+                not self._active_scans
+                and not self._worker_interruption_fences
+                and (shutdown_thread is None or not shutdown_thread.is_alive())
+            )
 
     def retained_controller_ids(self) -> tuple[str, ...]:
         with self._lock:
             self._reconcile_finished_locked()
-            return tuple(sorted(self._active_scans))
+            return tuple(sorted(set(self._active_scans) | self._worker_interruption_fences))
 
     @property
     def retained_cleanup_count(self) -> int:
@@ -548,7 +980,7 @@ class LanScanManager:
     def controller_count(self) -> int:
         with self._lock:
             self._reconcile_finished_locked()
-            return len(self._active_scans)
+            return len(set(self._active_scans) | self._worker_interruption_fences)
 
     def _start_locked(
         self,
@@ -583,6 +1015,7 @@ class LanScanManager:
             raise LanPreviewAuthorizationError("LAN interface preview changed")
         self._validate_authorization(authorization)
         preview_event = self._preview_event(authorization)
+        started = self._numeric_monotonic()
         try:
             claimed = self._ledger.claim_scan_start(
                 scan_id,
@@ -598,31 +1031,6 @@ class LanScanManager:
             raise
         if consume_authorization:
             self._authorizations.pop(id(authorization), None)
-
-        started = self._monotonic_clock()
-        if (
-            isinstance(started, bool)
-            or not isinstance(started, (int, float))
-            or not isfinite(float(started))
-        ):
-            terminal = self._ledger.commit_scan_terminal(
-                scan_id,
-                owner_principal=LAN_OWNER_PRINCIPAL,
-                expected_revision=claimed.revision,
-                status="failed",
-                terminal_reason="worker_error",
-                cancel_reason=None,
-                observations=(),
-                mdns_status=authorization.mdns_availability.value,
-                planned_count=0,
-                admitted_count=0,
-                completed_count=0,
-                error_category_counts={},
-                timeout_count=0,
-                evidence_complete=True,
-                unknown_inflight_count=0,
-            )
-            return terminal
         scope = PrivateScanScope.from_request(selected, current_preview.network)
         handle = _ActiveScan(
             scan_id=scan_id,
@@ -640,20 +1048,36 @@ class LanScanManager:
             raise RuntimeError("LAN lifecycle executor is unavailable")
         try:
             handle.future = executor.submit(self._run_controller, handle)
-        except BaseException:
+        except BaseException as exc:
             self._finalize_with_retry_locked(handle, failure="worker_error")
             durable = self._ledger.get_scan(scan_id)
             if durable is None or not durable.is_terminal:
+                if not isinstance(exc, Exception):
+                    raise
                 raise RuntimeError("LAN scan worker submission failed") from None
+            if not isinstance(exc, Exception):
+                raise
             return durable
         return claimed
 
     def _run_controller(self, handle: _ActiveScan) -> None:
+        if handle.mode == "manual":
+            self._run_manual_controller(handle)
+            return
+        authorization = handle.authorization
+        if type(authorization) is not LanPreviewAuthorization:
+            handle.pending_failure = "worker_error"
+            with self._lock:
+                try:
+                    self._finalize_with_retry_locked(handle, failure="worker_error")
+                finally:
+                    handle.controller_finished.set()
+            return
         failure: str | None = None
         observations: tuple[LanEndpointObservation, ...] = ()
         try:
             try:
-                if handle.authorization.mdns_availability is MdnsAvailability.AVAILABLE:
+                if authorization.mdns_availability is MdnsAvailability.AVAILABLE:
                     collection = self._mdns_collector(
                         handle.scope,
                         clock=self._monotonic_clock,
@@ -690,13 +1114,16 @@ class LanScanManager:
                     try:
                         observations = self._scanner(
                             handle.scope,
-                            handle.authorization.preview.limits,
+                            authorization.preview.limits,
                             candidates=collection.candidates,
                             cancellation=handle.cancellation,
                             clock=self._monotonic_clock,
                             executor=self._executor,
                             absolute_deadline=handle.absolute_deadline,
-                            progress=lambda progress: self._record_progress(handle, progress),
+                            progress=lambda progress: self._record_scanner_progress(
+                                handle,
+                                progress,
+                            ),
                         )
                         if type(observations) is not tuple or any(
                             type(item) is not LanEndpointObservation for item in observations
@@ -705,9 +1132,16 @@ class LanScanManager:
                         self._ingest_terminal_observations(handle, observations)
                         if handle.progress_persistence_failed:
                             failure = "worker_error"
-                    except Exception:
+                    except BaseException:
+                        # This controller runs only on the lifespan-owned worker
+                        # executor. Thread-local exit signals become fixed durable
+                        # failure evidence instead of false successful completion.
+                        # The scanner may have shared-executor children that outlive
+                        # its call frame, so close further admission immediately.
+                        handle.cancellation.cancel()
                         failure = "worker_error"
-        except Exception:
+        except BaseException:
+            handle.cancellation.cancel()
             failure = failure or "worker_error"
         finally:
             with self._lock:
@@ -719,7 +1153,121 @@ class LanScanManager:
                 finally:
                     handle.controller_finished.set()
 
-    def _record_progress(self, handle: _ActiveScan, progress: LanScanProgress) -> None:
+    def _run_manual_controller(self, handle: _ActiveScan) -> None:
+        failure: str | None = None
+        try:
+            endpoint = handle.manual_endpoint
+            if type(endpoint) is not ManualLanEndpoint:
+                raise ValueError("manual LAN controller lacks exact endpoint authority")
+            prior_progress = (
+                handle.planned_count,
+                handle.admitted_count,
+                handle.completed_count,
+            )
+            planned_persisted = self._record_progress(
+                handle,
+                LanScanProgress(
+                    phase="planned",
+                    planned_count=1,
+                    admitted_count=0,
+                    completed_count=0,
+                    observation=None,
+                ),
+            )
+            if not planned_persisted:
+                (
+                    handle.planned_count,
+                    handle.admitted_count,
+                    handle.completed_count,
+                ) = prior_progress
+                if handle.progress_persistence_failed:
+                    failure = "worker_error"
+                return
+            if self._durably_cancelling(handle):
+                return
+            if self._deadline_expired(handle):
+                failure = "deadline_expired"
+                return
+            prior_progress = (
+                handle.planned_count,
+                handle.admitted_count,
+                handle.completed_count,
+            )
+            admission_persisted = self._record_progress(
+                handle,
+                LanScanProgress(
+                    phase="admitted",
+                    planned_count=1,
+                    admitted_count=1,
+                    completed_count=0,
+                    observation=None,
+                ),
+            )
+            if not admission_persisted:
+                (
+                    handle.planned_count,
+                    handle.admitted_count,
+                    handle.completed_count,
+                ) = prior_progress
+                if handle.progress_persistence_failed:
+                    failure = "worker_error"
+                return
+            try:
+                observation = self._manual_scanner(
+                    handle.scope,
+                    endpoint,
+                    scan_deadline=handle.absolute_deadline,
+                    cancellation=handle.cancellation,
+                    clock=self._monotonic_clock,
+                )
+                if (
+                    type(observation) is not LanEndpointObservation
+                    or observation.endpoint != endpoint
+                ):
+                    raise ValueError("manual LAN scanner returned invalid endpoint evidence")
+            except BaseException:
+                # Manual admission is already durable. A worker-level exit with
+                # no typed result is an explicit evidence gap, never synthetic
+                # endpoint evidence.
+                handle.evidence_complete = False
+                failure = "worker_error"
+                return
+            completed_persisted = self._record_progress(
+                handle,
+                LanScanProgress(
+                    phase="completed",
+                    planned_count=1,
+                    admitted_count=1,
+                    completed_count=1,
+                    observation=observation,
+                ),
+            )
+            if not completed_persisted and handle.progress_persistence_failed:
+                failure = "worker_error"
+        except BaseException:
+            if handle.admitted_count > handle.completed_count:
+                # Admission is already durable, but no typed completion made it
+                # through conversion/persistence. Preserve that honest worker
+                # evidence gap for the specialized manual terminal receipt.
+                handle.evidence_complete = False
+            failure = failure or "worker_error"
+        finally:
+            with self._lock:
+                failure = failure or handle.pending_failure
+                handle.pending_failure = failure
+                try:
+                    self._finalize_with_retry_locked(handle, failure=failure)
+                finally:
+                    handle.controller_finished.set()
+
+    def _record_scanner_progress(
+        self,
+        handle: _ActiveScan,
+        progress: LanScanProgress,
+    ) -> None:
+        self._record_progress(handle, progress)
+
+    def _record_progress(self, handle: _ActiveScan, progress: LanScanProgress) -> bool:
         if type(progress) is not LanScanProgress:
             raise ValueError("LAN scanner progress must be exactly typed")
         observation: LanObservationDraft | None = None
@@ -729,13 +1277,10 @@ class LanScanManager:
                 progress.observation,
                 scope=handle.scope,
                 freshness_timestamp=_utc_text(self._now_utc()),
+                source=("manual" if handle.mode == "manual" else "active"),
             )
             failure = progress.observation.failure_category
         with self._lock:
-            current = self._ledger.get_scan(handle.scan_id)
-            if current is None or current.status not in {"running", "cancelling"}:
-                raise RuntimeError("lan_scan_progress_not_running")
-            handle.revision = current.revision
             handle.progress_seen = True
             handle.planned_count = progress.planned_count
             handle.admitted_count = progress.admitted_count
@@ -743,13 +1288,23 @@ class LanScanManager:
             if observation is not None:
                 handle.observations[observation.endpoint_id] = observation
                 handle.observation_failures[observation.endpoint_id] = failure
+            try:
+                current = self._ledger.get_scan(handle.scan_id)
+            except Exception:
+                handle.progress_persistence_failed = True
+                handle.pending_failure = "worker_error"
+                handle.cancellation.cancel()
+                return False
+            if current is None or current.status not in {"running", "cancelling"}:
+                raise RuntimeError("lan_scan_progress_not_running")
+            handle.revision = current.revision
             if current.status == "cancelling":
                 # The durable cancel event already closed progress mutation, but
                 # the real scanner must still drain and account for every task
                 # admitted before the token was signalled.
-                return
+                return False
             if handle.progress_persistence_failed:
-                return
+                return False
             errors, timeout_count = self._error_counts(handle)
             try:
                 updated = self._ledger.record_scan_progress(
@@ -774,8 +1329,9 @@ class LanScanManager:
                 handle.progress_persistence_failed = True
                 handle.pending_failure = "worker_error"
                 handle.cancellation.cancel()
-                return
+                return False
             handle.revision = updated.revision
+            return True
 
     def _ingest_terminal_observations(
         self,
@@ -815,13 +1371,39 @@ class LanScanManager:
             handle.pending_failure = failure
             return
         handle.revision = current.revision
+        if (
+            handle.mode == "automatic"
+            and failure == "worker_error"
+            and handle.admitted_count > handle.completed_count
+        ):
+            handle.cancellation.cancel()
+            interrupted = self._ledger.interrupt_returned_automatic_worker_gap(
+                handle.scan_id,
+                owner_principal=LAN_OWNER_PRINCIPAL,
+                expected_revision=handle.revision,
+            )
+            handle.revision = interrupted.revision
+            self._admission_open = False
+            self._authorizations.clear()
+            self._manual_authorization = None
+            self._manual_preview_generation += 1
+            self._worker_interruption_fences.add(handle.scan_id)
+            self._active_scans.pop(handle.scan_id, None)
+            return
         expired = self._deadline_expired(handle)
-        if current.status == "cancelling":
+        if current.status == "cancelling" and not handle.evidence_complete:
+            status = "failed"
+            terminal_reason = "worker_error"
+            cancel_reason = current.cancel_reason
+        elif current.status == "cancelling":
             status = "cancelled"
             terminal_reason = current.cancel_reason or "shutdown_cancelled"
             cancel_reason = terminal_reason
         elif current.status == "running":
-            if failure == "deadline_expired" or expired:
+            if not handle.evidence_complete:
+                status = "failed"
+                terminal_reason = "worker_error"
+            elif failure == "deadline_expired" or expired:
                 status = "failed"
                 terminal_reason = "deadline_expired"
             elif failure is not None:
@@ -848,7 +1430,7 @@ class LanScanManager:
             completed_count=handle.completed_count,
             error_category_counts=errors,
             timeout_count=timeout_count,
-            evidence_complete=True,
+            evidence_complete=handle.evidence_complete,
             unknown_inflight_count=0,
             absolute_deadline=(handle.absolute_deadline if not expired else None),
             monotonic_clock=self._monotonic_clock,
@@ -993,6 +1575,58 @@ class LanScanManager:
             raise LanPreviewAuthorizationError("LAN preview authorization digest changed")
         return context
 
+    def _validate_manual_authorization_locked(
+        self,
+        preview_digest: object,
+    ) -> _ManualAuthorizationContext:
+        if type(preview_digest) is not str:
+            raise LanManualPreviewConflict("manual LAN preview digest is invalid")
+        context = self._manual_authorization
+        now = self._now_utc()
+        if (
+            context is None
+            or context.generation != self._manual_preview_generation
+            or context.authorization.preview_digest != preview_digest
+        ):
+            if context is not None and now >= context.authorization.expires_at:
+                self._manual_authorization = None
+            raise LanManualPreviewConflict("manual LAN preview is not live")
+        authorization = context.authorization
+        if now >= authorization.expires_at:
+            self._manual_authorization = None
+            raise LanManualPreviewConflict("manual LAN preview expired")
+        if (
+            authorization.owner_principal != LAN_OWNER_PRINCIPAL
+            or authorization.interface_id != context.interface.interface_id
+            or authorization.server_version != LAN_SERVER_VERSION
+            or authorization.contract_version != LAN_MANUAL_PREVIEW_CONTRACT_VERSION
+            or authorization.requires_confirmation is not True
+        ):
+            raise LanManualPreviewConflict("manual LAN preview changed")
+        expected = manual_preview_authorization_digest(
+            owner_principal=authorization.owner_principal,
+            interface=context.interface,
+            inventory_authority=[
+                {
+                    "interface_id": interface_id,
+                    "os_identity": os_identity,
+                    "addresses": list(addresses),
+                }
+                for interface_id, os_identity, addresses in context.inventory_authority
+            ],
+            host_input_digest=authorization.host_input_digest,
+            port=authorization.port,
+            resolved_addresses=authorization.resolved_addresses,
+            issued_at=authorization.issued_at,
+            expires_at=authorization.expires_at,
+            server_version=authorization.server_version,
+            contract_version=authorization.contract_version,
+            limits=canonical_manual_scan_limits(authorization.port),
+        )
+        if expected != authorization.preview_digest:
+            raise LanManualPreviewConflict("manual LAN preview digest changed")
+        return context
+
     def _authorization_for_digest_locked(
         self,
         preview_digest: object,
@@ -1030,6 +1664,34 @@ class LanScanManager:
             "contract_version": authorization.contract_version,
             "preview_digest": authorization.preview_digest,
             "expires_at": _utc_text(authorization.expires_at),
+        }
+
+    def _manual_preview_event(
+        self,
+        authorization: LanManualPreviewAuthorization,
+        *,
+        network: str,
+    ) -> dict[str, object]:
+        return {
+            "schema": _MANUAL_SCAN_PREVIEW_EVENT_SCHEMA,
+            "mode": "manual",
+            "endpoint_kind": "manual",
+            "observation_source": "manual",
+            "owner_principal": LAN_OWNER_PRINCIPAL,
+            "interface_id": authorization.interface_id,
+            "network": network,
+            "limits": canonical_manual_scan_limits(authorization.port),
+            "active_host_count": 1,
+            "passive_or_manual_only": True,
+            "port_count": 1,
+            "exact_port": authorization.port,
+            "mdns_status": "unavailable",
+            "server_version": authorization.server_version,
+            "contract_version": authorization.contract_version,
+            "preview_digest": authorization.preview_digest,
+            "expires_at": _utc_text(authorization.expires_at),
+            "confirmed": True,
+            "privacy_acknowledged": True,
         }
 
     def _canonical_inventory(self) -> tuple[NetworkInterface, ...]:
@@ -1107,6 +1769,59 @@ def _default_mdns_availability() -> MdnsAvailability:
         if importlib.util.find_spec("zeroconf") is not None
         else MdnsAvailability.UNAVAILABLE
     )
+
+
+def _manual_inventory_payload(value: object) -> list[dict[str, object]]:
+    if type(value) not in {list, tuple}:
+        raise ValueError("manual LAN inventory authority is invalid")
+    entries = cast(list[object] | tuple[object, ...], value)
+    result: list[dict[str, object]] = []
+    identifiers: list[str] = []
+    os_identities: set[str] = set()
+    for raw in entries:
+        if type(raw) is not dict or set(raw) != {
+            "interface_id",
+            "os_identity",
+            "addresses",
+        }:
+            raise ValueError("manual LAN inventory authority is invalid")
+        interface_id = raw["interface_id"]
+        os_identity = raw["os_identity"]
+        addresses = raw["addresses"]
+        if (
+            type(interface_id) is not str
+            or type(os_identity) is not str
+            or type(addresses) not in {list, tuple}
+            or any(type(address) is not str for address in addresses)
+        ):
+            raise ValueError("manual LAN inventory authority is invalid")
+        identifiers.append(interface_id)
+        if os_identity in os_identities:
+            raise ValueError("manual LAN inventory authority is invalid")
+        os_identities.add(os_identity)
+        result.append(
+            {
+                "interface_id": interface_id,
+                "os_identity": os_identity,
+                "addresses": list(addresses),
+            }
+        )
+    if not result or identifiers != sorted(identifiers) or len(set(identifiers)) != len(result):
+        raise ValueError("manual LAN inventory authority is invalid")
+    return result
+
+
+def _inventory_payload(
+    inventory: tuple[NetworkInterface, ...],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "interface_id": interface.interface_id,
+            "os_identity": interface.os_identity,
+            "addresses": list(interface.addresses),
+        }
+        for interface in inventory
+    ]
 
 
 def _interface_authority(interface: NetworkInterface) -> tuple[str, str, tuple[str, ...]]:

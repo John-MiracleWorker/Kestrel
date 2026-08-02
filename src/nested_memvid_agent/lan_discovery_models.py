@@ -6,7 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -58,7 +58,7 @@ class NetworkInterface:
 
     interface_id: str
     os_identity: str
-    display_name: str
+    display_name: str = field(compare=False)
     addresses: tuple[str, ...]
 
     @classmethod
@@ -72,7 +72,9 @@ class NetworkInterface:
         normalized_identity = os_identity.strip()
         if not normalized_identity:
             raise ValueError("OS interface identity is required")
-        canonical_addresses = tuple(sorted({_canonical_interface_address(value) for value in addresses}))
+        canonical_addresses = tuple(
+            sorted({_canonical_interface_address(value) for value in addresses})
+        )
         if not canonical_addresses:
             raise ValueError("an interface must have at least one address")
         return cls(
@@ -132,13 +134,94 @@ class ResolvedLanEndpoint:
         if parsed not in network:
             raise ValueError("endpoint address must belong to the confirmed scope")
         canonical_address = str(parsed)
-        if isinstance(network, ipaddress.IPv4Network) and canonical_address not in scope.active_hosts:
+        if (
+            isinstance(network, ipaddress.IPv4Network)
+            and canonical_address not in scope.active_hosts
+        ):
             raise ValueError("endpoint address must belong to the confirmed scope")
-        if port not in KNOWN_MODEL_SERVICE_PORTS:
+        if type(port) is not int or port not in KNOWN_MODEL_SERVICE_PORTS:
             raise ValueError("endpoint port must be one of the known model-service ports")
         endpoint = object.__new__(cls)
         object.__setattr__(endpoint, "interface_id", scope.interface.interface_id)
         object.__setattr__(endpoint, "address", canonical_address)
+        object.__setattr__(endpoint, "port", port)
+        return endpoint
+
+    @property
+    def endpoint_id(self) -> str:
+        return _sha256_identifier(
+            {"interface_id": self.interface_id, "address": self.address, "port": self.port}
+        )
+
+    @property
+    def kind(self) -> str:
+        """The durable discriminator for ordinary bounded discovery."""
+
+        return "automatic"
+
+
+@dataclass(frozen=True, init=False)
+class ManualLanEndpoint:
+    """One explicitly confirmed literal host and port on an attached interface."""
+
+    kind: str
+    interface_id: str
+    address: str
+    port: int
+
+    @classmethod
+    def from_exact_scope(
+        cls,
+        scope: PrivateScanScope,
+        address: str,
+        port: int,
+    ) -> ManualLanEndpoint:
+        """Create a manual endpoint only from a canonical /32 or /128 scope."""
+
+        from nested_memvid_agent.lan_discovery_scope import PrivateScanScope
+
+        error = ValueError("manual endpoint requires a canonical exact scope")
+        if type(scope) is not PrivateScanScope:
+            raise error
+        try:
+            canonical_interface = NetworkInterface.from_addresses(
+                os_identity=scope.interface.os_identity,
+                display_name=scope.interface.display_name,
+                addresses=scope.interface.addresses,
+            )
+            canonical_scope = PrivateScanScope.from_request(canonical_interface, scope.network)
+        except (AttributeError, TypeError, ValueError):
+            raise error from None
+        if scope.interface != canonical_interface or scope != canonical_scope:
+            raise error
+        if (
+            _SHA256_IDENTIFIER_RE.fullmatch(scope.interface.interface_id) is None
+            or scope.interface.interface_id != canonical_interface.interface_id
+        ):
+            raise ValueError("manual endpoint requires a canonical interface ID")
+        if type(address) is not str or "%" in address:
+            raise ValueError("manual endpoint requires a canonical literal address")
+        try:
+            parsed = ipaddress.ip_address(address)
+            network = ipaddress.ip_network(scope.network, strict=True)
+        except ValueError:
+            raise ValueError("manual endpoint requires a canonical literal address") from None
+        if address != str(parsed):
+            raise ValueError("manual endpoint requires a canonical literal address")
+        if network.prefixlen != network.max_prefixlen or parsed != network.network_address:
+            raise error
+        if type(parsed) is not type(network.network_address):
+            raise error
+        if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast or parsed.is_reserved:
+            raise ValueError("manual endpoint address is not eligible")
+        if not _is_private_lan_address(parsed):
+            raise ValueError("manual endpoint address is not eligible")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("manual endpoint port must be an integer from 1 through 65535")
+        endpoint = object.__new__(cls)
+        object.__setattr__(endpoint, "kind", "manual")
+        object.__setattr__(endpoint, "interface_id", scope.interface.interface_id)
+        object.__setattr__(endpoint, "address", address)
         object.__setattr__(endpoint, "port", port)
         return endpoint
 

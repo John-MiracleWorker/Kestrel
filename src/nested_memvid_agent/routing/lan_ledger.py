@@ -55,6 +55,46 @@ from .lan_serialization import (
 from .ledger_schema import ROUTING_SCHEMA_VERSION, ensure_routing_schema
 
 _TIMEOUT_ERROR_CATEGORIES = frozenset({"tcp_timeout", "http_timeout", "scan_deadline_exceeded"})
+_MANUAL_PREVIEW_EVENT_SCHEMA = "kestrel.lan.scan-preview.manual.v1"
+_MANUAL_PREVIEW_CONTRACT_VERSION = "kestrel.lan.manual-preview-authorization.v1"
+_LAN_SERVER_VERSION = "kestrel-local-runtime-v1"
+_PRIVATE_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
+)
+_PRIVATE_IPV6_NETWORKS = (
+    ipaddress.IPv6Network("fc00::/7"),
+    ipaddress.IPv6Network("fe80::/10"),
+)
+
+
+def _canonical_manual_limits(port: int) -> dict[str, object]:
+    if type(port) is not int or not 1 <= port <= 65_535:
+        raise ValueError("manual LAN port must be an exact integer between 1 and 65535")
+    return {
+        "mode": "manual",
+        "exact_port": port,
+        "max_active_hosts": 1,
+        "max_scan_concurrency": 1,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 256 * 1024,
+        "max_discovered_models": 8,
+        "mdns_enabled": False,
+    }
+
+
+def _manual_exact_port(limits: object) -> int | None:
+    if type(limits) is not dict or limits.get("mode") != "manual":
+        return None
+    port = limits.get("exact_port")
+    if type(port) is not int:
+        raise ValueError("manual LAN limits require an exact port")
+    expected = _canonical_manual_limits(port)
+    if limits != expected:
+        raise ValueError("manual LAN limits must match the fixed bounded limits")
+    return port
 
 
 def _validate_exact_owner_principal(value: object) -> str:
@@ -62,6 +102,55 @@ def _validate_exact_owner_principal(value: object) -> str:
     if type(value) is not str or owner != value:
         raise ValueError("LAN owner principal must be exact")
     return owner
+
+
+def _require_specialized_v2_lifecycle(scan: LanScanRecord) -> None:
+    if _manual_exact_port(scan.limits) is not None:
+        raise ValueError("manual LAN scans require the specialized v2 lifecycle")
+
+
+def _require_observation_scan_authority(
+    scan: LanScanRecord,
+    values: dict[str, Any],
+) -> None:
+    if values["interface_id"] != scan.confirmed_interface_id:
+        raise ValueError("observation interface does not match confirmed scan interface")
+    address = ipaddress.ip_address(str(values["address"]))
+    if address not in ipaddress.ip_network(scan.network, strict=True):
+        raise ValueError("observation address does not belong to confirmed scan network")
+    manual_port = _manual_exact_port(scan.limits)
+    if manual_port is None:
+        if values["source"] == "manual":
+            raise ValueError("automatic LAN scans cannot persist manual observations")
+    elif values["source"] != "manual" or values["port"] != manual_port:
+        raise ValueError("manual LAN observation does not match exact scan authority")
+
+
+def _require_manual_singleton_progress(
+    scan: LanScanRecord,
+    progress: dict[str, Any],
+    *,
+    terminal_status: str | None = None,
+) -> bool:
+    if _manual_exact_port(scan.limits) is None:
+        return False
+    count_fields = (
+        "planned_count",
+        "admitted_count",
+        "completed_count",
+        "persisted_observation_count",
+    )
+    shape = tuple(progress[field] for field in count_fields)
+    allowed = (
+        {(1, 0, 0, 0), (1, 1, 0, 0), (1, 1, 1, 1)}
+        if terminal_status is None
+        else {(0, 0, 0, 0), (1, 0, 0, 0), (1, 1, 0, 0), (1, 1, 1, 1)}
+    )
+    if terminal_status == "completed" and shape != (1, 1, 1, 1):
+        raise ValueError("manual completed scans require one complete observation")
+    if shape not in allowed:
+        raise ValueError("manual LAN scans require one-endpoint lifecycle progress")
+    return True
 
 
 @dataclass(frozen=True)
@@ -141,6 +230,8 @@ class LanDiscoveryLedger:
         normalized_preview = validate_digest(preview_digest, "preview_digest")
         normalized_network = normalize_network(network)
         normalized_limits = bounded_scan_limits(limits)
+        if _manual_exact_port(normalized_limits) is not None:
+            raise ValueError("manual LAN scans require atomic create-and-claim admission")
         limits_json = canonical_json(normalized_limits)
         limits_digest = sha256_digest(normalized_limits)
         now = self._now()
@@ -186,6 +277,138 @@ class LanDiscoveryLedger:
             ).fetchone()
         if row is None:
             raise RuntimeError("lan_scan_write_lost")
+        return scan_from_row(row)
+
+    def create_and_claim_manual_scan(
+        self,
+        *,
+        scan_id: str,
+        owner_principal: str,
+        confirmed_interface_id: str,
+        network: str,
+        limits: dict[str, object],
+        preview_digest: str,
+        authorized_preview_digest: str,
+        preview_event: dict[str, object],
+        expected_revision: int,
+    ) -> LanScanRecord:
+        """Atomically create and claim one exact manual endpoint scan."""
+
+        normalized_scan_id = validate_required_text(scan_id, "scan_id", maximum=128)
+        owner = _validate_exact_owner_principal(owner_principal)
+        interface_id = validate_digest(
+            confirmed_interface_id,
+            "confirmed_interface_id",
+        )
+        requested_digest = validate_digest(preview_digest, "preview_digest")
+        authorized_digest = validate_digest(
+            authorized_preview_digest,
+            "authorized_preview_digest",
+        )
+        if requested_digest != authorized_digest:
+            raise ValueError("LAN preview authorization digest does not match request")
+        if type(expected_revision) is not int or expected_revision != 0:
+            raise LanScanRevisionConflict(normalized_scan_id, 0)
+
+        normalized_network = normalize_network(network)
+        parsed_network = ipaddress.ip_network(normalized_network, strict=True)
+        required_prefix = 32 if isinstance(parsed_network, ipaddress.IPv4Network) else 128
+        if parsed_network.prefixlen != required_prefix:
+            raise ValueError("manual LAN scans require one exact destination network")
+        eligible = (
+            any(parsed_network.subnet_of(allowed) for allowed in _PRIVATE_IPV4_NETWORKS)
+            if isinstance(parsed_network, ipaddress.IPv4Network)
+            else any(parsed_network.subnet_of(allowed) for allowed in _PRIVATE_IPV6_NETWORKS)
+        )
+        if not eligible:
+            raise ValueError("manual LAN destination is outside private interface scope")
+        normalized_limits = bounded_scan_limits(limits)
+        exact_port = _manual_exact_port(normalized_limits)
+        if exact_port is None:
+            raise ValueError("manual LAN scans require exact manual limits")
+        event_payload = bounded_scan_preview_event(preview_event)
+        self._require_manual_preview_bindings(
+            event_payload,
+            owner_principal=owner,
+            interface_id=interface_id,
+            network=normalized_network,
+            limits=normalized_limits,
+            preview_digest=requested_digest,
+            exact_port=exact_port,
+        )
+        limits_json = canonical_json(normalized_limits)
+        limits_digest = sha256_digest(normalized_limits)
+
+        with self.state._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT revision FROM routing_lan_scans WHERE scan_id = ?",
+                (normalized_scan_id,),
+            ).fetchone()
+            if existing is not None:
+                raise LanScanRevisionConflict(
+                    normalized_scan_id,
+                    int(existing["revision"]),
+                )
+            active = connection.execute(
+                """
+                SELECT scan_id FROM routing_lan_scans
+                WHERE owner_principal = ?
+                  AND status IN ('running', 'cancelling')
+                LIMIT 1
+                """,
+                (owner,),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError("lan_scan_owner_already_active")
+            now = self._now()
+            self._require_live_preview_event(event_payload, now)
+            connection.execute(
+                """
+                INSERT INTO routing_lan_scans (
+                    scan_id, status, revision, owner_principal,
+                    confirmed_interface_id, network, limits_json, limits_digest,
+                    preview_digest, created_at, updated_at, started_at, finished_at,
+                    cancel_reason, terminal_reason, candidate_count, error_count,
+                    timeout_count, terminal_receipt_json, terminal_receipt_digest
+                ) VALUES (?, 'draft', 1, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+                          NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+                """,
+                (
+                    normalized_scan_id,
+                    owner,
+                    interface_id,
+                    normalized_network,
+                    limits_json,
+                    limits_digest,
+                    requested_digest,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_event_txn(
+                connection,
+                scan_id=normalized_scan_id,
+                event_type="scan_started",
+                payload=event_payload,
+                created_at=now,
+            )
+            connection.execute(
+                """
+                UPDATE routing_lan_scans
+                SET status = 'running', revision = 2, updated_at = ?, started_at = ?
+                WHERE scan_id = ? AND revision = 1
+                """,
+                (now, now, normalized_scan_id),
+            )
+            self._before_commit("create_and_claim_manual_scan")
+            self._require_live_preview_event(event_payload, self._now())
+            row = connection.execute(
+                "SELECT * FROM routing_lan_scans WHERE scan_id = ?",
+                (normalized_scan_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("lan_manual_scan_start_write_lost")
         return scan_from_row(row)
 
     def get_scan(self, scan_id: str) -> LanScanRecord | None:
@@ -240,11 +463,8 @@ class LanDiscoveryLedger:
                 scan_id,
                 expected_revision=expected_revision,
             )
-            if values["interface_id"] != scan.confirmed_interface_id:
-                raise ValueError("observation interface does not match confirmed scan interface")
-            address = ipaddress.ip_address(str(values["address"]))
-            if address not in ipaddress.ip_network(scan.network, strict=True):
-                raise ValueError("observation address does not belong to confirmed scan network")
+            _require_specialized_v2_lifecycle(scan)
+            _require_observation_scan_authority(scan, values)
             try:
                 connection.execute(
                     """
@@ -385,6 +605,7 @@ class LanDiscoveryLedger:
                 scan_id,
                 expected_revision=expected_revision,
             )
+            _require_specialized_v2_lifecycle(scan)
             sequence_row = connection.execute(
                 """
                 SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
@@ -486,6 +707,7 @@ class LanDiscoveryLedger:
                 scan_id,
                 expected_revision=expected_revision,
             )
+            _require_specialized_v2_lifecycle(scan)
             if new_status not in ALLOWED_SCAN_TRANSITIONS[scan.status]:
                 raise LanScanTransitionError(scan.scan_id, scan.status, new_status)
 
@@ -805,6 +1027,9 @@ class LanDiscoveryLedger:
             )
             if scan.status != "running":
                 raise LanScanTransitionError(scan.scan_id, scan.status, "running")
+            manual_scan = _require_manual_singleton_progress(scan, payload)
+            if manual_scan and payload["mdns_status"] != "unavailable":
+                raise ValueError("manual LAN scans require unavailable mDNS evidence")
             previous = self._last_progress_payload(connection, scan.scan_id)
             if previous is not None:
                 self._require_monotonic_progress(previous, payload)
@@ -895,8 +1120,8 @@ class LanDiscoveryLedger:
             type(cancel_reason) is not str or cancel_reason not in LAN_CANCEL_REASONS
         ):
             raise ValueError("LAN cancel reason is invalid")
-        if type(evidence_complete) is not bool or not evidence_complete:
-            raise ValueError("ordinary LAN terminal evidence must be complete")
+        if type(evidence_complete) is not bool:
+            raise ValueError("ordinary LAN terminal evidence flag must be exact")
         if (
             type(unknown_inflight_count) is not int
             or unknown_inflight_count < 0
@@ -914,6 +1139,11 @@ class LanDiscoveryLedger:
             raise ValueError("cancelled LAN scan reason is inconsistent")
         if status == "failed" and terminal_reason not in {"worker_error", "deadline_expired"}:
             raise ValueError("failed LAN scan reason is invalid")
+        incomplete_worker_failure = (
+            evidence_complete is False and status == "failed" and terminal_reason == "worker_error"
+        )
+        if not evidence_complete and not incomplete_worker_failure:
+            raise ValueError("incomplete LAN terminal evidence requires a worker failure")
         self._check_deadline(absolute_deadline, monotonic_clock)
         now = self._now()
         with self.state._connect() as connection:
@@ -925,11 +1155,25 @@ class LanDiscoveryLedger:
                 expected_revision=expected_revision,
             )
             legal = (scan.status == "running" and status in {"completed", "failed"}) or (
-                scan.status == "cancelling" and status == "cancelled"
+                scan.status == "cancelling" and (status == "cancelled" or incomplete_worker_failure)
             )
             if not legal:
                 raise LanScanTransitionError(scan.scan_id, scan.status, status)
-            effective_cancel = cancel_reason or scan.cancel_reason
+            manual_scan = _manual_exact_port(scan.limits) is not None
+            if incomplete_worker_failure and not manual_scan:
+                raise ValueError("incomplete worker evidence requires a manual v2 scan")
+            if manual_scan and mdns_status != "unavailable":
+                raise ValueError("manual LAN scans require unavailable mDNS evidence")
+            if scan.status == "running":
+                if cancel_reason is not None or scan.cancel_reason is not None:
+                    raise ValueError("running LAN terminals cannot introduce a cancel reason")
+                effective_cancel = None
+            else:
+                if scan.cancel_reason is None or cancel_reason != scan.cancel_reason:
+                    raise ValueError(
+                        "cancelling LAN terminals require the exact durable cancel reason"
+                    )
+                effective_cancel = scan.cancel_reason
             if status == "cancelled" and effective_cancel != terminal_reason:
                 raise ValueError("cancelled LAN scan reason changed after request")
             for observation in observations:
@@ -967,11 +1211,20 @@ class LanDiscoveryLedger:
                     "mdns_status": mdns_status,
                 }
             )
+            _require_manual_singleton_progress(
+                scan,
+                progress,
+                terminal_status=status,
+            )
             previous = self._last_progress_payload(connection, scan.scan_id)
             if previous is not None:
                 self._require_monotonic_progress(previous, progress)
-            if progress["completed_count"] != progress["admitted_count"]:
+            if evidence_complete and (progress["completed_count"] != progress["admitted_count"]):
                 raise ValueError("terminal LAN scan has unsettled admitted work")
+            if not evidence_complete and (
+                progress["completed_count"] >= progress["admitted_count"]
+            ):
+                raise ValueError("incomplete LAN terminal evidence requires an evidence gap")
             if len(durable_observations) != progress["completed_count"]:
                 raise ValueError(
                     "terminal LAN scan complete evidence does not match completed work"
@@ -1006,8 +1259,8 @@ class LanDiscoveryLedger:
                 observations=durable_observations,
                 error_category_counts=errors,
                 timeout_count=progress["timeout_count"],
-                evidence_complete=True,
-                unknown_inflight_count=0,
+                evidence_complete=evidence_complete,
+                unknown_inflight_count=unknown_inflight_count,
             )
             receipt_json = canonical_json(receipt)
             self._require_bounded_receipt(receipt_json)
@@ -1046,6 +1299,127 @@ class LanDiscoveryLedger:
         if row is None:
             raise RuntimeError("lan_scan_terminal_write_lost")
         return scan_from_row(row)
+
+    def interrupt_returned_automatic_worker_gap(
+        self,
+        scan_id: str,
+        *,
+        owner_principal: str,
+        expected_revision: int,
+    ) -> LanScanRecord:
+        """Close one returned automatic worker gap from durable evidence only.
+
+        The manager may call this only after the scanner invocation has returned.
+        Shared-executor work is not assumed drained, so the receipt records the
+        exact durable admitted/completed gap and remains interruption evidence.
+        """
+
+        owner = _validate_exact_owner_principal(owner_principal)
+        now = self._now()
+        with self.state._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            scan = self._owned_mutable_scan(
+                connection,
+                scan_id,
+                owner_principal=owner,
+                expected_revision=expected_revision,
+            )
+            if scan.status not in {"running", "cancelling"}:
+                raise LanScanTransitionError(scan.scan_id, scan.status, "interrupted")
+            if _manual_exact_port(scan.limits) is not None:
+                raise ValueError("returned worker-gap interruption requires automatic authority")
+            if scan.status == "running" and scan.cancel_reason is not None:
+                raise ValueError("running automatic scan has invalid cancel authority")
+            if scan.status == "cancelling" and scan.cancel_reason is None:
+                raise ValueError("cancelling automatic scan lacks durable cancel authority")
+
+            progress = self._last_progress_payload(connection, scan.scan_id)
+            if progress is None:
+                raise ValueError("returned automatic worker gap requires durable progress")
+            admitted_count = int(progress["admitted_count"])
+            completed_count = int(progress["completed_count"])
+            if admitted_count <= completed_count:
+                raise ValueError("returned automatic worker gap requires admitted work")
+
+            rows = connection.execute(
+                """
+                SELECT * FROM routing_lan_observations
+                WHERE scan_id = ? ORDER BY endpoint_id ASC
+                """,
+                (scan.scan_id,),
+            ).fetchall()
+            observations = [observation_from_row(row) for row in rows]
+            if len(observations) != int(progress["persisted_observation_count"]):
+                raise ValueError("durable automatic worker-gap observations disagree")
+            errors, timeout_count = self._durable_error_counts(connection, scan.scan_id)
+            if errors != progress["error_category_counts"] or timeout_count != int(
+                progress["timeout_count"]
+            ):
+                raise ValueError("durable automatic worker-gap errors disagree")
+
+            unknown_inflight_count = admitted_count - completed_count
+            self._insert_event_txn(
+                connection,
+                scan_id=scan.scan_id,
+                event_type="scan_interrupted",
+                payload=self._terminal_event_payload(
+                    status="interrupted",
+                    terminal_reason="worker_interrupted",
+                    cancel_reason=scan.cancel_reason,
+                ),
+                created_at=now,
+            )
+            receipt = self._terminal_receipt_v2(
+                scan=scan,
+                status="interrupted",
+                started_at=scan.started_at,
+                finished_at=now,
+                cancel_reason=scan.cancel_reason,
+                terminal_reason="worker_interrupted",
+                mdns_status=str(progress["mdns_status"]),
+                planned_count=int(progress["planned_count"]),
+                admitted_count=admitted_count,
+                completed_count=completed_count,
+                observations=observations,
+                error_category_counts=errors,
+                timeout_count=timeout_count,
+                evidence_complete=False,
+                unknown_inflight_count=unknown_inflight_count,
+            )
+            receipt_json = canonical_json(receipt)
+            self._require_bounded_receipt(receipt_json)
+            connection.execute(
+                """
+                UPDATE routing_lan_scans
+                SET status = 'interrupted', revision = ?, updated_at = ?,
+                    finished_at = ?, cancel_reason = ?,
+                    terminal_reason = 'worker_interrupted', candidate_count = ?,
+                    error_count = ?, timeout_count = ?, terminal_receipt_json = ?,
+                    terminal_receipt_digest = ?
+                WHERE scan_id = ? AND revision = ?
+                """,
+                (
+                    scan.revision + 1,
+                    now,
+                    now,
+                    scan.cancel_reason,
+                    len(observations),
+                    sum(errors.values()),
+                    timeout_count,
+                    receipt_json,
+                    sha256_digest(receipt),
+                    scan.scan_id,
+                    scan.revision,
+                ),
+            )
+            self._before_commit("interrupt_returned_automatic_worker_gap")
+            updated = connection.execute(
+                "SELECT * FROM routing_lan_scans WHERE scan_id = ?",
+                (scan.scan_id,),
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("lan_scan_worker_interruption_write_lost")
+        return scan_from_row(updated)
 
     def interrupt_active_scans(self, *, owner_principal: str) -> list[LanScanRecord]:
         owner = _validate_exact_owner_principal(owner_principal)
@@ -1164,6 +1538,40 @@ class LanDiscoveryLedger:
         return interrupted
 
     @staticmethod
+    def _require_manual_preview_bindings(
+        event_payload: dict[str, Any],
+        *,
+        owner_principal: str,
+        interface_id: str | None,
+        network: str,
+        limits: dict[str, Any],
+        preview_digest: str | None,
+        exact_port: int,
+    ) -> None:
+        expected = {
+            "schema": _MANUAL_PREVIEW_EVENT_SCHEMA,
+            "mode": "manual",
+            "endpoint_kind": "manual",
+            "observation_source": "manual",
+            "owner_principal": owner_principal,
+            "interface_id": interface_id,
+            "network": network,
+            "limits": limits,
+            "active_host_count": 1,
+            "passive_or_manual_only": True,
+            "port_count": 1,
+            "exact_port": exact_port,
+            "mdns_status": "unavailable",
+            "server_version": _LAN_SERVER_VERSION,
+            "contract_version": _MANUAL_PREVIEW_CONTRACT_VERSION,
+            "preview_digest": preview_digest,
+            "confirmed": True,
+            "privacy_acknowledged": True,
+        }
+        if any(event_payload.get(field) != value for field, value in expected.items()):
+            raise ValueError("manual LAN preview event does not match durable authority")
+
+    @staticmethod
     def _require_live_preview_event(
         event_payload: dict[str, Any],
         now: str,
@@ -1275,11 +1683,7 @@ class LanDiscoveryLedger:
         created_at: str,
     ) -> bool:
         values = validate_observation(observation)
-        if values["interface_id"] != scan.confirmed_interface_id:
-            raise ValueError("observation interface does not match confirmed scan interface")
-        address = ipaddress.ip_address(str(values["address"]))
-        if address not in ipaddress.ip_network(scan.network, strict=True):
-            raise ValueError("observation address does not belong to confirmed scan network")
+        _require_observation_scan_authority(scan, values)
         existing_row = connection.execute(
             """
             SELECT * FROM routing_lan_observations

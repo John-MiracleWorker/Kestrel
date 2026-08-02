@@ -1,5 +1,7 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -215,6 +217,29 @@ def test_security_headers_cover_lan_fixed_errors_and_terminal_sse(
                 ),
             )
 
+        def manual_preview(self, interface_id: str, host: str, port: int) -> object:
+            del host
+            task6 = import_module("nested_memvid_agent.lan_scan_manager")
+            routes = import_module("nested_memvid_agent.server_lan_discovery_routes")
+            now = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+            return SimpleNamespace(
+                schema=routes.LAN_MANUAL_PREVIEW_SCHEMA,
+                interface_id=interface_id,
+                port=port,
+                resolved_addresses=("192.168.90.2",),
+                preview_digest="sha256:" + "d" * 64,
+                issued_at=now,
+                expires_at=now + timedelta(seconds=30),
+                server_version=task6.LAN_SERVER_VERSION,
+                contract_version=task6.LAN_MANUAL_PREVIEW_CONTRACT_VERSION,
+                requires_confirmation=True,
+            )
+
+        def confirm_manual(self, *args: object, **kwargs: object) -> LanScanRecord:
+            del args, kwargs
+            task6 = import_module("nested_memvid_agent.lan_scan_manager")
+            raise task6.LanManualPreviewConflict("raw-secret-address-192.168.90.2")
+
         def events(
             self,
             requested_scan_id: str,
@@ -234,6 +259,28 @@ def test_security_headers_cover_lan_fixed_errors_and_terminal_sse(
             "/api/routing/lan/interfaces",
             headers=headers,
         )
+        manual_success = client.post(
+            "/api/routing/lan/manual-probe",
+            headers=headers,
+            json={
+                "mode": "preview",
+                "interface_id": "sha256:" + "b" * 64,
+                "host": "model-box.local",
+                "port": 5001,
+            },
+        )
+        manual_fixed_error = client.post(
+            "/api/routing/lan/manual-probe",
+            headers=headers,
+            json={
+                "mode": "confirm",
+                "expected_revision": 0,
+                "preview_digest": "sha256:" + "d" * 64,
+                "selected_address": "192.168.90.2",
+                "confirmed": True,
+                "privacy_acknowledged": True,
+            },
+        )
         fixed_error = client.get(
             "/api/routing/lan/scans/lan_" + "f" * 32,
             headers=headers,
@@ -246,6 +293,11 @@ def test_security_headers_cover_lan_fixed_errors_and_terminal_sse(
 
     assert json_success.status_code == 200
     assert json_success.headers["content-type"].startswith("application/json")
+    assert manual_success.status_code == 200
+    assert manual_success.headers["content-type"].startswith("application/json")
+    assert manual_fixed_error.status_code == 409
+    assert manual_fixed_error.json() == {"detail": {"code": "lan_manual_preview_conflict"}}
+    assert "raw-secret" not in manual_fixed_error.text
     assert fixed_error.status_code == 404
     assert fixed_error.json() == {"detail": {"code": "lan_scan_not_found"}}
     assert sse.status_code == 200
@@ -253,5 +305,11 @@ def test_security_headers_cover_lan_fixed_errors_and_terminal_sse(
     assert sse.headers["cache-control"] == "no-store, no-transform"
     assert sse.headers["x-accel-buffering"] == "no"
     assert "event: scan_completed\n" in sse.text
-    for response in (json_success, fixed_error, sse):
+    for response in (
+        json_success,
+        manual_success,
+        manual_fixed_error,
+        fixed_error,
+        sse,
+    ):
         _assert_security_headers(response)

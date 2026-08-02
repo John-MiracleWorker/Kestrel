@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
+from importlib import import_module
 
 import pytest
 
@@ -23,6 +24,18 @@ def interface_fixture(*addresses: str, os_identity: str = "darwin:en0") -> Netwo
         display_name="Wi-Fi",
         addresses=addresses or ("192.168.1.7/24",),
     )
+
+
+def manual_endpoint_type():
+    """Resolve the wished-for Task 7B type without breaking control-test collection."""
+
+    return import_module("nested_memvid_agent.lan_discovery_models").ManualLanEndpoint
+
+
+class HostilePort(int):
+    def __format__(self, format_spec: str) -> str:
+        del format_spec
+        raise AssertionError("hostile port formatting crossed validation")
 
 
 @pytest.mark.parametrize(
@@ -148,6 +161,179 @@ def test_endpoint_rejects_ports_outside_the_known_active_matrix() -> None:
 
     with pytest.raises(ValueError, match="known model-service ports"):
         ResolvedLanEndpoint.from_scope(scope, "192.168.1.8", 22)
+
+
+def test_automatic_endpoint_factory_rejects_int_subclass_port() -> None:
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.0/24",
+    )
+
+    with pytest.raises(ValueError, match="port"):
+        ResolvedLanEndpoint.from_scope(scope, "192.168.1.8", HostilePort(11434))
+
+
+@pytest.mark.parametrize(
+    ("interface_address", "network", "address", "port"),
+    (
+        ("192.168.1.7/24", "192.168.1.8/32", "192.168.1.8", 1),
+        ("192.168.1.7/24", "192.168.1.8/32", "192.168.1.8", 5001),
+        ("192.168.1.7/24", "192.168.1.8/32", "192.168.1.8", 11434),
+        ("192.168.1.7/24", "192.168.1.8/32", "192.168.1.8", 65535),
+        ("169.254.10.7/16", "169.254.10.8/32", "169.254.10.8", 5001),
+        ("fd00::7/64", "fd00::8/128", "fd00::8", 5001),
+        ("fe80::7/64", "fe80::8/128", "fe80::8", 5001),
+    ),
+)
+def test_manual_endpoint_is_a_separate_exact_host_authority(
+    interface_address: str,
+    network: str,
+    address: str,
+    port: int,
+) -> None:
+    """Broadening the automatic endpoint factory would turn one consent into a port scan."""
+
+    manual_type = manual_endpoint_type()
+    scope = PrivateScanScope.from_request(interface_fixture(interface_address), network)
+
+    endpoint = manual_type.from_exact_scope(scope, address, port)
+
+    assert type(endpoint) is manual_type
+    assert (endpoint.kind, endpoint.interface_id, endpoint.address, endpoint.port) == (
+        "manual",
+        scope.interface.interface_id,
+        address,
+        port,
+    )
+    if port not in KNOWN_MODEL_SERVICE_PORTS:
+        with pytest.raises(ValueError, match="known model-service ports"):
+            ResolvedLanEndpoint.from_scope(scope, address, port)
+
+
+def test_manual_endpoint_authority_is_factory_only_and_frozen() -> None:
+    manual_type = manual_endpoint_type()
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.8/32",
+    )
+    endpoint = manual_type.from_exact_scope(scope, "192.168.1.8", 5001)
+    construction_attempts = (
+        ((scope.interface.interface_id, "192.168.1.8", 5001), {}),
+        (("manual", scope.interface.interface_id, "192.168.1.8", 5001), {}),
+        (
+            (),
+            {
+                "interface_id": scope.interface.interface_id,
+                "address": "192.168.1.8",
+                "port": 5001,
+            },
+        ),
+        (
+            (),
+            {
+                "kind": "manual",
+                "interface_id": scope.interface.interface_id,
+                "address": "192.168.1.8",
+                "port": 5001,
+            },
+        ),
+    )
+
+    for args, kwargs in construction_attempts:
+        with pytest.raises(TypeError):
+            manual_type(*args, **kwargs)
+
+    with pytest.raises((FrozenInstanceError, AttributeError)):
+        endpoint.port = 5002
+    assert (endpoint.kind, endpoint.address, endpoint.port) == (
+        "manual",
+        "192.168.1.8",
+        5001,
+    )
+
+
+@pytest.mark.parametrize("port", [False, True, 0, -1, 65536, 1.0, "5001"])
+def test_manual_endpoint_rejects_non_integer_or_out_of_range_ports(port: object) -> None:
+    manual_type = manual_endpoint_type()
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.8/32",
+    )
+
+    with pytest.raises((TypeError, ValueError), match="port"):
+        manual_type.from_exact_scope(scope, "192.168.1.8", port)
+
+
+def test_manual_endpoint_factory_rejects_int_subclass_port() -> None:
+    manual_type = manual_endpoint_type()
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.8/32",
+    )
+
+    with pytest.raises(ValueError, match="port"):
+        manual_type.from_exact_scope(scope, "192.168.1.8", HostilePort(5001))
+
+
+@pytest.mark.parametrize(
+    "address",
+    [3232235784, b"\xc0\xa8\x01\x08", True, object()],
+)
+def test_manual_endpoint_rejects_non_string_address_lookalikes(address: object) -> None:
+    manual_type = manual_endpoint_type()
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.8/32",
+    )
+
+    with pytest.raises((TypeError, ValueError), match="manual|literal|address"):
+        manual_type.from_exact_scope(scope, address, 5001)
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "8.8.8.8",
+        "127.0.0.1",
+        "224.0.0.1",
+        "0.0.0.0",
+        "192.0.2.1",
+        "model-box.local",
+        "http://192.168.1.8",
+        "user@192.168.1.8",
+        "fe80::8%en0",
+        "192.168.001.008",
+        "192.168.1.9",
+    ],
+)
+def test_manual_endpoint_rejects_nonliteral_ineligible_or_different_exact_host(
+    address: str,
+) -> None:
+    manual_type = manual_endpoint_type()
+    scope = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.8/32",
+    )
+
+    with pytest.raises(ValueError, match="manual|literal|eligible|scope|address"):
+        manual_type.from_exact_scope(scope, address, 5001)
+
+
+def test_manual_endpoint_rejects_broad_or_forged_scope_objects() -> None:
+    manual_type = manual_endpoint_type()
+    broad = PrivateScanScope.from_request(
+        interface_fixture("192.168.1.7/24"),
+        "192.168.1.0/24",
+    )
+    exact = PrivateScanScope.from_request(
+        broad.interface,
+        "192.168.1.8/32",
+    )
+    forged = replace(exact, network="192.168.1.9/32")
+
+    for scope in (broad, forged, object()):
+        with pytest.raises((TypeError, ValueError), match="manual|exact|scope"):
+            manual_type.from_exact_scope(scope, "192.168.1.8", 5001)
 
 
 @pytest.mark.parametrize("interface_id", ["sha256:abc", "sha256:" + "A" * 64])

@@ -1603,6 +1603,7 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
         assert lan_manifest(client.app) == Counter()
         assert client.get("/api/routing/lan/interfaces").status_code == 404
         assert client.post("/api/routing/lan/preview", json={}).status_code == 404
+        assert client.post("/api/routing/lan/manual-probe", json={}).status_code == 404
         assert client.post("/api/routing/lan/import", json={}).status_code == 404
         assert (
             client.post(
@@ -1625,6 +1626,12 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
             headers={"content-type": "application/json"},
         )
         assert unauthorized_preview.status_code == 401
+        unauthorized_manual = client.post(
+            "/api/routing/lan/manual-probe",
+            content=b"\xff",
+            headers={"content-type": "application/json"},
+        )
+        assert unauthorized_manual.status_code == 401
         assert enumeration_calls == 0
         unauthorized = client.post("/api/routing/lan/import", json={})
         assert unauthorized.status_code == 401
@@ -1640,6 +1647,13 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
         )
         assert authorized.status_code in {400, 422}
         assert authorized.status_code != 404
+        authorized_manual = client.post(
+            "/api/routing/lan/manual-probe",
+            json={},
+            headers={"X-Kestrel-API-Key": "lan-route-test-token"},
+        )
+        assert authorized_manual.status_code == 422
+        assert authorized_manual.json() == {"detail": {"code": "lan_request_invalid"}}
         authorized_review = client.post(
             "/api/routing/lan/targets/missing/review",
             json={},
@@ -1667,12 +1681,10 @@ def test_create_app_registers_lan_mutations_only_with_authenticated_ingress(
                 ("GET", "/api/routing/lan/scans/{scan_id}"): 1,
                 ("POST", "/api/routing/lan/scans/{scan_id}/cancel"): 1,
                 ("GET", "/api/routing/lan/scans/{scan_id}/events"): 1,
+                ("POST", "/api/routing/lan/manual-probe"): 1,
                 ("POST", "/api/routing/lan/import"): 1,
                 ("POST", "/api/routing/lan/targets/{target_id}/review"): 1,
             }
-        )
-        assert not any(
-            path == "/api/routing/lan/manual-probe" for _method, path in lan_manifest(client.app)
         )
 
 
@@ -2300,6 +2312,7 @@ def test_create_app_desktop_launch_registers_lan_mutations_behind_launch_auth(
     with testclient.TestClient(app) as client:
         unauthorized_interfaces = client.get("/api/routing/lan/interfaces")
         unauthorized_preview = client.post("/api/routing/lan/preview", json={})
+        unauthorized_manual = client.post("/api/routing/lan/manual-probe", json={})
         unauthorized_import = client.post("/api/routing/lan/import", json={})
         unauthorized_review = client.post(
             "/api/routing/lan/targets/missing/review",
@@ -2307,12 +2320,18 @@ def test_create_app_desktop_launch_registers_lan_mutations_behind_launch_auth(
         )
         assert unauthorized_interfaces.status_code == 401
         assert unauthorized_preview.status_code == 401
+        assert unauthorized_manual.status_code == 401
         assert unauthorized_import.status_code == 401
         assert unauthorized_review.status_code == 401
 
         headers = {"Authorization": f"Bearer {launch.api_token}"}
         authorized_preview = client.post(
             "/api/routing/lan/preview",
+            json={},
+            headers=headers,
+        )
+        authorized_manual = client.post(
+            "/api/routing/lan/manual-probe",
             json={},
             headers=headers,
         )
@@ -2327,8 +2346,10 @@ def test_create_app_desktop_launch_registers_lan_mutations_behind_launch_auth(
             headers=headers,
         )
         assert authorized_preview.status_code in {400, 422}
+        assert authorized_manual.status_code == 422
         assert authorized_import.status_code in {400, 422}
         assert authorized_review.status_code in {400, 422}
         assert authorized_preview.status_code != 404
+        assert authorized_manual.status_code != 404
         assert authorized_import.status_code != 404
         assert authorized_review.status_code != 404
