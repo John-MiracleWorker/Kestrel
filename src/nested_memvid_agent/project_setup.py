@@ -61,6 +61,8 @@ def build_project_setup_draft(
     )
     demo_route = normalized_provider.casefold() == "mock"
 
+    effective_estimate: float | None
+    effective_budget: float | None
     if demo_route or local_route:
         effective_estimate = 0.0
         effective_budget = 0.0 if reviewed_budget is None else reviewed_budget

@@ -100,6 +100,8 @@ def register_settings_routes(
             )
         except RuntimeSettingsConflict:
             current = current_projection().require(setting_id).to_public_dict()
+            if http_exception is None:
+                raise RuntimeError("setting_revision_conflict") from None
             raise http_exception(
                 status_code=409,
                 detail={
