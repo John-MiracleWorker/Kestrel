@@ -260,3 +260,77 @@ export type TargetCalibrationRecord = {
   effective_sample_size: number;
   updated_at: string;
 };
+
+export type LanStaleReason =
+  | "interface_changed"
+  | "network_changed"
+  | "address_changed"
+  | "port_changed"
+  | "transport_security_changed"
+  | "certificate_changed"
+  | "api_shape_changed"
+  | "catalog_changed"
+  | "model_identity_changed"
+  | "model_missing"
+  | "capability_changed"
+  | "freshness_expired";
+
+export type LanExpectedRevision = Readonly<{
+  resourceId: string;
+  revision: number;
+}>;
+
+export type LanReplacementConfirmation = Readonly<{
+  providerProfileId: string;
+  expectedProfileRevision: number;
+  expectedEndpointFingerprint: string;
+  expectedMaterialBindingDigests: string[];
+}>;
+
+export type LanImportRequest = Readonly<{
+  scanId: string;
+  endpointBindingDigest: string;
+  expectedTerminalReceiptDigest: string;
+  expectedObservationDigest: string;
+  expectedProfileRevision: number;
+  expectedTargetRevisions: LanExpectedRevision[];
+  replacement: LanReplacementConfirmation | null;
+}>;
+
+export type LanImportResult = Readonly<{
+  profile: ProviderProfile | null;
+  targets: ModelTarget[];
+  observation_digest: string;
+  endpoint_fingerprint: string | null;
+  outage_observed: boolean;
+  affected_target_ids: string[];
+  invalidated_binding_digests: string[];
+  stale_reasons_by_target: Array<{
+    target_id: string;
+    reasons: LanStaleReason[];
+  }>;
+}>;
+
+export type LanTargetReviewRequest = Readonly<{
+  targetId: string;
+  expectedProfileRevision: number;
+  expectedTargetRevision: number;
+  expectedTerminalReceiptDigest: string;
+  expectedObservationDigest: string;
+  expectedEndpointFingerprint: string;
+  expectedMaterialBindingDigest: string;
+  expectedReviewDigest: string;
+  expectedStaleReasons: LanStaleReason[];
+  trustClass: "operator_confirmed";
+  intendedRoles: string[];
+  taskFamilyAffinities: string[];
+  privacyAcknowledged: true;
+  enabled: boolean;
+}>;
+
+export type LanTargetReviewResult = Readonly<{
+  profile: ProviderProfile;
+  target: ModelTarget;
+  privacy_acknowledgement_digest: string;
+  material_binding_digest: string;
+}>;
