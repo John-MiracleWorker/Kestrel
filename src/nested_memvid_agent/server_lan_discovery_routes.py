@@ -44,7 +44,9 @@ from .routing.lan_serialization import (
 from .server_routing_routes import _parse_lan_json_request, _require_lan_get_request
 
 _SCAN_ID_RE = re.compile(r"lan_[0-9a-f]{32}\Z")
-_UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z")
+_UTC_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)\Z"
+)
 _TERMINAL_STATUSES = frozenset({"cancelled", "completed", "failed", "interrupted"})
 _ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -420,20 +422,24 @@ def _manual_preview_payload(authorization: object) -> dict[str, object]:
     }
 
 
-def _validate_timestamp(value: object) -> str:
+def _normalize_event_timestamp(value: object) -> str:
     if type(value) is not str or len(value.encode("utf-8")) > 64:
         raise ValueError("LAN event timestamp is invalid")
     if _UTC_TIMESTAMP_RE.fullmatch(value) is None:
         raise ValueError("LAN event timestamp is invalid")
     try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
     except ValueError as exc:
         raise ValueError("LAN event timestamp is invalid") from exc
     if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
         raise ValueError("LAN event timestamp is invalid")
-    if parsed.astimezone(UTC).isoformat().replace("+00:00", "Z") != value:
+    storage_timestamp = parsed.astimezone(UTC).isoformat()
+    wire_timestamp = storage_timestamp.replace("+00:00", "Z")
+    if value not in {storage_timestamp, wire_timestamp}:
         raise ValueError("LAN event timestamp is invalid")
-    return value
+    return wire_timestamp
 
 
 def _terminal_payload(event_type: str, value: object) -> dict[str, object]:
@@ -545,12 +551,13 @@ def _public_event(
             or payload["cancel_reason"] != scan_record.cancel_reason
         ):
             raise ValueError("LAN terminal event disagrees with scan")
+    sequence_text = str(sequence)
     public = {
         "scan_id": scan_id,
-        "sequence": sequence,
+        "sequence": sequence_text,
         "event_type": event_type,
         "payload": payload,
-        "created_at": _validate_timestamp(event.created_at),
+        "created_at": _normalize_event_timestamp(event.created_at),
     }
     encoded = json.dumps(
         public,
@@ -559,7 +566,7 @@ def _public_event(
         ensure_ascii=False,
         allow_nan=False,
     )
-    frame = f"id: {sequence}\nevent: {event_type}\ndata: {encoded}\n\n"
+    frame = f"id: {sequence_text}\nevent: {event_type}\ndata: {encoded}\n\n"
     if len(frame.encode("utf-8")) > _MAX_EVENT_FRAME_BYTES:
         raise ValueError("LAN event frame is too large")
     public["_frame"] = frame
@@ -590,7 +597,7 @@ def _validated_frames(
         if terminal_status is not None:
             raise ValueError("LAN event follows a terminal event")
         public = _public_event(event, scan_id=scan_id, scan_record=scan_record)
-        sequence = public["sequence"]
+        sequence = event.sequence
         if type(sequence) is not int or sequence <= cursor:
             raise ValueError("LAN event sequence is invalid")
         cursor = sequence

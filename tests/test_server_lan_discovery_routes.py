@@ -289,10 +289,10 @@ def _expected_public_event(event: LanScanEvent) -> dict[str, object]:
         json.dumps(
             {
                 "scan_id": event.scan_id,
-                "sequence": event.sequence,
+                "sequence": str(event.sequence),
                 "event_type": event.event_type,
                 "payload": _public_event_payload(event.event_type),
-                "created_at": event.created_at,
+                "created_at": event.created_at.replace("+00:00", "Z"),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1760,6 +1760,42 @@ def test_sse_cursor_accepts_zero_and_all_canonical_positive_int64_values(cursor:
     assert response.response_headers()["content-type"].startswith("text/event-stream")
 
 
+def test_sse_normalizes_persisted_plus_zero_timestamp_and_emits_decimal_string_sequence() -> None:
+    manager = RouteManager(terminal=True)
+    manager.durable_events = [
+        _event(1, created_at="2026-08-01T12:00:01+00:00"),
+    ]
+
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+    )
+
+    assert status == 200
+    frame_lines = response.text().strip().splitlines()
+    assert frame_lines[:2] == ["id: 1", "event: scan_completed"]
+    public = json.loads(frame_lines[2].removeprefix("data: "))
+    assert public["sequence"] == "1"
+    assert public["created_at"] == "2026-08-01T12:00:01Z"
+
+
+def test_sse_preserves_max_signed_int64_in_id_and_json_text() -> None:
+    maximum = 2**63 - 1
+    manager = RouteManager(terminal=True)
+    manager.durable_events = [_event(maximum)]
+
+    status, response = _bounded_asgi_get(
+        manager,
+        f"/api/routing/lan/scans/{SCAN_ID}/events",
+    )
+
+    assert status == 200
+    frame_lines = response.text().strip().splitlines()
+    assert frame_lines[0] == f"id: {maximum}"
+    public = json.loads(frame_lines[2].removeprefix("data: "))
+    assert public["sequence"] == str(maximum)
+
+
 def test_sse_replays_strictly_after_cursor_with_canonical_bounded_frames_and_headers() -> None:
     manager = RouteManager(terminal=True)
     status, response = _bounded_asgi_get(
@@ -1835,7 +1871,7 @@ def test_sse_replays_safe_manual_start_projection_then_drains_terminal_event() -
     projected = json.loads(first_data.removeprefix("data: "))
     assert projected == {
         "scan_id": SCAN_ID,
-        "sequence": 1,
+        "sequence": "1",
         "event_type": "scan_started",
         "payload": _manual_public_event_payload(),
         "created_at": manual_started.created_at,
@@ -2433,6 +2469,45 @@ def test_sse_projects_returned_worker_interruption_bound_to_durable_record() -> 
             "completed",
             PREVIEW_DIGEST,
             id="nonmonotonic-sequence",
+        ),
+        pytest.param(
+            (
+                _event(
+                    1,
+                    "scan_started",
+                    created_at="2026-08-01T12:00:01+01:00",
+                ),
+                _event(2),
+            ),
+            "completed",
+            "2026-08-01T12:00:01+01:00",
+            id="non-utc-created-at",
+        ),
+        pytest.param(
+            (
+                _event(
+                    1,
+                    "scan_started",
+                    created_at="2026-08-01T12:00:01+0000",
+                ),
+                _event(2),
+            ),
+            "completed",
+            "2026-08-01T12:00:01+0000",
+            id="noncanonical-offset-created-at",
+        ),
+        pytest.param(
+            (
+                _event(
+                    1,
+                    "scan_started",
+                    created_at="2026-08-01T12:00:01.1Z",
+                ),
+                _event(2),
+            ),
+            "completed",
+            "2026-08-01T12:00:01.1Z",
+            id="noncanonical-fraction-created-at",
         ),
         pytest.param(
             (
