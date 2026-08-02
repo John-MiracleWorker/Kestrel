@@ -75,6 +75,12 @@ jobs:
         run: shellcheck install.sh scripts/*.sh
       - name: Tests
         run: pytest -q
+      - name: LAN discovery adversarial security suite
+        run: >-
+          pytest -q
+          tests/test_lan_discovery_security.py
+          tests/test_lan_scanner.py
+          tests/test_server_lan_discovery_routes.py
       - name: Preload digest-pinned golden validation image
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         env:
@@ -281,6 +287,9 @@ jobs:
         working-directory: desktop
       - name: Run installed-renderer e2e journeys
         run: npm run e2e
+        working-directory: desktop
+      - name: Run LAN discovery adversarial e2e journeys
+        run: npm run e2e -- lan-discovery
         working-directory: desktop
 
   codeql:

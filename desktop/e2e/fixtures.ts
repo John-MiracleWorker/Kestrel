@@ -661,3 +661,302 @@ export function demoFixtureInitScript(
     })();
   `;
 }
+
+
+/* ------------------------------------------------------------------------ */
+/* Controlled private-network LAN discovery fixture (LAN plan Task 10).      */
+/*                                                                           */
+/* The fixture simulates exactly one owner-confirmed private scope           */
+/* (192.168.90.0/24 on one interface) with one model server at               */
+/* 192.168.90.2:11434. It is a pure in-page fetch stub: no network of any    */
+/* kind is ever touched, every LAN mutation body is validated exactly, and   */
+/* any request outside the stub throws so a regression that tried to reach   */
+/* the ambient network fails the suite instead of silently passing.          */
+/* ------------------------------------------------------------------------ */
+
+const lanInterfaceId = `sha256:${"d".repeat(64)}`;
+const lanDigestA = `sha256:${"a".repeat(64)}`;
+const lanDigestB = `sha256:${"b".repeat(64)}`;
+const lanDigestC = `sha256:${"c".repeat(64)}`;
+const lanScanId = `lan_${"1".repeat(32)}`;
+const lanNetwork = "192.168.90.0/24";
+
+const lanAutomaticLimits = {
+  known_model_service_ports: [1_234, 8_000, 8_080, 11_434],
+  max_active_hosts: 256,
+  max_scan_concurrency: 16,
+  tcp_connect_timeout_seconds: 0.75,
+  http_probe_timeout_seconds: 2,
+  total_scan_deadline_seconds: 45,
+  max_probe_response_bytes: 262_144,
+  max_discovered_models: 8,
+  mdns_window_seconds: 2.5,
+} as const;
+
+function lanScanPayload(status: string, revision: number) {
+  const running = status === "running";
+  const completed = status === "completed";
+  return {
+    scan_id: lanScanId,
+    status,
+    revision,
+    confirmed_interface_id: lanInterfaceId,
+    network: lanNetwork,
+    limits: lanAutomaticLimits,
+    limits_digest: lanDigestB,
+    preview_digest: lanDigestA,
+    created_at: "2026-08-01T12:00:00Z",
+    updated_at: "2026-08-01T12:00:01Z",
+    started_at: running || completed ? "2026-08-01T12:00:01Z" : null,
+    finished_at: completed || status === "cancelled" ? "2026-08-01T12:00:02Z" : null,
+    cancel_reason: status === "cancelled" ? "owner_cancelled" : null,
+    terminal_reason: completed ? "scan_complete" : status === "cancelled" ? "owner_cancelled" : null,
+    candidate_count: running || status === "draft" ? null : 1,
+    error_count: running || status === "draft" ? null : 0,
+    timeout_count: running || status === "draft" ? null : 0,
+    terminal_receipt_digest: completed ? lanDigestB : null,
+  };
+}
+
+function lanObservation() {
+  return {
+    scan_id: lanScanId,
+    endpoint_id: lanDigestC,
+    source: "active",
+    interface_id: lanInterfaceId,
+    address: "192.168.90.2",
+    port: 11_434,
+    api_shape: "ollama_compatible",
+    tls_enabled: false,
+    certificate_sha256: null,
+    catalog_digest: lanDigestB,
+    capability_digest: lanDigestC,
+    public_payload: {
+      schema: "kestrel.lan.durable-observation.v1",
+      endpoint_binding_digest: lanDigestC,
+      observation_digest: lanDigestA,
+      reachability: "reachable",
+      transport_security: "plain_http",
+      api_shape: "ollama_compatible",
+      catalog_complete: true,
+      catalog_truncated: false,
+      model_ids: ["fixture-llama"],
+      capability_route: "/api/generate",
+      selected_model_id: "fixture-llama",
+      capabilities: [
+        {
+          capability: "generation",
+          provenance: "observed",
+          status: "observed_pass",
+          supported: true,
+        },
+        ...["streaming", "structured_output", "tools", "vision"].map(
+          (capability) => ({
+            capability,
+            provenance: "not_run",
+            status: "not_run",
+            supported: null,
+          }),
+        ),
+      ],
+      failure_category: null,
+    },
+    freshness_timestamp: "2026-08-01T12:00:01Z",
+    error_category: null,
+    created_at: "2026-08-01T12:00:01Z",
+  };
+}
+
+export type LanDiscoveryFixtureOptions = Readonly<{
+  theme?: "light" | "dark";
+  /**
+   * Keep the scan in `running` so the cancellation journey is deterministic
+   * (the fixture completes only after 50 detail reads instead of 2).
+   */
+  holdRunning?: boolean;
+}>;
+
+/**
+ * Install the controlled private-network LAN fixture. Mirrors the Demo
+ * fixture contract (exact-path table + loud throws on anything unknown) and
+ * adds a stateful LAN scan lifecycle: preview -> draft -> running ->
+ * completed/cancelled. The event stream endpoint answers 503 so the hook
+ * exercises its deterministic polling fallback.
+ */
+export function lanDiscoveryFixtureInitScript(
+  options: LanDiscoveryFixtureOptions = {},
+): string {
+  const theme = options.theme ?? "light";
+  const holdRunning = options.holdRunning ?? false;
+  const payloads: Record<string, unknown> = {
+    ...baseGetPayloads(),
+    ...modePayloads("idle"),
+  };
+  payloads["/api/approvals?status=pending"] = payloads["/api/approvals"];
+  const interfacePayload = {
+    interface_id: lanInterfaceId,
+    display_name: "Fixture Wi-Fi",
+    addresses: ["192.168.90.1"],
+  };
+  const previewPayload = {
+    interface_id: lanInterfaceId,
+    network: lanNetwork,
+    limits: lanAutomaticLimits,
+    active_host_count: 254,
+    passive_or_manual_only: false,
+    port_count: 1_016,
+    mdns_status: "available",
+    server_version: "0.5.0",
+    contract_version: "kestrel.lan.v1",
+    preview_digest: lanDigestA,
+    issued_at: "2026-08-01T12:00:00Z",
+    expires_at: "2026-08-01T12:05:00Z",
+  };
+  const observationPayload = lanObservation();
+  return `
+    (() => {
+      const payloads = ${json(payloads)};
+      const lanInterface = ${json(interfacePayload)};
+      const lanPreview = ${json(previewPayload)};
+      const lanObservation = ${json(observationPayload)};
+      const theme = ${json(theme)};
+      const holdRunning = ${json(holdRunning)};
+      const lan = { status: "none", revision: 0, detailReads: 0 };
+      const scanPayload = ${json(lanScanPayload("STATUS", 0))};
+      const buildScan = (status, revision) => ({
+        ...scanPayload,
+        status,
+        revision,
+        started_at: status === "draft" ? null : scanPayload.started_at ?? "2026-08-01T12:00:01Z",
+        finished_at: status === "completed" || status === "cancelled" ? "2026-08-01T12:00:02Z" : null,
+        cancel_reason: status === "cancelled" ? "owner_cancelled" : null,
+        terminal_reason: status === "completed" ? "scan_complete" : status === "cancelled" ? "owner_cancelled" : null,
+        candidate_count: status === "running" || status === "draft" ? null : 1,
+        error_count: status === "running" || status === "draft" ? null : 0,
+        timeout_count: status === "running" || status === "draft" ? null : 0,
+        terminal_receipt_digest: status === "completed" ? scanPayload.terminal_receipt_digest ?? "${lanDigestB}" : null,
+      });
+      try {
+        window.localStorage.setItem(${json(THEME_STORAGE_KEY)}, theme);
+        window.localStorage.setItem(${json(MOTION_STORAGE_KEY)}, "reduce");
+      } catch { /* storage may be unavailable in exotic contexts */ }
+      window.__kestrelE2eRequestedPaths = [];
+      const record = (path) => {
+        window.__kestrelE2eRequestedPaths.push(path);
+      };
+      const jsonResponse = (payload, status = 200) =>
+        new Response(JSON.stringify(payload), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        });
+      const lanDetail = () => ({
+        ...buildScan(lan.status, lan.revision),
+        observations: lan.status === "completed" ? [lanObservation] : [],
+        observation_total_count: lan.status === "completed" ? 1 : 0,
+        observations_truncated: false,
+        observation_next_cursor: null,
+      });
+      const lanMutation = (method, path, body) => {
+        if (method === "POST" && path === "/api/routing/lan/preview") {
+          if (body.interface_id !== lanInterface.interface_id) {
+            return jsonResponse({ detail: "unknown private network interface" }, 400);
+          }
+          if (body.network !== lanPreview.network) {
+            return jsonResponse(
+              { detail: "network must be a private interface scope" },
+              400,
+            );
+          }
+          return jsonResponse(lanPreview);
+        }
+        if (method === "POST" && path === "/api/routing/lan/scans") {
+          const exact = body.preview_digest === lanPreview.preview_digest
+            && body.expected_revision === 0
+            && body.confirmed === true
+            && Object.keys(body).length === 3;
+          if (!exact || lan.status !== "none") {
+            return jsonResponse({ detail: "lan_scan_revision_conflict" }, 409);
+          }
+          lan.status = "draft";
+          lan.revision = 1;
+          return jsonResponse(buildScan("draft", 1), 201);
+        }
+        const scanMatch = path.match(/^\\/api\\/routing\\/lan\\/scans\\/(lan_[0-9a-f]{32})(?:\\/(start|cancel|events))?$/);
+        if (!scanMatch || scanMatch[1] !== "${lanScanId}" || lan.status === "none") {
+          throw new Error("e2e_fixture_refused_mutation:" + method + " " + path);
+        }
+        const action = scanMatch[2] ?? "";
+        if (method === "POST" && action === "start") {
+          const exact = body.expected_revision === 1
+            && body.preview_digest === lanPreview.preview_digest
+            && body.confirmed === true
+            && Object.keys(body).length === 3;
+          if (!exact || lan.status !== "draft") {
+            return jsonResponse({ detail: "lan_scan_revision_conflict" }, 409);
+          }
+          lan.status = "running";
+          lan.revision = 2;
+          lan.detailReads = 0;
+          return jsonResponse(buildScan("running", 2), 202);
+        }
+        if (method === "POST" && action === "cancel") {
+          const exact = body.expected_revision === lan.revision
+            && Object.keys(body).length === 1;
+          if (!exact || lan.status !== "running") {
+            return jsonResponse({ detail: "lan_scan_revision_conflict" }, 409);
+          }
+          lan.status = "cancelled";
+          lan.revision += 1;
+          return jsonResponse(buildScan("cancelled", lan.revision));
+        }
+        throw new Error("e2e_fixture_refused_mutation:" + method + " " + path);
+      };
+      window.fetch = async (input, init) => {
+        const url = typeof input === "string" ? input : String(input.url ?? input);
+        const parsed = new URL(url, window.location.href);
+        const path = parsed.pathname + parsed.search;
+        const method = init && init.method ? String(init.method).toUpperCase() : "GET";
+        record(method + " " + path);
+        if (!parsed.pathname.startsWith("/api/")) {
+          throw new Error("e2e_fixture_refused_non_api_request:" + path);
+        }
+        let body = {};
+        if (method !== "GET") {
+          try {
+            body = JSON.parse(String((init && init.body) || "{}"));
+          } catch {
+          }
+          return lanMutation(method, parsed.pathname, body);
+        }
+        const lanGetMatch = parsed.pathname.match(/^\\/api\\/routing\\/lan\\/scans\\/(lan_[0-9a-f]{32})(?:\\/(events))?$/);
+        if (lanGetMatch) {
+          if (lanGetMatch[2] === "events") {
+            return jsonResponse({ detail: "stream unavailable in fixture" }, 503);
+          }
+          if (lan.status === "running") {
+            lan.detailReads += 1;
+            if (lan.detailReads >= (holdRunning ? 50 : 2)) {
+              lan.status = "completed";
+              lan.revision = 3;
+            }
+          }
+          return jsonResponse(lanDetail());
+        }
+        if (path === "/api/routing/lan/interfaces") {
+          return jsonResponse([lanInterface]);
+        }
+        if (Object.prototype.hasOwnProperty.call(payloads, path)) {
+          return jsonResponse(payloads[path]);
+        }
+        throw new Error("e2e_fixture_missing:" + path);
+      };
+      class StubEventSource {
+        constructor(url) { this.url = url; record("EVENTSOURCE " + String(url)); }
+        addEventListener() {}
+        removeEventListener() {}
+        close() {}
+      }
+      window.EventSource = StubEventSource;
+    })();
+  `;
+}

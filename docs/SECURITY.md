@@ -89,6 +89,16 @@ nest-agent server --host 127.0.0.1 --port 8765
 
 If binding to `0.0.0.0`, enable `NEST_AGENT_REQUIRE_API_AUTH=1`, set `NEST_AGENT_API_TOKEN`, put Kestrel behind an authenticated reverse proxy, and keep dangerous tool flags disabled. Startup fails with `unsafe_bind` when a non-loopback host is requested without API auth and a configured token.
 
+## LAN Model Discovery
+
+Explicit LAN model discovery is manual, bounded, and private-scope-only. Nothing is probed until the owner selects an interface, inspects the exact scope and limits in a server-owned preview, and confirms; the confirmed scope cannot be broadened while a scan runs, and cancellation stops new probes. The server re-derives every authority: only RFC1918/link-local/ULA ranges attached to the selected interface are eligible, active probing is capped at 256 hosts across four known model-service ports, and each probe re-authenticates a fresh interface inventory before connecting so address drift stops the scan with `interface_drift`.
+
+The probe transport fails closed against hostile servers: redirects are terminal and never followed, response headers and bodies are byte-capped (32 KiB / 256 KiB), only strict chunked or identity framing is accepted, one absolute deadline bounds every read (slowloris cannot stall a scan), and catalogs are parsed with a strict JSON parser that rejects duplicate members, non-finite constants, and credential-shaped model identifiers. Manual host entry resolves once, accepts only canonical attached literals, and probes the confirmed literal without further DNS, so DNS rebinding cannot move a confirmed target. mDNS advertisements are re-validated server-side, deduplicated per endpoint, bounded to 256 candidates, and dropped when display text carries control characters or credential-shaped content.
+
+Discovery never grants authority. Every imported server/model is a disabled, `unconfirmed` draft with no secret reference; enablement requires a separate owner review with exact revision checks, a privacy acknowledgement that prompts and code leave the computer, and digest-bound evidence. Address, catalog, capability, or freshness drift stales the target and blocks review until a positive refresh. Observations, events, and support surfaces serialize digests and closed public error text only — never raw response bodies, untrusted error details, or credential material.
+
+The adversarial qualification corpus lives in `tests/evals/lan_discovery/hostile_responses.json` and is executed by `tests/test_lan_discovery_security.py`: for every hostile case it proves probe destinations never expand beyond the confirmed scope, no enabled target is ever produced, and a secret sentinel never appears in serialized evidence. Renderer journeys in `desktop/e2e/lan-discovery.spec.ts` run the same contracts against a controlled in-page private-network fixture that never touches the ambient network. Controlled two-machine live evidence (`RUN_LAN_DISCOVERY_INTEGRATION=1`) remains an operator-gated integration step, never a CI default.
+
 ## API Auth
 
 The local API can require a shared token:
