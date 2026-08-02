@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from .control_plane_integrity import ROUTING_INTEGRITY_KEY_NAME
 from .file_lock import lock_exclusive, unlock
 from .layers import DEFAULT_LAYER_SPECS, LayerSpec, load_layer_specs
 from .memory_backup import (
@@ -40,6 +41,12 @@ _EMBEDDED_LAYER_CONFIG_PATH = "components/memory/layers.json"
 _LEGACY_ABSENT_REPAIR_COMPONENTS = frozenset(
     {"repair_signing_key", "repair_validations", "repair_reviews"}
 )
+# Agent backups created before the routing integrity key joined the full-backup
+# contract have no metadata for this optional component.  Treat it as
+# explicitly absent so restore removes any live key instead of pairing the
+# restored database with stale signing authority.  That is a fail-closed
+# migration: receipts signed before the restore must be requalified.
+_LEGACY_ABSENT_ROUTING_COMPONENTS = frozenset({"routing_integrity_key"})
 # Native Windows exposes only a small subset of POSIX permission semantics:
 # ``chmod`` can toggle read-only state but cannot reliably materialize or report
 # exact 0600/0700 modes.  Manifests still carry those canonical intended modes
@@ -439,6 +446,14 @@ class AgentBackupManager:
         components = [
             AgentBackupComponent("memory", self.memory_dir, "directory", required=True),
             AgentBackupComponent("state", self.state_path, "sqlite", required=True),
+            # Owner-only receipt authentication key material travels with the
+            # SQLite state it signs for; the pair is staged and verified from
+            # one manifest before restore replaces either half.
+            AgentBackupComponent(
+                "routing_integrity_key",
+                self.state_path.parent / ROUTING_INTEGRITY_KEY_NAME,
+                "file",
+            ),
         ]
         optional: tuple[tuple[str, Path | None, AgentBackupKind], ...] = (
             ("runs", runs_dir, "directory"),
@@ -542,6 +557,18 @@ class AgentBackupManager:
                 for item in self.components
                 if item.required
             )
+            state_metadata = component_metadata["state"]
+            routing_key_metadata = component_metadata["routing_integrity_key"]
+            if state_metadata["present"] and not routing_key_metadata["present"]:
+                state_snapshot = (
+                    temporary / "components" / "state" / str(state_metadata["target_name"])
+                )
+                if _sqlite_has_qualification_receipts(state_snapshot):
+                    raise MemoryBackupError(
+                        "routing integrity key is missing while qualification "
+                        "receipts exist; refusing to back up signed receipts "
+                        "without their owner key"
+                    )
             manifest = {
                 "schema": self.schema,
                 "backup_id": backup_id,
@@ -636,7 +663,12 @@ class AgentBackupManager:
         entries: list[dict[str, Any]],
     ) -> None:
         _assert_regular_private_source(component)
-        relative = Path("components") / component.name / component.path.name
+        if component.name == "routing_integrity_key":
+            # The owner key travels inside the state component's manifest
+            # namespace so the database/key pair reads as one unit.
+            relative = Path("components") / "state" / component.path.name
+        else:
+            relative = Path("components") / component.name / component.path.name
         target = temporary / relative
         canonical_mode = _copy_private_file(component.path, target)
         entries.append(_agent_file_entry(target, relative=relative, canonical_mode=canonical_mode))
@@ -693,7 +725,8 @@ class AgentBackupManager:
         # a fail-closed migration: restored policy evidence must be revalidated.
         legacy_absent_components: list[str] = []
         for component_name in sorted(
-            _LEGACY_ABSENT_REPAIR_COMPONENTS & set(self._component_by_name)
+            (_LEGACY_ABSENT_REPAIR_COMPONENTS | _LEGACY_ABSENT_ROUTING_COMPONENTS)
+            & set(self._component_by_name)
         ):
             if component_name in components:
                 continue
@@ -882,19 +915,50 @@ class AgentBackupManager:
                 _verify_sqlite(state_backup_path)
             except MemoryBackupError as exc:
                 errors.append(f"sqlite:{exc}")
+        state_present = (
+            isinstance(state_metadata, dict) and state_metadata.get("present") is True
+        )
+        routing_key_metadata = components.get("routing_integrity_key")
+        routing_key_present = (
+            isinstance(routing_key_metadata, dict)
+            and routing_key_metadata.get("present") is True
+        )
+        # The state database and its routing integrity key must belong to the
+        # same manifest; restore never replaces one half without the other.
+        if routing_key_present and not state_present:
+            errors.append("routing_integrity_key_without_state")
+        if (
+            state_present
+            and not routing_key_present
+            and state_backup_path.is_file()
+            and not any(
+                error.startswith(("checksum:components/state/", "size:components/state/"))
+                for error in errors
+            )
+        ):
+            try:
+                if _sqlite_has_qualification_receipts(state_backup_path):
+                    errors.append("routing_integrity_key_missing")
+            except MemoryBackupError as exc:
+                errors.append(f"sqlite:{exc}")
+        migration_warnings: list[str] = []
+        if set(legacy_absent_components) & _LEGACY_ABSENT_REPAIR_COMPONENTS:
+            migration_warnings.append(
+                "legacy_backup_missing_repair_integrity_artifacts; "
+                "restore will remove live repair trust material and policy evidence "
+                "will fail closed until revalidated"
+            )
+        if set(legacy_absent_components) & _LEGACY_ABSENT_ROUTING_COMPONENTS:
+            migration_warnings.append(
+                "legacy_backup_missing_routing_integrity_key; restore will remove "
+                "live routing integrity key material so the restored database never "
+                "pairs with stale signing authority"
+            )
         result: dict[str, Any] = {
             "ok": not errors,
             "backup_id": backup_id,
             "errors": errors,
-            "migration_warnings": (
-                [
-                    "legacy_backup_missing_repair_integrity_artifacts; "
-                    "restore will remove live repair trust material and policy evidence "
-                    "will fail closed until revalidated"
-                ]
-                if legacy_absent_components
-                else []
-            ),
+            "migration_warnings": migration_warnings,
             "manifest": manifest,
         }
         if capture_sources:
@@ -907,6 +971,10 @@ class AgentBackupManager:
         component = self._component_by_name.get(relative.parts[1])
         if component is None:
             raise MemoryBackupError(f"Unknown agent backup component: {relative.parts[1]}")
+        if component.name == "state" and relative.name == ROUTING_INTEGRITY_KEY_NAME:
+            routing_key = self._component_by_name.get("routing_integrity_key")
+            if routing_key is not None:
+                return routing_key
         return component
 
     def _validate_component_relative_path(
@@ -998,7 +1066,9 @@ class AgentBackupManager:
         relevant: list[tuple[Path, Path, int, dict[str, Any]]] = []
         for entry in entries:
             relative = _safe_manifest_path(str(entry["path"]))
-            if len(relative.parts) < 3 or relative.parts[1] != component.name:
+            if len(relative.parts) < 3 or relative.parts[0] != "components":
+                continue
+            if self._component_for_manifest_path(relative).name != component.name:
                 continue
             relevant.append(
                 (
@@ -1722,6 +1792,27 @@ def _verify_sqlite(path: Path) -> None:
         raise MemoryBackupError(f"SQLite backup is unreadable: {exc}") from exc
     if result is None or str(result[0]).lower() != "ok":
         raise MemoryBackupError("SQLite backup failed integrity_check")
+
+
+def _sqlite_has_qualification_receipts(path: Path) -> bool:
+    """Whether a state database snapshot holds qualification receipt rows."""
+
+    try:
+        with closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        ) as connection:
+            table = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'routing_qualification_receipts'"
+            ).fetchone()
+            if table is None or int(table[0]) == 0:
+                return False
+            count = connection.execute(
+                "SELECT COUNT(*) FROM routing_qualification_receipts"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise MemoryBackupError(f"SQLite receipt probe is unreadable: {exc}") from exc
+    return count is not None and int(count[0]) > 0
 
 
 def _component_source_is_present(component: AgentBackupComponent) -> bool:

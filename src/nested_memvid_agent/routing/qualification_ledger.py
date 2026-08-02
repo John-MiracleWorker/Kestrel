@@ -10,12 +10,19 @@ these methods reject the same mutations with clearer errors.
 
 from __future__ import annotations
 
+import hmac
 import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
+from ..control_plane_integrity import (
+    AuthenticatedPayload,
+    ControlPlaneIntegrity,
+    authenticated_payload_digest,
+)
 from ..state_store import AgentStateStore, utc_now
 from .ledger_schema import ensure_routing_schema
 from .qualification_digest import canonical_digest, canonical_json
@@ -80,11 +87,32 @@ def _require_text(value: str, name: str) -> None:
         raise ValueError(f"{name} is required")
 
 
+def _receipt_authentication_projection(row: sqlite3.Row) -> dict[str, Any]:
+    """Canonical receipt projection bound by the authentication envelope."""
+
+    attempt_id = row["attempt_id"]
+    return {
+        "receipt_id": str(row["receipt_id"]),
+        "run_id": str(row["run_id"]),
+        "attempt_id": None if attempt_id is None else str(attempt_id),
+        "receipt_type": str(row["receipt_type"]),
+        "payload_digest": str(row["payload_digest"]),
+        "created_at": str(row["created_at"]),
+        "payload": json.loads(str(row["payload_json"])),
+    }
+
+
 class QualificationLedger:
     """Flock qualification runs, cases, attempts, receipts, and grants."""
 
-    def __init__(self, state: AgentStateStore) -> None:
+    def __init__(
+        self,
+        state: AgentStateStore,
+        *,
+        integrity: ControlPlaneIntegrity | None = None,
+    ) -> None:
         self.state = state
+        self._integrity = integrity
         ensure_routing_schema(self.state)
 
     def schema_version(self) -> int:
@@ -354,6 +382,68 @@ class QualificationLedger:
                 (run_id,),
             ).fetchall()
         return [receipt_from_row(row) for row in rows]
+
+    # -- receipt authentication (owner-only control-plane key material) ---------
+
+    def receipt_envelope(self, receipt_id: str) -> AuthenticatedPayload:
+        """Sign the canonical projection of one stored immutable receipt."""
+
+        _require_text(receipt_id, "receipt_id")
+        with self.state._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routing_qualification_receipts WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown qualification receipt: {receipt_id}")
+        return self._control_plane_integrity().sign(
+            _receipt_authentication_projection(row)
+        )
+
+    def verify_receipt_envelope(self, envelope: Mapping[str, Any]) -> bool:
+        """Verify an envelope cryptographically and against the stored row.
+
+        Verification never creates key material: a missing or unsafe key fails
+        closed, and a new key is never generated over existing receipts.
+        """
+
+        integrity = self._integrity
+        if integrity is None:
+            try:
+                integrity = ControlPlaneIntegrity(
+                    Path(self.state.path).parent,
+                    create_if_missing=False,
+                )
+            except (OSError, ValueError):
+                return False
+        if not integrity.verify(envelope):
+            return False
+        payload = envelope.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        receipt_id = payload.get("receipt_id")
+        if not isinstance(receipt_id, str):
+            return False
+        with self.state._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routing_qualification_receipts WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        projection_digest = authenticated_payload_digest(
+            _receipt_authentication_projection(row)
+        )
+        return hmac.compare_digest(str(envelope.get("payload_digest")), projection_digest)
+
+    def _control_plane_integrity(self) -> ControlPlaneIntegrity:
+        # First signing mints the owner key atomically-once.  A key lost after
+        # envelopes were issued is surfaced by desktop recovery reporting and
+        # by the backup state/key pairing gate, never by silently minting a
+        # replacement on a read-only path.
+        if self._integrity is None:
+            self._integrity = ControlPlaneIntegrity(Path(self.state.path).parent)
+        return self._integrity
 
     # -- cases ------------------------------------------------------------------
 

@@ -26,6 +26,7 @@ _BLOCKING_REASONS = frozenset(
         "pending_high_risk_approval",
         "ambiguous_provider_attempt",
         "recovery_inspection_unavailable",
+        "routing_integrity_key_missing_or_mismatched",
     }
 )
 
@@ -92,11 +93,13 @@ class DesktopRecoveryService:
         routing: _RecoveryRouting,
         credential_readiness: Callable[[], Mapping[str, object]],
         memory_ready: Callable[[], bool],
+        routing_integrity: Callable[[], str] | None = None,
     ) -> None:
         self._state = state
         self._routing = routing
         self._credential_readiness = credential_readiness
         self._memory_ready = memory_ready
+        self._routing_integrity = routing_integrity
         self._inspection_lock = Lock()
 
     def inspect(self) -> DesktopRecoveryReport:
@@ -162,6 +165,17 @@ class DesktopRecoveryService:
             "unavailable",
         }:
             reasons.append("credential_backend_unavailable")
+
+        # Read-only probe: recovery reports key problems but never generates
+        # new key material over existing signed receipts.
+        if self._routing_integrity is not None:
+            try:
+                routing_integrity_state = str(self._routing_integrity())
+            except Exception:
+                routing_integrity_state = "unavailable"
+                inspection_failed = True
+            if routing_integrity_state != "ok":
+                reasons.append("routing_integrity_key_missing_or_mismatched")
 
         if inspection_failed:
             reasons.append("recovery_inspection_unavailable")
