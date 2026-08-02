@@ -47,6 +47,7 @@ from nested_memvid_agent.lan_scanner import (
 from nested_memvid_agent.routing.lan_ledger import LanDiscoveryLedger
 from nested_memvid_agent.routing.lan_serialization import (
     lan_observation_to_draft,
+    load_authenticated_task4_observation,
 )
 from nested_memvid_agent.routing.ledger import RoutingLedger
 from nested_memvid_agent.routing.ledger_records import RoutingRevisionConflict
@@ -319,6 +320,88 @@ def _persist_completed_scan(
         timeout_count=0,
     )
     assert completed.terminal_receipt_digest is not None
+    return persisted, completed
+
+
+def _persist_completed_scan_v2(
+    state: AgentStateStore,
+    *,
+    scan_id: str,
+    observations: tuple[object, ...],
+    scope: PrivateScanScope | None = None,
+):
+    active_scope = scope or _scope()
+    limits = {
+        "known_model_service_ports": [1234, 8000, 8080, 11434],
+        "max_active_hosts": 256,
+        "max_scan_concurrency": 16,
+        "tcp_connect_timeout_seconds": 0.75,
+        "http_probe_timeout_seconds": 2.0,
+        "total_scan_deadline_seconds": 45.0,
+        "max_probe_response_bytes": 262144,
+        "max_discovered_models": 8,
+        "mdns_window_seconds": 2.5,
+    }
+    ledger = LanDiscoveryLedger(state)
+    draft = ledger.create_scan(
+        scan_id=scan_id,
+        owner_principal=OWNER,
+        confirmed_interface_id=active_scope.interface.interface_id,
+        network=active_scope.network,
+        limits=limits,
+        preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+    running = ledger.claim_scan_start(
+        draft.scan_id,
+        owner_principal=OWNER,
+        expected_revision=draft.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event={
+            "schema": "kestrel.lan.scan-preview.v1",
+            "owner_principal": OWNER,
+            "interface_id": active_scope.interface.interface_id,
+            "network": active_scope.network,
+            "limits": limits,
+            "active_host_count": len(active_scope.active_hosts),
+            "passive_or_manual_only": active_scope.passive_or_manual_only,
+            "port_count": 4,
+            "mdns_status": "available",
+            "server_version": "kestrel-test",
+            "contract_version": "kestrel.lan.preview-authorization.v1",
+            "preview_digest": PREVIEW_DIGEST,
+            "expires_at": "2099-08-01T12:00:30Z",
+        },
+    )
+    drafts = tuple(
+        lan_observation_to_draft(
+            observation,  # type: ignore[arg-type]
+            scope=active_scope,
+            freshness_timestamp="2026-08-01T12:00:00Z",
+            source="active",
+        )
+        for observation in observations
+    )
+    completed = ledger.commit_scan_terminal(
+        running.scan_id,
+        owner_principal=OWNER,
+        expected_revision=running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=drafts,
+        mdns_status="available",
+        planned_count=len(drafts),
+        admitted_count=len(drafts),
+        completed_count=len(drafts),
+        error_category_counts={},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+    persisted = tuple(ledger.list_observations(scan_id))
+    assert len(persisted) == len(drafts)
     return persisted, completed
 
 
@@ -1962,6 +2045,192 @@ def test_import_crash_hook_rolls_back_profile_and_all_targets(
     registry = RoutingLedger(state)
     assert registry.list_provider_profiles() == []
     assert registry.list_model_targets() == []
+
+
+def test_task5_loader_authenticates_legacy_v1_and_aggregate_v2_receipts(
+    tmp_path: Path,
+) -> None:
+    legacy_state = AgentStateStore(tmp_path / "legacy" / "state.db")
+    legacy_observation = _positive_observation()
+    _legacy_row, legacy_scan = _persist_completed_scan(
+        legacy_state,
+        scan_id="scan-legacy-v1",
+        observation=legacy_observation,
+    )
+    assert legacy_scan.terminal_receipt is not None
+    assert "observations" in legacy_scan.terminal_receipt
+    assert legacy_scan.terminal_receipt_digest is not None
+    with legacy_state._connect() as connection:
+        authenticated_legacy = load_authenticated_task4_observation(
+            connection,
+            scan_id=legacy_scan.scan_id,
+            endpoint_binding_digest=legacy_observation.endpoint_binding_digest,
+            expected_terminal_receipt_digest=legacy_scan.terminal_receipt_digest,
+            expected_observation_digest=legacy_observation.observation_digest,
+            authenticated_owner_principal=OWNER,
+        )
+    assert authenticated_legacy.observation == legacy_observation
+
+    v2_state = AgentStateStore(tmp_path / "v2" / "state.db")
+    scope = _scope()
+    v2_observations = (
+        _positive_observation(scope=scope, address="192.168.50.2", port=1234),
+        _positive_observation(scope=scope, address="192.168.50.3", port=8000),
+    )
+    _v2_rows, v2_scan = _persist_completed_scan_v2(
+        v2_state,
+        scan_id="scan-aggregate-v2",
+        observations=tuple(reversed(v2_observations)),
+        scope=scope,
+    )
+    assert v2_scan.terminal_receipt is not None
+    assert v2_scan.terminal_receipt["schema"] == "kestrel.lan.scan-receipt.v2"
+    assert "observations" not in v2_scan.terminal_receipt
+    assert v2_scan.terminal_receipt_digest is not None
+    with v2_state._connect() as connection:
+        authenticated_v2 = load_authenticated_task4_observation(
+            connection,
+            scan_id=v2_scan.scan_id,
+            endpoint_binding_digest=v2_observations[0].endpoint_binding_digest,
+            expected_terminal_receipt_digest=v2_scan.terminal_receipt_digest,
+            expected_observation_digest=v2_observations[0].observation_digest,
+            authenticated_owner_principal=OWNER,
+        )
+    assert authenticated_v2.observation == v2_observations[0]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "membership_digest",
+        "count",
+        "error_counts",
+        "noncanonical_order",
+        "durable_row",
+    ),
+)
+def test_task5_v2_loader_rejects_aggregate_or_member_tampering_without_import(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    state = AgentStateStore(tmp_path / tamper / "state.db")
+    scope = _scope()
+    observations = (
+        _positive_observation(scope=scope, address="192.168.50.2", port=1234),
+        _positive_observation(scope=scope, address="192.168.50.3", port=8000),
+    )
+    _rows, completed = _persist_completed_scan_v2(
+        state,
+        scan_id=f"scan-v2-{tamper}",
+        observations=observations,
+        scope=scope,
+    )
+    assert completed.terminal_receipt is not None
+
+    if tamper == "membership_digest":
+        _rewrite_terminal_receipt(
+            state,
+            completed.scan_id,
+            mutate=lambda receipt: receipt.__setitem__(
+                "observation_membership_digest", "sha256:" + "9" * 64
+            ),
+            recompute_digest=True,
+        )
+    elif tamper == "count":
+        _rewrite_terminal_receipt(
+            state,
+            completed.scan_id,
+            mutate=lambda receipt: receipt.__setitem__("observation_count", 3),
+            recompute_digest=True,
+        )
+    elif tamper == "error_counts":
+        receipt = json.loads(json.dumps(completed.terminal_receipt))
+        receipt["error_count"] = 1
+        receipt["error_category_counts"] = {"tcp_refused": 1}
+        receipt_json = json.dumps(
+            receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        with state._connect() as connection:
+            connection.execute("DROP TRIGGER trg_routing_lan_terminal_scan_update_immutable")
+            connection.execute(
+                """
+                UPDATE routing_lan_scans
+                SET error_count = 1, terminal_receipt_json = ?,
+                    terminal_receipt_digest = ?
+                WHERE scan_id = ?
+                """,
+                (receipt_json, _digest(receipt), completed.scan_id),
+            )
+        LanDiscoveryLedger(state)
+    elif tamper == "noncanonical_order":
+        members = [
+            {
+                "endpoint_id": observation.endpoint_binding_digest,
+                "observation_digest": observation.observation_digest,
+            }
+            for observation in observations
+        ]
+        canonical_members = sorted(members, key=lambda item: item["endpoint_id"])
+        reversed_members = list(reversed(canonical_members))
+        assert reversed_members != canonical_members
+        bad_order_digest = _digest(
+            {
+                "schema": "kestrel.lan.observation-membership.v1",
+                "count": 2,
+                "members": reversed_members,
+            }
+        )
+        _rewrite_terminal_receipt(
+            state,
+            completed.scan_id,
+            mutate=lambda receipt: receipt.__setitem__(
+                "observation_membership_digest", bad_order_digest
+            ),
+            recompute_digest=True,
+        )
+    else:
+        with state._connect() as connection:
+            connection.execute("DROP TRIGGER trg_routing_lan_terminal_observation_update_immutable")
+            connection.execute(
+                """
+                UPDATE routing_lan_observations
+                SET freshness_timestamp = '2026-08-01 12:00:00'
+                WHERE scan_id = ? AND endpoint_id = ?
+                """,
+                (completed.scan_id, observations[0].endpoint_binding_digest),
+            )
+        LanDiscoveryLedger(state)
+
+    current = LanDiscoveryLedger(state).get_scan(completed.scan_id)
+    assert current is not None and current.terminal_receipt_digest is not None
+    with state._connect() as connection, pytest.raises((KeyError, ValueError)):
+        load_authenticated_task4_observation(
+            connection,
+            scan_id=current.scan_id,
+            endpoint_binding_digest=observations[0].endpoint_binding_digest,
+            expected_terminal_receipt_digest=current.terminal_receipt_digest,
+            expected_observation_digest=observations[0].observation_digest,
+            authenticated_owner_principal=OWNER,
+        )
+
+    provider_id = _provider_id(observations[0].endpoint_binding_digest)
+    target_id = _target_id(provider_id, "alpha")
+    with pytest.raises(LanDiscoveryConflict):
+        LanDiscoveryService(RoutingLedger(state), clock=lambda: NOW).import_observation(
+            _import_request(
+                observations[0],
+                current,
+                profile_revision=0,
+                target_revisions=((target_id, 0),),
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+    assert RoutingLedger(state).list_provider_profiles() == []
+    assert RoutingLedger(state).list_model_targets() == []
 
 
 @pytest.mark.parametrize(
@@ -5398,8 +5667,8 @@ def _enabled_alpha_with_fresh_disabled_beta(
     *,
     scan_id: str,
 ):
-    _observation, registry, _service, provider_id, alpha_id, enabled = (
-        _enabled_task5b_binding(state, scan_id=scan_id)
+    _observation, registry, _service, provider_id, alpha_id, enabled = _enabled_task5b_binding(
+        state, scan_id=scan_id
     )
     beta_observation = _positive_observation(
         models=("beta",),
@@ -5988,10 +6257,10 @@ def test_outage_last_enabled_expiry_requires_complete_cas_before_write(
             _import_request(
                 outage,
                 outage_scan,
-                profile_revision=(profile.revision - 1 if missing_cas == "profile" else profile.revision),
-                target_revisions=(
-                    () if missing_cas == "target" else ((alpha_id, alpha.revision),)
+                profile_revision=(
+                    profile.revision - 1 if missing_cas == "profile" else profile.revision
                 ),
+                target_revisions=(() if missing_cas == "target" else ((alpha_id, alpha.revision),)),
             ),
             authenticated_owner_principal=OWNER,
         )
@@ -6050,8 +6319,8 @@ def test_marker_downgrade_authority_invalidation_rolls_back_atomically(
     import nested_memvid_agent.routing.ledger_registry as ledger_registry
 
     state = AgentStateStore(tmp_path / "state" / "agent.db")
-    observation, registry, _service, provider_id, target_id, enabled = (
-        _enabled_task5b_binding(state, scan_id="scan-binding-before-downgrade-crash")
+    observation, registry, _service, provider_id, target_id, enabled = _enabled_task5b_binding(
+        state, scan_id="scan-binding-before-downgrade-crash"
     )
     _row, downgrade_scan = _persist_completed_scan(
         state,
@@ -6095,11 +6364,9 @@ def test_runtime_interface_binding_digest_clears_on_every_stale_transition(
     invalidation: str,
 ) -> None:
     state = AgentStateStore(tmp_path / "state" / "agent.db")
-    observation, registry, _service, provider_id, target_id, enabled = (
-        _enabled_task5b_binding(
-            state,
-            scan_id=f"scan-binding-before-{invalidation}",
-        )
+    observation, registry, _service, provider_id, target_id, enabled = _enabled_task5b_binding(
+        state,
+        scan_id=f"scan-binding-before-{invalidation}",
     )
     old_protected = enabled.target.target.metadata["lan_discovery"]
     assert old_protected["reviewed_runtime_interface_binding_digest"] is not None
@@ -6161,13 +6428,9 @@ def test_runtime_interface_binding_digest_clears_on_every_stale_transition(
                 provider_profile_id=provider_id,
                 expected_profile_revision=enabled.profile.revision,
                 expected_endpoint_fingerprint=str(
-                    enabled.profile.profile.metadata["lan_discovery"][
-                        "endpoint_fingerprint"
-                    ]
+                    enabled.profile.profile.metadata["lan_discovery"]["endpoint_fingerprint"]
                 ),
-                expected_material_binding_digests=(
-                    str(old_protected["material_binding_digest"]),
-                ),
+                expected_material_binding_digests=(str(old_protected["material_binding_digest"]),),
             ),
         )
 
@@ -6180,10 +6443,7 @@ def test_runtime_interface_binding_digest_clears_on_every_stale_transition(
     assert stale.target.enabled is False
     assert stale.target.metadata["lan_discovery"]["stale_reasons"]
     assert (
-        stale.target.metadata["lan_discovery"][
-            "reviewed_runtime_interface_binding_digest"
-        ]
-        is None
+        stale.target.metadata["lan_discovery"]["reviewed_runtime_interface_binding_digest"] is None
     )
 
 
@@ -6311,9 +6571,7 @@ def test_task5b_positive_reimport_upgrades_exact_legacy_task5a_target_shape(
     ).review_lan_target(enable, authenticated_owner_principal=OWNER)
     assert enabled.target.target.enabled is True
     assert (
-        enabled.target.target.metadata["lan_discovery"][
-            "reviewed_runtime_interface_binding_digest"
-        ]
+        enabled.target.target.metadata["lan_discovery"]["reviewed_runtime_interface_binding_digest"]
         is not None
     )
 
@@ -6431,9 +6689,7 @@ def test_task5b_marker_requires_post_install_positive_reimport_before_enable(
         )
     assert registry.get_provider_profile(provider_id) == after_disabled_profile
     assert registry.get_model_target(target_id) == after_disabled_target
-    assert (
-        after_disabled_profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
-    )
+    assert after_disabled_profile.profile.metadata["lan_discovery"]["runtime_hardening"] is None
     assert after_disabled_target.target.metadata["lan_discovery"]["runtime_hardening"] is None
 
     _row, refreshed_scan = _persist_completed_scan(
@@ -6484,9 +6740,7 @@ def test_task5b_marker_requires_post_install_positive_reimport_before_enable(
     assert enabled.target.target.health == "unknown"
     assert enabled.target.target.metadata["lan_discovery"]["reviewed"] is True
     assert (
-        enabled.target.target.metadata["lan_discovery"][
-            "reviewed_runtime_interface_binding_digest"
-        ]
+        enabled.target.target.metadata["lan_discovery"]["reviewed_runtime_interface_binding_digest"]
         is not None
     )
     assert enabled.privacy_acknowledgement_digest == privacy_digest
@@ -6662,9 +6916,7 @@ def test_enabled_review_inventory_failure_is_closed_and_byte_for_byte_atomic(
     assert current is not None
     assert current.target.enabled is False
     assert (
-        current.target.metadata["lan_discovery"][
-            "reviewed_runtime_interface_binding_digest"
-        ]
+        current.target.metadata["lan_discovery"]["reviewed_runtime_interface_binding_digest"]
         is None
     )
 
@@ -6920,9 +7172,7 @@ def test_forged_profile_marker_mismatch_blocks_enable_without_partial_write(
     target = registry.get_model_target(target_id)
     assert profile is not None and target is not None
     forged_profile_metadata = json.loads(json.dumps(profile.profile.metadata))
-    forged_profile_metadata["lan_discovery"]["runtime_hardening"] = (
-        "kestrel.lan.runtime.openai.v0"
-    )
+    forged_profile_metadata["lan_discovery"]["runtime_hardening"] = "kestrel.lan.runtime.openai.v0"
     with state._connect() as connection:
         connection.execute(
             "UPDATE routing_provider_profiles SET metadata_json = ? WHERE profile_id = ?",

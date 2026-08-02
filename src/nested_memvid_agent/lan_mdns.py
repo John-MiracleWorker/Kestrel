@@ -15,8 +15,10 @@ import socket
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
+from math import isfinite
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -40,9 +42,7 @@ ALLOWED_MODEL_SERVICE_TYPES = (
 )
 MAX_MDNS_METADATA_BYTES = 4096
 
-_DISPLAY_TXT_FIELDS = frozenset(
-    {"display_name", "description", "vendor", "product", "version"}
-)
+_DISPLAY_TXT_FIELDS = frozenset({"display_name", "description", "vendor", "product", "version"})
 # This per-field cap also guarantees that reconciling all five fields (including
 # worst-case JSON escaping) stays within the canonical aggregate byte bound.
 _MAX_DISPLAY_VALUE_BYTES = 300
@@ -117,6 +117,14 @@ class CurrentInterfaceState:
     addresses: tuple[str, ...]
 
 
+class MdnsAvailability(StrEnum):
+    """Closed mDNS capability/collection outcomes."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    TIMED_OUT = "timed_out"
+
+
 @dataclass(frozen=True)
 class MdnsRecord:
     """A narrow, deliberately untrusted adapter callback value."""
@@ -187,6 +195,46 @@ class LanCandidate:
         """mDNS never grants or even suggests provider identity."""
 
         return None
+
+
+@dataclass(frozen=True, eq=False)
+class MdnsCollection:
+    """A typed collection outcome; available-empty is not unavailable."""
+
+    availability: MdnsAvailability
+    candidates: tuple[LanCandidate, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.availability) is not MdnsAvailability:
+            raise ValueError("mDNS availability must use the closed enum")
+        if type(self.candidates) is not tuple or any(
+            type(candidate) is not LanCandidate for candidate in self.candidates
+        ):
+            raise ValueError("mDNS candidates must be an exact typed tuple")
+
+    def __iter__(self) -> Iterator[LanCandidate]:
+        return iter(self.candidates)
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def __getitem__(self, index: int) -> LanCandidate:
+        return self.candidates[index]
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is MdnsCollection:
+            return self.availability == other.availability and self.candidates == other.candidates
+        if type(other) is tuple:
+            return self.candidates == other
+        return False
+
+
+class _MdnsAdapterCreationError(RuntimeError):
+    """Fixed startup failure that retains partial live cleanup authority."""
+
+    def __init__(self, cleanup_handle: object) -> None:
+        self.cleanup_handle = cleanup_handle
+        super().__init__("mDNS adapter startup failed")
 
 
 class MdnsSession(Protocol):
@@ -268,9 +316,7 @@ class _CandidateState:
             )[:MAX_ACTIVE_HOSTS]
         )
         self._candidates = {
-            key: candidate
-            for key, candidate in self._candidates.items()
-            if key in retained_keys
+            key: candidate for key, candidate in self._candidates.items() if key in retained_keys
         }
 
 
@@ -280,7 +326,9 @@ def collect_mdns_candidates(
     adapter_factory: MdnsAdapterFactory | None = None,
     clock: Callable[[], float] = time.monotonic,
     interface_state_resolver: InterfaceStateResolver | None = None,
-) -> tuple[LanCandidate, ...]:
+    absolute_deadline: float | None = None,
+    cleanup_handle_sink: Callable[[object], None] | None = None,
+) -> MdnsCollection:
     """Collect one fixed-window, passive set for a canonical owner-confirmed scope."""
 
     canonical_scope = _authenticate_scope(scope)
@@ -292,27 +340,62 @@ def collect_mdns_candidates(
             else _resolve_current_interface_state
         ),
     )
-    limits = LanScanLimits()
     started_at = clock()
-    deadline = started_at + limits.mdns_window_seconds
+    collection_deadline = started_at + LanScanLimits().mdns_window_seconds
+    cleanup_deadline = collection_deadline + _LIVE_CLEANUP_SECONDS
+    if absolute_deadline is not None:
+        if (
+            isinstance(absolute_deadline, bool)
+            or not isinstance(absolute_deadline, (int, float))
+            or not isfinite(float(absolute_deadline))
+        ):
+            raise ValueError("mDNS absolute deadline must be numeric")
+        cleanup_deadline = float(absolute_deadline)
+        collection_deadline = min(collection_deadline, cleanup_deadline)
+    if started_at >= collection_deadline:
+        return MdnsCollection(MdnsAvailability.TIMED_OUT, ())
     state = _CandidateState(
         scope=canonical_scope,
         binding=binding,
-        deadline=deadline,
+        deadline=collection_deadline,
         clock=clock,
     )
     factory = adapter_factory if adapter_factory is not None else _live_adapter_factory
     session: MdnsSession | None = None
+    partial_creation = False
     try:
-        session = factory(binding, ALLOWED_MODEL_SERVICE_TYPES, state.admit)
-        remaining = max(0.0, deadline - clock())
+        try:
+            session = factory(binding, ALLOWED_MODEL_SERVICE_TYPES, state.admit)
+        except ModuleNotFoundError:
+            return MdnsCollection(MdnsAvailability.UNAVAILABLE, ())
+        except _MdnsAdapterCreationError as exc:
+            cleanup = exc.cleanup_handle
+            if not isinstance(cleanup, _LiveMdnsSession):
+                raise RuntimeError("mDNS adapter startup failed") from None
+            session = cleanup
+            partial_creation = True
+            if cleanup_handle_sink is not None:
+                cleanup_handle_sink(cleanup)
+            cleanup.wait_finished(timeout_seconds=max(0.0, cleanup_deadline - clock()))
+            raise RuntimeError("mDNS adapter startup failed") from None
+        if cleanup_handle_sink is not None and type(session) is _LiveMdnsSession:
+            cleanup_handle_sink(session)
+        remaining = max(0.0, collection_deadline - clock())
         session.wait(remaining)
     finally:
         # This lock transition happens before browser cancellation/join in close().
         state.close_admissions()
-        if session is not None:
-            session.close()
-    return state.snapshot()
+        if session is not None and not partial_creation:
+            if isinstance(session, _LiveMdnsSession):
+                session.close(
+                    timeout_seconds=max(
+                        0.0,
+                        min(_LIVE_CLEANUP_SECONDS, cleanup_deadline - clock()),
+                    )
+                )
+            else:
+                session.close()
+    return MdnsCollection(MdnsAvailability.AVAILABLE, state.snapshot())
 
 
 def _authenticate_scope(scope: PrivateScanScope) -> PrivateScanScope:
@@ -370,8 +453,7 @@ def _binding_for_scope(
     except (TypeError, ValueError) as exc:
         raise ValueError("mDNS current selected interface addresses are invalid") from exc
     if not all(
-        _is_eligible_confirmed_interface_address(value)
-        for value in current_interface.addresses
+        _is_eligible_confirmed_interface_address(value) for value in current_interface.addresses
     ):
         raise ValueError("mDNS current selected interface addresses are invalid")
     if current_interface.addresses != scope.interface.addresses:
@@ -698,7 +780,9 @@ class _LiveMdnsSession:
         bounded = min(max(0.0, seconds), LanScanLimits().mdns_window_seconds)
         self._wait_event.wait(bounded)
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: float = _LIVE_CLEANUP_SECONDS) -> None:
+        if timeout_seconds < 0:
+            raise ValueError("mDNS cleanup timeout must not be negative")
         with self._close_lock:
             if self._cleanup_thread is None:
                 self._cleanup_thread = threading.Thread(
@@ -707,10 +791,43 @@ class _LiveMdnsSession:
                     daemon=True,
                 )
                 self._cleanup_thread.start()
-        if not self._cleanup_done.wait(_LIVE_CLEANUP_SECONDS):
+        if not self._wait_for_cleanup_thread(min(timeout_seconds, _LIVE_CLEANUP_SECONDS)):
             raise TimeoutError("live mDNS cleanup did not settle within its bounded window")
         if self._cleanup_error is not None:
             raise self._cleanup_error
+
+    def is_quiescent(self) -> bool:
+        return self.is_finished() and self._cleanup_error is None
+
+    def wait_quiescent(self, *, timeout_seconds: float) -> bool:
+        if timeout_seconds < 0:
+            raise ValueError("mDNS cleanup timeout must not be negative")
+        return self._wait_for_cleanup_thread(timeout_seconds) and self._cleanup_error is None
+
+    def is_finished(self) -> bool:
+        cleanup_thread = self._cleanup_thread
+        return (
+            self._cleanup_done.is_set()
+            and cleanup_thread is not None
+            and cleanup_thread is not threading.current_thread()
+            and not cleanup_thread.is_alive()
+        )
+
+    def wait_finished(self, *, timeout_seconds: float) -> bool:
+        if timeout_seconds < 0:
+            raise ValueError("mDNS cleanup timeout must not be negative")
+        return self._wait_for_cleanup_thread(timeout_seconds)
+
+    def _wait_for_cleanup_thread(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        if not self._cleanup_done.wait(timeout_seconds):
+            return False
+        cleanup_thread = self._cleanup_thread
+        if cleanup_thread is None or cleanup_thread is threading.current_thread():
+            return False
+        if cleanup_thread.is_alive():
+            cleanup_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not cleanup_thread.is_alive()
 
     def _cleanup(self) -> None:
         try:
@@ -750,10 +867,12 @@ def _live_adapter_factory(
         return _LiveMdnsSession(zeroconf, browser)
     except Exception as creation_error:
         if browser is not None or zeroconf is not None:
+            cleanup_handle = _LiveMdnsSession(zeroconf, browser)
             try:
-                _LiveMdnsSession(zeroconf, browser).close()
-            except Exception as cleanup_error:
-                creation_error.add_note(f"bounded mDNS cleanup also failed: {cleanup_error}")
+                cleanup_handle.close(timeout_seconds=0.0)
+            except Exception:
+                pass
+            raise _MdnsAdapterCreationError(cleanup_handle) from creation_error
         raise
 
 
@@ -766,8 +885,11 @@ def _cached_mdns_record(
 ) -> MdnsRecord | None:
     if type(service_type) is not str or service_type not in ALLOWED_MODEL_SERVICE_TYPES:
         raise ValueError("live mDNS callback service type is not allowed")
-    if type(name) is not str or not name or len(name.encode("utf-8")) > (
-        _MAX_INSTANCE_NAME_BYTES + len(service_type.encode("utf-8")) + 1
+    if (
+        type(name) is not str
+        or not name
+        or len(name.encode("utf-8"))
+        > (_MAX_INSTANCE_NAME_BYTES + len(service_type.encode("utf-8")) + 1)
     ):
         raise ValueError("live mDNS callback name is invalid")
 
@@ -811,10 +933,9 @@ def _cached_mdns_record(
     )
     addresses: list[object] = []
     for address_record in address_records:
-        if (
-            getattr(address_record, "class_", None) != _DNS_CLASS_IN
-            or getattr(address_record, "type", None) not in {_DNS_TYPE_A, _DNS_TYPE_AAAA}
-        ):
+        if getattr(address_record, "class_", None) != _DNS_CLASS_IN or getattr(
+            address_record, "type", None
+        ) not in {_DNS_TYPE_A, _DNS_TYPE_AAAA}:
             continue
         if not _cache_record_is_fresh(address_record, now_millis):
             continue

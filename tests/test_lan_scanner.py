@@ -33,6 +33,7 @@ from nested_memvid_agent.lan_scanner import (
     CapabilityObservationStatus,
     CapabilityProvenance,
     LanFailureCategory,
+    LanScanProgress,
     Reachability,
     ScanCancellation,
     TransportSecurity,
@@ -689,6 +690,152 @@ def test_untyped_http_adapter_response_is_a_reachable_protocol_failure() -> None
     assert all(
         item.failure_category is LanFailureCategory.HTTP_PROTOCOL_REJECTED for item in observations
     )
+
+
+def test_injected_executor_uses_one_absolute_deadline_and_emits_typed_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = scope_fixture("192.168.60.1/32", "192.168.60.1/32")
+    progress: list[LanScanProgress] = []
+    external = concurrent.futures.ThreadPoolExecutor(
+        max_workers=16,
+        thread_name_prefix="task6-injected-probe",
+    )
+
+    class CapturingTcpProbe(RecordingTcpProbe):
+        def __init__(self) -> None:
+            super().__init__(reachable=False)
+            self.deadlines: list[float] = []
+
+        def tcp_reachable(self, *args, deadline: float, **kwargs):
+            self.deadlines.append(deadline)
+            return super().tcp_reachable(*args, deadline=deadline, **kwargs)
+
+    tcp = CapturingTcpProbe()
+    monkeypatch.setattr(
+        lan_scanner_module,
+        "ThreadPoolExecutor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production manager path must not create a nested executor")
+        ),
+    )
+    try:
+        observations = scan_lan_scope(
+            scope,
+            LanScanLimits(),
+            clock=lambda: 100.0,
+            tcp_probe=tcp,
+            http_transport=RecordingHttpTransport({}),
+            interface_inventory_resolver=lambda: current_inventory(scope),
+            executor=external,
+            absolute_deadline=120.0,
+            progress=progress.append,
+        )
+    finally:
+        external.shutdown(wait=True)
+
+    assert len(observations) == 4
+    assert tcp.deadlines == [100.75] * 4
+    assert progress[0] == LanScanProgress(
+        phase="planned",
+        planned_count=4,
+        admitted_count=0,
+        completed_count=0,
+        observation=None,
+    )
+    assert [item.phase for item in progress].count("planned") == 1
+    assert [item.phase for item in progress].count("admitted") == 4
+    assert [item.phase for item in progress].count("completed") == 4
+    assert [item.admitted_count for item in progress if item.phase == "admitted"] == [1, 2, 3, 4]
+    assert [item.completed_count for item in progress if item.phase == "completed"] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert all(item.planned_count == 4 for item in progress)
+
+
+def test_progress_callback_failure_closes_admission_cancels_and_drains_injected_work() -> None:
+    scope = scope_fixture()
+    cancellation = ScanCancellation()
+    probe_entered = threading.Event()
+    probe_release = threading.Event()
+    callback_called = threading.Event()
+    controller_returned = threading.Event()
+    external = concurrent.futures.ThreadPoolExecutor(
+        max_workers=16,
+        thread_name_prefix="task6-progress-failure",
+    )
+    callbacks = 0
+    probe_calls = 0
+
+    class BlockedTcp(RecordingTcpProbe):
+        def tcp_reachable(self, *args, **kwargs):
+            nonlocal probe_calls
+            probe_calls += 1
+            probe_entered.set()
+            assert probe_release.wait(timeout=3)
+            return super().tcp_reachable(*args, **kwargs)
+
+    tcp = BlockedTcp(reachable=False)
+
+    def fail_progress(progress: LanScanProgress) -> None:
+        nonlocal callbacks
+        callbacks += 1
+        if progress.phase == "planned":
+            return
+        callback_called.set()
+        raise RuntimeError("secret progress callback body")
+
+    failures: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            scan_lan_scope(
+                scope,
+                LanScanLimits(),
+                cancellation=cancellation,
+                clock=lambda: 100.0,
+                tcp_probe=tcp,
+                http_transport=RecordingHttpTransport({}),
+                interface_inventory_resolver=lambda: current_inventory(scope),
+                executor=external,
+                absolute_deadline=120.0,
+                progress=fail_progress,
+            )
+        except BaseException as exc:  # noqa: BLE001 - assert fixed public failure below
+            failures.append(exc)
+        finally:
+            controller_returned.set()
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    try:
+        assert callback_called.wait(timeout=1.0)
+        assert probe_entered.wait(timeout=1.0)
+        assert worker.is_alive()
+        assert controller_returned.is_set() is False
+        assert cancellation.is_cancelled() is True
+        assert probe_calls == 1
+        assert callbacks == 2
+    finally:
+        probe_release.set()
+        worker.join(timeout=2)
+    try:
+        sentinel = external.submit(lambda: "drained")
+        assert sentinel.result(timeout=1.0) == "drained"
+    finally:
+        external.shutdown(wait=True)
+
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert type(failures[0]) is RuntimeError
+    assert str(failures[0]) == "lan_scan_progress_failed"
+    assert callbacks == 2
+    assert probe_calls == 1
+    assert cancellation.is_cancelled() is True
+    assert len(tcp.destinations) == 1
 
 
 def test_catalog_is_sanitized_deduplicated_top_eight_and_digest_is_order_stable() -> None:

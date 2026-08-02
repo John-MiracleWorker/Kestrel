@@ -10,11 +10,12 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable, Mapping
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Executor, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from types import MappingProxyType
-from typing import Protocol
+from typing import Literal, Protocol
 
 from nested_memvid_agent.lan_discovery_models import (
     HTTP_PROBE_TIMEOUT_SECONDS,
@@ -543,6 +544,33 @@ class ScanCancellation:
             return submit(), None
 
 
+@dataclass(frozen=True)
+class LanScanProgress:
+    """Bounded monotonic progress emitted for planning, admission, and completion."""
+
+    phase: Literal["planned", "admitted", "completed"]
+    planned_count: int
+    admitted_count: int
+    completed_count: int
+    observation: LanEndpointObservation | None
+
+    def __post_init__(self) -> None:
+        if self.phase not in {"planned", "admitted", "completed"}:
+            raise ValueError("LAN progress phase is invalid")
+        for field_name in ("planned_count", "admitted_count", "completed_count"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"LAN progress {field_name} must be a non-negative integer")
+        if not self.completed_count <= self.admitted_count <= self.planned_count:
+            raise ValueError("LAN progress counters are not monotonic")
+        if self.phase in {"planned", "admitted"} and self.observation is not None:
+            raise ValueError("planning and admission progress cannot include an observation")
+        if self.phase == "planned" and (self.admitted_count != 0 or self.completed_count != 0):
+            raise ValueError("planning progress must precede all admitted work")
+        if self.phase == "completed" and type(self.observation) is not LanEndpointObservation:
+            raise ValueError("completion progress requires an exact observation")
+
+
 def scan_lan_scope(
     scope: PrivateScanScope,
     limits: LanScanLimits,
@@ -553,6 +581,9 @@ def scan_lan_scope(
     tcp_probe: LanTcpProbe | None = None,
     http_transport: LanHttpTransport | None = None,
     interface_inventory_resolver: InterfaceInventoryResolver | None = None,
+    executor: Executor | None = None,
+    absolute_deadline: float | None = None,
+    progress: Callable[[LanScanProgress], None] | None = None,
 ) -> tuple[LanEndpointObservation, ...]:
     """Probe a deterministic matrix with a sliding at-most-sixteen-task window."""
 
@@ -573,15 +604,61 @@ def scan_lan_scope(
     http = http_transport or direct
     started_at = clock()
     scan_deadline = started_at + TOTAL_SCAN_DEADLINE_SECONDS
+    if absolute_deadline is not None:
+        if (
+            isinstance(absolute_deadline, bool)
+            or not isinstance(absolute_deadline, (int, float))
+            or not isfinite(float(absolute_deadline))
+        ):
+            raise ValueError("LAN scan absolute deadline must be finite numeric time")
+        scan_deadline = min(scan_deadline, float(absolute_deadline))
+    if progress is not None and not callable(progress):
+        raise TypeError("LAN scan progress callback must be callable")
     results: list[LanEndpointObservation | None] = [None] * len(endpoints)
     next_index = 0
     closure_failure: LanFailureCategory | None = None
     pending: dict[Future[LanEndpointObservation], int] = {}
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_SCAN_CONCURRENCY,
-        thread_name_prefix="kestrel-lan-probe",
-    ) as executor:
+    owned_executor = (
+        ThreadPoolExecutor(
+            max_workers=MAX_SCAN_CONCURRENCY,
+            thread_name_prefix="kestrel-lan-probe",
+        )
+        if executor is None
+        else None
+    )
+    active_executor = executor if executor is not None else owned_executor
+    if active_executor is None:
+        raise RuntimeError("LAN scan executor unavailable")
+    admitted_count = 0
+    completed_count = 0
+    progress_failed = False
+    submission_failed = False
+
+    def emit_progress(event: LanScanProgress) -> bool:
+        nonlocal progress_failed
+        if progress is None or progress_failed:
+            return not progress_failed
+        try:
+            progress(event)
+        except Exception:
+            progress_failed = True
+            token.cancel()
+            return False
+        return True
+
+    if not emit_progress(
+        LanScanProgress(
+            phase="planned",
+            planned_count=len(endpoints),
+            admitted_count=0,
+            completed_count=0,
+            observation=None,
+        )
+    ):
+        closure_failure = LanFailureCategory.CANCELLED
+
+    try:
         while pending or next_index < len(endpoints):
             while (
                 closure_failure is None
@@ -591,7 +668,7 @@ def scan_lan_scope(
                 index = next_index
 
                 def submit_endpoint(index: int = index) -> Future[LanEndpointObservation]:
-                    return executor.submit(
+                    return active_executor.submit(
                         probe_lan_endpoint,
                         canonical_scope,
                         endpoints[index],
@@ -603,17 +680,35 @@ def scan_lan_scope(
                         interface_inventory_resolver=interface_inventory_resolver,
                     )
 
-                future, admission_failure = token._admit(
-                    deadline=scan_deadline,
-                    clock=clock,
-                    submit=submit_endpoint,
-                )
+                try:
+                    future, admission_failure = token._admit(
+                        deadline=scan_deadline,
+                        clock=clock,
+                        submit=submit_endpoint,
+                    )
+                except Exception:
+                    submission_failed = True
+                    token.cancel()
+                    closure_failure = LanFailureCategory.CANCELLED
+                    break
                 if admission_failure is not None:
                     closure_failure = admission_failure
                     break
                 assert future is not None
                 next_index += 1
                 pending[future] = index
+                admitted_count += 1
+                if not emit_progress(
+                    LanScanProgress(
+                        phase="admitted",
+                        planned_count=len(endpoints),
+                        admitted_count=admitted_count,
+                        completed_count=completed_count,
+                        observation=None,
+                    )
+                ):
+                    closure_failure = LanFailureCategory.CANCELLED
+                    break
 
             if not pending:
                 break
@@ -638,6 +733,24 @@ def scan_lan_scope(
                         reachability=Reachability.UNREACHABLE,
                         failure_category=LanFailureCategory.TCP_ERROR,
                     )
+                completed_count += 1
+                if not emit_progress(
+                    LanScanProgress(
+                        phase="completed",
+                        planned_count=len(endpoints),
+                        admitted_count=admitted_count,
+                        completed_count=completed_count,
+                        observation=results[index],
+                    )
+                ):
+                    closure_failure = LanFailureCategory.CANCELLED
+    finally:
+        if owned_executor is not None:
+            shutdown = getattr(owned_executor, "shutdown", None)
+            if callable(shutdown):
+                shutdown(wait=True, cancel_futures=False)
+            else:
+                owned_executor.__exit__(None, None, None)
 
     if closure_failure is None:
         closure_failure = (
@@ -652,6 +765,10 @@ def scan_lan_scope(
                 reachability=Reachability.NOT_ATTEMPTED,
                 failure_category=closure_failure,
             )
+    if progress_failed:
+        raise RuntimeError("lan_scan_progress_failed") from None
+    if submission_failed:
+        raise RuntimeError("lan_scan_executor_submission_failed") from None
     return tuple(result for result in results if result is not None)
 
 

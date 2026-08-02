@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -17,7 +18,9 @@ from nested_memvid_agent.lan_mdns import (
     ALLOWED_MODEL_SERVICE_TYPES,
     MAX_MDNS_METADATA_BYTES,
     LanCandidate,
+    MdnsAvailability,
     MdnsBinding,
+    MdnsCollection,
     MdnsRecord,
     collect_mdns_candidates,
 )
@@ -168,6 +171,239 @@ def test_collector_uses_exact_service_allowlist_and_known_ports_only() -> None:
     assert {(candidate.service_type, candidate.port) for candidate in candidates} == set(
         zip(ALLOWED_MODEL_SERVICE_TYPES, (1234, 8000, 8080, 11434), strict=True)
     )
+
+
+def test_collection_distinguishes_available_empty_unavailable_and_timed_out() -> None:
+    scope = scope_fixture()
+    available_clock = ManualClock()
+    available = collect_mdns_candidates(
+        scope,
+        adapter_factory=FakeAdapterFactory((), available_clock),
+        clock=available_clock,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+    assert isinstance(available, MdnsCollection)
+    assert available.availability is MdnsAvailability.AVAILABLE
+    assert available.candidates == ()
+
+    unavailable = collect_mdns_candidates(
+        scope,
+        adapter_factory=lambda *_args: (_ for _ in ()).throw(
+            ModuleNotFoundError("optional zeroconf unavailable")
+        ),
+        clock=lambda: 100.0,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+    assert unavailable.availability is MdnsAvailability.UNAVAILABLE
+    assert unavailable.candidates == ()
+
+    factory_calls = 0
+
+    def must_not_start(*_args: object) -> object:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("expired absolute deadline must precede mDNS startup")
+
+    timed_out = collect_mdns_candidates(
+        scope,
+        adapter_factory=must_not_start,
+        clock=lambda: 100.0,
+        absolute_deadline=100.0,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+    assert timed_out.availability is MdnsAvailability.TIMED_OUT
+    assert timed_out.candidates == ()
+    assert factory_calls == 0
+
+
+def test_synchronous_custom_session_closes_inline_without_retained_cleanup_authority() -> None:
+    scope = scope_fixture()
+    clock = ManualClock()
+    factory = FakeAdapterFactory((), clock)
+    retained: list[object] = []
+
+    outcome = collect_mdns_candidates(
+        scope,
+        adapter_factory=factory,
+        clock=clock,
+        cleanup_handle_sink=retained.append,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+
+    assert outcome.availability is MdnsAvailability.AVAILABLE
+    assert factory.session is not None and factory.session.close_calls == 1
+    assert retained == []
+
+
+def test_collection_window_is_capped_by_shared_absolute_deadline() -> None:
+    scope = scope_fixture()
+    clock = ManualClock()
+    factory = FakeAdapterFactory((), clock)
+
+    outcome = collect_mdns_candidates(
+        scope,
+        adapter_factory=factory,
+        clock=clock,
+        absolute_deadline=101.0,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+
+    assert outcome.availability is MdnsAvailability.AVAILABLE
+    assert factory.session is not None
+    assert factory.session.wait_seconds == [1.0]
+
+
+@pytest.mark.parametrize("deadline", [True, math.nan, math.inf, -math.inf])
+def test_collection_rejects_non_finite_or_boolean_absolute_deadline(deadline: object) -> None:
+    scope = scope_fixture()
+    factory_calls = 0
+
+    def factory(*_args: object) -> object:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("invalid deadline must fail before mDNS startup")
+
+    with pytest.raises(ValueError, match="absolute deadline"):
+        collect_mdns_candidates(
+            scope,
+            adapter_factory=factory,
+            clock=lambda: 100.0,
+            absolute_deadline=deadline,  # type: ignore[arg-type]
+            interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                interface_index=7,
+                addresses=scope.interface.addresses,
+            ),
+        )
+    assert factory_calls == 0
+
+
+def test_shared_deadline_remaining_budget_is_passed_to_live_cleanup() -> None:
+    scope = scope_fixture()
+    clock = ManualClock()
+    close_timeouts: list[float] = []
+
+    class DeadlineSession(lan_mdns._LiveMdnsSession):  # noqa: SLF001
+        def __init__(self) -> None:
+            pass
+
+        def wait(self, seconds: float) -> None:
+            assert seconds == 1.0
+            clock.advance(0.6)
+
+        def close(self, *, timeout_seconds: float) -> None:
+            close_timeouts.append(timeout_seconds)
+
+    outcome = collect_mdns_candidates(
+        scope,
+        adapter_factory=lambda *_args: DeadlineSession(),
+        clock=clock,
+        absolute_deadline=101.0,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+
+    assert outcome.availability is MdnsAvailability.AVAILABLE
+    assert close_timeouts == pytest.approx([0.4])
+
+
+def test_collection_window_does_not_consume_the_shared_cleanup_budget() -> None:
+    scope = scope_fixture()
+    clock = ManualClock()
+    close_timeouts: list[float] = []
+
+    class SharedDeadlineSession(lan_mdns._LiveMdnsSession):  # noqa: SLF001
+        def __init__(self) -> None:
+            pass
+
+        def wait(self, seconds: float) -> None:
+            assert seconds == 2.5
+            clock.advance(seconds)
+
+        def close(self, *, timeout_seconds: float) -> None:
+            close_timeouts.append(timeout_seconds)
+
+    outcome = collect_mdns_candidates(
+        scope,
+        adapter_factory=lambda *_args: SharedDeadlineSession(),
+        clock=clock,
+        absolute_deadline=145.0,
+        interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+            interface_index=7,
+            addresses=scope.interface.addresses,
+        ),
+    )
+
+    assert outcome.availability is MdnsAvailability.AVAILABLE
+    assert close_timeouts == [0.75]
+
+
+def test_partial_live_adapter_cleanup_is_registered_before_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = scope_fixture()
+    cleanup_started = threading.Event()
+    cleanup_finished = threading.Event()
+    cleanup_release = threading.Event()
+    retained: list[object] = []
+
+    class FakeIPVersion:
+        V4Only = "v4"
+
+    class PartialZeroconf:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def close(self) -> None:
+            cleanup_started.set()
+            cleanup_release.wait(timeout=0.2)
+            cleanup_finished.set()
+
+    fake_module = SimpleNamespace(
+        IPVersion=FakeIPVersion,
+        Zeroconf=PartialZeroconf,
+        ServiceBrowser=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("hostile partial startup detail")
+        ),
+    )
+    monkeypatch.setattr(lan_mdns.importlib, "import_module", lambda _name: fake_module)
+
+    try:
+        with pytest.raises(RuntimeError, match="adapter startup failed"):
+            collect_mdns_candidates(
+                scope,
+                clock=lambda: 100.0,
+                absolute_deadline=100.01,
+                cleanup_handle_sink=retained.append,
+                interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
+                    interface_index=7,
+                    addresses=scope.interface.addresses,
+                ),
+            )
+        assert cleanup_started.is_set()
+        assert cleanup_finished.is_set() is False
+        assert len(retained) == 1
+        cleanup = retained[0]
+        assert cleanup.is_quiescent() is False  # type: ignore[attr-defined]
+    finally:
+        cleanup_release.set()
+    assert retained[0].wait_quiescent(timeout_seconds=1.0) is True  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(
@@ -569,9 +805,7 @@ def test_domain_relevant_product_version_and_sentence_punctuation_remain_display
     field: bytes,
     display_value: bytes,
 ) -> None:
-    candidates, _factory = collect_fake(
-        [record(properties={field: display_value})]
-    )
+    candidates, _factory = collect_fake([record(properties={field: display_value})])
 
     assert len(candidates) == 1
     assert dict(candidates[0].metadata) == {field.decode("ascii"): display_value.decode("ascii")}
@@ -584,9 +818,7 @@ def test_domain_relevant_product_version_and_sentence_punctuation_remain_display
 def test_numeric_version_syntax_does_not_admit_private_ip_material(
     private_ip_version: bytes,
 ) -> None:
-    candidates, _factory = collect_fake(
-        [record(properties={b"version": private_ip_version})]
-    )
+    candidates, _factory = collect_fake([record(properties={b"version": private_ip_version})])
 
     assert candidates == ()
 
@@ -848,9 +1080,7 @@ def cached_record_fixture(
             ),
         )
     records.extend(address_records)
-    address_bucket = {
-        f"address-{index}": address for index, address in enumerate(address_records)
-    }
+    address_bucket = {f"address-{index}": address for index, address in enumerate(address_records)}
     zeroconf = SimpleNamespace(
         cache=SimpleNamespace(
             cache={
@@ -1030,6 +1260,7 @@ def test_live_listener_fails_closed_when_expiry_shape_drifts(
     if expiry_shape == "non-callable":
         srv_record.is_expired = None  # type: ignore[assignment]
     elif expiry_shape == "raising":
+
         def raise_from_expiry(_now: float) -> bool:
             raise RuntimeError("expiry shape drift")
 
@@ -1203,6 +1434,135 @@ def test_live_wrapper_uses_exact_binding_cache_only_reads_and_idempotent_close(
     ]
 
 
+@pytest.mark.parametrize("failing_resource", ["browser", "zeroconf"])
+def test_finished_live_cleanup_with_an_error_never_reports_quiescence(
+    failing_resource: str,
+) -> None:
+    class FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Callable[[], None]) -> None:
+            callback()
+
+    class FakeZeroconf:
+        loop = FakeLoop()
+
+        def close(self) -> None:
+            if failing_resource == "zeroconf":
+                raise RuntimeError("injected zeroconf cleanup failure")
+
+    class FakeBrowser:
+        def __init__(self, zeroconf: FakeZeroconf) -> None:
+            self.zc = zeroconf
+            self.queue = SimpleNamespace(put=self._queue_put)
+            self.alive = True
+
+        def _queue_put(self, _value: object) -> None:
+            if failing_resource == "browser":
+                raise RuntimeError("injected browser cleanup failure")
+            self.alive = False
+
+        def _async_cancel(self) -> None:
+            self.alive = False
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.25
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    zeroconf = FakeZeroconf()
+    session = lan_mdns._LiveMdnsSession(zeroconf, FakeBrowser(zeroconf))  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match=f"injected {failing_resource} cleanup failure"):
+        session.close(timeout_seconds=1.0)
+
+    assert session._cleanup_done.is_set() is True  # noqa: SLF001
+    assert session.wait_quiescent(timeout_seconds=0.0) is False
+    assert session.is_quiescent() is False
+    with pytest.raises(RuntimeError, match=f"injected {failing_resource} cleanup failure"):
+        session.close(timeout_seconds=1.0)
+
+
+def test_cleanup_done_signal_is_not_quiescent_until_the_cleanup_thread_exits() -> None:
+    cleanup_signalled = threading.Event()
+    release_cleanup_thread = threading.Event()
+
+    class GateEvent:
+        def __init__(self) -> None:
+            self._event = threading.Event()
+
+        def set(self) -> None:
+            self._event.set()
+            cleanup_signalled.set()
+            release_cleanup_thread.wait(timeout=2.0)
+
+        def is_set(self) -> bool:
+            return self._event.is_set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return self._event.wait(timeout)
+
+    class FakeLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Callable[[], None]) -> None:
+            callback()
+
+    class FakeZeroconf:
+        loop = FakeLoop()
+
+        def close(self) -> None:
+            return
+
+    class FakeBrowser:
+        def __init__(self, zeroconf: FakeZeroconf) -> None:
+            self.zc = zeroconf
+            self.queue = SimpleNamespace(put=self._queue_put)
+            self.alive = True
+
+        def _queue_put(self, _value: object) -> None:
+            self.alive = False
+
+        def _async_cancel(self) -> None:
+            self.alive = False
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.25
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    zeroconf = FakeZeroconf()
+    session = lan_mdns._LiveMdnsSession(zeroconf, FakeBrowser(zeroconf))  # noqa: SLF001
+    session._cleanup_done = GateEvent()  # type: ignore[assignment]  # noqa: SLF001
+    close_errors: list[BaseException] = []
+
+    def close_session() -> None:
+        try:
+            session.close(timeout_seconds=1.0)
+        except BaseException as exc:  # noqa: BLE001 - assert thread outcome below
+            close_errors.append(exc)
+
+    close_thread = threading.Thread(target=close_session, name="mdns-close-gate")
+    close_thread.start()
+    assert cleanup_signalled.wait(timeout=1.0)
+    assert session._cleanup_thread is not None  # noqa: SLF001
+    assert session._cleanup_thread.is_alive() is True  # noqa: SLF001
+    assert close_thread.is_alive() is True
+    assert session.is_quiescent() is False
+    assert session.wait_quiescent(timeout_seconds=0.01) is False
+
+    release_cleanup_thread.set()
+    close_thread.join(timeout=1.0)
+    assert close_thread.is_alive() is False
+    assert close_errors == []
+    assert session.is_quiescent() is True
+    assert session.wait_quiescent(timeout_seconds=0.0) is True
+
+
 def test_collection_never_calls_pinned_blocking_browser_cancel() -> None:
     events: list[object] = []
     cancel_release = threading.Event()
@@ -1285,6 +1645,7 @@ def test_cleanup_timeout_keeps_admissions_closed_and_does_not_restart(
     queue_put_calls = 0
     captured_callback: Callable[[MdnsRecord], None] | None = None
     session: lan_mdns._LiveMdnsSession | None = None  # noqa: SLF001
+    retained_cleanup: list[object] = []
 
     class FakeLoop:
         def is_closed(self) -> bool:
@@ -1370,6 +1731,7 @@ def test_cleanup_timeout_keeps_admissions_closed_and_does_not_restart(
                 scope,
                 adapter_factory=factory,
                 clock=ExpiredClockForCleanup(),
+                cleanup_handle_sink=retained_cleanup.append,
                 interface_state_resolver=lambda _identity: lan_mdns.CurrentInterfaceState(
                     interface_index=7,
                     addresses=scope.interface.addresses,
@@ -1381,6 +1743,8 @@ def test_cleanup_timeout_keeps_admissions_closed_and_does_not_restart(
         assert session is not None
         assert session._cleanup_thread is not None  # noqa: SLF001
         assert session._cleanup_thread.daemon is True  # noqa: SLF001
+        assert retained_cleanup == [session]
+        assert session.is_quiescent() is False
 
         assert captured_callback is not None
         captured_callback(record(instance="Too late"))
@@ -1391,6 +1755,8 @@ def test_cleanup_timeout_keeps_admissions_closed_and_does_not_restart(
 
     assert session is not None
     assert session._cleanup_done.wait(timeout=1.0)  # noqa: SLF001
+    assert session.wait_quiescent(timeout_seconds=1.0) is True
+    assert session.is_quiescent() is True
     session.close()
     session.close()
     assert queue_put_calls == 1
@@ -1566,11 +1932,14 @@ def test_live_wrapper_closes_partial_zeroconf_when_browser_creation_fails(
     )
     monkeypatch.setattr(lan_mdns.importlib, "import_module", lambda _name: fake_module)
 
-    with pytest.raises(RuntimeError, match="browser creation failed"):
+    with pytest.raises(RuntimeError, match="^mDNS adapter startup failed$") as caught:
         lan_mdns._live_adapter_factory(  # noqa: SLF001
             MdnsBinding(ipv4_addresses=("192.168.50.7",), ipv6_interface_index=None),
             ALLOWED_MODEL_SERVICE_TYPES,
             lambda _record: None,
         )
 
+    cleanup = caught.value.cleanup_handle  # type: ignore[attr-defined]
+    assert cleanup.wait_quiescent(timeout_seconds=1.0) is True
+    assert cleanup.is_quiescent() is True
     assert events == ["zeroconf.open", "browser.fail", "zeroconf.close"]

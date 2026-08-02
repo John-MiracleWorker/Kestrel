@@ -480,6 +480,43 @@ def test_shutdown_times_out_for_blocked_synchronous_scheduler_and_retries_cleanl
     assert manager.shutdown(timeout_seconds=1.0) is True
 
 
+def test_shutdown_closes_lan_lifecycle_admission_even_when_run_worker_is_blocked(
+    tmp_path,
+) -> None:
+    manager = _manager(tmp_path)
+    run_started = Event()
+    release_run = Event()
+
+    def blocked_turn(run_id, _config, _message, _session_id):
+        manager.state.transition_run(run_id, "running")
+        run_started.set()
+        release_run.wait(timeout=3)
+        manager.state.transition_run(run_id, "cancelled", stop_reason="cancelled")
+
+    manager._run_agent_turn = blocked_turn  # type: ignore[method-assign]
+
+    class LanLifecycle:
+        def __init__(self) -> None:
+            self.admission_closed = Event()
+
+        def shutdown(self, *, timeout_seconds: float) -> bool:
+            assert timeout_seconds >= 0
+            self.admission_closed.set()
+            return True
+
+    lifecycle = LanLifecycle()
+    manager.register_lifecycle_dependency("lan_scans", lifecycle)
+    manager.create_run(message="block while LAN admission closes", autonomy_mode="manual")
+    assert run_started.wait(timeout=2)
+
+    try:
+        assert manager.shutdown(timeout_seconds=0.01) is False
+        assert lifecycle.admission_closed.is_set()
+    finally:
+        release_run.set()
+    assert manager.shutdown(timeout_seconds=1.0) is True
+
+
 def test_cancelled_synchronous_scheduler_is_not_public_until_operation_closes(
     tmp_path,
 ) -> None:

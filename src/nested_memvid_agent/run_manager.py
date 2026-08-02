@@ -171,6 +171,7 @@ class RunManager:
         self._runtime_ownership = (
             PrimaryRuntimeOwnership(state.path) if enforce_single_owner else None
         )
+        start_cleanup_authoritative = False
         try:
             self.plugins = plugins or PluginManager(config.plugins_dir, state)
             self.capabilities = CapabilityPolicy(state, lambda: self.config)
@@ -189,6 +190,8 @@ class RunManager:
             self._memvid_agent_active = False
             self._memory_close_observer: Callable[[], None] | None = None
             self._shutdown_event = Event()
+            self._lifecycle_dependencies: dict[str, Any] = {}
+            self._startup_dependencies: dict[str, Callable[[], Any]] = {}
             self._approval_call_arguments: dict[str, tuple[str, dict[str, Any]]] = {}
             self._execution_locks = tuple(RLock() for _ in range(64))
             self._execution_context = local()
@@ -214,7 +217,12 @@ class RunManager:
                 tuple[MemoryCleanupIncompleteError, Callable[[], None]]
             ] = []
             self._shutting_down = False
+            self._shutdown_condition = Condition(self._lock)
+            self._shutdown_owner: Thread | None = None
+            self._shutdown_result: bool | None = None
+            self._startup_failure_cleanup_in_progress = False
             self._started = False
+            self._startup_in_progress = False
             self._start_lock = Lock()
             self._lease_owner = f"manager_{os.getpid()}_{uuid4().hex}"
             self._tool_fence = RuntimeToolFence()
@@ -228,9 +236,11 @@ class RunManager:
                 "preserved": [],
             }
             if auto_start:
+                start_cleanup_authoritative = True
                 self.start()
         except BaseException:
-            self._release_runtime_ownership()
+            if not start_cleanup_authoritative:
+                self._release_runtime_ownership()
             raise
 
     def configure_memory_close_observer(
@@ -243,6 +253,45 @@ class RunManager:
             raise TypeError("memory close observer must be callable")
         with self._memvid_agent_condition:
             self._memory_close_observer = observer
+
+    def register_lifecycle_dependency(self, name: str, dependency: Any) -> None:
+        """Register bounded cleanup that must finish before ownership release."""
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("lifecycle dependency name is required")
+        if not callable(getattr(dependency, "shutdown", None)):
+            raise TypeError("lifecycle dependency must define shutdown")
+        with self._lock:
+            if self._shutting_down or self._startup_failure_cleanup_in_progress:
+                raise RuntimeError("run_manager_shutting_down")
+            if name in self._lifecycle_dependencies:
+                raise ValueError(f"lifecycle dependency already registered: {name}")
+            self._lifecycle_dependencies[name] = dependency
+
+    def register_startup_dependency(
+        self,
+        name: str,
+        startup: Callable[[], Any],
+    ) -> None:
+        """Bind startup work after ownership but before any recovery can run."""
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("startup dependency name is required")
+        if not callable(startup):
+            raise TypeError("startup dependency must be callable")
+        with self._lock:
+            if (
+                self._started
+                or self._startup_in_progress
+                or self._shutting_down
+                or self._startup_failure_cleanup_in_progress
+            ):
+                raise RuntimeError("runtime_manager_already_started")
+            if name not in self._lifecycle_dependencies:
+                raise ValueError("startup dependency requires matching lifecycle cleanup")
+            if name in self._startup_dependencies:
+                raise ValueError(f"startup dependency already registered: {name}")
+            self._startup_dependencies[name] = startup
 
     def _uses_actionable_project_routing(self) -> bool:
         """Return whether task-level routing, rather than the direct LLM, is authoritative."""
@@ -267,19 +316,54 @@ class RunManager:
             if self._started:
                 return
             try:
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                    self._startup_in_progress = True
+                    startup_dependencies = tuple(self._startup_dependencies.values())
                 if self._runtime_ownership is not None:
                     self._runtime_ownership.acquire()
-                self._started = True
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                for startup in startup_dependencies:
+                    startup()
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                    self._started = True
                 if not self.read_only_observer:
                     self.reconcile_capabilities()
+                    self._raise_if_startup_shutdown_requested()
                 if self._recover_startup_work:
                     self.startup_recovery = self._reconcile_startup()
+                    self._raise_if_startup_shutdown_requested()
                     self.startup_worker_recovery = self._reconcile_startup_workers()
+                    self._raise_if_startup_shutdown_requested()
                     self._resume_startup_queued_runs()
+                    self._raise_if_startup_shutdown_requested()
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                    self._startup_in_progress = False
             except BaseException:
-                self._started = False
-                self._release_runtime_ownership()
+                with self._lock:
+                    self._started = False
+                    self._startup_in_progress = False
+                    shutdown_won = self._shutting_down
+                if not shutdown_won:
+                    try:
+                        self._shutdown_after_start_failure(timeout_seconds=5.0)
+                    except BaseException:
+                        # Cleanup failure is fail-closed: the ownership handle
+                        # stays retained and the original startup error wins.
+                        pass
                 raise
+
+    def _raise_if_startup_shutdown_requested(self) -> None:
+        with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("runtime_manager_shut_down")
 
     def reconcile_capabilities(self) -> None:
         """Reconcile extension inventory at startup or an explicit refresh.
@@ -296,10 +380,10 @@ class RunManager:
     def _require_mutable_runtime(self, operation: str) -> None:
         if self.read_only_observer:
             raise RuntimeError(f"read_only_runtime_observer:{operation}")
-        if not self._started:
-            raise RuntimeError(f"runtime_not_started:{operation}")
         with self._lock:
             shutting_down = self._shutting_down
+        if not self._started and not (shutting_down and operation == "cancel_run"):
+            raise RuntimeError(f"runtime_not_started:{operation}")
         if shutting_down and operation != "cancel_run":
             if operation in {"create_run", "create_scheduled_routine_run"}:
                 raise RunCapacityError("run_manager_shutting_down")
@@ -6546,6 +6630,102 @@ class RunManager:
             return 1
         return max(1, active_config.max_concurrent_runs)
 
+    @staticmethod
+    def _stop_lifecycle_dependencies(
+        dependencies: tuple[Any, ...],
+        *,
+        deadline: float,
+    ) -> bool:
+        stopped_all = True
+        for dependency in dependencies:
+            try:
+                stopped = dependency.shutdown(timeout_seconds=max(0.0, deadline - monotonic()))
+            except Exception:  # noqa: BLE001 - retain ownership on cleanup failure
+                stopped = False
+            stopped_all = stopped_all and bool(stopped)
+        return stopped_all
+
+    def _shutdown_run_ids_locked(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                [
+                    *self._active_primary_runs,
+                    *(item[0] for item in self._queued_primary_runs),
+                    *self._reserved_primary_runs,
+                    *self._thread_run_ids.values(),
+                    *self._active_run_operations,
+                ]
+            )
+        )
+
+    def _signal_shutdown(self) -> None:
+        self._shutdown_event.set()
+        with self._memvid_agent_condition:
+            self._memvid_agent_condition.notify_all()
+
+    def _finish_shutdown_election(self, completed: bool) -> None:
+        caller = current_thread()
+        with self._shutdown_condition:
+            if self._shutdown_owner is caller:
+                self._shutdown_result = completed
+                self._shutdown_owner = None
+                self._shutdown_condition.notify_all()
+
+    def _wait_for_startup_failure_cleanup(self, *, deadline: float) -> bool:
+        with self._shutdown_condition:
+            while self._startup_failure_cleanup_in_progress:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._shutdown_condition.wait(timeout=min(remaining, 0.05))
+            return True
+
+    def _shutdown_after_start_failure(self, *, timeout_seconds: float) -> bool:
+        """Clean startup work fully unless an external shutdown wins the election."""
+
+        deadline = monotonic() + timeout_seconds
+        with self._lock:
+            if self._shutting_down:
+                return False
+            self._startup_failure_cleanup_in_progress = True
+            lifecycle_dependencies = tuple(self._lifecycle_dependencies.values())
+        try:
+            try:
+                lifecycle_dependencies_stopped = self._stop_lifecycle_dependencies(
+                    lifecycle_dependencies,
+                    deadline=deadline,
+                )
+            except BaseException:
+                # Failed-start cleanup must not replace the triggering startup
+                # error. Continue fail-closed, drain everything else, and keep
+                # ownership for an explicit idempotent shutdown retry.
+                lifecycle_dependencies_stopped = False
+            caller = current_thread()
+            with self._shutdown_condition:
+                if self._shutting_down or self._shutdown_owner is not None:
+                    return False
+                self._shutting_down = True
+                self._shutdown_owner = caller
+                self._shutdown_result = None
+                run_ids = self._shutdown_run_ids_locked()
+                self._startup_failure_cleanup_in_progress = False
+                self._shutdown_condition.notify_all()
+            completed = False
+            try:
+                self._signal_shutdown()
+                completed = self._complete_shutdown(
+                    deadline=deadline,
+                    lifecycle_dependencies_stopped=lifecycle_dependencies_stopped,
+                    run_ids=run_ids,
+                )
+                return completed
+            finally:
+                self._finish_shutdown_election(completed)
+        finally:
+            with self._shutdown_condition:
+                self._startup_failure_cleanup_in_progress = False
+                self._shutdown_condition.notify_all()
+
     def shutdown(self, *, timeout_seconds: float = 5.0) -> bool:
         """Stop admission, cancel owned work, and join worker threads boundedly.
 
@@ -6558,22 +6738,46 @@ class RunManager:
 
         if timeout_seconds < 0:
             raise ValueError("shutdown timeout must not be negative")
-        with self._lock:
+        deadline = monotonic() + timeout_seconds
+        caller = current_thread()
+        with self._shutdown_condition:
             self._shutting_down = True
-            run_ids = tuple(
-                dict.fromkeys(
-                    [
-                        *self._active_primary_runs,
-                        *(item[0] for item in self._queued_primary_runs),
-                        *self._reserved_primary_runs,
-                        *self._thread_run_ids.values(),
-                        *self._active_run_operations,
-                    ]
-                )
+            while self._shutdown_owner is not None:
+                if self._shutdown_owner is caller:
+                    return False
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._shutdown_condition.wait(timeout=min(remaining, 0.05))
+            if self._shutdown_result is True:
+                return True
+            self._shutdown_owner = caller
+            self._shutdown_result = None
+            lifecycle_dependencies = tuple(self._lifecycle_dependencies.values())
+            run_ids = self._shutdown_run_ids_locked()
+        completed = False
+        try:
+            self._signal_shutdown()
+            lifecycle_dependencies_stopped = self._stop_lifecycle_dependencies(
+                lifecycle_dependencies,
+                deadline=deadline,
             )
-        self._shutdown_event.set()
-        with self._memvid_agent_condition:
-            self._memvid_agent_condition.notify_all()
+            completed = self._complete_shutdown(
+                deadline=deadline,
+                lifecycle_dependencies_stopped=lifecycle_dependencies_stopped,
+                run_ids=run_ids,
+            )
+            return completed
+        finally:
+            self._finish_shutdown_election(completed)
+
+    def _complete_shutdown(
+        self,
+        *,
+        deadline: float,
+        lifecycle_dependencies_stopped: bool,
+        run_ids: tuple[str, ...],
+    ) -> bool:
         cancellation_failed = False
         for run_id in run_ids:
             try:
@@ -6607,7 +6811,6 @@ class RunManager:
                     pass
                 self._forget_approval_arguments_for_run(run_id)
 
-        deadline = monotonic() + timeout_seconds
         cleanup_retry_attempted = False
         while True:
             with self._lock:
@@ -6629,6 +6832,7 @@ class RunManager:
                 memvid_agent_active = self._memvid_agent_active
             with self._lock:
                 admission_reconciliation_pending = bool(self._failed_admission_reconciliations)
+                startup_in_progress = self._startup_in_progress
             if not threads and not active_run_operations and not memvid_agent_active:
                 with self._lock:
                     durability_failed = bool(self._cancelled_run_durability_failures)
@@ -6642,10 +6846,14 @@ class RunManager:
                     mcp_stopped = self.mcp.shutdown()
                 except Exception:  # noqa: BLE001 - lifecycle failure is returned fail-closed
                     mcp_stopped = False
+                if not self._wait_for_startup_failure_cleanup(deadline=deadline):
+                    return False
                 completed = (
                     not cancellation_failed
                     and not durability_failed
                     and not admission_reconciliation_pending
+                    and not startup_in_progress
+                    and lifecycle_dependencies_stopped
                     and skills_stopped
                     and mcp_stopped
                 )

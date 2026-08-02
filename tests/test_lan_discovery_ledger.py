@@ -3,13 +3,26 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections import Counter
 from dataclasses import asdict, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier, Thread
 
 import pytest
 
 import nested_memvid_agent.routing.lan_ledger as lan_ledger_module
-from nested_memvid_agent.lan_discovery_models import LanScanLimits
+from nested_memvid_agent.lan_discovery_models import (
+    LanScanLimits,
+    NetworkInterface,
+    ResolvedLanEndpoint,
+)
+from nested_memvid_agent.lan_discovery_scope import PrivateScanScope
+from nested_memvid_agent.lan_scanner import (
+    LanFailureCategory,
+    Reachability,
+    _make_observation,
+)
 from nested_memvid_agent.routing.lan_ledger import LanDiscoveryLedger
 from nested_memvid_agent.routing.lan_records import (
     ALLOWED_SCAN_TRANSITIONS,
@@ -18,6 +31,7 @@ from nested_memvid_agent.routing.lan_records import (
     LanScanRevisionConflict,
     LanScanTransitionError,
 )
+from nested_memvid_agent.routing.lan_serialization import lan_observation_to_draft
 from nested_memvid_agent.routing.ledger import RoutingLedger
 from nested_memvid_agent.routing.models import ModelTarget, ProviderProfile
 from nested_memvid_agent.state_store import AgentStateStore
@@ -38,6 +52,24 @@ def lan_ledger(state: AgentStateStore) -> LanDiscoveryLedger:
 
 def _limits() -> dict[str, object]:
     return asdict(LanScanLimits())
+
+
+def _preview_event() -> dict[str, object]:
+    return {
+        "schema": "kestrel.lan.scan-preview.v1",
+        "owner_principal": "owner:test",
+        "interface_id": INTERFACE_ID,
+        "network": "192.168.10.0/30",
+        "limits": _limits(),
+        "active_host_count": 2,
+        "passive_or_manual_only": False,
+        "port_count": 4,
+        "mdns_status": "available",
+        "server_version": "kestrel-test",
+        "contract_version": "kestrel.lan.preview-authorization.v1",
+        "preview_digest": PREVIEW_DIGEST,
+        "expires_at": "2099-08-01T12:00:30Z",
+    }
 
 
 def _create_scan(
@@ -79,6 +111,25 @@ def _observation(
     )
 
 
+def _task4_observation(
+    scope: PrivateScanScope,
+    address: str,
+    port: int,
+) -> LanObservationDraft:
+    endpoint = ResolvedLanEndpoint.from_scope(scope, address, port)
+    observation = _make_observation(
+        endpoint,
+        reachability=Reachability.UNREACHABLE,
+        failure_category=LanFailureCategory.TCP_REFUSED,
+    )
+    return lan_observation_to_draft(
+        observation,
+        scope=scope,
+        freshness_timestamp="2026-08-01T12:00:00Z",
+        source="active",
+    )
+
+
 def _running_scan(ledger: LanDiscoveryLedger, *, scan_id: str = "lan_1"):
     draft = _create_scan(ledger, scan_id=scan_id)
     return ledger.transition_scan(
@@ -108,6 +159,17 @@ def _lan_table_snapshot(
         ensure_ascii=False,
     ).encode("utf-8")
     return values, canonical_bytes
+
+
+def _lan_state_bytes(state: AgentStateStore) -> tuple[bytes, bytes, bytes]:
+    return tuple(
+        _lan_table_snapshot(state, table)[1]
+        for table in (
+            "routing_lan_scans",
+            "routing_lan_observations",
+            "routing_lan_scan_events",
+        )
+    )  # type: ignore[return-value]
 
 
 def _install_pre_hardening_nullable_v3_schema(state: AgentStateStore) -> None:
@@ -1397,6 +1459,1952 @@ def test_observation_insert_rolls_back_when_revision_update_fails_in_sqlite(
 
     assert lan_ledger.list_observations(running.scan_id) == []
     assert lan_ledger.get_scan(running.scan_id) == running
+
+
+def test_claim_scan_start_is_one_transaction_with_event_before_running_state(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    draft = _create_scan(lan_ledger, scan_id="lan_atomic_start")
+    with state._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER test_require_start_event_before_running
+            BEFORE UPDATE OF status ON routing_lan_scans
+            WHEN NEW.scan_id = 'lan_atomic_start' AND NEW.status = 'running'
+             AND NOT EXISTS (
+                SELECT 1 FROM routing_lan_scan_events
+                WHERE scan_id = NEW.scan_id AND event_type = 'scan_started'
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'start_event_missing');
+            END
+            """
+        )
+
+    running = lan_ledger.claim_scan_start(
+        draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=draft.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event=_preview_event(),
+    )
+
+    assert running.status == "running"
+    assert running.revision == draft.revision + 1
+    assert [event.event_type for event in lan_ledger.list_events(draft.scan_id)] == ["scan_started"]
+    assert lan_ledger.list_events(draft.scan_id)[0].payload == json.loads(
+        json.dumps(_preview_event())
+    )
+
+
+@pytest.mark.parametrize("cross_during_precommit", [False, True])
+def test_claim_scan_start_rejects_expiry_equality_and_transaction_crossing_without_writes(
+    state: AgentStateStore,
+    cross_during_precommit: bool,
+) -> None:
+    expires_at = datetime(2026, 8, 1, 12, 0, 30, tzinfo=UTC)
+    now = [expires_at - timedelta(microseconds=1)]
+
+    def precommit(operation: str) -> None:
+        if operation == "claim_scan_start" and cross_during_precommit:
+            now[0] = expires_at + timedelta(microseconds=1)
+
+    ledger = LanDiscoveryLedger(
+        state,
+        utc_clock=lambda: now[0],
+        precommit_hook=precommit,
+    )
+    draft = _create_scan(ledger, scan_id="lan_expiring_claim")
+    preview_event = {
+        **_preview_event(),
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+    }
+    if not cross_during_precommit:
+        now[0] = expires_at
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="^LAN preview authorization expired$"):
+        ledger.claim_scan_start(
+            draft.scan_id,
+            owner_principal="owner:test",
+            expected_revision=draft.revision,
+            preview_digest=PREVIEW_DIGEST,
+            authorized_preview_digest=PREVIEW_DIGEST,
+            preview_event=preview_event,
+        )
+
+    assert _lan_state_bytes(state) == before
+    assert ledger.get_scan(draft.scan_id) == draft
+    assert ledger.list_events(draft.scan_id) == []
+
+
+def test_claim_scan_start_rejects_foreign_stale_and_second_active_without_writes(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    first = _create_scan(lan_ledger, scan_id="lan_first")
+    second = _create_scan(lan_ledger, scan_id="lan_second")
+    running = lan_ledger.claim_scan_start(
+        first.scan_id,
+        owner_principal="owner:test",
+        expected_revision=first.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event=_preview_event(),
+    )
+
+    for kwargs in (
+        {"owner_principal": "owner:foreign", "expected_revision": second.revision},
+        {"owner_principal": "owner:test", "expected_revision": 0},
+    ):
+        with pytest.raises((ValueError, LanScanRevisionConflict)):
+            lan_ledger.claim_scan_start(
+                second.scan_id,
+                preview_digest=PREVIEW_DIGEST,
+                authorized_preview_digest=PREVIEW_DIGEST,
+                preview_event=_preview_event(),
+                **kwargs,
+            )
+    with pytest.raises(RuntimeError, match="active"):
+        lan_ledger.claim_scan_start(
+            second.scan_id,
+            owner_principal="owner:test",
+            expected_revision=second.revision,
+            preview_digest=PREVIEW_DIGEST,
+            authorized_preview_digest=PREVIEW_DIGEST,
+            preview_event=_preview_event(),
+        )
+
+    assert lan_ledger.get_scan(first.scan_id) == running
+    assert lan_ledger.get_scan(second.scan_id) == second
+    assert lan_ledger.list_events(second.scan_id) == []
+
+
+def test_request_cancel_commits_event_and_state_before_token_layer_can_signal(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    running = _running_scan(lan_ledger, scan_id="lan_atomic_cancel")
+    with state._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER test_require_cancel_event_before_cancelling
+            BEFORE UPDATE OF status ON routing_lan_scans
+            WHEN NEW.scan_id = 'lan_atomic_cancel' AND NEW.status = 'cancelling'
+             AND NOT EXISTS (
+                SELECT 1 FROM routing_lan_scan_events
+                WHERE scan_id = NEW.scan_id AND event_type = 'scan_cancel_requested'
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'cancel_event_missing');
+            END
+            """
+        )
+
+    cancelling = lan_ledger.request_scan_cancel(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        cancel_reason="owner_cancelled",
+    )
+
+    assert cancelling.status == "cancelling"
+    assert cancelling.cancel_reason == "owner_cancelled"
+    assert [event.event_type for event in lan_ledger.list_events(running.scan_id)] == [
+        "scan_cancel_requested"
+    ]
+
+
+def test_draft_cancel_is_atomic_terminal_and_stale_or_foreign_cancel_is_zero_write(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    draft = _create_scan(lan_ledger, scan_id="lan_draft_cancel")
+    before_events = lan_ledger.list_events(draft.scan_id)
+    with pytest.raises(LanScanRevisionConflict):
+        lan_ledger.request_scan_cancel(
+            draft.scan_id,
+            owner_principal="owner:test",
+            expected_revision=0,
+            cancel_reason="owner_cancelled",
+        )
+    with pytest.raises(ValueError, match="owner"):
+        lan_ledger.request_scan_cancel(
+            draft.scan_id,
+            owner_principal="owner:foreign",
+            expected_revision=draft.revision,
+            cancel_reason="owner_cancelled",
+        )
+    assert lan_ledger.get_scan(draft.scan_id) == draft
+    assert lan_ledger.list_events(draft.scan_id) == before_events
+
+    cancelled = lan_ledger.request_scan_cancel(
+        draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=draft.revision,
+        cancel_reason="owner_cancelled",
+    )
+    assert cancelled.status == "cancelled"
+    assert cancelled.terminal_receipt is not None
+    assert cancelled.terminal_receipt["evidence_complete"] is True
+    assert cancelled.terminal_receipt["unknown_inflight_count"] == 0
+    assert [event.event_type for event in lan_ledger.list_events(draft.scan_id)] == [
+        "scan_cancelled"
+    ]
+
+
+def test_start_vs_draft_cancel_has_exactly_one_revision_winner(
+    state: AgentStateStore,
+) -> None:
+    first = LanDiscoveryLedger(state)
+    second = LanDiscoveryLedger(state)
+    draft = _create_scan(first, scan_id="lan_start_cancel_race")
+    barrier = Barrier(2)
+    outcomes: list[str] = []
+
+    def claim() -> None:
+        barrier.wait()
+        try:
+            first.claim_scan_start(
+                draft.scan_id,
+                owner_principal="owner:test",
+                expected_revision=draft.revision,
+                preview_digest=PREVIEW_DIGEST,
+                authorized_preview_digest=PREVIEW_DIGEST,
+                preview_event=_preview_event(),
+            )
+        except (LanScanRevisionConflict, LanScanTransitionError):
+            outcomes.append("claim_lost")
+        else:
+            outcomes.append("claim_won")
+
+    def cancel() -> None:
+        barrier.wait()
+        try:
+            second.request_scan_cancel(
+                draft.scan_id,
+                owner_principal="owner:test",
+                expected_revision=draft.revision,
+                cancel_reason="owner_cancelled",
+            )
+        except (LanScanRevisionConflict, LanScanTransitionError):
+            outcomes.append("cancel_lost")
+        else:
+            outcomes.append("cancel_won")
+
+    threads = [Thread(target=claim), Thread(target=cancel)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert len(outcomes) == 2
+    assert len([outcome for outcome in outcomes if outcome.endswith("won")]) == 1
+    current = first.get_scan(draft.scan_id)
+    assert current is not None
+    events = first.list_events(draft.scan_id)
+    assert current.revision == draft.revision + 1
+    assert first.list_observations(draft.scan_id) == []
+    if current.status == "running":
+        assert outcomes.count("claim_won") == 1
+        assert outcomes.count("cancel_lost") == 1
+        assert current.terminal_receipt is None
+        assert [event.event_type for event in events] == ["scan_started"]
+    else:
+        assert current.status == "cancelled"
+        assert outcomes.count("cancel_won") == 1
+        assert outcomes.count("claim_lost") == 1
+        assert current.terminal_receipt is not None
+        assert [event.event_type for event in events] == ["scan_cancelled"]
+
+
+def test_completion_vs_cancel_has_one_terminal_authority_winner(
+    state: AgentStateStore,
+) -> None:
+    worker_ledger = LanDiscoveryLedger(state)
+    cancel_ledger = LanDiscoveryLedger(state)
+    running = _running_scan(worker_ledger, scan_id="lan_completion_cancel_race")
+    barrier = Barrier(2)
+    outcomes: list[str] = []
+
+    def complete() -> None:
+        barrier.wait()
+        try:
+            worker_ledger.commit_scan_terminal(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                status="completed",
+                terminal_reason="scan_complete",
+                cancel_reason=None,
+                observations=(),
+                mdns_status="available",
+                planned_count=0,
+                admitted_count=0,
+                completed_count=0,
+                error_category_counts={},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+            )
+        except LanScanRevisionConflict:
+            outcomes.append("completion_lost")
+        else:
+            outcomes.append("completion_won")
+
+    def cancel() -> None:
+        barrier.wait()
+        try:
+            cancel_ledger.request_scan_cancel(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                cancel_reason="owner_cancelled",
+            )
+        except LanScanRevisionConflict:
+            outcomes.append("cancel_lost")
+        else:
+            outcomes.append("cancel_won")
+
+    threads = [Thread(target=complete), Thread(target=cancel)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert len(outcomes) == 2
+    assert len([outcome for outcome in outcomes if outcome.endswith("won")]) == 1
+    current = worker_ledger.get_scan(running.scan_id)
+    assert current is not None
+    assert current.revision == running.revision + 1
+    pre_terminal_events = worker_ledger.list_events(running.scan_id)
+    if current.status == "cancelling":
+        assert outcomes.count("cancel_won") == 1
+        assert outcomes.count("completion_lost") == 1
+        assert current.terminal_receipt is None
+        assert [event.event_type for event in pre_terminal_events] == ["scan_cancel_requested"]
+        current = worker_ledger.commit_scan_terminal(
+            current.scan_id,
+            owner_principal="owner:test",
+            expected_revision=current.revision,
+            status="cancelled",
+            terminal_reason="owner_cancelled",
+            cancel_reason="owner_cancelled",
+            observations=(),
+            mdns_status="available",
+            planned_count=0,
+            admitted_count=0,
+            completed_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+        assert current.revision == running.revision + 2
+        assert [event.event_type for event in worker_ledger.list_events(running.scan_id)] == [
+            "scan_cancel_requested",
+            "scan_cancelled",
+        ]
+    else:
+        assert current.status == "completed"
+        assert outcomes.count("completion_won") == 1
+        assert outcomes.count("cancel_lost") == 1
+        assert [event.event_type for event in pre_terminal_events] == ["scan_completed"]
+    assert current.status in {"completed", "cancelled"}
+    assert current.terminal_receipt is not None
+    assert worker_ledger.list_observations(running.scan_id) == []
+
+
+def test_terminal_observations_event_receipt_and_status_roll_back_at_crash_hook(
+    state: AgentStateStore,
+) -> None:
+    def crash(operation: str) -> None:
+        if operation == "commit_scan_terminal":
+            raise RuntimeError("injected terminal crash")
+
+    ledger = LanDiscoveryLedger(state, precommit_hook=crash)
+    running = _running_scan(ledger, scan_id="lan_terminal_rollback")
+
+    with pytest.raises(RuntimeError, match="injected terminal crash"):
+        ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status="completed",
+            terminal_reason="scan_complete",
+            cancel_reason=None,
+            observations=(_observation(),),
+            mdns_status="available",
+            planned_count=1,
+            admitted_count=1,
+            completed_count=1,
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+
+    assert ledger.get_scan(running.scan_id) == running
+    assert ledger.list_observations(running.scan_id) == []
+    assert ledger.list_events(running.scan_id) == []
+
+
+@pytest.mark.parametrize(
+    ("case", "hook_operation"),
+    (
+        ("start", "claim_scan_start"),
+        ("running_cancel", "request_scan_cancel"),
+        ("draft_cancel", "request_scan_cancel"),
+        ("progress", "record_scan_progress"),
+        ("terminal", "commit_scan_terminal"),
+        ("interrupt", "interrupt_active_scans"),
+    ),
+)
+def test_every_specialized_lifecycle_crash_hook_is_byte_for_byte_zero_write(
+    state: AgentStateStore,
+    case: str,
+    hook_operation: str,
+) -> None:
+    seed = LanDiscoveryLedger(state)
+    if case in {"start", "draft_cancel"}:
+        current = _create_scan(seed, scan_id=f"lan_crash_{case}")
+    else:
+        current = _running_scan(seed, scan_id=f"lan_crash_{case}")
+    before = _lan_state_bytes(state)
+
+    def crash(operation: str) -> None:
+        assert operation == hook_operation
+        raise RuntimeError(f"injected {case} crash")
+
+    ledger = LanDiscoveryLedger(state, precommit_hook=crash)
+    with pytest.raises(RuntimeError, match=f"injected {case} crash"):
+        if case == "start":
+            ledger.claim_scan_start(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=current.revision,
+                preview_digest=PREVIEW_DIGEST,
+                authorized_preview_digest=PREVIEW_DIGEST,
+                preview_event=_preview_event(),
+            )
+        elif case in {"running_cancel", "draft_cancel"}:
+            ledger.request_scan_cancel(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=current.revision,
+                cancel_reason="owner_cancelled",
+            )
+        elif case == "progress":
+            ledger.record_scan_progress(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=current.revision,
+                planned_count=4,
+                admitted_count=1,
+                completed_count=1,
+                persisted_observation_count=1,
+                error_category_counts={},
+                timeout_count=0,
+                mdns_status="available",
+                observations=(_observation(),),
+            )
+        elif case == "terminal":
+            ledger.commit_scan_terminal(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=current.revision,
+                status="completed",
+                terminal_reason="scan_complete",
+                cancel_reason=None,
+                observations=(_observation(),),
+                mdns_status="available",
+                planned_count=1,
+                admitted_count=1,
+                completed_count=1,
+                error_category_counts={},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+            )
+        else:
+            ledger.interrupt_active_scans(owner_principal="owner:test")
+
+    assert _lan_state_bytes(state) == before
+
+
+def test_terminal_events_exist_before_completed_or_cancelled_status_update(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    running = _running_scan(lan_ledger, scan_id="lan_event_before_completed")
+    failing = _running_scan(lan_ledger, scan_id="lan_event_before_failed")
+    draft = _create_scan(lan_ledger, scan_id="lan_event_before_cancelled")
+    with state._connect() as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER test_completed_event_precedes_terminal_status
+            BEFORE UPDATE OF status ON routing_lan_scans
+            WHEN NEW.scan_id = 'lan_event_before_completed' AND NEW.status = 'completed'
+             AND NOT EXISTS (
+                SELECT 1 FROM routing_lan_scan_events
+                WHERE scan_id = NEW.scan_id AND event_type = 'scan_completed'
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'completed_event_missing');
+            END;
+            CREATE TRIGGER test_cancelled_event_precedes_terminal_status
+            BEFORE UPDATE OF status ON routing_lan_scans
+            WHEN NEW.scan_id = 'lan_event_before_cancelled' AND NEW.status = 'cancelled'
+             AND NOT EXISTS (
+                SELECT 1 FROM routing_lan_scan_events
+                WHERE scan_id = NEW.scan_id AND event_type = 'scan_cancelled'
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'cancelled_event_missing');
+            END;
+            CREATE TRIGGER test_failed_event_precedes_terminal_status
+            BEFORE UPDATE OF status ON routing_lan_scans
+            WHEN NEW.scan_id = 'lan_event_before_failed' AND NEW.status = 'failed'
+             AND NOT EXISTS (
+                SELECT 1 FROM routing_lan_scan_events
+                WHERE scan_id = NEW.scan_id AND event_type = 'scan_failed'
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'failed_event_missing');
+            END;
+            """
+        )
+
+    completed = lan_ledger.commit_scan_terminal(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=(),
+        mdns_status="available",
+        planned_count=0,
+        admitted_count=0,
+        completed_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+    cancelled = lan_ledger.request_scan_cancel(
+        draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=draft.revision,
+        cancel_reason="owner_cancelled",
+    )
+    failed = lan_ledger.commit_scan_terminal(
+        failing.scan_id,
+        owner_principal="owner:test",
+        expected_revision=failing.revision,
+        status="failed",
+        terminal_reason="worker_error",
+        cancel_reason=None,
+        observations=(),
+        mdns_status="unavailable",
+        planned_count=0,
+        admitted_count=0,
+        completed_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+
+    assert completed.status == "completed"
+    assert cancelled.status == "cancelled"
+    assert failed.status == "failed"
+
+
+def test_progress_is_monotonic_idempotent_and_persists_exact_observation_membership(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    scope = PrivateScanScope.from_request(
+        NetworkInterface.from_addresses(
+            os_identity="darwin:en-progress",
+            display_name="Progress fixture",
+            addresses=("192.168.73.1/30",),
+        ),
+        "192.168.73.0/30",
+    )
+    draft = lan_ledger.create_scan(
+        scan_id="lan_progress_exact",
+        owner_principal="owner:test",
+        confirmed_interface_id=scope.interface.interface_id,
+        network=scope.network,
+        limits=_limits(),
+        preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+    running = lan_ledger.claim_scan_start(
+        draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=draft.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event={
+            **_preview_event(),
+            "interface_id": scope.interface.interface_id,
+            "network": scope.network,
+        },
+    )
+    first_observation = _task4_observation(scope, "192.168.73.1", 8000)
+    second_observation = _task4_observation(scope, "192.168.73.2", 8080)
+
+    admitted = lan_ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        planned_count=4,
+        admitted_count=1,
+        completed_count=0,
+        persisted_observation_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        mdns_status="available",
+        observations=(),
+    )
+    completed_one = lan_ledger.record_scan_progress(
+        admitted.scan_id,
+        owner_principal="owner:test",
+        expected_revision=admitted.revision,
+        planned_count=4,
+        admitted_count=1,
+        completed_count=1,
+        persisted_observation_count=1,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        mdns_status="available",
+        observations=(first_observation,),
+    )
+    assert admitted.revision == running.revision + 1
+    assert completed_one.revision == admitted.revision + 1
+    durable_observations = lan_ledger.list_observations(running.scan_id)
+    assert len(durable_observations) == 1
+    assert durable_observations[0].endpoint_id == first_observation.endpoint_id
+    after_progress = _lan_state_bytes(state)
+
+    duplicate = lan_ledger.record_scan_progress(
+        completed_one.scan_id,
+        owner_principal="owner:test",
+        expected_revision=completed_one.revision,
+        planned_count=4,
+        admitted_count=1,
+        completed_count=1,
+        persisted_observation_count=1,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        mdns_status="available",
+        observations=(first_observation,),
+    )
+    assert duplicate == completed_one
+    assert _lan_state_bytes(state) == after_progress
+
+    for invalid in (
+        {
+            "planned_count": 4,
+            "admitted_count": 0,
+            "completed_count": 0,
+            "persisted_observation_count": 1,
+            "error_category_counts": {"tcp_refused": 1},
+            "timeout_count": 0,
+            "mdns_status": "available",
+        },
+        {
+            "planned_count": 4,
+            "admitted_count": 1,
+            "completed_count": 1,
+            "persisted_observation_count": 1,
+            "error_category_counts": {"not_closed": 1},
+            "timeout_count": 0,
+            "mdns_status": "available",
+        },
+        {
+            "planned_count": 4,
+            "admitted_count": 1,
+            "completed_count": 1,
+            "persisted_observation_count": 1,
+            "error_category_counts": {"tcp_refused": 1},
+            "timeout_count": 0,
+            "mdns_status": "lookalike",
+        },
+    ):
+        with pytest.raises(ValueError):
+            lan_ledger.record_scan_progress(
+                completed_one.scan_id,
+                owner_principal="owner:test",
+                expected_revision=completed_one.revision,
+                observations=(),
+                **invalid,
+            )
+        assert _lan_state_bytes(state) == after_progress
+
+    terminal = lan_ledger.commit_scan_terminal(
+        completed_one.scan_id,
+        owner_principal="owner:test",
+        expected_revision=completed_one.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=(first_observation, second_observation),
+        mdns_status="available",
+        planned_count=4,
+        admitted_count=2,
+        completed_count=2,
+        error_category_counts={"tcp_refused": 2},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+    assert terminal.terminal_receipt is not None
+    assert terminal.candidate_count == 2
+    assert terminal.error_count == 2
+    assert terminal.terminal_receipt["persisted_observation_count"] == 2
+    assert terminal.terminal_receipt["error_category_counts"] == {"tcp_refused": 2}
+    assert len(lan_ledger.list_observations(running.scan_id)) == 2
+    assert [event.event_type for event in lan_ledger.list_events(running.scan_id)] == [
+        "scan_started",
+        "scan_progress",
+        "scan_progress",
+        "scan_completed",
+    ]
+
+
+def test_specialized_progress_rejects_planned_work_growth_without_writes(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    running = _running_scan(lan_ledger, scan_id="lan_fixed_plan")
+    progressed = lan_ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        planned_count=1,
+        admitted_count=0,
+        completed_count=0,
+        persisted_observation_count=0,
+        error_category_counts={},
+        timeout_count=0,
+        mdns_status="available",
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="planned count"):
+        lan_ledger.record_scan_progress(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=progressed.revision,
+            planned_count=2,
+            admitted_count=0,
+            completed_count=0,
+            persisted_observation_count=0,
+            error_category_counts={},
+            timeout_count=0,
+            mdns_status="available",
+        )
+
+    assert _lan_state_bytes(state) == before
+
+
+def test_terminal_error_counts_must_equal_durable_observation_categories(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    running = _running_scan(lan_ledger, scan_id="lan_exact_error_counts")
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="durable observations"):
+        lan_ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status="completed",
+            terminal_reason="scan_complete",
+            cancel_reason=None,
+            observations=(_observation(),),
+            mdns_status="available",
+            planned_count=1,
+            admitted_count=1,
+            completed_count=1,
+            error_category_counts={"tcp_refused": 1},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+
+
+def test_ordinary_terminal_requires_one_durable_observation_per_completion(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    running = _running_scan(lan_ledger, scan_id="lan_complete_evidence")
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="complete evidence"):
+        lan_ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status="completed",
+            terminal_reason="scan_complete",
+            cancel_reason=None,
+            observations=(),
+            mdns_status="available",
+            planned_count=1,
+            admitted_count=1,
+            completed_count=1,
+            error_category_counts={},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+
+    assert _lan_state_bytes(state) == before
+
+
+@pytest.mark.parametrize("operation", ("start", "cancel", "progress", "terminal"))
+def test_specialized_lifecycle_rejects_boolean_revision_without_writes(
+    state: AgentStateStore,
+    operation: str,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    current = (
+        _create_scan(ledger, scan_id=f"lan_bool_{operation}")
+        if operation in {"start", "cancel"}
+        else _running_scan(ledger, scan_id=f"lan_bool_{operation}")
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(LanScanRevisionConflict):
+        if operation == "start":
+            ledger.claim_scan_start(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=True,  # type: ignore[arg-type]
+                preview_digest=PREVIEW_DIGEST,
+                authorized_preview_digest=PREVIEW_DIGEST,
+                preview_event=_preview_event(),
+            )
+        elif operation == "cancel":
+            ledger.request_scan_cancel(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=True,  # type: ignore[arg-type]
+                cancel_reason="owner_cancelled",
+            )
+        elif operation == "progress":
+            ledger.record_scan_progress(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=True,  # type: ignore[arg-type]
+                planned_count=0,
+                admitted_count=0,
+                completed_count=0,
+                persisted_observation_count=0,
+                error_category_counts={},
+                timeout_count=0,
+                mdns_status="available",
+                observations=(),
+            )
+        else:
+            ledger.commit_scan_terminal(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=True,  # type: ignore[arg-type]
+                status="completed",
+                terminal_reason="scan_complete",
+                cancel_reason=None,
+                observations=(),
+                mdns_status="available",
+                planned_count=0,
+                admitted_count=0,
+                completed_count=0,
+                error_category_counts={},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+            )
+
+    assert _lan_state_bytes(state) == before
+
+
+def test_shared_revision_validator_rejects_bool_when_current_revision_is_one() -> None:
+    from nested_memvid_agent.routing.lan_serialization import validate_exact_revision
+
+    assert validate_exact_revision(1, actual_revision=1, scan_id="lan_revision_one") == 1
+    with pytest.raises(LanScanRevisionConflict):
+        validate_exact_revision(True, actual_revision=1, scan_id="lan_revision_one")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("mdns_status", "unknown"),
+        ("error_category_counts", {"not_closed": 1}),
+        ("status", "Completed"),
+        ("terminal_reason", "raw exception text"),
+    ),
+)
+def test_terminal_projection_rejects_open_enum_lookalikes_atomically(
+    state: AgentStateStore,
+    field: str,
+    value: object,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _running_scan(ledger, scan_id=f"lan_closed_{field}")
+    before = _lan_state_bytes(state)
+    kwargs: dict[str, object] = {
+        "status": "completed",
+        "terminal_reason": "scan_complete",
+        "cancel_reason": None,
+        "observations": (),
+        "mdns_status": "available",
+        "planned_count": 0,
+        "admitted_count": 0,
+        "completed_count": 0,
+        "error_category_counts": {},
+        "timeout_count": 0,
+        "evidence_complete": True,
+        "unknown_inflight_count": 0,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError):
+        ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            **kwargs,  # type: ignore[arg-type]
+        )
+    assert _lan_state_bytes(state) == before
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("start", "cancel", "progress", "terminal", "recovery"),
+)
+def test_specialized_lifecycle_rejects_padded_owner_without_writes(
+    state: AgentStateStore,
+    operation: str,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    current = (
+        _create_scan(ledger, scan_id=f"lan_owner_{operation}")
+        if operation == "start"
+        else _running_scan(ledger, scan_id=f"lan_owner_{operation}")
+    )
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(ValueError, match="^LAN owner principal must be exact$"):
+        if operation == "start":
+            ledger.claim_scan_start(
+                current.scan_id,
+                owner_principal=" owner:test ",
+                expected_revision=current.revision,
+                preview_digest=PREVIEW_DIGEST,
+                authorized_preview_digest=PREVIEW_DIGEST,
+                preview_event=_preview_event(),
+            )
+        elif operation == "cancel":
+            ledger.request_scan_cancel(
+                current.scan_id,
+                owner_principal=" owner:test ",
+                expected_revision=current.revision,
+                cancel_reason="owner_cancelled",
+            )
+        elif operation == "progress":
+            ledger.record_scan_progress(
+                current.scan_id,
+                owner_principal=" owner:test ",
+                expected_revision=current.revision,
+                planned_count=0,
+                admitted_count=0,
+                completed_count=0,
+                persisted_observation_count=0,
+                error_category_counts={},
+                timeout_count=0,
+                mdns_status="available",
+                observations=(),
+            )
+        elif operation == "terminal":
+            ledger.commit_scan_terminal(
+                current.scan_id,
+                owner_principal=" owner:test ",
+                expected_revision=current.revision,
+                status="completed",
+                terminal_reason="scan_complete",
+                cancel_reason=None,
+                observations=(),
+                mdns_status="available",
+                planned_count=0,
+                admitted_count=0,
+                completed_count=0,
+                error_category_counts={},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+            )
+        else:
+            ledger.interrupt_active_scans(owner_principal=" owner:test ")
+
+    assert _lan_state_bytes(state) == before
+
+
+def test_specialized_authority_and_legal_source_status_matrix_is_zero_write(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+
+    mismatch = _create_scan(ledger, scan_id="lan_digest_mismatch")
+    before = _lan_state_bytes(state)
+    with pytest.raises(ValueError, match="preview"):
+        ledger.claim_scan_start(
+            mismatch.scan_id,
+            owner_principal="owner:test",
+            expected_revision=mismatch.revision,
+            preview_digest=PREVIEW_DIGEST,
+            authorized_preview_digest="sha256:" + "9" * 64,
+            preview_event=_preview_event(),
+        )
+    assert _lan_state_bytes(state) == before
+    before = _lan_state_bytes(state)
+    with pytest.raises(ValueError, match="preview"):
+        ledger.claim_scan_start(
+            mismatch.scan_id,
+            owner_principal="owner:test",
+            expected_revision=mismatch.revision,
+            preview_digest="sha256:" + "9" * 64,
+            authorized_preview_digest="sha256:" + "9" * 64,
+            preview_event={
+                **_preview_event(),
+                "preview_digest": "sha256:" + "9" * 64,
+            },
+        )
+    assert _lan_state_bytes(state) == before
+
+    running = _running_scan(ledger, scan_id="lan_illegal_running")
+    progress_kwargs = {
+        "planned_count": 0,
+        "admitted_count": 0,
+        "completed_count": 0,
+        "persisted_observation_count": 0,
+        "error_category_counts": {},
+        "timeout_count": 0,
+        "mdns_status": "available",
+        "observations": (),
+    }
+    terminal_kwargs = {
+        "terminal_reason": "scan_complete",
+        "cancel_reason": None,
+        "observations": (),
+        "mdns_status": "available",
+        "planned_count": 0,
+        "admitted_count": 0,
+        "completed_count": 0,
+        "error_category_counts": {},
+        "timeout_count": 0,
+        "evidence_complete": True,
+        "unknown_inflight_count": 0,
+    }
+    for operation in ("foreign_progress", "foreign_terminal", "running_cancelled", "interrupted"):
+        before = _lan_state_bytes(state)
+        with pytest.raises((ValueError, LanScanTransitionError)):
+            if operation == "foreign_progress":
+                ledger.record_scan_progress(
+                    running.scan_id,
+                    owner_principal="owner:foreign",
+                    expected_revision=running.revision,
+                    **progress_kwargs,  # type: ignore[arg-type]
+                )
+            else:
+                selected_terminal_kwargs = dict(terminal_kwargs)
+                if operation == "interrupted":
+                    selected_terminal_kwargs.update(
+                        terminal_reason="startup_interrupted",
+                        evidence_complete=False,
+                        unknown_inflight_count=None,
+                    )
+                ledger.commit_scan_terminal(
+                    running.scan_id,
+                    owner_principal=(
+                        "owner:foreign" if operation == "foreign_terminal" else "owner:test"
+                    ),
+                    expected_revision=running.revision,
+                    status=(
+                        "cancelled"
+                        if operation == "running_cancelled"
+                        else ("interrupted" if operation == "interrupted" else "completed")
+                    ),
+                    **selected_terminal_kwargs,  # type: ignore[arg-type]
+                )
+        assert _lan_state_bytes(state) == before
+
+    cancelling_draft = _create_scan(ledger, scan_id="lan_illegal_cancelling")
+    cancelling = ledger.transition_scan(
+        cancelling_draft.scan_id,
+        "running",
+        expected_revision=cancelling_draft.revision,
+    )
+    cancelling = ledger.transition_scan(
+        cancelling.scan_id,
+        "cancelling",
+        expected_revision=cancelling.revision,
+        cancel_reason="owner_cancelled",
+    )
+    for operation in ("progress", "completed", "failed", "interrupted"):
+        before = _lan_state_bytes(state)
+        with pytest.raises((ValueError, LanScanTransitionError)):
+            if operation == "progress":
+                ledger.record_scan_progress(
+                    cancelling.scan_id,
+                    owner_principal="owner:test",
+                    expected_revision=cancelling.revision,
+                    **progress_kwargs,  # type: ignore[arg-type]
+                )
+            else:
+                selected_terminal_kwargs = {
+                    key: value for key, value in terminal_kwargs.items() if key != "terminal_reason"
+                }
+                if operation == "interrupted":
+                    selected_terminal_kwargs.update(
+                        evidence_complete=False,
+                        unknown_inflight_count=None,
+                    )
+                ledger.commit_scan_terminal(
+                    cancelling.scan_id,
+                    owner_principal="owner:test",
+                    expected_revision=cancelling.revision,
+                    status=operation,
+                    terminal_reason=(
+                        "worker_error"
+                        if operation == "failed"
+                        else (
+                            "startup_interrupted" if operation == "interrupted" else "scan_complete"
+                        )
+                    ),
+                    **selected_terminal_kwargs,  # type: ignore[arg-type]
+                )
+        assert _lan_state_bytes(state) == before
+
+
+@pytest.mark.parametrize(
+    ("case", "value"),
+    (
+        ("cancel_reason", 1),
+        ("cancel_reason", "OWNER_CANCELLED"),
+        ("cancel_reason", None),
+        ("evidence_complete", 1),
+        ("evidence_complete", "true"),
+        ("evidence_complete", False),
+        ("unknown_inflight_count", True),
+        ("unknown_inflight_count", "0"),
+        ("unknown_inflight_count", None),
+        ("unknown_inflight_count", -1),
+    ),
+)
+def test_cancel_and_terminal_exact_types_and_closed_values_are_atomic(
+    state: AgentStateStore,
+    case: str,
+    value: object,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    current = (
+        _create_scan(ledger, scan_id=f"lan_exact_{case}")
+        if case == "cancel_reason"
+        else _running_scan(ledger, scan_id=f"lan_exact_{case}")
+    )
+    before = _lan_state_bytes(state)
+    with pytest.raises((TypeError, ValueError)):
+        if case == "cancel_reason":
+            ledger.request_scan_cancel(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=current.revision,
+                cancel_reason=value,  # type: ignore[arg-type]
+            )
+        else:
+            kwargs: dict[str, object] = {
+                "status": "completed",
+                "terminal_reason": "scan_complete",
+                "cancel_reason": None,
+                "observations": (),
+                "mdns_status": "available",
+                "planned_count": 0,
+                "admitted_count": 0,
+                "completed_count": 0,
+                "error_category_counts": {},
+                "timeout_count": 0,
+                "evidence_complete": True,
+                "unknown_inflight_count": 0,
+            }
+            kwargs[case] = value
+            ledger.commit_scan_terminal(
+                current.scan_id,
+                owner_principal="owner:test",
+                expected_revision=current.revision,
+                **kwargs,  # type: ignore[arg-type]
+            )
+    assert _lan_state_bytes(state) == before
+
+
+def test_conflicting_same_endpoint_replay_is_rejected_in_progress_and_terminal(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    scope = PrivateScanScope.from_request(
+        NetworkInterface.from_addresses(
+            os_identity="darwin:en-replay",
+            display_name="Replay fixture",
+            addresses=("192.168.75.1/30",),
+        ),
+        "192.168.75.0/30",
+    )
+    endpoint = ResolvedLanEndpoint.from_scope(scope, "192.168.75.2", 11434)
+    first = lan_observation_to_draft(
+        _make_observation(
+            endpoint,
+            reachability=Reachability.UNREACHABLE,
+            failure_category=LanFailureCategory.TCP_REFUSED,
+        ),
+        scope=scope,
+        freshness_timestamp="2026-08-01T12:00:00Z",
+    )
+    conflict = lan_observation_to_draft(
+        _make_observation(
+            endpoint,
+            reachability=Reachability.UNREACHABLE,
+            failure_category=LanFailureCategory.TCP_TIMEOUT,
+        ),
+        scope=scope,
+        freshness_timestamp="2026-08-01T12:00:00Z",
+    )
+    assert first.endpoint_id == conflict.endpoint_id
+    assert (
+        first.public_payload["observation_digest"] != conflict.public_payload["observation_digest"]
+    )
+    draft = ledger.create_scan(
+        scan_id="lan_replay",
+        owner_principal="owner:test",
+        confirmed_interface_id=scope.interface.interface_id,
+        network=scope.network,
+        limits=_limits(),
+        preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+    running = ledger.claim_scan_start(
+        draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=draft.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event={
+            **_preview_event(),
+            "interface_id": scope.interface.interface_id,
+            "network": scope.network,
+        },
+    )
+    progressed = ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        planned_count=1,
+        admitted_count=1,
+        completed_count=1,
+        persisted_observation_count=1,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        mdns_status="available",
+        observations=(first,),
+    )
+
+    for operation in ("progress", "terminal"):
+        before = _lan_state_bytes(state)
+        with pytest.raises(ValueError, match="endpoint"):
+            if operation == "progress":
+                ledger.record_scan_progress(
+                    progressed.scan_id,
+                    owner_principal="owner:test",
+                    expected_revision=progressed.revision,
+                    planned_count=1,
+                    admitted_count=1,
+                    completed_count=1,
+                    persisted_observation_count=1,
+                    error_category_counts={"tcp_refused": 1},
+                    timeout_count=0,
+                    mdns_status="available",
+                    observations=(conflict,),
+                )
+            else:
+                ledger.commit_scan_terminal(
+                    progressed.scan_id,
+                    owner_principal="owner:test",
+                    expected_revision=progressed.revision,
+                    status="completed",
+                    terminal_reason="scan_complete",
+                    cancel_reason=None,
+                    observations=(conflict,),
+                    mdns_status="available",
+                    planned_count=1,
+                    admitted_count=1,
+                    completed_count=1,
+                    error_category_counts={"tcp_refused": 1},
+                    timeout_count=0,
+                    evidence_complete=True,
+                    unknown_inflight_count=0,
+                )
+        assert _lan_state_bytes(state) == before
+
+
+def test_v2_terminal_receipt_has_exact_schema_bindings_counts_and_injected_times(
+    state: AgentStateStore,
+) -> None:
+    current_time = [datetime(2026, 8, 1, 12, 0, tzinfo=UTC)]
+    ledger = LanDiscoveryLedger(state, utc_clock=lambda: current_time[0])
+    scope = PrivateScanScope.from_request(
+        NetworkInterface.from_addresses(
+            os_identity="darwin:en-receipt",
+            display_name="Receipt fixture",
+            addresses=("192.168.76.1/30",),
+        ),
+        "192.168.76.0/30",
+    )
+    observation = _task4_observation(scope, "192.168.76.2", 11434)
+    draft = ledger.create_scan(
+        scan_id="lan_exact_receipt",
+        owner_principal="owner:test",
+        confirmed_interface_id=scope.interface.interface_id,
+        network=scope.network,
+        limits=_limits(),
+        preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+    current_time[0] = datetime(2026, 8, 1, 12, 1, tzinfo=UTC)
+    preview_event = {
+        **_preview_event(),
+        "interface_id": scope.interface.interface_id,
+        "network": scope.network,
+    }
+    running = ledger.claim_scan_start(
+        draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=draft.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event=preview_event,
+    )
+    current_time[0] = datetime(2026, 8, 1, 12, 2, tzinfo=UTC)
+    terminal = ledger.commit_scan_terminal(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=(observation,),
+        mdns_status="available",
+        planned_count=1,
+        admitted_count=1,
+        completed_count=1,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+
+    canonical_limits = json.loads(json.dumps(_limits(), sort_keys=True, separators=(",", ":")))
+    limits_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                canonical_limits,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+    )
+    membership_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "kestrel.lan.observation-membership.v1",
+                    "count": 1,
+                    "members": [
+                        {
+                            "endpoint_id": observation.endpoint_id,
+                            "observation_digest": observation.public_payload["observation_digest"],
+                        }
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+    )
+    expected = {
+        "schema": "kestrel.lan.scan-receipt.v2",
+        "version": 2,
+        "scan_id": draft.scan_id,
+        "status": "completed",
+        "owner_principal": "owner:test",
+        "confirmed_interface_id": scope.interface.interface_id,
+        "network": scope.network,
+        "limits": canonical_limits,
+        "limits_digest": limits_digest,
+        "preview_digest": PREVIEW_DIGEST,
+        "started_at": "2026-08-01T12:01:00+00:00",
+        "finished_at": "2026-08-01T12:02:00+00:00",
+        "cancel_reason": None,
+        "terminal_reason": "scan_complete",
+        "mdns_status": "available",
+        "planned_count": 1,
+        "admitted_count": 1,
+        "completed_count": 1,
+        "persisted_observation_count": 1,
+        "error_count": 1,
+        "timeout_count": 0,
+        "error_category_counts": {"tcp_refused": 1},
+        "observation_count": 1,
+        "observation_membership_digest": membership_digest,
+        "evidence_complete": True,
+        "unknown_inflight_count": 0,
+    }
+    assert terminal.terminal_receipt == expected
+    assert set(terminal.terminal_receipt) == set(expected)
+    assert terminal.candidate_count == 1
+    assert terminal.error_count == 1
+    assert terminal.timeout_count == 0
+    assert terminal.terminal_receipt_digest == (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                expected,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+    )
+
+
+@pytest.mark.parametrize("operation", ("progress", "terminal"))
+def test_shared_deadline_expiry_during_persistence_rolls_back_every_write(
+    state: AgentStateStore,
+    operation: str,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    running = _running_scan(ledger, scan_id=f"lan_deadline_{operation}")
+    samples = iter((100.0, 102.0))
+    calls: list[float] = []
+
+    def clock() -> float:
+        value = next(samples)
+        calls.append(value)
+        return value
+
+    before = _lan_state_bytes(state)
+    with pytest.raises(TimeoutError, match="deadline"):
+        if operation == "progress":
+            ledger.record_scan_progress(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                planned_count=1,
+                admitted_count=1,
+                completed_count=1,
+                persisted_observation_count=1,
+                error_category_counts={},
+                timeout_count=0,
+                mdns_status="available",
+                observations=(_observation(),),
+                absolute_deadline=101.0,
+                monotonic_clock=clock,
+            )
+        else:
+            ledger.commit_scan_terminal(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                status="completed",
+                terminal_reason="scan_complete",
+                cancel_reason=None,
+                observations=(_observation(),),
+                mdns_status="available",
+                planned_count=1,
+                admitted_count=1,
+                completed_count=1,
+                error_category_counts={},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+                absolute_deadline=101.0,
+                monotonic_clock=clock,
+            )
+    assert calls == [100.0, 102.0]
+    assert _lan_state_bytes(state) == before
+
+
+@pytest.mark.parametrize("operation", ("progress", "terminal"))
+def test_shared_deadline_crossing_in_precommit_hook_rolls_back_every_write(
+    state: AgentStateStore,
+    operation: str,
+) -> None:
+    class BoundaryClock:
+        def __init__(self) -> None:
+            self.value = 100.0
+            self.calls: list[float] = []
+
+        def __call__(self) -> float:
+            self.calls.append(self.value)
+            return self.value
+
+    clock = BoundaryClock()
+    crossed = False
+    target_operation = "record_scan_progress" if operation == "progress" else "commit_scan_terminal"
+
+    def cross_deadline(selected_operation: str) -> None:
+        nonlocal crossed
+        if selected_operation == target_operation and not crossed:
+            crossed = True
+            clock.value = 102.0
+
+    ledger = LanDiscoveryLedger(state, precommit_hook=cross_deadline)
+    running = _running_scan(ledger, scan_id=f"lan_precommit_deadline_{operation}")
+    before = _lan_state_bytes(state)
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        if operation == "progress":
+            ledger.record_scan_progress(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                planned_count=1,
+                admitted_count=1,
+                completed_count=1,
+                persisted_observation_count=1,
+                error_category_counts={},
+                timeout_count=0,
+                mdns_status="available",
+                observations=(_observation(),),
+                absolute_deadline=101.0,
+                monotonic_clock=clock,
+            )
+        else:
+            ledger.commit_scan_terminal(
+                running.scan_id,
+                owner_principal="owner:test",
+                expected_revision=running.revision,
+                status="completed",
+                terminal_reason="scan_complete",
+                cancel_reason=None,
+                observations=(_observation(),),
+                mdns_status="available",
+                planned_count=1,
+                admitted_count=1,
+                completed_count=1,
+                error_category_counts={},
+                timeout_count=0,
+                evidence_complete=True,
+                unknown_inflight_count=0,
+                absolute_deadline=101.0,
+                monotonic_clock=clock,
+            )
+
+    assert crossed is True
+    assert clock.calls == [100.0, 100.0, 102.0]
+    assert _lan_state_bytes(state) == before
+
+
+def test_terminal_receipt_uses_bounded_aggregate_membership_for_1024_observations(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scope = PrivateScanScope.from_request(
+        NetworkInterface.from_addresses(
+            os_identity="darwin:en1024",
+            display_name="IPv6 aggregate fixture",
+            addresses=("fd00::1/120",),
+        ),
+        "fd00::/120",
+    )
+    draft = lan_ledger.create_scan(
+        scan_id="lan_aggregate_1024",
+        owner_principal="owner:test",
+        confirmed_interface_id=scope.interface.interface_id,
+        network=scope.network,
+        limits=_limits(),
+        preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+    running = lan_ledger.claim_scan_start(
+        draft.scan_id,
+        owner_principal="owner:test",
+        expected_revision=draft.revision,
+        preview_digest=PREVIEW_DIGEST,
+        authorized_preview_digest=PREVIEW_DIGEST,
+        preview_event={
+            **_preview_event(),
+            "interface_id": scope.interface.interface_id,
+            "network": scope.network,
+            "active_host_count": 0,
+            "passive_or_manual_only": True,
+        },
+    )
+    observations = tuple(
+        _task4_observation(scope, f"fd00::{address:x}", port)
+        for address in range(256)
+        for port in (1234, 8000, 8080, 11434)
+    )
+
+    before = _lan_state_bytes(lan_ledger.state)
+    with pytest.raises(ValueError, match="fixed ceiling"):
+        lan_ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status="completed",
+            terminal_reason="scan_complete",
+            cancel_reason=None,
+            observations=(*observations, observations[0]),
+            mdns_status="available",
+            planned_count=1025,
+            admitted_count=1025,
+            completed_count=1025,
+            error_category_counts={"tcp_refused": 1025},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+    assert _lan_state_bytes(lan_ledger.state) == before
+
+    terminal = lan_ledger.commit_scan_terminal(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        status="completed",
+        terminal_reason="scan_complete",
+        cancel_reason=None,
+        observations=observations,
+        mdns_status="available",
+        planned_count=1024,
+        admitted_count=1024,
+        completed_count=1024,
+        error_category_counts={"tcp_refused": 1024},
+        timeout_count=0,
+        evidence_complete=True,
+        unknown_inflight_count=0,
+    )
+
+    assert terminal.terminal_receipt is not None
+    receipt_json = json.dumps(terminal.terminal_receipt, sort_keys=True, separators=(",", ":"))
+    assert len(receipt_json.encode()) < 16_384
+    assert terminal.terminal_receipt["observation_count"] == 1024
+    assert terminal.terminal_receipt["persisted_observation_count"] == 1024
+    assert terminal.candidate_count == 1024
+    assert terminal.terminal_receipt["observation_membership_digest"].startswith("sha256:")
+    assert "observations" not in terminal.terminal_receipt
+    ordered_members = sorted(
+        (
+            {
+                "endpoint_id": observation.endpoint_id,
+                "observation_digest": observation.public_payload["observation_digest"],
+            }
+            for observation in observations
+        ),
+        key=lambda item: item["endpoint_id"],
+    )
+    membership_preimage = {
+        "schema": "kestrel.lan.observation-membership.v1",
+        "count": 1024,
+        "members": ordered_members,
+    }
+    expected_membership = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                membership_preimage,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+    )
+    assert terminal.terminal_receipt["observation_membership_digest"] == expected_membership
+
+
+def test_membership_digest_changes_when_one_durable_member_changes(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    from nested_memvid_agent.routing.lan_serialization import (
+        observation_membership_digest,
+    )
+
+    scope = PrivateScanScope.from_request(
+        NetworkInterface.from_addresses(
+            os_identity="darwin:en-membership",
+            display_name="Membership fixture",
+            addresses=("192.168.74.1/30",),
+        ),
+        "192.168.74.0/30",
+    )
+    members = (
+        _task4_observation(scope, "192.168.74.1", 8000),
+        _task4_observation(scope, "192.168.74.2", 8080),
+    )
+    ordered_members = sorted(
+        (
+            {
+                "endpoint_id": member.endpoint_id,
+                "observation_digest": member.public_payload["observation_digest"],
+            }
+            for member in members
+        ),
+        key=lambda item: item["endpoint_id"],
+    )
+    expected = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "kestrel.lan.observation-membership.v1",
+                    "count": 2,
+                    "members": ordered_members,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+    )
+    assert observation_membership_digest(members) == expected
+    assert observation_membership_digest(tuple(reversed(members))) == expected
+
+    terminals = []
+    for scan_id, observations in (
+        ("lan_membership_a", members),
+        ("lan_membership_b", tuple(reversed(members))),
+    ):
+        draft = lan_ledger.create_scan(
+            scan_id=scan_id,
+            owner_principal="owner:test",
+            confirmed_interface_id=scope.interface.interface_id,
+            network=scope.network,
+            limits=_limits(),
+            preview_digest=PREVIEW_DIGEST,
+            expected_revision=0,
+        )
+        running = lan_ledger.claim_scan_start(
+            draft.scan_id,
+            owner_principal="owner:test",
+            expected_revision=draft.revision,
+            preview_digest=PREVIEW_DIGEST,
+            authorized_preview_digest=PREVIEW_DIGEST,
+            preview_event={
+                **_preview_event(),
+                "interface_id": scope.interface.interface_id,
+                "network": scope.network,
+            },
+        )
+        terminal = lan_ledger.commit_scan_terminal(
+            running.scan_id,
+            owner_principal="owner:test",
+            expected_revision=running.revision,
+            status="completed",
+            terminal_reason="scan_complete",
+            cancel_reason=None,
+            observations=observations,
+            mdns_status="available",
+            planned_count=2,
+            admitted_count=2,
+            completed_count=2,
+            error_category_counts={"tcp_refused": 2},
+            timeout_count=0,
+            evidence_complete=True,
+            unknown_inflight_count=0,
+        )
+        assert terminal.terminal_receipt is not None
+        terminals.append(terminal)
+
+    assert {
+        terminal.terminal_receipt["observation_membership_digest"]
+        for terminal in terminals
+        if terminal.terminal_receipt is not None
+    } == {expected}
+
+    changed_members = (members[0], _task4_observation(scope, "192.168.74.2", 11434))
+    assert observation_membership_digest(changed_members) != expected
+
+
+def test_interrupted_recovery_is_owner_filtered_and_never_invents_inflight_counts(
+    lan_ledger: LanDiscoveryLedger,
+    state: AgentStateStore,
+) -> None:
+    owned_running = _running_scan(lan_ledger, scan_id="lan_owned_running")
+    owned_cancelling_draft = _create_scan(lan_ledger, scan_id="lan_owned_cancelling")
+    owned_cancelling = lan_ledger.transition_scan(
+        owned_cancelling_draft.scan_id,
+        "running",
+        expected_revision=owned_cancelling_draft.revision,
+    )
+    owned_cancelling = lan_ledger.transition_scan(
+        owned_cancelling.scan_id,
+        "cancelling",
+        expected_revision=owned_cancelling.revision,
+        cancel_reason="owner_cancelled",
+    )
+    owned_draft = _create_scan(lan_ledger, scan_id="lan_owned_draft")
+    foreign = lan_ledger.create_scan(
+        scan_id="lan_foreign_running",
+        owner_principal="owner:foreign",
+        confirmed_interface_id=INTERFACE_ID,
+        network="192.168.10.0/30",
+        limits=_limits(),
+        preview_digest=PREVIEW_DIGEST,
+        expected_revision=0,
+    )
+    foreign = lan_ledger.transition_scan(
+        foreign.scan_id,
+        "running",
+        expected_revision=foreign.revision,
+    )
+    with state._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER test_interrupt_event_precedes_terminal_status
+            BEFORE UPDATE OF status ON routing_lan_scans
+            WHEN NEW.scan_id IN ('lan_owned_running', 'lan_owned_cancelling')
+             AND NEW.status = 'interrupted'
+             AND NOT EXISTS (
+                SELECT 1 FROM routing_lan_scan_events
+                WHERE scan_id = NEW.scan_id AND event_type = 'scan_interrupted'
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'interrupt_event_missing');
+            END
+            """
+        )
+
+    interrupted = lan_ledger.interrupt_active_scans(owner_principal="owner:test")
+
+    assert [item.scan_id for item in interrupted] == [
+        owned_cancelling.scan_id,
+        owned_running.scan_id,
+    ]
+    for item in interrupted:
+        assert item.status == "interrupted"
+        assert item.terminal_receipt is not None
+        assert item.terminal_receipt["evidence_complete"] is False
+        assert item.terminal_receipt["unknown_inflight_count"] is None
+    assert lan_ledger.get_scan(owned_draft.scan_id) == owned_draft
+    assert lan_ledger.get_scan(foreign.scan_id) == foreign
+    assert Counter(
+        event.event_type for item in interrupted for event in lan_ledger.list_events(item.scan_id)
+    ) == Counter({"scan_interrupted": 2})
+
+
+def test_interrupted_recovery_projects_durable_progress_as_lower_bounds(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    running = _running_scan(lan_ledger, scan_id="lan_progress_recovery")
+    observations = (
+        replace(
+            _observation(
+                endpoint_id="sha256:" + "8" * 64,
+                address="192.168.10.1",
+            ),
+            error_category="tcp_refused",
+        ),
+        _observation(
+            endpoint_id="sha256:" + "9" * 64,
+            address="192.168.10.2",
+        ),
+    )
+    progressed = lan_ledger.record_scan_progress(
+        running.scan_id,
+        owner_principal="owner:test",
+        expected_revision=running.revision,
+        planned_count=8,
+        admitted_count=3,
+        completed_count=2,
+        persisted_observation_count=2,
+        error_category_counts={"tcp_refused": 1},
+        timeout_count=0,
+        mdns_status="available",
+        observations=observations,
+    )
+
+    interrupted = lan_ledger.interrupt_active_scans(owner_principal="owner:test")
+
+    assert len(interrupted) == 1
+    receipt = interrupted[0].terminal_receipt
+    assert receipt is not None
+    assert interrupted[0].revision == progressed.revision + 1
+    assert receipt["planned_count"] == 8
+    assert receipt["admitted_count"] == 3
+    assert receipt["completed_count"] == 2
+    assert receipt["persisted_observation_count"] == 2
+    assert receipt["error_category_counts"] == {"tcp_refused": 1}
+    assert receipt["evidence_complete"] is False
+    assert receipt["unknown_inflight_count"] is None
+
+
+def test_interrupted_recovery_without_progress_derives_known_durable_error_counts(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    running = _running_scan(lan_ledger, scan_id="lan_legacy_error_recovery")
+    first = lan_ledger.append_observation(
+        running.scan_id,
+        replace(
+            _observation(
+                endpoint_id="sha256:" + "a" * 64,
+                address="192.168.10.1",
+            ),
+            error_category="tcp_refused",
+        ),
+        expected_revision=running.revision,
+    )
+    current = lan_ledger.get_scan(first.scan_id)
+    assert current is not None
+    lan_ledger.append_observation(
+        current.scan_id,
+        replace(
+            _observation(
+                endpoint_id="sha256:" + "b" * 64,
+                address="192.168.10.2",
+            ),
+            error_category="http_timeout",
+        ),
+        expected_revision=current.revision,
+    )
+
+    interrupted = lan_ledger.interrupt_active_scans(owner_principal="owner:test")
+
+    assert len(interrupted) == 1
+    terminal = interrupted[0]
+    receipt = terminal.terminal_receipt
+    assert receipt is not None
+    assert terminal.error_count == 2
+    assert terminal.timeout_count == 1
+    assert receipt["planned_count"] == 2
+    assert receipt["admitted_count"] == 2
+    assert receipt["completed_count"] == 2
+    assert receipt["persisted_observation_count"] == 2
+    assert receipt["error_category_counts"] == {
+        "http_timeout": 1,
+        "tcp_refused": 1,
+    }
+    assert receipt["timeout_count"] == 1
+    assert receipt["evidence_complete"] is False
+    assert receipt["unknown_inflight_count"] is None
 
 
 def _independent_terminal_digest(

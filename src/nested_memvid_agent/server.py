@@ -1,5 +1,6 @@
 import json
 from collections.abc import Callable, MutableMapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from functools import partial
@@ -23,6 +24,7 @@ from .desktop_memory_health import (
 from .event_bus import RunEventBus
 from .lan_discovery_service import LanDiscoveryService
 from .lan_runtime_authority import LAN_OPENAI_RUNTIME_HARDENING_VERSION
+from .lan_scan_manager import LanScanManager
 from .layers import (
     load_layer_specs,
     prepare_private_memory_artifacts,
@@ -35,6 +37,7 @@ from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
 from .routine_loop import RoutineLoop
 from .routines import RoutineService
+from .routing.lan_ledger import LanDiscoveryLedger
 from .routing.runtime import build_run_manager
 from .run_manager import RunCapacityError
 from .runtime_settings import (
@@ -312,6 +315,8 @@ def _create_app(
     runs = run_manager_build.runs
     routing_ledger = run_manager_build.routing_ledger
     routing_config = run_manager_build.routing_config
+    lan_scan_manager = LanScanManager(ledger=LanDiscoveryLedger.from_initialized_state(state))
+    runs.register_lifecycle_dependency("lan_scans", lan_scan_manager)
 
     desktop_memory_receipt: DesktopMemvidPreflightReceipt | None = (
         desktop_context.memory_preflight_receipt if desktop_context is not None else None
@@ -494,7 +499,24 @@ def _create_app(
     async def lifespan(app_instance: Any) -> Any:
         del app_instance
         try:
-            runs.start()
+            lan_scan_executor = ThreadPoolExecutor(
+                max_workers=17,
+                thread_name_prefix="kestrel-lan-scan",
+            )
+            lan_start_invoked = False
+
+            def start_lan_scans() -> None:
+                nonlocal lan_start_invoked
+                lan_start_invoked = True
+                lan_scan_manager.start_lifecycle(lan_scan_executor)
+
+            try:
+                runs.register_startup_dependency("lan_scans", start_lan_scans)
+                runs.start()
+            except BaseException:
+                if not lan_start_invoked:
+                    lan_scan_executor.shutdown(wait=True, cancel_futures=True)
+                raise
             if routine_loop is not None:
                 routine_loop.start()
             if active_config.provider_startup_probe:

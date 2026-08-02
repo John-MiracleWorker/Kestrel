@@ -8,12 +8,14 @@ import json
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from ..lan_discovery_models import (
     KNOWN_MODEL_SERVICE_PORTS,
+    MAX_ACTIVE_HOSTS,
     MAX_DISCOVERED_MODELS,
     LanScanLimits,
     ResolvedLanEndpoint,
@@ -38,12 +40,14 @@ from .lan_records import (
     LanObservationSource,
     LanScanEvent,
     LanScanRecord,
+    LanScanRevisionConflict,
 )
 
 MAX_PUBLIC_PAYLOAD_BYTES = 16_384
 MAX_EVENT_PAYLOAD_BYTES = 8_192
 MAX_LIMITS_BYTES = 16_384
 MAX_RECEIPT_BYTES = 1_048_576
+MAX_LAN_SCAN_OBSERVATIONS = MAX_ACTIVE_HOSTS * len(KNOWN_MODEL_SERVICE_PORTS)
 LAN_OBSERVATION_MAX_AGE_SECONDS = 300
 LAN_OBSERVATION_MAX_FUTURE_SKEW_SECONDS = 5
 
@@ -83,6 +87,23 @@ _EVENT_PUBLIC_FIELDS = frozenset(
     }
 )
 _TASK4_OBSERVATION_SCHEMA = "kestrel.lan.durable-observation.v1"
+LAN_SCAN_RECEIPT_V2_SCHEMA = "kestrel.lan.scan-receipt.v2"
+LAN_OBSERVATION_MEMBERSHIP_SCHEMA = "kestrel.lan.observation-membership.v1"
+LAN_SCAN_PREVIEW_EVENT_SCHEMA = "kestrel.lan.scan-preview.v1"
+LAN_SCAN_PROGRESS_EVENT_SCHEMA = "kestrel.lan.scan-progress.v1"
+LAN_SCAN_TERMINAL_EVENT_SCHEMA = "kestrel.lan.scan-terminal.v2"
+LAN_MDNS_STATUSES = frozenset({"available", "unavailable", "timed_out"})
+LAN_CANCEL_REASONS = frozenset({"owner_cancelled", "shutdown_cancelled"})
+LAN_TERMINAL_REASONS = frozenset(
+    {
+        "scan_complete",
+        "owner_cancelled",
+        "shutdown_cancelled",
+        "deadline_expired",
+        "worker_error",
+        "startup_interrupted",
+    }
+)
 _TASK4_OBSERVATION_PUBLIC_FIELDS = frozenset(
     {
         "schema",
@@ -138,6 +159,201 @@ def canonical_json(value: object) -> str:
 def sha256_digest(value: object) -> str:
     encoded = canonical_json(value).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def validate_exact_revision(
+    value: object,
+    *,
+    actual_revision: int,
+    scan_id: str,
+) -> int:
+    """Require an exact integer CAS revision, rejecting bool-as-int aliases."""
+
+    if type(value) is not int or value != actual_revision:
+        raise LanScanRevisionConflict(scan_id, actual_revision)
+    return value
+
+
+def observation_membership_digest(
+    observations: Iterable[LanObservationDraft | LanObservationRecord],
+) -> str:
+    """Bind canonical endpoint identities to exact durable observation evidence."""
+
+    members: dict[str, str] = {}
+    for observation in observations:
+        if type(observation) not in {LanObservationDraft, LanObservationRecord}:
+            raise ValueError("LAN observation membership requires exact durable records")
+        draft = (
+            observation
+            if type(observation) is LanObservationDraft
+            else LanObservationDraft(
+                endpoint_id=observation.endpoint_id,
+                source=observation.source,
+                interface_id=observation.interface_id,
+                address=observation.address,
+                port=observation.port,
+                api_shape=observation.api_shape,
+                tls_enabled=observation.tls_enabled,
+                certificate_sha256=observation.certificate_sha256,
+                catalog_digest=observation.catalog_digest,
+                capability_digest=observation.capability_digest,
+                public_payload=observation.public_payload,
+                freshness_timestamp=observation.freshness_timestamp,
+                error_category=observation.error_category,
+            )
+        )
+        values = validate_observation(draft)
+        endpoint_id = str(values["endpoint_id"])
+        payload = values["public_payload"]
+        if type(payload) is dict and payload.get("schema") == _TASK4_OBSERVATION_SCHEMA:
+            observation_digest = validate_digest(
+                payload.get("observation_digest"),
+                "observation_digest",
+            )
+            assert observation_digest is not None
+        else:
+            observation_digest = sha256_digest(
+                {
+                    "schema": "kestrel.lan.observation-projection.v1",
+                    **values,
+                }
+            )
+        existing = members.get(endpoint_id)
+        if existing is not None and existing != observation_digest:
+            raise ValueError(f"conflicting LAN observation endpoint: {endpoint_id}")
+        members[endpoint_id] = observation_digest
+    ordered = [
+        {"endpoint_id": endpoint_id, "observation_digest": members[endpoint_id]}
+        for endpoint_id in sorted(members)
+    ]
+    return sha256_digest(
+        {
+            "schema": LAN_OBSERVATION_MEMBERSHIP_SCHEMA,
+            "count": len(ordered),
+            "members": ordered,
+        }
+    )
+
+
+def bounded_scan_preview_event(value: object) -> dict[str, Any]:
+    payload = _require_string_keyed_object(value, "scan preview event")
+    expected = {
+        "schema",
+        "owner_principal",
+        "interface_id",
+        "network",
+        "limits",
+        "active_host_count",
+        "passive_or_manual_only",
+        "port_count",
+        "mdns_status",
+        "server_version",
+        "contract_version",
+        "preview_digest",
+        "expires_at",
+    }
+    if set(payload) != expected or payload.get("schema") != LAN_SCAN_PREVIEW_EVENT_SCHEMA:
+        raise ValueError("LAN scan preview event has an invalid field set")
+    passive = payload["passive_or_manual_only"]
+    if type(passive) is not bool:
+        raise ValueError("passive_or_manual_only must be boolean")
+    mdns_status = payload["mdns_status"]
+    if type(mdns_status) is not str or mdns_status not in LAN_MDNS_STATUSES:
+        raise ValueError("LAN mDNS status is invalid")
+    interface_id = payload["interface_id"]
+    preview_digest = payload["preview_digest"]
+    if type(interface_id) is not str or type(preview_digest) is not str:
+        raise ValueError("LAN preview digest binding is invalid")
+    result = {
+        "schema": LAN_SCAN_PREVIEW_EVENT_SCHEMA,
+        "owner_principal": validate_required_text(
+            payload["owner_principal"], "owner_principal", maximum=256
+        ),
+        "interface_id": validate_digest(interface_id, "interface_id"),
+        "network": normalize_network(payload["network"]),  # type: ignore[arg-type]
+        "limits": bounded_scan_limits(payload["limits"]),
+        "active_host_count": validate_non_negative_count(
+            payload["active_host_count"], "active_host_count"
+        ),
+        "passive_or_manual_only": passive,
+        "port_count": validate_non_negative_count(payload["port_count"], "port_count"),
+        "mdns_status": mdns_status,
+        "server_version": validate_required_text(
+            payload["server_version"], "server_version", maximum=128
+        ),
+        "contract_version": validate_required_text(
+            payload["contract_version"], "contract_version", maximum=128
+        ),
+        "preview_digest": validate_digest(preview_digest, "preview_digest"),
+        "expires_at": _normalize_observation_timestamp(payload["expires_at"]),
+    }
+    return _bounded_json_object(
+        result,
+        kind="scan preview event",
+        max_bytes=MAX_EVENT_PAYLOAD_BYTES,
+    )
+
+
+def bounded_scan_progress_event(value: object) -> dict[str, Any]:
+    payload = _require_string_keyed_object(value, "scan progress event")
+    expected = {
+        "schema",
+        "planned_count",
+        "admitted_count",
+        "completed_count",
+        "persisted_observation_count",
+        "error_category_counts",
+        "timeout_count",
+        "mdns_status",
+    }
+    if set(payload) != expected or payload.get("schema") != LAN_SCAN_PROGRESS_EVENT_SCHEMA:
+        raise ValueError("LAN scan progress event has an invalid field set")
+    counts = {
+        field: validate_non_negative_count(payload[field], field)
+        for field in (
+            "planned_count",
+            "admitted_count",
+            "completed_count",
+            "persisted_observation_count",
+            "timeout_count",
+        )
+    }
+    if not (counts["completed_count"] <= counts["admitted_count"] <= counts["planned_count"]):
+        raise ValueError("LAN scan progress counts are inconsistent")
+    if counts["planned_count"] > MAX_LAN_SCAN_OBSERVATIONS:
+        raise ValueError("LAN scan planned count exceeds the fixed observation ceiling")
+    if counts["persisted_observation_count"] > counts["completed_count"]:
+        raise ValueError("persisted observation count exceeds completed count")
+    error_counts = bounded_error_category_counts(payload["error_category_counts"])
+    if sum(error_counts.values()) > counts["completed_count"]:
+        raise ValueError("LAN error counts exceed completed count")
+    if counts["timeout_count"] > sum(error_counts.values()):
+        raise ValueError("timeout_count exceeds error count")
+    mdns_status = payload["mdns_status"]
+    if type(mdns_status) is not str or mdns_status not in LAN_MDNS_STATUSES:
+        raise ValueError("LAN mDNS status is invalid")
+    return _bounded_json_object(
+        {
+            "schema": LAN_SCAN_PROGRESS_EVENT_SCHEMA,
+            **counts,
+            "error_category_counts": error_counts,
+            "mdns_status": mdns_status,
+        },
+        kind="scan progress event",
+        max_bytes=MAX_EVENT_PAYLOAD_BYTES,
+    )
+
+
+def bounded_error_category_counts(value: object) -> dict[str, int]:
+    payload = _require_string_keyed_object(value, "error category counts")
+    allowed = {item.value for item in LanFailureCategory}
+    if any(key not in allowed for key in payload):
+        raise ValueError("LAN error category is invalid")
+    return {
+        key: validate_non_negative_count(payload[key], f"error_category_counts.{key}")
+        for key in sorted(payload)
+        if validate_non_negative_count(payload[key], f"error_category_counts.{key}") > 0
+    }
 
 
 def bounded_observation_public_evidence(value: object) -> dict[str, Any]:
@@ -346,6 +562,7 @@ def load_authenticated_task4_observation(
     receipt_observations = [
         _strict_observation_receipt_payload(row, scan_id=scan_id) for row in observation_rows
     ]
+    durable_observations = [observation_from_row(row) for row in observation_rows]
     authenticated_observations: dict[str, tuple[LanEndpointObservation, datetime]] = {}
     for row in observation_rows:
         raw_payload = _strict_json_object(
@@ -371,40 +588,67 @@ def load_authenticated_task4_observation(
         scan_row["timeout_count"],
         "timeout_count",
     )
-    receipt = {
-        "scan_id": scan_id,
-        "status": "completed",
-        "owner_principal": owner_principal,
-        "confirmed_interface_id": interface_id,
-        "network": network,
-        "limits": limits,
-        "limits_digest": str(scan_row["limits_digest"]),
-        "preview_digest": preview_digest,
-        "started_at": _strict_optional_text(scan_row["started_at"], "started_at"),
-        "finished_at": validate_required_text(
-            scan_row["finished_at"],
-            "finished_at",
-            maximum=64,
-        ),
-        "cancel_reason": _strict_optional_text(
-            scan_row["cancel_reason"],
-            "cancel_reason",
-        ),
-        "terminal_reason": _strict_optional_text(
-            scan_row["terminal_reason"],
-            "terminal_reason",
-        ),
-        "candidate_count": candidate_count,
-        "error_count": error_count,
-        "timeout_count": timeout_count,
-        "observations": receipt_observations,
-    }
     stored_receipt = _strict_json_object(
         scan_row["terminal_receipt_json"],
         "terminal receipt",
     )
     if canonical_json(stored_receipt) != str(scan_row["terminal_receipt_json"]):
         raise ValueError("durable LAN terminal receipt is not canonical")
+    if stored_receipt.get("schema") == LAN_SCAN_RECEIPT_V2_SCHEMA:
+        receipt = _validated_v2_terminal_receipt(
+            stored_receipt,
+            scan_id=scan_id,
+            owner_principal=owner_principal,
+            interface_id=interface_id,
+            network=network,
+            limits=limits,
+            limits_digest=str(scan_row["limits_digest"]),
+            preview_digest=preview_digest,
+            started_at=_strict_optional_text(scan_row["started_at"], "started_at"),
+            finished_at=validate_required_text(
+                scan_row["finished_at"],
+                "finished_at",
+                maximum=64,
+            ),
+            cancel_reason=_strict_optional_text(scan_row["cancel_reason"], "cancel_reason"),
+            terminal_reason=_strict_optional_text(
+                scan_row["terminal_reason"],
+                "terminal_reason",
+            ),
+            candidate_count=candidate_count,
+            error_count=error_count,
+            timeout_count=timeout_count,
+            observations=durable_observations,
+        )
+    else:
+        receipt = {
+            "scan_id": scan_id,
+            "status": "completed",
+            "owner_principal": owner_principal,
+            "confirmed_interface_id": interface_id,
+            "network": network,
+            "limits": limits,
+            "limits_digest": str(scan_row["limits_digest"]),
+            "preview_digest": preview_digest,
+            "started_at": _strict_optional_text(scan_row["started_at"], "started_at"),
+            "finished_at": validate_required_text(
+                scan_row["finished_at"],
+                "finished_at",
+                maximum=64,
+            ),
+            "cancel_reason": _strict_optional_text(
+                scan_row["cancel_reason"],
+                "cancel_reason",
+            ),
+            "terminal_reason": _strict_optional_text(
+                scan_row["terminal_reason"],
+                "terminal_reason",
+            ),
+            "candidate_count": candidate_count,
+            "error_count": error_count,
+            "timeout_count": timeout_count,
+            "observations": receipt_observations,
+        }
     if stored_receipt != receipt:
         raise ValueError("durable LAN terminal receipt does not match durable rows")
     stored_receipt_digest = validate_digest(
@@ -433,6 +677,153 @@ def load_authenticated_task4_observation(
         observed_at=observed_at,
         observation=observation,
     )
+
+
+def _validated_v2_terminal_receipt(
+    receipt: dict[str, Any],
+    *,
+    scan_id: str,
+    owner_principal: str,
+    interface_id: str,
+    network: str,
+    limits: dict[str, Any],
+    limits_digest: str,
+    preview_digest: str | None,
+    started_at: str | None,
+    finished_at: str,
+    cancel_reason: str | None,
+    terminal_reason: str | None,
+    candidate_count: int,
+    error_count: int,
+    timeout_count: int,
+    observations: list[LanObservationRecord],
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema",
+        "version",
+        "scan_id",
+        "status",
+        "owner_principal",
+        "confirmed_interface_id",
+        "network",
+        "limits",
+        "limits_digest",
+        "preview_digest",
+        "started_at",
+        "finished_at",
+        "cancel_reason",
+        "terminal_reason",
+        "mdns_status",
+        "planned_count",
+        "admitted_count",
+        "completed_count",
+        "persisted_observation_count",
+        "error_count",
+        "timeout_count",
+        "error_category_counts",
+        "observation_count",
+        "observation_membership_digest",
+        "evidence_complete",
+        "unknown_inflight_count",
+    }
+    if set(receipt) != expected_fields:
+        raise ValueError("durable LAN v2 receipt has an invalid field set")
+    if receipt["schema"] != LAN_SCAN_RECEIPT_V2_SCHEMA:
+        raise ValueError("durable LAN v2 receipt schema is invalid")
+    if type(receipt["version"]) is not int or receipt["version"] != 2:
+        raise ValueError("durable LAN v2 receipt version is invalid")
+    exact_bindings = {
+        "scan_id": scan_id,
+        "status": "completed",
+        "owner_principal": owner_principal,
+        "confirmed_interface_id": interface_id,
+        "network": network,
+        "limits": limits,
+        "limits_digest": limits_digest,
+        "preview_digest": preview_digest,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "cancel_reason": cancel_reason,
+        "terminal_reason": terminal_reason,
+    }
+    if any(receipt[field] != value for field, value in exact_bindings.items()):
+        raise ValueError("durable LAN v2 receipt binding does not match scan row")
+    if terminal_reason != "scan_complete" or cancel_reason is not None:
+        raise ValueError("completed LAN v2 receipt has an invalid terminal reason")
+    mdns_status = receipt["mdns_status"]
+    if type(mdns_status) is not str or mdns_status not in LAN_MDNS_STATUSES:
+        raise ValueError("durable LAN v2 mDNS status is invalid")
+    counts = {
+        field: validate_non_negative_count(receipt[field], field)
+        for field in (
+            "planned_count",
+            "admitted_count",
+            "completed_count",
+            "persisted_observation_count",
+            "error_count",
+            "timeout_count",
+            "observation_count",
+        )
+    }
+    if not (counts["completed_count"] == counts["admitted_count"] <= counts["planned_count"]):
+        raise ValueError("durable LAN v2 terminal counts are inconsistent")
+    durable_count = len(observations)
+    if durable_count > MAX_LAN_SCAN_OBSERVATIONS:
+        raise ValueError("durable LAN v2 observation count exceeds the fixed ceiling")
+    if (
+        counts["persisted_observation_count"] != durable_count
+        or counts["observation_count"] != durable_count
+        or candidate_count != durable_count
+    ):
+        raise ValueError("durable LAN v2 observation count does not match rows")
+    if durable_count != counts["completed_count"]:
+        raise ValueError("durable LAN v2 complete evidence does not match completed work")
+    error_counts = bounded_error_category_counts(receipt["error_category_counts"])
+    durable_error_counts: dict[str, int] = {}
+    for observation in observations:
+        if observation.error_category is not None:
+            durable_error_counts[observation.error_category] = (
+                durable_error_counts.get(observation.error_category, 0) + 1
+            )
+    durable_error_counts = dict(sorted(durable_error_counts.items()))
+    durable_timeout_count = sum(
+        count
+        for category, count in durable_error_counts.items()
+        if category in {"tcp_timeout", "http_timeout", "scan_deadline_exceeded"}
+    )
+    if error_counts != durable_error_counts:
+        raise ValueError("durable LAN v2 error counts do not match observations")
+    if counts["error_count"] != sum(error_counts.values()) or error_count != counts["error_count"]:
+        raise ValueError("durable LAN v2 error counts do not match rows")
+    if counts["timeout_count"] != timeout_count or timeout_count != durable_timeout_count:
+        raise ValueError("durable LAN v2 timeout count does not match row")
+    membership = validate_digest(
+        receipt["observation_membership_digest"],
+        "observation_membership_digest",
+    )
+    if membership != observation_membership_digest(observations):
+        raise ValueError("durable LAN v2 observation membership does not match rows")
+    if type(receipt["evidence_complete"]) is not bool or not receipt["evidence_complete"]:
+        raise ValueError("durable completed LAN v2 receipt must have complete evidence")
+    if type(receipt["unknown_inflight_count"]) is not int or receipt["unknown_inflight_count"] != 0:
+        raise ValueError("durable completed LAN v2 in-flight count must be exact zero")
+    return {
+        "schema": LAN_SCAN_RECEIPT_V2_SCHEMA,
+        "version": 2,
+        **exact_bindings,
+        "mdns_status": mdns_status,
+        "planned_count": counts["planned_count"],
+        "admitted_count": counts["admitted_count"],
+        "completed_count": counts["completed_count"],
+        "persisted_observation_count": durable_count,
+        "error_count": error_count,
+        "timeout_count": timeout_count,
+        "error_category_counts": error_counts,
+        "observation_count": durable_count,
+        "observation_membership_digest": membership,
+        "evidence_complete": True,
+        "unknown_inflight_count": 0,
+    }
 
 
 def _strict_observation_receipt_payload(
