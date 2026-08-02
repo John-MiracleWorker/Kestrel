@@ -7,7 +7,7 @@ import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal, cast
 
 from .lan_http_transport import InterfaceInventoryResolver
 from .lan_runtime_authority import LAN_OPENAI_RUNTIME_HARDENING_VERSION
@@ -30,6 +30,7 @@ from .routing.ledger_records import (
 
 _LAN_PROFILE_ID_RE = re.compile(r"lan-provider-[0-9a-f]{64}\Z")
 _LAN_TARGET_ID_RE = re.compile(r"lan-target-[0-9a-f]{64}\Z")
+_LAN_SCAN_ID_RE = re.compile(r"lan_[0-9a-f]{32}\Z")
 _MAX_AFFINITIES = 16
 _MAX_AFFINITY_UTF8_BYTES = 64
 
@@ -206,6 +207,245 @@ class LanReviewResult:
     privacy_acknowledgement_digest: str
 
 
+@dataclass(frozen=True)
+class LanImportSelector:
+    scan_id: str
+    endpoint_id: str
+    replacement_provider_profile_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.scan_id) is not str or _LAN_SCAN_ID_RE.fullmatch(self.scan_id) is None:
+            raise ValueError("LAN import selector scan ID is invalid")
+        _validate_exact_digest(self.endpoint_id, "endpoint_id")
+        if self.replacement_provider_profile_id is not None:
+            _validate_profile_id(self.replacement_provider_profile_id)
+
+
+@dataclass(frozen=True)
+class LanImportAuthority:
+    expected_terminal_receipt_digest: str
+    expected_observation_digest: str
+    expected_profile_revision: int
+    expected_target_revisions: tuple[LanExpectedRevision, ...]
+    endpoint_fingerprint: str | None
+    replacement: LanReplacementConfirmation | None
+
+    def __post_init__(self) -> None:
+        _validate_exact_digest(
+            self.expected_terminal_receipt_digest,
+            "expected_terminal_receipt_digest",
+        )
+        _validate_exact_digest(
+            self.expected_observation_digest,
+            "expected_observation_digest",
+        )
+        _validate_revision(self.expected_profile_revision)
+        if type(self.expected_target_revisions) is not tuple or any(
+            type(item) is not LanExpectedRevision
+            for item in self.expected_target_revisions
+        ):
+            raise ValueError("LAN import authority revisions must be exactly typed")
+        resource_ids = tuple(
+            item.resource_id for item in self.expected_target_revisions
+        )
+        if len(resource_ids) != len(set(resource_ids)):
+            raise ValueError("LAN import authority revisions must be unique")
+        if self.endpoint_fingerprint is not None:
+            _validate_exact_digest(
+                self.endpoint_fingerprint,
+                "endpoint_fingerprint",
+            )
+        if self.replacement is not None:
+            if type(self.replacement) is not LanReplacementConfirmation:
+                raise ValueError("LAN import replacement authority must be exactly typed")
+            LanReplacementConfirmation.__post_init__(self.replacement)
+
+
+@dataclass(frozen=True)
+class LanImportPreview:
+    selector: LanImportSelector
+    preview_digest: str
+    evidence_expires_at: str
+    authority: LanImportAuthority
+    result: LanImportResult
+    requires_confirmation: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.selector) is not LanImportSelector:
+            raise ValueError("LAN import preview selector must be exactly typed")
+        if type(self.authority) is not LanImportAuthority:
+            raise ValueError("LAN import preview authority must be exactly typed")
+        if type(self.result) is not LanImportResult:
+            raise ValueError("LAN import preview result must be exactly typed")
+        LanImportSelector.__post_init__(self.selector)
+        LanImportAuthority.__post_init__(self.authority)
+        _validate_exact_digest(self.preview_digest, "preview_digest")
+        _validate_canonical_utc_timestamp(
+            self.evidence_expires_at,
+            "evidence_expires_at",
+        )
+        if (
+            type(self.requires_confirmation) is not bool
+            or self.requires_confirmation is not True
+        ):
+            raise ValueError("LAN import preview must require confirmation")
+        if self.result.observation_digest != self.authority.expected_observation_digest:
+            raise ValueError("LAN import preview evidence authority is inconsistent")
+
+
+@dataclass(frozen=True)
+class LanImportConfirmation:
+    selector: LanImportSelector
+    preview_digest: str
+    confirmed: bool
+
+    def __post_init__(self) -> None:
+        if type(self.selector) is not LanImportSelector:
+            raise ValueError("LAN import confirmation selector must be exactly typed")
+        LanImportSelector.__post_init__(self.selector)
+        _validate_exact_digest(self.preview_digest, "preview_digest")
+        if type(self.confirmed) is not bool or self.confirmed is not True:
+            raise ValueError("LAN import confirmation must be explicit")
+
+
+@dataclass(frozen=True)
+class LanImportConfirmationResult:
+    preview_digest: str
+    result: LanImportResult
+
+    def __post_init__(self) -> None:
+        _validate_exact_digest(self.preview_digest, "preview_digest")
+        if type(self.result) is not LanImportResult:
+            raise ValueError("LAN import confirmation result must be exactly typed")
+
+
+@dataclass(frozen=True)
+class LanReviewOptions:
+    target_id: str
+    intended_roles: tuple[str, ...]
+    task_family_affinities: tuple[str, ...]
+    enabled: bool
+
+    def __post_init__(self) -> None:
+        _validate_target_id(self.target_id)
+        _validate_affinities(self.intended_roles, "intended roles")
+        _validate_affinities(self.task_family_affinities, "task-family affinities")
+        if type(self.enabled) is not bool:
+            raise ValueError("LAN review enabled must be boolean")
+
+
+@dataclass(frozen=True)
+class LanReviewAuthority:
+    provider_profile_id: str
+    expected_profile_revision: int
+    expected_target_revision: int
+    expected_terminal_receipt_digest: str
+    expected_observation_digest: str
+    expected_endpoint_fingerprint: str
+    expected_material_binding_digest: str
+    expected_stale_reasons: tuple[LanStaleReason, ...]
+    trust_class: Literal["operator_confirmed"]
+    privacy_acknowledgement_digest: str
+    review_digest: str
+    reviewed_material_binding_digest: str
+    reviewed_runtime_interface_binding_digest: str | None
+
+    def __post_init__(self) -> None:
+        _validate_profile_id(self.provider_profile_id)
+        _validate_revision(self.expected_profile_revision)
+        _validate_revision(self.expected_target_revision)
+        for field in (
+            "expected_terminal_receipt_digest",
+            "expected_observation_digest",
+            "expected_endpoint_fingerprint",
+            "expected_material_binding_digest",
+            "privacy_acknowledgement_digest",
+            "review_digest",
+            "reviewed_material_binding_digest",
+        ):
+            _validate_exact_digest(getattr(self, field), field)
+        _validate_stale_reasons(self.expected_stale_reasons)
+        if self.trust_class != "operator_confirmed":
+            raise ValueError("LAN review authority trust class is invalid")
+        if self.reviewed_runtime_interface_binding_digest is not None:
+            _validate_exact_digest(
+                self.reviewed_runtime_interface_binding_digest,
+                "reviewed_runtime_interface_binding_digest",
+            )
+
+
+@dataclass(frozen=True)
+class LanReviewPreview:
+    options: LanReviewOptions
+    preview_digest: str
+    evidence_expires_at: str
+    authority: LanReviewAuthority
+    profile: ProviderProfileEntry
+    target: ModelTargetEntry
+    requires_privacy_acknowledgement: bool = True
+    requires_confirmation: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.options) is not LanReviewOptions:
+            raise ValueError("LAN review preview options must be exactly typed")
+        if type(self.authority) is not LanReviewAuthority:
+            raise ValueError("LAN review preview authority must be exactly typed")
+        if type(self.profile) is not ProviderProfileEntry:
+            raise ValueError("LAN review preview profile must be exactly typed")
+        if type(self.target) is not ModelTargetEntry:
+            raise ValueError("LAN review preview target must be exactly typed")
+        LanReviewOptions.__post_init__(self.options)
+        LanReviewAuthority.__post_init__(self.authority)
+        _validate_exact_digest(self.preview_digest, "preview_digest")
+        _validate_canonical_utc_timestamp(
+            self.evidence_expires_at,
+            "evidence_expires_at",
+        )
+        if (
+            type(self.requires_privacy_acknowledgement) is not bool
+            or self.requires_privacy_acknowledgement is not True
+            or type(self.requires_confirmation) is not bool
+            or self.requires_confirmation is not True
+        ):
+            raise ValueError("LAN review preview must require explicit acknowledgement")
+        if self.target.target.target_id != self.options.target_id:
+            raise ValueError("LAN review preview target is inconsistent")
+        if self.profile.profile.profile_id != self.authority.provider_profile_id:
+            raise ValueError("LAN review preview profile authority is inconsistent")
+
+
+@dataclass(frozen=True)
+class LanReviewConfirmation:
+    options: LanReviewOptions
+    preview_digest: str
+    privacy_acknowledged: bool
+    confirmed: bool
+
+    def __post_init__(self) -> None:
+        if type(self.options) is not LanReviewOptions:
+            raise ValueError("LAN review confirmation options must be exactly typed")
+        LanReviewOptions.__post_init__(self.options)
+        _validate_exact_digest(self.preview_digest, "preview_digest")
+        if (
+            type(self.privacy_acknowledged) is not bool
+            or self.privacy_acknowledged is not True
+            or type(self.confirmed) is not bool
+            or self.confirmed is not True
+        ):
+            raise ValueError("LAN review confirmation requires explicit owner acknowledgement")
+
+
+@dataclass(frozen=True)
+class LanReviewConfirmationResult:
+    preview_digest: str
+    result: LanReviewResult
+
+    def __post_init__(self) -> None:
+        _validate_exact_digest(self.preview_digest, "preview_digest")
+        if type(self.result) is not LanReviewResult:
+            raise ValueError("LAN review confirmation result must be exactly typed")
+
+
 class LanDiscoveryService:
     """Translate authenticated Task 4 evidence into disabled routing drafts."""
 
@@ -232,6 +472,197 @@ class LanDiscoveryService:
         ):
             raise ValueError("LAN interface inventory resolver must be callable")
         self._interface_inventory_resolver = interface_inventory_resolver
+
+    def prepare_lan_import(
+        self,
+        selector: LanImportSelector,
+        *,
+        authenticated_owner_principal: str,
+    ) -> LanImportPreview:
+        if type(selector) is not LanImportSelector:
+            raise ValueError("LAN import selector must be exactly typed")
+        LanImportSelector.__post_init__(selector)
+        owner = _validate_canonical_owner(authenticated_owner_principal)
+        now = _validate_utc_clock(self._clock())
+        try:
+            plan = self.registry.prepare_server_owned_lan_import(
+                scan_id=selector.scan_id,
+                endpoint_id=selector.endpoint_id,
+                replacement_provider_profile_id=(
+                    selector.replacement_provider_profile_id
+                ),
+                authenticated_owner_principal=owner,
+                now=now,
+                runtime_hardening_version=self._runtime_hardening_version,
+            )
+        except RoutingRevisionConflict as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        except ValueError as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        replacement = (
+            None
+            if plan.replacement is None
+            else LanReplacementConfirmation(
+                provider_profile_id=plan.replacement[0],
+                expected_profile_revision=plan.replacement[1],
+                expected_endpoint_fingerprint=plan.replacement[2],
+                expected_material_binding_digests=plan.replacement[3],
+            )
+        )
+        result = _lan_import_result_from_plan(plan)
+        return LanImportPreview(
+            selector=selector,
+            preview_digest=plan.preview_digest,
+            evidence_expires_at=plan.evidence_expires_at,
+            authority=LanImportAuthority(
+                expected_terminal_receipt_digest=(
+                    plan.expected_terminal_receipt_digest
+                ),
+                expected_observation_digest=plan.expected_observation_digest,
+                expected_profile_revision=plan.expected_profile_revision,
+                expected_target_revisions=tuple(
+                    LanExpectedRevision(resource_id=target_id, revision=revision)
+                    for target_id, revision in plan.expected_target_revisions
+                ),
+                endpoint_fingerprint=plan.endpoint_fingerprint,
+                replacement=replacement,
+            ),
+            result=result,
+        )
+
+    def confirm_lan_import(
+        self,
+        confirmation: LanImportConfirmation,
+        *,
+        authenticated_owner_principal: str,
+    ) -> LanImportConfirmationResult:
+        if type(confirmation) is not LanImportConfirmation:
+            raise ValueError("LAN import confirmation must be exactly typed")
+        LanImportConfirmation.__post_init__(confirmation)
+        owner = _validate_canonical_owner(authenticated_owner_principal)
+        now = _validate_utc_clock(self._clock())
+        try:
+            plan = self.registry.confirm_server_owned_lan_import(
+                scan_id=confirmation.selector.scan_id,
+                endpoint_id=confirmation.selector.endpoint_id,
+                replacement_provider_profile_id=(
+                    confirmation.selector.replacement_provider_profile_id
+                ),
+                preview_digest=confirmation.preview_digest,
+                authenticated_owner_principal=owner,
+                now=now,
+                runtime_hardening_version=self._runtime_hardening_version,
+            )
+        except RoutingRevisionConflict as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        except ValueError as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        return LanImportConfirmationResult(
+            preview_digest=plan.preview_digest,
+            result=_lan_import_result_from_plan(plan),
+        )
+
+    def prepare_lan_review(
+        self,
+        options: LanReviewOptions,
+        *,
+        authenticated_owner_principal: str,
+    ) -> LanReviewPreview:
+        if type(options) is not LanReviewOptions:
+            raise ValueError("LAN review options must be exactly typed")
+        LanReviewOptions.__post_init__(options)
+        owner = _validate_canonical_owner(authenticated_owner_principal)
+        now = _validate_utc_clock(self._clock())
+        try:
+            plan = self.registry.prepare_server_owned_lan_review(
+                target_id=options.target_id,
+                intended_roles=options.intended_roles,
+                task_family_affinities=options.task_family_affinities,
+                enabled=options.enabled,
+                authenticated_owner_principal=owner,
+                now=now,
+                runtime_hardening_version=self._runtime_hardening_version,
+                interface_inventory_resolver=self._interface_inventory_resolver,
+            )
+        except RoutingRevisionConflict as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        except ValueError as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        return LanReviewPreview(
+            options=options,
+            preview_digest=plan.preview_digest,
+            evidence_expires_at=plan.evidence_expires_at,
+            authority=LanReviewAuthority(
+                provider_profile_id=plan.provider_profile_id,
+                expected_profile_revision=plan.expected_profile_revision,
+                expected_target_revision=plan.expected_target_revision,
+                expected_terminal_receipt_digest=(
+                    plan.expected_terminal_receipt_digest
+                ),
+                expected_observation_digest=plan.expected_observation_digest,
+                expected_endpoint_fingerprint=plan.expected_endpoint_fingerprint,
+                expected_material_binding_digest=(
+                    plan.expected_material_binding_digest
+                ),
+                expected_stale_reasons=cast(
+                    tuple[LanStaleReason, ...],
+                    plan.expected_stale_reasons,
+                ),
+                trust_class="operator_confirmed",
+                privacy_acknowledgement_digest=(
+                    plan.privacy_acknowledgement_digest
+                ),
+                review_digest=plan.review_digest,
+                reviewed_material_binding_digest=(
+                    plan.reviewed_material_binding_digest
+                ),
+                reviewed_runtime_interface_binding_digest=(
+                    plan.reviewed_runtime_interface_binding_digest
+                ),
+            ),
+            profile=plan.result_profile,
+            target=plan.result_target,
+        )
+
+    def confirm_lan_review(
+        self,
+        confirmation: LanReviewConfirmation,
+        *,
+        authenticated_owner_principal: str,
+    ) -> LanReviewConfirmationResult:
+        if type(confirmation) is not LanReviewConfirmation:
+            raise ValueError("LAN review confirmation must be exactly typed")
+        LanReviewConfirmation.__post_init__(confirmation)
+        owner = _validate_canonical_owner(authenticated_owner_principal)
+        now = _validate_utc_clock(self._clock())
+        options = confirmation.options
+        try:
+            plan = self.registry.confirm_server_owned_lan_review(
+                target_id=options.target_id,
+                intended_roles=options.intended_roles,
+                task_family_affinities=options.task_family_affinities,
+                enabled=options.enabled,
+                preview_digest=confirmation.preview_digest,
+                authenticated_owner_principal=owner,
+                now=now,
+                runtime_hardening_version=self._runtime_hardening_version,
+                interface_inventory_resolver=self._interface_inventory_resolver,
+            )
+        except RoutingRevisionConflict as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        except ValueError as exc:
+            raise LanDiscoveryConflict(str(exc)) from None
+        return LanReviewConfirmationResult(
+            preview_digest=plan.preview_digest,
+            result=LanReviewResult(
+                profile=plan.result_profile,
+                target=plan.result_target,
+                material_binding_digest=plan.reviewed_material_binding_digest,
+                privacy_acknowledgement_digest=(
+                    plan.privacy_acknowledgement_digest
+                ),
+            ),
+        )
 
     def import_observation(
         self,
@@ -352,6 +783,19 @@ def _validate_canonical_owner(value: object) -> str:
     return owner
 
 
+def _lan_import_result_from_plan(plan: Any) -> LanImportResult:
+    return LanImportResult(
+        profile=plan.result_profile,
+        targets=plan.result_targets,
+        affected_target_ids=plan.affected_target_ids,
+        invalidated_binding_digests=plan.invalidated_binding_digests,
+        stale_reasons_by_target=plan.stale_reasons_by_target,
+        observation_digest=plan.expected_observation_digest,
+        endpoint_fingerprint=plan.endpoint_fingerprint,
+        outage_observed=plan.outage_observed,
+    )
+
+
 def _validate_canonical_text(value: object, field: str, *, maximum: int) -> str:
     if type(value) is not str:
         raise ValueError(f"{field} must be exact text")
@@ -381,6 +825,18 @@ def _validate_utc_clock(value: object) -> datetime:
         or value.utcoffset() != UTC.utcoffset(value)
     ):
         raise ValueError("LAN discovery clock must return an aware UTC datetime")
+    return value
+
+
+def _validate_canonical_utc_timestamp(value: object, field: str) -> str:
+    if type(value) is not str or not value.endswith("Z"):
+        raise ValueError(f"LAN {field} must be canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        raise ValueError(f"LAN {field} is invalid") from None
+    if parsed.astimezone(UTC).isoformat().replace("+00:00", "Z") != value:
+        raise ValueError(f"LAN {field} must be canonical UTC")
     return value
 
 

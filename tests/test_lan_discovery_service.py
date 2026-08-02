@@ -12,6 +12,7 @@ from threading import Event
 
 import pytest
 
+import nested_memvid_agent.lan_discovery_service as lan_discovery_service_module
 import nested_memvid_agent.routing.lan_serialization as lan_serialization_module
 from nested_memvid_agent.lan_discovery_models import (
     NetworkInterface,
@@ -8454,3 +8455,324 @@ def test_multi_target_positive_reimport_installs_one_marker_atomically_everywher
         service.review_lan_target(enable_beta, authenticated_owner_principal=OWNER)
     assert registry.get_provider_profile(provider_id) == before_beta_review[0]
     assert tuple(registry.get_model_target(item) for item in target_ids) == before_beta_review[1]
+
+
+def test_server_owned_import_preview_derives_authority_without_mutation(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scan_id = "lan_" + "1" * 32
+    observation = _positive_observation(models=("alpha", "beta"))
+    _row, completed = _persist_completed_scan(
+        state,
+        scan_id=scan_id,
+        observation=observation,
+    )
+    assert completed.terminal_receipt_digest is not None
+    registry = RoutingLedger(state)
+    service = LanDiscoveryService(registry, clock=lambda: NOW)
+    before = _routing_inventory_snapshot(state)
+    provider_id = _provider_id(observation.endpoint_binding_digest)
+    target_ids = (
+        _target_id(provider_id, "alpha"),
+        _target_id(provider_id, "beta"),
+    )
+
+    selector = lan_discovery_service_module.LanImportSelector(
+        scan_id=scan_id,
+        endpoint_id=observation.endpoint_binding_digest,
+    )
+    preview = service.prepare_lan_import(
+        selector,
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert _routing_inventory_snapshot(state) == before
+    assert preview.selector == selector
+    assert preview.preview_digest.startswith("sha256:")
+    assert preview.evidence_expires_at == "2026-08-01T12:05:00Z"
+    assert preview.requires_confirmation is True
+    assert preview.authority.expected_terminal_receipt_digest == (
+        completed.terminal_receipt_digest
+    )
+    assert preview.authority.expected_observation_digest == observation.observation_digest
+    assert preview.authority.expected_profile_revision == 0
+    assert tuple(
+        (item.resource_id, item.revision)
+        for item in preview.authority.expected_target_revisions
+    ) == tuple((target_id, 0) for target_id in target_ids)
+    assert preview.authority.endpoint_fingerprint is not None
+    assert preview.authority.replacement is None
+    assert preview.result.profile is not None
+    assert preview.result.profile.profile.profile_id == provider_id
+    assert preview.result.profile.revision == 1
+    assert tuple(item.target.target_id for item in preview.result.targets) == target_ids
+    assert all(item.revision == 1 for item in preview.result.targets)
+    assert all(item.target.enabled is False for item in preview.result.targets)
+    assert all(item.target.trust_class == "unconfirmed" for item in preview.result.targets)
+
+
+def test_server_owned_import_confirmation_commits_exact_preview_once(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scan_id = "lan_" + "2" * 32
+    observation = _positive_observation(models=("alpha", "beta"))
+    _persist_completed_scan(state, scan_id=scan_id, observation=observation)
+    registry = RoutingLedger(state)
+    service = LanDiscoveryService(registry, clock=lambda: NOW)
+    selector = lan_discovery_service_module.LanImportSelector(
+        scan_id=scan_id,
+        endpoint_id=observation.endpoint_binding_digest,
+    )
+    preview = service.prepare_lan_import(
+        selector,
+        authenticated_owner_principal=OWNER,
+    )
+
+    confirmed = service.confirm_lan_import(
+        lan_discovery_service_module.LanImportConfirmation(
+            selector=selector,
+            preview_digest=preview.preview_digest,
+            confirmed=True,
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert confirmed.preview_digest == preview.preview_digest
+    assert confirmed.result == preview.result
+    assert confirmed.result.profile is not None
+    assert registry.get_provider_profile(
+        confirmed.result.profile.profile.profile_id
+    ) == confirmed.result.profile
+    assert tuple(
+        registry.get_model_target(entry.target.target_id)
+        for entry in confirmed.result.targets
+    ) == confirmed.result.targets
+    committed = _routing_inventory_snapshot(state)
+
+    with pytest.raises(LanDiscoveryConflict, match="preview_conflict"):
+        service.confirm_lan_import(
+            lan_discovery_service_module.LanImportConfirmation(
+                selector=selector,
+                preview_digest=preview.preview_digest,
+                confirmed=True,
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+    assert _routing_inventory_snapshot(state) == committed
+
+
+def test_server_owned_import_confirmation_rejects_tampered_digest_without_mutation(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scan_id = "lan_" + "3" * 32
+    observation = _positive_observation()
+    _persist_completed_scan(state, scan_id=scan_id, observation=observation)
+    service = LanDiscoveryService(RoutingLedger(state), clock=lambda: NOW)
+    selector = lan_discovery_service_module.LanImportSelector(
+        scan_id=scan_id,
+        endpoint_id=observation.endpoint_binding_digest,
+    )
+    before = _routing_inventory_snapshot(state)
+
+    with pytest.raises(LanDiscoveryConflict, match="preview_conflict"):
+        service.confirm_lan_import(
+            lan_discovery_service_module.LanImportConfirmation(
+                selector=selector,
+                preview_digest="sha256:" + "0" * 64,
+                confirmed=True,
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+
+    assert _routing_inventory_snapshot(state) == before
+
+
+def test_server_owned_review_preview_and_confirmation_are_exact_and_atomic(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scan_id = "lan_" + "4" * 32
+    observation = _positive_observation()
+    _persist_completed_scan(state, scan_id=scan_id, observation=observation)
+    registry = RoutingLedger(state)
+    service = LanDiscoveryService(registry, clock=lambda: NOW)
+    selector = lan_discovery_service_module.LanImportSelector(
+        scan_id=scan_id,
+        endpoint_id=observation.endpoint_binding_digest,
+    )
+    imported = service.confirm_lan_import(
+        lan_discovery_service_module.LanImportConfirmation(
+            selector=selector,
+            preview_digest=service.prepare_lan_import(
+                selector,
+                authenticated_owner_principal=OWNER,
+            ).preview_digest,
+            confirmed=True,
+        ),
+        authenticated_owner_principal=OWNER,
+    ).result
+    target = imported.targets[0]
+    options = lan_discovery_service_module.LanReviewOptions(
+        target_id=target.target.target_id,
+        intended_roles=("chat",),
+        task_family_affinities=("general",),
+        enabled=False,
+    )
+    before = _routing_inventory_snapshot(state)
+
+    preview = service.prepare_lan_review(
+        options,
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert _routing_inventory_snapshot(state) == before
+    assert preview.options == options
+    assert preview.evidence_expires_at == "2026-08-01T12:05:00Z"
+    assert preview.authority.provider_profile_id == target.target.provider_profile_id
+    assert preview.authority.expected_profile_revision == 1
+    assert preview.authority.expected_target_revision == 1
+    assert preview.authority.trust_class == "operator_confirmed"
+    assert preview.authority.reviewed_runtime_interface_binding_digest is None
+    assert preview.profile.revision == 2
+    assert preview.target.revision == 2
+    assert preview.target.target.enabled is False
+    assert preview.target.target.trust_class == "operator_confirmed"
+
+    confirmed = service.confirm_lan_review(
+        lan_discovery_service_module.LanReviewConfirmation(
+            options=options,
+            preview_digest=preview.preview_digest,
+            privacy_acknowledged=True,
+            confirmed=True,
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert confirmed.preview_digest == preview.preview_digest
+    assert confirmed.result.profile == preview.profile
+    assert confirmed.result.target == preview.target
+    assert confirmed.result.material_binding_digest == (
+        preview.authority.reviewed_material_binding_digest
+    )
+    assert confirmed.result.privacy_acknowledgement_digest == (
+        preview.authority.privacy_acknowledgement_digest
+    )
+    assert registry.get_provider_profile(
+        confirmed.result.profile.profile.profile_id
+    ) == confirmed.result.profile
+    assert registry.get_model_target(options.target_id) == confirmed.result.target
+    committed = _routing_inventory_snapshot(state)
+    with pytest.raises(LanDiscoveryConflict, match="preview_conflict"):
+        service.confirm_lan_review(
+            lan_discovery_service_module.LanReviewConfirmation(
+                options=options,
+                preview_digest=preview.preview_digest,
+                privacy_acknowledged=True,
+                confirmed=True,
+            ),
+            authenticated_owner_principal=OWNER,
+        )
+    assert _routing_inventory_snapshot(state) == committed
+
+
+def test_server_owned_import_derives_replacement_family_and_stales_it_atomically(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    (
+        _old_observation,
+        _old_scan,
+        registry,
+        _service,
+        _old_result,
+        old_provider_id,
+        (old_target_id,),
+    ) = _import_first_positive(state)
+    old_profile = registry.get_provider_profile(old_provider_id)
+    old_target = registry.get_model_target(old_target_id)
+    assert old_profile is not None and old_target is not None
+    changed = _positive_observation(address="192.168.50.3")
+    scan_id = "lan_" + "5" * 32
+    _persist_completed_scan(state, scan_id=scan_id, observation=changed)
+    service = LanDiscoveryService(registry, clock=lambda: NOW)
+    selector = lan_discovery_service_module.LanImportSelector(
+        scan_id=scan_id,
+        endpoint_id=changed.endpoint_binding_digest,
+        replacement_provider_profile_id=old_provider_id,
+    )
+    before = _routing_inventory_snapshot(state)
+
+    preview = service.prepare_lan_import(
+        selector,
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert _routing_inventory_snapshot(state) == before
+    assert preview.authority.replacement is not None
+    assert preview.authority.replacement.provider_profile_id == old_provider_id
+    assert preview.authority.replacement.expected_profile_revision == old_profile.revision
+    assert preview.authority.replacement.expected_material_binding_digests == (
+        old_target.target.metadata["lan_discovery"]["material_binding_digest"],
+    )
+    assert old_target_id in preview.result.affected_target_ids
+    assert preview.result.stale_reasons_by_target == (
+        (old_target_id, ("address_changed",)),
+    )
+
+    confirmed = service.confirm_lan_import(
+        lan_discovery_service_module.LanImportConfirmation(
+            selector=selector,
+            preview_digest=preview.preview_digest,
+            confirmed=True,
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert confirmed.result == preview.result
+    stale_old = registry.get_model_target(old_target_id)
+    assert stale_old is not None
+    assert stale_old.target.enabled is False
+    assert stale_old.target.metadata["lan_discovery"]["stale_reasons"] == [
+        "address_changed"
+    ]
+
+
+def test_server_owned_uncorrelated_outage_preview_and_confirmation_write_nothing(
+    tmp_path: Path,
+) -> None:
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    scan_id = "lan_" + "6" * 32
+    observation = _outage_observation()
+    _persist_completed_scan(state, scan_id=scan_id, observation=observation)
+    registry = RoutingLedger(state)
+    service = LanDiscoveryService(registry, clock=lambda: NOW)
+    selector = lan_discovery_service_module.LanImportSelector(
+        scan_id=scan_id,
+        endpoint_id=observation.endpoint_binding_digest,
+    )
+    before = _routing_inventory_snapshot(state)
+
+    preview = service.prepare_lan_import(
+        selector,
+        authenticated_owner_principal=OWNER,
+    )
+    confirmed = service.confirm_lan_import(
+        lan_discovery_service_module.LanImportConfirmation(
+            selector=selector,
+            preview_digest=preview.preview_digest,
+            confirmed=True,
+        ),
+        authenticated_owner_principal=OWNER,
+    )
+
+    assert preview.authority.expected_profile_revision == 0
+    assert preview.authority.expected_target_revisions == ()
+    assert preview.authority.endpoint_fingerprint is None
+    assert preview.result.outage_observed is True
+    assert preview.result.profile is None
+    assert preview.result.targets == ()
+    assert confirmed.result == preview.result
+    assert _routing_inventory_snapshot(state) == before

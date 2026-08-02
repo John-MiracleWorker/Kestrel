@@ -276,24 +276,35 @@ export type LanStaleReason =
   | "freshness_expired";
 
 export type LanExpectedRevision = Readonly<{
-  resourceId: string;
+  resource_id: string;
   revision: number;
 }>;
 
 export type LanReplacementConfirmation = Readonly<{
-  providerProfileId: string;
-  expectedProfileRevision: number;
-  expectedEndpointFingerprint: string;
-  expectedMaterialBindingDigests: string[];
+  provider_profile_id: string;
+  expected_profile_revision: number;
+  expected_endpoint_fingerprint: string;
+  expected_material_binding_digests: string[];
 }>;
 
-export type LanImportRequest = Readonly<{
+export type LanImportSelector = Readonly<{
   scanId: string;
-  endpointBindingDigest: string;
-  expectedTerminalReceiptDigest: string;
-  expectedObservationDigest: string;
-  expectedProfileRevision: number;
-  expectedTargetRevisions: LanExpectedRevision[];
+  endpointId: string;
+  replacementProviderProfileId: string | null;
+}>;
+
+export type LanImportSelectorProjection = Readonly<{
+  scan_id: string;
+  endpoint_id: string;
+  replacement_provider_profile_id: string | null;
+}>;
+
+export type LanImportAuthority = Readonly<{
+  expected_terminal_receipt_digest: string;
+  expected_observation_digest: string;
+  expected_profile_revision: number;
+  expected_target_revisions: LanExpectedRevision[];
+  endpoint_fingerprint: string | null;
   replacement: LanReplacementConfirmation | null;
 }>;
 
@@ -311,21 +322,54 @@ export type LanImportResult = Readonly<{
   }>;
 }>;
 
-export type LanTargetReviewRequest = Readonly<{
+export type LanImportPreview = Readonly<{
+  selector: LanImportSelectorProjection;
+  preview_digest: string;
+  evidence_expires_at: string;
+  authority: LanImportAuthority;
+  result: LanImportResult;
+  requires_confirmation: true;
+}>;
+
+export type LanImportConfirmation = Readonly<{
+  selector: LanImportSelector;
+  previewDigest: string;
+  confirmed: true;
+}>;
+
+export type LanImportConfirmationResult = Readonly<{
+  preview_digest: string;
+  result: LanImportResult;
+}>;
+
+export type LanTargetReviewOptions = Readonly<{
   targetId: string;
-  expectedProfileRevision: number;
-  expectedTargetRevision: number;
-  expectedTerminalReceiptDigest: string;
-  expectedObservationDigest: string;
-  expectedEndpointFingerprint: string;
-  expectedMaterialBindingDigest: string;
-  expectedReviewDigest: string;
-  expectedStaleReasons: LanStaleReason[];
-  trustClass: "operator_confirmed";
   intendedRoles: string[];
   taskFamilyAffinities: string[];
-  privacyAcknowledged: true;
   enabled: boolean;
+}>;
+
+export type LanTargetReviewOptionsProjection = Readonly<{
+  target_id: string;
+  intended_roles: string[];
+  task_family_affinities: string[];
+  enabled: boolean;
+}>;
+
+export type LanTargetReviewAuthority = Readonly<{
+  provider_profile_id: string;
+  expected_profile_revision: number;
+  expected_target_revision: number;
+  expected_terminal_receipt_digest: string;
+  expected_observation_digest: string;
+  expected_endpoint_fingerprint: string;
+  expected_material_binding_digest: string;
+  expected_stale_reasons: LanStaleReason[];
+  trust_class: "operator_confirmed";
+  privacy_acknowledgement_digest: string;
+  review_digest: string;
+  reviewed_material_binding_digest: string;
+  reviewed_runtime_interface_binding_digest: string | null;
 }>;
 
 export type LanTargetReviewResult = Readonly<{
@@ -333,4 +377,27 @@ export type LanTargetReviewResult = Readonly<{
   target: ModelTarget;
   privacy_acknowledgement_digest: string;
   material_binding_digest: string;
+}>;
+
+export type LanTargetReviewPreview = Readonly<{
+  options: LanTargetReviewOptionsProjection;
+  preview_digest: string;
+  evidence_expires_at: string;
+  authority: LanTargetReviewAuthority;
+  profile: ProviderProfile;
+  target: ModelTarget;
+  requires_privacy_acknowledgement: true;
+  requires_confirmation: true;
+}>;
+
+export type LanTargetReviewConfirmation = LanTargetReviewOptions &
+  Readonly<{
+    previewDigest: string;
+    privacyAcknowledged: true;
+    confirmed: true;
+  }>;
+
+export type LanTargetReviewConfirmationResult = Readonly<{
+  preview_digest: string;
+  result: LanTargetReviewResult;
 }>;

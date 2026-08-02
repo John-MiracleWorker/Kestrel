@@ -1,7 +1,10 @@
+// @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  importLanObservation,
-  reviewLanTarget,
+  confirmLanImport,
+  confirmLanTargetReview,
+  previewLanImport,
+  previewLanTargetReview,
 } from "../../routing/api";
 import {
   removeFakeDesktopEnvironment,
@@ -141,7 +144,13 @@ function providerResponse(revision = 1) {
     locality: "local",
     trust_class: "unreviewed",
     max_concurrency: 1,
-    metadata: {},
+    metadata: {
+      lan_discovery: {
+        endpoint_binding_digest: digestA,
+        observation_digest: digestC,
+        endpoint_fingerprint: digestA,
+      },
+    },
     revision,
     created_at: "2026-08-01T12:00:00+00:00",
     updated_at: "2026-08-01T12:00:01+00:00",
@@ -175,10 +184,263 @@ function targetResponse(revision = 1) {
     health: "unknown",
     recent_failure_rate: 0,
     predicted_success: null,
-    metadata: {},
+    metadata: {
+      lan_discovery: {
+        endpoint_binding_digest: digestA,
+        observation_digest: digestC,
+        endpoint_fingerprint: digestA,
+      },
+    },
     revision,
     created_at: "2026-08-01T12:00:00+00:00",
     updated_at: "2026-08-01T12:00:01+00:00",
+  };
+}
+
+function importResultResponse() {
+  return {
+    profile: providerResponse(),
+    targets: [targetResponse()],
+    observation_digest: digestC,
+    endpoint_fingerprint: digestA,
+    outage_observed: false,
+    affected_target_ids: [targetId],
+    invalidated_binding_digests: [],
+    stale_reasons_by_target: [],
+  };
+}
+
+function existingProfileOutageResultResponse() {
+  const existingProfileMetadata = {
+    lan_discovery: {
+      endpoint_binding_digest: digestA,
+      observation_digest: digestC,
+      endpoint_fingerprint: digestA,
+    },
+  };
+  return {
+    profile: {
+      ...providerResponse(),
+      metadata: existingProfileMetadata,
+    },
+    targets: [
+      {
+        ...targetResponse(),
+        metadata: existingProfileMetadata,
+      },
+    ],
+    observation_digest: digestB,
+    endpoint_fingerprint: digestA,
+    outage_observed: true,
+    affected_target_ids: [targetId],
+    invalidated_binding_digests: [],
+    stale_reasons_by_target: [],
+  };
+}
+
+function existingProfileOutagePreviewResponse(
+  selector = {
+    scan_id: scanId,
+    endpoint_id: digestA,
+    replacement_provider_profile_id: null as string | null,
+  },
+) {
+  return {
+    selector,
+    preview_digest: digestB,
+    evidence_expires_at: "2026-08-01T12:05:00Z",
+    authority: {
+      expected_terminal_receipt_digest: digestB,
+      expected_observation_digest: digestB,
+      expected_profile_revision: 1,
+      expected_target_revisions: [{ resource_id: targetId, revision: 0 }],
+      endpoint_fingerprint: digestA,
+      replacement: null,
+    },
+    result: existingProfileOutageResultResponse(),
+    requires_confirmation: true,
+  };
+}
+
+function importPreviewResponse(
+  selector = {
+    scan_id: scanId,
+    endpoint_id: digestA,
+    replacement_provider_profile_id: null as string | null,
+  },
+) {
+  return {
+    selector,
+    preview_digest: digestB,
+    evidence_expires_at: "2026-08-01T12:05:00Z",
+    authority: {
+      expected_terminal_receipt_digest: digestB,
+      expected_observation_digest: digestC,
+      expected_profile_revision: 0,
+      expected_target_revisions: [{ resource_id: targetId, revision: 0 }],
+      endpoint_fingerprint: digestA,
+      replacement: null,
+    },
+    result: importResultResponse(),
+    requires_confirmation: true,
+  };
+}
+
+function reviewedTargetResponse(
+  options: {
+    intended_roles: string[];
+    task_family_affinities: string[];
+    enabled: boolean;
+  } = {
+    intended_roles: ["worker"],
+    task_family_affinities: ["coding"],
+    enabled: false,
+  },
+) {
+  return {
+    ...targetResponse(2),
+    enabled: options.enabled,
+    trust_class: "operator_confirmed",
+    role_affinities: options.intended_roles,
+    task_family_affinities: options.task_family_affinities,
+    metadata: {
+      lan_discovery: {
+        endpoint_binding_digest: digestA,
+        observation_digest: digestB,
+        endpoint_fingerprint: digestC,
+        privacy_acknowledgement_digest: digestB,
+        material_binding_digest: digestA,
+        reviewed_runtime_interface_binding_digest: options.enabled
+          ? digestC
+          : null,
+      },
+    },
+  };
+}
+
+function reviewPreviewResponse(
+  options = {
+    target_id: targetId,
+    intended_roles: ["worker"],
+    task_family_affinities: ["coding"],
+    enabled: false,
+  },
+) {
+  return {
+    options,
+    preview_digest: digestC,
+    evidence_expires_at: "2026-08-01T12:05:00Z",
+    authority: {
+      provider_profile_id: profileId,
+      expected_profile_revision: 1,
+      expected_target_revision: 1,
+      expected_terminal_receipt_digest: digestA,
+      expected_observation_digest: digestB,
+      expected_endpoint_fingerprint: digestC,
+      expected_material_binding_digest: digestA,
+      expected_stale_reasons: [],
+      trust_class: "operator_confirmed",
+      privacy_acknowledgement_digest: digestB,
+      review_digest: digestC,
+      reviewed_material_binding_digest: digestA,
+      reviewed_runtime_interface_binding_digest: null,
+    },
+    profile: providerResponse(2),
+    target: reviewedTargetResponse(options),
+    requires_privacy_acknowledgement: true,
+    requires_confirmation: true,
+  };
+}
+
+function reviewResultResponse(options: {
+  intended_roles: string[];
+  task_family_affinities: string[];
+  enabled: boolean;
+}) {
+  return {
+    profile: providerResponse(2),
+    target: reviewedTargetResponse(options),
+    privacy_acknowledgement_digest: digestB,
+    material_binding_digest: digestA,
+  };
+}
+
+function replacementImportPreviewResponse(options: {
+  replacementEndpointFingerprint?: string;
+  replacementMaterialDigests?: string[];
+  targetMaterialDigest?: (index: number) => string | undefined;
+  invalidatedBindingDigests?: string[];
+}) {
+  const replacementProfileId = `lan-provider-${"3".repeat(64)}`;
+  const currentTargetId = `lan-target-${"f".repeat(64)}`;
+  const replacementTargetIds = Array.from(
+    { length: 2 },
+    (_, index) => `lan-target-${index.toString(16).padStart(64, "0")}`,
+  );
+  const affectedTargetIds = [currentTargetId, ...replacementTargetIds];
+  const targetRevisions = affectedTargetIds.map((resourceId) => ({
+    resource_id: resourceId,
+    revision: 1,
+  }));
+  const replacementEndpointFingerprint =
+    options.replacementEndpointFingerprint ?? digestB;
+  const replacementMaterialDigests =
+    options.replacementMaterialDigests ??
+    Array.from(
+      { length: 2 },
+      (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`,
+    );
+  const selector = {
+    scan_id: scanId,
+    endpoint_id: digestA,
+    replacement_provider_profile_id: replacementProfileId,
+  };
+  return {
+    response: {
+      ...importPreviewResponse(selector),
+      authority: {
+        ...importPreviewResponse(selector).authority,
+        expected_target_revisions: targetRevisions,
+        replacement: {
+          provider_profile_id: replacementProfileId,
+          expected_profile_revision: 1,
+          expected_endpoint_fingerprint: replacementEndpointFingerprint,
+          expected_material_binding_digests: replacementMaterialDigests,
+        },
+      },
+      result: {
+        ...importResultResponse(),
+        targets: affectedTargetIds.map((resourceId, index) => {
+          const isCurrent = index === 0;
+          const materialDigest =
+            options.targetMaterialDigest?.(index) ??
+            (isCurrent ? undefined : replacementMaterialDigests[index - 1]);
+          return {
+            ...targetResponse(),
+            target_id: resourceId,
+            provider_profile_id: isCurrent ? profileId : replacementProfileId,
+            model: isCurrent ? "current" : `replaced-${index}`,
+            metadata: {
+              lan_discovery: {
+                endpoint_binding_digest: digestA,
+                observation_digest: digestC,
+                endpoint_fingerprint: isCurrent
+                  ? digestA
+                  : replacementEndpointFingerprint,
+                ...(materialDigest !== undefined
+                  ? { material_binding_digest: materialDigest }
+                  : {}),
+              },
+            },
+          };
+        }),
+        affected_target_ids: affectedTargetIds,
+        invalidated_binding_digests:
+          options.invalidatedBindingDigests ?? replacementMaterialDigests,
+        stale_reasons_by_target: [],
+      },
+    },
+    replacementProfileId,
   };
 }
 
@@ -230,38 +492,41 @@ function responseFor(path: string, method: string, body: unknown): unknown {
       observation_next_cursor: null,
     };
   }
+  if (path === "/api/routing/lan/import/preview") {
+    const request = body as {
+      scan_id: string;
+      endpoint_id: string;
+      replacement_provider_profile_id: string | null;
+    };
+    return importPreviewResponse(request);
+  }
   if (path === "/api/routing/lan/import") {
+    const request = body as {
+      preview_digest: string;
+    };
     return {
-      profile: providerResponse(),
-      targets: [targetResponse()],
-      observation_digest: digestC,
-      endpoint_fingerprint: digestA,
-      outage_observed: false,
-      affected_target_ids: [targetId],
-      invalidated_binding_digests: [],
-      stale_reasons_by_target: [],
+      preview_digest: request.preview_digest,
+      result: importResultResponse(),
     };
   }
+  if (path === `/api/routing/lan/targets/${targetId}/review/preview`) {
+    const request = body as {
+      intended_roles: string[];
+      task_family_affinities: string[];
+      enabled: boolean;
+    };
+    return reviewPreviewResponse({ target_id: targetId, ...request });
+  }
   if (path === `/api/routing/lan/targets/${targetId}/review`) {
-    const request =
-      typeof body === "object" && body !== null
-        ? (body as Record<string, unknown>)
-        : {};
+    const request = body as {
+      intended_roles: string[];
+      task_family_affinities: string[];
+      enabled: boolean;
+      preview_digest: string;
+    };
     return {
-      profile: providerResponse(2),
-      target: {
-        ...targetResponse(2),
-        role_affinities: Array.isArray(request.intended_roles)
-          ? request.intended_roles
-          : [],
-        task_family_affinities: Array.isArray(
-          request.task_family_affinities,
-        )
-          ? request.task_family_affinities
-          : [],
-      },
-      privacy_acknowledgement_digest: digestB,
-      material_binding_digest: digestC,
+      preview_digest: request.preview_digest,
+      result: reviewResultResponse(request),
     };
   }
   if (path.startsWith("/api/routing/lan/")) return scanResponse();
@@ -874,389 +1139,840 @@ describe("typed LAN discovery API", () => {
     await expect(getLanScan(scanId)).rejects.toThrow("lan_response_invalid");
   });
 
-  it("serializes import and review authority without camel-case leakage", async () => {
+  it("uses four exact server-owned preview and confirmation bodies", async () => {
     const requests: CapturedRequest[] = [];
     vi.stubGlobal("fetch", captureFetch(requests));
-    await importLanObservation({
+    const selector = {
       scanId,
-      endpointBindingDigest: digestA,
-      expectedTerminalReceiptDigest: digestB,
-      expectedObservationDigest: digestC,
-      expectedProfileRevision: 0,
-      expectedTargetRevisions: [{ resourceId: targetId, revision: 0 }],
-      replacement: null,
-    });
-    await reviewLanTarget({
+      endpointId: digestA,
+      replacementProviderProfileId: null,
+    } as const;
+    const options = {
       targetId,
-      expectedProfileRevision: 1,
-      expectedTargetRevision: 1,
-      expectedTerminalReceiptDigest: digestA,
-      expectedObservationDigest: digestB,
-      expectedEndpointFingerprint: digestC,
-      expectedMaterialBindingDigest: digestA,
-      expectedReviewDigest: digestB,
-      expectedStaleReasons: ["freshness_expired"],
-      trustClass: "operator_confirmed",
       intendedRoles: ["worker"],
       taskFamilyAffinities: ["coding"],
-      privacyAcknowledged: true,
       enabled: false,
+    };
+
+    const importPreview = await previewLanImport(selector);
+    const importConfirmation = await confirmLanImport({
+      selector,
+      previewDigest: importPreview.preview_digest,
+      confirmed: true,
+    });
+    const reviewPreview = await previewLanTargetReview(options);
+    const reviewConfirmation = await confirmLanTargetReview({
+      ...options,
+      previewDigest: reviewPreview.preview_digest,
+      privacyAcknowledged: true,
+      confirmed: true,
     });
 
     expect(requests.map(({ path, body }) => ({ path, body }))).toEqual([
       {
-        path: "/api/routing/lan/import",
+        path: "/api/routing/lan/import/preview",
         body: {
           scan_id: scanId,
-          endpoint_binding_digest: digestA,
-          expected_terminal_receipt_digest: digestB,
-          expected_observation_digest: digestC,
-          expected_profile_revision: 0,
-          expected_target_revisions: [{ resource_id: targetId, revision: 0 }],
-          replacement: null,
+          endpoint_id: digestA,
+          replacement_provider_profile_id: null,
+        },
+      },
+      {
+        path: "/api/routing/lan/import",
+        body: {
+          selector: {
+            scan_id: scanId,
+            endpoint_id: digestA,
+            replacement_provider_profile_id: null,
+          },
+          preview_digest: digestB,
+          confirmed: true,
+        },
+      },
+      {
+        path: `/api/routing/lan/targets/${targetId}/review/preview`,
+        body: {
+          intended_roles: ["worker"],
+          task_family_affinities: ["coding"],
+          enabled: false,
         },
       },
       {
         path: `/api/routing/lan/targets/${targetId}/review`,
         body: {
-          expected_profile_revision: 1,
-          expected_target_revision: 1,
-          expected_terminal_receipt_digest: digestA,
-          expected_observation_digest: digestB,
-          expected_endpoint_fingerprint: digestC,
-          expected_material_binding_digest: digestA,
-          expected_review_digest: digestB,
-          expected_stale_reasons: ["freshness_expired"],
-          trust_class: "operator_confirmed",
           intended_roles: ["worker"],
           task_family_affinities: ["coding"],
-          privacy_acknowledged: true,
           enabled: false,
+          preview_digest: digestC,
+          privacy_acknowledged: true,
+          confirmed: true,
         },
       },
     ]);
+    expect(importConfirmation.preview_digest).toBe(digestB);
+    expect(reviewConfirmation.preview_digest).toBe(digestC);
   });
 
-  it("uses backend code-point ordering for Unicode review affinities", async () => {
+  it("rejects legacy renderer-owned authority fields before fetch", async () => {
+    const fetchMock = captureFetch([]);
+    vi.stubGlobal("fetch", fetchMock);
+    const selector = {
+      scanId,
+      endpointId: digestA,
+      replacementProviderProfileId: null,
+    } as const;
+    const options = {
+      targetId,
+      intendedRoles: ["worker"],
+      taskFamilyAffinities: ["coding"],
+      enabled: false,
+    };
+    const calls = [
+      () =>
+        previewLanImport({
+          ...selector,
+          expectedObservationDigest: digestC,
+        } as unknown as Parameters<typeof previewLanImport>[0]),
+      () =>
+        confirmLanImport({
+          selector: {
+            ...selector,
+            expectedProfileRevision: 1,
+          },
+          previewDigest: digestB,
+          confirmed: true,
+        } as unknown as Parameters<typeof confirmLanImport>[0]),
+      () =>
+        confirmLanImport({
+          selector,
+          previewDigest: digestB,
+          confirmed: true,
+          replacement: null,
+        } as unknown as Parameters<typeof confirmLanImport>[0]),
+      () =>
+        previewLanTargetReview({
+          ...options,
+          trustClass: "operator_confirmed",
+        } as unknown as Parameters<typeof previewLanTargetReview>[0]),
+      () =>
+        confirmLanTargetReview({
+          ...options,
+          previewDigest: digestC,
+          privacyAcknowledged: true,
+          confirmed: true,
+          expectedReviewDigest: digestB,
+        } as unknown as Parameters<typeof confirmLanTargetReview>[0]),
+    ];
+
+    for (const call of calls) {
+      await expect(call()).rejects.toThrow("lan_request_invalid");
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("requires exact literal confirmation and privacy booleans before fetch", async () => {
+    const fetchMock = captureFetch([]);
+    vi.stubGlobal("fetch", fetchMock);
+    const selector = {
+      scanId,
+      endpointId: digestA,
+      replacementProviderProfileId: null,
+    } as const;
+    const options = {
+      targetId,
+      intendedRoles: [] as string[],
+      taskFamilyAffinities: [] as string[],
+      enabled: false,
+      previewDigest: digestC,
+      privacyAcknowledged: true,
+      confirmed: true,
+    };
+
+    for (const confirmed of [false, 1]) {
+      await expect(
+        confirmLanImport({
+          selector,
+          previewDigest: digestB,
+          confirmed,
+        } as unknown as Parameters<typeof confirmLanImport>[0]),
+      ).rejects.toThrow("lan_request_invalid");
+    }
+    for (const privacyAcknowledged of [false, 1]) {
+      await expect(
+        confirmLanTargetReview({
+          ...options,
+          privacyAcknowledged,
+        } as unknown as Parameters<typeof confirmLanTargetReview>[0]),
+      ).rejects.toThrow("lan_request_invalid");
+    }
+    for (const confirmed of [false, 1]) {
+      await expect(
+        confirmLanTargetReview({
+          ...options,
+          confirmed,
+        } as unknown as Parameters<typeof confirmLanTargetReview>[0]),
+      ).rejects.toThrow("lan_request_invalid");
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves Python code-point ordering and spaces through both review phases", async () => {
     const requests: CapturedRequest[] = [];
     vi.stubGlobal("fetch", captureFetch(requests));
-
-    const result = await reviewLanTarget({
+    const options = {
       targetId,
-      expectedProfileRevision: 1,
-      expectedTargetRevision: 1,
-      expectedTerminalReceiptDigest: digestA,
-      expectedObservationDigest: digestB,
-      expectedEndpointFingerprint: digestC,
-      expectedMaterialBindingDigest: digestA,
-      expectedReviewDigest: digestB,
-      expectedStaleReasons: [],
-      trustClass: "operator_confirmed",
       intendedRoles: ["Ａ", "😀"],
       taskFamilyAffinities: [" family "],
-      privacyAcknowledged: true,
       enabled: false,
+    };
+
+    const preview = await previewLanTargetReview(options);
+    const confirmation = await confirmLanTargetReview({
+      ...options,
+      previewDigest: preview.preview_digest,
+      privacyAcknowledged: true,
+      confirmed: true,
     });
 
-    expect(requests[0]?.body).toMatchObject({
+    expect(requests[0]?.body).toEqual({
+      intended_roles: ["Ａ", "😀"],
+      task_family_affinities: [" family "],
+      enabled: false,
+    });
+    expect(requests[1]?.body).toMatchObject({
       intended_roles: ["Ａ", "😀"],
       task_family_affinities: [" family "],
     });
-    expect(result.target.role_affinities).toEqual(["Ａ", "😀"]);
-    expect(result.target.task_family_affinities).toEqual([" family "]);
+    expect(preview.target.role_affinities).toEqual(["Ａ", "😀"]);
+    expect(confirmation.result.target.task_family_affinities).toEqual([
+      " family ",
+    ]);
   });
 
   it.each([
-    ["more than 64 UTF-8 bytes", "😀".repeat(17)],
-    ["non-NFC text", "e\u0301"],
-    ["a Unicode control category", "worker\u0000"],
-  ])("rejects review affinities containing %s before fetch", async (_label, affinity) => {
+    ["more than 64 UTF-8 bytes", ["😀".repeat(17)]],
+    ["non-NFC text", ["e\u0301"]],
+    ["a Unicode control category", ["worker\u0000"]],
+    ["a duplicate", ["worker", "worker"]],
+    ["a noncanonical order", ["😀", "Ａ"]],
+    [
+      "more than 16 entries",
+      Array.from({ length: 17 }, (_, index) => `family-${index
+        .toString()
+        .padStart(2, "0")}`),
+    ],
+  ])("rejects review affinity lists containing %s before fetch", async (_label, affinities) => {
     const fetchMock = captureFetch([]);
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
-      reviewLanTarget({
+      previewLanTargetReview({
         targetId,
-        expectedProfileRevision: 1,
-        expectedTargetRevision: 1,
-        expectedTerminalReceiptDigest: digestA,
-        expectedObservationDigest: digestB,
-        expectedEndpointFingerprint: digestC,
-        expectedMaterialBindingDigest: digestA,
-        expectedReviewDigest: digestB,
-        expectedStaleReasons: [],
-        trustClass: "operator_confirmed",
-        intendedRoles: [affinity],
+        intendedRoles: affinities,
         taskFamilyAffinities: [],
-        privacyAcknowledged: true,
         enabled: false,
       }),
     ).rejects.toThrow("lan_request_invalid");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not invent an eight-item cap for exact import CAS sets", async () => {
-    const requests: CapturedRequest[] = [];
-    vi.stubGlobal("fetch", captureFetch(requests));
-    const expectedTargetRevisions = Array.from({ length: 9 }, (_, index) => ({
-      resourceId: `lan-target-${index.toString(16).padStart(64, "0")}`,
-      revision: 0,
-    }));
-    const expectedMaterialBindingDigests = Array.from(
-      { length: 9 },
-      (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`,
-    );
-
-    await importLanObservation({
-      scanId,
-      endpointBindingDigest: digestA,
-      expectedTerminalReceiptDigest: digestB,
-      expectedObservationDigest: digestC,
-      expectedProfileRevision: 0,
-      expectedTargetRevisions,
-      replacement: {
-        providerProfileId: profileId,
-        expectedProfileRevision: 1,
-        expectedEndpointFingerprint: digestA,
-        expectedMaterialBindingDigests,
-      },
-    });
-
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.body).toMatchObject({
-      expected_target_revisions: expectedTargetRevisions.map((item) => ({
-        resource_id: item.resourceId,
-        revision: item.revision,
-      })),
-      replacement: {
-        expected_material_binding_digests: expectedMaterialBindingDigests,
-      },
-    });
-  });
-
-  it("accepts the complete accumulated replacement family in server order", async () => {
-    const replacedProfileId = `lan-provider-${"3".repeat(64)}`;
+  it("accepts a complete 65-target server-owned import preview without caps", async () => {
+    const replacementProfileId = `lan-provider-${"3".repeat(64)}`;
     const currentTargetId = `lan-target-${"f".repeat(64)}`;
-    const replacedTargetIds = Array.from(
+    const replacementTargetIds = Array.from(
       { length: 64 },
       (_, index) => `lan-target-${index.toString(16).padStart(64, "0")}`,
     );
-    const affectedTargetIds = [currentTargetId, ...replacedTargetIds];
-    const targets = affectedTargetIds.map((resourceId, index) => ({
-      ...targetResponse(),
-      target_id: resourceId,
-      provider_profile_id: index === 0 ? profileId : replacedProfileId,
-      model: index === 0 ? "current" : `replaced-${index}`,
+    const affectedTargetIds = [currentTargetId, ...replacementTargetIds];
+    const targetRevisions = affectedTargetIds.map((resourceId) => ({
+      resource_id: resourceId,
+      revision: 1,
     }));
+    const replacementEndpointFingerprint = digestB;
+    const replacementMaterialDigests = Array.from(
+      { length: 64 },
+      (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`,
+    );
+    const selector = {
+      scan_id: scanId,
+      endpoint_id: digestA,
+      replacement_provider_profile_id: replacementProfileId,
+    };
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>().mockResolvedValue(
         jsonResponse({
-          profile: providerResponse(),
-          targets,
-          observation_digest: digestC,
-          endpoint_fingerprint: digestA,
-          outage_observed: false,
-          affected_target_ids: affectedTargetIds,
-          invalidated_binding_digests: [digestA, digestB],
-          stale_reasons_by_target: [
-            { target_id: currentTargetId, reasons: ["catalog_changed"] },
-            { target_id: replacedTargetIds[0], reasons: ["catalog_changed"] },
-          ],
+          ...importPreviewResponse(selector),
+          authority: {
+            ...importPreviewResponse(selector).authority,
+            expected_target_revisions: targetRevisions,
+            replacement: {
+              provider_profile_id: replacementProfileId,
+              expected_profile_revision: 1,
+              expected_endpoint_fingerprint: replacementEndpointFingerprint,
+              expected_material_binding_digests: replacementMaterialDigests,
+            },
+          },
+          result: {
+            ...importResultResponse(),
+            targets: affectedTargetIds.map((resourceId, index) => {
+              const isCurrent = index === 0;
+              return {
+                ...targetResponse(),
+                target_id: resourceId,
+                provider_profile_id: isCurrent
+                  ? profileId
+                  : replacementProfileId,
+                model: isCurrent ? "current" : `replaced-${index}`,
+                metadata: {
+                  lan_discovery: {
+                    endpoint_binding_digest: digestA,
+                    observation_digest: digestC,
+                    endpoint_fingerprint: isCurrent
+                      ? digestA
+                      : replacementEndpointFingerprint,
+                    material_binding_digest: isCurrent
+                      ? undefined
+                      : replacementMaterialDigests[index - 1],
+                  },
+                },
+              };
+            }),
+            affected_target_ids: affectedTargetIds,
+            invalidated_binding_digests: replacementMaterialDigests,
+            stale_reasons_by_target: [
+              { target_id: currentTargetId, reasons: ["catalog_changed"] },
+              {
+                target_id: replacementTargetIds[63],
+                reasons: ["catalog_changed"],
+              },
+            ],
+          },
         }),
       ),
     );
 
-    const result = await importLanObservation({
+    const preview = await previewLanImport({
       scanId,
-      endpointBindingDigest: digestA,
-      expectedTerminalReceiptDigest: digestB,
-      expectedObservationDigest: digestC,
-      expectedProfileRevision: 1,
-      expectedTargetRevisions: [...affectedTargetIds]
-        .sort()
-        .map((resourceId) => ({ resourceId, revision: 1 })),
-      replacement: {
-        providerProfileId: replacedProfileId,
-        expectedProfileRevision: 1,
-        expectedEndpointFingerprint: digestA,
-        expectedMaterialBindingDigests: [digestA, digestB],
-      },
+      endpointId: digestA,
+      replacementProviderProfileId: replacementProfileId,
     });
 
-    expect(result.targets).toHaveLength(65);
-    expect(result.targets.map((item) => item.target_id)).toEqual(
-      affectedTargetIds,
-    );
-    expect(result.affected_target_ids).toEqual(affectedTargetIds);
-    expect(result.stale_reasons_by_target.map((item) => item.target_id)).toEqual(
-      [currentTargetId, replacedTargetIds[0]],
-    );
+    expect(preview.authority.expected_target_revisions).toHaveLength(65);
+    expect(
+      preview.authority.replacement?.expected_material_binding_digests,
+    ).toHaveLength(64);
+    expect(preview.result.targets).toHaveLength(65);
+    expect(preview.result.affected_target_ids).toEqual(affectedTargetIds);
   });
 
-  it("rejects an import result whose targets disagree with its affected set", async () => {
+  it("rejects a replacement-family target whose endpoint fingerprint does not match the replacement authority", async () => {
+    const { response, replacementProfileId } =
+      replacementImportPreviewResponse({});
+    const hostile = {
+      ...response,
+      result: {
+        ...response.result,
+        targets: response.result.targets.map((target) =>
+          target.provider_profile_id === replacementProfileId
+            ? {
+                ...target,
+                metadata: {
+                  lan_discovery: {
+                    ...target.metadata.lan_discovery,
+                    endpoint_fingerprint: digestC,
+                  },
+                },
+              }
+            : target,
+        ),
+      },
+    };
     vi.stubGlobal(
       "fetch",
-      vi.fn<typeof fetch>().mockResolvedValue(
-        jsonResponse({
-          profile: providerResponse(),
-          targets: [targetResponse()],
-          observation_digest: digestC,
-          endpoint_fingerprint: digestA,
-          outage_observed: false,
-          affected_target_ids: [],
-          invalidated_binding_digests: [],
-          stale_reasons_by_target: [],
-        }),
-      ),
+      vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(hostile)),
     );
 
     await expect(
-      importLanObservation({
+      previewLanImport({
         scanId,
-        endpointBindingDigest: digestA,
-        expectedTerminalReceiptDigest: digestB,
-        expectedObservationDigest: digestC,
-        expectedProfileRevision: 0,
-        expectedTargetRevisions: [],
-        replacement: null,
+        endpointId: digestA,
+        replacementProviderProfileId: replacementProfileId,
       }),
     ).rejects.toThrow("lan_response_invalid");
   });
 
-  it("rejects import results without the profile authority required by their effect", async () => {
-    const replacedProfileId = `lan-provider-${"3".repeat(64)}`;
-    const replacedTarget = {
-      ...targetResponse(),
-      provider_profile_id: replacedProfileId,
+  it("rejects a replacement-family target whose material binding digest is not expected by the replacement authority", async () => {
+    const { response, replacementProfileId } =
+      replacementImportPreviewResponse({});
+    const hostile = {
+      ...response,
+      result: {
+        ...response.result,
+        targets: response.result.targets.map((target, index) =>
+          target.provider_profile_id === replacementProfileId && index === 1
+            ? {
+                ...target,
+                metadata: {
+                  lan_discovery: {
+                    ...target.metadata.lan_discovery,
+                    material_binding_digest: digestC,
+                  },
+                },
+              }
+            : target,
+        ),
+      },
     };
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(
-        jsonResponse({
-          profile: null,
-          targets: [],
-          observation_digest: digestC,
-          endpoint_fingerprint: null,
-          outage_observed: false,
-          affected_target_ids: [],
-          invalidated_binding_digests: [],
-          stale_reasons_by_target: [],
-        }),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse({
-          profile: null,
-          targets: [replacedTarget],
-          observation_digest: digestC,
-          endpoint_fingerprint: null,
-          outage_observed: true,
-          affected_target_ids: [targetId],
-          invalidated_binding_digests: [],
-          stale_reasons_by_target: [],
-        }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    const common: Omit<
-      Parameters<typeof importLanObservation>[0],
-      "replacement"
-    > = {
-      scanId,
-      endpointBindingDigest: digestA,
-      expectedTerminalReceiptDigest: digestB,
-      expectedObservationDigest: digestC,
-      expectedProfileRevision: 0,
-      expectedTargetRevisions: [],
-    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(hostile)),
+    );
 
     await expect(
-      importLanObservation({ ...common, replacement: null }),
+      previewLanImport({
+        scanId,
+        endpointId: digestA,
+        replacementProviderProfileId: replacementProfileId,
+      }),
     ).rejects.toThrow("lan_response_invalid");
+  });
+
+  it("rejects replacement import when invalidated binding digests disagree with the authority", async () => {
+    const { response, replacementProfileId } =
+      replacementImportPreviewResponse({});
+    const hostile = {
+      ...response,
+      result: {
+        ...response.result,
+        invalidated_binding_digests: [digestC],
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(hostile)),
+    );
+
     await expect(
-      importLanObservation({
-        ...common,
-        replacement: {
-          providerProfileId: replacedProfileId,
-          expectedProfileRevision: 1,
-          expectedEndpointFingerprint: digestA,
-          expectedMaterialBindingDigests: [digestA],
+      previewLanImport({
+        scanId,
+        endpointId: digestA,
+        replacementProviderProfileId: replacementProfileId,
+      }),
+    ).rejects.toThrow("lan_response_invalid");
+  });
+
+  it("rejects import preview evidence/result correlation failures", async () => {
+    const otherProfileId = `lan-provider-${"4".repeat(64)}`;
+    const otherTargetId = `lan-target-${"5".repeat(64)}`;
+    const responses = [
+      {
+        ...importPreviewResponse(),
+        result: { ...importResultResponse(), affected_target_ids: [] },
+      },
+      {
+        ...importPreviewResponse(),
+        result: {
+          ...importResultResponse(),
+          targets: [
+            { ...targetResponse(), provider_profile_id: otherProfileId },
+          ],
         },
-      }),
-    ).rejects.toThrow("lan_response_invalid");
-  });
-
-  it("rejects malformed import and review mutation results", async () => {
+      },
+      {
+        ...importPreviewResponse(),
+        result: { ...importResultResponse(), observation_digest: digestB },
+      },
+      {
+        ...importPreviewResponse(),
+        result: { ...importResultResponse(), endpoint_fingerprint: digestB },
+      },
+      {
+        ...importPreviewResponse(),
+        result: {
+          ...importResultResponse(),
+          stale_reasons_by_target: [
+            { target_id: otherTargetId, reasons: ["catalog_changed"] },
+          ],
+        },
+      },
+    ];
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>().mockImplementation(async () =>
-        jsonResponse({ profile: null, targets: "not-an-array" }),
+        jsonResponse(responses.shift()),
+      ),
+    );
+
+    for (let index = 0; index < 5; index += 1) {
+      await expect(
+        previewLanImport({
+          scanId,
+          endpointId: digestA,
+          replacementProviderProfileId: null,
+        }),
+      ).rejects.toThrow("lan_response_invalid");
+    }
+  });
+
+  it("rejects an import result whose current profile is not bound to the selected endpoint", async () => {
+    const replacementProfileId = `lan-provider-${"3".repeat(64)}`;
+    const selector = {
+      scan_id: scanId,
+      endpoint_id: digestA,
+      replacement_provider_profile_id: replacementProfileId,
+    };
+    const mismatchedMetadata = {
+      lan_discovery: {
+        endpoint_binding_digest: digestB,
+        observation_digest: digestC,
+        endpoint_fingerprint: digestA,
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        jsonResponse({
+          ...importPreviewResponse(selector),
+          authority: {
+            ...importPreviewResponse(selector).authority,
+            replacement: {
+              provider_profile_id: replacementProfileId,
+              expected_profile_revision: 1,
+              expected_endpoint_fingerprint: digestA,
+              expected_material_binding_digests: [digestA],
+            },
+          },
+          result: {
+            ...importResultResponse(),
+            profile: {
+              ...providerResponse(),
+              profile_id: replacementProfileId,
+              metadata: mismatchedMetadata,
+            },
+            targets: [
+              {
+                ...targetResponse(),
+                provider_profile_id: replacementProfileId,
+                metadata: mismatchedMetadata,
+              },
+            ],
+          },
+        }),
       ),
     );
 
     await expect(
-      importLanObservation({
+      previewLanImport({
         scanId,
-        endpointBindingDigest: digestA,
-        expectedTerminalReceiptDigest: digestB,
-        expectedObservationDigest: digestC,
-        expectedProfileRevision: 0,
-        expectedTargetRevisions: [],
-        replacement: null,
+        endpointId: digestA,
+        replacementProviderProfileId: replacementProfileId,
+      }),
+    ).rejects.toThrow("lan_response_invalid");
+  });
+
+  it("accepts an existing-profile outage import preview with a stale observation in metadata", async () => {
+    const selector = {
+      scan_id: scanId,
+      endpoint_id: digestA,
+      replacement_provider_profile_id: null,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        jsonResponse(existingProfileOutagePreviewResponse(selector)),
+      ),
+    );
+
+    const preview = await previewLanImport({
+      scanId,
+      endpointId: digestA,
+      replacementProviderProfileId: null,
+    });
+
+    expect(preview.result.outage_observed).toBe(true);
+    expect(preview.result.observation_digest).toBe(digestB);
+    expect(preview.result.profile?.profile_id).toBe(profileId);
+    expect(preview.result.targets[0]?.target_id).toBe(targetId);
+  });
+
+  it("accepts an existing-profile outage import confirmation with a stale observation in metadata", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        jsonResponse({
+          preview_digest: digestB,
+          result: existingProfileOutageResultResponse(),
+        }),
+      ),
+    );
+
+    const confirmation = await confirmLanImport({
+      selector: {
+        scanId,
+        endpointId: digestA,
+        replacementProviderProfileId: null,
+      },
+      previewDigest: digestB,
+      confirmed: true,
+    });
+
+    expect(confirmation.result.outage_observed).toBe(true);
+    expect(confirmation.result.observation_digest).toBe(digestB);
+    expect(confirmation.result.profile?.profile_id).toBe(profileId);
+    expect(confirmation.result.targets[0]?.target_id).toBe(targetId);
+  });
+
+  it("rejects preview selector/options and confirmation digest disagreement", async () => {
+    const otherTargetId = `lan-target-${"5".repeat(64)}`;
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse(
+          importPreviewResponse({
+            scan_id: scanId,
+            endpoint_id: digestB,
+            replacement_provider_profile_id: null,
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          preview_digest: digestC,
+          result: importResultResponse(),
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          reviewPreviewResponse({
+            target_id: otherTargetId,
+            intended_roles: ["worker"],
+            task_family_affinities: ["coding"],
+            enabled: false,
+          }),
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const selector = {
+      scanId,
+      endpointId: digestA,
+      replacementProviderProfileId: null,
+    } as const;
+
+    await expect(previewLanImport(selector)).rejects.toThrow(
+      "lan_response_invalid",
+    );
+    await expect(
+      confirmLanImport({
+        selector,
+        previewDigest: digestB,
+        confirmed: true,
       }),
     ).rejects.toThrow("lan_response_invalid");
     await expect(
-      reviewLanTarget({
+      previewLanTargetReview({
         targetId,
-        expectedProfileRevision: 1,
-        expectedTargetRevision: 1,
-        expectedTerminalReceiptDigest: digestA,
-        expectedObservationDigest: digestB,
-        expectedEndpointFingerprint: digestC,
-        expectedMaterialBindingDigest: digestA,
-        expectedReviewDigest: digestB,
-        expectedStaleReasons: [],
-        trustClass: "operator_confirmed",
-        intendedRoles: [],
-        taskFamilyAffinities: [],
-        privacyAcknowledged: true,
+        intendedRoles: ["worker"],
+        taskFamilyAffinities: ["coding"],
         enabled: false,
       }),
     ).rejects.toThrow("lan_response_invalid");
   });
 
-  it("rejects malformed routing mutation inputs with fixed errors before fetch", async () => {
-    const fetchMock = captureFetch([]);
-    vi.stubGlobal("fetch", fetchMock);
+  it("rejects review authority and returned-target disagreement", async () => {
+    const otherProfileId = `lan-provider-${"4".repeat(64)}`;
+    const otherTargetId = `lan-target-${"5".repeat(64)}`;
+    const baseOptions = {
+      target_id: targetId,
+      intended_roles: ["worker"],
+      task_family_affinities: ["coding"],
+      enabled: false,
+    };
+    const responses = [
+      {
+        ...reviewPreviewResponse(baseOptions),
+        authority: {
+          ...reviewPreviewResponse(baseOptions).authority,
+          provider_profile_id: otherProfileId,
+        },
+      },
+      {
+        ...reviewPreviewResponse(baseOptions),
+        target: { ...reviewedTargetResponse(), target_id: otherTargetId },
+      },
+      {
+        ...reviewPreviewResponse(baseOptions),
+        target: {
+          ...reviewedTargetResponse(),
+          provider_profile_id: otherProfileId,
+        },
+      },
+      {
+        ...reviewPreviewResponse(baseOptions),
+        target: { ...reviewedTargetResponse(), enabled: true },
+      },
+      {
+        ...reviewPreviewResponse(baseOptions),
+        target: { ...reviewedTargetResponse(), trust_class: "unreviewed" },
+      },
+      {
+        ...reviewPreviewResponse(baseOptions),
+        target: { ...reviewedTargetResponse(), role_affinities: [] },
+      },
+      {
+        ...reviewPreviewResponse(baseOptions),
+        target: {
+          ...reviewedTargetResponse(),
+          task_family_affinities: [],
+        },
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockImplementation(async () =>
+        jsonResponse(responses.shift()),
+      ),
+    );
+
+    for (let index = 0; index < 7; index += 1) {
+      await expect(
+        previewLanTargetReview({
+          targetId,
+          intendedRoles: ["worker"],
+          taskFamilyAffinities: ["coding"],
+          enabled: false,
+        }),
+      ).rejects.toThrow("lan_response_invalid");
+    }
+  });
+
+  it("binds review runtime and receipt evidence to the planned target", async () => {
+    const enabledOptions = {
+      target_id: targetId,
+      intended_roles: ["worker"],
+      task_family_affinities: ["coding"],
+      enabled: true,
+    };
+    const missingRuntimeBinding = reviewPreviewResponse(enabledOptions);
+    const mismatchedReceipt = reviewPreviewResponse();
+    mismatchedReceipt.target = {
+      ...mismatchedReceipt.target,
+      metadata: {
+        lan_discovery: {
+          endpoint_binding_digest: digestA,
+          observation_digest: digestB,
+          endpoint_fingerprint: digestC,
+          privacy_acknowledgement_digest: digestA,
+          material_binding_digest: digestA,
+          reviewed_runtime_interface_binding_digest: null,
+        },
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(jsonResponse(missingRuntimeBinding))
+        .mockResolvedValueOnce(jsonResponse(mismatchedReceipt)),
+    );
 
     await expect(
-      importLanObservation({
-        scanId,
-        endpointBindingDigest: digestA,
-        expectedTerminalReceiptDigest: digestB,
-        expectedObservationDigest: digestC,
-        expectedProfileRevision: 0,
-        expectedTargetRevisions: null,
-        replacement: null,
-      } as unknown as Parameters<typeof importLanObservation>[0]),
-    ).rejects.toThrow("lan_request_invalid");
-    await expect(
-      reviewLanTarget({
+      previewLanTargetReview({
         targetId,
-        expectedProfileRevision: 1,
-        expectedTargetRevision: 1,
-        expectedTerminalReceiptDigest: digestA,
-        expectedObservationDigest: digestB,
-        expectedEndpointFingerprint: digestC,
-        expectedMaterialBindingDigest: digestA,
-        expectedReviewDigest: digestB,
-        expectedStaleReasons: null,
-        trustClass: "operator_confirmed",
-        intendedRoles: [],
-        taskFamilyAffinities: [],
-        privacyAcknowledged: true,
+        intendedRoles: ["worker"],
+        taskFamilyAffinities: ["coding"],
+        enabled: true,
+      }),
+    ).rejects.toThrow("lan_response_invalid");
+    await expect(
+      previewLanTargetReview({
+        targetId,
+        intendedRoles: ["worker"],
+        taskFamilyAffinities: ["coding"],
         enabled: false,
-      } as unknown as Parameters<typeof reviewLanTarget>[0]),
-    ).rejects.toThrow("lan_request_invalid");
-    expect(fetchMock).not.toHaveBeenCalled();
+      }),
+    ).rejects.toThrow("lan_response_invalid");
+  });
+
+  it("requires canonical Z preview evidence expiry timestamps", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          jsonResponse({
+            ...importPreviewResponse(),
+            evidence_expires_at: "2026-08-01T12:05:00+00:00",
+          }),
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            ...reviewPreviewResponse(),
+            evidence_expires_at: "2026-08-01T12:05:00+00:00",
+          }),
+        ),
+    );
+
+    await expect(
+      previewLanImport({
+        scanId,
+        endpointId: digestA,
+        replacementProviderProfileId: null,
+      }),
+    ).rejects.toThrow("lan_response_invalid");
+    await expect(
+      previewLanTargetReview({
+        targetId,
+        intendedRoles: ["worker"],
+        taskFamilyAffinities: ["coding"],
+        enabled: false,
+      }),
+    ).rejects.toThrow("lan_response_invalid");
+  });
+
+  it("rejects missing or additional preview/confirmation response fields", async () => {
+    const importMissing = importPreviewResponse() as Record<string, unknown>;
+    delete importMissing.requires_confirmation;
+    const reviewExtra = {
+      ...reviewPreviewResponse(),
+      expected_review_digest: digestB,
+    };
+    const confirmationExtra = {
+      preview_digest: digestB,
+      result: importResultResponse(),
+      authority: {},
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(jsonResponse(importMissing))
+        .mockResolvedValueOnce(jsonResponse(reviewExtra))
+        .mockResolvedValueOnce(jsonResponse(confirmationExtra)),
+    );
+    const selector = {
+      scanId,
+      endpointId: digestA,
+      replacementProviderProfileId: null,
+    } as const;
+
+    await expect(previewLanImport(selector)).rejects.toThrow(
+      "lan_response_invalid",
+    );
+    await expect(
+      previewLanTargetReview({
+        targetId,
+        intendedRoles: ["worker"],
+        taskFamilyAffinities: ["coding"],
+        enabled: false,
+      }),
+    ).rejects.toThrow("lan_response_invalid");
+    await expect(
+      confirmLanImport({
+        selector,
+        previewDigest: digestB,
+        confirmed: true,
+      }),
+    ).rejects.toThrow("lan_response_invalid");
   });
 });

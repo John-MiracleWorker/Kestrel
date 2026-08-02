@@ -1,8 +1,18 @@
 import { getJson, postJson, queryString } from "../api";
 import type {
-  LanImportRequest,
+  LanImportAuthority,
+  LanImportConfirmation,
+  LanImportConfirmationResult,
+  LanImportPreview,
   LanImportResult,
-  LanTargetReviewRequest,
+  LanImportSelector,
+  LanImportSelectorProjection,
+  LanTargetReviewAuthority,
+  LanTargetReviewConfirmation,
+  LanTargetReviewConfirmationResult,
+  LanTargetReviewOptions,
+  LanTargetReviewOptionsProjection,
+  LanTargetReviewPreview,
   LanTargetReviewResult,
   ModelTarget,
   ModelTargetDraft,
@@ -75,68 +85,82 @@ export async function getRunRouting(
   );
 }
 
-export async function importLanObservation(
-  request: LanImportRequest,
-): Promise<LanImportResult> {
-  validateLanImportRequest(request);
-  const payload = await postJson<unknown>("/api/routing/lan/import", {
-    scan_id: request.scanId,
-    endpoint_binding_digest: request.endpointBindingDigest,
-    expected_terminal_receipt_digest:
-      request.expectedTerminalReceiptDigest,
-    expected_observation_digest: request.expectedObservationDigest,
-    expected_profile_revision: request.expectedProfileRevision,
-    expected_target_revisions: request.expectedTargetRevisions.map(
-      (item) => ({
-        resource_id: item.resourceId,
-        revision: item.revision,
-      }),
-    ),
-    replacement:
-      request.replacement === null
-        ? null
-        : {
-            provider_profile_id:
-              request.replacement.providerProfileId,
-            expected_profile_revision:
-              request.replacement.expectedProfileRevision,
-            expected_endpoint_fingerprint:
-              request.replacement.expectedEndpointFingerprint,
-            expected_material_binding_digests:
-              request.replacement.expectedMaterialBindingDigests,
-      },
-  });
-  return parseLanImportResult(payload, request);
+export async function previewLanImport(
+  selector: LanImportSelector,
+): Promise<LanImportPreview> {
+  validateLanImportSelector(selector);
+  const payload = await postJson<unknown>(
+    "/api/routing/lan/import/preview",
+    lanImportSelectorBody(selector),
+  );
+  return parseLanImportPreview(payload, selector);
 }
 
-export async function reviewLanTarget(
-  request: LanTargetReviewRequest,
-): Promise<LanTargetReviewResult> {
-  validateLanReviewRequest(request);
+export async function confirmLanImport(
+  confirmation: LanImportConfirmation,
+): Promise<LanImportConfirmationResult> {
+  exactRequestRecord(confirmation, ["selector", "previewDigest", "confirmed"]);
+  validateLanImportSelector(confirmation.selector);
+  if (!isDigestText(confirmation.previewDigest) || confirmation.confirmed !== true) {
+    invalidLanRequest();
+  }
+  const payload = await postJson<unknown>("/api/routing/lan/import", {
+    selector: lanImportSelectorBody(confirmation.selector),
+    preview_digest: confirmation.previewDigest,
+    confirmed: true,
+  });
+  return parseLanImportConfirmation(payload, confirmation);
+}
+
+export async function previewLanTargetReview(
+  options: LanTargetReviewOptions,
+): Promise<LanTargetReviewPreview> {
+  exactRequestRecord(options, [
+    "targetId",
+    "intendedRoles",
+    "taskFamilyAffinities",
+    "enabled",
+  ]);
+  validateLanReviewOptions(options);
+  const payload = await postJson<unknown>(
+    `/api/routing/lan/targets/${encodeURIComponent(options.targetId)}/review/preview`,
+    lanReviewOptionsBody(options),
+  );
+  return parseLanReviewPreview(payload, options);
+}
+
+export async function confirmLanTargetReview(
+  confirmation: LanTargetReviewConfirmation,
+): Promise<LanTargetReviewConfirmationResult> {
+  exactRequestRecord(confirmation, [
+    "targetId",
+    "intendedRoles",
+    "taskFamilyAffinities",
+    "enabled",
+    "previewDigest",
+    "privacyAcknowledged",
+    "confirmed",
+  ]);
+  validateLanReviewOptions(confirmation);
+  if (
+    !isDigestText(confirmation.previewDigest) ||
+    confirmation.privacyAcknowledged !== true ||
+    confirmation.confirmed !== true
+  ) {
+    invalidLanRequest();
+  }
   const payload = await postJson<unknown>(
     `/api/routing/lan/targets/${encodeURIComponent(
-      request.targetId,
+      confirmation.targetId,
     )}/review`,
     {
-      expected_profile_revision: request.expectedProfileRevision,
-      expected_target_revision: request.expectedTargetRevision,
-      expected_terminal_receipt_digest:
-        request.expectedTerminalReceiptDigest,
-      expected_observation_digest: request.expectedObservationDigest,
-      expected_endpoint_fingerprint:
-        request.expectedEndpointFingerprint,
-      expected_material_binding_digest:
-        request.expectedMaterialBindingDigest,
-      expected_review_digest: request.expectedReviewDigest,
-      expected_stale_reasons: request.expectedStaleReasons,
-      trust_class: request.trustClass,
-      intended_roles: request.intendedRoles,
-      task_family_affinities: request.taskFamilyAffinities,
-      privacy_acknowledged: request.privacyAcknowledged,
-      enabled: request.enabled,
+      ...lanReviewOptionsBody(confirmation),
+      preview_digest: confirmation.previewDigest,
+      privacy_acknowledged: true,
+      confirmed: true,
     },
   );
-  return parseLanReviewResult(payload, request);
+  return parseLanReviewConfirmation(payload, confirmation);
 }
 
 const LAN_SCAN_ID = /^lan_[0-9a-f]{32}$/;
@@ -161,78 +185,240 @@ const LAN_STALE_REASONS = [
   "freshness_expired",
 ] as const;
 
-function validateLanImportRequest(request: LanImportRequest): void {
+function validateLanImportSelector(selector: LanImportSelector): void {
+  exactRequestRecord(selector, [
+    "scanId",
+    "endpointId",
+    "replacementProviderProfileId",
+  ]);
   if (
-    !isRecord(request) ||
-    typeof request.scanId !== "string" ||
-    !LAN_SCAN_ID.test(request.scanId) ||
-    !isDigestText(request.endpointBindingDigest) ||
-    !isDigestText(request.expectedTerminalReceiptDigest) ||
-    !isDigestText(request.expectedObservationDigest) ||
-    !isNonnegativeInteger(request.expectedProfileRevision) ||
-    !Array.isArray(request.expectedTargetRevisions)
+    typeof selector.scanId !== "string" ||
+    !LAN_SCAN_ID.test(selector.scanId) ||
+    !isDigestText(selector.endpointId) ||
+    (selector.replacementProviderProfileId !== null &&
+      (typeof selector.replacementProviderProfileId !== "string" ||
+        !LAN_PROFILE_ID.test(selector.replacementProviderProfileId)))
   ) {
     invalidLanRequest();
-  }
-  const targetIds = request.expectedTargetRevisions.map((item) => {
-    if (
-      !LAN_TARGET_ID.test(item.resourceId) ||
-      !isNonnegativeInteger(item.revision)
-    ) {
-      invalidLanRequest();
-    }
-    return item.resourceId;
-  });
-  if (!isCanonicalSequence(targetIds)) invalidLanRequest();
-  const replacement = request.replacement;
-  if (replacement !== null) {
-    if (
-      !isRecord(replacement) ||
-      typeof replacement.providerProfileId !== "string" ||
-      !LAN_PROFILE_ID.test(replacement.providerProfileId) ||
-      !isNonnegativeInteger(replacement.expectedProfileRevision) ||
-      !isDigestText(replacement.expectedEndpointFingerprint) ||
-      !Array.isArray(replacement.expectedMaterialBindingDigests) ||
-      replacement.expectedMaterialBindingDigests.length === 0 ||
-      replacement.expectedMaterialBindingDigests.some(
-        (value) => !LAN_DIGEST.test(value),
-      ) ||
-      !isCanonicalSequence(replacement.expectedMaterialBindingDigests)
-    ) {
-      invalidLanRequest();
-    }
   }
 }
 
-function validateLanReviewRequest(request: LanTargetReviewRequest): void {
+function lanImportSelectorBody(selector: LanImportSelector) {
+  return {
+    scan_id: selector.scanId,
+    endpoint_id: selector.endpointId,
+    replacement_provider_profile_id: selector.replacementProviderProfileId,
+  };
+}
+
+function validateLanReviewOptions(options: LanTargetReviewOptions): void {
   if (
-    !isRecord(request) ||
-    typeof request.targetId !== "string" ||
-    !LAN_TARGET_ID.test(request.targetId) ||
-    !isNonnegativeInteger(request.expectedProfileRevision) ||
-    !isNonnegativeInteger(request.expectedTargetRevision) ||
-    !isDigestText(request.expectedTerminalReceiptDigest) ||
-    !isDigestText(request.expectedObservationDigest) ||
-    !isDigestText(request.expectedEndpointFingerprint) ||
-    !isDigestText(request.expectedMaterialBindingDigest) ||
-    !isDigestText(request.expectedReviewDigest) ||
-    request.trustClass !== "operator_confirmed" ||
-    request.privacyAcknowledged !== true ||
-    typeof request.enabled !== "boolean" ||
-    !Array.isArray(request.expectedStaleReasons) ||
-    !isCanonicalStaleReasons(request.expectedStaleReasons) ||
-    !Array.isArray(request.intendedRoles) ||
-    !isCanonicalAffinityList(request.intendedRoles) ||
-    !Array.isArray(request.taskFamilyAffinities) ||
-    !isCanonicalAffinityList(request.taskFamilyAffinities)
+    typeof options.targetId !== "string" ||
+    !LAN_TARGET_ID.test(options.targetId) ||
+    typeof options.enabled !== "boolean" ||
+    !Array.isArray(options.intendedRoles) ||
+    !isCanonicalAffinityList(options.intendedRoles) ||
+    !Array.isArray(options.taskFamilyAffinities) ||
+    !isCanonicalAffinityList(options.taskFamilyAffinities)
   ) {
     invalidLanRequest();
   }
 }
+
+function lanReviewOptionsBody(options: LanTargetReviewOptions) {
+  return {
+    intended_roles: options.intendedRoles,
+    task_family_affinities: options.taskFamilyAffinities,
+    enabled: options.enabled,
+  };
+}
+
+function parseLanImportPreview(
+  value: unknown,
+  requested: LanImportSelector,
+): LanImportPreview {
+  const record = exactRecord(value, [
+    "selector",
+    "preview_digest",
+    "evidence_expires_at",
+    "authority",
+    "result",
+    "requires_confirmation",
+  ]);
+  const selector = parseLanImportSelectorProjection(record.selector, requested);
+  const authority = parseLanImportAuthority(record.authority, requested);
+  if (record.requires_confirmation !== true) invalidLanResponse();
+  const result = parseLanImportResult(record.result, {
+    expectedObservationDigest: authority.expected_observation_digest,
+    expectedEndpointFingerprint: authority.endpoint_fingerprint,
+    replacementProviderProfileId: selector.replacement_provider_profile_id,
+    replacement:
+      authority.replacement === null
+        ? null
+        : {
+            expectedEndpointFingerprint:
+              authority.replacement.expected_endpoint_fingerprint,
+            expectedMaterialBindingDigests:
+              authority.replacement.expected_material_binding_digests,
+          },
+    currentEndpointId: selector.endpoint_id,
+  });
+  if (
+    !sameSequence(
+      authority.expected_target_revisions.map((item) => item.resource_id),
+      result.affected_target_ids,
+    )
+  ) {
+    invalidLanResponse();
+  }
+  return {
+    selector,
+    preview_digest: digest(record.preview_digest),
+    evidence_expires_at: canonicalPreviewExpiry(record.evidence_expires_at),
+    authority,
+    result,
+    requires_confirmation: true,
+  };
+}
+
+function parseLanImportConfirmation(
+  value: unknown,
+  confirmation: LanImportConfirmation,
+): LanImportConfirmationResult {
+  const record = exactRecord(value, ["preview_digest", "result"]);
+  const previewDigest = digest(record.preview_digest);
+  if (previewDigest !== confirmation.previewDigest) {
+    invalidLanResponse();
+  }
+  return {
+    preview_digest: previewDigest,
+    result: parseLanImportResult(record.result, {
+      expectedObservationDigest: null,
+      expectedEndpointFingerprint: undefined,
+      replacementProviderProfileId:
+        confirmation.selector.replacementProviderProfileId,
+      replacement: null,
+      currentEndpointId: confirmation.selector.endpointId,
+    }),
+  };
+}
+
+function parseLanImportSelectorProjection(
+  value: unknown,
+  requested: LanImportSelector,
+): LanImportSelectorProjection {
+  const record = exactRecord(value, [
+    "scan_id",
+    "endpoint_id",
+    "replacement_provider_profile_id",
+  ]);
+  const scanId = lanScanId(record.scan_id);
+  const endpointId = digest(record.endpoint_id);
+  const replacementProfileId = nullableLanProfileId(
+    record.replacement_provider_profile_id,
+  );
+  if (
+    scanId !== requested.scanId ||
+    endpointId !== requested.endpointId ||
+    replacementProfileId !== requested.replacementProviderProfileId
+  ) {
+    invalidLanResponse();
+  }
+  return {
+    scan_id: scanId,
+    endpoint_id: endpointId,
+    replacement_provider_profile_id: replacementProfileId,
+  };
+}
+
+function parseLanImportAuthority(
+  value: unknown,
+  requested: LanImportSelector,
+): LanImportAuthority {
+  const record = exactRecord(value, [
+    "expected_terminal_receipt_digest",
+    "expected_observation_digest",
+    "expected_profile_revision",
+    "expected_target_revisions",
+    "endpoint_fingerprint",
+    "replacement",
+  ]);
+  if (!Array.isArray(record.expected_target_revisions)) invalidLanResponse();
+  const expectedTargetRevisions = record.expected_target_revisions.map((item) => {
+    const revision = exactRecord(item, ["resource_id", "revision"]);
+    return {
+      resource_id: lanTargetId(revision.resource_id),
+      revision: nonnegativeInteger(revision.revision),
+    };
+  });
+  if (
+    new Set(expectedTargetRevisions.map((item) => item.resource_id)).size !==
+    expectedTargetRevisions.length
+  ) {
+    invalidLanResponse();
+  }
+  let replacement: LanImportAuthority["replacement"] = null;
+  if (record.replacement !== null) {
+    const replacementRecord = exactRecord(record.replacement, [
+      "provider_profile_id",
+      "expected_profile_revision",
+      "expected_endpoint_fingerprint",
+      "expected_material_binding_digests",
+    ]);
+    if (!Array.isArray(replacementRecord.expected_material_binding_digests)) {
+      invalidLanResponse();
+    }
+    const materials = replacementRecord.expected_material_binding_digests.map(digest);
+    if (materials.length === 0 || !isCanonicalSequence(materials)) {
+      invalidLanResponse();
+    }
+    replacement = {
+      provider_profile_id: lanProfileId(replacementRecord.provider_profile_id),
+      expected_profile_revision: nonnegativeInteger(
+        replacementRecord.expected_profile_revision,
+      ),
+      expected_endpoint_fingerprint: digest(
+        replacementRecord.expected_endpoint_fingerprint,
+      ),
+      expected_material_binding_digests: materials,
+    };
+  }
+  if (
+    (replacement === null) !==
+      (requested.replacementProviderProfileId === null) ||
+    (replacement !== null &&
+      replacement.provider_profile_id !== requested.replacementProviderProfileId)
+  ) {
+    invalidLanResponse();
+  }
+  return {
+    expected_terminal_receipt_digest: digest(
+      record.expected_terminal_receipt_digest,
+    ),
+    expected_observation_digest: digest(record.expected_observation_digest),
+    expected_profile_revision: nonnegativeInteger(
+      record.expected_profile_revision,
+    ),
+    expected_target_revisions: expectedTargetRevisions,
+    endpoint_fingerprint: nullableDigest(record.endpoint_fingerprint),
+    replacement,
+  };
+}
+
+type LanImportResultContext = Readonly<{
+  expectedObservationDigest: string | null;
+  expectedEndpointFingerprint: string | null | undefined;
+  replacementProviderProfileId: string | null;
+  replacement: Readonly<{
+    expectedEndpointFingerprint: string;
+    expectedMaterialBindingDigests: string[];
+  }> | null;
+  currentEndpointId: string;
+}>;
 
 function parseLanImportResult(
   value: unknown,
-  request: LanImportRequest,
+  context: LanImportResultContext,
 ): LanImportResult {
   const record = exactRecord(value, [
     "profile",
@@ -251,11 +437,15 @@ function parseLanImportResult(
   const observationDigest = digest(record.observation_digest);
   const endpointFingerprint = nullableDigest(record.endpoint_fingerprint);
   if (
-    observationDigest !== request.expectedObservationDigest ||
+    (context.expectedObservationDigest !== null &&
+      observationDigest !== context.expectedObservationDigest) ||
+    (context.expectedEndpointFingerprint !== undefined &&
+      endpointFingerprint !== context.expectedEndpointFingerprint) ||
     typeof record.outage_observed !== "boolean"
   ) {
     invalidLanResponse();
   }
+  const outageObserved = record.outage_observed;
   const affectedTargetIds = uniqueLanTargetIdArray(record.affected_target_ids);
   if (
     !sameSequence(
@@ -270,8 +460,8 @@ function parseLanImportResult(
   }
   const allowedProfileIds = new Set<string>();
   if (profile !== null) allowedProfileIds.add(profile.profile_id);
-  if (request.replacement !== null) {
-    allowedProfileIds.add(request.replacement.providerProfileId);
+  if (context.replacementProviderProfileId !== null) {
+    allowedProfileIds.add(context.replacementProviderProfileId);
   }
   if (
     targets.some(
@@ -280,9 +470,65 @@ function parseLanImportResult(
   ) {
     invalidLanResponse();
   }
+  if (
+    profile !== null &&
+    (endpointFingerprint === null ||
+      !lanImportEvidenceMatches(
+        profile.metadata,
+        context.currentEndpointId,
+        observationDigest,
+        endpointFingerprint,
+        outageObserved,
+      ) ||
+      targets.some(
+        (target) =>
+          target.provider_profile_id === profile.profile_id &&
+          !lanImportEvidenceMatches(
+            target.metadata,
+            context.currentEndpointId,
+            observationDigest,
+            endpointFingerprint,
+            outageObserved,
+          ),
+      ))
+  ) {
+    invalidLanResponse();
+  }
   const invalidatedDigests = canonicalDigestArray(
     record.invalidated_binding_digests,
   );
+  if (context.replacement !== null) {
+    if (context.replacementProviderProfileId === null) {
+      invalidLanResponse();
+    }
+    if (
+      !sameSequence(
+        invalidatedDigests,
+        context.replacement.expectedMaterialBindingDigests,
+      )
+    ) {
+      invalidLanResponse();
+    }
+    const expectedMaterials = new Set(
+      context.replacement.expectedMaterialBindingDigests,
+    );
+    for (const target of targets) {
+      if (
+        target.provider_profile_id !== context.replacementProviderProfileId
+      ) {
+        continue;
+      }
+      if (
+        !lanImportReplacementEvidenceMatches(
+          target.metadata,
+          context.replacement.expectedEndpointFingerprint,
+          expectedMaterials,
+        )
+      ) {
+        invalidLanResponse();
+      }
+    }
+  }
   if (!Array.isArray(record.stale_reasons_by_target)) {
     invalidLanResponse();
   }
@@ -312,9 +558,186 @@ function parseLanImportResult(
   };
 }
 
+function parseLanReviewPreview(
+  value: unknown,
+  requested: LanTargetReviewOptions,
+): LanTargetReviewPreview {
+  const record = exactRecord(value, [
+    "options",
+    "preview_digest",
+    "evidence_expires_at",
+    "authority",
+    "profile",
+    "target",
+    "requires_privacy_acknowledgement",
+    "requires_confirmation",
+  ]);
+  const options = parseLanReviewOptionsProjection(record.options, requested);
+  const authority = parseLanReviewAuthority(record.authority);
+  const profile = parseLanProviderProfile(record.profile);
+  const target = parseLanModelTarget(record.target);
+  if (
+    record.requires_privacy_acknowledgement !== true ||
+    record.requires_confirmation !== true ||
+    authority.provider_profile_id !== profile.profile_id ||
+    !reviewTargetMatchesOptions(target, profile.profile_id, options)
+    || !reviewTargetMatchesAuthority(target, authority, options.enabled)
+  ) {
+    invalidLanResponse();
+  }
+  return {
+    options,
+    preview_digest: digest(record.preview_digest),
+    evidence_expires_at: canonicalPreviewExpiry(record.evidence_expires_at),
+    authority,
+    profile,
+    target,
+    requires_privacy_acknowledgement: true,
+    requires_confirmation: true,
+  };
+}
+
+function parseLanReviewConfirmation(
+  value: unknown,
+  confirmation: LanTargetReviewConfirmation,
+): LanTargetReviewConfirmationResult {
+  const record = exactRecord(value, ["preview_digest", "result"]);
+  const previewDigest = digest(record.preview_digest);
+  if (previewDigest !== confirmation.previewDigest) {
+    invalidLanResponse();
+  }
+  const options: LanTargetReviewOptionsProjection = {
+    target_id: confirmation.targetId,
+    intended_roles: confirmation.intendedRoles,
+    task_family_affinities: confirmation.taskFamilyAffinities,
+    enabled: confirmation.enabled,
+  };
+  return {
+    preview_digest: previewDigest,
+    result: parseLanReviewResult(record.result, options),
+  };
+}
+
+function parseLanReviewOptionsProjection(
+  value: unknown,
+  requested: LanTargetReviewOptions,
+): LanTargetReviewOptionsProjection {
+  const record = exactRecord(value, [
+    "target_id",
+    "intended_roles",
+    "task_family_affinities",
+    "enabled",
+  ]);
+  const options = {
+    target_id: lanTargetId(record.target_id),
+    intended_roles: affinityArray(record.intended_roles),
+    task_family_affinities: affinityArray(record.task_family_affinities),
+    enabled: exactBoolean(record.enabled),
+  };
+  if (
+    options.target_id !== requested.targetId ||
+    !sameSequence(options.intended_roles, requested.intendedRoles) ||
+    !sameSequence(
+      options.task_family_affinities,
+      requested.taskFamilyAffinities,
+    ) ||
+    options.enabled !== requested.enabled
+  ) {
+    invalidLanResponse();
+  }
+  return options;
+}
+
+function parseLanReviewAuthority(value: unknown): LanTargetReviewAuthority {
+  const record = exactRecord(value, [
+    "provider_profile_id",
+    "expected_profile_revision",
+    "expected_target_revision",
+    "expected_terminal_receipt_digest",
+    "expected_observation_digest",
+    "expected_endpoint_fingerprint",
+    "expected_material_binding_digest",
+    "expected_stale_reasons",
+    "trust_class",
+    "privacy_acknowledgement_digest",
+    "review_digest",
+    "reviewed_material_binding_digest",
+    "reviewed_runtime_interface_binding_digest",
+  ]);
+  if (record.trust_class !== "operator_confirmed") invalidLanResponse();
+  return {
+    provider_profile_id: lanProfileId(record.provider_profile_id),
+    expected_profile_revision: nonnegativeInteger(
+      record.expected_profile_revision,
+    ),
+    expected_target_revision: nonnegativeInteger(record.expected_target_revision),
+    expected_terminal_receipt_digest: digest(
+      record.expected_terminal_receipt_digest,
+    ),
+    expected_observation_digest: digest(record.expected_observation_digest),
+    expected_endpoint_fingerprint: digest(record.expected_endpoint_fingerprint),
+    expected_material_binding_digest: digest(
+      record.expected_material_binding_digest,
+    ),
+    expected_stale_reasons: staleReasonArray(record.expected_stale_reasons),
+    trust_class: "operator_confirmed",
+    privacy_acknowledgement_digest: digest(
+      record.privacy_acknowledgement_digest,
+    ),
+    review_digest: digest(record.review_digest),
+    reviewed_material_binding_digest: digest(
+      record.reviewed_material_binding_digest,
+    ),
+    reviewed_runtime_interface_binding_digest: nullableDigest(
+      record.reviewed_runtime_interface_binding_digest,
+    ),
+  };
+}
+
+function reviewTargetMatchesOptions(
+  target: ModelTarget,
+  profileId: string,
+  options: LanTargetReviewOptionsProjection,
+): boolean {
+  return (
+    target.target_id === options.target_id &&
+    target.provider_profile_id === profileId &&
+    target.enabled === options.enabled &&
+    target.trust_class === "operator_confirmed" &&
+    sameSequence(target.role_affinities, options.intended_roles) &&
+    sameSequence(
+      target.task_family_affinities,
+      options.task_family_affinities,
+    )
+  );
+}
+
+function reviewTargetMatchesAuthority(
+  target: ModelTarget,
+  authority: LanTargetReviewAuthority,
+  enabled: boolean,
+): boolean {
+  const evidence = lanDiscoveryMetadata(target.metadata);
+  const runtimeBinding = nullableDigest(
+    evidence.reviewed_runtime_interface_binding_digest,
+  );
+  return (
+    digest(evidence.observation_digest) ===
+      authority.expected_observation_digest &&
+    digest(evidence.endpoint_fingerprint) ===
+      authority.expected_endpoint_fingerprint &&
+    digest(evidence.privacy_acknowledgement_digest) ===
+      authority.privacy_acknowledgement_digest &&
+    digest(evidence.material_binding_digest) ===
+      authority.reviewed_material_binding_digest &&
+    runtimeBinding === authority.reviewed_runtime_interface_binding_digest &&
+    (runtimeBinding !== null) === enabled
+  );
+}
+
 function parseLanReviewResult(
   value: unknown,
-  request: LanTargetReviewRequest,
+  options: LanTargetReviewOptionsProjection,
 ): LanTargetReviewResult {
   const record = exactRecord(value, [
     "profile",
@@ -325,19 +748,65 @@ function parseLanReviewResult(
   const profile = parseLanProviderProfile(record.profile);
   const target = parseLanModelTarget(record.target);
   if (
-    target.target_id !== request.targetId ||
-    target.provider_profile_id !== profile.profile_id
+    !reviewTargetMatchesOptions(target, profile.profile_id, options)
+  ) {
+    invalidLanResponse();
+  }
+  const evidence = lanDiscoveryMetadata(target.metadata);
+  const privacyDigest = digest(record.privacy_acknowledgement_digest);
+  const materialDigest = digest(record.material_binding_digest);
+  const runtimeBinding = nullableDigest(
+    evidence.reviewed_runtime_interface_binding_digest,
+  );
+  if (
+    digest(evidence.privacy_acknowledgement_digest) !== privacyDigest ||
+    digest(evidence.material_binding_digest) !== materialDigest ||
+    (runtimeBinding !== null) !== options.enabled
   ) {
     invalidLanResponse();
   }
   return {
     profile,
     target,
-    privacy_acknowledgement_digest: digest(
-      record.privacy_acknowledgement_digest,
-    ),
-    material_binding_digest: digest(record.material_binding_digest),
+    privacy_acknowledgement_digest: privacyDigest,
+    material_binding_digest: materialDigest,
   };
+}
+
+function lanImportEvidenceMatches(
+  metadata: Record<string, unknown>,
+  endpointId: string,
+  observationDigest: string,
+  endpointFingerprint: string,
+  outageObserved: boolean,
+): boolean {
+  const evidence = lanDiscoveryMetadata(metadata);
+  return (
+    digest(evidence.endpoint_binding_digest) === endpointId &&
+    (outageObserved ||
+      digest(evidence.observation_digest) === observationDigest) &&
+    digest(evidence.endpoint_fingerprint) === endpointFingerprint
+  );
+}
+
+function lanImportReplacementEvidenceMatches(
+  metadata: Record<string, unknown>,
+  expectedEndpointFingerprint: string,
+  expectedMaterialBindingDigests: Set<string>,
+): boolean {
+  const evidence = lanDiscoveryMetadata(metadata);
+  return (
+    digest(evidence.endpoint_fingerprint) === expectedEndpointFingerprint &&
+    expectedMaterialBindingDigests.has(digest(evidence.material_binding_digest))
+  );
+}
+
+function lanDiscoveryMetadata(
+  metadata: Record<string, unknown>,
+): Record<string, unknown> {
+  const evidence = metadata.lan_discovery;
+  if (!isRecord(evidence)) invalidLanResponse();
+  return evidence;
 }
 
 function parseLanProviderProfile(value: unknown): ProviderProfile {
@@ -489,6 +958,20 @@ function exactRecord(
   return value;
 }
 
+function exactRequestRecord(
+  value: unknown,
+  keys: readonly string[],
+): asserts value is Record<string, unknown> {
+  if (!isRecord(value)) invalidLanRequest();
+  const actual = Object.keys(value);
+  if (
+    actual.length !== keys.length ||
+    actual.some((key) => !keys.includes(key))
+  ) {
+    invalidLanRequest();
+  }
+}
+
 function boundedMetadata(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) invalidLanResponse();
   let encoded: string;
@@ -607,11 +1090,22 @@ function isCanonicalSequence(value: readonly string[]): boolean {
   return JSON.stringify(value) === JSON.stringify([...new Set(value)].sort());
 }
 
+function lanScanId(value: unknown): string {
+  if (typeof value !== "string" || !LAN_SCAN_ID.test(value)) {
+    invalidLanResponse();
+  }
+  return value;
+}
+
 function lanProfileId(value: unknown): string {
   if (typeof value !== "string" || !LAN_PROFILE_ID.test(value)) {
     invalidLanResponse();
   }
   return value;
+}
+
+function nullableLanProfileId(value: unknown): string | null {
+  return value === null ? null : lanProfileId(value);
 }
 
 function lanTargetId(value: unknown): string {
@@ -657,6 +1151,17 @@ function positiveInteger(value: unknown): number {
   return parsed;
 }
 
+function nonnegativeInteger(value: unknown): number {
+  const parsed = integer(value);
+  if (parsed < 0) invalidLanResponse();
+  return parsed;
+}
+
+function exactBoolean(value: unknown): boolean {
+  if (typeof value !== "boolean") invalidLanResponse();
+  return value;
+}
+
 function nullablePositiveInteger(value: unknown): number | null {
   return value === null ? null : positiveInteger(value);
 }
@@ -686,6 +1191,12 @@ function utcTimestamp(value: unknown): string {
     invalidLanResponse();
   }
   return value;
+}
+
+function canonicalPreviewExpiry(value: unknown): string {
+  const parsed = utcTimestamp(value);
+  if (!parsed.endsWith("Z")) invalidLanResponse();
+  return parsed;
 }
 
 function isNonnegativeInteger(value: unknown): value is number {

@@ -422,10 +422,20 @@ export type LanScanEventStreamOptions = Readonly<{
 
 export type {
   LanExpectedRevision,
-  LanImportRequest,
+  LanImportAuthority,
+  LanImportConfirmation,
+  LanImportConfirmationResult,
+  LanImportPreview,
   LanImportResult,
+  LanImportSelector,
+  LanImportSelectorProjection,
   LanReplacementConfirmation,
   LanStaleReason,
-  LanTargetReviewRequest,
+  LanTargetReviewAuthority,
+  LanTargetReviewConfirmation,
+  LanTargetReviewConfirmationResult,
+  LanTargetReviewOptions,
+  LanTargetReviewOptionsProjection,
+  LanTargetReviewPreview,
   LanTargetReviewResult,
 } from "../../routing/types";

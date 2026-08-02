@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import json
 import re
 import sqlite3
 import unicodedata
 from collections.abc import Callable
-from dataclasses import asdict
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -200,6 +202,54 @@ _LAN_TARGET_PROTECTED_KEYS = frozenset(
 
 class _LegacyLanProtectedMetadata(dict[str, Any]):
     """Read-only normalization marker for exact pre-Task-7B metadata."""
+
+
+@dataclass(frozen=True)
+class _LanImportPlan:
+    scan_id: str
+    endpoint_id: str
+    replacement_provider_profile_id: str | None
+    owner_principal: str
+    evidence_expires_at: str
+    expected_terminal_receipt_digest: str
+    expected_observation_digest: str
+    expected_profile_revision: int
+    expected_target_revisions: tuple[tuple[str, int], ...]
+    endpoint_fingerprint: str | None
+    replacement: tuple[str, int, str, tuple[str, ...]] | None
+    result_profile: ProviderProfileEntry | None
+    replacement_result_profile: ProviderProfileEntry | None
+    result_targets: tuple[ModelTargetEntry, ...]
+    outage_observed: bool
+    affected_target_ids: tuple[str, ...]
+    invalidated_binding_digests: tuple[str, ...]
+    stale_reasons_by_target: tuple[tuple[str, tuple[str, ...]], ...]
+    preview_digest: str
+
+
+@dataclass(frozen=True)
+class _LanReviewPlan:
+    target_id: str
+    owner_principal: str
+    intended_roles: tuple[str, ...]
+    task_family_affinities: tuple[str, ...]
+    enabled: bool
+    evidence_expires_at: str
+    provider_profile_id: str
+    expected_profile_revision: int
+    expected_target_revision: int
+    expected_terminal_receipt_digest: str
+    expected_observation_digest: str
+    expected_endpoint_fingerprint: str
+    expected_material_binding_digest: str
+    expected_stale_reasons: tuple[str, ...]
+    privacy_acknowledgement_digest: str
+    review_digest: str
+    reviewed_material_binding_digest: str
+    reviewed_runtime_interface_binding_digest: str | None
+    result_profile: ProviderProfileEntry
+    result_target: ModelTargetEntry
+    preview_digest: str
 
 
 class RoutingRegistry:
@@ -802,12 +852,16 @@ class RoutingRegistry:
         endpoint_binding_digest: str,
         expected_terminal_receipt_digest: str,
         expected_observation_digest: str,
-        expected_profile_revision: int,
-        expected_target_revisions: tuple[tuple[str, int], ...],
+        expected_profile_revision: int | None,
+        expected_target_revisions: tuple[tuple[str, int], ...] | None,
         replacement: tuple[str, int, str, tuple[str, ...]] | None,
         authenticated_owner_principal: str,
         now: datetime,
         runtime_hardening_version: str | None = None,
+        _replacement_provider_profile_id: str | None = None,
+        _connection: sqlite3.Connection | None = None,
+        _server_owned_authority: bool = False,
+        _invoke_commit_hook: bool = True,
     ) -> tuple[
         ProviderProfileEntry | None,
         tuple[ModelTargetEntry, ...],
@@ -838,23 +892,31 @@ class RoutingRegistry:
         _validate_canonical_lan_owner(authenticated_owner_principal)
         _validate_installed_runtime_hardening(runtime_hardening_version)
         now_text = _lan_timestamp(now)
-        _validate_exact_expected_revision(expected_profile_revision)
-        if type(expected_target_revisions) is not tuple:
-            raise ValueError("LAN expected target revisions must be an exact tuple")
-        for item in expected_target_revisions:
-            if type(item) is not tuple or len(item) != 2:
-                raise ValueError("LAN expected target revision entry is invalid")
-            target_id, revision = item
-            if type(target_id) is not str or _LAN_TARGET_ID_RE.fullmatch(target_id) is None:
-                raise ValueError("LAN expected target identifier is invalid")
-            _validate_exact_expected_revision(revision)
+        if (
+            expected_profile_revision is None
+            or expected_target_revisions is None
+            or _replacement_provider_profile_id is not None
+        ) and (not _server_owned_authority or _connection is None):
+            raise ValueError("LAN server-owned authority requires a private transaction")
+        if expected_profile_revision is not None:
+            _validate_exact_expected_revision(expected_profile_revision)
+        if expected_target_revisions is not None:
+            if type(expected_target_revisions) is not tuple:
+                raise ValueError("LAN expected target revisions must be an exact tuple")
+            for item in expected_target_revisions:
+                if type(item) is not tuple or len(item) != 2:
+                    raise ValueError("LAN expected target revision entry is invalid")
+                target_id, revision = item
+                if type(target_id) is not str or _LAN_TARGET_ID_RE.fullmatch(target_id) is None:
+                    raise ValueError("LAN expected target identifier is invalid")
+                _validate_exact_expected_revision(revision)
         if replacement is not None:
             if type(replacement) is not tuple or len(replacement) != 4:
                 raise ValueError("LAN replacement confirmation is invalid")
-            replacement_profile_id, replacement_revision, fingerprint, materials = replacement
+            supplied_profile_id, replacement_revision, fingerprint, materials = replacement
             if (
-                type(replacement_profile_id) is not str
-                or _LAN_PROFILE_ID_RE.fullmatch(replacement_profile_id) is None
+                type(supplied_profile_id) is not str
+                or _LAN_PROFILE_ID_RE.fullmatch(supplied_profile_id) is None
             ):
                 raise ValueError("LAN replacement provider identifier is invalid")
             _validate_exact_expected_revision(replacement_revision)
@@ -865,11 +927,28 @@ class RoutingRegistry:
                 validate_digest(material, "expected_material_binding_digest")
             if len(materials) != len(set(materials)):
                 raise ValueError("LAN replacement material binding set is invalid")
-        expected_map = dict(expected_target_revisions)
-        if len(expected_map) != len(expected_target_revisions):
+        if _replacement_provider_profile_id is not None:
+            if (
+                replacement is not None
+                or type(_replacement_provider_profile_id) is not str
+                or _LAN_PROFILE_ID_RE.fullmatch(_replacement_provider_profile_id) is None
+            ):
+                raise ValueError("LAN server-owned replacement selector is invalid")
+        expected_map = (
+            None if expected_target_revisions is None else dict(expected_target_revisions)
+        )
+        if (
+            expected_target_revisions is not None
+            and expected_map is not None
+            and len(expected_map) != len(expected_target_revisions)
+        ):
             raise ValueError("LAN expected target revisions must be unique")
-        with self.state._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        connection_context = (
+            self.state._connect() if _connection is None else nullcontext(_connection)
+        )
+        with connection_context as connection:
+            if _connection is None:
+                connection.execute("BEGIN IMMEDIATE")
             evidence = load_authenticated_task4_observation(
                 connection,
                 scan_id=scan_id,
@@ -895,7 +974,7 @@ class RoutingRegistry:
                 and bool(observation.catalog)
             )
             if not positive:
-                if replacement is not None:
+                if replacement is not None or _replacement_provider_profile_id is not None:
                     raise ValueError("LAN outage evidence cannot replace an endpoint")
                 result = _apply_lan_outage(
                     connection,
@@ -905,8 +984,12 @@ class RoutingRegistry:
                     now=now,
                     now_text=now_text,
                 )
-                if result[5] or (
-                    result[0] is not None and result[0].revision != expected_profile_revision
+                if _invoke_commit_hook and (
+                    result[5]
+                    or (
+                        result[0] is not None
+                        and result[0].revision != expected_profile_revision
+                    )
                 ):
                     _before_lan_commit()
                 return (
@@ -944,11 +1027,19 @@ class RoutingRegistry:
                 != authenticated_owner_principal
             ):
                 raise ValueError("LAN managed provider owner mismatch")
+            derived_profile_revision = (
+                0 if existing_profile is None else existing_profile.revision
+            )
+            effective_profile_revision = (
+                derived_profile_revision
+                if expected_profile_revision is None
+                else expected_profile_revision
+            )
             profile_revision, profile_created_at = _next_revision(
                 "provider_profile",
                 profile_id,
                 profile_row,
-                expected_revision=expected_profile_revision,
+                expected_revision=effective_profile_revision,
                 now=now_text,
             )
             existing_rows = connection.execute(
@@ -1128,13 +1219,13 @@ class RoutingRegistry:
             replacement_profile_created_at: str | None = None
             replacement_targets: dict[str, ModelTargetEntry] = {}
             replacement_reasons: tuple[str, ...] = ()
-            if replacement is not None:
-                (
-                    old_profile_id,
-                    old_expected_revision,
-                    old_expected_fingerprint,
-                    old_expected_materials,
-                ) = replacement
+            selected_replacement_profile_id = (
+                _replacement_provider_profile_id
+                if _replacement_provider_profile_id is not None
+                else (None if replacement is None else replacement[0])
+            )
+            if selected_replacement_profile_id is not None:
+                old_profile_id = selected_replacement_profile_id
                 if old_profile_id == profile_id:
                     raise ValueError("LAN replacement must bind a distinct endpoint")
                 old_profile_row = connection.execute(
@@ -1147,6 +1238,16 @@ class RoutingRegistry:
                 old_protected = replacement_entry.profile.metadata["lan_discovery"]
                 if old_protected["owner_principal"] != authenticated_owner_principal:
                     raise ValueError("LAN replacement owner mismatch")
+                old_expected_revision = (
+                    replacement_entry.revision
+                    if replacement is None
+                    else replacement[1]
+                )
+                old_expected_fingerprint = (
+                    str(old_protected["endpoint_fingerprint"])
+                    if replacement is None
+                    else replacement[2]
+                )
                 if old_protected["endpoint_fingerprint"] != old_expected_fingerprint:
                     raise ValueError("LAN replacement endpoint fingerprint mismatch")
                 replacement_profile_revision, replacement_profile_created_at = _next_revision(
@@ -1178,6 +1279,9 @@ class RoutingRegistry:
                         str(entry.target.metadata["lan_discovery"]["material_binding_digest"])
                         for entry in replacement_targets.values()
                     )
+                )
+                old_expected_materials = (
+                    actual_materials if replacement is None else replacement[3]
                 )
                 if tuple(sorted(old_expected_materials)) != actual_materials:
                     raise ValueError("LAN replacement material binding set mismatch")
@@ -1217,7 +1321,17 @@ class RoutingRegistry:
                 )
                 affected_ids = tuple(dict.fromkeys((*affected_ids, *sorted(replacement_targets))))
 
-            if set(expected_map) != set(affected_ids):
+            if expected_map is None:
+                expected_map = {}
+                for target_id in affected_ids:
+                    current_row = connection.execute(
+                        "SELECT revision FROM routing_model_targets WHERE target_id = ?",
+                        (target_id,),
+                    ).fetchone()
+                    expected_map[target_id] = (
+                        0 if current_row is None else int(current_row["revision"])
+                    )
+            elif set(expected_map) != set(affected_ids):
                 raise ValueError("LAN expected target revision set is not exact")
             planned_revisions: dict[str, tuple[int, str]] = {}
             for target_id in affected_ids:
@@ -1540,7 +1654,8 @@ class RoutingRegistry:
             persisted_targets = tuple(
                 persisted_targets_by_id[target_id] for target_id in affected_ids
             )
-            _before_lan_commit()
+            if _invoke_commit_hook:
+                _before_lan_commit()
         return (
             persisted_profile,
             persisted_targets,
@@ -1577,6 +1692,8 @@ class RoutingRegistry:
         now: datetime,
         runtime_hardening_version: str | None = None,
         interface_inventory_resolver: InterfaceInventoryResolver | None = None,
+        _connection: sqlite3.Connection | None = None,
+        _invoke_commit_hook: bool = True,
     ) -> tuple[ProviderProfileEntry, ModelTargetEntry, str, str]:
         """Atomically record an owner review over one exact LAN preimage."""
 
@@ -1628,8 +1745,12 @@ class RoutingRegistry:
             raise ValueError("LAN review requires owner-confirmed privacy and trust")
         _validate_canonical_lan_owner(authenticated_owner_principal)
         now_text = _lan_timestamp(now)
-        with self.state._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        connection_context = (
+            self.state._connect() if _connection is None else nullcontext(_connection)
+        )
+        with connection_context as connection:
+            if _connection is None:
+                connection.execute("BEGIN IMMEDIATE")
             target_row = connection.execute(
                 "SELECT * FROM routing_model_targets WHERE target_id = ?",
                 (target_id,),
@@ -1950,7 +2071,8 @@ class RoutingRegistry:
                 created_at=target_created_at,
                 updated_at=now_text,
             )
-            _before_lan_commit()
+            if _invoke_commit_hook:
+                _before_lan_commit()
             persisted_profile = connection.execute(
                 "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
                 (profile_id,),
@@ -1967,6 +2089,136 @@ class RoutingRegistry:
             privacy_digest,
             reviewed_material,
         )
+
+    def prepare_server_owned_lan_import(
+        self,
+        *,
+        scan_id: str,
+        endpoint_id: str,
+        replacement_provider_profile_id: str | None,
+        authenticated_owner_principal: str,
+        now: datetime,
+        runtime_hardening_version: str | None = None,
+    ) -> _LanImportPlan:
+        """Project an import from an immutable snapshot without writing the ledger."""
+
+        snapshot = _lan_inventory_snapshot_connection(self.state)
+        try:
+            snapshot.execute("BEGIN IMMEDIATE")
+            plan = _server_owned_lan_import_plan(
+                self,
+                snapshot,
+                scan_id=scan_id,
+                endpoint_id=endpoint_id,
+                replacement_provider_profile_id=replacement_provider_profile_id,
+                authenticated_owner_principal=authenticated_owner_principal,
+                now=now,
+                runtime_hardening_version=runtime_hardening_version,
+            )
+            snapshot.rollback()
+            return plan
+        finally:
+            snapshot.close()
+
+    def confirm_server_owned_lan_import(
+        self,
+        *,
+        scan_id: str,
+        endpoint_id: str,
+        replacement_provider_profile_id: str | None,
+        preview_digest: str,
+        authenticated_owner_principal: str,
+        now: datetime,
+        runtime_hardening_version: str | None = None,
+    ) -> _LanImportPlan:
+        """Recompute, authenticate, and commit one exact import plan."""
+
+        validate_digest(preview_digest, "preview_digest")
+        with self.state._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            plan = _server_owned_lan_import_plan(
+                self,
+                connection,
+                scan_id=scan_id,
+                endpoint_id=endpoint_id,
+                replacement_provider_profile_id=replacement_provider_profile_id,
+                authenticated_owner_principal=authenticated_owner_principal,
+                now=now,
+                runtime_hardening_version=runtime_hardening_version,
+            )
+            if not hmac.compare_digest(plan.preview_digest, preview_digest):
+                raise ValueError("lan_import_preview_conflict")
+            _before_lan_commit()
+        return plan
+
+    def prepare_server_owned_lan_review(
+        self,
+        *,
+        target_id: str,
+        intended_roles: tuple[str, ...],
+        task_family_affinities: tuple[str, ...],
+        enabled: bool,
+        authenticated_owner_principal: str,
+        now: datetime,
+        runtime_hardening_version: str | None = None,
+        interface_inventory_resolver: InterfaceInventoryResolver | None = None,
+    ) -> _LanReviewPlan:
+        """Project an owner review from an immutable snapshot."""
+
+        snapshot = _lan_inventory_snapshot_connection(self.state)
+        try:
+            snapshot.execute("BEGIN IMMEDIATE")
+            plan = _server_owned_lan_review_plan(
+                self,
+                snapshot,
+                target_id=target_id,
+                intended_roles=intended_roles,
+                task_family_affinities=task_family_affinities,
+                enabled=enabled,
+                authenticated_owner_principal=authenticated_owner_principal,
+                now=now,
+                runtime_hardening_version=runtime_hardening_version,
+                interface_inventory_resolver=interface_inventory_resolver,
+            )
+            snapshot.rollback()
+            return plan
+        finally:
+            snapshot.close()
+
+    def confirm_server_owned_lan_review(
+        self,
+        *,
+        target_id: str,
+        intended_roles: tuple[str, ...],
+        task_family_affinities: tuple[str, ...],
+        enabled: bool,
+        preview_digest: str,
+        authenticated_owner_principal: str,
+        now: datetime,
+        runtime_hardening_version: str | None = None,
+        interface_inventory_resolver: InterfaceInventoryResolver | None = None,
+    ) -> _LanReviewPlan:
+        """Recompute, authenticate, and commit one exact owner-review plan."""
+
+        validate_digest(preview_digest, "preview_digest")
+        with self.state._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            plan = _server_owned_lan_review_plan(
+                self,
+                connection,
+                target_id=target_id,
+                intended_roles=intended_roles,
+                task_family_affinities=task_family_affinities,
+                enabled=enabled,
+                authenticated_owner_principal=authenticated_owner_principal,
+                now=now,
+                runtime_hardening_version=runtime_hardening_version,
+                interface_inventory_resolver=interface_inventory_resolver,
+            )
+            if not hmac.compare_digest(plan.preview_digest, preview_digest):
+                raise ValueError("lan_review_preview_conflict")
+            _before_lan_commit()
+        return plan
 
     def put_policy(
         self,
@@ -2041,6 +2293,444 @@ def _before_inventory_commit() -> None:
 
 def _before_lan_commit() -> None:
     """Test seam immediately before an atomic LAN inventory commit."""
+
+
+def _lan_inventory_snapshot_connection(state: AgentStateStore) -> sqlite3.Connection:
+    snapshot = sqlite3.connect(":memory:")
+    snapshot.row_factory = sqlite3.Row
+    with state._connect() as source:
+        source.backup(snapshot)
+    snapshot.execute("PRAGMA foreign_keys = ON")
+    return snapshot
+
+
+def _server_owned_selector_evidence(
+    connection: sqlite3.Connection,
+    *,
+    scan_id: str,
+    endpoint_id: str,
+    authenticated_owner_principal: str,
+) -> AuthenticatedLanObservation:
+    scan_row = connection.execute(
+        "SELECT terminal_receipt_digest FROM routing_lan_scans WHERE scan_id = ?",
+        (scan_id,),
+    ).fetchone()
+    if scan_row is None:
+        raise KeyError(f"Unknown LAN scan: {scan_id}")
+    terminal_receipt_digest = validate_digest(
+        scan_row["terminal_receipt_digest"],
+        "terminal_receipt_digest",
+    )
+    observation_row = connection.execute(
+        """
+        SELECT public_payload_json FROM routing_lan_observations
+        WHERE scan_id = ? AND endpoint_id = ?
+        """,
+        (scan_id, endpoint_id),
+    ).fetchone()
+    if observation_row is None:
+        raise KeyError(f"Unknown LAN observation endpoint: {endpoint_id}")
+    try:
+        public_payload = json.loads(str(observation_row["public_payload_json"]))
+    except (TypeError, ValueError):
+        raise ValueError("LAN observation public payload is invalid") from None
+    if type(public_payload) is not dict:
+        raise ValueError("LAN observation public payload is invalid")
+    observation_digest = validate_digest(
+        public_payload.get("observation_digest"),
+        "observation_digest",
+    )
+    if terminal_receipt_digest is None or observation_digest is None:
+        raise ValueError("LAN selector evidence is incomplete")
+    return load_authenticated_task4_observation(
+        connection,
+        scan_id=scan_id,
+        endpoint_binding_digest=endpoint_id,
+        expected_terminal_receipt_digest=terminal_receipt_digest,
+        expected_observation_digest=observation_digest,
+        authenticated_owner_principal=authenticated_owner_principal,
+    )
+
+
+def _server_owned_replacement_authority(
+    connection: sqlite3.Connection,
+    *,
+    provider_profile_id: str | None,
+    authenticated_owner_principal: str,
+) -> tuple[str, int, str, tuple[str, ...]] | None:
+    if provider_profile_id is None:
+        return None
+    profile_row = connection.execute(
+        "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
+        (provider_profile_id,),
+    ).fetchone()
+    if profile_row is None:
+        raise ValueError("LAN replacement profile is missing")
+    profile = _strict_lan_profile_entry(profile_row)
+    protected = profile.profile.metadata["lan_discovery"]
+    if protected["owner_principal"] != authenticated_owner_principal:
+        raise ValueError("LAN replacement owner mismatch")
+    target_rows = connection.execute(
+        """
+        SELECT * FROM routing_model_targets
+        WHERE provider_profile_id = ? ORDER BY target_id ASC
+        """,
+        (provider_profile_id,),
+    ).fetchall()
+    targets = tuple(_strict_lan_target_entry(row) for row in target_rows)
+    if any(
+        target.target.metadata["lan_discovery"]["owner_principal"]
+        != authenticated_owner_principal
+        for target in targets
+    ):
+        raise ValueError("LAN replacement target owner mismatch")
+    materials = tuple(
+        sorted(
+            str(target.target.metadata["lan_discovery"]["material_binding_digest"])
+            for target in targets
+        )
+    )
+    if not materials:
+        raise ValueError("LAN replacement material binding set is empty")
+    return (
+        provider_profile_id,
+        profile.revision,
+        str(protected["endpoint_fingerprint"]),
+        materials,
+    )
+
+
+def _server_owned_lan_import_plan(
+    registry: RoutingRegistry,
+    connection: sqlite3.Connection,
+    *,
+    scan_id: str,
+    endpoint_id: str,
+    replacement_provider_profile_id: str | None,
+    authenticated_owner_principal: str,
+    now: datetime,
+    runtime_hardening_version: str | None,
+) -> _LanImportPlan:
+    evidence = _server_owned_selector_evidence(
+        connection,
+        scan_id=scan_id,
+        endpoint_id=endpoint_id,
+        authenticated_owner_principal=authenticated_owner_principal,
+    )
+    replacement = _server_owned_replacement_authority(
+        connection,
+        provider_profile_id=replacement_provider_profile_id,
+        authenticated_owner_principal=authenticated_owner_principal,
+    )
+    profile_revisions = {
+        str(row["profile_id"]): int(row["revision"])
+        for row in connection.execute(
+            "SELECT profile_id, revision FROM routing_provider_profiles"
+        ).fetchall()
+    }
+    target_revisions = {
+        str(row["target_id"]): int(row["revision"])
+        for row in connection.execute(
+            "SELECT target_id, revision FROM routing_model_targets"
+        ).fetchall()
+    }
+    raw_result = registry.apply_lan_import(
+        scan_id=scan_id,
+        endpoint_binding_digest=endpoint_id,
+        expected_terminal_receipt_digest=evidence.terminal_receipt_digest,
+        expected_observation_digest=evidence.observation.observation_digest,
+        expected_profile_revision=None,
+        expected_target_revisions=None,
+        replacement=None,
+        authenticated_owner_principal=authenticated_owner_principal,
+        now=now,
+        runtime_hardening_version=runtime_hardening_version,
+        _replacement_provider_profile_id=replacement_provider_profile_id,
+        _connection=connection,
+        _server_owned_authority=True,
+        _invoke_commit_hook=False,
+    )
+    result_profile = raw_result[0]
+    result_targets = raw_result[1]
+    profile_id = (
+        _lan_profile_id(endpoint_id)
+        if result_profile is None
+        else result_profile.profile.profile_id
+    )
+    replacement_result_profile: ProviderProfileEntry | None = None
+    if replacement_provider_profile_id is not None:
+        replacement_row = connection.execute(
+            "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
+            (replacement_provider_profile_id,),
+        ).fetchone()
+        if replacement_row is None:
+            raise RuntimeError("LAN replacement profile write was lost")
+        replacement_result_profile = _strict_lan_profile_entry(replacement_row)
+    plan = _LanImportPlan(
+        scan_id=scan_id,
+        endpoint_id=endpoint_id,
+        replacement_provider_profile_id=replacement_provider_profile_id,
+        owner_principal=authenticated_owner_principal,
+        evidence_expires_at=_lan_timestamp(
+            evidence.observed_at + timedelta(seconds=LAN_OBSERVATION_MAX_AGE_SECONDS)
+        ),
+        expected_terminal_receipt_digest=evidence.terminal_receipt_digest,
+        expected_observation_digest=evidence.observation.observation_digest,
+        expected_profile_revision=profile_revisions.get(profile_id, 0),
+        expected_target_revisions=tuple(
+            (target_id, target_revisions.get(target_id, 0))
+            for target_id in raw_result[5]
+        ),
+        endpoint_fingerprint=raw_result[3],
+        replacement=replacement,
+        result_profile=result_profile,
+        replacement_result_profile=replacement_result_profile,
+        result_targets=result_targets,
+        outage_observed=raw_result[4],
+        affected_target_ids=raw_result[5],
+        invalidated_binding_digests=raw_result[6],
+        stale_reasons_by_target=raw_result[7],
+        preview_digest="",
+    )
+    return replace(plan, preview_digest=_lan_import_plan_digest(plan))
+
+
+def _lan_entry_digest_payload(
+    entry: ProviderProfileEntry | ModelTargetEntry | None,
+) -> dict[str, Any] | None:
+    if entry is None:
+        return None
+    model = entry.profile if isinstance(entry, ProviderProfileEntry) else entry.target
+    return {"revision": entry.revision, "model": asdict(model)}
+
+
+def _lan_import_plan_digest(plan: _LanImportPlan) -> str:
+    return sha256_digest(
+        {
+            "schema": "kestrel.lan.import-preview.v1",
+            "owner_principal": plan.owner_principal,
+            "selector": {
+                "scan_id": plan.scan_id,
+                "endpoint_id": plan.endpoint_id,
+                "replacement_provider_profile_id": plan.replacement_provider_profile_id,
+            },
+            "evidence_expires_at": plan.evidence_expires_at,
+            "authority": {
+                "expected_terminal_receipt_digest": plan.expected_terminal_receipt_digest,
+                "expected_observation_digest": plan.expected_observation_digest,
+                "expected_profile_revision": plan.expected_profile_revision,
+                "expected_target_revisions": [
+                    {"resource_id": target_id, "revision": revision}
+                    for target_id, revision in plan.expected_target_revisions
+                ],
+                "endpoint_fingerprint": plan.endpoint_fingerprint,
+                "replacement": (
+                    None
+                    if plan.replacement is None
+                    else {
+                        "provider_profile_id": plan.replacement[0],
+                        "expected_profile_revision": plan.replacement[1],
+                        "expected_endpoint_fingerprint": plan.replacement[2],
+                        "expected_material_binding_digests": list(plan.replacement[3]),
+                    }
+                ),
+            },
+            "result": {
+                "profile": _lan_entry_digest_payload(plan.result_profile),
+                "replacement_profile": _lan_entry_digest_payload(
+                    plan.replacement_result_profile
+                ),
+                "targets": [
+                    _lan_entry_digest_payload(target) for target in plan.result_targets
+                ],
+                "outage_observed": plan.outage_observed,
+                "affected_target_ids": list(plan.affected_target_ids),
+                "invalidated_binding_digests": list(
+                    plan.invalidated_binding_digests
+                ),
+                "stale_reasons_by_target": [
+                    {"target_id": target_id, "reasons": list(reasons)}
+                    for target_id, reasons in plan.stale_reasons_by_target
+                ],
+            },
+        }
+    )
+
+
+def _server_owned_lan_review_plan(
+    registry: RoutingRegistry,
+    connection: sqlite3.Connection,
+    *,
+    target_id: str,
+    intended_roles: tuple[str, ...],
+    task_family_affinities: tuple[str, ...],
+    enabled: bool,
+    authenticated_owner_principal: str,
+    now: datetime,
+    runtime_hardening_version: str | None,
+    interface_inventory_resolver: InterfaceInventoryResolver | None,
+) -> _LanReviewPlan:
+    target_row = connection.execute(
+        "SELECT * FROM routing_model_targets WHERE target_id = ?",
+        (target_id,),
+    ).fetchone()
+    if target_row is None:
+        raise KeyError(f"Unknown LAN target: {target_id}")
+    target_entry = _strict_lan_target_entry(target_row)
+    provider_profile_id = target_entry.target.provider_profile_id
+    profile_row = connection.execute(
+        "SELECT * FROM routing_provider_profiles WHERE profile_id = ?",
+        (provider_profile_id,),
+    ).fetchone()
+    if profile_row is None:
+        raise ValueError("LAN target provider profile is missing")
+    profile_entry = _strict_lan_profile_entry(profile_row)
+    target_protected = target_entry.target.metadata["lan_discovery"]
+    profile_protected = profile_entry.profile.metadata["lan_discovery"]
+    expected_terminal_receipt_digest = str(
+        target_protected["terminal_receipt_digest"]
+    )
+    expected_observation_digest = str(target_protected["observation_digest"])
+    expected_endpoint_fingerprint = str(target_protected["endpoint_fingerprint"])
+    expected_material_binding_digest = str(
+        target_protected["material_binding_digest"]
+    )
+    expected_stale_reasons = tuple(target_protected["stale_reasons"])
+    transition_receipt = target_protected[
+        "stale_transition_terminal_receipt_digest"
+    ]
+    privacy_digest = _lan_privacy_acknowledgement_digest(
+        owner_principal=authenticated_owner_principal,
+        provider_profile_id=provider_profile_id,
+        target_id=target_id,
+        observation_digest=expected_observation_digest,
+        endpoint_fingerprint=expected_endpoint_fingerprint,
+        expected_profile_revision=profile_entry.revision,
+        expected_target_revision=target_entry.revision,
+        intended_roles=intended_roles,
+        task_family_affinities=task_family_affinities,
+        expected_stale_reasons=expected_stale_reasons,
+        stale_transition_terminal_receipt_digest=transition_receipt,
+        enabled=enabled,
+    )
+    reviewed_material = _lan_material_binding_digest(
+        target_protected,
+        target_id=target_id,
+        trust_class="operator_confirmed",
+        privacy_acknowledgement_digest=privacy_digest,
+        intended_roles=intended_roles,
+        task_family_affinities=task_family_affinities,
+    )
+    review_digest = sha256_digest(
+        {
+            "schema": "kestrel.lan.review.v1",
+            "privacy_acknowledgement_digest": privacy_digest,
+            "expected_terminal_receipt_digest": expected_terminal_receipt_digest,
+            "expected_observation_digest": expected_observation_digest,
+            "pre_review_material_binding_digest": expected_material_binding_digest,
+            "reviewed_material_binding_digest": reviewed_material,
+            "expected_stale_reasons": list(expected_stale_reasons),
+            "stale_transition_terminal_receipt_digest": transition_receipt,
+        }
+    )
+    raw_result = registry.review_lan_target(
+        target_id=target_id,
+        expected_profile_revision=profile_entry.revision,
+        expected_target_revision=target_entry.revision,
+        expected_terminal_receipt_digest=expected_terminal_receipt_digest,
+        expected_observation_digest=expected_observation_digest,
+        expected_endpoint_fingerprint=expected_endpoint_fingerprint,
+        expected_material_binding_digest=expected_material_binding_digest,
+        expected_review_digest=review_digest,
+        expected_stale_reasons=expected_stale_reasons,
+        trust_class="operator_confirmed",
+        intended_roles=intended_roles,
+        task_family_affinities=task_family_affinities,
+        privacy_acknowledged=True,
+        enabled=enabled,
+        authenticated_owner_principal=authenticated_owner_principal,
+        now=now,
+        runtime_hardening_version=runtime_hardening_version,
+        interface_inventory_resolver=interface_inventory_resolver,
+        _connection=connection,
+        _invoke_commit_hook=False,
+    )
+    reviewed_protected = raw_result[1].target.metadata["lan_discovery"]
+    runtime_binding = reviewed_protected[
+        "reviewed_runtime_interface_binding_digest"
+    ]
+    plan = _LanReviewPlan(
+        target_id=target_id,
+        owner_principal=authenticated_owner_principal,
+        intended_roles=intended_roles,
+        task_family_affinities=task_family_affinities,
+        enabled=enabled,
+        evidence_expires_at=_lan_timestamp(
+            min(
+                _parse_lan_timestamp(profile_protected["fresh_until"], "fresh_until"),
+                _parse_lan_timestamp(target_protected["fresh_until"], "fresh_until"),
+            )
+        ),
+        provider_profile_id=provider_profile_id,
+        expected_profile_revision=profile_entry.revision,
+        expected_target_revision=target_entry.revision,
+        expected_terminal_receipt_digest=expected_terminal_receipt_digest,
+        expected_observation_digest=expected_observation_digest,
+        expected_endpoint_fingerprint=expected_endpoint_fingerprint,
+        expected_material_binding_digest=expected_material_binding_digest,
+        expected_stale_reasons=expected_stale_reasons,
+        privacy_acknowledgement_digest=privacy_digest,
+        review_digest=review_digest,
+        reviewed_material_binding_digest=reviewed_material,
+        reviewed_runtime_interface_binding_digest=(
+            None if runtime_binding is None else str(runtime_binding)
+        ),
+        result_profile=raw_result[0],
+        result_target=raw_result[1],
+        preview_digest="",
+    )
+    return replace(plan, preview_digest=_lan_review_plan_digest(plan))
+
+
+def _lan_review_plan_digest(plan: _LanReviewPlan) -> str:
+    return sha256_digest(
+        {
+            "schema": "kestrel.lan.review-preview.v1",
+            "owner_principal": plan.owner_principal,
+            "options": {
+                "target_id": plan.target_id,
+                "intended_roles": list(plan.intended_roles),
+                "task_family_affinities": list(plan.task_family_affinities),
+                "enabled": plan.enabled,
+            },
+            "evidence_expires_at": plan.evidence_expires_at,
+            "authority": {
+                "provider_profile_id": plan.provider_profile_id,
+                "expected_profile_revision": plan.expected_profile_revision,
+                "expected_target_revision": plan.expected_target_revision,
+                "expected_terminal_receipt_digest": plan.expected_terminal_receipt_digest,
+                "expected_observation_digest": plan.expected_observation_digest,
+                "expected_endpoint_fingerprint": plan.expected_endpoint_fingerprint,
+                "expected_material_binding_digest": plan.expected_material_binding_digest,
+                "expected_stale_reasons": list(plan.expected_stale_reasons),
+                "trust_class": "operator_confirmed",
+                "privacy_acknowledgement_digest": (
+                    plan.privacy_acknowledgement_digest
+                ),
+                "review_digest": plan.review_digest,
+                "reviewed_material_binding_digest": (
+                    plan.reviewed_material_binding_digest
+                ),
+                "reviewed_runtime_interface_binding_digest": (
+                    plan.reviewed_runtime_interface_binding_digest
+                ),
+            },
+            "result": {
+                "profile": _lan_entry_digest_payload(plan.result_profile),
+                "target": _lan_entry_digest_payload(plan.result_target),
+            },
+        }
+    )
 
 
 def _lan_profile_id(endpoint_binding_digest: str) -> str:
@@ -3505,8 +4195,8 @@ def _apply_lan_outage(
     connection: sqlite3.Connection,
     *,
     evidence: AuthenticatedLanObservation,
-    expected_profile_revision: int,
-    expected_target_revisions: dict[str, int],
+    expected_profile_revision: int | None,
+    expected_target_revisions: dict[str, int] | None,
     now: datetime,
     now_text: str,
 ) -> tuple[
@@ -3537,7 +4227,7 @@ def _apply_lan_outage(
         if protected["endpoint_binding_digest"] == evidence.observation.endpoint_binding_digest:
             matches.append(entry)
     if not matches:
-        if expected_profile_revision != 0:
+        if expected_profile_revision not in {None, 0}:
             raise RoutingRevisionConflict(
                 "provider_profile",
                 _lan_profile_id(evidence.observation.endpoint_binding_digest),
@@ -3549,7 +4239,12 @@ def _apply_lan_outage(
     if len(matches) != 1:
         raise ValueError("LAN outage endpoint correlation is ambiguous")
     profile_entry = matches[0]
-    if profile_entry.revision != expected_profile_revision:
+    effective_profile_revision = (
+        profile_entry.revision
+        if expected_profile_revision is None
+        else expected_profile_revision
+    )
+    if profile_entry.revision != effective_profile_revision:
         raise RoutingRevisionConflict(
             "provider_profile",
             profile_entry.profile.profile_id,
@@ -3590,7 +4285,12 @@ def _apply_lan_outage(
         and "freshness_expired" not in target.target.metadata["lan_discovery"]["stale_reasons"]
     )
     affected_ids = tuple(entry.target.target_id for entry in affected_targets)
-    if set(expected_target_revisions) != set(affected_ids):
+    effective_target_revisions = (
+        {entry.target.target_id: entry.revision for entry in affected_targets}
+        if expected_target_revisions is None
+        else expected_target_revisions
+    )
+    if set(effective_target_revisions) != set(affected_ids):
         raise ValueError("LAN outage target revision set is not exact")
     if not profile_needs_transition and not affected_targets:
         return profile_entry, (), endpoint_fingerprint, (), (), ()
@@ -3611,7 +4311,7 @@ def _apply_lan_outage(
             "model_target",
             target_id,
             row,
-            expected_revision=expected_target_revisions[target_id],
+            expected_revision=effective_target_revisions[target_id],
             now=now_text,
         )
     profile_protected = dict(protected)
@@ -3670,7 +4370,7 @@ def _apply_lan_outage(
             "provider_profile",
             profile_entry.profile.profile_id,
             profile_row,
-            expected_revision=expected_profile_revision,
+            expected_revision=effective_profile_revision,
             now=now_text,
         )
         _upsert_lan_provider(
