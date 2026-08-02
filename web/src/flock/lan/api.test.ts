@@ -12,6 +12,7 @@ import {
   createLanScan,
   getLanInterfaces,
   getLanScan,
+  getLanScanPage,
   listLanScans,
   previewLanScope,
   previewManualLanProbe,
@@ -27,6 +28,9 @@ const digestC = `sha256:${"c".repeat(64)}`;
 const interfaceId = `sha256:${"d".repeat(64)}`;
 const profileId = `lan-provider-${"1".repeat(64)}`;
 const targetId = `lan-target-${"2".repeat(64)}`;
+const observationCursor =
+  "eyJzY2hlbWEiOiJrZXN0cmVsLmxhbi5vYnNlcnZhdGlvbi1jdXJzb3IudjEifQ";
+const nextObservationCursor = "bmV4dC1vYnNlcnZhdGlvbi1jdXJzb3I";
 
 type CapturedRequest = {
   path: string;
@@ -223,6 +227,7 @@ function responseFor(path: string, method: string, body: unknown): unknown {
       observations: [durableObservation()],
       observation_total_count: 1,
       observations_truncated: false,
+      observation_next_cursor: null,
     };
   }
   if (path === "/api/routing/lan/import") {
@@ -418,6 +423,139 @@ describe("typed LAN discovery API", () => {
       failure_category: null,
     });
   });
+
+  it("sends an opaque observation cursor only in the bounded request header", async () => {
+    const requests: CapturedRequest[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = typeof input === "string" ? input : input.toString();
+        requests.push({
+          path,
+          method: init?.method ?? "GET",
+          headers: new Headers(init?.headers),
+          body: null,
+        });
+        return jsonResponse({
+          ...scanResponse(),
+          observations: [durableObservation()],
+          observation_total_count: 2,
+          observations_truncated: true,
+          observation_next_cursor: nextObservationCursor,
+        });
+      }),
+    );
+
+    const page = await getLanScanPage(scanId, {
+      cursor: observationCursor,
+    });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.path).toBe(`/api/routing/lan/scans/${scanId}`);
+    expect(
+      requests[0]?.headers.get("Kestrel-Lan-Observation-Cursor"),
+    ).toBe(observationCursor);
+    expect(page.observation_next_cursor).toBe(nextObservationCursor);
+    expect(page.observations_truncated).toBe(true);
+  });
+
+  it.each([
+    {
+      name: "mismatched scan",
+      inputCursor: undefined,
+      response: {
+        ...scanResponse(),
+        scan_id: `lan_${"f".repeat(32)}`,
+        observations: [],
+        observation_total_count: 0,
+        observations_truncated: false,
+        observation_next_cursor: null,
+      },
+    },
+    {
+      name: "replayed cursor",
+      inputCursor: observationCursor,
+      response: {
+        ...scanResponse(),
+        observations: [durableObservation()],
+        observation_total_count: 2,
+        observations_truncated: true,
+        observation_next_cursor: observationCursor,
+      },
+    },
+    {
+      name: "cursor without truncation",
+      inputCursor: undefined,
+      response: {
+        ...scanResponse(),
+        observations: [durableObservation()],
+        observation_total_count: 1,
+        observations_truncated: false,
+        observation_next_cursor: nextObservationCursor,
+      },
+    },
+    {
+      name: "truncated first page without cursor",
+      inputCursor: undefined,
+      response: {
+        ...scanResponse(),
+        observations: [durableObservation()],
+        observation_total_count: 2,
+        observations_truncated: true,
+        observation_next_cursor: null,
+      },
+    },
+  ])("rejects an incoherent scan page response: $name", async ({
+    inputCursor,
+    response,
+  }) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(response)),
+    );
+
+    await expect(
+      getLanScanPage(
+        scanId,
+        inputCursor === undefined ? {} : { cursor: inputCursor },
+      ),
+    ).rejects.toThrow("lan_response_invalid");
+  });
+
+  it.each(["", "cursor with spaces", "abc=", "*", "AB", "A".repeat(1_025)])(
+    "rejects a malformed observation cursor before fetch: %s",
+    async (cursor) => {
+      const fetchMock = captureFetch([]);
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(getLanScanPage(scanId, { cursor })).rejects.toThrow(
+        "lan_request_invalid",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["", "abc=", "*", "AB", "A".repeat(1_025), 7])(
+    "rejects a malformed observation cursor in a scan response: %s",
+    async (cursor) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>().mockResolvedValue(
+          jsonResponse({
+            ...scanResponse(),
+            observations: [durableObservation()],
+            observation_total_count: 1,
+            observations_truncated: false,
+            observation_next_cursor: cursor,
+          }),
+        ),
+      );
+
+      await expect(getLanScan(scanId)).rejects.toThrow(
+        "lan_response_invalid",
+      );
+    },
+  );
 
   it("rejects a noncanonical scan identifier before fetch", async () => {
     const fetchMock = captureFetch([]);
@@ -728,6 +866,7 @@ describe("typed LAN discovery API", () => {
           observations: [hostile],
           observation_total_count: 1,
           observations_truncated: false,
+          observation_next_cursor: null,
         }),
       ),
     );

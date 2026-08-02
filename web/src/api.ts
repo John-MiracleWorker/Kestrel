@@ -22,9 +22,13 @@ export class ApiAuthError extends ApiResponseError {
   }
 }
 
-export async function getJson<T>(path: string, options: { signal?: AbortSignal } = {}): Promise<T> {
+export async function getJson<T>(
+  path: string,
+  options: { signal?: AbortSignal; headers?: HeadersInit } = {},
+): Promise<T> {
   const response = await runtimeTransport(apiAuthHeaders).fetch(path, {
-    signal: options.signal
+    signal: options.signal,
+    headers: options.headers,
   });
   return parseResponse<T>(response);
 }

@@ -16,12 +16,14 @@ import type {
   LanFailureCategory,
   LanInterface,
   LanManualPreview,
+  LanObservationCursor,
   LanObservationPublicEvidence,
   LanScan,
   LanScanDetail,
   LanScanEvent,
   LanScanEventStreamOptions,
   LanScanEventType,
+  LanScanPageOptions,
   LanScopePreview,
   PreviewLanScopeInput,
   PreviewManualLanProbeInput,
@@ -39,6 +41,10 @@ const LAN_EVENT_TYPES = new Set<LanScanEventType>([
 ]);
 const LAN_SCAN_ID = /^lan_[0-9a-f]{32}$/;
 const LAN_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const LAN_OBSERVATION_CURSOR = /^[A-Za-z0-9_-]{1,1024}$/;
+const BASE64URL_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const LAN_OBSERVATION_CURSOR_HEADER = "Kestrel-Lan-Observation-Cursor";
 const LAN_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$/;
 const MAX_EVENT_SEQUENCE = 9_223_372_036_854_775_807n;
@@ -181,12 +187,44 @@ export async function getLanScan(
   scanId: string,
   signal?: AbortSignal,
 ): Promise<LanScanDetail> {
+  return getLanScanPage(
+    scanId,
+    signal === undefined ? {} : { signal },
+  );
+}
+
+export async function getLanScanPage(
+  scanId: string,
+  options: LanScanPageOptions = {},
+): Promise<LanScanDetail> {
   const identifier = requireScanId(scanId);
+  const cursor =
+    options.cursor === undefined
+      ? undefined
+      : requireObservationCursor(options.cursor);
   const payload = await getJson<unknown>(
     `/api/routing/lan/scans/${identifier}`,
-    { signal },
+    {
+      signal: options.signal,
+      headers:
+        cursor === undefined
+          ? undefined
+          : { [LAN_OBSERVATION_CURSOR_HEADER]: cursor },
+    },
   );
-  return parseScanDetail(payload);
+  const page = parseScanDetail(payload);
+  if (
+    page.scan_id !== identifier ||
+    (page.observation_next_cursor !== null &&
+      (!page.observations_truncated || page.observations.length === 0)) ||
+    (cursor === undefined &&
+      page.observations_truncated &&
+      page.observation_next_cursor === null) ||
+    (cursor !== undefined && page.observation_next_cursor === cursor)
+  ) {
+    invalidResponse();
+  }
+  return page;
 }
 
 export async function cancelLanScan(
@@ -590,6 +628,7 @@ function parseScanDetail(value: unknown): LanScanDetail {
     "observations",
     "observation_total_count",
     "observations_truncated",
+    "observation_next_cursor",
   ]);
   const scanProjection = Object.fromEntries(
     SCAN_KEYS.map((key) => [key, record[key]]),
@@ -597,6 +636,9 @@ function parseScanDetail(value: unknown): LanScanDetail {
   const base = parseScan(scanProjection);
   const observations = record.observations;
   const total = nonnegativeInteger(record.observation_total_count);
+  const nextCursor = nullableObservationCursor(
+    record.observation_next_cursor,
+  );
   if (
     !Array.isArray(observations) ||
     observations.length > 200 ||
@@ -632,6 +674,7 @@ function parseScanDetail(value: unknown): LanScanDetail {
     observations: parsedObservations,
     observation_total_count: total,
     observations_truncated: record.observations_truncated,
+    observation_next_cursor: nextCursor,
   };
 }
 
@@ -1227,6 +1270,13 @@ function requireScanId(value: unknown): string {
   return value;
 }
 
+function requireObservationCursor(value: unknown): LanObservationCursor {
+  if (!isObservationCursor(value)) {
+    invalidRequest();
+  }
+  return value;
+}
+
 function requireRequestDigest(value: unknown): string {
   if (typeof value !== "string" || !LAN_DIGEST.test(value)) {
     invalidRequest();
@@ -1366,6 +1416,28 @@ function digest(value: unknown): string {
 
 function nullableDigest(value: unknown): string | null {
   return value === null ? null : digest(value);
+}
+
+function nullableObservationCursor(value: unknown): LanObservationCursor | null {
+  if (value === null) return null;
+  if (!isObservationCursor(value)) invalidResponse();
+  return value;
+}
+
+function isObservationCursor(value: unknown): value is LanObservationCursor {
+  if (
+    typeof value !== "string" ||
+    !LAN_OBSERVATION_CURSOR.test(value) ||
+    value.length % 4 === 1
+  ) {
+    return false;
+  }
+  const remainder = value.length % 4;
+  if (remainder === 0) return true;
+  const finalSextet = BASE64URL_ALPHABET.indexOf(value.at(-1) ?? "");
+  return remainder === 2
+    ? (finalSextet & 0b001111) === 0
+    : (finalSextet & 0b000011) === 0;
 }
 
 function text(value: unknown, maximum: number): string {

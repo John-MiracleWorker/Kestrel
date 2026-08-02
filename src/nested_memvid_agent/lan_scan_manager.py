@@ -60,6 +60,15 @@ from nested_memvid_agent.routing.lan_ledger import (
     LanDiscoveryLedger,
     LanScanObservationPage,
 )
+from nested_memvid_agent.routing.lan_ledger import (
+    LanObservationCursorConflict as LanObservationCursorConflict,
+)
+from nested_memvid_agent.routing.lan_ledger import (
+    LanObservationCursorInvalid as LanObservationCursorInvalid,
+)
+from nested_memvid_agent.routing.lan_ledger import (
+    LanScanObservationCursor as LanScanObservationCursor,
+)
 from nested_memvid_agent.routing.lan_records import (
     LanObservationDraft,
     LanScanEvent,
@@ -776,11 +785,13 @@ class LanScanManager:
         scan_id: str,
         *,
         limit: int,
+        cursor: LanScanObservationCursor | None = None,
     ) -> LanScanObservationPage | None:
         return self._ledger.read_scan_observation_page(
             scan_id,
             owner_principal=LAN_OWNER_PRINCIPAL,
             limit=limit,
+            cursor=cursor,
         )
 
     def events(

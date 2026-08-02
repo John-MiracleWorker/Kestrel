@@ -68,6 +68,14 @@ _PRIVATE_IPV6_NETWORKS = (
 )
 
 
+class LanObservationCursorConflict(RuntimeError):
+    """A continuation no longer names the current scan snapshot."""
+
+
+class LanObservationCursorInvalid(ValueError):
+    """A continuation is malformed or does not name an exact page anchor."""
+
+
 def _canonical_manual_limits(port: int) -> dict[str, object]:
     if type(port) is not int or not 1 <= port <= 65_535:
         raise ValueError("manual LAN port must be an exact integer between 1 and 65535")
@@ -154,6 +162,47 @@ def _require_manual_singleton_progress(
 
 
 @dataclass(frozen=True)
+class LanScanObservationCursor:
+    """Bind a keyset continuation to one exact scan observation snapshot."""
+
+    scan_id: str
+    scan_revision: int
+    terminal_receipt_digest: str | None
+    observation_total_count: int
+    after_endpoint_id: str
+
+
+def _validated_observation_cursor(value: object) -> LanScanObservationCursor:
+    if type(value) is not LanScanObservationCursor:
+        raise LanObservationCursorInvalid("LAN observation cursor type is invalid")
+    cursor = value
+    try:
+        scan_id = validate_required_text(cursor.scan_id, "scan_id", maximum=128)
+        terminal_receipt_digest = validate_digest(
+            cursor.terminal_receipt_digest,
+            "terminal_receipt_digest",
+            optional=True,
+        )
+        after_endpoint_id = validate_digest(
+            cursor.after_endpoint_id,
+            "after_endpoint_id",
+        )
+    except (TypeError, ValueError):
+        raise LanObservationCursorInvalid("LAN observation cursor field is invalid") from None
+    if (
+        scan_id != cursor.scan_id
+        or type(cursor.scan_revision) is not int
+        or not 1 <= cursor.scan_revision <= 2**63 - 1
+        or terminal_receipt_digest != cursor.terminal_receipt_digest
+        or type(cursor.observation_total_count) is not int
+        or not 0 <= cursor.observation_total_count <= MAX_LAN_SCAN_OBSERVATIONS
+        or after_endpoint_id != cursor.after_endpoint_id
+    ):
+        raise LanObservationCursorInvalid("LAN observation cursor field is invalid")
+    return cursor
+
+
+@dataclass(frozen=True)
 class LanScanObservationPage:
     """One owner-qualified, revision-consistent scan detail snapshot."""
 
@@ -161,6 +210,7 @@ class LanScanObservationPage:
     observations: tuple[LanObservationRecord, ...]
     total_count: int
     truncated: bool
+    next_cursor: LanScanObservationCursor | None
 
 
 class LanDiscoveryLedger:
@@ -535,6 +585,7 @@ class LanDiscoveryLedger:
         *,
         owner_principal: str,
         limit: int,
+        cursor: LanScanObservationCursor | None = None,
     ) -> LanScanObservationPage | None:
         """Read scan metadata, observation count, and one ordered page atomically."""
 
@@ -554,6 +605,10 @@ class LanDiscoveryLedger:
             ).fetchone()
             if scan_row is None:
                 return None
+            if cursor is not None:
+                cursor = _validated_observation_cursor(cursor)
+                if cursor.scan_id != scan_id:
+                    raise LanObservationCursorInvalid("LAN observation cursor scan is invalid")
             count_row = connection.execute(
                 """
                 SELECT COUNT(*)
@@ -566,25 +621,74 @@ class LanDiscoveryLedger:
             ).fetchone()
             if count_row is None:
                 raise RuntimeError("lan_observation_page_count_lost")
-            rows = connection.execute(
-                """
-                SELECT observation.*
-                FROM routing_lan_observations AS observation
-                INNER JOIN routing_lan_scans AS scan
-                    ON scan.scan_id = observation.scan_id
-                WHERE scan.scan_id = ? AND scan.owner_principal = ?
-                ORDER BY observation.endpoint_id ASC
-                LIMIT ?
-                """,
-                (scan_id, owner, limit),
-            ).fetchall()
-        total_count = int(count_row[0])
-        observations = tuple(observation_from_row(row) for row in rows)
+            total_count = int(count_row[0])
+            if not 0 <= total_count <= MAX_LAN_SCAN_OBSERVATIONS:
+                raise RuntimeError("lan_observation_page_count_invalid")
+            if cursor is not None and (
+                cursor.scan_revision != int(scan_row["revision"])
+                or cursor.terminal_receipt_digest != scan_row["terminal_receipt_digest"]
+                or cursor.observation_total_count != total_count
+            ):
+                raise LanObservationCursorConflict("LAN observation snapshot changed")
+            if cursor is not None:
+                anchor_row = connection.execute(
+                    """
+                    SELECT 1
+                    FROM routing_lan_observations AS observation
+                    INNER JOIN routing_lan_scans AS scan
+                        ON scan.scan_id = observation.scan_id
+                    WHERE scan.scan_id = ? AND scan.owner_principal = ?
+                      AND observation.endpoint_id = ?
+                    """,
+                    (scan_id, owner, cursor.after_endpoint_id),
+                ).fetchone()
+                if anchor_row is None:
+                    raise LanObservationCursorInvalid("LAN observation cursor anchor is invalid")
+            if cursor is None:
+                rows = connection.execute(
+                    """
+                    SELECT observation.*
+                    FROM routing_lan_observations AS observation
+                    INNER JOIN routing_lan_scans AS scan
+                        ON scan.scan_id = observation.scan_id
+                    WHERE scan.scan_id = ? AND scan.owner_principal = ?
+                    ORDER BY observation.endpoint_id ASC
+                    LIMIT ?
+                    """,
+                    (scan_id, owner, limit + 1),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT observation.*
+                    FROM routing_lan_observations AS observation
+                    INNER JOIN routing_lan_scans AS scan
+                        ON scan.scan_id = observation.scan_id
+                    WHERE scan.scan_id = ? AND scan.owner_principal = ?
+                      AND observation.endpoint_id > ?
+                    ORDER BY observation.endpoint_id ASC
+                    LIMIT ?
+                    """,
+                    (scan_id, owner, cursor.after_endpoint_id, limit + 1),
+                ).fetchall()
+        observations = tuple(observation_from_row(row) for row in rows[:limit])
+        next_cursor = (
+            LanScanObservationCursor(
+                scan_id=scan_id,
+                scan_revision=int(scan_row["revision"]),
+                terminal_receipt_digest=scan_row["terminal_receipt_digest"],
+                observation_total_count=total_count,
+                after_endpoint_id=observations[-1].endpoint_id,
+            )
+            if len(rows) > limit
+            else None
+        )
         return LanScanObservationPage(
             scan=scan_from_row(scan_row),
             observations=observations,
             total_count=total_count,
             truncated=total_count > len(observations),
+            next_cursor=next_cursor,
         )
 
     def append_event(

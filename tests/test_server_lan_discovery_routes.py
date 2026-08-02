@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import inspect
 import json
 import logging
@@ -57,6 +58,10 @@ def _task7_routes() -> Any:
 
 def _task6() -> Any:
     return import_module("nested_memvid_agent.lan_scan_manager")
+
+
+def _task_ledger() -> Any:
+    return import_module("nested_memvid_agent.routing.lan_ledger")
 
 
 def _manual_limits(port: int = 5001) -> dict[str, object]:
@@ -140,6 +145,36 @@ def _observation(index: int = 1, *, scan_id: str = SCAN_ID) -> LanObservationRec
         error_category=None,
         created_at="2026-08-01T12:00:01Z",
     )
+
+
+def _observation_cursor(
+    *,
+    scan_id: str = SCAN_ID,
+    scan_revision: int = 4,
+    terminal_receipt_digest: str | None = "sha256:" + "d" * 64,
+    observation_total_count: int = 3,
+    after_endpoint_id: str = "sha256:" + f"{2:064x}",
+) -> str:
+    payload = {
+        "after_endpoint_id": after_endpoint_id,
+        "observation_total_count": observation_total_count,
+        "scan_id": scan_id,
+        "scan_revision": scan_revision,
+        "schema": "kestrel.lan.observation-cursor.v1",
+        "terminal_receipt_digest": terminal_receipt_digest,
+    }
+    return _encode_observation_cursor_payload(payload)
+
+
+def _encode_observation_cursor_payload(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
 
 
 def _private_event_payload(event_type: str) -> dict[str, object]:
@@ -412,15 +447,29 @@ class RouteManager:
         self.calls.append(("get", scan_id))
         return self.record if scan_id == self.record.scan_id else None
 
-    def observation_page(self, scan_id: str, *, limit: int) -> object | None:
-        self.calls.append(("observations", scan_id, limit))
+    def observation_page(
+        self,
+        scan_id: str,
+        *,
+        limit: int,
+        cursor: object | None = None,
+    ) -> object | None:
+        self.calls.append(("observations", scan_id, limit, cursor))
         if scan_id != self.record.scan_id:
             return None
+        observations = (_observation(1), _observation(2))
         return SimpleNamespace(
             scan=self.record,
-            observations=(_observation(1), _observation(2)),
+            observations=observations,
             total_count=3,
             truncated=True,
+            next_cursor=_task_ledger().LanScanObservationCursor(
+                scan_id=scan_id,
+                scan_revision=self.record.revision,
+                terminal_receipt_digest=self.record.terminal_receipt_digest,
+                observation_total_count=3,
+                after_endpoint_id=observations[-1].endpoint_id,
+            ),
         )
 
     def cancel(self, scan_id: str, *, expected_revision: int) -> LanScanRecord:
@@ -696,6 +745,7 @@ def test_automatic_routes_project_only_bounded_public_manager_results() -> None:
     assert detail.json()["timeout_count"] == 0
     assert detail.json()["observation_total_count"] == 3
     assert detail.json()["observations_truncated"] is True
+    assert detail.json()["observation_next_cursor"] == _observation_cursor()
     assert len(detail.json()["observations"]) == 2
     assert cancelled.status_code == 202
     for payload in (
@@ -713,7 +763,7 @@ def test_automatic_routes_project_only_bounded_public_manager_results() -> None:
     assert ("start", SCAN_ID, 1, PREVIEW_DIGEST) in manager.calls
     assert ("list", 100) in manager.calls
     assert ("get", SCAN_ID) not in manager.calls
-    assert ("observations", SCAN_ID, 200) in manager.calls
+    assert ("observations", SCAN_ID, 200, None) in manager.calls
     assert ("cancel", SCAN_ID, 4) in manager.calls
 
 
@@ -1110,17 +1160,29 @@ def test_route_projection_enforces_100_scan_and_200_observation_caps_on_oversupp
             self.calls.append(("get", scan_id))
             return self.records[0] if scan_id == self.records[0].scan_id else None
 
-        def observation_page(self, scan_id: str, *, limit: int) -> object | None:
-            self.calls.append(("observations", scan_id, limit))
+        def observation_page(
+            self,
+            scan_id: str,
+            *,
+            limit: int,
+            cursor: object | None = None,
+        ) -> object | None:
+            self.calls.append(("observations", scan_id, limit, cursor))
             if scan_id != self.records[0].scan_id:
                 return None
+            observations = tuple(_observation(index + 1, scan_id=scan_id) for index in range(201))
             return SimpleNamespace(
                 scan=self.records[0],
-                observations=tuple(
-                    _observation(index + 1, scan_id=scan_id) for index in range(201)
-                ),
+                observations=observations,
                 total_count=201,
                 truncated=False,
+                next_cursor=_task_ledger().LanScanObservationCursor(
+                    scan_id=scan_id,
+                    scan_revision=self.records[0].revision,
+                    terminal_receipt_digest=self.records[0].terminal_receipt_digest,
+                    observation_total_count=201,
+                    after_endpoint_id=observations[199].endpoint_id,
+                ),
             )
 
     manager = OversupplyingManager()
@@ -1139,11 +1201,252 @@ def test_route_projection_enforces_100_scan_and_200_observation_caps_on_oversupp
     assert len(detail.json()["observations"]) == 200
     assert detail.json()["observation_total_count"] == 201
     assert detail.json()["observations_truncated"] is True
+    assert detail.json()["observation_next_cursor"] == _observation_cursor(
+        scan_id=detail_id,
+        observation_total_count=201,
+        after_endpoint_id="sha256:" + f"{200:064x}",
+    )
     _assert_no_private_authority(summaries.json())
     _assert_no_private_authority(detail.json())
     assert ("list", 100) in manager.calls
     assert ("get", detail_id) not in manager.calls
-    assert ("observations", detail_id, 200) in manager.calls
+    assert ("observations", detail_id, 200, None) in manager.calls
+
+
+def test_scan_detail_pages_all_observations_with_opaque_revision_bound_cursor() -> None:
+    class PagingManager(RouteManager):
+        def __init__(self) -> None:
+            super().__init__(terminal=True)
+            self.observations = tuple(_observation(index + 1) for index in range(201))
+
+        def observation_page(
+            self,
+            scan_id: str,
+            *,
+            limit: int,
+            cursor: object | None = None,
+        ) -> object | None:
+            self.calls.append(("observations", scan_id, limit, cursor))
+            assert scan_id == self.record.scan_id
+            assert limit == 200
+            if cursor is None:
+                page = self.observations[:200]
+                next_cursor = _task_ledger().LanScanObservationCursor(
+                    scan_id=scan_id,
+                    scan_revision=self.record.revision,
+                    terminal_receipt_digest=self.record.terminal_receipt_digest,
+                    observation_total_count=len(self.observations),
+                    after_endpoint_id=page[-1].endpoint_id,
+                )
+            else:
+                assert cursor == _task_ledger().LanScanObservationCursor(
+                    scan_id=scan_id,
+                    scan_revision=self.record.revision,
+                    terminal_receipt_digest=self.record.terminal_receipt_digest,
+                    observation_total_count=len(self.observations),
+                    after_endpoint_id=self.observations[199].endpoint_id,
+                )
+                page = self.observations[200:]
+                next_cursor = None
+            return SimpleNamespace(
+                scan=self.record,
+                observations=page,
+                total_count=len(self.observations),
+                truncated=len(self.observations) > len(page),
+                next_cursor=next_cursor,
+            )
+
+    manager = PagingManager()
+    with _route_client(manager) as client:
+        first = client.get(f"/api/routing/lan/scans/{SCAN_ID}")
+        first_payload = first.json()
+        cursor = first_payload["observation_next_cursor"]
+        second = client.get(
+            f"/api/routing/lan/scans/{SCAN_ID}",
+            headers={"Kestrel-Lan-Observation-Cursor": cursor},
+        )
+
+    assert first.status_code == 200
+    assert cursor == _observation_cursor(
+        observation_total_count=201,
+        after_endpoint_id="sha256:" + f"{200:064x}",
+    )
+    assert len(first_payload["observations"]) == 200
+    assert first_payload["observations_truncated"] is True
+    assert second.status_code == 200
+    second_payload = second.json()
+    assert len(second_payload["observations"]) == 1
+    assert second_payload["observation_total_count"] == 201
+    assert second_payload["observations_truncated"] is True
+    assert second_payload["observation_next_cursor"] is None
+    endpoint_ids = [
+        item["endpoint_id"]
+        for payload in (first_payload, second_payload)
+        for item in payload["observations"]
+    ]
+    assert endpoint_ids == sorted(set(endpoint_ids))
+    assert len(endpoint_ids) == 201
+    _assert_no_private_authority(first_payload)
+    _assert_no_private_authority(second_payload)
+
+
+def test_scan_detail_rejects_noncanonical_or_malformed_observation_cursors() -> None:
+    valid_payload = {
+        "after_endpoint_id": "sha256:" + f"{2:064x}",
+        "observation_total_count": 3,
+        "scan_id": SCAN_ID,
+        "scan_revision": 4,
+        "schema": "kestrel.lan.observation-cursor.v1",
+        "terminal_receipt_digest": "sha256:" + "d" * 64,
+    }
+
+    def encoded(raw: bytes) -> bytes:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+    duplicate_json = (
+        json.dumps(valid_payload, sort_keys=True, separators=(",", ":"))[:-1]
+        + f',"scan_id":"{SCAN_ID}"}}'
+    ).encode("ascii")
+    invalid_headers = (
+        b"",
+        b"A" * 1_025,
+        _observation_cursor().encode("ascii") + b"=",
+        b"*",
+        encoded(b"\xff"),
+        encoded(json.dumps(valid_payload, sort_keys=True).encode("ascii")),
+        encoded(duplicate_json),
+        _encode_observation_cursor_payload({**valid_payload, "extra": True}).encode(),
+        _encode_observation_cursor_payload(
+            {key: value for key, value in valid_payload.items() if key != "schema"}
+        ).encode(),
+        _encode_observation_cursor_payload(
+            {**valid_payload, "schema": "kestrel.lan.observation-cursor.v2"}
+        ).encode(),
+        _encode_observation_cursor_payload(
+            {**valid_payload, "scan_id": "lan_" + "f" * 32}
+        ).encode(),
+        _encode_observation_cursor_payload({**valid_payload, "scan_revision": 0}).encode(),
+        _encode_observation_cursor_payload({**valid_payload, "scan_revision": True}).encode(),
+        _encode_observation_cursor_payload(
+            {**valid_payload, "terminal_receipt_digest": "raw-secret"}
+        ).encode(),
+        _encode_observation_cursor_payload(
+            {**valid_payload, "observation_total_count": 1_025}
+        ).encode(),
+        _encode_observation_cursor_payload(
+            {**valid_payload, "after_endpoint_id": "not-a-digest"}
+        ).encode(),
+    )
+    manager = RouteManager(terminal=True)
+    for value in invalid_headers:
+        status, response = _bounded_asgi_get(
+            manager,
+            f"/api/routing/lan/scans/{SCAN_ID}",
+            headers=((b"Kestrel-Lan-Observation-Cursor", value),),
+        )
+        assert status == 400
+        assert response.json_body() == {"detail": {"code": "lan_observation_cursor_invalid"}}
+    assert not any(call[0] == "observations" for call in manager.calls)
+
+
+def test_scan_detail_rejects_duplicate_observation_cursor_headers() -> None:
+    value = _observation_cursor().encode("ascii")
+    status, response = _bounded_asgi_get(
+        RouteManager(terminal=True),
+        f"/api/routing/lan/scans/{SCAN_ID}",
+        headers=(
+            (b"Kestrel-Lan-Observation-Cursor", value),
+            (b"kestrel-lan-observation-cursor", value),
+        ),
+    )
+
+    assert status == 400
+    assert response.json_body() == {"detail": {"code": "lan_observation_cursor_invalid"}}
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "expected_status", "expected_code"),
+    (
+        ("LanObservationCursorInvalid", 400, "lan_observation_cursor_invalid"),
+        ("LanObservationCursorConflict", 409, "lan_observation_cursor_conflict"),
+    ),
+)
+def test_scan_detail_maps_ledger_cursor_failures_to_fixed_safe_errors(
+    exception_name: str,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    class RejectingManager(RouteManager):
+        def observation_page(
+            self,
+            scan_id: str,
+            *,
+            limit: int,
+            cursor: object | None = None,
+        ) -> object | None:
+            del scan_id, limit, cursor
+            raise getattr(_task_ledger(), exception_name)("raw-secret-cursor-detail")
+
+    with _route_client(RejectingManager(terminal=True)) as client:
+        response = client.get(
+            f"/api/routing/lan/scans/{SCAN_ID}",
+            headers={"Kestrel-Lan-Observation-Cursor": _observation_cursor()},
+        )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": {"code": expected_code}}
+    assert "raw-secret" not in response.text
+
+
+def test_scan_detail_cursor_preserves_missing_scan_existence_hiding_and_get_precedence() -> None:
+    manager = RouteManager(terminal=True)
+    missing = "lan_" + "f" * 32
+    with _route_client(manager) as client:
+        not_found = client.get(
+            f"/api/routing/lan/scans/{missing}",
+            headers={"Kestrel-Lan-Observation-Cursor": _observation_cursor(scan_id=missing)},
+        )
+        query_rejected = client.get(
+            f"/api/routing/lan/scans/{SCAN_ID}?owner_principal=attacker",
+            headers={"Kestrel-Lan-Observation-Cursor": _observation_cursor()},
+        )
+
+    assert not_found.status_code == 404
+    assert not_found.json() == {"detail": {"code": "lan_scan_not_found"}}
+    assert query_rejected.status_code == 400
+    assert query_rejected.json() == {"detail": {"code": "lan_request_rejected"}}
+
+
+def test_scan_detail_rejects_manager_cursor_that_disagrees_with_public_page() -> None:
+    class HostileManager(RouteManager):
+        def observation_page(
+            self,
+            scan_id: str,
+            *,
+            limit: int,
+            cursor: object | None = None,
+        ) -> object | None:
+            del limit, cursor
+            observations = (_observation(1), _observation(2))
+            return SimpleNamespace(
+                scan=self.record,
+                observations=observations,
+                total_count=3,
+                truncated=True,
+                next_cursor=_task_ledger().LanScanObservationCursor(
+                    scan_id=scan_id,
+                    scan_revision=self.record.revision + 1,
+                    terminal_receipt_digest=self.record.terminal_receipt_digest,
+                    observation_total_count=3,
+                    after_endpoint_id=observations[-1].endpoint_id,
+                ),
+            )
+
+    with _route_client(HostileManager(terminal=True)) as client:
+        response = client.get(f"/api/routing/lan/scans/{SCAN_ID}")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "lan_scan_unavailable"}}
 
 
 @pytest.mark.parametrize(

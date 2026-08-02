@@ -68,6 +68,7 @@ function scan(
     observations: [],
     observation_total_count: 0,
     observations_truncated: false,
+    observation_next_cursor: null,
   };
 }
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import ipaddress
 import json
 import re
@@ -24,9 +26,12 @@ from .lan_scan_manager import (
     LAN_OWNER_PRINCIPAL,
     LAN_SERVER_VERSION,
     LanManualPreviewConflict,
+    LanObservationCursorConflict,
+    LanObservationCursorInvalid,
     LanPreviewAuthorization,
     LanPreviewAuthorizationError,
     LanScanAdmissionConflict,
+    LanScanObservationCursor,
     canonical_manual_scan_limits,
 )
 from .routing.lan_records import (
@@ -44,9 +49,8 @@ from .routing.lan_serialization import (
 from .server_routing_routes import _parse_lan_json_request, _require_lan_get_request
 
 _SCAN_ID_RE = re.compile(r"lan_[0-9a-f]{32}\Z")
-_UTC_TIMESTAMP_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)\Z"
-)
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)\Z")
 _TERMINAL_STATUSES = frozenset({"cancelled", "completed", "failed", "interrupted"})
 _ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -61,6 +65,8 @@ _ALLOWED_EVENT_TYPES = frozenset(
 )
 _MAX_SCAN_SUMMARIES = 100
 _MAX_OBSERVATIONS = 200
+_MAX_OBSERVATION_TOTAL = 1_024
+_MAX_OBSERVATION_CURSOR_HEADER_BYTES = 1_024
 _MAX_EVENT_BATCH = 500
 _MAX_EVENT_FRAME_BYTES = 16 * 1024
 _MAX_EVENT_SEQUENCE = 2**63 - 1
@@ -68,6 +74,8 @@ _MAX_STREAMS = 4
 _HEARTBEAT_SECONDS = 15.0
 _POLL_SECONDS = 0.25
 LAN_MANUAL_PREVIEW_SCHEMA = "kestrel.lan.manual-preview.v1"
+LAN_OBSERVATION_CURSOR_SCHEMA = "kestrel.lan.observation-cursor.v1"
+LAN_OBSERVATION_CURSOR_HEADER = "kestrel-lan-observation-cursor"
 _MANUAL_IPV4_NETWORKS = tuple(
     ipaddress.IPv4Network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
@@ -428,9 +436,7 @@ def _normalize_event_timestamp(value: object) -> str:
     if _UTC_TIMESTAMP_RE.fullmatch(value) is None:
         raise ValueError("LAN event timestamp is invalid")
     try:
-        parsed = datetime.fromisoformat(
-            value[:-1] + "+00:00" if value.endswith("Z") else value
-        )
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
     except ValueError as exc:
         raise ValueError("LAN event timestamp is invalid") from exc
     if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
@@ -552,7 +558,7 @@ def _public_event(
         ):
             raise ValueError("LAN terminal event disagrees with scan")
     sequence_text = str(sequence)
-    public = {
+    public: dict[str, object] = {
         "scan_id": scan_id,
         "sequence": sequence_text,
         "event_type": event_type,
@@ -644,6 +650,175 @@ def _cursor_from_request(
     if cursor > _MAX_EVENT_SEQUENCE:
         raise _error(http_exception, 400, "lan_event_cursor_invalid")
     return cursor
+
+
+def _reject_observation_cursor_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate LAN observation cursor key")
+        value[key] = item
+    return value
+
+
+def _reject_observation_cursor_constant(value: str) -> object:
+    del value
+    raise ValueError("non-finite LAN observation cursor value")
+
+
+def _validated_observation_cursor_payload(
+    value: object,
+    *,
+    expected_scan_id: str,
+) -> LanScanObservationCursor:
+    keys = {
+        "after_endpoint_id",
+        "observation_total_count",
+        "scan_id",
+        "scan_revision",
+        "schema",
+        "terminal_receipt_digest",
+    }
+    if type(value) is not dict or set(value) != keys:
+        raise ValueError("LAN observation cursor shape is invalid")
+    payload = cast(dict[str, object], value)
+    scan_id = payload["scan_id"]
+    scan_revision = payload["scan_revision"]
+    terminal_receipt_digest = payload["terminal_receipt_digest"]
+    observation_total_count = payload["observation_total_count"]
+    after_endpoint_id = payload["after_endpoint_id"]
+    if (
+        payload["schema"] != LAN_OBSERVATION_CURSOR_SCHEMA
+        or type(scan_id) is not str
+        or _SCAN_ID_RE.fullmatch(scan_id) is None
+        or scan_id != expected_scan_id
+        or type(scan_revision) is not int
+        or not 1 <= scan_revision <= _MAX_EVENT_SEQUENCE
+        or (
+            terminal_receipt_digest is not None
+            and (
+                type(terminal_receipt_digest) is not str
+                or _DIGEST_RE.fullmatch(terminal_receipt_digest) is None
+            )
+        )
+        or type(observation_total_count) is not int
+        or not 1 <= observation_total_count <= _MAX_OBSERVATION_TOTAL
+        or type(after_endpoint_id) is not str
+        or _DIGEST_RE.fullmatch(after_endpoint_id) is None
+    ):
+        raise ValueError("LAN observation cursor value is invalid")
+    return LanScanObservationCursor(
+        scan_id=scan_id,
+        scan_revision=scan_revision,
+        terminal_receipt_digest=terminal_receipt_digest,
+        observation_total_count=observation_total_count,
+        after_endpoint_id=after_endpoint_id,
+    )
+
+
+def _observation_cursor_from_request(
+    request: Request,
+    *,
+    scan_id: str,
+    http_exception: type[Exception],
+) -> LanScanObservationCursor | None:
+    raw_values = [
+        value
+        for name, value in request.scope.get("headers", ())
+        if isinstance(name, bytes)
+        and name.decode("latin-1").lower() == LAN_OBSERVATION_CURSOR_HEADER
+    ]
+    if not raw_values:
+        return None
+    try:
+        if len(raw_values) != 1 or type(raw_values[0]) is not bytes:
+            raise ValueError("LAN observation cursor header is duplicated")
+        raw_value = raw_values[0]
+        if (
+            not raw_value
+            or len(raw_value) > _MAX_OBSERVATION_CURSOR_HEADER_BYTES
+            or re.fullmatch(rb"[A-Za-z0-9_-]+", raw_value) is None
+        ):
+            raise ValueError("LAN observation cursor encoding is invalid")
+        padding = b"=" * ((4 - len(raw_value) % 4) % 4)
+        decoded = base64.b64decode(
+            raw_value + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(decoded).rstrip(b"=") != raw_value:
+            raise ValueError("LAN observation cursor encoding is noncanonical")
+        parsed = json.loads(
+            decoded.decode("utf-8"),
+            object_pairs_hook=_reject_observation_cursor_duplicate_keys,
+            parse_constant=_reject_observation_cursor_constant,
+        )
+        cursor = _validated_observation_cursor_payload(
+            parsed,
+            expected_scan_id=scan_id,
+        )
+        canonical = json.dumps(
+            parsed,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+        if decoded != canonical:
+            raise ValueError("LAN observation cursor JSON is noncanonical")
+        return cursor
+    except (UnicodeDecodeError, UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise _error(http_exception, 400, "lan_observation_cursor_invalid") from exc
+
+
+def _encoded_observation_cursor(
+    cursor: object,
+    *,
+    scan: LanScanRecord,
+    observations: Sequence[LanObservationRecord],
+    total_count: int,
+) -> str:
+    if type(cursor) is not LanScanObservationCursor or not observations:
+        raise ValueError("LAN observation page cursor is invalid")
+    parsed = _validated_observation_cursor_payload(
+        {
+            "after_endpoint_id": cursor.after_endpoint_id,
+            "observation_total_count": cursor.observation_total_count,
+            "scan_id": cursor.scan_id,
+            "scan_revision": cursor.scan_revision,
+            "schema": LAN_OBSERVATION_CURSOR_SCHEMA,
+            "terminal_receipt_digest": cursor.terminal_receipt_digest,
+        },
+        expected_scan_id=scan.scan_id,
+    )
+    if (
+        parsed.scan_revision != scan.revision
+        or parsed.terminal_receipt_digest != scan.terminal_receipt_digest
+        or parsed.observation_total_count != total_count
+        or parsed.after_endpoint_id != observations[-1].endpoint_id
+    ):
+        raise ValueError("LAN observation page cursor disagrees with page")
+    payload = {
+        "after_endpoint_id": parsed.after_endpoint_id,
+        "observation_total_count": parsed.observation_total_count,
+        "scan_id": parsed.scan_id,
+        "scan_revision": parsed.scan_revision,
+        "schema": LAN_OBSERVATION_CURSOR_SCHEMA,
+        "terminal_receipt_digest": parsed.terminal_receipt_digest,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    rendered = base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
+    if len(rendered.encode("ascii")) > _MAX_OBSERVATION_CURSOR_HEADER_BYTES:
+        raise ValueError("LAN observation page cursor is too large")
+    return rendered
 
 
 async def _manager_call(function: Callable[..., Any], *args: object, **kwargs: object) -> Any:
@@ -836,26 +1011,77 @@ def register_lan_discovery_routes(
     async def scan_detail(scan_id: str, request: Request) -> dict[str, object]:
         identifier = _require_scan_id(scan_id, http_exception=http_exception)
         await require_get(request)
+        cursor = _observation_cursor_from_request(
+            request,
+            scan_id=identifier,
+            http_exception=http_exception,
+        )
         try:
+            page_options: dict[str, object] = {"limit": _MAX_OBSERVATIONS}
+            if cursor is not None:
+                page_options["cursor"] = cursor
             page = await _manager_call(
                 scan_manager.observation_page,
                 identifier,
-                limit=_MAX_OBSERVATIONS,
+                **page_options,
             )
             if page is None:
                 raise _error(http_exception, 404, "lan_scan_not_found")
-            observations = list(page.observations)[:_MAX_OBSERVATIONS]
+            all_observations = list(page.observations)
+            observations = all_observations[:_MAX_OBSERVATIONS]
             total = page.total_count
-            truncated = page.truncated
+            if (
+                type(total) is not int
+                or not 0 <= total <= _MAX_OBSERVATION_TOTAL
+                or total < len(all_observations)
+                or type(page.truncated) is not bool
+                or page.scan.scan_id != identifier
+            ):
+                raise ValueError("LAN observation page is invalid")
+            previous_endpoint = ""
+            for observation in observations:
+                if (
+                    type(observation) is not LanObservationRecord
+                    or observation.scan_id != identifier
+                    or _DIGEST_RE.fullmatch(observation.endpoint_id) is None
+                    or observation.endpoint_id <= previous_endpoint
+                ):
+                    raise ValueError("LAN observation page ordering is invalid")
+                previous_endpoint = observation.endpoint_id
+            if cursor is not None and (
+                page.scan.revision != cursor.scan_revision
+                or page.scan.terminal_receipt_digest != cursor.terminal_receipt_digest
+                or total != cursor.observation_total_count
+                or (observations and observations[0].endpoint_id <= cursor.after_endpoint_id)
+            ):
+                raise LanObservationCursorConflict("LAN observation snapshot changed")
+            next_cursor = page.next_cursor
+            if len(all_observations) > _MAX_OBSERVATIONS and next_cursor is None:
+                raise ValueError("LAN observation page oversupply lost its cursor")
+            encoded_next_cursor = (
+                None
+                if next_cursor is None
+                else _encoded_observation_cursor(
+                    next_cursor,
+                    scan=page.scan,
+                    observations=observations,
+                    total_count=total,
+                )
+            )
             payload = _scan_payload(page.scan)
             payload.update(
                 {
                     "observations": [_observation_payload(item) for item in observations],
                     "observation_total_count": total,
-                    "observations_truncated": bool(truncated or total > len(observations)),
+                    "observations_truncated": bool(page.truncated or total > len(observations)),
+                    "observation_next_cursor": encoded_next_cursor,
                 }
             )
             return payload
+        except LanObservationCursorInvalid as exc:
+            raise _error(http_exception, 400, "lan_observation_cursor_invalid") from exc
+        except LanObservationCursorConflict as exc:
+            raise _error(http_exception, 409, "lan_observation_cursor_conflict") from exc
         except Exception as exc:
             if isinstance(exc, http_exception):
                 raise

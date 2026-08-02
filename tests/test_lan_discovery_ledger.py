@@ -4204,6 +4204,271 @@ def test_route_observation_snapshot_is_deterministic_bounded_and_reports_exact_t
     )
 
 
+def test_route_observation_snapshot_pages_by_revision_bound_endpoint_key(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "7" * 32)
+    revision = scan.revision
+    for index in (3, 1, 2):
+        lan_ledger.append_observation(
+            scan.scan_id,
+            _observation(endpoint_id="sha256:" + f"{index:064x}"),
+            expected_revision=revision,
+        )
+        current = lan_ledger.get_scan(scan.scan_id)
+        assert current is not None
+        revision = current.revision
+
+    first = lan_ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=2,
+    )
+
+    assert first is not None
+    assert tuple(item.endpoint_id for item in first.observations) == (
+        "sha256:" + f"{1:064x}",
+        "sha256:" + f"{2:064x}",
+    )
+    assert first.total_count == 3
+    assert first.truncated is True
+    assert first.next_cursor is not None
+    assert first.next_cursor.scan_id == scan.scan_id
+    assert first.next_cursor.scan_revision == 4
+    assert first.next_cursor.terminal_receipt_digest is None
+    assert first.next_cursor.observation_total_count == 3
+    assert first.next_cursor.after_endpoint_id == "sha256:" + f"{2:064x}"
+
+    second = lan_ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=2,
+        cursor=first.next_cursor,
+    )
+
+    assert second is not None
+    assert tuple(item.endpoint_id for item in second.observations) == ("sha256:" + f"{3:064x}",)
+    assert second.scan.revision == 4
+    assert second.total_count == 3
+    assert second.truncated is True
+    assert second.next_cursor is None
+
+
+def test_route_observation_cursor_conflicts_when_scan_revision_changes(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "6" * 32)
+    first_observation = lan_ledger.append_observation(
+        scan.scan_id,
+        _observation(endpoint_id="sha256:" + f"{1:064x}"),
+        expected_revision=scan.revision,
+    )
+    current = lan_ledger.get_scan(scan.scan_id)
+    assert current is not None
+    lan_ledger.append_observation(
+        scan.scan_id,
+        _observation(endpoint_id="sha256:" + f"{2:064x}"),
+        expected_revision=current.revision,
+    )
+    first = lan_ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=1,
+    )
+    assert first is not None
+    assert first.next_cursor is not None
+    assert first.observations == (first_observation,)
+
+    current = lan_ledger.get_scan(scan.scan_id)
+    assert current is not None
+    lan_ledger.append_event(
+        scan.scan_id,
+        "snapshot_changed",
+        {},
+        expected_revision=current.revision,
+    )
+
+    with pytest.raises(lan_ledger_module.LanObservationCursorConflict):
+        lan_ledger.read_scan_observation_page(
+            scan.scan_id,
+            owner_principal="owner:test",
+            limit=1,
+            cursor=first.next_cursor,
+        )
+
+
+def test_route_observation_cursor_rejects_wrong_scan_and_missing_anchor(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "5" * 32)
+    revision = scan.revision
+    for index in (1, 2):
+        lan_ledger.append_observation(
+            scan.scan_id,
+            _observation(endpoint_id="sha256:" + f"{index:064x}"),
+            expected_revision=revision,
+        )
+        current = lan_ledger.get_scan(scan.scan_id)
+        assert current is not None
+        revision = current.revision
+    first = lan_ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=1,
+    )
+    assert first is not None
+    assert first.next_cursor is not None
+
+    for cursor in (
+        replace(first.next_cursor, scan_id="lan_" + "4" * 32),
+        replace(first.next_cursor, after_endpoint_id="sha256:" + "f" * 64),
+    ):
+        with pytest.raises(lan_ledger_module.LanObservationCursorInvalid):
+            lan_ledger.read_scan_observation_page(
+                scan.scan_id,
+                owner_principal="owner:test",
+                limit=1,
+                cursor=cursor,
+            )
+
+
+def test_route_observation_cursor_binds_terminal_receipt_and_exact_total(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "3" * 32)
+    revision = scan.revision
+    for index in (1, 2):
+        lan_ledger.append_observation(
+            scan.scan_id,
+            _observation(endpoint_id="sha256:" + f"{index:064x}"),
+            expected_revision=revision,
+        )
+        current = lan_ledger.get_scan(scan.scan_id)
+        assert current is not None
+        revision = current.revision
+    first = lan_ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=1,
+    )
+    assert first is not None
+    assert first.next_cursor is not None
+
+    for cursor in (
+        replace(
+            first.next_cursor,
+            terminal_receipt_digest="sha256:" + "a" * 64,
+        ),
+        replace(first.next_cursor, observation_total_count=3),
+    ):
+        with pytest.raises(lan_ledger_module.LanObservationCursorConflict):
+            lan_ledger.read_scan_observation_page(
+                scan.scan_id,
+                owner_principal="owner:test",
+                limit=1,
+                cursor=cursor,
+            )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("scan_id", " raw-scan "),
+        ("scan_revision", True),
+        ("scan_revision", 0),
+        ("scan_revision", 3.0),
+        ("terminal_receipt_digest", "sha256:not-a-digest"),
+        ("terminal_receipt_digest", 1),
+        ("observation_total_count", True),
+        ("observation_total_count", -1),
+        ("observation_total_count", 1_025),
+        ("after_endpoint_id", "sha256:not-a-digest"),
+    ),
+)
+def test_route_observation_cursor_rejects_non_exact_internal_fields(
+    lan_ledger: LanDiscoveryLedger,
+    field: str,
+    value: object,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "2" * 32)
+    revision = scan.revision
+    for index in (1, 2):
+        lan_ledger.append_observation(
+            scan.scan_id,
+            _observation(endpoint_id="sha256:" + f"{index:064x}"),
+            expected_revision=revision,
+        )
+        current = lan_ledger.get_scan(scan.scan_id)
+        assert current is not None
+        revision = current.revision
+    first = lan_ledger.read_scan_observation_page(
+        scan.scan_id,
+        owner_principal="owner:test",
+        limit=1,
+    )
+    assert first is not None
+    assert first.next_cursor is not None
+    malformed = replace(first.next_cursor, **{field: value})
+
+    with pytest.raises(lan_ledger_module.LanObservationCursorInvalid):
+        lan_ledger.read_scan_observation_page(
+            scan.scan_id,
+            owner_principal="owner:test",
+            limit=1,
+            cursor=malformed,
+        )
+
+
+def test_route_observation_cursor_rejects_lookalike_internal_type(
+    lan_ledger: LanDiscoveryLedger,
+) -> None:
+    scan = _create_scan(lan_ledger, scan_id="lan_" + "1" * 32)
+
+    with pytest.raises(lan_ledger_module.LanObservationCursorInvalid):
+        lan_ledger.read_scan_observation_page(
+            scan.scan_id,
+            owner_principal="owner:test",
+            limit=1,
+            cursor=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_route_observation_snapshot_rejects_count_above_fixed_scan_ceiling(
+    state: AgentStateStore,
+) -> None:
+    ledger = LanDiscoveryLedger(state)
+    scan = _create_scan(ledger, scan_id="lan_" + "0" * 32)
+    with state._connect() as connection:
+        connection.executemany(
+            """
+            INSERT INTO routing_lan_observations (
+                scan_id, endpoint_id, source, interface_id, address, port,
+                api_shape, tls_enabled, certificate_sha256, catalog_digest,
+                capability_digest, public_payload_json, freshness_timestamp,
+                error_category, created_at
+            ) VALUES (?, ?, 'active', ?, '192.168.10.1', 11434,
+                      NULL, 0, NULL, NULL, NULL, '{}', ?, NULL, ?)
+            """,
+            (
+                (
+                    scan.scan_id,
+                    "sha256:" + f"{index:064x}",
+                    INTERFACE_ID,
+                    "2026-08-01T12:00:00Z",
+                    "2026-08-01T12:00:00+00:00",
+                )
+                for index in range(1_025)
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="observation_page_count_invalid"):
+        ledger.read_scan_observation_page(
+            scan.scan_id,
+            owner_principal="owner:test",
+            limit=200,
+        )
+
+
 @pytest.mark.parametrize("limit", [True, False, 0, -1, 201, 1.0, "2"])
 def test_route_observation_snapshot_rejects_non_exact_or_unbounded_limits(
     lan_ledger: LanDiscoveryLedger,
@@ -4431,6 +4696,15 @@ def test_route_observation_snapshot_hides_foreign_owner_record_and_rows(
             scan.scan_id,
             owner_principal="owner:local-runtime:v1",
             limit=200,
+        )
+        is None
+    )
+    assert (
+        lan_ledger.read_scan_observation_page(
+            scan.scan_id,
+            owner_principal="owner:local-runtime:v1",
+            limit=200,
+            cursor=object(),  # type: ignore[arg-type]
         )
         is None
     )

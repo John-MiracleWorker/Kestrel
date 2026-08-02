@@ -249,11 +249,19 @@ export type LanObservation =
         error_category: string | null;
       }>);
 
+export type LanObservationCursor = string;
+
+export type LanScanPageOptions = Readonly<{
+  signal?: AbortSignal;
+  cursor?: LanObservationCursor;
+}>;
+
 export type LanScanDetail = LanScan &
   Readonly<{
     observations: LanObservation[];
     observation_total_count: number;
     observations_truncated: boolean;
+    observation_next_cursor: LanObservationCursor | null;
   }>;
 
 export type LanScanProgressPayload = Readonly<{

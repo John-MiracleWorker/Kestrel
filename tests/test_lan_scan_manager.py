@@ -3115,6 +3115,17 @@ def test_observation_page_is_fixed_owner_deterministic_and_bounded(
             "sha256:" + f"{1:064x}",
             "sha256:" + f"{2:064x}",
         )
+        assert page.next_cursor is not None
+        continuation = manager.observation_page(
+            owned.scan_id,
+            limit=2,
+            cursor=page.next_cursor,
+        )
+        assert continuation is not None
+        assert tuple(item.endpoint_id for item in continuation.observations) == (
+            "sha256:" + f"{3:064x}",
+        )
+        assert continuation.next_cursor is None
         assert manager.observation_page(foreign.scan_id, limit=2) is None
     finally:
         assert manager.shutdown(timeout_seconds=1.0) is True
