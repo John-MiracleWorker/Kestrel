@@ -178,6 +178,7 @@ class DurableRoutingCoordinator:
             service,
             base_config=base_config,
             assignment=static_assignment,
+            direct_target_pinned=effective_direct_target_id is not None,
         )
         decision_id = stable_decision_id(
             run_id=task.run_id,
@@ -269,6 +270,7 @@ class DurableRoutingCoordinator:
         *,
         base_config: AgentConfig,
         assignment: RoutingAssignment,
+        direct_target_pinned: bool = False,
     ) -> tuple[RoutingAssignment, RoutingShadowDraft]:
         contract = assignment.contract
         static_decision = assignment.decision
@@ -313,6 +315,11 @@ class DurableRoutingCoordinator:
             activation_reason = "replay_gate_not_enabled"
         elif learned_target_id == static_target_id:
             activation_reason = "learned_matches_static"
+        elif direct_target_pinned:
+            # An explicit direct-target pin (operator override or leased
+            # qualification matrix target) is authoritative: the learned
+            # layer may never substitute a different target for it.
+            activation_reason = "direct_target_pinned"
         elif evaluation.should_activate and learned_target_id in eligible_target_ids:
             activate = True
 
