@@ -37,8 +37,10 @@ from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
 from .routine_loop import RoutineLoop
 from .routines import RoutineService
+from .routing.activation_service import ActivationService
 from .routing.lan_ledger import LanDiscoveryLedger
 from .routing.qualification_ledger import QualificationLedger
+from .routing.qualification_preview import QualificationPreviewService, TargetInventory
 from .routing.qualification_runner import QualificationRunner
 from .routing.runtime import build_run_manager
 from .run_manager import RunCapacityError
@@ -195,6 +197,7 @@ def _create_app(
         )
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_engineering_routes import register_engineering_routes
+        from .server_flock_routes import FLOCK_OWNER_PRINCIPAL, register_flock_routes
         from .server_lan_discovery_routes import register_lan_discovery_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_mission_routes import (
@@ -322,10 +325,12 @@ def _create_app(
     runs.register_lifecycle_dependency("lan_scans", lan_scan_manager)
     # Durable Flock qualification run manager (Adaptive Flock Task 9). It is
     # constructed recovery-only here (no executor); sidecar startup reconciles
-    # non-terminal runs without ever dispatching provider work.
+    # non-terminal runs without ever dispatching provider work. The ledger is
+    # shared with the owner-facing Flock route adapters (Task 17).
+    qualification_ledger = QualificationLedger(state)
     qualification_runner = QualificationRunner(
         state,
-        QualificationLedger(state),
+        qualification_ledger,
         server_max_concurrency=active_config.max_concurrent_runs,
     )
     runs.register_lifecycle_dependency("qualification_runner", qualification_runner)
@@ -839,6 +844,24 @@ def _create_app(
             else None
         ),
         lan_owner_principal=(LAN_MUTATION_OWNER_PRINCIPAL if lan_mutations_registered else None),
+    )
+    register_flock_routes(
+        app,
+        qualification_runner=qualification_runner,
+        activation_service=ActivationService(qualification_ledger),
+        preview_service=QualificationPreviewService(
+            inventory=lambda: TargetInventory(
+                profiles=tuple(
+                    entry.profile for entry in routing_ledger.list_provider_profiles()
+                ),
+                targets=tuple(entry.target for entry in routing_ledger.list_model_targets()),
+            )
+        ),
+        ledger=qualification_ledger,
+        http_exception=HTTPException,
+        streaming_response=StreamingResponse,
+        owner_principal=FLOCK_OWNER_PRINCIPAL,
+        owner_authorized=lambda: lan_mutations_registered,
     )
     if lan_mutations_registered:
         register_lan_discovery_routes(

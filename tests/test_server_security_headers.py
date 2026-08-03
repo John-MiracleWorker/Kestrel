@@ -313,3 +313,99 @@ def test_security_headers_cover_lan_fixed_errors_and_terminal_sse(
         sse,
     ):
         _assert_security_headers(response)
+
+
+def _flock_scope_payload() -> dict:
+    return {
+        "project_id": "project-alpha",
+        "task_family": "repository_inspection",
+        "risk": "low",
+        "capability_key": "repository_inspection",
+        "policy_id": "balanced",
+        "policy_revision": 1,
+        "target_ids": ["target_a", "target_b"],
+        "target_inventory_digest": "1" * 64,
+        "price_digest": "2" * 64,
+        "learned_config_digest": "3" * 64,
+        "project_authority_digest": "4" * 64,
+    }
+
+
+def _flock_create_body() -> dict:
+    return {
+        "scope": _flock_scope_payload(),
+        "corpus": [
+            {
+                "item_id": "corpus_item_1",
+                "task_family": "repository_inspection",
+                "risk": "low",
+                "capabilities": ["repository_inspection"],
+                "task_contract_digest": "a" * 64,
+                "acceptance_plan_digest": "b" * 64,
+                "evidence_kind": "real_project",
+            }
+        ],
+        "target_snapshot": {"targets": ["target_a", "target_b"]},
+        "price_snapshot": {"source": "operator_verified"},
+        "policy_payload": {"policy_id": "balanced", "revision": 1},
+        "learned_payload": {"state": "disabled"},
+        "project_authority": {"principal": "owner:local-runtime:v1"},
+        "build": {"version": "0.5.0", "git": "bd2c182"},
+        "maximum_spend_usd": "50.00",
+        "attempt_ceiling_usd": "5.00",
+    }
+
+
+def test_security_headers_cover_flock_routes_and_terminal_sse(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    token = "flock-security-header-token"
+    monkeypatch.setenv("KESTREL_SECURITY_HEADER_TEST_TOKEN", token)
+    headers = {"X-Kestrel-API-Key": token}
+    with TestClient(create_app(_isolated_config(tmp_path))) as client:
+        unauthorized = client.get("/api/flock/qualifications")
+        listed = client.get("/api/flock/qualifications", headers=headers)
+        created = client.post(
+            "/api/flock/qualifications",
+            headers=headers,
+            json=_flock_create_body(),
+        )
+        assert created.status_code == 201, created.text
+        run_id = created.json()["run_id"]
+        cancelled = client.post(
+            f"/api/flock/qualifications/{run_id}/cancel",
+            headers=headers,
+            json={"expected_revision": created.json()["revision"]},
+        )
+        fixed_error = client.get(
+            "/api/flock/qualifications/qual_missing/events",
+            headers=headers,
+        )
+        sse = _bounded_asgi_get(
+            client.app,
+            f"/api/flock/qualifications/{run_id}/events",
+            headers=((b"x-kestrel-api-key", token.encode("ascii")),),
+        )
+
+    assert unauthorized.status_code == 401
+    assert listed.status_code == 200
+    assert listed.headers["content-type"].startswith("application/json")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert fixed_error.status_code == 404
+    assert fixed_error.json() == {"detail": {"code": "flock_qualification_not_found"}}
+    assert sse.status_code == 200
+    assert sse.headers["content-type"].startswith("text/event-stream")
+    assert sse.headers["cache-control"] == "no-store, no-transform"
+    assert sse.headers["x-accel-buffering"] == "no"
+    assert "event: run_cancelled\n" in sse.text
+    for response in (
+        unauthorized,
+        listed,
+        created,
+        cancelled,
+        fixed_error,
+        sse,
+    ):
+        _assert_security_headers(response)
