@@ -13,7 +13,7 @@ from __future__ import annotations
 import hmac
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -440,6 +440,15 @@ class QualificationLedger:
                 (receipt_id,),
             ).fetchone()
         return receipt_from_row(row)
+
+    def get_receipt(self, receipt_id: str) -> QualificationReceipt | None:
+        _require_text(receipt_id, "receipt_id")
+        with self.state._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routing_qualification_receipts WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        return None if row is None else receipt_from_row(row)
 
     def list_receipts(self, run_id: str) -> list[QualificationReceipt]:
         with self.state._connect() as conn:
@@ -988,22 +997,174 @@ class QualificationLedger:
         now = utc_now()
         with self.state._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            run_row = self._fetch_run(conn, draft.run_id)
-            if run_row is None:
-                raise ValueError(f"unknown qualification run: {draft.run_id}")
-            if str(run_row["status"]) != "completed":
-                raise ValueError(
-                    "activation grant requires a completed qualification run"
-                )
-            receipt_row = conn.execute(
-                "SELECT run_id FROM routing_qualification_receipts WHERE receipt_id = ?",
-                (draft.qualification_receipt_id,),
+            self._insert_grant_row(conn, draft, now)
+            row = conn.execute(
+                "SELECT * FROM routing_activation_grants WHERE grant_id = ?",
+                (draft.grant_id,),
             ).fetchone()
-            if receipt_row is None or str(receipt_row["run_id"]) != draft.run_id:
-                raise ValueError(
-                    "qualification receipt does not belong to the qualification run"
+        return grant_from_row(row)
+
+    def get_grant(self, grant_id: str) -> ActivationGrant | None:
+        with self.state._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routing_activation_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+        return None if row is None else grant_from_row(row)
+
+    def list_grants(
+        self,
+        *,
+        run_id: str | None = None,
+        receipt_id: str | None = None,
+        scope_digest: str | None = None,
+        target_id: str | None = None,
+    ) -> list[ActivationGrant]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if receipt_id is not None:
+            clauses.append("qualification_receipt_id = ?")
+            params.append(receipt_id)
+        if scope_digest is not None:
+            clauses.append("scope_digest = ?")
+            params.append(scope_digest)
+        if target_id is not None:
+            clauses.append("target_id = ?")
+            params.append(target_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.state._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM routing_activation_grants"
+                f"{where} ORDER BY created_at, grant_id",
+                params,
+            ).fetchall()
+        return [grant_from_row(row) for row in rows]
+
+    def activate_grants(
+        self,
+        drafts: Sequence[ActivationGrantDraft],
+        *,
+        reason: str,
+    ) -> tuple[
+        tuple[ActivationGrant, ActivationTransition, tuple[ActivationTransition, ...]],
+        ...,
+    ]:
+        """Transactionally create grants with their activation events (Task 13).
+
+        One ``BEGIN IMMEDIATE`` transaction inserts each immutable base grant
+        and its ``activated`` transition (the append-only activation event)
+        and supersedes every older exact-scope grant -- same scope digest,
+        target, and policy -- whose latest transition is not ``revoked`` by
+        appending a ``revoked`` transition carrying a
+        ``superseded_by_grant:<grant_id>`` reason.  Any failure rolls back
+        the whole batch: activation is all-or-nothing.
+        """
+
+        batch = tuple(drafts)
+        if not batch:
+            raise ValueError("at least one activation grant draft is required")
+        _require_text(reason, "reason")
+        now = utc_now()
+        results: list[
+            tuple[ActivationGrant, ActivationTransition, tuple[ActivationTransition, ...]]
+        ] = []
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            batch_ids = frozenset(draft.grant_id for draft in batch)
+            for draft in batch:
+                self._insert_grant_row(conn, draft, now)
+                activated = self._insert_transition_row(
+                    conn,
+                    draft.grant_id,
+                    "activated",
+                    reason,
+                    receipt_id=draft.qualification_receipt_id,
+                    now=now,
                 )
-            scope = self._run_scope_payload(run_row)
+                grant_row = conn.execute(
+                    "SELECT * FROM routing_activation_grants WHERE grant_id = ?",
+                    (draft.grant_id,),
+                ).fetchone()
+                grant = grant_from_row(grant_row)
+                superseded: list[ActivationTransition] = []
+                for prior_id in self._supersedable_grant_ids(conn, grant, batch_ids):
+                    superseded.append(
+                        self._insert_transition_row(
+                            conn,
+                            prior_id,
+                            "revoked",
+                            f"superseded_by_grant:{draft.grant_id}",
+                            receipt_id=draft.qualification_receipt_id,
+                            now=now,
+                        )
+                    )
+                results.append((grant, activated, tuple(superseded)))
+        return tuple(results)
+
+    def append_transition(
+        self,
+        grant_id: str,
+        transition_type: str,
+        reason: str,
+        *,
+        receipt_id: str | None = None,
+    ) -> ActivationTransition:
+        if transition_type not in GRANT_TRANSITION_TYPES:
+            raise ValueError(
+                f"transition_type must be one of {', '.join(GRANT_TRANSITION_TYPES)}"
+            )
+        _require_text(reason, "reason")
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return self._insert_transition_row(
+                conn,
+                grant_id,
+                transition_type,
+                reason,
+                receipt_id=receipt_id,
+                now=now,
+            )
+
+    def list_transitions(self, grant_id: str) -> list[ActivationTransition]:
+        with self.state._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM routing_activation_transitions
+                WHERE grant_id = ? ORDER BY sequence
+                """,
+                (grant_id,),
+            ).fetchall()
+        return [transition_from_row(row) for row in rows]
+
+    # -- internals ----------------------------------------------------------------
+
+    def _insert_grant_row(
+        self,
+        conn: sqlite3.Connection,
+        draft: ActivationGrantDraft,
+        now: str,
+    ) -> None:
+        run_row = self._fetch_run(conn, draft.run_id)
+        if run_row is None:
+            raise ValueError(f"unknown qualification run: {draft.run_id}")
+        if str(run_row["status"]) != "completed":
+            raise ValueError(
+                "activation grant requires a completed qualification run"
+            )
+        receipt_row = conn.execute(
+            "SELECT run_id FROM routing_qualification_receipts WHERE receipt_id = ?",
+            (draft.qualification_receipt_id,),
+        ).fetchone()
+        if receipt_row is None or str(receipt_row["run_id"]) != draft.run_id:
+            raise ValueError(
+                "qualification receipt does not belong to the qualification run"
+            )
+        scope = self._run_scope_payload(run_row)
+        try:
             conn.execute(
                 """
                 INSERT INTO routing_activation_grants (
@@ -1025,99 +1186,103 @@ class QualificationLedger:
                     now,
                 ),
             )
-            row = conn.execute(
-                "SELECT * FROM routing_activation_grants WHERE grant_id = ?",
-                (draft.grant_id,),
-            ).fetchone()
-        return grant_from_row(row)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"activation grant conflict: {draft.grant_id}"
+            ) from exc
 
-    def get_grant(self, grant_id: str) -> ActivationGrant | None:
-        with self.state._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM routing_activation_grants WHERE grant_id = ?",
-                (grant_id,),
-            ).fetchone()
-        return None if row is None else grant_from_row(row)
-
-    def append_transition(
+    def _insert_transition_row(
         self,
+        conn: sqlite3.Connection,
         grant_id: str,
         transition_type: str,
         reason: str,
         *,
-        receipt_id: str | None = None,
+        receipt_id: str | None,
+        now: str,
     ) -> ActivationTransition:
-        if transition_type not in GRANT_TRANSITION_TYPES:
-            raise ValueError(
-                f"transition_type must be one of {', '.join(GRANT_TRANSITION_TYPES)}"
-            )
-        _require_text(reason, "reason")
-        now = utc_now()
-        with self.state._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            grant_row = conn.execute(
-                "SELECT grant_id FROM routing_activation_grants WHERE grant_id = ?",
-                (grant_id,),
-            ).fetchone()
-            if grant_row is None:
-                raise ValueError(f"unknown activation grant: {grant_id}")
-            last = conn.execute(
-                """
-                SELECT transition_type, sequence FROM routing_activation_transitions
-                WHERE grant_id = ? ORDER BY sequence DESC LIMIT 1
-                """,
-                (grant_id,),
-            ).fetchone()
-            last_type = None if last is None else str(last["transition_type"])
-            if last_type == "revoked":
-                raise ValueError(f"activation grant {grant_id} is revoked")
-            if transition_type not in _NEXT_GRANT_TRANSITIONS[last_type]:
-                if last_type is None:
-                    raise ValueError(
-                        f"first transition must be 'activated', got "
-                        f"'{transition_type}'"
-                    )
+        grant_row = conn.execute(
+            "SELECT grant_id FROM routing_activation_grants WHERE grant_id = ?",
+            (grant_id,),
+        ).fetchone()
+        if grant_row is None:
+            raise ValueError(f"unknown activation grant: {grant_id}")
+        last = conn.execute(
+            """
+            SELECT transition_type, sequence FROM routing_activation_transitions
+            WHERE grant_id = ? ORDER BY sequence DESC LIMIT 1
+            """,
+            (grant_id,),
+        ).fetchone()
+        last_type = None if last is None else str(last["transition_type"])
+        if last_type == "revoked":
+            raise ValueError(f"activation grant {grant_id} is revoked")
+        if transition_type not in _NEXT_GRANT_TRANSITIONS[last_type]:
+            if last_type is None:
                 raise ValueError(
-                    f"transition '{transition_type}' is not allowed after "
-                    f"'{last_type}'"
+                    f"first transition must be 'activated', got "
+                    f"'{transition_type}'"
                 )
-            sequence = 1 if last is None else int(last["sequence"]) + 1
-            transition_id = f"{grant_id}:{sequence}"
-            conn.execute(
-                """
-                INSERT INTO routing_activation_transitions (
-                    transition_id, grant_id, sequence, transition_type,
-                    reason, receipt_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    transition_id,
-                    grant_id,
-                    sequence,
-                    transition_type,
-                    reason,
-                    receipt_id,
-                    now,
-                ),
+            raise ValueError(
+                f"transition '{transition_type}' is not allowed after "
+                f"'{last_type}'"
             )
-            row = conn.execute(
-                "SELECT * FROM routing_activation_transitions WHERE transition_id = ?",
-                (transition_id,),
-            ).fetchone()
+        sequence = 1 if last is None else int(last["sequence"]) + 1
+        transition_id = f"{grant_id}:{sequence}"
+        conn.execute(
+            """
+            INSERT INTO routing_activation_transitions (
+                transition_id, grant_id, sequence, transition_type,
+                reason, receipt_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transition_id,
+                grant_id,
+                sequence,
+                transition_type,
+                reason,
+                receipt_id,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM routing_activation_transitions WHERE transition_id = ?",
+            (transition_id,),
+        ).fetchone()
         return transition_from_row(row)
 
-    def list_transitions(self, grant_id: str) -> list[ActivationTransition]:
-        with self.state._connect() as conn:
-            rows = conn.execute(
+    def _supersedable_grant_ids(
+        self,
+        conn: sqlite3.Connection,
+        grant: ActivationGrant,
+        batch_ids: frozenset[str],
+    ) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT grant_id FROM routing_activation_grants
+            WHERE scope_digest = ? AND target_id = ?
+              AND policy_id = ? AND policy_revision = ?
+            ORDER BY created_at, grant_id
+            """,
+            (grant.scope_digest, grant.target_id, grant.policy_id, grant.policy_revision),
+        ).fetchall()
+        supersedable: list[str] = []
+        for row in rows:
+            prior_id = str(row["grant_id"])
+            if prior_id in batch_ids:
+                continue
+            last = conn.execute(
                 """
-                SELECT * FROM routing_activation_transitions
-                WHERE grant_id = ? ORDER BY sequence
+                SELECT transition_type FROM routing_activation_transitions
+                WHERE grant_id = ? ORDER BY sequence DESC LIMIT 1
                 """,
-                (grant_id,),
-            ).fetchall()
-        return [transition_from_row(row) for row in rows]
-
-    # -- internals ----------------------------------------------------------------
+                (prior_id,),
+            ).fetchone()
+            if last is None or str(last["transition_type"]) == "revoked":
+                continue
+            supersedable.append(prior_id)
+        return supersedable
 
     def _fetch_run(self, conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
         row: sqlite3.Row | None = conn.execute(
