@@ -65,6 +65,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 nested_memvid_agent = [
   "prompts/*.md",
+  "qualification_fixtures/v1/*.json",
   "web_dist/index.html",
   "web_dist/assets/*",
   "web_dist/THIRD_PARTY_NOTICES.txt",

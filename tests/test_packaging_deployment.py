@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from importlib import resources
 from pathlib import Path
 
 from nested_memvid_agent.config import AgentConfig
@@ -202,6 +203,28 @@ def test_package_includes_runtime_prompt_data() -> None:
     assert "web/public/THIRD_PARTY_NOTICES.txt" in pyproject["project"]["license-files"]
     assert any(str(dep).startswith("bandit>=") for dep in dev_deps)
     assert "build==1.5.0" in dev_deps
+
+
+def test_package_includes_qualification_fixture_data() -> None:
+    """Adaptive Flock Task 4: frozen builds ship the same fixture bytes."""
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+    assert "qualification_fixtures/v1/*.json" in package_data["nested_memvid_agent"]
+    assert (
+        "recursive-include src/nested_memvid_agent/qualification_fixtures *.json"
+        in manifest
+    )
+
+    shipped = resources.files("nested_memvid_agent") / "qualification_fixtures" / "v1"
+    names = {entry.name for entry in shipped.iterdir()}
+    assert {
+        "manifest.json",
+        "routing_guardrails.json",
+        "cost_accounting.json",
+        "abstention.json",
+    } <= names
 
 
 def test_sdist_manifest_excludes_partial_tests_and_local_evidence() -> None:

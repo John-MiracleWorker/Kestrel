@@ -3,5 +3,6 @@
 prune tests
 prune benchmark_results
 prune tiuni-fun
+recursive-include src/nested_memvid_agent/qualification_fixtures *.json
 exclude .env*
 global-exclude __pycache__ *.py[cod] .DS_Store
