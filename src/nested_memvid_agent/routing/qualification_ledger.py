@@ -59,7 +59,15 @@ from .qualification_serialization import (
     transition_from_row,
 )
 
-__all__ = ["QualificationLedger"]
+__all__ = ["BUDGET_SETTLEMENT_OUTCOMES", "QualificationLedger"]
+
+BUDGET_SETTLEMENT_OUTCOMES: tuple[str, ...] = (
+    "completed",
+    "overrun",
+    "missing_usage",
+    "transport_confirmed_zero",
+    "ambiguous",
+)
 
 _RUN_COLUMNS = """
     run_id, status, revision, owner_principal,
@@ -508,61 +516,218 @@ class QualificationLedger:
         now = utc_now()
         with self.state._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            case_row = self._fetch_case(conn, draft.case_id)
-            if case_row is None:
-                raise ValueError(f"unknown qualification case: {draft.case_id}")
-            run_row = self._live_run_row(conn, str(case_row["run_id"]))
-            scope = self._run_scope_payload(run_row)
-            if draft.target_id not in tuple(scope["target_ids"]):
-                raise ValueError(
-                    "attempt target is outside the qualification run scope"
-                )
-            if draft.reservation.micros > int(run_row["attempt_ceiling_micros"]):
-                raise ValueError(
-                    "attempt reservation exceeds the per-attempt ceiling"
-                )
+            case_row, _ = self._attempt_draft_context(conn, draft)
+            self._insert_attempt_row(conn, draft, case_row, status="pending", now=now)
+            row = self._fetch_attempt(conn, draft.attempt_id)
+        assert row is not None
+        return attempt_from_row(row)
+
+    # -- transactional hard-cap admission (Adaptive Flock Task 7) ----------------
+
+    def admit_attempt_with_budget(
+        self, draft: QualificationAttemptDraft
+    ) -> QualificationAttempt:
+        """Create and reserve an attempt atomically under the hard-cap condition.
+
+        The budget check, the attempt row insert (already ``reserved``), and
+        the run inflight-reserve increment happen in one SQLite transaction,
+        so a rejected admission leaves no attempt row and no reserve.
+        """
+
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            case_row, run_row = self._attempt_draft_context(conn, draft)
+            self._assert_budget_admission(run_row, draft.reservation)
+            self._insert_attempt_row(conn, draft, case_row, status="reserved", now=now)
             conn.execute(
                 """
-                INSERT INTO routing_qualification_attempts (
-                    attempt_id, case_id, run_id, attempt_number, status, revision,
-                    target_id, target_digest, routing_decision_id, routing_lease_id,
-                    provider_receipts_json, usage_json, reservation_micros,
-                    actual_cost_micros, unresolved_cost_micros, validation_passed,
-                    validation_codes_json, failure_category, guardrail_state,
-                    evidence_refs_json, created_at, updated_at, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?, ?)
+                UPDATE routing_qualification_runs
+                SET inflight_reserve_micros = inflight_reserve_micros + ?,
+                    updated_at = ?
+                WHERE run_id = ?
                 """,
-                (
-                    draft.attempt_id,
-                    draft.case_id,
-                    str(case_row["run_id"]),
-                    draft.attempt_number,
-                    "pending",
-                    1,
-                    draft.target_id,
-                    draft.target_digest,
-                    draft.routing_decision_id,
-                    draft.routing_lease_id,
-                    "[]",
-                    None,
-                    draft.reservation.micros,
-                    None,
-                    0,
-                    None,
-                    "[]",
-                    None,
-                    "clear",
-                    "[]",
-                    now,
-                    now,
-                    None,
-                    None,
-                ),
+                (draft.reservation.micros, now, str(case_row["run_id"])),
             )
             row = self._fetch_attempt(conn, draft.attempt_id)
         assert row is not None
         return attempt_from_row(row)
+
+    def settle_attempt_with_budget(
+        self,
+        attempt_id: str,
+        *,
+        outcome: str,
+        usage: Mapping[str, Any] | None = None,
+        actual_cost: MoneyMicros | None = None,
+        validation_passed: bool = False,
+        validation_codes: tuple[str, ...] = (),
+        evidence_refs: tuple[str, ...] = (),
+        guardrail_violated: bool = False,
+    ) -> QualificationAttempt:
+        """Terminalize an attempt and reconcile run budget columns atomically.
+
+        Outcomes (see :data:`BUDGET_SETTLEMENT_OUTCOMES`):
+
+        - ``completed``: replace the reserve with the exact known actual.
+        - ``overrun``: charge the actual, record ``budget_projection_overrun``,
+          and stop admissions by pinning the effective stop cap to zero.
+        - ``missing_usage``/``ambiguous``: move the full reserve to unresolved.
+        - ``transport_confirmed_zero``: release the reserve with known zero
+          cost (the provider adapter proved no request was accepted).
+        """
+
+        if outcome not in BUDGET_SETTLEMENT_OUTCOMES:
+            raise ValueError(f"unsupported budget settlement outcome: {outcome}")
+        if usage is not None and not isinstance(usage, Mapping):
+            raise ValueError("usage must be a mapping")
+        if actual_cost is not None and not isinstance(actual_cost, MoneyMicros):
+            raise ValueError("actual_cost must be a MoneyMicros value")
+        if not isinstance(validation_passed, bool):
+            raise ValueError("validation_passed must be a boolean")
+        codes = bounded_validation_codes(validation_codes)
+        refs = bounded_evidence_refs(evidence_refs)
+        guardrail_state = "violated" if guardrail_violated else "clear"
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            allowed = (
+                ("running",)
+                if outcome in ("completed", "overrun")
+                else ("reserved", "running")
+            )
+            row = self._attempt_row_for_transition(conn, attempt_id, allowed, "settle")
+            run_row = self._live_run_row(conn, str(row["run_id"]))
+            run_id = str(row["run_id"])
+            reserve = int(row["reservation_micros"])
+            if outcome in ("completed", "overrun"):
+                if actual_cost is None:
+                    raise ValueError("completed settlement requires an actual cost")
+                conn.execute(
+                    """
+                    UPDATE routing_qualification_attempts
+                    SET status = 'completed', revision = revision + 1,
+                        updated_at = ?, finished_at = ?, usage_json = ?,
+                        actual_cost_micros = ?, unresolved_cost_micros = 0,
+                        validation_passed = ?, validation_codes_json = ?,
+                        guardrail_state = ?, evidence_refs_json = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        now,
+                        now,
+                        canonical_json(usage if usage is not None else {}),
+                        actual_cost.micros,
+                        1 if validation_passed else 0,
+                        canonical_json(list(codes)),
+                        guardrail_state,
+                        canonical_json(list(refs)),
+                        attempt_id,
+                    ),
+                )
+                if outcome == "overrun":
+                    self._insert_event_row(
+                        conn,
+                        run_id,
+                        "budget_projection_overrun",
+                        {
+                            "attempt_id": attempt_id,
+                            "reserve_micros": reserve,
+                            "actual_micros": actual_cost.micros,
+                            "scope_digest": str(run_row["scope_digest"]),
+                        },
+                        now,
+                    )
+                    conn.execute(
+                        """
+                        UPDATE routing_qualification_runs
+                        SET actual_spend_micros = actual_spend_micros + ?,
+                            inflight_reserve_micros = inflight_reserve_micros - ?,
+                            effective_stop_cap_micros = 0,
+                            revision = revision + 1, updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (actual_cost.micros, reserve, now, run_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE routing_qualification_runs
+                        SET actual_spend_micros = actual_spend_micros + ?,
+                            inflight_reserve_micros = inflight_reserve_micros - ?,
+                            updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (actual_cost.micros, reserve, now, run_id),
+                    )
+            elif outcome == "transport_confirmed_zero":
+                conn.execute(
+                    """
+                    UPDATE routing_qualification_attempts
+                    SET status = 'failed', revision = revision + 1,
+                        updated_at = ?, finished_at = ?, usage_json = ?,
+                        actual_cost_micros = 0, unresolved_cost_micros = 0,
+                        failure_category = ?, guardrail_state = ?,
+                        evidence_refs_json = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        now,
+                        now,
+                        canonical_json({"input_tokens": 0, "output_tokens": 0}),
+                        "transport_failed_no_request_accepted",
+                        guardrail_state,
+                        canonical_json(list(refs)),
+                        attempt_id,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE routing_qualification_runs
+                    SET inflight_reserve_micros = inflight_reserve_micros - ?,
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (reserve, now, run_id),
+                )
+            else:
+                reason = (
+                    "usage_unreported"
+                    if outcome == "missing_usage"
+                    else "transport_outcome_ambiguous"
+                )
+                conn.execute(
+                    """
+                    UPDATE routing_qualification_attempts
+                    SET status = 'ambiguous', revision = revision + 1,
+                        updated_at = ?, finished_at = ?,
+                        unresolved_cost_micros = ?, failure_category = ?,
+                        guardrail_state = ?, evidence_refs_json = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        now,
+                        now,
+                        reserve,
+                        reason,
+                        guardrail_state,
+                        canonical_json(list(refs)),
+                        attempt_id,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE routing_qualification_runs
+                    SET inflight_reserve_micros = inflight_reserve_micros - ?,
+                        unresolved_reserve_micros = unresolved_reserve_micros + ?,
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (reserve, reserve, now, run_id),
+                )
+            updated = self._fetch_attempt(conn, attempt_id)
+        assert updated is not None
+        return attempt_from_row(updated)
 
     def get_attempt(self, attempt_id: str) -> QualificationAttempt | None:
         with self.state._connect() as conn:
@@ -838,6 +1003,102 @@ class QualificationLedger:
             (attempt_id,),
         ).fetchone()
         return row
+
+    def _attempt_draft_context(
+        self, conn: sqlite3.Connection, draft: QualificationAttemptDraft
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        case_row = self._fetch_case(conn, draft.case_id)
+        if case_row is None:
+            raise ValueError(f"unknown qualification case: {draft.case_id}")
+        run_row = self._live_run_row(conn, str(case_row["run_id"]))
+        scope = self._run_scope_payload(run_row)
+        if draft.target_id not in tuple(scope["target_ids"]):
+            raise ValueError(
+                "attempt target is outside the qualification run scope"
+            )
+        if draft.reservation.micros > int(run_row["attempt_ceiling_micros"]):
+            raise ValueError(
+                "attempt reservation exceeds the per-attempt ceiling"
+            )
+        return case_row, run_row
+
+    def _insert_attempt_row(
+        self,
+        conn: sqlite3.Connection,
+        draft: QualificationAttemptDraft,
+        case_row: sqlite3.Row,
+        *,
+        status: str,
+        now: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO routing_qualification_attempts (
+                attempt_id, case_id, run_id, attempt_number, status, revision,
+                target_id, target_digest, routing_decision_id, routing_lease_id,
+                provider_receipts_json, usage_json, reservation_micros,
+                actual_cost_micros, unresolved_cost_micros, validation_passed,
+                validation_codes_json, failure_category, guardrail_state,
+                evidence_refs_json, created_at, updated_at, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?)
+            """,
+            (
+                draft.attempt_id,
+                draft.case_id,
+                str(case_row["run_id"]),
+                draft.attempt_number,
+                status,
+                1,
+                draft.target_id,
+                draft.target_digest,
+                draft.routing_decision_id,
+                draft.routing_lease_id,
+                "[]",
+                None,
+                draft.reservation.micros,
+                None,
+                0,
+                None,
+                "[]",
+                None,
+                "clear",
+                "[]",
+                now,
+                now,
+                None,
+                None,
+            ),
+        )
+
+    def _assert_budget_admission(
+        self, run_row: sqlite3.Row, reservation: MoneyMicros
+    ) -> None:
+        """Fail closed unless the projected spend fits under the hard cap.
+
+        known_actual_spend + unresolved_cost_reserve + admitted_inflight
+        + projected_attempt_reserve <= min(immutable_max_spend,
+        effective_stop_cap)
+        """
+
+        cap = min(
+            int(run_row["max_spend_micros"]),
+            int(run_row["effective_stop_cap_micros"]),
+        )
+        projected = (
+            int(run_row["actual_spend_micros"])
+            + int(run_row["unresolved_reserve_micros"])
+            + int(run_row["inflight_reserve_micros"])
+            + reservation.micros
+        )
+        if projected > cap:
+            from .qualification_budget import BudgetAdmissionRejected
+
+            raise BudgetAdmissionRejected(
+                "hard_cap_exhausted",
+                f"projected {projected} micro-USD exceeds hard cap {cap} "
+                "micro-USD",
+            )
 
     def _run_row_for_update(
         self, conn: sqlite3.Connection, run_id: str, expected_revision: int
