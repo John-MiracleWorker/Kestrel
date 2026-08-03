@@ -1,6 +1,6 @@
 # Test Matrix
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 ## Unit and Contract Tests
 
@@ -23,12 +23,15 @@ Core unit coverage includes:
 - state-store migrations through schema 19, terminal transition immutability, approval immutability, routine idempotency, behavior-delta ledgers, and replay safety
 - LAN model discovery scope validation, bounded scanner, HTTP transport framing/deadline limits, mDNS containment, scan-manager lifecycle, preview/confirm gates, and disabled-draft import/review contracts
 - LAN discovery adversarial qualification (`tests/test_lan_discovery_security.py` executing the hostile corpus in `tests/evals/lan_discovery/hostile_responses.json`): public-range rejection, DNS rebinding simulation, redirect, oversize/chunked responses, slowloris deadlines, malformed JSON, duplicate mDNS, interface change, cancellation, stale results, secret reflection, revision races, and target-enablement bypass — for every case, probe destinations never expand beyond the confirmed scope, no enabled target is produced, and the secret sentinel never appears in serialized evidence
+- Adaptive Flock no-authority-expansion matrix (`tests/test_flock_authority_boundaries.py` executing the corpus in `tests/evals/adaptive_flock_qualification/authority_matrix.json`): tools, MCP, skills, plugins, network, workspace, secrets, budget, approvals, privacy, containment, task graph, memory, and high risk — for every case, a trained learned winner routed under an active durable grant leaves every non-routing-owned `AgentConfig` field identical, the compiled task contract digest unchanged, and high/critical-risk scopes deterministic-only (coordinator abstains with `high_risk`; the activation evaluator independently refuses with `high_risk_deterministic_only`)
+- Adaptive Flock no-policy-memory proof (`tests/test_flock_no_policy_memory.py`, cross-checked in `tests/test_memory_promotion_gates.py` and `tests/test_mutation_gate.py`): a completed qualification run, scope activation, and learned routing under the active grant write zero memvid records on any layer, emit zero learning-kernel decisions, trigger zero mutation-gate evaluations, and qualification evidence can never satisfy the policy-delta hard gates
 
 Run:
 
 ```bash
 python -m pytest -q
 python -m pytest -q tests/test_lan_discovery_security.py tests/test_lan_scanner.py tests/test_server_lan_discovery_routes.py
+python -m pytest -q tests/test_flock_authority_boundaries.py tests/test_flock_no_policy_memory.py tests/test_memory_promotion_gates.py tests/test_mutation_gate.py
 ```
 
 ## Runtime Tests

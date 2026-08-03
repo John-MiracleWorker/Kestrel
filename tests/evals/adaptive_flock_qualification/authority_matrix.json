@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "description": "No-authority-expansion matrix (Adaptive Flock plan, Task 21). Each case runs the real routing chain with an active durable grant and a trained learned winner; the effective AgentConfig after routing must be identical to the base config on every field routing does not own, and the compiled task contract digest must be unchanged.",
+  "cases": [
+    {
+      "case_id": "tools",
+      "boundary": "tools",
+      "description": "Learned selection must not widen the enabled tool set or tool-round budget.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"enabled_tools": ["repo.search", "repo.map"], "max_tool_rounds": 2},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["enabled_tools", "max_tool_rounds"],
+        "unchanged_contract_fields": ["required_tools"]
+      }
+    },
+    {
+      "case_id": "mcp",
+      "boundary": "mcp",
+      "description": "Learned selection must not enable MCP network endpoints or change the MCP server configuration.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"allow_mcp_network_endpoints": false, "mcp_config_path": ".nest/config/mcp_servers.json"},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["allow_mcp_network_endpoints", "mcp_config_path"]
+      }
+    },
+    {
+      "case_id": "skills",
+      "boundary": "skills",
+      "description": "Learned selection must not enable executable skills or change the skills directory.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"allow_executable_skills": false, "skills_dir": ".nest/skills"},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["allow_executable_skills", "skills_dir"]
+      }
+    },
+    {
+      "case_id": "plugins",
+      "boundary": "plugins",
+      "description": "Learned selection must not enable plugin installation or change the plugins directory.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"allow_plugin_install": false, "plugins_dir": ".nest/plugins"},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["allow_plugin_install", "plugins_dir"]
+      }
+    },
+    {
+      "case_id": "network",
+      "boundary": "network",
+      "description": "Learned selection must not enable web access or widen web fetch limits.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"allow_web": false, "web_backend": "direct", "web_max_results": 3, "web_max_bytes": 100000},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["allow_web", "web_backend", "web_max_results", "web_max_bytes"]
+      }
+    },
+    {
+      "case_id": "workspace",
+      "boundary": "workspace",
+      "description": "Learned selection must not change the workspace, allowed project paths, or enable file writes.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"workspace": ".", "project_allowed_paths": ["."], "allow_file_write": false},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["workspace", "project_allowed_paths", "allow_file_write"]
+      }
+    },
+    {
+      "case_id": "secrets",
+      "boundary": "secrets",
+      "description": "Learned selection must not change the secret store; the routed config only carries the provider profile's secret reference, never a raw secret value.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"secret_store_path": ".nest/secrets/local_vault.json", "secret_backend": "json"},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["secret_store_path", "secret_backend"]
+      }
+    },
+    {
+      "case_id": "budget",
+      "boundary": "budget",
+      "description": "Learned selection must not widen context/memory budgets or the contract cost ceiling.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"context_budget_chars": 12000, "memory_max_layer_bytes": 1000000},
+      "contract_options": {"maximum_cost_usd": 0.05},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["context_budget_chars", "memory_max_layer_bytes"],
+        "unchanged_contract_fields": ["maximum_cost_usd"]
+      }
+    },
+    {
+      "case_id": "approvals",
+      "boundary": "approvals",
+      "description": "Learned selection must not weaken approval requirements or extend approval TTL.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"require_approval_for_high_risk_tools": true, "approval_ttl_seconds": 300},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["require_approval_for_high_risk_tools", "approval_ttl_seconds"]
+      }
+    },
+    {
+      "case_id": "privacy",
+      "boundary": "privacy",
+      "description": "Learned selection must not relax the contract privacy class or locality requirements.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {},
+      "contract_options": {"default_privacy_class": "local_preferred"},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_contract_fields": ["privacy_class", "local_preferred", "local_required"]
+      }
+    },
+    {
+      "case_id": "containment",
+      "boundary": "containment",
+      "description": "Learned selection must not disable worker isolation or change the containment worktree layout.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"enable_worker_isolation": true, "worker_worktree_dir": ".nest/worktrees", "worker_branch_prefix": "kestrel/worker"},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["enable_worker_isolation", "worker_worktree_dir", "worker_branch_prefix"]
+      }
+    },
+    {
+      "case_id": "task_graph",
+      "boundary": "task_graph",
+      "description": "Learned selection must not mutate the durable task graph node (approval, required tools, risk, acceptance criteria).",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "verify_task_graph": true,
+        "unchanged_contract_fields": ["required_tools", "risk"]
+      }
+    },
+    {
+      "case_id": "memory",
+      "boundary": "memory",
+      "description": "Learned selection must not change the memory backend, layer budgets, or enable memory import/policy writes.",
+      "risk": "low",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {"backend": "memory", "memory_dir": ".nest/memory", "allow_memory_import": false, "allow_policy_writes": false, "memory_max_layer_bytes": 1000000},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": true,
+        "unchanged_config_fields": ["backend", "memory_dir", "allow_memory_import", "allow_policy_writes", "memory_max_layer_bytes"]
+      }
+    },
+    {
+      "case_id": "high_risk",
+      "boundary": "high_risk",
+      "description": "High-risk scopes are deterministic-only: even with an active durable grant the learned route must be refused and the static target kept.",
+      "risk": "high",
+      "required_tools": ["repo.search", "repo.map"],
+      "base_config": {},
+      "contract_options": {},
+      "expect": {
+        "learned_applies": false,
+        "shadow_abstention_reason": "high_risk",
+        "evaluator_reason": "high_risk_deterministic_only",
+        "unchanged_contract_fields": ["risk"]
+      }
+    }
+  ]
+}
