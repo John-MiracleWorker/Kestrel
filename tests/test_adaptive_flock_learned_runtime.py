@@ -339,3 +339,84 @@ def _configured_ledger(state: AgentStateStore) -> RoutingLedger:
     )
     ledger.put_policy(RoutePolicy())
     return ledger
+
+
+def test_threshold_mapped_config_keeps_route_selection_snapshots_stable(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from nested_memvid_agent.routing.qualification_models import QualificationThresholds
+
+    state = AgentStateStore(tmp_path / "state" / "agent.db")
+    project = _project(state, tmp_path, "mapped")
+    ledger = _configured_ledger(state)
+    trainer = DurableRoutingCoordinator(ledger, mode="constrained")
+
+    for index in range(10):
+        target_id = "cheap" if index < 7 else "expensive"
+        task = _create_task(
+            state,
+            workspace=Path(project.repository_path),
+            project_id=project.project_id,
+            project_revision=project.revision,
+            suffix=f"mapped-train-{index}",
+        )
+        durable = trainer.assign(
+            AgentConfig(),
+            task,
+            subagent_id=None,
+            attempt=1,
+            direct_target_id=target_id,
+        )
+        trainer.record_outcome(
+            durable,
+            execution_status="completed",
+            validation_passed=True,
+            validation_codes=("accepted",),
+            input_tokens=1_000,
+            output_tokens=500,
+            latency_seconds=1.0,
+            outcome_labels=("validated_success",),
+        )
+
+    mapped = replace(
+        LearnedRouterConfig.from_qualification_thresholds(
+            QualificationThresholds(
+                min_examples_per_scope=5,
+                min_examples_per_target=3,
+                confidence_threshold=0.65,
+                utility_margin=0.001,
+                cost_coverage_threshold=0.8,
+            )
+        ),
+        replay_gate_enabled=True,
+    )
+    assert mapped == LearnedRouterConfig(
+        min_examples=5,
+        min_target_examples=3,
+        confidence_threshold=0.65,
+        activation_margin=0.001,
+        cost_coverage_threshold=0.8,
+        replay_gate_enabled=True,
+    )
+
+    learned = DurableRoutingCoordinator(ledger, mode="adaptive", learned_config=mapped)
+    task = _create_task(
+        state,
+        workspace=Path(project.repository_path),
+        project_id=project.project_id,
+        project_revision=project.revision,
+        suffix="mapped-activate",
+    )
+    activated = learned.assign(AgentConfig(), task, subagent_id=None, attempt=1)
+
+    assert activated.record.selected_target_id == "cheap"
+    assert activated.record.selection_kind == "learned_constrained"
+    shadow = ledger.get_shadow(activated.record.decision_id)
+    assert shadow is not None
+    assert shadow.static_target_id == "expensive"
+    assert shadow.learned_target_id == "cheap"
+    assert shadow.actual_target_id == "cheap"
+    assert shadow.activated is True
+    assert shadow.evidence_count == 10

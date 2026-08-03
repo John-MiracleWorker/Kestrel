@@ -52,6 +52,12 @@ from .native_worker import (
     start_native_worker,
 )
 from .qualification_digest import canonical_digest, canonical_json
+from .qualification_evaluator import (
+    ScopeAttemptEvidence,
+    ScopeEvaluationInput,
+    ScopeQualificationResult,
+    evaluate_scope,
+)
 from .qualification_models import (
     CorpusItem,
     CorpusManifest,
@@ -126,6 +132,9 @@ __all__ = [
     "RoutingShadowEntry",
     "RoutingUnavailableError",
     "RunManagerBuild",
+    "ScopeAttemptEvidence",
+    "ScopeEvaluationInput",
+    "ScopeQualificationResult",
     "ShadowEvaluation",
     "TaskLike",
     "TargetCalibrationEntry",
@@ -140,6 +149,7 @@ __all__ = [
     "canonical_json",
     "capability_scope_key",
     "compile_task_contract",
+    "evaluate_scope",
     "evaluate_shadow",
     "evaluate_target_eligibility",
     "replay_history",
