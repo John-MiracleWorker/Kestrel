@@ -27,6 +27,7 @@ from ..state_store import AgentStateStore, utc_now
 from .ledger_schema import ensure_routing_schema
 from .qualification_digest import canonical_digest, canonical_json
 from .qualification_models import MoneyMicros
+from .qualification_receipt import authenticate_terminal_receipt
 from .qualification_records import (
     ATTEMPT_STATES,
     GRANT_TRANSITION_TYPES,
@@ -345,6 +346,37 @@ class QualificationLedger:
             terminal_reason=terminal_reason,
             actual_spend=actual_spend,
             receipt_payload=terminal_receipt,
+        )
+
+    def finalize_run_terminal(
+        self,
+        run_id: str,
+        *,
+        expected_revision: int,
+        terminal_status: str,
+        terminal_reason: str,
+        actual_spend: MoneyMicros,
+        receipt_payload: Mapping[str, Any],
+    ) -> QualificationRun:
+        """Authenticate the terminal receipt and finalize in one transaction.
+
+        Task 12: signing happens before the transaction opens, so a signing
+        failure persists nothing and no unsigned qualifying receipt is ever
+        invented.  The transaction itself writes the receipt, links the run,
+        marks it terminal, and appends the terminal event atomically.
+        """
+
+        authenticated = authenticate_terminal_receipt(
+            receipt_payload,
+            integrity=self._control_plane_integrity(),
+        )
+        return self._terminalize(
+            run_id,
+            expected_revision=expected_revision,
+            terminal_status=terminal_status,
+            terminal_reason=terminal_reason,
+            actual_spend=actual_spend,
+            receipt_payload=authenticated,
         )
 
     # -- events and receipts ----------------------------------------------------

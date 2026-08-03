@@ -34,6 +34,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from ..state_store import AgentStateStore
@@ -43,13 +44,21 @@ from .qualification_budget import (
     QualificationBudget,
 )
 from .qualification_digest import canonical_digest
+from .qualification_evaluator import ScopeAttemptEvidence, ScopeEvaluationInput
+from .qualification_evidence import FAILURE_CATEGORIES
 from .qualification_executor import (
     AttemptEvidence,
     AttemptLease,
     QualificationAttemptBlocked,
 )
 from .qualification_ledger import QualificationLedger
-from .qualification_models import MoneyMicros, PriceSnapshot
+from .qualification_models import (
+    MoneyMicros,
+    PriceSnapshot,
+    QualificationScope,
+    QualificationThresholds,
+)
+from .qualification_receipt import build_terminal_receipt
 from .qualification_records import (
     QualificationAttempt,
     QualificationAttemptDraft,
@@ -57,6 +66,7 @@ from .qualification_records import (
     QualificationRun,
     QualificationRunDraft,
 )
+from .qualification_replay import QualificationReplayer
 
 __all__ = [
     "AttemptExecutor",
@@ -68,6 +78,15 @@ __all__ = [
 
 DEFAULT_SERVER_MAX_CONCURRENCY = 4
 _RECOVERABLE_RUN_STATES = ("draft", "ready", "running", "pausing", "paused")
+RECEIPT_FINALIZATION_FAILURE = "receipt_finalization_failure"
+
+# Terminal attempt status -> learned-router execution status.  Cancelled
+# attempts never contacted a provider and are excluded from scope evidence.
+_ATTEMPT_EXECUTION_STATUS = {
+    "completed": "succeeded",
+    "failed": "failed",
+    "ambiguous": "ambiguous",
+}
 
 
 def _require_text(value: str, name: str) -> None:
@@ -78,6 +97,38 @@ def _require_text(value: str, name: str) -> None:
 def _require_positive_int(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _evidence_failure_category(attempt: QualificationAttempt) -> str | None:
+    """Map a stored attempt failure category onto the evidence taxonomy.
+
+    Ambiguous transport outcomes are honest ``unknown`` failures; they are
+    never silently treated as task-quality or provider-side categories.
+    """
+
+    if attempt.failure_category is None:
+        return None
+    if attempt.failure_category in FAILURE_CATEGORIES:
+        return attempt.failure_category
+    return "unknown"
+
+
+def _scope_from_payload(payload: Mapping[str, Any]) -> QualificationScope:
+    """Rebuild the immutable scope from its stored canonical payload."""
+
+    return QualificationScope(
+        project_id=str(payload["project_id"]),
+        task_family=str(payload["task_family"]),
+        risk=payload["risk"],
+        capabilities=tuple(str(payload["capability_key"]).split("+")),
+        policy_id=str(payload["policy_id"]),
+        policy_revision=int(payload["policy_revision"]),
+        target_ids=tuple(str(target) for target in payload["target_ids"]),
+        target_inventory_digest=str(payload["target_inventory_digest"]),
+        price_digest=str(payload["price_digest"]),
+        learned_config_digest=str(payload["learned_config_digest"]),
+        project_authority_digest=str(payload["project_authority_digest"]),
+    )
 
 
 class AttemptExecutor(Protocol):
@@ -672,26 +723,130 @@ class QualificationRunner:
         fresh = self._require_run(run.run_id)
         if fresh.is_terminal:
             return
-        attempts = self.list_attempts(run.run_id)
-        terminal = [attempt for attempt in attempts if attempt.is_terminal]
-        succeeded = [
-            attempt
-            for attempt in terminal
-            if attempt.status == "completed" and attempt.validation_passed
-        ]
-        receipt = {
-            "matrix_exhausted": True,
-            "evaluation_status": "pending",
-            "attempts_terminal": len(terminal),
-            "attempts_succeeded": len(succeeded),
-        }
-        self._ledger.complete_run(
-            run.run_id,
-            expected_revision=fresh.revision,
-            terminal_reason="matrix_exhausted",
-            actual_spend=self._conservative_spend(fresh),
-            terminal_receipt=receipt,
+        actual_spend = self._conservative_spend(fresh)
+        try:
+            receipt = self._completion_receipt(fresh)
+            self._ledger.finalize_run_terminal(
+                run.run_id,
+                expected_revision=fresh.revision,
+                terminal_status="completed",
+                terminal_reason="matrix_exhausted",
+                actual_spend=actual_spend,
+                receipt_payload=receipt,
+            )
+        except Exception:  # noqa: BLE001 - never invent an unsigned qualifying receipt
+            self._fail_run(
+                run.run_id,
+                terminal_reason=RECEIPT_FINALIZATION_FAILURE,
+                receipt={"qualifying": False, "reason": RECEIPT_FINALIZATION_FAILURE},
+            )
+
+    def _completion_receipt(self, run: QualificationRun) -> Mapping[str, Any]:
+        """Evaluate, replay twenty times, and build the terminal receipt.
+
+        The replay clock is frozen once from this completion snapshot so
+        decay cannot drift between repeats.
+        """
+
+        scope = _scope_from_payload(json.loads(run.scope_json))
+        if scope.digest != run.scope_digest:
+            raise ValueError("run scope payload does not match its digest")
+        thresholds = QualificationThresholds(**json.loads(run.thresholds_json))
+        bundle = ScopeEvaluationInput(
+            scope=scope,
+            static_target_id=scope.target_ids[0],
+            thresholds=thresholds,
+            attempts=self._scope_evidence(run),
         )
+        reference_time = datetime.now(UTC)
+        replay = QualificationReplayer(clock=lambda: reference_time).replay(
+            (bundle,),
+            repeats=thresholds.replay_runs,
+            successes_required=thresholds.replay_successes_required,
+        )
+        return build_terminal_receipt(
+            status="completed",
+            run=run,
+            terminal_reason="matrix_exhausted",
+            scopes=replay.results,
+            replay=replay,
+            attempt_summaries=self._attempt_summaries(run.run_id),
+            effective_cap_revisions=(
+                {
+                    "revision": run.revision,
+                    "effective_stop_cap_micros": run.effective_stop_cap.micros,
+                },
+            ),
+            details={"matrix_exhausted": True},
+        )
+
+    def _scope_evidence(self, run: QualificationRun) -> tuple[ScopeAttemptEvidence, ...]:
+        """Project terminal non-cancelled attempts into scope evidence."""
+
+        scope_payload = json.loads(run.scope_json)
+        corpus_items = {str(item["item_id"]): item for item in json.loads(run.corpus_json)["items"]}
+        evidence: list[ScopeAttemptEvidence] = []
+        for case in self._ledger.list_cases(run.run_id):
+            item = corpus_items[case.item_id]
+            for attempt in self._ledger.list_attempts(case.case_id):
+                if not attempt.is_terminal or attempt.status == "cancelled":
+                    continue
+                evidence.append(
+                    ScopeAttemptEvidence(
+                        attempt_id=attempt.attempt_id,
+                        case_id=case.case_id,
+                        scope_digest=run.scope_digest,
+                        target_id=attempt.target_id,
+                        attempt_ordinal=attempt.attempt_number,
+                        validation_passed=attempt.validation_passed is True,
+                        execution_status=_ATTEMPT_EXECUTION_STATUS[attempt.status],
+                        failure_category=_evidence_failure_category(attempt),
+                        actual_cost_usd=(
+                            None
+                            if attempt.actual_cost is None
+                            else attempt.actual_cost.micros / 1_000_000
+                        ),
+                        latency_seconds=None,
+                        guardrail_state=attempt.guardrail_state,
+                        evidence_kind=item["evidence_kind"],
+                        trusted_acceptance=(
+                            attempt.validation_passed is True
+                            and "accepted" in attempt.validation_codes
+                        ),
+                        task_family=case.task_family,
+                        risk=case.risk,
+                        contract_digest=case.task_contract_digest,
+                        project_id=str(scope_payload["project_id"]),
+                        capability_key=str(scope_payload["capability_key"]),
+                        created_at=attempt.finished_at or attempt.updated_at,
+                    )
+                )
+        return tuple(evidence)
+
+    def _attempt_summaries(self, run_id: str) -> tuple[dict[str, Any], ...]:
+        """Terminal attempt summaries linked to their raw evidence IDs."""
+
+        summaries: list[dict[str, Any]] = []
+        for case in self._ledger.list_cases(run_id):
+            for attempt in self._ledger.list_attempts(case.case_id):
+                if not attempt.is_terminal:
+                    continue
+                summaries.append(
+                    {
+                        "attempt_id": attempt.attempt_id,
+                        "case_id": case.case_id,
+                        "target_id": attempt.target_id,
+                        "status": attempt.status,
+                        "validation_passed": attempt.validation_passed,
+                        "failure_category": attempt.failure_category,
+                        "guardrail_state": attempt.guardrail_state,
+                        "actual_cost_micros": (
+                            None if attempt.actual_cost is None else attempt.actual_cost.micros
+                        ),
+                        "evidence_refs": list(attempt.evidence_refs),
+                    }
+                )
+        return tuple(summaries)
 
     def _fail_run(
         self,
@@ -703,13 +858,33 @@ class QualificationRunner:
         fresh = self._require_run(run_id)
         if fresh.is_terminal:
             return
-        self._ledger.fail_run(
-            run_id,
-            expected_revision=fresh.revision,
-            terminal_reason=terminal_reason,
-            actual_spend=self._conservative_spend(fresh),
-            terminal_receipt=receipt,
-        )
+        actual_spend = self._conservative_spend(fresh)
+        details = dict(receipt)
+        details["qualifying"] = False
+        try:
+            payload = build_terminal_receipt(
+                status="failed",
+                run=fresh,
+                terminal_reason=terminal_reason,
+                attempt_summaries=self._attempt_summaries(run_id),
+                details=details,
+            )
+            self._ledger.finalize_run_terminal(
+                run_id,
+                expected_revision=fresh.revision,
+                terminal_status="failed",
+                terminal_reason=terminal_reason,
+                actual_spend=actual_spend,
+                receipt_payload=payload,
+            )
+        except Exception:  # noqa: BLE001 - fail unsigned but never qualifying
+            self._ledger.fail_run(
+                run_id,
+                expected_revision=fresh.revision,
+                terminal_reason=terminal_reason,
+                actual_spend=actual_spend,
+                terminal_receipt=details,
+            )
 
     def _fail_run_best_effort(self, run_id: str) -> None:
         try:
@@ -732,19 +907,37 @@ class QualificationRunner:
         fresh = self._require_run(run_id)
         if fresh.is_terminal:
             return
-        terminal = [attempt for attempt in self.list_attempts(run_id) if attempt.is_terminal]
-        self._ledger.cancel_run(
-            run_id,
-            expected_revision=fresh.revision,
-            terminal_reason="cancelled_by_owner",
-            actual_spend=self._conservative_spend(fresh),
-            terminal_receipt={
-                "qualifying": False,
-                "terminal_reason": "cancelled_by_owner",
-                "attempts_terminal": len(terminal),
-                "evidence_preserved": True,
-            },
-        )
+        actual_spend = self._conservative_spend(fresh)
+        try:
+            payload = build_terminal_receipt(
+                status="cancelled",
+                run=fresh,
+                terminal_reason="cancelled_by_owner",
+                attempt_summaries=self._attempt_summaries(run_id),
+                details={"evidence_preserved": True},
+            )
+            self._ledger.finalize_run_terminal(
+                run_id,
+                expected_revision=fresh.revision,
+                terminal_status="cancelled",
+                terminal_reason="cancelled_by_owner",
+                actual_spend=actual_spend,
+                receipt_payload=payload,
+            )
+        except Exception:  # noqa: BLE001 - cancel must never stay non-terminal
+            terminal = [attempt for attempt in self.list_attempts(run_id) if attempt.is_terminal]
+            self._ledger.cancel_run(
+                run_id,
+                expected_revision=fresh.revision,
+                terminal_reason="cancelled_by_owner",
+                actual_spend=actual_spend,
+                terminal_receipt={
+                    "qualifying": False,
+                    "terminal_reason": "cancelled_by_owner",
+                    "attempts_terminal": len(terminal),
+                    "evidence_preserved": True,
+                },
+            )
 
     def _conservative_spend(self, run: QualificationRun) -> MoneyMicros:
         """Known spend plus unresolved reserves; reserves are never released."""
@@ -764,6 +957,8 @@ class QualificationRunner:
             blockers.append("owner_reconciliation_required")
         if not run.is_terminal and run.effective_stop_cap.micros == 0:
             blockers.append("budget_admissions_closed")
+        if run.status == "failed" and run.terminal_reason == RECEIPT_FINALIZATION_FAILURE:
+            blockers.append("terminal_receipt_recovery_required")
         return tuple(blockers)
 
     def _require_run(self, run_id: str) -> QualificationRun:

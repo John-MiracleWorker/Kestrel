@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from nested_memvid_agent.control_plane_integrity import ControlPlaneIntegrity
 from nested_memvid_agent.routing.contracts import compile_task_contract
 from nested_memvid_agent.routing.qualification_budget import AttemptTokenCeilings
 from nested_memvid_agent.routing.qualification_executor import (
@@ -38,6 +39,7 @@ from nested_memvid_agent.routing.qualification_models import (
     QualificationScope,
     QualificationThresholds,
 )
+from nested_memvid_agent.routing.qualification_receipt import verify_terminal_receipt
 from nested_memvid_agent.routing.qualification_records import (
     QualificationAttempt,
     QualificationAttemptDraft,
@@ -373,10 +375,65 @@ def test_completion_initiates_terminal_receipt(
     receipts = qualification_ledger.list_receipts(scenario.run_id)
     terminal = [receipt for receipt in receipts if receipt.receipt_type == "run_terminal"]
     assert len(terminal) == 1
-    assert terminal[0].payload["evaluation_status"] == "pending"
-    assert terminal[0].payload["attempts_terminal"] == 2
+    payload = terminal[0].payload
+    # Task 12: the receipt is finalized, evaluated, replayed, and signed.
+    assert payload["schema"] == "kestrel.flock_qualification_terminal_receipt.v1"
+    assert payload["status"] == "completed"
+    assert payload["qualifying"] is False
+    assert payload["attempts_terminal"] == 2
+    assert payload["attempts_succeeded"] == 2
+    assert payload["replay"]["unique_projection_digests"] == 1
+    assert len(payload["replay"]["projection_digests"]) == 20
+    assert len(payload["scopes"]) == 1
+    integrity = ControlPlaneIntegrity(Path(state.path).parent)
+    assert verify_terminal_receipt(payload, integrity=integrity) is True
     event_types = [event.event_type for event in qualification_ledger.list_events(scenario.run_id)]
     assert "run_completed" in event_types
+
+
+def test_receipt_finalization_failure_fails_run_with_recovery_blocker(
+    state: AgentStateStore,
+    qualification_ledger: QualificationLedger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = run_with_cases(state, qualification_ledger, 1, targets=("a", "b"), tmp_path=tmp_path)
+    runner = _make_runner(state, qualification_ledger, recording_executor(), scenario)
+
+    def broken_finalize(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("signing backend unavailable")
+
+    monkeypatch.setattr(qualification_ledger, "finalize_run_terminal", broken_finalize)
+    runner.start(scenario.run_id)
+    view = runner.get(scenario.run_id)
+    assert view.status == "failed"
+    assert view.run.terminal_reason == "receipt_finalization_failure"
+    assert "terminal_receipt_recovery_required" in view.blockers
+    receipts = qualification_ledger.list_receipts(scenario.run_id)
+    terminal = [receipt for receipt in receipts if receipt.receipt_type == "run_terminal"]
+    assert len(terminal) == 1
+    assert terminal[0].payload["qualifying"] is False
+
+
+def test_cancel_records_authenticated_non_qualifying_receipt(
+    state: AgentStateStore,
+    qualification_ledger: QualificationLedger,
+    tmp_path: Path,
+) -> None:
+    scenario = run_with_cases(state, qualification_ledger, 1, targets=("a", "b"), tmp_path=tmp_path)
+    runner = _make_runner(state, qualification_ledger, recording_executor(), scenario)
+    runner.cancel(scenario.run_id)
+    view = runner.get(scenario.run_id)
+    assert view.status == "cancelled"
+    receipts = qualification_ledger.list_receipts(scenario.run_id)
+    terminal = [receipt for receipt in receipts if receipt.receipt_type == "run_terminal"]
+    assert len(terminal) == 1
+    payload = terminal[0].payload
+    assert payload["status"] == "cancelled"
+    assert payload["qualifying"] is False
+    assert payload["scopes"] == []
+    integrity = ControlPlaneIntegrity(Path(state.path).parent)
+    assert verify_terminal_receipt(payload, integrity=integrity) is True
 
 
 # --- Pause / resume lifecycle ------------------------------------------------
