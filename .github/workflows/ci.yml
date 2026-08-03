@@ -291,6 +291,9 @@ jobs:
       - name: Run LAN discovery adversarial e2e journeys
         run: npm run e2e -- lan-discovery
         working-directory: desktop
+      - name: Run deterministic flock qualification e2e journeys
+        run: npm run e2e -- flock-qualification
+        working-directory: desktop
 
   codeql:
     name: CodeQL
