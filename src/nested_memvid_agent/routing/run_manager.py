@@ -682,6 +682,10 @@ def _routing_decision_payload(durable: DurableRoutingAssignment) -> dict[str, An
         "score": record.score,
         "reason_codes": list(record.reason_codes),
         "actionable": record.actionable,
+        "activation_grant_id": getattr(record, "activation_grant_id", None),
+        "activation_receipt_id": getattr(record, "activation_receipt_id", None),
+        "activation_effective": bool(getattr(record, "activation_effective", False)),
+        "activation_reason": getattr(record, "activation_reason", None),
         "reused": durable.reused,
     }
 

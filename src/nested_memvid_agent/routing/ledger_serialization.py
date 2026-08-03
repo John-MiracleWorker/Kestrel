@@ -271,6 +271,10 @@ def _decision_entry_from_row(row: sqlite3.Row) -> RouteDecisionEntry:
         created_at=str(row["created_at"]),
         started_at=_optional_str(row["started_at"]),
         finished_at=_optional_str(row["finished_at"]),
+        activation_grant_id=_optional_str(row["activation_grant_id"]),
+        activation_receipt_id=_optional_str(row["activation_receipt_id"]),
+        activation_effective=bool(row["activation_effective"]),
+        activation_reason=_optional_str(row["activation_reason"]),
     )
 
 
@@ -409,6 +413,10 @@ def _decision_request_identity(entry: RouteDecisionEntry) -> tuple[object, ...]:
         _json(list(entry.candidate_snapshot)),
         1 if entry.actionable else 0,
         entry.router_version,
+        entry.activation_grant_id,
+        entry.activation_receipt_id,
+        1 if entry.activation_effective else 0,
+        entry.activation_reason,
     )
 
 
@@ -444,6 +452,10 @@ def _decision_request_identity_values(values: tuple[object, ...]) -> tuple[objec
         values[28],
         values[29],
         values[30],
+        values[34],
+        values[35],
+        values[36],
+        values[37],
     )
 
 

@@ -1,16 +1,90 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.projects import ProjectRecord
+from nested_memvid_agent.routing.activation_evaluator import (
+    ActivationEvaluator,
+    EvaluationBindings,
+)
+from nested_memvid_agent.routing.activation_service import (
+    ActivationBindings,
+    ActivationRequest,
+    ActivationService,
+)
+from nested_memvid_agent.routing.contracts import compile_task_contract
 from nested_memvid_agent.routing.coordinator import DurableRoutingCoordinator
-from nested_memvid_agent.routing.learned_router import LearnedRouterConfig
+from nested_memvid_agent.routing.learned_router import (
+    LearnedRouterConfig,
+    LearnedRouterState,
+)
 from nested_memvid_agent.routing.ledger import RoutingLedger
-from nested_memvid_agent.routing.models import ModelTarget, ProviderProfile, RoutePolicy
+from nested_memvid_agent.routing.models import (
+    AgentTaskContract,
+    ModelTarget,
+    ProviderProfile,
+    RoutePolicy,
+)
+from nested_memvid_agent.routing.qualification_evaluator import (
+    ScopeAttemptEvidence,
+    ScopeEvaluationInput,
+    ScopeQualificationResult,
+)
+from nested_memvid_agent.routing.qualification_ledger import QualificationLedger
+from nested_memvid_agent.routing.qualification_models import (
+    CorpusItem,
+    CorpusManifest,
+    MoneyMicros,
+    QualificationScope,
+    QualificationThresholds,
+    RiskLevel,
+)
+from nested_memvid_agent.routing.qualification_receipt import build_terminal_receipt
+from nested_memvid_agent.routing.qualification_records import (
+    ActivationGrant,
+    QualificationReceipt,
+    QualificationRunDraft,
+)
+from nested_memvid_agent.routing.qualification_replay import ReplayResult
 from nested_memvid_agent.routing.router import RoutingUnavailableError
 from nested_memvid_agent.state_store import AgentStateStore, TaskNodeRecord
+
+OWNER = "owner@example.test"
+RECENT = datetime(2026, 8, 1, tzinfo=UTC)
+
+TARGET_SNAPSHOT: dict[str, Any] = {
+    "targets": [
+        {
+            "target_id": "cheap",
+            "model": "cheap-model",
+            "endpoint": "https://cheap.example.test",
+            "trust_class": "standard",
+            "capabilities": ["tag:repository_inspection"],
+            "privacy_class": "approved_cloud",
+            "locality": "cloud",
+            "network_constraints": [],
+        },
+        {
+            "target_id": "expensive",
+            "model": "expensive-model",
+            "endpoint": "https://expensive.example.test",
+            "trust_class": "standard",
+            "capabilities": ["tag:repository_inspection"],
+            "privacy_class": "approved_cloud",
+            "locality": "cloud",
+            "network_constraints": [],
+        },
+    ]
+}
+PRICE_SNAPSHOT: dict[str, Any] = {"source": "operator_verified"}
+POLICY_PAYLOAD: dict[str, Any] = {"policy_id": "balanced", "revision": 1}
+LEARNED_PAYLOAD: dict[str, Any] = {"state": "disabled"}
+PROJECT_AUTHORITY: dict[str, Any] = {"principal": OWNER}
 
 
 def test_outcome_cost_calibration_and_shadow_are_bound_to_decision_snapshot(
@@ -87,6 +161,14 @@ def test_adaptive_activation_is_evidence_gated_and_project_scoped(
             outcome_labels=("validated_success",),
         )
 
+    project_a_task = _create_task(
+        state,
+        workspace=Path(project_a.repository_path),
+        project_id=project_a.project_id,
+        project_revision=project_a.revision,
+        suffix="activate",
+    )
+    harness = _GrantHarness(state, compile_task_contract(project_a_task))
     learned = DurableRoutingCoordinator(
         ledger,
         mode="adaptive",
@@ -98,13 +180,7 @@ def test_adaptive_activation_is_evidence_gated_and_project_scoped(
             cost_coverage_threshold=0.8,
             replay_gate_enabled=True,
         ),
-    )
-    project_a_task = _create_task(
-        state,
-        workspace=Path(project_a.repository_path),
-        project_id=project_a.project_id,
-        project_revision=project_a.revision,
-        suffix="activate",
+        activation_evaluator=harness.evaluator,
     )
     activated = learned.assign(
         AgentConfig(),
@@ -115,6 +191,10 @@ def test_adaptive_activation_is_evidence_gated_and_project_scoped(
 
     assert activated.record.selected_target_id == "cheap"
     assert activated.record.selection_kind == "learned_constrained"
+    assert activated.record.activation_effective is True
+    assert activated.record.activation_grant_id == harness.grant.grant_id
+    assert activated.record.activation_receipt_id == harness.receipt.receipt_id
+    assert activated.record.activation_reason is None
     activated_shadow = ledger.get_shadow(activated.record.decision_id)
     assert activated_shadow is not None
     assert activated_shadow.static_target_id == "expensive"
@@ -138,6 +218,9 @@ def test_adaptive_activation_is_evidence_gated_and_project_scoped(
         attempt=1,
     )
     assert isolated.record.selected_target_id == "expensive"
+    assert isolated.record.activation_effective is False
+    assert isolated.record.activation_grant_id is None
+    assert isolated.record.activation_reason is None
     isolated_shadow = ledger.get_shadow(isolated.record.decision_id)
     assert isolated_shadow is not None
     assert isolated_shadow.evidence_count == 0
@@ -159,6 +242,9 @@ def test_adaptive_mode_cannot_activate_without_explicit_replay_gate(
     durable = coordinator.assign(AgentConfig(), task, subagent_id=None, attempt=1)
 
     assert durable.record.selected_target_id == "expensive"
+    assert durable.record.activation_effective is False
+    assert durable.record.activation_grant_id is None
+    assert durable.record.activation_reason is None
     shadow = ledger.get_shadow(durable.record.decision_id)
     assert shadow is not None
     assert shadow.activated is False
@@ -276,7 +362,7 @@ def _create_task(
     )
 
 
-def _project(state: AgentStateStore, tmp_path: Path, suffix: str):
+def _project(state: AgentStateStore, tmp_path: Path, suffix: str) -> ProjectRecord:
     root = tmp_path / f"project-{suffix}"
     root.mkdir()
     return state.create_project(
@@ -401,7 +487,6 @@ def test_threshold_mapped_config_keeps_route_selection_snapshots_stable(
         replay_gate_enabled=True,
     )
 
-    learned = DurableRoutingCoordinator(ledger, mode="adaptive", learned_config=mapped)
     task = _create_task(
         state,
         workspace=Path(project.repository_path),
@@ -409,10 +494,21 @@ def test_threshold_mapped_config_keeps_route_selection_snapshots_stable(
         project_revision=project.revision,
         suffix="mapped-activate",
     )
+    harness = _GrantHarness(state, compile_task_contract(task))
+    learned = DurableRoutingCoordinator(
+        ledger,
+        mode="adaptive",
+        learned_config=mapped,
+        activation_evaluator=harness.evaluator,
+    )
     activated = learned.assign(AgentConfig(), task, subagent_id=None, attempt=1)
 
     assert activated.record.selected_target_id == "cheap"
     assert activated.record.selection_kind == "learned_constrained"
+    assert activated.record.activation_effective is True
+    assert activated.record.activation_grant_id == harness.grant.grant_id
+    assert activated.record.activation_receipt_id == harness.receipt.receipt_id
+    assert activated.record.activation_reason is None
     shadow = ledger.get_shadow(activated.record.decision_id)
     assert shadow is not None
     assert shadow.static_target_id == "expensive"
@@ -420,3 +516,198 @@ def test_threshold_mapped_config_keeps_route_selection_snapshots_stable(
     assert shadow.actual_target_id == "cheap"
     assert shadow.activated is True
     assert shadow.evidence_count == 10
+
+
+# --- durable-grant seeding (Adaptive Flock plan, Task 15) ------------------------
+
+
+def _attempt_evidence(
+    scope: QualificationScope,
+    capability_key: str,
+    attempt_id: str,
+    target_id: str,
+    ordinal: int,
+    *,
+    cost: float,
+) -> ScopeAttemptEvidence:
+    return ScopeAttemptEvidence(
+        attempt_id=attempt_id,
+        case_id="case_1",
+        scope_digest=scope.digest,
+        target_id=target_id,
+        attempt_ordinal=ordinal,
+        validation_passed=True,
+        execution_status="completed",
+        failure_category=None,
+        actual_cost_usd=cost,
+        latency_seconds=1.0,
+        guardrail_state="clear",
+        evidence_kind="real_project",
+        trusted_acceptance=True,
+        task_family=scope.task_family,
+        risk=scope.risk,
+        contract_digest="a" * 64,
+        project_id=scope.project_id,
+        capability_key=capability_key,
+        created_at=RECENT.isoformat(),
+    )
+
+
+def _scope_result(scope: QualificationScope) -> ScopeQualificationResult:
+    return ScopeQualificationResult(
+        scope_digest=scope.digest,
+        state="qualified",
+        static_target_id="expensive",
+        selected_target_id="cheap",
+        total_support=10,
+        selected_target_support=8,
+        confidence=0.8,
+        static_utility=0.5,
+        learned_utility=0.99,
+        utility_delta=0.49,
+        cost_coverage=1.0,
+        estimated_savings_usd=0.99,
+        estimated_regret_usd=None,
+        guardrail_violations=0,
+        evaluated_target_ids=("cheap", "expensive"),
+        reasons=(),
+        router_state=LearnedRouterState(config_digest="6" * 64),
+        thresholds_digest=QualificationThresholds().digest,
+    )
+
+
+def _replay(results: tuple[ScopeQualificationResult, ...]) -> ReplayResult:
+    return ReplayResult(
+        repeats=20,
+        completed_repeats=20,
+        successes_required=20,
+        projection_digests=("c" * 64,) * 20,
+        results=results,
+        reasons=(),
+    )
+
+
+def _evaluation_bindings() -> EvaluationBindings:
+    return EvaluationBindings(
+        project_authority=PROJECT_AUTHORITY,
+        privacy={
+            "target_id": "cheap",
+            "privacy_class": "approved_cloud",
+            "locality": "cloud",
+            "network_constraints": [],
+        },
+        target_snapshot=TARGET_SNAPSHOT,
+        price_snapshot=PRICE_SNAPSHOT,
+        policy_payload=POLICY_PAYLOAD,
+        learned_payload=LEARNED_PAYLOAD,
+    )
+
+
+class _GrantHarness:
+    """One active grant for the exact contract scope plus its evaluator."""
+
+    def __init__(self, state: AgentStateStore, contract: AgentTaskContract) -> None:
+        self.qualifications = QualificationLedger(state)
+        capability_key = "+".join(sorted(set(contract.required_capabilities)))
+        scope = QualificationScope(
+            project_id="project-alpha",
+            task_family=contract.task_family,
+            risk=cast(RiskLevel, contract.risk),
+            capabilities=contract.required_capabilities,
+            policy_id="balanced",
+            policy_revision=1,
+            target_ids=("cheap", "expensive"),
+            target_inventory_digest="1" * 64,
+            price_digest="2" * 64,
+            learned_config_digest="3" * 64,
+            project_authority_digest="4" * 64,
+        )
+        self.scope = scope
+        service = ActivationService(self.qualifications, master_permit=lambda: True)
+        draft = QualificationRunDraft(
+            run_id="qual_learned_runtime",
+            owner_principal=OWNER,
+            scope=scope,
+            corpus=CorpusManifest(
+                schema_version=1,
+                items=(
+                    CorpusItem(
+                        item_id="corpus_item_1",
+                        task_family=contract.task_family,
+                        risk=cast(RiskLevel, contract.risk),
+                        capabilities=contract.required_capabilities,
+                        task_contract_digest="a" * 64,
+                        acceptance_plan_digest="b" * 64,
+                        evidence_kind="real_project",
+                    ),
+                ),
+            ),
+            thresholds=QualificationThresholds(),
+            target_snapshot=TARGET_SNAPSHOT,
+            price_snapshot=PRICE_SNAPSHOT,
+            policy_payload=POLICY_PAYLOAD,
+            learned_payload=LEARNED_PAYLOAD,
+            project_authority=PROJECT_AUTHORITY,
+            build={"version": "0.5.0", "git": "bd2c182"},
+            max_spend=MoneyMicros.from_usd_text("50.00"),
+            effective_stop_cap=MoneyMicros.from_usd_text("25.00"),
+            attempt_ceiling=MoneyMicros.from_usd_text("5.00"),
+        )
+        run = self.qualifications.create_run(draft)
+        result = _scope_result(scope)
+        payload = build_terminal_receipt(
+            status="completed",
+            run=run,
+            terminal_reason="matrix_exhausted",
+            scopes=[result],
+            replay=_replay((result,)),
+        )
+        self.qualifications.finalize_run_terminal(
+            run.run_id,
+            expected_revision=run.revision,
+            terminal_status="completed",
+            terminal_reason="matrix_exhausted",
+            actual_spend=run.actual_spend,
+            receipt_payload=payload,
+        )
+        self.receipt: QualificationReceipt = self.qualifications.list_receipts(run.run_id)[0]
+        request = ActivationRequest(
+            receipt_id=self.receipt.receipt_id,
+            scope_digests=(scope.digest,),
+            principal=OWNER,
+            expected_receipt_digest=str(self.receipt.payload["payload_digest"]),
+            expected_run_revision=int(self.receipt.payload["run"]["revision"]),
+            bindings=ActivationBindings(
+                project_authority=PROJECT_AUTHORITY,
+                target_snapshot=TARGET_SNAPSHOT,
+                price_snapshot=PRICE_SNAPSHOT,
+                policy_payload=POLICY_PAYLOAD,
+                learned_payload=LEARNED_PAYLOAD,
+            ),
+        )
+        self.grant: ActivationGrant = service.activate_scopes(request).grants[0]
+        attempts = [
+            _attempt_evidence(
+                scope, capability_key, f"attempt_cheap_{index}", "cheap", index, cost=0.01
+            )
+            for index in range(1, 9)
+        ]
+        attempts += [
+            _attempt_evidence(
+                scope, capability_key, f"attempt_expensive_{index}", "expensive", index, cost=1.0
+            )
+            for index in range(1, 3)
+        ]
+        bundle = ScopeEvaluationInput(
+            scope=scope,
+            static_target_id="expensive",
+            thresholds=QualificationThresholds(),
+            attempts=tuple(attempts),
+        )
+        self.evaluator = ActivationEvaluator(
+            self.qualifications,
+            bindings=_evaluation_bindings,
+            eligibility=lambda target_id: "eligible",
+            evidence=lambda grant: bundle,
+            master_permit=lambda: True,
+        )

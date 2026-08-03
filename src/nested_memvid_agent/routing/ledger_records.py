@@ -100,6 +100,10 @@ class RouteDecisionEntry:
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    activation_grant_id: str | None = None
+    activation_receipt_id: str | None = None
+    activation_effective: bool = False
+    activation_reason: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)

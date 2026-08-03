@@ -77,3 +77,8 @@ def test_cancelled_outcome_terminalizes_decision_as_cancelled(tmp_path: Path) ->
     decision = ledger.get_decision(durable.record.decision_id)
     assert decision is not None
     assert decision.status == "cancelled"
+    # Shadow mode never consults grant authority: no activation binding.
+    assert decision.activation_effective is False
+    assert decision.activation_grant_id is None
+    assert decision.activation_receipt_id is None
+    assert decision.activation_reason is None

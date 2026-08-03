@@ -13,6 +13,7 @@ from ..plugin_manager import PluginManager
 from ..run_manager import RunManager
 from ..skill_manager import SkillManager
 from ..state_store import AgentStateStore
+from .activation_evaluator import ActivationEvaluator
 from .coordinator import DurableRoutingCoordinator
 from .learned_router import LearnedRouterConfig
 from .ledger import RoutingLedger
@@ -31,6 +32,9 @@ class AdaptiveFlockRuntimeConfig:
     learned_activation_margin: float = 0.08
     learned_cost_coverage_threshold: float = 0.80
     learned_decay_half_life_days: float = 30.0
+    # Task 15: this flag is only a global permit inside the activation
+    # evaluator.  Learned routing additionally requires a durable effective
+    # grant for the exact contract scope; the flag alone never authorizes it.
     learned_activation_replay_verified: bool = False
 
     def __post_init__(self) -> None:
@@ -154,6 +158,7 @@ def build_run_manager(
     enforce_single_owner: bool = False,
     auto_start: bool = True,
     routing_config: AdaptiveFlockRuntimeConfig | None = None,
+    activation_evaluator: ActivationEvaluator | None = None,
 ) -> RunManagerBuild:
     active_routing = routing_config or AdaptiveFlockRuntimeConfig.from_env()
     ledger = RoutingLedger(state)
@@ -179,6 +184,7 @@ def build_run_manager(
             mode=active_routing.mode,
             learned_config=active_routing.learned_router_config(),
             lan_runtime_authority_resolver=lan_runtime_authority_resolver,
+            activation_evaluator=activation_evaluator,
         )
         runs = AdaptiveFlockRunManager(
             routing_coordinator=coordinator,
