@@ -21,6 +21,7 @@ from ..state_store import (
     TaskNodeRecord,
 )
 from .coordinator import DurableRoutingAssignment, DurableRoutingCoordinator
+from .qualification_evidence import classify_failure_code, normalize_provider_attempt
 from .router import RoutingUnavailableError
 
 _TERMINAL_ROUTING_TASK_STATUSES = {"completed", "failed", "cancelled"}
@@ -573,6 +574,47 @@ class AdaptiveFlockRunManager(RunManager):
             provider_failure_code,
             default=diagnosis_category,
         )
+        evidence = normalize_provider_attempt(
+            {
+                "subject_id": durable.record.decision_id,
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt": max(1, task.attempt_count),
+                "target_id": str(durable.record.selected_target_id),
+                "provider": str(durable.record.selected_provider),
+                "profile_id": str(
+                    getattr(durable.record, "selected_profile_id", "") or ""
+                ),
+                "model": str(durable.record.selected_model),
+                "request_id": provider_usage.get("provider_request_id")
+                or provider_usage.get("request_id"),
+                "status": task.status,
+                "execution_status": subagent.status,
+                "error_code": provider_failure_code,
+                "validation_passed": validation_passed,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": _optional_non_negative_int(
+                    provider_usage.get("cached_tokens")
+                ),
+                "reasoning_tokens": _optional_non_negative_int(
+                    provider_usage.get("reasoning_tokens")
+                ),
+                "latency_seconds": max(0.0, monotonic() - started_at),
+                "input_cost_per_million_usd": getattr(
+                    durable.record, "input_cost_per_million_usd", None
+                ),
+                "output_cost_per_million_usd": getattr(
+                    durable.record, "output_cost_per_million_usd", None
+                ),
+            }
+        )
+        evidence_refs = _validation_evidence_refs(validation)
+        if evidence.request_id_digest is not None:
+            evidence_refs = (
+                *evidence_refs,
+                f"provider_request:{evidence.request_id_digest}",
+            )
         outcome_labels: tuple[str, ...] = (
             ("validated_success",)
             if validation_passed
@@ -607,7 +649,7 @@ class AdaptiveFlockRunManager(RunManager):
                 escalated=fallback_count > 0,
                 reward_components={"completion": reward},
                 outcome_labels=outcome_labels,
-                evidence_refs=_validation_evidence_refs(validation),
+                evidence_refs=evidence_refs,
             )
         except Exception as exc:  # noqa: BLE001 - routing telemetry must not rewrite task truth
             self.events.publish(
@@ -683,35 +725,17 @@ def _provider_failure_category(
     *,
     default: str | None,
 ) -> str | None:
+    """Classify a typed provider failure code via the shared taxonomy.
+
+    Unrecognized codes fall back to the task diagnosis category (legacy
+    precedence) and then to ``"unknown"`` — never to task-quality blame.
+    """
     if provider_failure_code is None:
         return default
-    normalized = provider_failure_code.lower()
-    if any(
-        marker in normalized
-        for marker in (
-            "timeout",
-            "rate_limit",
-            "unavailable",
-            "connection",
-            "network",
-            "overload",
-            "transport",
-        )
-    ):
-        return "provider_outage"
-    if any(
-        marker in normalized
-        for marker in (
-            "unsupported",
-            "capability",
-            "context_length",
-            "tool",
-            "vision",
-            "structured_output",
-        )
-    ):
-        return "capability_failure"
-    return default or "provider_failure"
+    category = classify_failure_code(provider_failure_code)
+    if category is None or category == "unknown":
+        return default or category
+    return category
 
 
 def _changed_file_count(result: dict[str, Any]) -> int | None:

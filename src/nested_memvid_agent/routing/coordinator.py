@@ -21,6 +21,7 @@ from .ledger_records import (
     RoutingShadowDraft,
 )
 from .models import PrivacyClass, RouteDecision, RoutingMode
+from .qualification_evidence import PROVIDER_SIDE_FAILURE_CATEGORIES
 from .router import ReviewDiversityContext, RoutingUnavailableError
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
 
@@ -419,7 +420,7 @@ class DurableRoutingCoordinator:
         outcome = self.ledger.get_outcome(previous.decision_id)
         if outcome is None:
             return None, forbidden, None, previous.selected_target_id
-        if outcome.failure_category == "provider_outage":
+        if outcome.failure_category in PROVIDER_SIDE_FAILURE_CATEGORIES:
             return (
                 previous.selected_target_id,
                 forbidden,

@@ -32,6 +32,7 @@ from .ledger_serialization import (
     _validate_route_binding,
 )
 from .models import AgentTaskContract, RouteDecision
+from .qualification_evidence import PROVIDER_SIDE_FAILURE_CATEGORIES
 
 
 class RoutingLedger(RoutingRegistry):
@@ -806,7 +807,9 @@ def _refresh_target_calibration(
         if not {"validated_success", "acceptance_failed"} & labels:
             continue
         weight = _decay_weight(str(row["created_at"]), now=now)
-        is_outage = str(row["failure_category"] or "") == "provider_outage"
+        is_outage = (
+            str(row["failure_category"] or "") in PROVIDER_SIDE_FAILURE_CATEGORIES
+        )
         weighted_outages.append((weight, is_outage))
         total_weight += weight
         example_count += 1
