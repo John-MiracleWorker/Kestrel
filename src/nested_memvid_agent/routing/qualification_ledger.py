@@ -201,6 +201,35 @@ class QualificationLedger:
             row = self._fetch_run(conn, run_id)
         return None if row is None else run_from_row(row)
 
+    def list_runs(
+        self, *, statuses: tuple[str, ...] | None = None
+    ) -> list[QualificationRun]:
+        """List qualification runs, optionally restricted to given statuses."""
+
+        if statuses is not None:
+            for status in statuses:
+                if status not in RUN_STATES:
+                    raise ValueError(f"unsupported run status: {status}")
+        with self.state._connect() as conn:
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM routing_qualification_runs
+                    WHERE status IN ({placeholders})
+                    ORDER BY created_at, run_id
+                    """,
+                    statuses,
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM routing_qualification_runs
+                    ORDER BY created_at, run_id
+                    """
+                ).fetchall()
+        return [run_from_row(row) for row in rows]
+
     def mark_ready(self, run_id: str, *, expected_revision: int) -> QualificationRun:
         return self._run_transition(
             run_id,
@@ -552,6 +581,83 @@ class QualificationLedger:
             row = self._fetch_attempt(conn, draft.attempt_id)
         assert row is not None
         return attempt_from_row(row)
+
+    def admit_pending_attempt_with_budget(
+        self, attempt_id: str
+    ) -> QualificationAttempt:
+        """Reserve an existing pending attempt atomically under the hard cap.
+
+        The budget check, the ``pending -> reserved`` transition, and the run
+        inflight-reserve increment happen in one SQLite transaction, so a
+        rejected re-admission leaves the attempt pending with no reserve.
+        """
+
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._attempt_row_for_transition(
+                conn, attempt_id, ("pending",), "admit"
+            )
+            run_row = self._live_run_row(conn, str(row["run_id"]))
+            reservation = MoneyMicros(int(row["reservation_micros"]))
+            self._assert_budget_admission(run_row, reservation)
+            conn.execute(
+                """
+                UPDATE routing_qualification_attempts
+                SET status = 'reserved', revision = revision + 1, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (now, attempt_id),
+            )
+            conn.execute(
+                """
+                UPDATE routing_qualification_runs
+                SET inflight_reserve_micros = inflight_reserve_micros + ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (reservation.micros, now, str(row["run_id"])),
+            )
+            updated = self._fetch_attempt(conn, attempt_id)
+        assert updated is not None
+        return attempt_from_row(updated)
+
+    def release_attempt_reservation(self, attempt_id: str) -> QualificationAttempt:
+        """Recovery: return a never-dispatched reserved attempt to pending.
+
+        Releases the run inflight reserve in the same transaction. Only the
+        startup reconciliation path uses this: a ``reserved`` attempt whose
+        owner process died before dispatch was never submitted to a provider,
+        so the reservation can be released exactly once.
+        """
+
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._attempt_row_for_transition(
+                conn, attempt_id, ("reserved",), "release"
+            )
+            reserve = int(row["reservation_micros"])
+            conn.execute(
+                """
+                UPDATE routing_qualification_attempts
+                SET status = 'pending', revision = revision + 1, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (now, attempt_id),
+            )
+            conn.execute(
+                """
+                UPDATE routing_qualification_runs
+                SET inflight_reserve_micros = inflight_reserve_micros - ?,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (reserve, now, str(row["run_id"])),
+            )
+            updated = self._fetch_attempt(conn, attempt_id)
+        assert updated is not None
+        return attempt_from_row(updated)
 
     def settle_attempt_with_budget(
         self,

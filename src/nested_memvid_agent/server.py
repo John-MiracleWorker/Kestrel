@@ -38,6 +38,8 @@ from .promotion_ledger import PromotionLedger
 from .routine_loop import RoutineLoop
 from .routines import RoutineService
 from .routing.lan_ledger import LanDiscoveryLedger
+from .routing.qualification_ledger import QualificationLedger
+from .routing.qualification_runner import QualificationRunner
 from .routing.runtime import build_run_manager
 from .run_manager import RunCapacityError
 from .runtime_settings import (
@@ -318,6 +320,15 @@ def _create_app(
     routing_config = run_manager_build.routing_config
     lan_scan_manager = LanScanManager(ledger=LanDiscoveryLedger.from_initialized_state(state))
     runs.register_lifecycle_dependency("lan_scans", lan_scan_manager)
+    # Durable Flock qualification run manager (Adaptive Flock Task 9). It is
+    # constructed recovery-only here (no executor); sidecar startup reconciles
+    # non-terminal runs without ever dispatching provider work.
+    qualification_runner = QualificationRunner(
+        state,
+        QualificationLedger(state),
+        server_max_concurrency=active_config.max_concurrent_runs,
+    )
+    runs.register_lifecycle_dependency("qualification_runner", qualification_runner)
 
     desktop_memory_receipt: DesktopMemvidPreflightReceipt | None = (
         desktop_context.memory_preflight_receipt if desktop_context is not None else None
@@ -513,6 +524,9 @@ def _create_app(
 
             try:
                 runs.register_startup_dependency("lan_scans", start_lan_scans)
+                runs.register_startup_dependency(
+                    "qualification_runner", qualification_runner.recover_startup
+                )
                 runs.start()
             except BaseException:
                 if not lan_start_invoked:
