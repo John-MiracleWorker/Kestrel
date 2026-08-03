@@ -1,8 +1,8 @@
-import { Bird, ShieldCheck } from "lucide-react";
-import type { ReactNode } from "react";
+import { Bird } from "lucide-react";
 import { StatusBadge } from "../components";
 import { RoutingCenter } from "../routing/RoutingCenter";
 import { LanDiscoveryPanel } from "./lan/LanDiscoveryPanel";
+import { QualificationWorkspace } from "./qualification/QualificationWorkspace";
 
 export function FlockWorkspace({
   subroute,
@@ -19,11 +19,7 @@ export function FlockWorkspace({
 }) {
   if (subroute === "qualification") {
     return (
-      <DependencySurface
-        title="Adaptive Flock qualification"
-        detail="Qualification is not available in this build. No corpus run, routing authority, scoped grant, or activation has been created."
-        icon={<ShieldCheck size={20} />}
-      />
+      <QualificationWorkspace onError={onError} onNotice={onNotice} />
     );
   }
   if (subroute === "lan" || subroute === "discovery") {
@@ -45,8 +41,10 @@ export function FlockWorkspace({
             </a>
             <a className="data-row" href="#/flock/qualification">
               <strong>Adaptive qualification</strong>
-              <StatusBadge value="unavailable" />
-              <span>Requires the qualification and scoped-grant service.</span>
+              <StatusBadge value="available" />
+              <span>
+                Bounded, owner-reviewed evidence runs with decimal-text caps.
+              </span>
             </a>
             <a className="data-row" href="#/flock/lan">
               <strong>LAN model discovery</strong>
@@ -63,35 +61,5 @@ export function FlockWorkspace({
         onNotice={onNotice}
       />
     </>
-  );
-}
-
-function DependencySurface({
-  title,
-  detail,
-  icon,
-}: {
-  title: string;
-  detail: string;
-  icon: ReactNode;
-}) {
-  return (
-    <section className="panel flock-dependency" aria-labelledby="flock-dependency-title">
-      <div className="panel-head">
-        <h2 id="flock-dependency-title">
-          {icon}
-          {title}
-        </h2>
-        <StatusBadge value="unavailable" />
-      </div>
-      <p>{detail}</p>
-      <p className="muted">
-        Until its evidence service is installed and qualified, Kestrel remains
-        on deterministic routing with no learned authority.
-      </p>
-      <a className="btn subtle" href="#/flock/routing">
-        Open deterministic routing
-      </a>
-    </section>
   );
 }

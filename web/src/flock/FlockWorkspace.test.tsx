@@ -12,7 +12,7 @@ describe("FlockWorkspace", () => {
     window.history.replaceState(null, "", "/");
   });
 
-  it("routes Qualification to a truthful unavailable surface", async () => {
+  it("routes Qualification to the bounded qualification workspace", async () => {
     const requests: string[] = [];
     window.history.replaceState(null, "", "/#/flock/qualification");
     vi.stubGlobal(
@@ -27,17 +27,20 @@ describe("FlockWorkspace", () => {
         name: "Adaptive Flock qualification",
       }),
     ).toBeVisible();
-    expect(
-      screen.getByText(/no corpus run, routing authority, scoped grant/i),
-    ).toBeVisible();
+    expect(screen.getByLabelText("Maximum provider spend")).toHaveValue(
+      "50.00",
+    );
     await waitFor(() => {
       expect(requests).toContain("/api/runtime/models?provider=mock");
     });
     expect(requests.some((path) => path.startsWith("/api/routing/"))).toBe(
       false,
     );
+    expect(requests.some((path) => path.startsWith("/api/flock/"))).toBe(
+      false,
+    );
     expect(
-      screen.queryByRole("button", { name: /qualify|activate|grant/i }),
+      screen.queryByRole("button", { name: /activate|grant|start qualification/i }),
     ).not.toBeInTheDocument();
   });
 
