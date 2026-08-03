@@ -4424,6 +4424,12 @@ class AgentStateStore:
             raise KeyError(f"Unknown task: {task_id}")
         return _task_from_row(row)
 
+    def get_task_run_binding(self, task_id: str) -> tuple[TaskNodeRecord, RunRecord]:
+        """Return the task and its owning run for project-boundary checks."""
+
+        task = self.get_task_node(task_id)
+        return task, self.get_run(task.run_id)
+
     def list_task_nodes(self, run_id: str) -> list[TaskNodeRecord]:
         with self._connect() as conn:
             rows = conn.execute(
