@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +121,24 @@ def _forged_lan_inventory() -> tuple[ProviderProfile, ModelTarget]:
         metadata={"lan_discovery": {"managed": True, "reviewed": True}},
     )
     return profile, target
+
+
+def test_evaluate_target_eligibility_applies_the_same_lan_guards_as_route_task() -> None:
+    from nested_memvid_agent.routing import RoutePolicy, evaluate_target_eligibility
+
+    _profile, target = _forged_lan_inventory()
+    contract = _routing_contract()
+    evaluation = evaluate_target_eligibility(
+        contract,
+        target,
+        RoutePolicy(),
+        now=datetime.now(UTC),
+    )
+    assert not evaluation.eligible
+    assert "lan_binding_invalid" in evaluation.reason_codes
+    with pytest.raises(RoutingUnavailableError) as excinfo:
+        route_task(contract, [target])
+    assert tuple(sorted(excinfo.value.reason_codes)) == evaluation.reason_codes
 
 
 def _imported_managed_lan_target(tmp_path: Path) -> ModelTarget:

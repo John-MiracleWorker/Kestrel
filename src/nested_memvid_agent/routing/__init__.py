@@ -69,7 +69,13 @@ from .role_resolver import (
     RoleAssignmentResolver,
     resolve_graph_roles,
 )
-from .router import ReviewDiversityContext, RoutingUnavailableError, route_task
+from .router import (
+    EligibilityEvaluation,
+    ReviewDiversityContext,
+    RoutingUnavailableError,
+    evaluate_target_eligibility,
+    route_task,
+)
 from .run_manager import AdaptiveFlockRunManager
 from .runtime import AdaptiveFlockRuntimeConfig, RunManagerBuild, build_run_manager
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
@@ -83,6 +89,7 @@ __all__ = [
     "CorpusManifest",
     "DurableRoutingAssignment",
     "DurableRoutingCoordinator",
+    "EligibilityEvaluation",
     "EvidenceKind",
     "GraphRoleAssignment",
     "LearnedRouterConfig",
@@ -134,6 +141,7 @@ __all__ = [
     "capability_scope_key",
     "compile_task_contract",
     "evaluate_shadow",
+    "evaluate_target_eligibility",
     "replay_history",
     "resolve_graph_roles",
     "route_task",

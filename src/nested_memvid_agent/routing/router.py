@@ -34,6 +34,41 @@ class ReviewDiversityContext:
     model_family: str | None = None
 
 
+@dataclass(frozen=True)
+class EligibilityEvaluation:
+    """Result of the normal hard eligibility filter for one target.
+
+    Ordinary routing and Flock qualification preview both call
+    :func:`evaluate_target_eligibility`; there is no parallel approximation.
+    """
+
+    target: ModelTarget
+    eligible: bool
+    reason_codes: tuple[str, ...]
+
+
+def evaluate_target_eligibility(
+    contract: AgentTaskContract,
+    target: ModelTarget,
+    policy: RoutePolicy,
+    *,
+    review_context: ReviewDiversityContext | None = None,
+    now: datetime,
+) -> EligibilityEvaluation:
+    """Evaluate *target* against *contract* with the normal hard filters."""
+
+    reasons = _ineligibility_reasons(
+        contract,
+        target,
+        policy,
+        review_context=review_context,
+        now=now,
+    )
+    if reasons:
+        return EligibilityEvaluation(target=target, eligible=False, reason_codes=reasons)
+    return EligibilityEvaluation(target=target, eligible=True, reason_codes=("eligible",))
+
+
 def route_task(
     contract: AgentTaskContract,
     targets: tuple[ModelTarget, ...] | list[ModelTarget],
@@ -121,15 +156,20 @@ def _candidate(
     review_context: ReviewDiversityContext | None,
     now: datetime,
 ) -> RouteCandidate:
-    reasons = _ineligibility_reasons(
+    evaluation = evaluate_target_eligibility(
         contract,
         target,
         policy,
         review_context=review_context,
         now=now,
     )
-    if reasons:
-        return RouteCandidate(target=target, eligible=False, score=None, reason_codes=reasons)
+    if not evaluation.eligible:
+        return RouteCandidate(
+            target=target,
+            eligible=False,
+            score=None,
+            reason_codes=evaluation.reason_codes,
+        )
     components = _score_components(contract, target, policy, review_context=review_context)
     score = round(sum(components.values()), 8)
     return RouteCandidate(

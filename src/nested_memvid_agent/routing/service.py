@@ -29,8 +29,10 @@ from .models import (
     RoutingMode,
 )
 from .router import (
+    EligibilityEvaluation,
     ReviewDiversityContext,
     RoutingUnavailableError,
+    evaluate_target_eligibility,
     managed_lan_target_guard_reasons,
     route_task,
 )
@@ -283,6 +285,52 @@ class AdaptiveFlockRoutingService:
             stream=False,
             lan_runtime_authority=authority,
         )
+
+    def evaluate_targets(
+        self,
+        contract: AgentTaskContract,
+        *,
+        review_context: ReviewDiversityContext | None = None,
+    ) -> tuple[EligibilityEvaluation, ...]:
+        """Evaluate every configured target with the normal hard eligibility filters.
+
+        Unlike :meth:`preview`, which silently pre-filters the inventory by
+        provider profile, this reports profile-level exclusions as reason
+        codes so qualification previews never shrink owner intent silently.
+        """
+
+        now = _read_utc_clock(self.clock)
+        evaluations: list[EligibilityEvaluation] = []
+        for target in sorted(self.targets, key=lambda item: item.target_id):
+            profile = self.profiles.get(target.provider_profile_id)
+            if profile is None:
+                evaluations.append(
+                    EligibilityEvaluation(
+                        target=target,
+                        eligible=False,
+                        reason_codes=("provider_profile_unknown",),
+                    )
+                )
+                continue
+            if not profile.enabled:
+                evaluations.append(
+                    EligibilityEvaluation(
+                        target=target,
+                        eligible=False,
+                        reason_codes=("provider_profile_disabled",),
+                    )
+                )
+                continue
+            evaluations.append(
+                evaluate_target_eligibility(
+                    contract,
+                    target,
+                    self.policy,
+                    review_context=review_context,
+                    now=now,
+                )
+            )
+        return tuple(evaluations)
 
     def _eligible_inventory(self) -> tuple[ModelTarget, ...]:
         return tuple(
