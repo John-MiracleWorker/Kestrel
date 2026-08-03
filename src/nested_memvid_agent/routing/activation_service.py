@@ -61,6 +61,9 @@ __all__ = [
     "ActivationResult",
     "ActivationScopePreview",
     "ActivationService",
+    "env_master_permit",
+    "load_verification_integrity",
+    "receipt_authenticates",
 ]
 
 #: Material drift conditions that suspend a grant after activation (the
@@ -216,7 +219,7 @@ def _require_text(value: str, name: str) -> None:
         raise ValueError(f"{name} is required")
 
 
-def _env_master_permit() -> bool:
+def env_master_permit() -> bool:
     """Global master permit projection; never sufficient authority by itself."""
 
     from .runtime import AdaptiveFlockRuntimeConfig
@@ -225,6 +228,34 @@ def _env_master_permit() -> bool:
         return AdaptiveFlockRuntimeConfig.from_env().learned_activation_replay_verified
     except ValueError:
         return False
+
+
+def load_verification_integrity(
+    ledger: QualificationLedger,
+    integrity: ControlPlaneIntegrity | None,
+) -> ControlPlaneIntegrity:
+    """Load the receipt verification key fail-closed; never mint key material.
+
+    Shared with the Task 14 activation evaluator: a missing or unsafe owner
+    key raises, and the caller fails closed as an authentication failure.
+    """
+
+    if integrity is not None:
+        return integrity
+    return ControlPlaneIntegrity(
+        Path(ledger.state.path).parent,
+        create_if_missing=False,
+    )
+
+
+def receipt_authenticates(
+    receipt: QualificationReceipt,
+    *,
+    integrity: ControlPlaneIntegrity,
+) -> bool:
+    """Fail-closed terminal receipt authentication (never mints key material)."""
+
+    return verify_terminal_receipt(receipt.payload, integrity=integrity)
 
 
 class ActivationService:
@@ -239,7 +270,7 @@ class ActivationService:
     ) -> None:
         self._ledger = ledger
         self._integrity = integrity
-        self._master_permit = master_permit or _env_master_permit
+        self._master_permit = master_permit or env_master_permit
 
     def list_grants(self, *, receipt_id: str | None = None) -> list[ActivationGrant]:
         return self._ledger.list_grants(receipt_id=receipt_id)
@@ -392,17 +423,14 @@ class ActivationService:
             integrity = self._verification_integrity()
         except (OSError, ValueError) as exc:
             raise ActivationConflict("receipt_authentication_failed") from exc
-        if not verify_terminal_receipt(receipt.payload, integrity=integrity):
+        if not receipt_authenticates(receipt, integrity=integrity):
             raise ActivationConflict("receipt_authentication_failed")
 
     def _verification_integrity(self) -> ControlPlaneIntegrity:
         # Verification never mints key material: a missing or unsafe owner key
         # fails closed as an authentication failure.
         if self._integrity is None:
-            self._integrity = ControlPlaneIntegrity(
-                Path(self._ledger.state.path).parent,
-                create_if_missing=False,
-            )
+            self._integrity = load_verification_integrity(self._ledger, None)
         return self._integrity
 
     def _scope_preview(

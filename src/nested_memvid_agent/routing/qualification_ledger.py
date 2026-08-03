@@ -1129,6 +1129,60 @@ class QualificationLedger:
                 now=now,
             )
 
+    def suspend_grant(
+        self,
+        grant_id: str,
+        *,
+        reason: str,
+        expected_sequence: int,
+        receipt_id: str | None = None,
+    ) -> ActivationTransition:
+        """Append an automatic suspension checked against the latest revision.
+
+        Task 14: the activation evaluator appends ``suspended`` for material
+        binding drift with the exact latest-transition sequence it observed.
+        A racing evaluator that already appended wins; the loser gets a
+        :class:`QualificationRevisionConflict`, reloads, and converges on the
+        same terminal state instead of double-writing.
+        """
+
+        _require_text(reason, "reason")
+        if (
+            isinstance(expected_sequence, bool)
+            or not isinstance(expected_sequence, int)
+            or expected_sequence < 1
+        ):
+            raise ValueError("expected_sequence must be a positive integer")
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            grant_row = conn.execute(
+                "SELECT grant_id FROM routing_activation_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+            if grant_row is None:
+                raise ValueError(f"unknown activation grant: {grant_id}")
+            last = conn.execute(
+                """
+                SELECT sequence FROM routing_activation_transitions
+                WHERE grant_id = ? ORDER BY sequence DESC LIMIT 1
+                """,
+                (grant_id,),
+            ).fetchone()
+            current = 0 if last is None else int(last["sequence"])
+            if current != expected_sequence:
+                raise QualificationRevisionConflict(
+                    "activation_grant_transition", grant_id, current
+                )
+            return self._insert_transition_row(
+                conn,
+                grant_id,
+                "suspended",
+                reason,
+                receipt_id=receipt_id,
+                now=now,
+            )
+
     def list_transitions(self, grant_id: str) -> list[ActivationTransition]:
         with self.state._connect() as conn:
             rows = conn.execute(

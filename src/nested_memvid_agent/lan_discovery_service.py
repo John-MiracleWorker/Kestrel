@@ -34,6 +34,8 @@ _LAN_SCAN_ID_RE = re.compile(r"lan_[0-9a-f]{32}\Z")
 _MAX_AFFINITIES = 16
 _MAX_AFFINITY_UTF8_BYTES = 64
 
+ActivationTargetEligibility = Literal["eligible", "hard_ineligible", "outage"]
+
 LanStaleReason = Literal[
     "interface_changed",
     "address_changed",
@@ -718,6 +720,28 @@ class LanDiscoveryService:
             endpoint_fingerprint=result[3],
             outage_observed=result[4],
         )
+
+    def activation_target_eligibility(self, target_id: str) -> ActivationTargetEligibility:
+        """Classify current hard eligibility for activation evaluation (Task 14).
+
+        A removed, disabled, or trust-invalidated target is hard-ineligible
+        and suspends grants bound to it.  A temporarily unreachable but still
+        enabled and operator-trusted target is an ephemeral outage: it fails
+        or falls back at route time and never suspends a grant by itself.
+        Read-only; never mutates routing registry state.
+        """
+
+        if type(target_id) is not str or not target_id:
+            raise ValueError("LAN activation eligibility target ID is required")
+        entry = self.registry.get_model_target(target_id)
+        if entry is None:
+            return "hard_ineligible"
+        target = entry.target
+        if not target.enabled or target.trust_class == "unconfirmed":
+            return "hard_ineligible"
+        if target.health in ("unavailable", "open"):
+            return "outage"
+        return "eligible"
 
     def review_lan_target(
         self,
