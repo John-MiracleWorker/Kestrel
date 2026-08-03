@@ -1,6 +1,7 @@
 import { Bird } from "lucide-react";
 import { StatusBadge } from "../components";
 import { RoutingCenter } from "../routing/RoutingCenter";
+import { ActivationsWorkspace } from "./activation/ActivationsWorkspace";
 import { LanDiscoveryPanel } from "./lan/LanDiscoveryPanel";
 import { QualificationWorkspace } from "./qualification/QualificationWorkspace";
 
@@ -21,6 +22,9 @@ export function FlockWorkspace({
     return (
       <QualificationWorkspace onError={onError} onNotice={onNotice} />
     );
+  }
+  if (subroute === "activations") {
+    return <ActivationsWorkspace onError={onError} onNotice={onNotice} />;
   }
   if (subroute === "lan" || subroute === "discovery") {
     return <LanDiscoveryPanel onError={onError} onNotice={onNotice} />;
@@ -44,6 +48,14 @@ export function FlockWorkspace({
               <StatusBadge value="available" />
               <span>
                 Bounded, owner-reviewed evidence runs with decimal-text caps.
+              </span>
+            </a>
+            <a className="data-row" href="#/flock/activations">
+              <strong>Scoped activation</strong>
+              <StatusBadge value="available" />
+              <span>
+                Exact, owner-confirmed grant activation, suspension, and
+                revocation.
               </span>
             </a>
             <a className="data-row" href="#/flock/lan">

@@ -309,7 +309,9 @@ export function RoutingCenter({
             />
             <p className="muted">
               Routing is launch-controlled. Inventory changes affect future attempts and never expand a task&apos;s tools,
-              workspace, approvals, or privacy policy.
+              workspace, approvals, or privacy policy. Learned-route activation is owner-confirmed per exact scope
+              under <a href="#/flock/activations">Scoped activation</a>; enabling a provider or target here never
+              activates a grant.
             </p>
           </>
         ) : (
@@ -813,6 +815,11 @@ function RoutingRunHistory({ report }: { report: RoutingRunReport }) {
               {" · "}
               route regret {formatUsd(shadow.route_regret_usd)}
             </span>
+            {shadow.activated ? (
+              <a className="btn subtle" href="#/flock/activations">
+                Grant &amp; receipt evidence
+              </a>
+            ) : null}
           </div>
         );
       })}
