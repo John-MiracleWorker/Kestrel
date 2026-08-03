@@ -28,6 +28,17 @@ The activation transaction:
    schema v4 terminal-run evidence trigger bars new rows on
    ``routing_qualification_events`` once the run is completed, so the
    append-only transition chain is the event log.
+
+Task 16 adds owner revocation and resume on top of the same append-only
+chain: :meth:`ActivationService.revoke` appends a terminal ``revoked``
+transition checked against the expected latest-transition revision, and a
+revoked grant can never return to active -- reactivation requires fresh
+qualification plus owner confirmation.  :meth:`ActivationService.activate_existing`
+resumes a suspended grant through an append-only ``resumed`` transition;
+the route-time evaluator re-verifies every binding, so resuming a grant
+whose drift persists simply re-suspends on the next decision.  The
+environment master flag remains only a global permit: it never undoes a
+revocation or a suspension.
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ from .qualification_records import (
     ActivationGrantDraft,
     ActivationTransition,
     QualificationReceipt,
+    QualificationRevisionConflict,
     QualificationRun,
 )
 
@@ -89,6 +101,8 @@ REVOCATION_BEHAVIOR = (
 )
 
 _ACTIVATION_REASON = "owner_confirmed_activation"
+_REVOCATION_REASON = "owner_revocation"
+_RESUME_REASON = "owner_resumed_activation"
 
 _BINDING_CHECK_ORDER: tuple[str, ...] = (
     "project_authority",
@@ -373,7 +387,101 @@ class ActivationService:
             ),
         )
 
+    def revoke(
+        self,
+        grant_id: str,
+        *,
+        expected_revision: int | None = None,
+        reason: str = _REVOCATION_REASON,
+    ) -> ActivationTransition:
+        """Append a terminal ``revoked`` transition (Task 16).
+
+        The revocation is checked against the expected latest-transition
+        revision when one is given: a stale expectation raises
+        :class:`QualificationRevisionConflict` and appends nothing.  A
+        revoked grant is terminal -- the schema v4 transition vocabulary
+        bars every follow-up transition, so reactivation requires fresh
+        qualification plus owner confirmation.
+        """
+
+        grant, latest = self._grant_state(grant_id)
+        if latest is not None and latest.transition_type == "revoked":
+            raise ValueError(f"activation grant {grant_id} is already revoked")
+        self._check_expected_revision(grant_id, latest, expected_revision)
+        return self._ledger.append_transition(
+            grant_id,
+            "revoked",
+            reason,
+            receipt_id=grant.qualification_receipt_id,
+        )
+
+    def activate_existing(
+        self,
+        grant_id: str,
+        *,
+        expected_revision: int | None = None,
+        reason: str = _RESUME_REASON,
+    ) -> ActivationTransition:
+        """Resume a suspended grant through an append-only transition (Task 16).
+
+        Only a grant whose latest transition is ``suspended`` can resume,
+        and only when the expected latest-transition revision still matches.
+        A revoked grant can never return to active: reactivation requires
+        fresh qualification plus owner confirmation.  Resuming does not
+        re-verify bindings here -- the route-time evaluator re-verifies
+        every binding on the next decision and re-suspends on drift.
+        """
+
+        grant, latest = self._grant_state(grant_id)
+        if latest is None:
+            raise ValueError(f"activation grant {grant_id} has no transitions")
+        if latest.transition_type == "revoked":
+            raise ValueError(
+                f"activation grant {grant_id} is revoked; reactivation "
+                "requires fresh qualification plus owner confirmation"
+            )
+        if latest.transition_type in ("activated", "resumed"):
+            raise ValueError(f"activation grant {grant_id} is already active")
+        self._check_expected_revision(grant_id, latest, expected_revision)
+        return self._ledger.append_transition(
+            grant_id,
+            "resumed",
+            reason,
+            receipt_id=grant.qualification_receipt_id,
+        )
+
     # -- internals ------------------------------------------------------------
+
+    def _grant_state(
+        self,
+        grant_id: str,
+    ) -> tuple[ActivationGrant, ActivationTransition | None]:
+        _require_text(grant_id, "grant_id")
+        grant = self._ledger.get_grant(grant_id)
+        if grant is None:
+            raise ValueError(f"unknown activation grant: {grant_id}")
+        transitions = self._ledger.list_transitions(grant_id)
+        return grant, transitions[-1] if transitions else None
+
+    def _check_expected_revision(
+        self,
+        grant_id: str,
+        latest: ActivationTransition | None,
+        expected_revision: int | None,
+    ) -> None:
+        if expected_revision is None:
+            return
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        current = 0 if latest is None else latest.sequence
+        if current != expected_revision:
+            raise QualificationRevisionConflict(
+                "activation_grant_transition", grant_id, current
+            )
 
     def _receipt_context(
         self,

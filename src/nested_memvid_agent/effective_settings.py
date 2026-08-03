@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,14 @@ SETTING_CATEGORIES: tuple[str, ...] = (
 )
 
 _NETWORK_CAPABILITY_KEY = "network"
+
+#: Owner master switch for learned-routing authority (Adaptive Flock plan,
+#: Task 16).  The configured value is owner authority intent; the effective
+#: value additionally requires the global replay-verification permit, which
+#: is only a permit -- it never grants authority and never undoes a
+#: revocation or suspension.
+_LEARNED_AUTHORITY_SETTING_ID = "flock.learned_authority.enabled"
+_LEARNED_AUTHORITY_PERMIT_BLOCKER = "permit:learned_replay_verification_required"
 
 
 @dataclass(frozen=True)
@@ -313,6 +322,12 @@ SETTING_DESCRIPTORS: tuple[SettingDescriptor, ...] = (
         authority_impact="grants_authority",
         privacy_impact="local_write",
     ),
+    _permission(
+        "flock.learned_authority.enabled",
+        "enable_learned_routing_authority",
+        authority_impact="grants_authority",
+        privacy_impact="none",
+    ),
     SettingDescriptor(
         id="server.require_api_auth",
         key="require_api_auth",
@@ -504,17 +519,38 @@ def _configured_value(
     return getattr(runtime, descriptor.key)
 
 
+def _learned_authority_permit_value(
+    permit: Callable[[], bool] | None,
+) -> bool:
+    """Resolve the global replay-verification permit (fail-closed).
+
+    The permit only ever blocks effectiveness; it is never a source of
+    learned-routing authority by itself.
+    """
+
+    if permit is not None:
+        if not callable(permit):
+            raise ValueError("learned_authority_permit must be callable")
+        return bool(permit())
+    from .routing.activation_service import env_master_permit
+
+    return env_master_permit()
+
+
 def project_settings(
     *,
     runtime: RuntimeSettings,
     capabilities: Any = (),
     config: AgentConfig | None = None,
+    learned_authority_permit: Callable[[], bool] | None = None,
 ) -> SettingsProjection:
     """Project configured/effective settings truth from current stores.
 
     Values are read from the loaded runtime settings (and the live config for
     launch-controlled evidence); capability blockers come from the caller's
-    capability catalog. No values are persisted here.
+    capability catalog. No values are persisted here.  The learned-routing
+    authority master setting is effective only when the configured owner
+    switch and the global replay-verification permit both hold.
     """
 
     disabled_capabilities = {
@@ -523,6 +559,7 @@ def project_settings(
         if isinstance(item, dict) and not bool(item.get("effective_enabled", True))
     }
     fallback_config = config if config is not None else AgentConfig()
+    authority_permit: bool | None = None
     projected: list[ProjectedSetting] = []
     for descriptor in SETTING_DESCRIPTORS:
         configured = _configured_value(descriptor, runtime, fallback_config)
@@ -532,8 +569,16 @@ def project_settings(
             and descriptor.requires_capability in disabled_capabilities
         ):
             blockers = (f"capability:{descriptor.requires_capability}_disabled",)
-        if blockers and isinstance(configured, bool):
-            effective: Any = False
+        if descriptor.id == _LEARNED_AUTHORITY_SETTING_ID:
+            if authority_permit is None:
+                authority_permit = _learned_authority_permit_value(
+                    learned_authority_permit
+                )
+            if configured is True and not authority_permit:
+                blockers = (*blockers, _LEARNED_AUTHORITY_PERMIT_BLOCKER)
+            effective = configured is True and authority_permit
+        elif blockers and isinstance(configured, bool):
+            effective = False
         else:
             effective = configured
         provenance = (

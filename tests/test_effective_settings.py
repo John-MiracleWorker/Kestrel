@@ -271,3 +271,80 @@ def test_blocked_setting_still_commits_and_reflects_in_projection(tmp_path: Path
     assert web_search.blockers == ("capability:network_disabled",)
     # A blocked capability must never report effective success.
     assert web_search.configured_value != web_search.effective_value
+
+
+def test_flock_learned_authority_defaults_off(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = _store(tmp_path)
+    projection = project_settings(runtime=store.load(config), capabilities=())
+
+    setting = projection.require("flock.learned_authority.enabled")
+    assert setting.configured_value is False
+    assert setting.effective_value is False
+    assert setting.blockers == ()
+    assert setting.writable is True
+    assert setting.category == "Safety and permissions"
+    assert setting.type == "boolean"
+    assert setting.authority_impact == "grants_authority"
+    assert setting.applies == "new_runs"
+
+
+def test_flock_learned_authority_requires_global_permit_for_effectiveness(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    store = _store(tmp_path)
+    initial = store.load(config)
+
+    updated = apply_setting_change(
+        store,
+        config,
+        setting_id="flock.learned_authority.enabled",
+        value=True,
+        expected_revision=initial.revision,
+    )
+    # Without the global replay-verification permit the configured on-switch
+    # stays ineffective: the environment flag is a permit, never authority.
+    projection = project_settings(runtime=updated.settings, capabilities=())
+    setting = projection.require("flock.learned_authority.enabled")
+    assert setting.configured_value is True
+    assert setting.effective_value is False
+    assert setting.blockers == ("permit:learned_replay_verification_required",)
+
+
+def test_flock_learned_authority_effective_with_global_permit(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = _store(tmp_path)
+    initial = store.load(config)
+
+    updated = apply_setting_change(
+        store,
+        config,
+        setting_id="flock.learned_authority.enabled",
+        value=True,
+        expected_revision=initial.revision,
+    )
+    projection = project_settings(
+        runtime=updated.settings,
+        capabilities=(),
+        learned_authority_permit=lambda: True,
+    )
+    setting = projection.require("flock.learned_authority.enabled")
+    assert setting.configured_value is True
+    assert setting.effective_value is True
+    assert setting.blockers == ()
+
+    # Turning the master setting back off is immediate and revision-checked.
+    disabled = apply_setting_change(
+        store,
+        config,
+        setting_id="flock.learned_authority.enabled",
+        value=False,
+        expected_revision=updated.settings.revision,
+    )
+    restored = project_settings(
+        runtime=disabled.settings,
+        capabilities=(),
+        learned_authority_permit=lambda: True,
+    )
+    assert restored.require("flock.learned_authority.enabled").effective_value is False

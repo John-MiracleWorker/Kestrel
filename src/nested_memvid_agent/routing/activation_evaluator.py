@@ -22,6 +22,11 @@ same terminal state (one appends, the others reload).  Only safe reason
 codes are returned -- never secret material.  An ephemeral provider outage
 yields normal routing failure/fallback downstream and never suspends a grant
 or rewrites historical quality by itself.
+
+Task 16: a grant whose latest transition is ``resumed`` (owner resume of a
+suspension) is active again and re-verified end to end on the next
+decision, while ``revoked`` is terminal -- the environment master flag is
+only a global permit and never undoes a revocation or a suspension.
 """
 
 from __future__ import annotations
@@ -95,6 +100,10 @@ TARGET_ELIGIBILITY_STATES: tuple[str, ...] = (
 )
 
 _DETERMINISTIC_ONLY_RISKS: tuple[str, ...] = ("high", "critical")
+
+#: Transition types that leave a grant active (Task 16: an owner resume of a
+#: suspension returns the grant to active and it is re-verified in full).
+_ACTIVE_TRANSITION_TYPES: tuple[str, ...] = ("activated", "resumed")
 
 
 def _require_text(value: str, name: str) -> None:
@@ -245,8 +254,10 @@ class ActivationEvaluator:
         transitions = self._ledger.list_transitions(grant.grant_id)
         latest = transitions[-1] if transitions else None
 
-        # 1. current grant transition.
-        if latest is None or latest.transition_type != "activated":
+        # 1. current grant transition: ``activated``/``resumed`` are active;
+        # ``revoked`` is terminal and ``suspended`` stays ineffective until
+        # an owner resume -- the environment permit never undoes either.
+        if latest is None or latest.transition_type not in _ACTIVE_TRANSITION_TYPES:
             code = (
                 "grant_revoked"
                 if latest is not None and latest.transition_type == "revoked"

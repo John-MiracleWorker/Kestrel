@@ -85,6 +85,11 @@ class RuntimeSettings:
     enable_auto_consolidation_shadow: bool = False
     enable_auto_consolidation_apply: bool = False
     enable_diagnosis_to_patch: bool = False
+    # Owner master switch for learned-routing authority (Adaptive Flock plan,
+    # Task 16).  Off changes effective routing immediately for new leases
+    # without rewriting grant history; it is never a source of authority by
+    # itself and never undoes a revocation or suspension.
+    enable_learned_routing_authority: bool = False
     updated_at: str | None = None
 
     @classmethod
@@ -369,6 +374,7 @@ def merge_runtime_settings(config: AgentConfig, current: RuntimeSettings, raw: d
         "autonomy_mode",
         "provider_startup_probe",
         "enable_semantic_orchestration",
+        "enable_learned_routing_authority",
         *TOOL_PERMISSION_FIELDS,
     }:
         if key in raw:
@@ -460,6 +466,7 @@ def _normalize_settings(settings: RuntimeSettings) -> RuntimeSettings:
         enable_auto_consolidation_shadow=_clean_bool(settings.enable_auto_consolidation_shadow),
         enable_auto_consolidation_apply=_clean_bool(settings.enable_auto_consolidation_apply),
         enable_diagnosis_to_patch=_clean_bool(settings.enable_diagnosis_to_patch),
+        enable_learned_routing_authority=_clean_bool(settings.enable_learned_routing_authority),
         updated_at=str(settings.updated_at) if settings.updated_at else None,
     )
 
