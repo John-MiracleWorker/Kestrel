@@ -3476,11 +3476,13 @@ def test_get_run_waits_for_publication_after_slow_terminal_finalizer(
         manager.state.transition_run(run_id, "running")
         manager.state.transition_run(run_id, "completed", stop_reason="complete")
         terminal_transitioned.set()
-        assert release_publication.wait(timeout=5)
+        assert release_publication.wait(timeout=10)
         manager.events.publish(run_id, "run.completed", {"probe": True})
 
     manager._schedule_primary_run(run.run_id, slow_finalizer)
-    assert terminal_transitioned.wait(timeout=1)
+    # Windows scheduler + thread startup is slow; use generous waits so the
+    # test exercises the publication-wait logic, not the platform's wake latency.
+    assert terminal_transitioned.wait(timeout=10)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         observed_future = pool.submit(manager.get_run, run.run_id)
@@ -3491,7 +3493,7 @@ def test_get_run_waits_for_publication_after_slow_terminal_finalizer(
         assert listed["stop_reason"] == "publication_pending"
         assert listed["publication_pending"] is True
         release_publication.set()
-        observed = observed_future.result(timeout=1)
+        observed = observed_future.result(timeout=10)
 
     timeline = manager.state.list_run_steps(run.run_id)
     assert observed["status"] == "completed"
