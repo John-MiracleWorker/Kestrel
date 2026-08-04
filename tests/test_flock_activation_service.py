@@ -23,7 +23,10 @@ from nested_memvid_agent.routing.activation_service import (
 from nested_memvid_agent.routing.learned_router import LearnedRouterState
 from nested_memvid_agent.routing.qualification_digest import canonical_digest
 from nested_memvid_agent.routing.qualification_evaluator import ScopeQualificationResult
-from nested_memvid_agent.routing.qualification_ledger import QualificationLedger
+from nested_memvid_agent.routing.qualification_ledger import (
+    ActivationGrantAuthority,
+    QualificationLedger,
+)
 from nested_memvid_agent.routing.qualification_models import (
     CorpusItem,
     CorpusManifest,
@@ -33,6 +36,7 @@ from nested_memvid_agent.routing.qualification_models import (
 )
 from nested_memvid_agent.routing.qualification_receipt import build_terminal_receipt
 from nested_memvid_agent.routing.qualification_records import (
+    ActivationGrantDraft,
     QualificationReceipt,
     QualificationRun,
     QualificationRunDraft,
@@ -587,4 +591,40 @@ def test_reactivation_supersedes_prior_grant_in_same_transaction(
     assert [transition.grant_id for transition in second.superseded] == [old_grant.grant_id]
     new_transitions = qualification_ledger.list_transitions(new_grant.grant_id)
     assert [transition.transition_type for transition in new_transitions] == ["activated"]
-    assert len(service.list_grants()) == 2
+
+
+# --- grant creation is restricted to the service path -------------------------------
+
+
+def test_direct_ledger_grant_creation_requires_service_authority(
+    service: ActivationService,
+    qualification_ledger: QualificationLedger,
+    master_permit: None,
+) -> None:
+    receipt = completed_qualified_receipt(qualification_ledger)
+    forged = ActivationGrantDraft(
+        grant_id="grant_forged",
+        run_id=receipt.run_id,
+        target_id="target_b",
+        qualification_receipt_id=receipt.receipt_id,
+        created_by="attacker@evil.test",
+    )
+    # A caller holding the ledger cannot mint a grant without the token the
+    # ledger issued to the activation service path.
+    with pytest.raises(TypeError):
+        qualification_ledger.activate_grants((forged,), reason="forged_activation")  # type: ignore[call-arg]
+    with pytest.raises(PermissionError, match="activation service"):
+        qualification_ledger.activate_grants(
+            (forged,),
+            reason="forged_activation",
+            authority=ActivationGrantAuthority(),
+        )
+    # The forged grant never reached the ledger, so no evaluator can see it.
+    assert service.list_grants() == []
+    # The legitimate owner-confirmed service flow still creates the grant.
+    result = service.activate_scopes(activation_request(receipt))
+    assert [grant.target_id for grant in result.grants] == ["target_b"]
+    assert [grant.created_by for grant in result.grants] == [OWNER]
+    assert [grant.grant_id for grant in service.list_grants()] == [
+        grant.grant_id for grant in result.grants
+    ]

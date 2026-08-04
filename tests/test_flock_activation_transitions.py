@@ -390,7 +390,22 @@ def test_revoke_appends_terminal_transition_without_rewriting_history(
     assert harness.history() == ["activated", "revoked"]
     # Revocation is terminal: a second revoke cannot extend the chain.
     with pytest.raises(ValueError, match="revoked"):
-        harness.service.revoke(harness.grant.grant_id)
+        harness.service.revoke(harness.grant.grant_id, expected_revision=2)
+    assert harness.history() == ["activated", "revoked"]
+
+
+def test_revoke_requires_expected_revision(harness: TransitionHarness) -> None:
+    # An unchecked revoke is never reachable through the service API.
+    with pytest.raises(ValueError, match="expected_revision"):
+        harness.service.revoke(harness.grant.grant_id, expected_revision=None)
+    assert harness.history() == ["activated"]
+    # A wrong revision still conflicts and appends nothing.
+    with pytest.raises(QualificationRevisionConflict):
+        harness.service.revoke(harness.grant.grant_id, expected_revision=99)
+    assert harness.history() == ["activated"]
+    # The correct revision still revokes.
+    transition = harness.service.revoke(harness.grant.grant_id, expected_revision=1)
+    assert transition.transition_type == "revoked"
     assert harness.history() == ["activated", "revoked"]
 
 

@@ -60,7 +60,25 @@ from .qualification_serialization import (
     transition_from_row,
 )
 
-__all__ = ["BUDGET_SETTLEMENT_OUTCOMES", "QualificationLedger"]
+__all__ = [
+    "BUDGET_SETTLEMENT_OUTCOMES",
+    "ActivationGrantAuthority",
+    "QualificationLedger",
+]
+
+
+class ActivationGrantAuthority:
+    """Service-internal capability token authorizing grant creation.
+
+    The ledger issues exactly one token per instance and
+    :meth:`QualificationLedger.activate_grants` refuses any call that does
+    not present that token.  Grant creation is therefore restricted to the
+    activation service path -- the only component that authenticates the
+    receipt HMAC, confirms the owner principal, and re-verifies every
+    binding digest before a grant row is inserted.
+    """
+
+    __slots__ = ()
 
 BUDGET_SETTLEMENT_OUTCOMES: tuple[str, ...] = (
     "completed",
@@ -122,7 +140,19 @@ class QualificationLedger:
     ) -> None:
         self.state = state
         self._integrity = integrity
+        self._grant_authority = ActivationGrantAuthority()
         ensure_routing_schema(self.state)
+
+    def _grant_activation_authority(self) -> ActivationGrantAuthority:
+        """Service-internal: the grant-creation capability for this ledger.
+
+        Only :class:`nested_memvid_agent.routing.activation_service.ActivationService`
+        may hold and present this token; every other caller must go through
+        the service so receipt authentication, owner confirmation, and
+        binding verification cannot be bypassed.
+        """
+
+        return self._grant_authority
 
     def schema_version(self) -> int:
         with self.state._connect() as conn:
@@ -1048,6 +1078,7 @@ class QualificationLedger:
         drafts: Sequence[ActivationGrantDraft],
         *,
         reason: str,
+        authority: ActivationGrantAuthority,
     ) -> tuple[
         tuple[ActivationGrant, ActivationTransition, tuple[ActivationTransition, ...]],
         ...,
@@ -1061,8 +1092,19 @@ class QualificationLedger:
         appending a ``revoked`` transition carrying a
         ``superseded_by_grant:<grant_id>`` reason.  Any failure rolls back
         the whole batch: activation is all-or-nothing.
+
+        Grant creation is restricted to the activation service path: the
+        caller must present the :class:`ActivationGrantAuthority` token this
+        ledger issued to its activation service.  Any other token -- or a
+        freshly minted one -- is rejected before the transaction opens.
         """
 
+        if authority is not self._grant_authority:
+            raise PermissionError(
+                "grant creation requires the activation service path: "
+                "activate_grants accepts only the ledger-issued "
+                "ActivationGrantAuthority token"
+            )
         batch = tuple(drafts)
         if not batch:
             raise ValueError("at least one activation grant draft is required")

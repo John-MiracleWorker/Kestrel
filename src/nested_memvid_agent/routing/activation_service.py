@@ -285,6 +285,7 @@ class ActivationService:
         self._ledger = ledger
         self._integrity = integrity
         self._master_permit = master_permit or env_master_permit
+        self._grant_authority = ledger._grant_activation_authority()
 
     def list_grants(self, *, receipt_id: str | None = None) -> list[ActivationGrant]:
         return self._ledger.list_grants(receipt_id=receipt_id)
@@ -378,7 +379,11 @@ class ActivationService:
             self._grant_draft(run, receipt, request.principal, scope_digest, target)
             for scope_digest, target in selected
         )
-        activations = self._ledger.activate_grants(drafts, reason=_ACTIVATION_REASON)
+        activations = self._ledger.activate_grants(
+            drafts,
+            reason=_ACTIVATION_REASON,
+            authority=self._grant_authority,
+        )
         return ActivationResult(
             grants=tuple(activation[0] for activation in activations),
             transitions=tuple(activation[1] for activation in activations),
@@ -396,14 +401,19 @@ class ActivationService:
     ) -> ActivationTransition:
         """Append a terminal ``revoked`` transition (Task 16).
 
-        The revocation is checked against the expected latest-transition
-        revision when one is given: a stale expectation raises
+        The revocation always requires the expected latest-transition
+        revision: an unchecked revoke (``expected_revision=None``) is
+        rejected, a stale expectation raises
         :class:`QualificationRevisionConflict` and appends nothing.  A
         revoked grant is terminal -- the schema v4 transition vocabulary
         bars every follow-up transition, so reactivation requires fresh
         qualification plus owner confirmation.
         """
 
+        if expected_revision is None:
+            raise ValueError(
+                "expected_revision is required to revoke an activation grant"
+            )
         grant, latest = self._grant_state(grant_id)
         if latest is not None and latest.transition_type == "revoked":
             raise ValueError(f"activation grant {grant_id} is already revoked")

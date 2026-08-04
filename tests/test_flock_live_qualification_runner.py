@@ -20,6 +20,7 @@ from scripts.run_flock_live_qualification import (
     REPORT_SCHEMA,
     build_live_report,
     main,
+    report_from_receipt,
     verify_live_report,
 )
 
@@ -180,6 +181,89 @@ def test_runner_requires_explicit_confirmation_flag() -> None:
                 "report.json",
             ]
         )
+
+
+def _attempt_summary(
+    attempt_id: str,
+    target_id: str,
+    evidence_kind: str | None = "real_provider",
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "attempt_id": attempt_id,
+        "case_id": f"case_{attempt_id}",
+        "target_id": target_id,
+    }
+    if evidence_kind is not None:
+        summary["evidence_kind"] = evidence_kind
+    return summary
+
+
+def _receipt_payload(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "run": {"run_id": "qual_live_001"},
+        "digests": {"scope": "9" * 64},
+        "attempts": attempts,
+        "payload_digest": "c" * 64,
+        "status": "completed",
+        "spend": {
+            "actual_spend_micros": 1_000_000,
+            "unresolved_reserve_micros": 0,
+            "inflight_reserve_micros": 0,
+        },
+        "caps": {"max_spend_micros": 50_000_000},
+        "replay": {"repeats": 20, "unique_projection_digests": 1},
+        "guardrail_violations": 0,
+        "terminal_reason": "matrix_exhausted",
+    }
+
+
+def _report_from_attempts(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    return report_from_receipt(
+        _receipt_payload(attempts),
+        source_commit="a" * 40,
+        installed_artifact_digest="b" * 64,
+        receipt_id="receipt-qual_live_001-terminal",
+        platform="macOS-15.5",
+        architecture="arm64",
+        project_digest="d" * 64,
+        tree_digest="e" * 64,
+    )
+
+
+def test_mock_executor_receipt_cannot_certify_live_qualification() -> None:
+    attempts = [
+        _attempt_summary("attempt_1", "target_a", "deterministic_mock"),
+        _attempt_summary("attempt_2", "target_b", "deterministic_mock"),
+    ]
+    report = _report_from_attempts(attempts)
+    # The receipt's per-attempt evidence kind is projected, never relabeled.
+    assert {target["evidence_kind"] for target in report["targets"]} == {
+        "deterministic_mock"
+    }
+    with pytest.raises(ValueError, match="mock evidence cannot certify"):
+        verify_live_report(report)
+
+
+def test_real_attempt_evidence_kind_propagates_into_report() -> None:
+    attempts = [
+        _attempt_summary("attempt_1", "target_a"),
+        _attempt_summary("attempt_2", "target_b"),
+    ]
+    report = _report_from_attempts(attempts)
+    assert {target["evidence_kind"] for target in report["targets"]} == {
+        "real_provider"
+    }
+    verify_live_report(report)
+
+
+def test_missing_attempt_evidence_kind_fails_closed() -> None:
+    attempts = [
+        _attempt_summary("attempt_1", "target_a", None),
+        _attempt_summary("attempt_2", "target_b", None),
+    ]
+    report = _report_from_attempts(attempts)
+    with pytest.raises(ValueError, match="two real eligible targets"):
+        verify_live_report(report)
 
 
 def test_report_is_deeply_independent_of_builder_inputs() -> None:

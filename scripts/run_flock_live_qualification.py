@@ -216,7 +216,14 @@ def report_from_receipt(
     project_digest: str | None = None,
     tree_digest: str | None = None,
 ) -> dict[str, Any]:
-    """Project an authenticated terminal receipt into a live evidence report."""
+    """Project an authenticated terminal receipt into a live evidence report.
+
+    The per-attempt ``evidence_kind`` recorded in the receipt is propagated
+    into each target entry; a target only projects as ``real_provider`` when
+    every one of its attempts says so.  Missing, mock, or mixed kinds are
+    carried through verbatim (or as ``"mixed"``) so the verifier's
+    mock-rejection and minimum-real-target checks genuinely bite.
+    """
 
     run_section = payload.get("run")
     if not isinstance(run_section, Mapping):
@@ -229,6 +236,7 @@ def report_from_receipt(
     if not isinstance(attempts, Sequence) or isinstance(attempts, str):
         raise ValueError("terminal receipt is missing attempt evidence")
     by_target: dict[str, dict[str, Any]] = {}
+    kinds_by_target: dict[str, set[str]] = {}
     for summary in attempts:
         if not isinstance(summary, Mapping):
             raise ValueError("attempt evidence must be a mapping")
@@ -240,7 +248,7 @@ def report_from_receipt(
             {
                 "target_id": target_id,
                 "eligible": True,
-                "evidence_kind": REAL_EVIDENCE_KIND,
+                "evidence_kind": "",
                 "attempt_ids": [],
                 "provider": "unknown",
                 "model": "unknown",
@@ -254,6 +262,12 @@ def report_from_receipt(
             },
         )
         entry["attempt_ids"].append(str(summary.get("attempt_id") or ""))
+        kinds_by_target.setdefault(target_id, set()).add(
+            str(summary.get("evidence_kind") or "")
+        )
+    for target_id, entry in by_target.items():
+        kinds = kinds_by_target[target_id]
+        entry["evidence_kind"] = next(iter(kinds)) if len(kinds) == 1 else "mixed"
     resolved_project = project_digest or str(scope_payload.get("project_digest") or "")
     resolved_tree = tree_digest or str(scope_payload.get("tree_digest") or "")
     if not resolved_project or not resolved_tree:
