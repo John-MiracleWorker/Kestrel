@@ -1391,15 +1391,24 @@ async function privateEmptyControlPublicationPending(pathValue) {
     // redundant — and harmful: realpath() can throw or observe a mid-replace
     // path under a symlinked tmp root, turning a legitimate pending publication
     // into a hard failure.
-    return (
+    const pending =
       !metadata.isSymbolicLink() &&
       metadata.isFile() &&
       metadata.nlink === 1 &&
       metadata.size === 0 &&
       (process.platform === "win32" ||
         (metadata.uid === process.getuid?.() &&
-          (metadata.mode & 0o777) === 0o600))
-    );
+          (metadata.mode & 0o777) === 0o600));
+    if (!pending && process.env.KESTREL_DEBUG_SMOKE === "1") {
+      process.stderr.write(
+        `[smoke-debug] not-pending path=${pathValue} ` +
+          `symlink=${metadata.isSymbolicLink()} isFile=${metadata.isFile()} ` +
+          `nlink=${metadata.nlink} size=${metadata.size} ` +
+          `uid=${metadata.uid}==${process.getuid?.()} ` +
+          `mode=${(metadata.mode & 0o777).toString(8)}\n`,
+      );
+    }
+    return pending;
   } catch {
     return false;
   }
