@@ -378,6 +378,14 @@ else {
     if ($dockerContextProbe.exit_code -eq 0) {
         $dockerContext = ([string] $dockerContextProbe.stdout).Trim()
     }
+    # When the docker daemon isn't reachable, `context show` fails and
+    # $dockerContext stays $null; ([string] $null) is "" which fails to bind to
+    # the [string[]] Arguments parameter ("Cannot bind argument ... empty
+    # string"). Fall back to the standard "default" context so the downstream
+    # probes bind cleanly and simply report non-zero exit codes.
+    if ([string]::IsNullOrEmpty($dockerContext)) {
+        $dockerContext = "default"
+    }
     $dockerEndpointProbe = Invoke-BoundedProbe -Executable $dockerExecutable -Arguments @(
         "context", "inspect", ([string] $dockerContext), "--format",
         "{{.Endpoints.docker.Host}}"
