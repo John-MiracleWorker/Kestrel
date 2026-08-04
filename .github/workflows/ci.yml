@@ -271,8 +271,6 @@ jobs:
       - name: Validate developer directory bundle contracts
         run: npm run test:build-dir
         working-directory: desktop
-        env:
-          KESTREL_DEBUG_SMOKE: "1"
       - name: Audit desktop dependencies
         run: npm run audit:reviewed
         working-directory: desktop

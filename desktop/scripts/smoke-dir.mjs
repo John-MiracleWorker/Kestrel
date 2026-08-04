@@ -1391,24 +1391,23 @@ async function privateEmptyControlPublicationPending(pathValue) {
     // redundant — and harmful: realpath() can throw or observe a mid-replace
     // path under a symlinked tmp root, turning a legitimate pending publication
     // into a hard failure.
-    const pending =
+    // "Pending publication" = the file is still owned-and-private (mode 0600)
+    // but inspectRegularFile rejected it as untrusted because it caught a
+    // transient mid-write size (Node's writeFile truncates to 0 then writes,
+    // so a poll can observe size 0). We must NOT require size === 0 here: by
+    // the time this helper re-lstats after the throw, the write may have
+    // completed (size > 0), which is still a legitimate pending publication to
+    // retry. The discriminator against a *genuine* rejection (the test chmods
+    // the file to 0644 to assert fail-closed) is the owner-only mode: a real
+    // untrusted file has the wrong mode/owner and returns false here.
+    return (
       !metadata.isSymbolicLink() &&
       metadata.isFile() &&
       metadata.nlink === 1 &&
-      metadata.size === 0 &&
       (process.platform === "win32" ||
         (metadata.uid === process.getuid?.() &&
-          (metadata.mode & 0o777) === 0o600));
-    if (!pending && process.env.KESTREL_DEBUG_SMOKE === "1") {
-      process.stderr.write(
-        `[smoke-debug] not-pending path=${pathValue} ` +
-          `symlink=${metadata.isSymbolicLink()} isFile=${metadata.isFile()} ` +
-          `nlink=${metadata.nlink} size=${metadata.size} ` +
-          `uid=${metadata.uid}==${process.getuid?.()} ` +
-          `mode=${(metadata.mode & 0o777).toString(8)}\n`,
-      );
-    }
-    return pending;
+          (metadata.mode & 0o777) === 0o600))
+    );
   } catch {
     return false;
   }
