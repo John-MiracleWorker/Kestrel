@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -23,7 +24,13 @@ from .private_artifacts import (
     ensure_owner_only_directory,
     open_private_file_descriptor,
 )
-from .server_client import KestrelServerClient, ServerProbe
+from .runtime_profile_lease import (
+    LeaseProcessInspector,
+    RuntimeProfileLease,
+    inspect_lease_process,
+    resolve_runtime_profile_root,
+)
+from .server_client import KestrelServerClient, ServerCompatibility, ServerProbe
 
 
 class ServiceState(StrEnum):
@@ -107,6 +114,15 @@ class ProcessInspector(Protocol):
 
 class ProbeClient(Protocol):
     def probe(self) -> ServerProbe: ...
+
+    def probe_desktop_compatibility(
+        self,
+        *,
+        profile_id: str,
+        version: str,
+        launch_nonce_digest: str,
+        base_url: str | None = None,
+    ) -> ServerCompatibility: ...
 
 
 class ProcessSignaler(Protocol):
@@ -565,12 +581,14 @@ class ServiceController:
         client: ProbeClient | None = None,
         signaler: ProcessSignaler | None = None,
         popen: Callable[..., object] = subprocess.Popen,
+        lease_inspector: LeaseProcessInspector = inspect_lease_process,
     ) -> None:
         self.paths = paths
         self.inspector = inspector or SystemProcessInspector()
         self.client = client or KestrelServerClient(paths.url)
         self.signaler = signaler or SystemProcessSignaler()
         self.popen = popen
+        self.lease_inspector = lease_inspector
 
     def status(self) -> ServiceStatus:
         try:
@@ -631,6 +649,9 @@ class ServiceController:
             sleep=sleep,
         ):
             current = self._locked_status()
+            lease_status = self._profile_lease_start_status(current)
+            if lease_status is not None:
+                return lease_status
             if current.state == ServiceState.RUNNING:
                 return current
             if current.state == ServiceState.CONFLICT:
@@ -713,6 +734,80 @@ class ServiceController:
                         f"Inspect {self.paths.log_path}, then run `kestrel doctor`."
                     ),
                 ) from startup_error
+
+    def _profile_lease_start_status(
+        self,
+        current_status: ServiceStatus,
+    ) -> ServiceStatus | None:
+        profile_root = resolve_runtime_profile_root(
+            self.paths.state_path,
+            self.paths.memory_dir,
+            profile_id="default",
+        )
+        version = _package_version()
+        lease = RuntimeProfileLease.inspect(
+            profile_root,
+            profile_id="default",
+            version=version,
+            inspector=self.lease_inspector,
+        )
+        if lease.status in {
+            "available",
+            "stale_unverified",
+        }:
+            return None
+        if lease.status == "offer_desktop_takeover":
+            if current_status.state == ServiceState.RUNNING:
+                return current_status
+            raise ServiceControlError(
+                "Another CLI runtime owns the profile before listener readiness.",
+                code="runtime_profile_lease_conflict",
+                recovery="Wait for the existing CLI server or stop its verified managed service.",
+            )
+        if lease.status == "attach_desktop" and lease.current is not None:
+            compatibility = self.client.probe_desktop_compatibility(
+                profile_id="default",
+                version=version,
+                launch_nonce_digest=lease.current.launch_nonce_digest,
+                base_url=lease.current.base_url,
+            )
+            if compatibility.disposition == "attach_desktop":
+                return ServiceStatus(
+                    state=ServiceState.RUNNING,
+                    management=ServiceManagement.EXTERNAL,
+                    url=lease.current.base_url,
+                    pid=lease.current.pid,
+                    supervisor_pid=None,
+                    pgid=None,
+                    detail="profile_owned_by_desktop",
+                )
+            if compatibility.disposition == "version_conflict":
+                raise ServiceControlError(
+                    "Desktop readiness reported a different runtime version.",
+                    code="runtime_profile_version_conflict",
+                    recovery=(
+                        "Use the matching Kestrel Desktop and CLI versions "
+                        "before attaching."
+                    ),
+                )
+            raise ServiceControlError(
+                "Desktop readiness did not match the verified profile lease.",
+                code="runtime_profile_lease_conflict",
+                recovery=(
+                    "Inspect the Desktop runtime and profile lease, then retry "
+                    "only after their identity evidence agrees."
+                ),
+            )
+        code = (
+            "runtime_profile_version_conflict"
+            if lease.status == "version_conflict"
+            else "runtime_profile_lease_conflict"
+        )
+        raise ServiceControlError(
+            f"The Kestrel runtime profile is unavailable: {lease.status}.",
+            code=code,
+            recovery="Inspect the profile lease; do not terminate a process from lease metadata.",
+        )
 
     def stop(
         self,
@@ -2101,6 +2196,13 @@ def _bounded_seconds(
         qualifier = "non-negative" if allow_zero else "positive"
         raise ValueError(f"{name} must be a finite {qualifier} number")
     return seconds
+
+
+def _package_version() -> str:
+    try:
+        return importlib_metadata.version("nested-memvid-agent")
+    except importlib_metadata.PackageNotFoundError:
+        return "0.5.0"
 
 
 def _wait_until(

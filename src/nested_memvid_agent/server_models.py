@@ -177,6 +177,22 @@ class ProjectRecipeRequest(BaseModel):
     working_directory: str | None = Field(default=None, max_length=1_024)
 
 
+class ProjectSetupDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    repository_path: str = Field(min_length=1, max_length=4_096)
+    direct_estimated_cost_usd: float | None = Field(
+        default=None,
+        ge=0,
+        le=1_000_000,
+    )
+    cost_budget: float | None = Field(
+        default=None,
+        ge=0,
+        le=1_000_000,
+    )
+
+
 class ProjectCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

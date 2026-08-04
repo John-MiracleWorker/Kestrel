@@ -1,18 +1,30 @@
 import json
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from functools import partial
+from hashlib import sha256
 from importlib import import_module
 from pathlib import Path
-from threading import Thread
-from typing import Any
+from threading import Lock, Thread
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from .behavior_delta_ledger import BehaviorDeltaLedger
 from .capability_policy import parent_resource_digest
 from .channels import ChannelManager
 from .config import AgentConfig
+from .desktop_bootstrap import DesktopLaunchConfig
+from .desktop_memory_health import (
+    DesktopMemvidPreflightReceipt,
+    capture_desktop_memvid_preflight_receipt,
+    inspect_desktop_memvid_readiness,
+)
 from .event_bus import RunEventBus
+from .lan_discovery_service import LanDiscoveryService
+from .lan_runtime_authority import LAN_OPENAI_RUNTIME_HARDENING_VERSION
+from .lan_scan_manager import LanScanManager
 from .layers import (
     load_layer_specs,
     prepare_private_memory_artifacts,
@@ -25,9 +37,15 @@ from .plugin_manager import PluginError, PluginManager
 from .promotion_ledger import PromotionLedger
 from .routine_loop import RoutineLoop
 from .routines import RoutineService
+from .routing.activation_service import ActivationService
+from .routing.lan_ledger import LanDiscoveryLedger
+from .routing.qualification_ledger import QualificationLedger
+from .routing.qualification_preview import QualificationPreviewService, TargetInventory
+from .routing.qualification_runner import QualificationRunner
 from .routing.runtime import build_run_manager
 from .run_manager import RunCapacityError
 from .runtime_settings import (
+    RuntimeSettings,
     RuntimeSettingsStore,
     apply_runtime_settings,
     default_runtime_settings_path,
@@ -81,6 +99,9 @@ from .server_support import (
 from .skill_manager import SkillManager
 from .state_store import AgentStateStore, CapabilityConflictError
 
+if TYPE_CHECKING:
+    from .server_desktop_routes import DesktopShutdownController
+
 _BROWSER_SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; "
@@ -106,6 +127,7 @@ _BROWSER_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+_DESKTOP_RENDERER_ORIGIN = "kestrel://app"
 
 
 def _apply_browser_security_headers(response: Any) -> None:
@@ -114,12 +136,22 @@ def _apply_browser_security_headers(response: Any) -> None:
             response.headers[name] = value
 
 
-def create_app(config: AgentConfig | None = None) -> Any:
+def create_app(
+    config: AgentConfig | None = None,
+    *,
+    desktop_context: DesktopLaunchConfig | None = None,
+    desktop_shutdown: "DesktopShutdownController | None" = None,
+) -> Any:
     """Create the local Kestrel web/API app."""
 
     construction_cleanup: list[Callable[[], None]] = []
     try:
-        return _create_app(config, construction_cleanup=construction_cleanup)
+        return _create_app(
+            config,
+            desktop_context=desktop_context,
+            desktop_shutdown=desktop_shutdown,
+            construction_cleanup=construction_cleanup,
+        )
     except BaseException:
         for cleanup in reversed(construction_cleanup):
             try:
@@ -132,6 +164,8 @@ def create_app(config: AgentConfig | None = None) -> Any:
 def _create_app(
     config: AgentConfig | None,
     *,
+    desktop_context: DesktopLaunchConfig | None,
+    desktop_shutdown: "DesktopShutdownController | None",
     construction_cleanup: list[Callable[[], None]],
 ) -> Any:
     """Assemble an app while exposing acquired resources to the factory guard."""
@@ -141,6 +175,8 @@ def _create_app(
         responses_module = import_module("starlette.responses")
         staticfiles_module = import_module("starlette.staticfiles")
         cors_module = import_module("starlette.middleware.cors")
+        from starlette.routing import Match, Route
+
         from .mission_control import (
             mission_launch_binding_matches,
             mission_plan_scope_matches,
@@ -148,10 +184,21 @@ def _create_app(
         )
         from .provider_probe import ProviderProbeService
         from .server_behavior_delta_routes import register_behavior_delta_routes
-        from .server_capability_routes import register_capability_routes
+        from .server_capability_routes import _catalog, register_capability_routes
         from .server_channel_routes import register_channel_routes
+        from .server_desktop_recovery_routes import (
+            register_desktop_recovery_routes,
+        )
+        from .server_desktop_routes import (
+            desktop_auth_error,
+            desktop_credential_capability_error,
+            desktop_credential_mutation_request,
+            register_desktop_routes,
+        )
         from .server_diagnosis_routes import register_diagnosis_routes
         from .server_engineering_routes import register_engineering_routes
+        from .server_flock_routes import FLOCK_OWNER_PRINCIPAL, register_flock_routes
+        from .server_lan_discovery_routes import register_lan_discovery_routes
         from .server_mcp_routes import register_mcp_routes
         from .server_mission_routes import (
             evaluate_mission_preflight,
@@ -186,9 +233,20 @@ def _create_app(
         from .server_product_routes import register_product_routes
         from .server_project_routes import register_project_routes
         from .server_routine_routes import register_routine_routes
-        from .server_routing_routes import register_routing_routes
-        from .server_runtime_routes import register_runtime_routes
+        from .server_routing_routes import (
+            LAN_MUTATION_OWNER_PRINCIPAL,
+            LAN_REDACTED_QUERY_SCOPE_KEY,
+            LAN_REJECTED_PATH_SCOPE_KEY,
+            MAX_LAN_MUTATION_BODY_BYTES,
+            classify_lan_mutation_path,
+            register_routing_routes,
+        )
+        from .server_runtime_routes import (
+            register_runtime_routes,
+            revoke_disabled_tool_approvals,
+        )
         from .server_secret_routes import register_secret_routes
+        from .server_settings_routes import register_settings_routes
         from .server_tool_routes import register_tool_routes, tool_invoke_response
         from .server_web_routes import register_web_routes
     except ImportError as exc:
@@ -204,17 +262,39 @@ def _create_app(
     CORSMiddleware = cors_module.CORSMiddleware
 
     base_config = config or AgentConfig.from_env()
-    runtime_settings_store = RuntimeSettingsStore(default_runtime_settings_path(base_config))
+    if desktop_context is not None:
+        base_config = _apply_desktop_runtime_authority(base_config, desktop_context)
+    runtime_settings_path = (
+        desktop_context.runtime_settings_path
+        if desktop_context is not None
+        else default_runtime_settings_path(base_config)
+    )
+    settings_canonicalizer: Callable[[RuntimeSettings], RuntimeSettings] | None = None
+    if desktop_context is not None:
+        settings_canonicalizer = partial(
+            _apply_desktop_settings_authority,
+            launch=desktop_context,
+        )
+    runtime_settings_store = RuntimeSettingsStore(
+        runtime_settings_path,
+        canonicalize=settings_canonicalizer,
+    )
     active_config = apply_runtime_settings(base_config, runtime_settings_store.load(base_config))
-    _prepare_private_runtime_artifacts(active_config)
+    if desktop_context is not None:
+        active_config = _apply_desktop_runtime_authority(
+            active_config,
+            desktop_context,
+        )
+    _prepare_private_runtime_artifacts(
+        active_config,
+        harden_existing_memory=desktop_context is None,
+    )
     workspace = active_config.workspace.expanduser().resolve()
     secret_store_path = active_config.secret_store_path.expanduser()
     if not secret_store_path.is_absolute():
         secret_store_path = workspace / secret_store_path
     secret_store_path = secret_store_path.resolve()
-    secret_broker = build_secret_broker(
-        secret_store_path, backend=active_config.secret_backend
-    )
+    secret_broker = build_secret_broker(secret_store_path, backend=active_config.secret_backend)
     state = AgentStateStore(active_config.state_path)
     events = RunEventBus(state)
     mcp = MCPManager(
@@ -241,6 +321,57 @@ def _create_app(
     runs = run_manager_build.runs
     routing_ledger = run_manager_build.routing_ledger
     routing_config = run_manager_build.routing_config
+    lan_scan_manager = LanScanManager(ledger=LanDiscoveryLedger.from_initialized_state(state))
+    runs.register_lifecycle_dependency("lan_scans", lan_scan_manager)
+    # Durable Flock qualification run manager (Adaptive Flock Task 9). It is
+    # constructed recovery-only here (no executor); sidecar startup reconciles
+    # non-terminal runs without ever dispatching provider work. The ledger is
+    # shared with the owner-facing Flock route adapters (Task 17).
+    qualification_ledger = QualificationLedger(state)
+    qualification_runner = QualificationRunner(
+        state,
+        qualification_ledger,
+        server_max_concurrency=active_config.max_concurrent_runs,
+    )
+    runs.register_lifecycle_dependency("qualification_runner", qualification_runner)
+
+    desktop_memory_receipt: DesktopMemvidPreflightReceipt | None = (
+        desktop_context.memory_preflight_receipt if desktop_context is not None else None
+    )
+    desktop_memory_receipt_lock = Lock()
+
+    if desktop_context is not None:
+        desktop_launch_nonce_digest = sha256(
+            desktop_context.launch_nonce.encode("utf-8")
+        ).hexdigest()
+        desktop_resource_manifest_digest = desktop_context.resource_manifest_digest
+
+        def current_desktop_memory_ready() -> bool:
+            with desktop_memory_receipt_lock:
+                current_receipt = desktop_memory_receipt
+            return inspect_desktop_memvid_readiness(
+                desktop_context.memory_dir,
+                receipt=current_receipt,
+                launch_nonce_digest=desktop_launch_nonce_digest,
+                resource_manifest_digest=(desktop_resource_manifest_digest),
+            )
+
+        def refresh_desktop_memory_receipt() -> None:
+            nonlocal desktop_memory_receipt
+            refreshed: DesktopMemvidPreflightReceipt | None
+            try:
+                refreshed = capture_desktop_memvid_preflight_receipt(
+                    desktop_context.memory_dir
+                ).bind(
+                    launch_nonce_digest=(desktop_launch_nonce_digest),
+                    resource_manifest_digest=(desktop_resource_manifest_digest),
+                )
+            except Exception:
+                refreshed = None
+            with desktop_memory_receipt_lock:
+                desktop_memory_receipt = refreshed
+
+        runs.configure_memory_close_observer(refresh_desktop_memory_receipt)
 
     def abort_runtime_construction() -> None:
         runs_stopped = runs.shutdown(timeout_seconds=5.0)
@@ -251,7 +382,9 @@ def _create_app(
             raise RuntimeError("runtime_shutdown_incomplete")
 
     construction_cleanup.append(abort_runtime_construction)
-    channels = ChannelManager(active_config, secret_resolver=secret_broker.resolve, run_manager=runs)
+    channels = ChannelManager(
+        active_config, secret_resolver=secret_broker.resolve, run_manager=runs
+    )
     routine_service = RoutineService(
         state,
         runs,
@@ -274,10 +407,26 @@ def _create_app(
 
     def update_active_config(next_config: AgentConfig) -> None:
         nonlocal active_config
+        if desktop_context is not None:
+            next_config = _apply_desktop_runtime_authority(
+                next_config,
+                desktop_context,
+            )
         active_config = next_config
         runs.config = next_config
         channels.config = next_config
         secret_broker.register_allowed_env_names(_provider_secret_env_names(next_config))
+
+    def validate_runtime_config(next_config: AgentConfig) -> None:
+        if desktop_context is not None:
+            next_config = _apply_desktop_runtime_authority(
+                next_config,
+                desktop_context,
+            )
+        _prepare_private_runtime_artifacts(
+            next_config,
+            harden_existing_memory=desktop_context is None,
+        )
 
     channels.configure_runtime_settings(
         settings_store=runtime_settings_store,
@@ -288,13 +437,35 @@ def _create_app(
         authorization: str | None = Header(default=None),
         x_kestrel_api_key: str | None = Header(default=None),
     ) -> bool:
-        auth_error = _api_auth_error(
-            active_config,
-            {"authorization": authorization or "", "x-kestrel-api-key": x_kestrel_api_key or ""},
+        headers = {
+            "authorization": authorization or "",
+            "x-kestrel-api-key": x_kestrel_api_key or "",
+        }
+        auth_error = (
+            desktop_auth_error(desktop_context, headers)
+            if desktop_context is not None
+            else _api_auth_error(active_config, headers)
         )
         if auth_error is not None:
             status_code, detail = auth_error
             raise HTTPException(status_code=status_code, detail=detail)
+        return True
+
+    def require_desktop_credential_capability(
+        request: Request,  # type: ignore[valid-type]
+    ) -> bool:
+        if desktop_context is None:
+            return True
+        capability_error = desktop_credential_capability_error(
+            desktop_context,
+            request_headers(request),
+        )
+        if capability_error is not None:
+            status_code, detail = capability_error
+            raise HTTPException(
+                status_code=status_code,
+                detail=detail,
+            )
         return True
 
     def audit_plugin(action: str, plugin: dict[str, Any]) -> None:
@@ -345,7 +516,27 @@ def _create_app(
     async def lifespan(app_instance: Any) -> Any:
         del app_instance
         try:
-            runs.start()
+            lan_scan_executor = ThreadPoolExecutor(
+                max_workers=17,
+                thread_name_prefix="kestrel-lan-scan",
+            )
+            lan_start_invoked = False
+
+            def start_lan_scans() -> None:
+                nonlocal lan_start_invoked
+                lan_start_invoked = True
+                lan_scan_manager.start_lifecycle(lan_scan_executor)
+
+            try:
+                runs.register_startup_dependency("lan_scans", start_lan_scans)
+                runs.register_startup_dependency(
+                    "qualification_runner", qualification_runner.recover_startup
+                )
+                runs.start()
+            except BaseException:
+                if not lan_start_invoked:
+                    lan_scan_executor.shutdown(wait=True, cancel_futures=True)
+                raise
             if routine_loop is not None:
                 routine_loop.start()
             if active_config.provider_startup_probe:
@@ -359,10 +550,7 @@ def _create_app(
         finally:
             shutdown_incomplete = False
             try:
-                loop_stopped = (
-                    routine_loop is None
-                    or routine_loop.close(timeout_seconds=5.0)
-                )
+                loop_stopped = routine_loop is None or routine_loop.close(timeout_seconds=5.0)
                 if routine_loop is not None and not loop_stopped:
                     loop_stopped = routine_loop.close(timeout_seconds=1.0)
                 shutdown_incomplete = not loop_stopped
@@ -398,10 +586,36 @@ def _create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    lan_mutations_registered = desktop_context is not None or active_config.require_api_auth
     rate_limiter = RequestRateLimiter()
+
+    async def _cache_lan_body_through_sentinel(request: Any, *, limit: int) -> None:
+        body = bytearray()
+        sentinel_limit = limit + 1
+        async for chunk in request.stream():
+            remaining = sentinel_limit - len(body)
+            if remaining > 0:
+                body.extend(chunk[:remaining])
+            if len(body) > limit or len(chunk) > remaining:
+                request._body = bytes(body)
+                raise RequestBodyTooLarge("LAN request body exceeds its byte limit")
+        request._body = bytes(body)
 
     @app.middleware("http")  # type: ignore[untyped-decorator]
     async def local_ingress_guard(request: Any, call_next: Any) -> Any:
+        scope = getattr(request, "scope", {})
+        path = str(scope.get("path", "")) if isinstance(scope, dict) else ""
+        method = str(getattr(request, "method", "GET")).upper()
+        lan_mutation_path, lan_path_rejected, safe_path = classify_lan_mutation_path(path)
+        registered_lan_mutation_path = lan_mutations_registered and lan_mutation_path
+        path = safe_path
+        if lan_mutation_path and isinstance(scope, dict):
+            scope[LAN_REDACTED_QUERY_SCOPE_KEY] = bool(scope.get("query_string", b""))
+            scope[LAN_REJECTED_PATH_SCOPE_KEY] = lan_path_rejected
+            scope["query_string"] = b""
+            if lan_path_rejected:
+                scope["path"] = safe_path
+                scope["raw_path"] = safe_path.encode("ascii")
         headers = request_headers(request)
         host = _hostname_from_header(str(headers.get("host", "")))
         trusted_hosts = set(active_config.trusted_hosts)
@@ -409,18 +623,21 @@ def _create_app(
             return responses_module.JSONResponse({"detail": "untrusted_host"}, status_code=400)
         origin = str(headers.get("origin", "")).strip()
         if origin:
-            origin_host = _hostname_from_url(origin)
-            if not origin_host or not _host_is_trusted(origin_host, trusted_hosts):  # nosec
+            if desktop_context is not None:
+                origin_is_trusted = origin == _DESKTOP_RENDERER_ORIGIN
+            else:
+                origin_host = _hostname_from_url(origin)
+                origin_is_trusted = bool(origin_host) and _host_is_trusted(  # nosec
+                    origin_host,
+                    trusted_hosts,
+                )
+            if not origin_is_trusted:
                 return responses_module.JSONResponse(
                     {"detail": "untrusted_origin"}, status_code=403
                 )
-        path = str(getattr(getattr(request, "url", None), "path", ""))
-        method = str(getattr(request, "method", "GET")).upper()
         api_path = path == "/api" or path.startswith("/api/")
         guarded_path = api_path or path == "/metrics"
-        public_telegram_webhook = (
-            method == "POST" and path == "/api/channels/telegram/webhook"
-        )
+        public_telegram_webhook = method == "POST" and path == "/api/channels/telegram/webhook"
         cors_preflight = (
             method == "OPTIONS"
             and bool(origin)
@@ -428,27 +645,101 @@ def _create_app(
         )
         if guarded_path:
             if not public_telegram_webhook and not cors_preflight:
-                auth_error = _api_auth_error(active_config, headers)
+                auth_error = (
+                    desktop_auth_error(desktop_context, headers)
+                    if desktop_context is not None
+                    else _api_auth_error(active_config, headers)
+                )
                 if auth_error is not None:
                     status_code, detail = auth_error
-                    return responses_module.JSONResponse({"detail": detail}, status_code=status_code)
+                    return responses_module.JSONResponse(
+                        {"detail": detail}, status_code=status_code
+                    )
+            if desktop_context is not None and desktop_credential_mutation_request(
+                method,
+                path,
+            ):
+                capability_error = desktop_credential_capability_error(
+                    desktop_context,
+                    headers,
+                )
+                if capability_error is not None:
+                    status_code, detail = capability_error
+                    return responses_module.JSONResponse(
+                        {"detail": detail},
+                        status_code=status_code,
+                    )
+            if (
+                registered_lan_mutation_path
+                and isinstance(scope, dict)
+                and (
+                    scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
+                    or scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
+                )
+            ):
+                return responses_module.JSONResponse(
+                    {"detail": {"code": "lan_request_rejected"}},
+                    status_code=400,
+                )
             content_length = str(headers.get("content-length", "")).strip()
+            request_body_limit = (
+                min(
+                    active_config.max_request_body_bytes,
+                    MAX_LAN_MUTATION_BODY_BYTES,
+                )
+                if registered_lan_mutation_path
+                else active_config.max_request_body_bytes
+            )
             if content_length:
                 try:
                     request_bytes = int(content_length)
                 except ValueError:
-                    return responses_module.JSONResponse({"detail": "invalid_content_length"}, status_code=400)
-                if request_bytes > active_config.max_request_body_bytes:
-                    return responses_module.JSONResponse({"detail": "request_body_too_large"}, status_code=413)
+                    ingress_detail: object = (
+                        {"code": "lan_request_rejected"}
+                        if registered_lan_mutation_path
+                        else "invalid_content_length"
+                    )
+                    return responses_module.JSONResponse(
+                        {"detail": ingress_detail}, status_code=400
+                    )
+                if request_bytes < 0:
+                    ingress_detail = (
+                        {"code": "lan_request_rejected"}
+                        if registered_lan_mutation_path
+                        else "invalid_content_length"
+                    )
+                    return responses_module.JSONResponse(
+                        {"detail": ingress_detail}, status_code=400
+                    )
+                if request_bytes > request_body_limit:
+                    ingress_detail = (
+                        {"code": "lan_request_too_large"}
+                        if registered_lan_mutation_path
+                        else "request_body_too_large"
+                    )
+                    return responses_module.JSONResponse(
+                        {"detail": ingress_detail}, status_code=413
+                    )
             if method not in {"GET", "HEAD", "OPTIONS"}:
                 try:
-                    await _cache_bounded_request_body(
-                        request,
-                        limit=active_config.max_request_body_bytes,
-                    )
+                    if registered_lan_mutation_path:
+                        await _cache_lan_body_through_sentinel(
+                            request,
+                            limit=request_body_limit,
+                        )
+                    else:
+                        await _cache_bounded_request_body(
+                            request,
+                            limit=request_body_limit,
+                        )
                 except RequestBodyTooLarge:
+                    ingress_detail = (
+                        {"code": "lan_request_too_large"}
+                        if registered_lan_mutation_path
+                        else "request_body_too_large"
+                    )
                     return responses_module.JSONResponse(
-                        {"detail": "request_body_too_large"},
+                        {"detail": ingress_detail},
                         status_code=413,
                     )
                 client = getattr(request, "client", None)
@@ -459,7 +750,9 @@ def _create_app(
                     window_seconds=active_config.api_rate_limit_window_seconds,
                     max_keys=active_config.api_rate_limit_max_clients,
                 ):
-                    return responses_module.JSONResponse({"detail": "rate_limit_exceeded"}, status_code=429)
+                    return responses_module.JSONResponse(
+                        {"detail": "rate_limit_exceeded"}, status_code=429
+                    )
         return await call_next(request)
 
     @app.middleware("http")  # type: ignore[untyped-decorator]
@@ -482,7 +775,7 @@ def _create_app(
         active_config=lambda: active_config,
         state=state,
         settings_store=runtime_settings_store,
-        validate_config_update=_prepare_private_runtime_artifacts,
+        validate_config_update=validate_runtime_config,
         on_config_update=update_active_config,
         secret_broker=secret_broker,
         http_exception=HTTPException,
@@ -493,6 +786,47 @@ def _create_app(
             secret_resolver=secret_broker.resolve,
         ),
     )
+
+    def _settings_commit_effects(update: Any) -> dict[str, Any]:
+        revoked = revoke_disabled_tool_approvals(
+            runs,
+            previous_config=update.previous_config,
+            next_config=update.config,
+        )
+        return {
+            "revoked_approvals": revoked,
+            "authority_changes": (
+                [
+                    {
+                        "type": "approvals_revoked",
+                        "count": revoked,
+                        "reason": "global_capability_disabled",
+                    }
+                ]
+                if revoked
+                else []
+            ),
+        }
+
+    register_settings_routes(
+        app,
+        active_config=lambda: active_config,
+        settings_store=runtime_settings_store,
+        capabilities=lambda: _catalog(state=state, runs=runs),
+        validate_config_update=validate_runtime_config,
+        on_config_update=update_active_config,
+        on_commit=_settings_commit_effects,
+        http_exception=HTTPException,
+    )
+    if desktop_context is not None:
+        register_desktop_routes(
+            app,
+            launch=desktop_context,
+            shutdown_controller=desktop_shutdown,
+            secret_broker=secret_broker,
+            http_exception=HTTPException,
+            sensitive_material_transition=(mcp_sensitive_material_transition),
+        )
     register_routing_routes(
         app,
         ledger=routing_ledger,
@@ -501,7 +835,41 @@ def _create_app(
         provider_probe_service=ProviderProbeService(
             secret_resolver=secret_broker.resolve,
         ),
+        lan_discovery_service=(
+            LanDiscoveryService(
+                routing_ledger,
+                runtime_hardening_version=LAN_OPENAI_RUNTIME_HARDENING_VERSION,
+            )
+            if lan_mutations_registered
+            else None
+        ),
+        lan_owner_principal=(LAN_MUTATION_OWNER_PRINCIPAL if lan_mutations_registered else None),
     )
+    register_flock_routes(
+        app,
+        qualification_runner=qualification_runner,
+        activation_service=ActivationService(qualification_ledger),
+        preview_service=QualificationPreviewService(
+            inventory=lambda: TargetInventory(
+                profiles=tuple(
+                    entry.profile for entry in routing_ledger.list_provider_profiles()
+                ),
+                targets=tuple(entry.target for entry in routing_ledger.list_model_targets()),
+            )
+        ),
+        ledger=qualification_ledger,
+        http_exception=HTTPException,
+        streaming_response=StreamingResponse,
+        owner_principal=FLOCK_OWNER_PRINCIPAL,
+        owner_authorized=lambda: lan_mutations_registered,
+    )
+    if lan_mutations_registered:
+        register_lan_discovery_routes(
+            app,
+            scan_manager=lan_scan_manager,
+            http_exception=HTTPException,
+            streaming_response=StreamingResponse,
+        )
     register_routine_routes(
         app,
         active_config=lambda: active_config,
@@ -516,8 +884,69 @@ def _create_app(
         http_exception=HTTPException,
         secret_broker=secret_broker,
         sensitive_material_transition=mcp_sensitive_material_transition,
+        mutation_dependency=(
+            require_desktop_credential_capability if desktop_context is not None else None
+        ),
     )
-    register_product_routes(app, active_config=lambda: active_config, secret_resolver=secret_broker.resolve)
+    desktop_storage_readiness = getattr(
+        secret_broker,
+        "desktop_readiness",
+        None,
+    )
+
+    def current_desktop_storage_readiness() -> dict[str, object]:
+        current = getattr(
+            secret_broker,
+            "desktop_readiness",
+            None,
+        )
+        if current is None:
+            return {
+                "schema": ("kestrel.desktop_credential_readiness.v1"),
+                "state": "unavailable",
+                "backend": None,
+                "persistence": "none",
+                "reason": "metadata_invalid",
+                "remediation": ("Repair the Desktop credential readiness metadata and retry."),
+            }
+        try:
+            payload = current.to_public_payload()
+        except Exception:
+            return {
+                "schema": ("kestrel.desktop_credential_readiness.v1"),
+                "state": "unavailable",
+                "backend": None,
+                "persistence": "none",
+                "reason": "metadata_invalid",
+                "remediation": ("Repair the Desktop credential readiness metadata and retry."),
+            }
+        return dict(payload)
+
+    if desktop_context is not None:
+        from .desktop_recovery import DesktopRecoveryService
+
+        register_desktop_recovery_routes(
+            app,
+            service=DesktopRecoveryService(
+                state=state,
+                routing=routing_ledger,
+                credential_readiness=(current_desktop_storage_readiness),
+                memory_ready=current_desktop_memory_ready,
+            ),
+            http_exception=HTTPException,
+        )
+
+    register_product_routes(
+        app,
+        active_config=lambda: active_config,
+        secret_resolver=(None if desktop_context is not None else secret_broker.resolve),
+        secret_status=(secret_broker.metadata_status if desktop_context is not None else None),
+        credential_storage=(
+            current_desktop_storage_readiness
+            if desktop_context is not None and desktop_storage_readiness is not None
+            else None
+        ),
+    )
     register_project_routes(
         app,
         active_config=lambda: active_config,
@@ -752,8 +1181,9 @@ def _create_app(
         runs=runs,
         routine_loop=routine_loop,
     )
-    register_behavior_delta_routes(app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state))
-
+    register_behavior_delta_routes(
+        app, http_exception=HTTPException, ledger=BehaviorDeltaLedger(state)
+    )
 
     @app.get("/api/learning/dashboard")  # type: ignore[untyped-decorator]
     def learning_dashboard(since: str = "30d") -> dict[str, object]:
@@ -793,7 +1223,9 @@ def _create_app(
             raw_rows = execution.data.get("trusted_onboarding_hits")
             rows = raw_rows if isinstance(raw_rows, list) else []
         state_payload = onboarding_state_from_reflection(rows)
-        state_payload["reflection"] = execution.data.get("reflection") if isinstance(execution.data, dict) else None
+        state_payload["reflection"] = (
+            execution.data.get("reflection") if isinstance(execution.data, dict) else None
+        )
         return state_payload
 
     @app.post("/api/self/onboarding")  # type: ignore[untyped-decorator]
@@ -1124,7 +1556,11 @@ def _create_app(
         include_inactive: bool = False,
     ) -> list[dict[str, object]]:
         return _search_memory(
-            query=query, layers=_csv_layers(layers), k=k, mode=mode, include_inactive=include_inactive
+            query=query,
+            layers=_csv_layers(layers),
+            k=k,
+            mode=mode,
+            include_inactive=include_inactive,
         )
 
     @app.post("/api/memory/search")  # type: ignore[untyped-decorator]
@@ -1362,20 +1798,77 @@ def _create_app(
         def index() -> Any:
             return FileResponse(web_dist / "index.html")
 
-        @app.get("/{path:path}")  # type: ignore[untyped-decorator]
-        def spa_fallback(path: str) -> Any:
-            if path == "api" or path.startswith("api/"):
-                raise HTTPException(status_code=404, detail="not_found")
+        class _NonApiSpaFallbackRoute(Route):
+            def matches(
+                self,
+                scope: Any,
+            ) -> tuple[Any, MutableMapping[str, Any]]:
+                path = str(scope.get("path", ""))
+                if path == "/api" or path.startswith("/api/"):
+                    return Match.NONE, {}
+                return super().matches(scope)
+
+        def spa_fallback(request: Any) -> Any:
+            del request
             return FileResponse(web_dist / "index.html")
+
+        app.router.routes.append(
+            _NonApiSpaFallbackRoute(
+                "/{path:path}",
+                endpoint=spa_fallback,
+                methods=["GET"],
+                name="spa_fallback",
+            )
+        )
 
     construction_cleanup.clear()
     return app
 
 
-def _prepare_private_runtime_artifacts(config: AgentConfig) -> None:
+def _prepare_private_runtime_artifacts(
+    config: AgentConfig,
+    *,
+    harden_existing_memory: bool = True,
+) -> None:
     specs = load_layer_specs(config.layer_config_path) if config.layer_config_path else None
-    prepare_private_memory_artifacts(config.memory_dir, specs=specs)
+    prepare_private_memory_artifacts(
+        config.memory_dir,
+        specs=specs,
+        harden_existing=harden_existing_memory,
+    )
     prepare_private_runs_root(config.memory_dir.parent / "runs")
+
+
+def _apply_desktop_runtime_authority(
+    config: AgentConfig,
+    launch: DesktopLaunchConfig,
+) -> AgentConfig:
+    """Keep canonical Desktop writer paths and Memvid backend launch-controlled."""
+
+    return replace(
+        config,
+        backend="memvid",
+        memory_dir=launch.memory_dir,
+        state_path=launch.state_path,
+        secret_store_path=(launch.profile_root / "secrets" / "desktop-keyring-metadata.json"),
+        secret_backend="desktop",
+        require_api_auth=True,
+        cors_origins=(_DESKTOP_RENDERER_ORIGIN,),
+    )
+
+
+def _apply_desktop_settings_authority(
+    settings: RuntimeSettings,
+    launch: DesktopLaunchConfig,
+) -> RuntimeSettings:
+    """Canonicalize persisted settings that are owned by the Desktop launch."""
+
+    return replace(
+        settings,
+        backend="memvid",
+        memory_dir=str(launch.memory_dir),
+        require_api_auth=True,
+    )
 
 
 def _resolve_web_dist() -> Path | None:
@@ -1384,7 +1877,9 @@ def _resolve_web_dist() -> Path | None:
         module_path.parent / "web_dist",
         module_path.parents[2] / "web" / "dist",
     )
-    return next((candidate for candidate in candidates if (candidate / "index.html").is_file()), None)
+    return next(
+        (candidate for candidate in candidates if (candidate / "index.html").is_file()), None
+    )
 
 
 def _probe_provider_health(
@@ -1408,7 +1903,11 @@ def _probe_provider_health(
         pass
     provider_id = provider_health_id(config)
     snapshot = global_provider_health_registry.snapshot(provider_id)
-    return {"provider_id": provider_id, "operational": snapshot.get("state") == "healthy", **snapshot}
+    return {
+        "provider_id": provider_id,
+        "operational": snapshot.get("state") == "healthy",
+        **snapshot,
+    }
 
 
 def _provider_secret_env_names(config: AgentConfig) -> set[str]:

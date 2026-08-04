@@ -1,0 +1,130 @@
+/*
+ * Wildflower Workshop semantic tokens.
+ *
+ * Components consume the semantic names below. The legacy aliases at the end
+ * keep the existing workbench legible while feature styles migrate in place.
+ */
+
+/* theme:light */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --canvas: #f7f0df;
+  --surface: #fffaf0;
+  --ink: #2b172c;
+  --muted-ink: #675b64;
+  --structural: #4a204c;
+  --action: #a93d35;
+  --on-action: #fffaf0;
+  --success: #226c5d;
+  --attention: #586a00;
+  --caution: #87530f;
+  --info: #3f5fae;
+  --danger: #a22f40;
+  --focus: #2d67c8;
+  --border: #c9bcae;
+  --border-strong: #6a5365;
+  --shadow: 0 18px 60px rgb(74 32 76 / 16%);
+  --shadow-offset: 4px 4px 0 rgb(74 32 76 / 28%);
+
+  --selected: #d9e987;
+  --on-selected: #2b172c;
+  --surface-raised: #fffdf7;
+  --surface-sunken: #efe5d2;
+  --action-soft: #f8d8ce;
+  --success-soft: #d5ebe2;
+  --attention-soft: #ebf3bd;
+  --caution-soft: #f7e2bb;
+  --info-soft: #dce4fa;
+  --danger-soft: #f6d9dc;
+}
+
+/* theme:dark */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --canvas: #17111a;
+  --surface: #231b25;
+  --ink: #f6ecdf;
+  --muted-ink: #e8dcea;
+  --structural: #d7a3cf;
+  --action: #ff8b7e;
+  --on-action: #2b172c;
+  --success: #74d7bb;
+  --attention: #d9ed72;
+  --caution: #ffc36a;
+  --info: #9db4ff;
+  --danger: #ff929d;
+  --focus: #87b3ff;
+  --border: #493b4b;
+  --border-strong: #8a7186;
+  --shadow: 0 20px 70px rgb(0 0 0 / 46%);
+  --shadow-offset: 4px 4px 0 rgb(215 163 207 / 24%);
+
+  --selected: #556612;
+  --on-selected: #f6ecdf;
+  --surface-raised: #302635;
+  --surface-sunken: #110d13;
+  --action-soft: #4d292a;
+  --success-soft: #193d35;
+  --attention-soft: #37400f;
+  --caution-soft: #493319;
+  --info-soft: #293253;
+  --danger-soft: #4d252d;
+}
+
+:root {
+  --bg: var(--canvas);
+  --paper: var(--surface);
+  --ink-soft: color-mix(in srgb, var(--ink) 82%, var(--canvas));
+  --muted: var(--muted-ink);
+  --faint: color-mix(in srgb, var(--muted-ink) 88%, var(--canvas));
+  --rule: var(--border);
+  --rule-strong: var(--border-strong);
+  --accent: var(--action);
+  --accent-ink: var(--structural);
+  --accent-soft: var(--action-soft);
+  --warn: var(--caution);
+  --warn-soft: var(--caution-soft);
+  --good: var(--success);
+  --good-soft: var(--success-soft);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --radius-small: 0.5rem;
+  --radius-medium: 0.75rem;
+  --radius-large: 1.125rem;
+  --motion-fast: 120ms;
+  --motion-standard: 180ms;
+}
+
+:root[data-reduced-motion="reduce"] {
+  --motion-fast: 1ms;
+  --motion-standard: 1ms;
+}
+
+:root[data-reduced-motion="reduce"] *,
+:root[data-reduced-motion="reduce"] *::before,
+:root[data-reduced-motion="reduce"] *::after {
+  scroll-behavior: auto !important;
+  animation-duration: 1ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 1ms !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

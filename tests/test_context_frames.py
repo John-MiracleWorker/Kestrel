@@ -2,16 +2,32 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from nested_memvid_agent.context_frames import (
     MV2ContextFrame,
     content_hash_for,
+    direct_frame_lookup,
     estimate_tokens,
     from_memory_record,
+    make_child_frame,
     make_conflict_set_frame,
     make_correction_frame,
     to_memory_record,
 )
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+
+
+def _project_frame(frame_id: str, project_id: str | None) -> MV2ContextFrame:
+    return MV2ContextFrame(
+        id=frame_id,
+        frame_type="raw_chunk",
+        title=f"Evidence {frame_id}",
+        content=f"Evidence payload for {frame_id}.",
+        layer=MemoryLayer.EPISODIC,
+        kind=MemoryKind.EVENT,
+        project_id=project_id,
+    )
 
 
 def test_frame_converts_to_and_from_memory_record() -> None:
@@ -98,3 +114,63 @@ def test_correction_and_conflict_frames_preserve_links() -> None:
     assert conflict.frame_type == "conflict_set"
     assert conflict.metadata["conflict_group_id"] == "conflict-feature-alpha"
     assert conflict.parent_ids == ("fact-1", correction.id)
+
+
+def test_child_frame_inherits_parent_project_boundary() -> None:
+    parent = _project_frame("parent_a", "project_a")
+
+    child = make_child_frame(
+        parent,
+        frame_id="child_a",
+        frame_type="section_summary",
+        title="Child summary",
+        content="Derived entirely from project A evidence.",
+    )
+
+    assert child.project_id == "project_a"
+    assert child.parent_ids == ("parent_a",)
+
+
+def test_child_frame_cannot_smuggle_cross_project_evidence() -> None:
+    parent = _project_frame("parent_a", "project_a")
+
+    with pytest.raises(ValueError, match="project boundary"):
+        make_child_frame(
+            parent,
+            frame_id="child_b",
+            frame_type="section_summary",
+            title="Smuggled summary",
+            content="Evidence harvested from project B.",
+            project_id="project_b",
+        )
+
+
+def test_direct_frame_lookup_is_fenced_to_the_selected_project() -> None:
+    frame_a = _project_frame("frame_a", "project_a")
+    frame_b = _project_frame("frame_b", "project_b")
+    frames = {frame_a.id: frame_a, frame_b.id: frame_b}
+
+    assert direct_frame_lookup(frames, "frame_a", project_id="project_a") is frame_a
+    with pytest.raises(KeyError, match="project boundary"):
+        direct_frame_lookup(frames, "frame_b", project_id="project_a")
+    with pytest.raises(KeyError, match="unknown frame"):
+        direct_frame_lookup(frames, "frame_missing", project_id="project_a")
+
+
+def test_direct_frame_lookup_rejects_unscoped_frames_fail_closed() -> None:
+    unscoped = _project_frame("frame_legacy", None)
+
+    with pytest.raises(KeyError, match="project boundary"):
+        direct_frame_lookup({unscoped.id: unscoped}, "frame_legacy", project_id="project_a")
+
+
+def test_project_id_round_trips_through_memory_record_metadata() -> None:
+    frame = _project_frame("frame_scoped", "project_a")
+
+    record = to_memory_record(frame)
+    restored = from_memory_record(record)
+
+    assert record.metadata["project_id"] == "project_a"
+    assert restored.project_id == "project_a"
+    unscoped = from_memory_record(to_memory_record(_project_frame("frame_plain", None)))
+    assert unscoped.project_id is None

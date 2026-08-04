@@ -1,0 +1,1028 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hmac
+import json
+import os
+import secrets
+import socket
+import sqlite3
+import stat
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import datetime
+from hashlib import sha256
+from pathlib import Path
+from typing import Any, Protocol
+
+from .backends.memvid_backend import MemvidBackend
+from .config import AgentConfig
+from .desktop_bootstrap import (
+    DesktopLaunchConfig,
+    consume_desktop_bootstrap,
+)
+from .desktop_memory_health import (
+    DesktopMemvidPreflightReceipt,
+    capture_desktop_memvid_preflight_receipt,
+)
+from .layers import DEFAULT_LAYER_SPECS, prepare_private_memory_artifacts
+from .platform_primitives import is_link_or_reparse_point
+from .private_artifacts import (
+    ensure_owner_only_directory,
+    read_private_text,
+    write_private_text,
+    write_private_text_exclusive,
+)
+from .runtime_profile_lease import (
+    LeaseManagement,
+    LeaseProcessInspector,
+    LeaseProcessSnapshot,
+    RuntimeLeaseIdentity,
+    RuntimeProfileLease,
+    current_runtime_lease_identity,
+    inspect_lease_process,
+    resolve_runtime_profile_root,
+)
+from .server import create_app
+from .server_desktop_routes import DesktopShutdownController
+from .state_store import SCHEMA_VERSION
+
+_UVICORN_BACKLOG = 2048
+_SIDECAR_READINESS_SCHEMA = "kestrel.desktop.sidecar_readiness.v1"
+_SIDECAR_READINESS_DIRECTORY = "runtime"
+_SIDECAR_READINESS_NAME = "desktop-readiness.json"
+_SIDECAR_FAILURE_SCHEMA = "kestrel.desktop.sidecar-failure.v1"
+_SIDECAR_FAILURE_PREFIX = "desktop-failure-"
+_SIDECAR_FAILURE_CONTEXT = b"kestrel.desktop.sidecar-failure.v1\0"
+_MAX_SIDECAR_FAILURE_BYTES = 16 * 1024
+_MAX_RESOURCE_MANIFEST_BYTES = 1024 * 1024
+_RESOURCE_MANIFEST_NAME = "kestrel-resource-manifest.json"
+_DESKTOP_STARTUP_FAILURE_REASONS = frozenset(
+    {
+        "profile_conflict",
+        "state_incompatible",
+        "state_corrupt",
+        "memvid_reopen_failed",
+    }
+)
+
+
+class _DesktopServer(Protocol):
+    should_exit: bool
+
+    async def serve(self, *, sockets: list[socket.socket]) -> None: ...
+
+
+class _PreflightBackend(Protocol):
+    def open(self) -> None: ...
+
+    def close(self) -> Any: ...
+
+
+class _RuntimeLease(Protocol):
+    def release(self) -> None: ...
+
+
+BackendFactory = Callable[[Path], _PreflightBackend]
+ServerFactory = Callable[[Any], _DesktopServer]
+SocketFactory = Callable[[], socket.socket]
+Preflight = Callable[[Path], DesktopMemvidPreflightReceipt | None]
+DeveloperBirthMarkerReader = Callable[[int], str | None]
+DeveloperParentPidReader = Callable[[int], int | None]
+
+
+class IdentityFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        profile_id: str,
+        management: LeaseManagement,
+        base_url: str,
+        launch_nonce: str,
+    ) -> RuntimeLeaseIdentity: ...
+
+
+class LeaseAcquirer(Protocol):
+    def __call__(
+        self,
+        profile_root: Path,
+        identity: RuntimeLeaseIdentity,
+    ) -> _RuntimeLease: ...
+
+
+class AppFactory(Protocol):
+    def __call__(
+        self,
+        config: AgentConfig,
+        *,
+        desktop_context: DesktopLaunchConfig,
+        desktop_shutdown: DesktopShutdownController,
+    ) -> Any: ...
+
+
+@dataclass(frozen=True)
+class DesktopSidecarReadiness:
+    pid: int
+    process_birth_marker: str
+    port: int
+    profile_id: str
+    sidecar_version: str
+    executable_digest: str
+    resource_manifest_digest: str
+    launch_nonce_digest: str
+    schema: str = _SIDECAR_READINESS_SCHEMA
+
+    def __post_init__(self) -> None:
+        if isinstance(self.pid, bool) or not isinstance(self.pid, int) or self.pid <= 0:
+            raise ValueError("pid must be a positive integer")
+        if isinstance(self.port, bool) or not isinstance(self.port, int):
+            raise ValueError("port must be an integer")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("port must be between 1 and 65535")
+        for field_name in (
+            "process_birth_marker",
+            "profile_id",
+            "sidecar_version",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        for field_name in ("executable_digest", "launch_nonce_digest"):
+            object.__setattr__(
+                self,
+                field_name,
+                _sha256_digest(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self,
+            "resource_manifest_digest",
+            _prefixed_sha256_digest(
+                self.resource_manifest_digest,
+                "resource_manifest_digest",
+            ),
+        )
+        if self.schema != _SIDECAR_READINESS_SCHEMA:
+            raise ValueError(f"schema must be {_SIDECAR_READINESS_SCHEMA}")
+
+    @classmethod
+    def from_runtime(
+        cls,
+        identity: RuntimeLeaseIdentity,
+        *,
+        port: int,
+        resource_manifest_digest: str,
+    ) -> DesktopSidecarReadiness:
+        if identity.management != "desktop":
+            raise ValueError("Desktop readiness requires a desktop-managed lease")
+        return cls(
+            pid=identity.pid,
+            process_birth_marker=identity.process_birth_marker,
+            port=port,
+            profile_id=identity.profile_id,
+            sidecar_version=identity.version,
+            executable_digest=identity.executable_digest,
+            resource_manifest_digest=resource_manifest_digest,
+            launch_nonce_digest=identity.launch_nonce_digest,
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "pid": self.pid,
+            "process_birth_marker": self.process_birth_marker,
+            "port": self.port,
+            "profile_id": self.profile_id,
+            "sidecar_version": self.sidecar_version,
+            "executable_digest": self.executable_digest,
+            "resource_manifest_digest": self.resource_manifest_digest,
+            "launch_nonce_digest": self.launch_nonce_digest,
+        }
+
+
+@dataclass(frozen=True)
+class DesktopSidecarFailure:
+    launch_nonce_digest: str
+    profile_id: str
+    reason: str
+    resource_manifest_digest: str
+    sidecar_version: str
+    authentication_tag: str
+    schema: str = _SIDECAR_FAILURE_SCHEMA
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "launch_nonce_digest",
+            _sha256_digest(
+                self.launch_nonce_digest,
+                "launch_nonce_digest",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "resource_manifest_digest",
+            _prefixed_sha256_digest(
+                self.resource_manifest_digest,
+                "resource_manifest_digest",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "authentication_tag",
+            _sha256_digest(
+                self.authentication_tag,
+                "authentication_tag",
+            ),
+        )
+        if (
+            not isinstance(self.profile_id, str)
+            or not self.profile_id.strip()
+            or len(self.profile_id) > 120
+        ):
+            raise ValueError("profile_id must be bounded non-empty text")
+        if (
+            not isinstance(self.sidecar_version, str)
+            or not self.sidecar_version.strip()
+            or len(self.sidecar_version) > 64
+        ):
+            raise ValueError("sidecar_version must be bounded non-empty text")
+        if self.reason not in _DESKTOP_STARTUP_FAILURE_REASONS:
+            raise ValueError("unsupported desktop startup failure reason")
+        if self.schema != _SIDECAR_FAILURE_SCHEMA:
+            raise ValueError(f"schema must be {_SIDECAR_FAILURE_SCHEMA}")
+
+    @classmethod
+    def create(
+        cls,
+        launch: DesktopLaunchConfig,
+        *,
+        sidecar_version: str,
+        reason: str,
+    ) -> DesktopSidecarFailure:
+        unsigned = {
+            "schema": _SIDECAR_FAILURE_SCHEMA,
+            "launch_nonce_digest": sha256(launch.launch_nonce.encode("utf-8")).hexdigest(),
+            "profile_id": launch.profile_id,
+            "reason": reason,
+            "resource_manifest_digest": (launch.resource_manifest_digest),
+            "sidecar_version": sidecar_version,
+        }
+        tag = hmac.new(
+            launch.api_token.encode("utf-8"),
+            _SIDECAR_FAILURE_CONTEXT + _canonical_json(unsigned).encode("utf-8"),
+            "sha256",
+        ).hexdigest()
+        return cls(**unsigned, authentication_tag=tag)
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "schema": self.schema,
+            "launch_nonce_digest": self.launch_nonce_digest,
+            "profile_id": self.profile_id,
+            "reason": self.reason,
+            "resource_manifest_digest": (self.resource_manifest_digest),
+            "sidecar_version": self.sidecar_version,
+            "authentication_tag": self.authentication_tag,
+        }
+
+
+class DesktopStateIncompatibleError(RuntimeError):
+    pass
+
+
+class DesktopStateCorruptError(RuntimeError):
+    pass
+
+
+def bind_desktop_socket(*, backlog: int = _UVICORN_BACKLOG) -> socket.socket:
+    """Return one listening socket on an operating-system-assigned loopback port."""
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(backlog)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+async def serve_desktop_app(
+    app: Any,
+    sock: socket.socket,
+    *,
+    shutdown_controller: DesktopShutdownController | None = None,
+    server_factory: ServerFactory | None = None,
+) -> None:
+    """Serve an app without reopening or replacing its already-bound socket."""
+
+    if server_factory is None:
+        import uvicorn
+
+        config = uvicorn.Config(app, access_log=False, lifespan="on")
+        sock.listen(config.backlog)
+        server: _DesktopServer = uvicorn.Server(config)
+    else:
+        server = server_factory(app)
+
+    def request_exit() -> None:
+        server.should_exit = True
+
+    if shutdown_controller is not None:
+        shutdown_controller.bind(request_exit)
+    try:
+        await server.serve(sockets=[sock])
+    finally:
+        if shutdown_controller is not None:
+            shutdown_controller.unbind(request_exit)
+
+
+def run_desktop_sidecar_preflight(
+    memory_dir: Path,
+    *,
+    backend_factory: BackendFactory | None = None,
+) -> DesktopMemvidPreflightReceipt:
+    """Open and close every canonical Memvid v2 layer before API readiness."""
+
+    ensure_owner_only_directory(memory_dir)
+    prepare_private_memory_artifacts(memory_dir)
+    opened: list[_PreflightBackend] = []
+    try:
+        for layer, spec in DEFAULT_LAYER_SPECS.items():
+            path = Path(memory_dir) / spec.mv2_file
+            backend = (
+                backend_factory(path)
+                if backend_factory is not None
+                else MemvidBackend(path=path, layer=layer)
+            )
+            backend.open()
+            opened.append(backend)
+    finally:
+        cleanup_error: BaseException | None = None
+        for backend in reversed(opened):
+            try:
+                backend.close()
+            except BaseException as exc:  # noqa: BLE001 - close every opened layer
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            raise RuntimeError("desktop_memvid_preflight_cleanup_incomplete") from cleanup_error
+    return capture_desktop_memvid_preflight_receipt(Path(memory_dir))
+
+
+def build_desktop_agent_config(launch: DesktopLaunchConfig) -> AgentConfig:
+    """Build the immutable profile boundary around owner-tunable runtime settings."""
+
+    root = launch.profile_root
+    return AgentConfig(
+        backend="memvid",
+        provider="mock",
+        model="mock",
+        memory_dir=launch.memory_dir,
+        workspace=root / "workspace",
+        log_dir=root / "logs",
+        state_path=launch.state_path,
+        secret_store_path=(root / "secrets" / "desktop-keyring-metadata.json"),
+        secret_backend="desktop",
+        skills_dir=root / "skills",
+        plugins_dir=root / "plugins",
+        mcp_config_path=root / "config" / "mcp_servers.json",
+        channel_config_path=root / "config" / "channels.json",
+        worker_worktree_dir=root / "worktrees",
+        require_api_auth=True,
+    )
+
+
+def prepare_desktop_profile_directories(launch: DesktopLaunchConfig) -> None:
+    """Create or repair the dedicated Desktop profile directories as owner-only."""
+
+    for directory in (
+        launch.profile_root,
+        launch.state_path.parent,
+        launch.memory_dir,
+        launch.runtime_settings_path.parent,
+        launch.profile_root / _SIDECAR_READINESS_DIRECTORY,
+        launch.profile_root / "logs",
+        launch.profile_root / "secrets",
+        launch.profile_root / "skills",
+        launch.profile_root / "plugins",
+        launch.profile_root / "worktrees",
+        launch.profile_root / "workspace",
+    ):
+        ensure_owner_only_directory(directory)
+
+
+async def run_desktop_sidecar(
+    bootstrap_path: Path,
+    *,
+    manifest_path: Path | None = None,
+    inspector: LeaseProcessInspector = inspect_lease_process,
+    socket_factory: SocketFactory = bind_desktop_socket,
+    identity_factory: IdentityFactory = current_runtime_lease_identity,
+    lease_acquirer: LeaseAcquirer = RuntimeProfileLease.acquire,
+    preflight: Preflight = run_desktop_sidecar_preflight,
+    app_factory: AppFactory = create_app,
+    server_factory: ServerFactory | None = None,
+    developer_birth_marker_reader: DeveloperBirthMarkerReader | None = None,
+) -> None:
+    """Run one authenticated Desktop-owned Kestrel authority."""
+
+    launch = consume_desktop_bootstrap(Path(bootstrap_path))
+    resolved_developer_birth_marker_reader = (
+        developer_birth_marker_reader or read_developer_macos_process_birth_marker
+    )
+    verify_desktop_parent_identity(
+        launch,
+        inspector=inspector,
+        developer_birth_marker_reader=resolved_developer_birth_marker_reader,
+    )
+    verified_manifest_digest = verify_resource_manifest_binding(
+        launch,
+        manifest_path=manifest_path or resolve_resource_manifest_path(),
+    )
+
+    sock: socket.socket | None = None
+    lease: _RuntimeLease | None = None
+    readiness: DesktopSidecarReadiness | None = None
+    readiness_path = desktop_readiness_path(launch)
+    readiness_cleanup_eligible = False
+    primary_error: BaseException | None = None
+    startup_phase = "prelease"
+    try:
+        sock = socket_factory()
+        host, raw_port = sock.getsockname()
+        port = int(raw_port)
+        if host != "127.0.0.1" or not 1 <= port <= 65535:
+            raise RuntimeError("desktop_sidecar_socket_is_not_ipv4_loopback")
+        base_url = f"http://127.0.0.1:{port}/"
+        identity = identity_factory(
+            profile_id=launch.profile_id,
+            management="desktop",
+            base_url=base_url,
+            launch_nonce=launch.launch_nonce,
+        )
+        identity = bind_developer_runtime_identity(
+            launch,
+            identity,
+            developer_birth_marker_reader=resolved_developer_birth_marker_reader,
+        )
+        if (
+            identity.profile_id != launch.profile_id
+            or identity.management != "desktop"
+            or identity.base_url != base_url
+            or not secrets.compare_digest(
+                identity.launch_nonce_digest,
+                sha256(launch.launch_nonce.encode("utf-8")).hexdigest(),
+            )
+        ):
+            raise RuntimeError("desktop_runtime_identity_mismatch")
+        profile_root = resolve_runtime_profile_root(
+            launch.state_path,
+            launch.memory_dir,
+            profile_id=launch.profile_id,
+        )
+        startup_phase = "lease"
+        lease = lease_acquirer(profile_root, identity)
+        startup_phase = "profile"
+        prepare_desktop_profile_directories(launch)
+        startup_phase = "state"
+        run_desktop_state_preflight(launch.state_path)
+        startup_phase = "memvid"
+        memory_preflight_receipt = preflight(launch.memory_dir)
+        if memory_preflight_receipt is not None:
+            if type(memory_preflight_receipt) is not DesktopMemvidPreflightReceipt:
+                raise RuntimeError("desktop_memvid_preflight_receipt_invalid")
+            launch = replace(
+                launch,
+                memory_preflight_receipt=memory_preflight_receipt.bind(
+                    launch_nonce_digest=sha256(launch.launch_nonce.encode("utf-8")).hexdigest(),
+                    resource_manifest_digest=verified_manifest_digest,
+                ),
+            )
+        startup_phase = "app"
+        config = build_desktop_agent_config(launch)
+        shutdown_controller = DesktopShutdownController()
+        app = app_factory(
+            config,
+            desktop_context=launch,
+            desktop_shutdown=shutdown_controller,
+        )
+        readiness = DesktopSidecarReadiness.from_runtime(
+            identity,
+            port=port,
+            resource_manifest_digest=verified_manifest_digest,
+        )
+        readiness_cleanup_eligible = True
+        write_desktop_readiness(readiness_path, readiness)
+        await serve_desktop_app(
+            app,
+            sock,
+            shutdown_controller=shutdown_controller,
+            server_factory=server_factory,
+        )
+    except BaseException as exc:
+        primary_error = exc
+        if readiness is None:
+            reason = classify_desktop_startup_failure(
+                startup_phase,
+                exc,
+            )
+            if reason is not None:
+                try:
+                    write_desktop_failure(
+                        desktop_failure_path(launch),
+                        DesktopSidecarFailure.create(
+                            launch,
+                            sidecar_version=(launch.readiness().sidecar_version),
+                            reason=reason,
+                        ),
+                    )
+                except BaseException:
+                    # The primary startup failure remains authoritative.
+                    pass
+        raise
+    finally:
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        try:
+            if readiness_cleanup_eligible and readiness is not None:
+                try:
+                    removed = remove_owned_desktop_readiness(
+                        readiness_path,
+                        readiness,
+                    )
+                    if not removed:
+                        cleanup_failures.append(
+                            (
+                                "readiness",
+                                RuntimeError("owned_desktop_readiness_not_removed"),
+                            )
+                        )
+                except BaseException as exc:  # noqa: BLE001 - continue ownership cleanup
+                    cleanup_failures.append(("readiness", exc))
+        finally:
+            try:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except BaseException as exc:  # noqa: BLE001 - lease release must follow
+                        cleanup_failures.append(("socket", exc))
+            finally:
+                if lease is not None:
+                    try:
+                        lease.release()
+                    except BaseException as exc:  # noqa: BLE001 - report after all attempts
+                        cleanup_failures.append(("lease", exc))
+        if cleanup_failures:
+            stages = ",".join(stage for stage, _error in cleanup_failures)
+            detail = f"desktop_sidecar_cleanup_incomplete:{stages}"
+            if primary_error is not None:
+                primary_error.add_note(detail)
+            else:
+                raise RuntimeError(detail) from cleanup_failures[0][1]
+
+
+def resolve_resource_manifest_path() -> Path:
+    """Locate the immutable manifest in both one-file and app-resource layouts."""
+
+    executable_parent = Path(sys.executable).resolve().parent
+    bundle_root = Path(getattr(sys, "_MEIPASS", executable_parent))
+    candidates = (
+        bundle_root / _RESOURCE_MANIFEST_NAME,
+        bundle_root / "resources" / _RESOURCE_MANIFEST_NAME,
+        executable_parent / _RESOURCE_MANIFEST_NAME,
+        executable_parent / "resources" / _RESOURCE_MANIFEST_NAME,
+        executable_parent.parent / _RESOURCE_MANIFEST_NAME,
+    )
+    for candidate in candidates:
+        try:
+            os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        return candidate
+    raise RuntimeError("packaged_resource_manifest_missing")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="kestrel-desktop-sidecar")
+    parser.add_argument("bootstrap_path", type=Path)
+    arguments = parser.parse_args(argv)
+    asyncio.run(run_desktop_sidecar(arguments.bootstrap_path))
+
+
+def verify_desktop_parent_identity(
+    launch: DesktopLaunchConfig,
+    *,
+    actual_parent_pid: int | None = None,
+    current_pid: int | None = None,
+    inspector: LeaseProcessInspector,
+    developer_birth_marker_reader: DeveloperBirthMarkerReader | None = None,
+    developer_parent_pid_reader: DeveloperParentPidReader | None = None,
+    frozen_runtime: bool | None = None,
+) -> LeaseProcessSnapshot:
+    """Verify that the live parent matches the bootstrap's birth-bound identity."""
+
+    observed_parent_pid = os.getppid() if actual_parent_pid is None else actual_parent_pid
+    resolved_frozen_runtime = (
+        bool(getattr(sys, "frozen", False))
+        if frozen_runtime is None
+        else frozen_runtime
+    )
+    has_developer_bootloader = observed_parent_pid != launch.parent_pid
+    resolved_parent_pid_reader = (
+        developer_parent_pid_reader or read_developer_macos_process_parent_pid
+    )
+    if has_developer_bootloader:
+        if launch.assurance_mode != "developer" or not resolved_frozen_runtime:
+            raise RuntimeError("desktop_parent_pid_mismatch")
+        if resolved_parent_pid_reader(observed_parent_pid) != launch.parent_pid:
+            raise RuntimeError("desktop_parent_identity_unverified")
+    own_pid = os.getpid() if current_pid is None else current_pid
+    parent = inspector(launch.parent_pid)
+    current = inspector(own_pid)
+    bootloader = inspector(observed_parent_pid) if has_developer_bootloader else None
+    resolved_developer_birth_marker_reader = (
+        developer_birth_marker_reader or read_developer_macos_process_birth_marker
+    )
+    observed_parent_birth_marker = (
+        resolved_developer_birth_marker_reader(launch.parent_pid)
+        if launch.assurance_mode == "developer"
+        else (parent.process_birth_marker if parent is not None else None)
+    )
+    if (
+        parent is None
+        or current is None
+        or parent.pid != launch.parent_pid
+        or current.pid != own_pid
+        or observed_parent_birth_marker is None
+        or not secrets.compare_digest(
+            observed_parent_birth_marker,
+            launch.parent_birth_marker,
+        )
+        or not secrets.compare_digest(parent.owner_digest, current.owner_digest)
+    ):
+        raise RuntimeError("desktop_parent_identity_unverified")
+    if has_developer_bootloader:
+        if (
+            bootloader is None
+            or bootloader.pid != observed_parent_pid
+            or observed_parent_pid in {launch.parent_pid, own_pid}
+            or not secrets.compare_digest(
+                bootloader.owner_digest,
+                parent.owner_digest,
+            )
+            or not secrets.compare_digest(
+                bootloader.owner_digest,
+                current.owner_digest,
+            )
+            or not secrets.compare_digest(
+                bootloader.executable_digest,
+                current.executable_digest,
+            )
+            or resolved_parent_pid_reader(observed_parent_pid)
+            != launch.parent_pid
+            or inspector(launch.parent_pid) != parent
+            or inspector(observed_parent_pid) != bootloader
+            or inspector(own_pid) != current
+        ):
+            raise RuntimeError("desktop_parent_identity_unverified")
+    return parent
+
+
+def read_developer_macos_process_parent_pid(pid: int) -> int | None:
+    """Read one developer-only macOS parent edge without walking arbitrary ancestry."""
+
+    if sys.platform != "darwin" or isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 - absolute trusted system binary
+            [
+                "/bin/ps",
+                "-ww",
+                "-p",
+                str(pid),
+                "-o",
+                "ppid=",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > 16 * 1024:
+        return None
+    try:
+        rendered = completed.stdout.decode("utf-8").strip()
+        parent_pid = int(rendered)
+    except (UnicodeDecodeError, ValueError, OverflowError):
+        return None
+    return parent_pid if parent_pid > 0 else None
+
+
+def read_developer_macos_process_birth_marker(pid: int) -> str | None:
+    """Read the developer-only, ps-derived macOS birth marker used by Electron."""
+
+    if sys.platform != "darwin" or isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 - absolute trusted system binary
+            [
+                "/bin/ps",
+                "-ww",
+                "-p",
+                str(pid),
+                "-o",
+                "uid=",
+                "-o",
+                "lstart=",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > 16 * 1024:
+        return None
+    try:
+        parts = completed.stdout.decode("utf-8").strip().split()
+        if len(parts) != 6 or not parts[0].isdigit():
+            return None
+        birth = datetime.strptime(
+            " ".join(parts[1:]),
+            "%a %b %d %H:%M:%S %Y",
+        )
+        birth_milliseconds = int(birth.timestamp() * 1000)
+    except (UnicodeDecodeError, ValueError, OverflowError, OSError):
+        return None
+    if birth_milliseconds <= 0:
+        return None
+    return f"developer-ps-lstart-ms:{birth_milliseconds}"
+
+
+def bind_developer_runtime_identity(
+    launch: DesktopLaunchConfig,
+    identity: RuntimeLeaseIdentity,
+    *,
+    developer_birth_marker_reader: DeveloperBirthMarkerReader = (
+        read_developer_macos_process_birth_marker
+    ),
+) -> RuntimeLeaseIdentity:
+    """Use the shared developer marker without weakening release identities."""
+
+    if launch.assurance_mode == "release":
+        return identity
+    marker = developer_birth_marker_reader(identity.pid)
+    prefix = "developer-ps-lstart-ms:"
+    marker_value = marker.removeprefix(prefix) if marker is not None else ""
+    if (
+        marker is None
+        or not marker.startswith(prefix)
+        or not marker_value.isdigit()
+        or int(marker_value) <= 0
+    ):
+        raise RuntimeError("developer_runtime_identity_unverified")
+    return replace(identity, process_birth_marker=marker)
+
+
+def verify_resource_manifest_binding(
+    launch: DesktopLaunchConfig,
+    *,
+    manifest_path: Path,
+) -> str:
+    """Bind the consumed bootstrap to the exact packaged resource manifest bytes."""
+
+    expected = _prefixed_sha256_digest(
+        launch.resource_manifest_digest,
+        "resource_manifest_digest",
+    )
+    manifest_bytes = _verified_file_bytes(manifest_path)
+    actual = f"sha256:{sha256(manifest_bytes).hexdigest()}"
+    if not secrets.compare_digest(actual, expected):
+        raise RuntimeError("resource_manifest_digest_mismatch")
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("resource_manifest_identity_invalid") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("resource_manifest_identity_invalid")
+    build_mode = manifest.get("build_mode")
+    if build_mode not in {"developer", "release"}:
+        raise RuntimeError("resource_manifest_identity_invalid")
+    if not secrets.compare_digest(build_mode, launch.assurance_mode):
+        raise RuntimeError("resource_manifest_assurance_mode_mismatch")
+    return actual
+
+
+def desktop_readiness_path(launch: DesktopLaunchConfig) -> Path:
+    return launch.profile_root / _SIDECAR_READINESS_DIRECTORY / _SIDECAR_READINESS_NAME
+
+
+def desktop_failure_path(launch: DesktopLaunchConfig) -> Path:
+    nonce_digest = sha256(launch.launch_nonce.encode("utf-8")).hexdigest()
+    return (
+        launch.profile_root
+        / _SIDECAR_READINESS_DIRECTORY
+        / (f"{_SIDECAR_FAILURE_PREFIX}{nonce_digest[:24]}.json")
+    )
+
+
+def write_desktop_failure(
+    path: Path,
+    failure: DesktopSidecarFailure,
+) -> None:
+    rendered = (
+        json.dumps(
+            failure.to_payload(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    if len(rendered.encode("utf-8")) > _MAX_SIDECAR_FAILURE_BYTES:
+        raise ValueError("Desktop sidecar failure exceeds 16 KiB")
+    write_private_text_exclusive(path, rendered)
+
+
+def classify_desktop_startup_failure(
+    phase: str,
+    error: BaseException,
+) -> str | None:
+    if phase == "lease":
+        return "profile_conflict"
+    if phase == "memvid":
+        return "memvid_reopen_failed"
+    if isinstance(error, DesktopStateIncompatibleError):
+        return "state_incompatible"
+    if isinstance(error, DesktopStateCorruptError):
+        return "state_corrupt"
+    if phase == "state":
+        if isinstance(error, RuntimeError) and "newer than supported" in str(error):
+            return "state_incompatible"
+        if isinstance(
+            error,
+            (OSError, ValueError, sqlite3.DatabaseError),
+        ):
+            return "state_corrupt"
+    return None
+
+
+def run_desktop_state_preflight(state_path: Path) -> None:
+    """Read state integrity/schema before any migration or runtime start."""
+
+    path = Path(state_path)
+    if not path.exists():
+        return
+    try:
+        with sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+        ) as connection:
+            row = connection.execute("PRAGMA quick_check(1)").fetchone()
+            if row is None or str(row[0]) != "ok":
+                raise DesktopStateCorruptError("desktop_state_integrity_failed")
+            table = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'schema_version'
+                """
+            ).fetchone()
+            if table is None:
+                return
+            version_row = connection.execute(
+                "SELECT version FROM schema_version WHERE id = 1"
+            ).fetchone()
+            version = 0 if version_row is None else int(version_row[0])
+            if version > SCHEMA_VERSION:
+                raise DesktopStateIncompatibleError("desktop_state_schema_newer_than_supported")
+    except (
+        DesktopStateCorruptError,
+        DesktopStateIncompatibleError,
+    ):
+        raise
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+        raise DesktopStateCorruptError("desktop_state_integrity_failed") from exc
+
+
+def write_desktop_readiness(
+    path: Path,
+    readiness: DesktopSidecarReadiness,
+) -> None:
+    ensure_owner_only_directory(Path(path).parent)
+    rendered = json.dumps(
+        readiness.to_payload(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    write_private_text(path, f"{rendered}\n")
+
+
+def remove_owned_desktop_readiness(
+    path: Path,
+    readiness: DesktopSidecarReadiness,
+) -> bool:
+    expected = json.dumps(
+        readiness.to_payload(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    try:
+        current = read_private_text(path, missing_ok=True)
+    except (OSError, PermissionError, ValueError):
+        return False
+    if current is None or current.strip() != expected:
+        return False
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if is_link_or_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _verified_file_bytes(path: Path) -> bytes:
+    target = Path(path)
+    before_open = os.lstat(target)
+    if is_link_or_reparse_point(before_open) or not stat.S_ISREG(before_open.st_mode):
+        raise RuntimeError("resource_manifest_must_be_a_regular_file")
+    if before_open.st_size > _MAX_RESOURCE_MANIFEST_BYTES:
+        raise RuntimeError("resource_manifest_too_large")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags)
+    try:
+        opened = os.fstat(descriptor)
+        after_open = os.lstat(target)
+        if (
+            is_link_or_reparse_point(opened)
+            or is_link_or_reparse_point(after_open)
+            or not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(after_open.st_mode)
+            or not os.path.samestat(before_open, opened)
+            or not os.path.samestat(opened, after_open)
+        ):
+            raise RuntimeError("resource_manifest_changed_during_verification")
+        if opened.st_size > _MAX_RESOURCE_MANIFEST_BYTES:
+            raise RuntimeError("resource_manifest_too_large")
+        chunks: list[bytes] = []
+        byte_count = 0
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                byte_count += len(chunk)
+                if byte_count > _MAX_RESOURCE_MANIFEST_BYTES:
+                    raise RuntimeError("resource_manifest_too_large")
+                chunks.append(chunk)
+        final = os.lstat(target)
+        if is_link_or_reparse_point(final) or not os.path.samestat(after_open, final):
+            raise RuntimeError("resource_manifest_changed_during_verification")
+        return b"".join(chunks)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _sha256_digest(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a SHA-256 digest")
+    text = value.strip().lower()
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise ValueError(f"{field_name} must be a SHA-256 digest")
+    return text
+
+
+def _prefixed_sha256_digest(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        raise ValueError(f"{field_name} must be a sha256-prefixed digest")
+    return f"sha256:{_sha256_digest(value[7:], field_name)}"
+
+
+def _canonical_json(payload: dict[str, str]) -> str:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )

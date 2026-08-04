@@ -262,6 +262,19 @@ def test_regular_state_connections_do_not_reopen_sqlite_sidecars(
     assert store.health_snapshot()["integrity"] == "ok"
 
 
+def test_regular_state_connections_enable_recursive_triggers(tmp_path: Path) -> None:
+    store = AgentStateStore(tmp_path / "recursive-triggers" / "state.db")
+
+    with store._connect() as connection:
+        foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
+        recursive_triggers = connection.execute("PRAGMA recursive_triggers").fetchone()
+
+    assert foreign_keys is not None
+    assert foreign_keys[0] == 1
+    assert recursive_triggers is not None
+    assert recursive_triggers[0] == 1
+
+
 def test_regular_connection_setup_retries_busy_with_a_fresh_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

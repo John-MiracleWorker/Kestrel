@@ -48,6 +48,7 @@ from .graph_runtime import (
     criterion_requires_validation_evidence,
     evaluate_turn_review,
 )
+from .lan_runtime_authority import LanRuntimeAuthorityResolver
 from .layers import MemoryCleanupIncompleteError
 from .mcp_manager import MCPManager
 from .models import MemoryLayer
@@ -139,6 +140,8 @@ class RunManager:
         skills: SkillManager,
         plugins: PluginManager | None = None,
         secret_resolver: Callable[[str | None], str | None] | None = None,
+        lan_runtime_authority_resolver: LanRuntimeAuthorityResolver | None = None,
+        lan_runtime_utc_clock: Callable[[], datetime] | None = None,
         recover_startup_work: bool = True,
         enforce_single_owner: bool = False,
         read_only_observer: bool = False,
@@ -148,17 +151,27 @@ class RunManager:
             raise ValueError("read-only observers cannot recover startup work")
         if read_only_observer and enforce_single_owner:
             raise ValueError("read-only observers cannot own the primary runtime")
+        if lan_runtime_authority_resolver is not None and not callable(
+            lan_runtime_authority_resolver
+        ):
+            raise TypeError("LAN runtime authority resolver must be callable")
+        if lan_runtime_utc_clock is not None and not callable(lan_runtime_utc_clock):
+            raise TypeError("LAN runtime UTC clock must be callable")
+        config = replace(config, lan_runtime_authority=None)
         self.config = config
         self.state = state
         self.events = events
         self.mcp = mcp
         self.skills = skills
         self.secret_resolver = secret_resolver
+        self.lan_runtime_authority_resolver = lan_runtime_authority_resolver
+        self.lan_runtime_utc_clock = lan_runtime_utc_clock
         self.read_only_observer = read_only_observer
         self._recover_startup_work = recover_startup_work
         self._runtime_ownership = (
             PrimaryRuntimeOwnership(state.path) if enforce_single_owner else None
         )
+        start_cleanup_authoritative = False
         try:
             self.plugins = plugins or PluginManager(config.plugins_dir, state)
             self.capabilities = CapabilityPolicy(state, lambda: self.config)
@@ -175,7 +188,10 @@ class RunManager:
             self._approval_lock = Lock()
             self._memvid_agent_condition = Condition(Lock())
             self._memvid_agent_active = False
+            self._memory_close_observer: Callable[[], None] | None = None
             self._shutdown_event = Event()
+            self._lifecycle_dependencies: dict[str, Any] = {}
+            self._startup_dependencies: dict[str, Callable[[], Any]] = {}
             self._approval_call_arguments: dict[str, tuple[str, dict[str, Any]]] = {}
             self._execution_locks = tuple(RLock() for _ in range(64))
             self._execution_context = local()
@@ -201,7 +217,12 @@ class RunManager:
                 tuple[MemoryCleanupIncompleteError, Callable[[], None]]
             ] = []
             self._shutting_down = False
+            self._shutdown_condition = Condition(self._lock)
+            self._shutdown_owner: Thread | None = None
+            self._shutdown_result: bool | None = None
+            self._startup_failure_cleanup_in_progress = False
             self._started = False
+            self._startup_in_progress = False
             self._start_lock = Lock()
             self._lease_owner = f"manager_{os.getpid()}_{uuid4().hex}"
             self._tool_fence = RuntimeToolFence()
@@ -215,10 +236,62 @@ class RunManager:
                 "preserved": [],
             }
             if auto_start:
+                start_cleanup_authoritative = True
                 self.start()
         except BaseException:
-            self._release_runtime_ownership()
+            if not start_cleanup_authoritative:
+                self._release_runtime_ownership()
             raise
+
+    def configure_memory_close_observer(
+        self,
+        observer: Callable[[], None],
+    ) -> None:
+        """Observe successful Memvid closes while the lifecycle slot is held."""
+
+        if not callable(observer):
+            raise TypeError("memory close observer must be callable")
+        with self._memvid_agent_condition:
+            self._memory_close_observer = observer
+
+    def register_lifecycle_dependency(self, name: str, dependency: Any) -> None:
+        """Register bounded cleanup that must finish before ownership release."""
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("lifecycle dependency name is required")
+        if not callable(getattr(dependency, "shutdown", None)):
+            raise TypeError("lifecycle dependency must define shutdown")
+        with self._lock:
+            if self._shutting_down or self._startup_failure_cleanup_in_progress:
+                raise RuntimeError("run_manager_shutting_down")
+            if name in self._lifecycle_dependencies:
+                raise ValueError(f"lifecycle dependency already registered: {name}")
+            self._lifecycle_dependencies[name] = dependency
+
+    def register_startup_dependency(
+        self,
+        name: str,
+        startup: Callable[[], Any],
+    ) -> None:
+        """Bind startup work after ownership but before any recovery can run."""
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("startup dependency name is required")
+        if not callable(startup):
+            raise TypeError("startup dependency must be callable")
+        with self._lock:
+            if (
+                self._started
+                or self._startup_in_progress
+                or self._shutting_down
+                or self._startup_failure_cleanup_in_progress
+            ):
+                raise RuntimeError("runtime_manager_already_started")
+            if name not in self._lifecycle_dependencies:
+                raise ValueError("startup dependency requires matching lifecycle cleanup")
+            if name in self._startup_dependencies:
+                raise ValueError(f"startup dependency already registered: {name}")
+            self._startup_dependencies[name] = startup
 
     def _uses_actionable_project_routing(self) -> bool:
         """Return whether task-level routing, rather than the direct LLM, is authoritative."""
@@ -243,19 +316,54 @@ class RunManager:
             if self._started:
                 return
             try:
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                    self._startup_in_progress = True
+                    startup_dependencies = tuple(self._startup_dependencies.values())
                 if self._runtime_ownership is not None:
                     self._runtime_ownership.acquire()
-                self._started = True
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                for startup in startup_dependencies:
+                    startup()
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                    self._started = True
                 if not self.read_only_observer:
                     self.reconcile_capabilities()
+                    self._raise_if_startup_shutdown_requested()
                 if self._recover_startup_work:
                     self.startup_recovery = self._reconcile_startup()
+                    self._raise_if_startup_shutdown_requested()
                     self.startup_worker_recovery = self._reconcile_startup_workers()
+                    self._raise_if_startup_shutdown_requested()
                     self._resume_startup_queued_runs()
+                    self._raise_if_startup_shutdown_requested()
+                with self._lock:
+                    if self._shutting_down:
+                        raise RuntimeError("runtime_manager_shut_down")
+                    self._startup_in_progress = False
             except BaseException:
-                self._started = False
-                self._release_runtime_ownership()
+                with self._lock:
+                    self._started = False
+                    self._startup_in_progress = False
+                    shutdown_won = self._shutting_down
+                if not shutdown_won:
+                    try:
+                        self._shutdown_after_start_failure(timeout_seconds=5.0)
+                    except BaseException:
+                        # Cleanup failure is fail-closed: the ownership handle
+                        # stays retained and the original startup error wins.
+                        pass
                 raise
+
+    def _raise_if_startup_shutdown_requested(self) -> None:
+        with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("runtime_manager_shut_down")
 
     def reconcile_capabilities(self) -> None:
         """Reconcile extension inventory at startup or an explicit refresh.
@@ -272,10 +380,10 @@ class RunManager:
     def _require_mutable_runtime(self, operation: str) -> None:
         if self.read_only_observer:
             raise RuntimeError(f"read_only_runtime_observer:{operation}")
-        if not self._started:
-            raise RuntimeError(f"runtime_not_started:{operation}")
         with self._lock:
             shutting_down = self._shutting_down
+        if not self._started and not (shutting_down and operation == "cancel_run"):
+            raise RuntimeError(f"runtime_not_started:{operation}")
         if shutting_down and operation != "cancel_run":
             if operation in {"create_run", "create_scheduled_routine_run"}:
                 raise RunCapacityError("run_manager_shutting_down")
@@ -1353,8 +1461,7 @@ class RunManager:
             and project.cost_budget is not None
             and direct_estimated_cost is not None
             and normalized_mission_plan
-            and direct_estimated_cost * len(normalized_mission_plan)
-            > project.cost_budget
+            and direct_estimated_cost * len(normalized_mission_plan) > project.cost_budget
         ):
             raise ValueError(
                 "mission direct-provider estimate exceeds the current project cost budget"
@@ -1452,9 +1559,7 @@ class RunManager:
                 canonical = registry.canonical_name(requested_tool)
                 spec = registry.spec_for(canonical or requested_tool)
                 if canonical is None or spec is None:
-                    raise ValueError(
-                        f"mission task requires an unknown tool: {requested_tool}"
-                    )
+                    raise ValueError(f"mission task requires an unknown tool: {requested_tool}")
                 decision = self.capabilities.tool_decision(spec)
                 required_capability_keys = _project_capability_keys_for_tool(spec)
                 if not decision.effective_enabled or any(
@@ -1475,9 +1580,7 @@ class RunManager:
             if risk not in _MISSION_RISK_RANK:
                 raise ValueError("mission task risk must be low, medium, high, or critical")
             if _MISSION_RISK_RANK[risk] < minimum_risk_rank:
-                raise ValueError(
-                    "mission task risk cannot downgrade its required tool risk"
-                )
+                raise ValueError("mission task risk cannot downgrade its required tool risk")
             normalized.append(
                 {
                     "task_id": task_id,
@@ -1494,8 +1597,7 @@ class RunManager:
             unknown = sorted(set(task["dependencies"]) - task_ids)
             if unknown:
                 raise ValueError(
-                    "mission task dependencies reference unknown tasks: "
-                    + ", ".join(unknown)
+                    "mission task dependencies reference unknown tasks: " + ", ".join(unknown)
                 )
         _assert_acyclic_mission_plan(normalized)
         return tuple(normalized)
@@ -1771,8 +1873,7 @@ class RunManager:
             )
         )
         mission_task_ids = {
-            str(planned["task_id"]): f"task_{uuid4().hex}"
-            for planned in planned_tasks
+            str(planned["task_id"]): f"task_{uuid4().hex}" for planned in planned_tasks
         }
         tasks = [root]
         for planned in planned_tasks:
@@ -1867,9 +1968,7 @@ class RunManager:
                 raise ValueError(f"approval packet contains an unknown tool: {requested_name}")
             capability = self.capabilities.tool_decision(spec)
             if not capability.effective_enabled:
-                raise PermissionError(
-                    f"approval packet tool is disabled: {canonical}"
-                )
+                raise PermissionError(f"approval packet tool is disabled: {canonical}")
             if project is not None:
                 missing = [
                     key
@@ -1893,9 +1992,7 @@ class RunManager:
                     resource_digest=self.tool_resource_digest(spec),
                     reason=str(raw.get("reason") or ""),
                     resource_scope=str(raw.get("resource_scope") or ""),
-                    expected_side_effect=str(
-                        raw.get("expected_side_effect") or ""
-                    ),
+                    expected_side_effect=str(raw.get("expected_side_effect") or ""),
                     rollback=str(raw.get("rollback") or ""),
                 )
             )
@@ -2573,9 +2670,7 @@ class RunManager:
                         run_id=run_id,
                         project_id=agent.config.project_id,
                         project_revision=agent.config.project_revision,
-                        project_baseline_index_digest=(
-                            agent.config.project_baseline_index_digest
-                        ),
+                        project_baseline_index_digest=(agent.config.project_baseline_index_digest),
                         allowed_paths=agent.config.project_allowed_paths,
                         execution_origin="manual",
                         approval_handler=self._approval_handler if run_id else None,
@@ -3094,9 +3189,7 @@ class RunManager:
             fanout_id=fanout_id,
             run_id=run_id,
             source_task_id=source_task_id,
-            task_contract_digest=self.candidate_fanouts.task_contract_digest(
-                source_task_id
-            ),
+            task_contract_digest=self.candidate_fanouts.task_contract_digest(source_task_id),
             candidates=tuple(isolations),
             estimated_budget_delta_usd=estimated_budget_delta_usd,
         )
@@ -3140,13 +3233,10 @@ class RunManager:
                 run_id=run_id,
                 worker_id=candidate_id,
             )
-            if (
-                str(isolation.workspace) != str(raw.get("workspace"))
-                or isolation.branch != str(raw.get("branch"))
+            if str(isolation.workspace) != str(raw.get("workspace")) or isolation.branch != str(
+                raw.get("branch")
             ):
-                raise ValueError(
-                    "prepared candidate isolation does not match the approved plan"
-                )
+                raise ValueError("prepared candidate isolation does not match the approved plan")
             prepared.append(isolation.to_payload())
         fanout = self.candidate_fanouts.create_fanout(
             fanout_id=fanout_id,
@@ -3213,8 +3303,7 @@ class RunManager:
                     item
                     for fanout in self._candidate_fanouts_for_run(run_id)
                     for item in fanout.candidates
-                    if item.candidate_id == candidate_id
-                    and item.task_id == task_id
+                    if item.candidate_id == candidate_id and item.task_id == task_id
                 ),
                 None,
             )
@@ -3223,9 +3312,7 @@ class RunManager:
             workspace = Path(candidate.workspace)
         config = self._config_for_run(run)
         if not config.allow_browser_validation:
-            raise PermissionError(
-                "browser validation is disabled by allow_browser_validation"
-            )
+            raise PermissionError("browser validation is disabled by allow_browser_validation")
         selected_image = str(image or config.validation_container_image or "").strip()
         record = self.browser_validations.validate(
             BrowserValidationRequest(
@@ -3240,11 +3327,7 @@ class RunManager:
                     BrowserAssertion(
                         selector=str(item.get("selector") or ""),
                         expectation=str(item.get("expectation") or ""),
-                        value=(
-                            None
-                            if item.get("value") is None
-                            else str(item.get("value"))
-                        ),
+                        value=(None if item.get("value") is None else str(item.get("value"))),
                     )
                     for item in assertions
                 ),
@@ -3252,11 +3335,7 @@ class RunManager:
                     BrowserInteraction(
                         action=str(item.get("action") or ""),
                         selector=str(item.get("selector") or ""),
-                        value=(
-                            None
-                            if item.get("value") is None
-                            else str(item.get("value"))
-                        ),
+                        value=(None if item.get("value") is None else str(item.get("value"))),
                     )
                     for item in interactions
                 ),
@@ -3280,10 +3359,7 @@ class RunManager:
                 """,
                 (run_id,),
             ).fetchall()
-        return [
-            self.candidate_fanouts.get_fanout(str(row["fanout_id"]))
-            for row in rows
-        ]
+        return [self.candidate_fanouts.get_fanout(str(row["fanout_id"])) for row in rows]
 
     def create_subagent(
         self, *, run_id: str, profile: str, goal: str, task_id: str | None = None
@@ -4662,9 +4738,7 @@ class RunManager:
                     run_id=run_id,
                     project_id=agent.config.project_id,
                     project_revision=agent.config.project_revision,
-                    project_baseline_index_digest=(
-                        agent.config.project_baseline_index_digest
-                    ),
+                    project_baseline_index_digest=(agent.config.project_baseline_index_digest),
                     allowed_paths=agent.config.project_allowed_paths,
                     execution_origin=execution_origin,
                     approved_tool_call_ids=frozenset({call.id}),
@@ -5638,9 +5712,7 @@ class RunManager:
             for task in children
             if str((task.plan or {}).get("replaces_task_id") or "").strip()
         }
-        effective_children = [
-            task for task in children if task.task_id not in superseded_task_ids
-        ]
+        effective_children = [task for task in children if task.task_id not in superseded_task_ids]
         child_statuses = {task.status for task in effective_children}
         root_result = dict(root.result or {})
         root_result["child_statuses"] = sorted(child_statuses)
@@ -5884,16 +5956,40 @@ class RunManager:
         if self._shutdown_event.is_set():
             raise RuntimeError("run_manager_shutting_down")
         release_memvid_slot: Callable[[], None] | None = None
+        close_handler: Callable[[], None] | None = None
+        agent_constructed = False
         if config.backend == "memvid":
             release_memvid_slot = self._acquire_memvid_agent_slot()
+            release = release_memvid_slot
+
+            def memory_closed() -> None:
+                try:
+                    if agent_constructed:
+                        with self._memvid_agent_condition:
+                            observer = self._memory_close_observer
+                        if observer is not None:
+                            try:
+                                observer()
+                            except Exception:
+                                # Readiness fails closed; slot release is
+                                # still guaranteed by the outer finally.
+                                return
+                finally:
+                    release()
+
+            close_handler = memory_closed
         try:
-            return build_agent(
+            agent = build_agent(
                 config,
                 tools=self.build_registry(config),
                 state=self.state,
                 secret_resolver=self.secret_resolver,
-                close_handler=release_memvid_slot,
+                lan_runtime_authority_resolver=self.lan_runtime_authority_resolver,
+                lan_runtime_utc_clock=self.lan_runtime_utc_clock,
+                close_handler=close_handler,
             )
+            agent_constructed = True
+            return agent
         except MemoryCleanupIncompleteError as exc:
             if release_memvid_slot is not None:
                 with self._lock:
@@ -6195,9 +6291,7 @@ class RunManager:
             *self.skills.tool_adapters(include_disabled=True),
         ]:
             registry.register(adapter)
-        registry.set_capability_gate(
-            lambda spec: self._capability_gate(spec, config=active_config)
-        )
+        registry.set_capability_gate(lambda spec: self._capability_gate(spec, config=active_config))
         return registry
 
     def _capability_gate(
@@ -6233,15 +6327,11 @@ class RunManager:
                 f"Tool {spec.name} is blocked because the project scope changed.",
             )
         if (
-            (
-                active_config.project_revision is not None
-                and active_config.project_revision != project.revision
-            )
-            or (
-                active_config.project_baseline_index_digest is not None
-                and active_config.project_baseline_index_digest
-                != project.baseline_index_digest
-            )
+            active_config.project_revision is not None
+            and active_config.project_revision != project.revision
+        ) or (
+            active_config.project_baseline_index_digest is not None
+            and active_config.project_baseline_index_digest != project.baseline_index_digest
         ):
             return (
                 False,
@@ -6540,6 +6630,102 @@ class RunManager:
             return 1
         return max(1, active_config.max_concurrent_runs)
 
+    @staticmethod
+    def _stop_lifecycle_dependencies(
+        dependencies: tuple[Any, ...],
+        *,
+        deadline: float,
+    ) -> bool:
+        stopped_all = True
+        for dependency in dependencies:
+            try:
+                stopped = dependency.shutdown(timeout_seconds=max(0.0, deadline - monotonic()))
+            except Exception:  # noqa: BLE001 - retain ownership on cleanup failure
+                stopped = False
+            stopped_all = stopped_all and bool(stopped)
+        return stopped_all
+
+    def _shutdown_run_ids_locked(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                [
+                    *self._active_primary_runs,
+                    *(item[0] for item in self._queued_primary_runs),
+                    *self._reserved_primary_runs,
+                    *self._thread_run_ids.values(),
+                    *self._active_run_operations,
+                ]
+            )
+        )
+
+    def _signal_shutdown(self) -> None:
+        self._shutdown_event.set()
+        with self._memvid_agent_condition:
+            self._memvid_agent_condition.notify_all()
+
+    def _finish_shutdown_election(self, completed: bool) -> None:
+        caller = current_thread()
+        with self._shutdown_condition:
+            if self._shutdown_owner is caller:
+                self._shutdown_result = completed
+                self._shutdown_owner = None
+                self._shutdown_condition.notify_all()
+
+    def _wait_for_startup_failure_cleanup(self, *, deadline: float) -> bool:
+        with self._shutdown_condition:
+            while self._startup_failure_cleanup_in_progress:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._shutdown_condition.wait(timeout=min(remaining, 0.05))
+            return True
+
+    def _shutdown_after_start_failure(self, *, timeout_seconds: float) -> bool:
+        """Clean startup work fully unless an external shutdown wins the election."""
+
+        deadline = monotonic() + timeout_seconds
+        with self._lock:
+            if self._shutting_down:
+                return False
+            self._startup_failure_cleanup_in_progress = True
+            lifecycle_dependencies = tuple(self._lifecycle_dependencies.values())
+        try:
+            try:
+                lifecycle_dependencies_stopped = self._stop_lifecycle_dependencies(
+                    lifecycle_dependencies,
+                    deadline=deadline,
+                )
+            except BaseException:
+                # Failed-start cleanup must not replace the triggering startup
+                # error. Continue fail-closed, drain everything else, and keep
+                # ownership for an explicit idempotent shutdown retry.
+                lifecycle_dependencies_stopped = False
+            caller = current_thread()
+            with self._shutdown_condition:
+                if self._shutting_down or self._shutdown_owner is not None:
+                    return False
+                self._shutting_down = True
+                self._shutdown_owner = caller
+                self._shutdown_result = None
+                run_ids = self._shutdown_run_ids_locked()
+                self._startup_failure_cleanup_in_progress = False
+                self._shutdown_condition.notify_all()
+            completed = False
+            try:
+                self._signal_shutdown()
+                completed = self._complete_shutdown(
+                    deadline=deadline,
+                    lifecycle_dependencies_stopped=lifecycle_dependencies_stopped,
+                    run_ids=run_ids,
+                )
+                return completed
+            finally:
+                self._finish_shutdown_election(completed)
+        finally:
+            with self._shutdown_condition:
+                self._startup_failure_cleanup_in_progress = False
+                self._shutdown_condition.notify_all()
+
     def shutdown(self, *, timeout_seconds: float = 5.0) -> bool:
         """Stop admission, cancel owned work, and join worker threads boundedly.
 
@@ -6552,22 +6738,46 @@ class RunManager:
 
         if timeout_seconds < 0:
             raise ValueError("shutdown timeout must not be negative")
-        with self._lock:
+        deadline = monotonic() + timeout_seconds
+        caller = current_thread()
+        with self._shutdown_condition:
             self._shutting_down = True
-            run_ids = tuple(
-                dict.fromkeys(
-                    [
-                        *self._active_primary_runs,
-                        *(item[0] for item in self._queued_primary_runs),
-                        *self._reserved_primary_runs,
-                        *self._thread_run_ids.values(),
-                        *self._active_run_operations,
-                    ]
-                )
+            while self._shutdown_owner is not None:
+                if self._shutdown_owner is caller:
+                    return False
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._shutdown_condition.wait(timeout=min(remaining, 0.05))
+            if self._shutdown_result is True:
+                return True
+            self._shutdown_owner = caller
+            self._shutdown_result = None
+            lifecycle_dependencies = tuple(self._lifecycle_dependencies.values())
+            run_ids = self._shutdown_run_ids_locked()
+        completed = False
+        try:
+            self._signal_shutdown()
+            lifecycle_dependencies_stopped = self._stop_lifecycle_dependencies(
+                lifecycle_dependencies,
+                deadline=deadline,
             )
-        self._shutdown_event.set()
-        with self._memvid_agent_condition:
-            self._memvid_agent_condition.notify_all()
+            completed = self._complete_shutdown(
+                deadline=deadline,
+                lifecycle_dependencies_stopped=lifecycle_dependencies_stopped,
+                run_ids=run_ids,
+            )
+            return completed
+        finally:
+            self._finish_shutdown_election(completed)
+
+    def _complete_shutdown(
+        self,
+        *,
+        deadline: float,
+        lifecycle_dependencies_stopped: bool,
+        run_ids: tuple[str, ...],
+    ) -> bool:
         cancellation_failed = False
         for run_id in run_ids:
             try:
@@ -6601,7 +6811,6 @@ class RunManager:
                     pass
                 self._forget_approval_arguments_for_run(run_id)
 
-        deadline = monotonic() + timeout_seconds
         cleanup_retry_attempted = False
         while True:
             with self._lock:
@@ -6623,6 +6832,7 @@ class RunManager:
                 memvid_agent_active = self._memvid_agent_active
             with self._lock:
                 admission_reconciliation_pending = bool(self._failed_admission_reconciliations)
+                startup_in_progress = self._startup_in_progress
             if not threads and not active_run_operations and not memvid_agent_active:
                 with self._lock:
                     durability_failed = bool(self._cancelled_run_durability_failures)
@@ -6636,10 +6846,14 @@ class RunManager:
                     mcp_stopped = self.mcp.shutdown()
                 except Exception:  # noqa: BLE001 - lifecycle failure is returned fail-closed
                     mcp_stopped = False
+                if not self._wait_for_startup_failure_cleanup(deadline=deadline):
+                    return False
                 completed = (
                     not cancellation_failed
                     and not durability_failed
                     and not admission_reconciliation_pending
+                    and not startup_in_progress
+                    and lifecycle_dependencies_stopped
                     and skills_stopped
                     and mcp_stopped
                 )
@@ -7465,15 +7679,9 @@ def _project_repair_tool_artifact(
             artifact["summary"] = safe_summary[:4_096]
         raw_risks = data.get("risks")
         if isinstance(raw_risks, list):
-            safe_risks = redact_secrets(
-                [str(item).strip()[:2_048] for item in raw_risks[:32]]
-            )
+            safe_risks = redact_secrets([str(item).strip()[:2_048] for item in raw_risks[:32]])
             if isinstance(safe_risks, list):
-                artifact["risks"] = [
-                    item
-                    for item in safe_risks
-                    if isinstance(item, str) and item
-                ]
+                artifact["risks"] = [item for item in safe_risks if isinstance(item, str) and item]
         if diff_preview is not None:
             artifact["diff_preview"] = diff_preview
         return artifact
@@ -7681,10 +7889,7 @@ def _repair_diff_preview_projection(
         or not isinstance(content, str)
         or len(content) > _MAX_REPAIR_DIFF_PREVIEW_CHARS
         or "\x00" in content
-        or any(
-            ord(character) < 32 and character not in {"\n", "\r", "\t"}
-            for character in content
-        )
+        or any(ord(character) < 32 and character not in {"\n", "\r", "\t"} for character in content)
         or str(redact_secrets(content)) != content
         or value.get("bound_diff_digest") != expected_diff_digest
         or value.get("redacted") is not True
@@ -8093,13 +8298,12 @@ def _bounded_mission_text(
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")
     normalized = value.strip()
-    if not normalized or len(normalized) > maximum or any(
-        not character.isprintable() and character not in "\n\t"
-        for character in normalized
+    if (
+        not normalized
+        or len(normalized) > maximum
+        or any(not character.isprintable() and character not in "\n\t" for character in normalized)
     ):
-        raise ValueError(
-            f"{field_name} must contain between 1 and {maximum} printable characters"
-        )
+        raise ValueError(f"{field_name} must contain between 1 and {maximum} printable characters")
     return normalized
 
 
@@ -8115,8 +8319,7 @@ def _mission_string_sequence(
         raise ValueError(f"{field_name} must be a sequence")
     if not minimum_items <= len(value) <= maximum_items:
         raise ValueError(
-            f"{field_name} must contain between {minimum_items} and "
-            f"{maximum_items} items"
+            f"{field_name} must contain between {minimum_items} and {maximum_items} items"
         )
     return tuple(
         _bounded_mission_text(
@@ -8130,8 +8333,7 @@ def _mission_string_sequence(
 
 def _assert_acyclic_mission_plan(tasks: Sequence[Mapping[str, Any]]) -> None:
     dependencies = {
-        str(task["task_id"]): tuple(str(item) for item in task["dependencies"])
-        for task in tasks
+        str(task["task_id"]): tuple(str(item) for item in task["dependencies"]) for task in tasks
     }
     visiting: set[str] = set()
     visited: set[str] = set()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
@@ -457,6 +458,250 @@ def test_product_setup_route_uses_active_config(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["schema"] == "kestrel.setup_readiness.v1"
     assert any(check["check_id"] == "workspace" for check in payload["checks"])
+
+
+def test_setup_readiness_uses_metadata_only_credential_status(
+    tmp_path: Path,
+) -> None:
+    resolver_calls: list[str | None] = []
+    status_calls: list[str | None] = []
+
+    def forbidden_resolver(name_or_ref: str | None) -> str | None:
+        resolver_calls.append(name_or_ref)
+        raise AssertionError("setup readiness must not resolve raw values")
+
+    def metadata_status(name_or_ref: str | None) -> dict[str, object]:
+        status_calls.append(name_or_ref)
+        return {
+            "source_env": name_or_ref,
+            "configured": True,
+            "validated": False,
+            "source": "broker",
+        }
+
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="openai",
+            model="gpt-test",
+            api_key_env="OPENAI_API_KEY",
+            workspace=tmp_path,
+            memory_dir=tmp_path / "memory",
+        ),
+        secret_resolver=forbidden_resolver,
+        secret_status=metadata_status,
+        credential_storage={
+            "schema": "kestrel.desktop_credential_readiness.v1",
+            "state": "session_only",
+            "backend": "Session memory",
+            "persistence": "session",
+            "reason": "secret_service_missing",
+            "remediation": (
+                "Start an unlocked Linux Secret Service to keep "
+                "credentials across restarts."
+            ),
+        },
+    )
+
+    payload = report.to_dict()
+    checks = {
+        check["check_id"]: check for check in payload["checks"]
+    }
+    assert resolver_calls == []
+    assert status_calls == ["OPENAI_API_KEY"]
+    assert checks["provider_configuration"]["status"] == "pass"
+    assert checks["credential_storage"]["status"] == "warn"
+    assert payload["credential_storage"] == {
+        "schema": "kestrel.desktop_credential_readiness.v1",
+        "state": "session_only",
+        "backend": "Session memory",
+        "persistence": "session",
+        "reason": "secret_service_missing",
+        "remediation": (
+            "Start an unlocked Linux Secret Service to keep "
+            "credentials across restarts."
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "backend", "persistence", "reason", "status"),
+    [
+        (
+            "available",
+            "macOS Keychain",
+            "persistent",
+            "ready",
+            "pass",
+        ),
+        (
+            "session_only",
+            "Session memory",
+            "session",
+            "secret_service_missing",
+            "warn",
+        ),
+        (
+            "locked_vault_required",
+            "macOS Keychain",
+            "none",
+            "vault_locked",
+            "warn",
+        ),
+        (
+            "unavailable",
+            None,
+            "none",
+            "keyring_package_missing",
+            "warn",
+        ),
+    ],
+)
+def test_setup_readiness_projects_exact_credential_storage_state(
+    tmp_path: Path,
+    state: str,
+    backend: str | None,
+    persistence: str,
+    reason: str,
+    status: str,
+) -> None:
+    resolver_calls: list[str | None] = []
+    credential_storage = {
+        "schema": "kestrel.desktop_credential_readiness.v1",
+        "state": state,
+        "backend": backend,
+        "persistence": persistence,
+        "reason": reason,
+        "remediation": "Fixed safe remediation.",
+    }
+
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="mock",
+            model="mock",
+            workspace=tmp_path,
+            memory_dir=tmp_path / "memory",
+        ),
+        secret_resolver=lambda value: (
+            resolver_calls.append(value) or "must-not-resolve"
+        ),
+        secret_status=lambda _value: pytest.fail(
+            "mock provider should not inspect credentials"
+        ),
+        credential_storage=credential_storage,
+    )
+    payload = report.to_dict()
+    checks = {
+        check["check_id"]: check for check in payload["checks"]
+    }
+
+    assert checks["credential_storage"] == {
+        "check_id": "credential_storage",
+        "title": "Credential storage",
+        "status": status,
+        "detail": (
+            f"Credential storage state is {state}; "
+            f"persistence is {persistence}."
+        ),
+        "recovery": "Fixed safe remediation.",
+    }
+    assert payload["credential_storage"] == credential_storage
+    assert resolver_calls == []
+    assert report.ready is True
+
+
+def test_cloud_provider_missing_metadata_still_fails_closed_without_resolve(
+    tmp_path: Path,
+) -> None:
+    resolver_calls: list[str | None] = []
+    status_calls: list[str | None] = []
+
+    report = build_setup_readiness_report(
+        AgentConfig(
+            provider="openai",
+            model="gpt-test",
+            api_key_env="OPENAI_API_KEY",
+            workspace=tmp_path,
+            memory_dir=tmp_path / "memory",
+        ),
+        secret_resolver=lambda value: (
+            resolver_calls.append(value) or "must-not-resolve"
+        ),
+        secret_status=lambda value: (
+            status_calls.append(value)
+            or {
+                "source_env": value,
+                "configured": False,
+                "validated": False,
+                "source": "missing",
+            }
+        ),
+        credential_storage={
+            "schema": "kestrel.desktop_credential_readiness.v1",
+            "state": "available",
+            "backend": "macOS Keychain",
+            "persistence": "persistent",
+            "reason": "ready",
+            "remediation": "No recovery needed.",
+        },
+    )
+    checks = {
+        check.check_id: check for check in report.checks
+    }
+
+    assert resolver_calls == []
+    assert status_calls == ["OPENAI_API_KEY"]
+    assert (
+        checks["provider_configuration"].status
+        == SetupReadinessStatus.FAIL
+    )
+    assert checks["credential_storage"].status == (
+        SetupReadinessStatus.PASS
+    )
+    assert report.ready is False
+
+
+def test_product_setup_route_injects_metadata_status_and_storage_readiness(
+    tmp_path: Path,
+) -> None:
+    app = FastAPI()
+    status_calls: list[str | None] = []
+    credential_storage = {
+        "schema": "kestrel.desktop_credential_readiness.v1",
+        "state": "session_only",
+        "backend": "Session memory",
+        "persistence": "session",
+        "reason": "secret_service_missing",
+        "remediation": "Start Linux Secret Service.",
+    }
+    register_product_routes(
+        app,
+        active_config=lambda: AgentConfig(
+            provider="openai",
+            model="gpt-test",
+            api_key_env="OPENAI_API_KEY",
+            workspace=tmp_path,
+        ),
+        secret_resolver=lambda _value: pytest.fail(
+            "route must not resolve a raw secret"
+        ),
+        secret_status=lambda value: (
+            status_calls.append(value)
+            or {
+                "configured": True,
+                "validated": False,
+                "source": "broker",
+            }
+        ),
+        credential_storage=lambda: credential_storage,
+    )
+
+    response = TestClient(app).get("/api/product/setup")
+
+    assert response.status_code == 200
+    assert response.json()["credential_storage"] == (
+        credential_storage
+    )
+    assert status_calls == ["OPENAI_API_KEY"]
 
 
 def test_provider_certification_report_is_redacted_and_actionable(

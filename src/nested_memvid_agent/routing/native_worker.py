@@ -12,6 +12,8 @@ Key safety properties:
 - Multiple workers cannot overwrite each other's branches
 - Merge proposal requires independent validation/review
 - No auto-merge or remote publication
+- Candidate code executes only inside an isolated worktree or qualified
+  containment path; host execution fallback is impossible
 """
 from __future__ import annotations
 
@@ -27,6 +29,15 @@ WorkerLifecycleState = Literal[
     "failed",
     "cancelled",
 ]
+
+
+# Containment modes in which a native (code-mutating) worker may execute.
+# Read-only staging cannot host a mutating worker and host fallback is never
+# allowed (Adaptive Flock plan, Task 8 containment invariant).
+NATIVE_WORKER_CONTAINMENT_MODES: tuple[str, ...] = (
+    "isolated_worktree",
+    "qualified_containment",
+)
 
 
 class WorkerState:
@@ -58,6 +69,7 @@ class NativeWorkerConfig:
     trust_domain: str = "local"
     command: str = "codex --quiet --print"
     timeout_seconds: int = 300
+    containment: str = "isolated_worktree"
 
     def __post_init__(self) -> None:
         if not self.worker_id.strip():
@@ -68,6 +80,12 @@ class NativeWorkerConfig:
             raise ValueError("branch is required")
         if self.trust_domain not in ("local", "cloud"):
             raise ValueError("trust_domain must be 'local' or 'cloud'")
+        if self.containment not in NATIVE_WORKER_CONTAINMENT_MODES:
+            allowed = ", ".join(NATIVE_WORKER_CONTAINMENT_MODES)
+            raise ValueError(
+                "containment_required: native workers execute only in "
+                f"{allowed}; host fallback is never allowed"
+            )
 
 
 @dataclass

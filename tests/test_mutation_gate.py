@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from nested_memvid_agent.behavior_delta import (
     BehaviorDelta,
     BehaviorDeltaKind,
@@ -278,3 +280,54 @@ def test_active_delta_requires_evidence_and_disableable_rollback() -> None:
     assert decision.accepted is True
     assert decision.status == BehaviorDeltaStatus.STAGED
     assert "missing_evidence_refs" in decision.blocked_by
+
+
+def test_flock_qualification_and_activation_trigger_no_mutation_gate_evaluation(tmp_path: Path) -> None:
+    """Adaptive Flock plan, Task 21: a completed Flock qualification run,
+    scope activation, and learned routing under the active grant produce zero
+    mutation-gate evaluations — the flow emits no behavior-delta or policy
+    mutation signal.
+    """
+    from test_flock_no_policy_memory import run_completed_qualification_and_activation
+
+    gate = MutationGate()
+    evaluations: list[BehaviorDelta] = []
+    original_evaluate = gate.evaluate
+
+    def spied_evaluate(delta: BehaviorDelta, evidence: MutationGateEvidence):
+        evaluations.append(delta)
+        return original_evaluate(delta, evidence)
+
+    gate.evaluate = spied_evaluate  # type: ignore[method-assign]
+
+    run_completed_qualification_and_activation(tmp_path)
+
+    assert evaluations == []
+
+
+def test_policy_delta_citing_flock_evidence_still_requires_all_hard_gates() -> None:
+    """Adaptive Flock plan, Task 21: qualification/activation evidence can
+    never substitute for the policy-delta hard gates — a policy delta citing
+    Flock qualification evidence with perfect validation is still rejected
+    without an explicit instruction and enabled policy-delta activation.
+    """
+    delta = _delta(
+        kind=BehaviorDeltaKind.POLICY,
+        target_layer=MemoryLayer.POLICY,
+        evidence_refs=(
+            EvidenceRef(
+                source="flock_qualification_receipt",
+                locator="receipt-1:scope-1",
+                quote="qualified scope with 20/20 replay",
+            ),
+        ),
+    )
+
+    decision = MutationGate().evaluate(
+        delta,
+        MutationGateEvidence(validation_score=1.0, repeat_count=100, replay_passed=True),
+    )
+
+    assert decision.status == BehaviorDeltaStatus.STAGED
+    assert "missing_explicit_policy_instruction" in decision.blocked_by
+    assert "policy_delta_activation_disabled" in decision.blocked_by

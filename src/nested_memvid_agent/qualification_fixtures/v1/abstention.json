@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "fixture_id": "abstention_v1",
+  "task_family": "abstention",
+  "risk": "low",
+  "capabilities": [
+    "abstention",
+    "routing"
+  ],
+  "task_contract": {
+    "prompt": "When routed evidence does not meet the qualification confidence threshold, abstain with a registered abstention reason instead of guessing a target.",
+    "required_output_keys": [
+      "abstention_reason"
+    ]
+  },
+  "replay": {
+    "seed": 20260729,
+    "runs": 20,
+    "targets": [
+      "fixture_abstention_primary"
+    ],
+    "script": [
+      {
+        "outcome": "abstention",
+        "category": "insufficient_confidence",
+        "output_keys": [
+          "abstention_reason"
+        ],
+        "input_tokens": 0,
+        "output_tokens": 0
+      }
+    ]
+  },
+  "validator": {
+    "id": "abstention_reason",
+    "parameters": {
+      "allowed_reasons": [
+        "insufficient_confidence",
+        "policy_denied",
+        "sparse_evidence"
+      ]
+    }
+  },
+  "expected": {
+    "outcome": "abstention",
+    "category": "insufficient_confidence"
+  }
+}

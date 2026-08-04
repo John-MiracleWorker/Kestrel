@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 
 from ..config import AgentConfig
+from ..lan_runtime_authority import LanRuntimeAuthorityResolver
+from .activation_evaluator import ActivationEvaluation, ActivationEvaluator
 from .contracts import TaskLike
 from .learned_router import LearnedRouterConfig, build_route_examples, evaluate_shadow
 from .ledger import (
@@ -18,7 +21,8 @@ from .ledger_records import (
     RoutingRevisionConflict,
     RoutingShadowDraft,
 )
-from .models import PrivacyClass, RouteDecision, RoutingMode
+from .models import AgentTaskContract, PrivacyClass, RouteDecision, RoutingMode
+from .qualification_evidence import PROVIDER_SIDE_FAILURE_CATEGORIES
 from .router import ReviewDiversityContext, RoutingUnavailableError
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
 
@@ -44,6 +48,9 @@ class DurableRoutingCoordinator:
         policy_id: str = "balanced",
         mode: RoutingMode = "shadow",
         learned_config: LearnedRouterConfig | None = None,
+        lan_runtime_authority_resolver: LanRuntimeAuthorityResolver | None = None,
+        activation_evaluator: ActivationEvaluator | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if mode == "off":
             raise ValueError(
@@ -53,6 +60,19 @@ class DurableRoutingCoordinator:
         self.policy_id = policy_id
         self.mode = mode
         self.learned_config = learned_config or LearnedRouterConfig()
+        if lan_runtime_authority_resolver is not None and not callable(
+            lan_runtime_authority_resolver
+        ):
+            raise TypeError("LAN runtime authority resolver must be callable")
+        if activation_evaluator is not None and not isinstance(
+            activation_evaluator, ActivationEvaluator
+        ):
+            raise TypeError("activation evaluator must be an ActivationEvaluator")
+        if clock is not None and not callable(clock):
+            raise TypeError("routing clock must be callable")
+        self.lan_runtime_authority_resolver = lan_runtime_authority_resolver
+        self.activation_evaluator = activation_evaluator
+        self.clock = clock
 
     def assign(
         self,
@@ -85,6 +105,8 @@ class DurableRoutingCoordinator:
             targets=[entry.target for entry in self.ledger.list_model_targets()],
             policy=policy_entry.policy,
             mode=self.mode,
+            lan_runtime_authority_resolver=self.lan_runtime_authority_resolver,
+            clock=self.clock,
         )
         existing = self.ledger.get_attempt_decision(
             run_id=task.run_id,
@@ -160,10 +182,11 @@ class DurableRoutingCoordinator:
                 selection_kind=escalation_reason,
                 reason_code=escalation_reason,
             )
-        assignment, shadow = self._evaluate_learned_route(
+        assignment, shadow, authority = self._evaluate_learned_route(
             service,
             base_config=base_config,
             assignment=static_assignment,
+            direct_target_pinned=effective_direct_target_id is not None,
         )
         decision_id = stable_decision_id(
             run_id=task.run_id,
@@ -183,6 +206,10 @@ class DurableRoutingCoordinator:
             policy_revision=policy_entry.revision,
             contract=assignment.contract,
             shadow=shadow,
+            activation_grant_id=authority.grant_id if authority is not None else None,
+            activation_receipt_id=authority.receipt_id if authority is not None else None,
+            activation_effective=authority is not None and authority.effective,
+            activation_reason=_activation_abstention_reason(authority),
         )
         return DurableRoutingAssignment(assignment=assignment, record=record, reused=False)
 
@@ -255,7 +282,8 @@ class DurableRoutingCoordinator:
         *,
         base_config: AgentConfig,
         assignment: RoutingAssignment,
-    ) -> tuple[RoutingAssignment, RoutingShadowDraft]:
+        direct_target_pinned: bool = False,
+    ) -> tuple[RoutingAssignment, RoutingShadowDraft, ActivationEvaluation | None]:
         contract = assignment.contract
         static_decision = assignment.decision
         static_target_id = static_decision.selected_target.target_id
@@ -289,6 +317,7 @@ class DurableRoutingCoordinator:
         learned_target_id = evaluation.learned_target_id
         activation_reason = evaluation.abstention_reason
         activate = False
+        authority: ActivationEvaluation | None = None
         if self.mode == "shadow":
             activation_reason = activation_reason or "shadow_only"
         elif self.mode == "constrained":
@@ -299,8 +328,25 @@ class DurableRoutingCoordinator:
             activation_reason = "replay_gate_not_enabled"
         elif learned_target_id == static_target_id:
             activation_reason = "learned_matches_static"
+        elif direct_target_pinned:
+            # An explicit direct-target pin (operator override or leased
+            # qualification matrix target) is authoritative: the learned
+            # layer may never substitute a different target for it.
+            activation_reason = "direct_target_pinned"
         elif evaluation.should_activate and learned_target_id in eligible_target_ids:
-            activate = True
+            # Learned routing requires a durable effective grant.  The
+            # environment flag is only a global permit inside the evaluator;
+            # without a grant the decision stays static and the mission
+            # continues on the deterministic route.
+            authority = self._activation_authority(contract)
+            if authority.effective:
+                activate = True
+            else:
+                activation_reason = (
+                    authority.reason_codes[0]
+                    if authority.reason_codes
+                    else "durable_grant_required"
+                )
 
         effective_assignment = assignment
         if activate and learned_target_id is not None:
@@ -373,7 +419,35 @@ class DurableRoutingCoordinator:
             activated=activate,
             abstention_reason=activation_reason,
             config_digest=evaluation.config_digest,
-        )
+        ), authority
+
+    def _activation_authority(self, contract: AgentTaskContract) -> ActivationEvaluation:
+        """Resolve durable grant authority for one new route decision.
+
+        A missing evaluator (or any evaluation failure, including a malformed
+        active grant) fails closed: learned routing is never authorized
+        without a durable effective grant.
+        """
+
+        evaluator = self.activation_evaluator
+        if evaluator is None:
+            return ActivationEvaluation(
+                effective=False,
+                grant_id=None,
+                receipt_id=None,
+                reason_codes=("durable_grant_required",),
+                learned_state=None,
+            )
+        try:
+            return evaluator.evaluate(contract)
+        except Exception:  # noqa: BLE001 - malformed grant state fails closed
+            return ActivationEvaluation(
+                effective=False,
+                grant_id=None,
+                receipt_id=None,
+                reason_codes=("activation_evaluation_failed",),
+                learned_state=None,
+            )
 
     def _prior_failure_directive(
         self,
@@ -398,7 +472,7 @@ class DurableRoutingCoordinator:
         outcome = self.ledger.get_outcome(previous.decision_id)
         if outcome is None:
             return None, forbidden, None, previous.selected_target_id
-        if outcome.failure_category == "provider_outage":
+        if outcome.failure_category in PROVIDER_SIDE_FAILURE_CATEGORIES:
             return (
                 previous.selected_target_id,
                 forbidden,
@@ -548,7 +622,7 @@ class DurableRoutingCoordinator:
             config=(
                 service.apply_decision(base_config, leased_decision)
                 if existing.actionable
-                else base_config
+                else replace(base_config, lan_runtime_authority=None)
             ),
             executes_selected_target=existing.actionable,
         )
@@ -557,6 +631,20 @@ class DurableRoutingCoordinator:
             record=existing,
             reused=True,
         )
+
+
+def _activation_abstention_reason(authority: ActivationEvaluation | None) -> str | None:
+    """Record why learned routing was not authorized at the activation gate.
+
+    ``None`` means the gate was never consulted (shadow/constrained modes,
+    earlier abstention rungs) or the grant was effective.
+    """
+
+    if authority is None or authority.effective:
+        return None
+    if authority.reason_codes:
+        return authority.reason_codes[0]
+    return "durable_grant_required"
 
 
 def _actual_cost_from_usage(
@@ -598,7 +686,7 @@ def _annotate_assignment(
         config=(
             service.apply_decision(base_config, decision)
             if decision.actionable
-            else base_config
+            else replace(base_config, lan_runtime_authority=None)
         ),
         executes_selected_target=decision.actionable,
     )

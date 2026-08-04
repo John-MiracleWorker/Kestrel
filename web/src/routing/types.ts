@@ -260,3 +260,144 @@ export type TargetCalibrationRecord = {
   effective_sample_size: number;
   updated_at: string;
 };
+
+export type LanStaleReason =
+  | "interface_changed"
+  | "network_changed"
+  | "address_changed"
+  | "port_changed"
+  | "transport_security_changed"
+  | "certificate_changed"
+  | "api_shape_changed"
+  | "catalog_changed"
+  | "model_identity_changed"
+  | "model_missing"
+  | "capability_changed"
+  | "freshness_expired";
+
+export type LanExpectedRevision = Readonly<{
+  resource_id: string;
+  revision: number;
+}>;
+
+export type LanReplacementConfirmation = Readonly<{
+  provider_profile_id: string;
+  expected_profile_revision: number;
+  expected_endpoint_fingerprint: string;
+  expected_material_binding_digests: string[];
+}>;
+
+export type LanImportSelector = Readonly<{
+  scanId: string;
+  endpointId: string;
+  replacementProviderProfileId: string | null;
+}>;
+
+export type LanImportSelectorProjection = Readonly<{
+  scan_id: string;
+  endpoint_id: string;
+  replacement_provider_profile_id: string | null;
+}>;
+
+export type LanImportAuthority = Readonly<{
+  expected_terminal_receipt_digest: string;
+  expected_observation_digest: string;
+  expected_profile_revision: number;
+  expected_target_revisions: LanExpectedRevision[];
+  endpoint_fingerprint: string | null;
+  replacement: LanReplacementConfirmation | null;
+}>;
+
+export type LanImportResult = Readonly<{
+  profile: ProviderProfile | null;
+  targets: ModelTarget[];
+  observation_digest: string;
+  endpoint_fingerprint: string | null;
+  outage_observed: boolean;
+  affected_target_ids: string[];
+  invalidated_binding_digests: string[];
+  stale_reasons_by_target: Array<{
+    target_id: string;
+    reasons: LanStaleReason[];
+  }>;
+}>;
+
+export type LanImportPreview = Readonly<{
+  selector: LanImportSelectorProjection;
+  preview_digest: string;
+  evidence_expires_at: string;
+  authority: LanImportAuthority;
+  result: LanImportResult;
+  requires_confirmation: true;
+}>;
+
+export type LanImportConfirmation = Readonly<{
+  selector: LanImportSelector;
+  previewDigest: string;
+  confirmed: true;
+}>;
+
+export type LanImportConfirmationResult = Readonly<{
+  preview_digest: string;
+  result: LanImportResult;
+}>;
+
+export type LanTargetReviewOptions = Readonly<{
+  targetId: string;
+  intendedRoles: string[];
+  taskFamilyAffinities: string[];
+  enabled: boolean;
+}>;
+
+export type LanTargetReviewOptionsProjection = Readonly<{
+  target_id: string;
+  intended_roles: string[];
+  task_family_affinities: string[];
+  enabled: boolean;
+}>;
+
+export type LanTargetReviewAuthority = Readonly<{
+  provider_profile_id: string;
+  expected_profile_revision: number;
+  expected_target_revision: number;
+  expected_terminal_receipt_digest: string;
+  expected_observation_digest: string;
+  expected_endpoint_fingerprint: string;
+  expected_material_binding_digest: string;
+  expected_stale_reasons: LanStaleReason[];
+  trust_class: "operator_confirmed";
+  privacy_acknowledgement_digest: string;
+  review_digest: string;
+  reviewed_material_binding_digest: string;
+  reviewed_runtime_interface_binding_digest: string | null;
+}>;
+
+export type LanTargetReviewResult = Readonly<{
+  profile: ProviderProfile;
+  target: ModelTarget;
+  privacy_acknowledgement_digest: string;
+  material_binding_digest: string;
+}>;
+
+export type LanTargetReviewPreview = Readonly<{
+  options: LanTargetReviewOptionsProjection;
+  preview_digest: string;
+  evidence_expires_at: string;
+  authority: LanTargetReviewAuthority;
+  profile: ProviderProfile;
+  target: ModelTarget;
+  requires_privacy_acknowledgement: true;
+  requires_confirmation: true;
+}>;
+
+export type LanTargetReviewConfirmation = LanTargetReviewOptions &
+  Readonly<{
+    previewDigest: string;
+    privacyAcknowledged: true;
+    confirmed: true;
+  }>;
+
+export type LanTargetReviewConfirmationResult = Readonly<{
+  preview_digest: string;
+  result: LanTargetReviewResult;
+}>;

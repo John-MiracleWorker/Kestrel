@@ -32,6 +32,7 @@ from .ledger_serialization import (
     _validate_route_binding,
 )
 from .models import AgentTaskContract, RouteDecision
+from .qualification_evidence import PROVIDER_SIDE_FAILURE_CATEGORIES
 
 
 class RoutingLedger(RoutingRegistry):
@@ -51,11 +52,23 @@ class RoutingLedger(RoutingRegistry):
         shadow: RoutingShadowDraft | None = None,
         status: str = "selected",
         router_version: str = "adaptive-flock.v2",
+        activation_grant_id: str | None = None,
+        activation_receipt_id: str | None = None,
+        activation_effective: bool = False,
+        activation_reason: str | None = None,
     ) -> RouteDecisionEntry:
         if isinstance(attempt, bool) or attempt < 1:
             raise ValueError("route attempt must be a positive integer")
         if status not in {"selected", "running"}:
             raise ValueError("route decision status must be selected or running")
+        if not isinstance(activation_effective, bool):
+            raise ValueError("activation_effective must be a boolean")
+        if activation_effective and (not activation_grant_id or not activation_receipt_id):
+            raise ValueError(
+                "effective learned routing requires a durable grant and receipt binding"
+            )
+        if activation_effective and activation_reason is not None:
+            raise ValueError("effective learned routing must not record an abstention reason")
         target_entry = self.get_model_target(decision.selected_target.target_id)
         if target_entry is None:
             raise ValueError(f"selected target is not registered: {decision.selected_target.target_id}")
@@ -133,6 +146,10 @@ class RoutingLedger(RoutingRegistry):
             now,
             None,
             None,
+            activation_grant_id,
+            activation_receipt_id,
+            1 if activation_effective else 0,
+            activation_reason,
         )
         with self.state._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -194,8 +211,9 @@ class RoutingLedger(RoutingRegistry):
                     output_cost_per_million_usd, project_id, task_family, risk,
                     required_capabilities_json, capability_key, reason_codes_json,
                     candidate_snapshot_json, actionable, router_version, created_at,
-                    started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, finished_at, activation_grant_id, activation_receipt_id,
+                    activation_effective, activation_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -285,6 +303,29 @@ class RoutingLedger(RoutingRegistry):
         with self.state._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [_decision_entry_from_row(row) for row in rows]
+
+    def count_running_decisions(
+        self,
+        *,
+        limit: int = 1_000,
+    ) -> int:
+        """Count bounded in-flight attempts without loading route snapshots."""
+
+        bounded_limit = max(1, min(int(limit), 1_000))
+        with self.state._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS item_count
+                FROM (
+                    SELECT 1
+                    FROM routing_decisions
+                    WHERE status = 'running'
+                    LIMIT ?
+                )
+                """,
+                (bounded_limit,),
+            ).fetchone()
+        return 0 if row is None else int(row["item_count"])
 
     def record_outcome(
         self,
@@ -783,7 +824,9 @@ def _refresh_target_calibration(
         if not {"validated_success", "acceptance_failed"} & labels:
             continue
         weight = _decay_weight(str(row["created_at"]), now=now)
-        is_outage = str(row["failure_category"] or "") == "provider_outage"
+        is_outage = (
+            str(row["failure_category"] or "") in PROVIDER_SIDE_FAILURE_CATEGORIES
+        )
         weighted_outages.append((weight, is_outage))
         total_weight += weight
         example_count += 1

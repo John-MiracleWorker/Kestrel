@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -17,6 +17,12 @@ def register_product_routes(
     auth_dependency: Callable[..., Any] | None = None,
     active_config: Callable[[], AgentConfig] | None = None,
     secret_resolver: Callable[[str | None], str | None] | None = None,
+    secret_status: (
+        Callable[[str | None], Mapping[str, object]] | None
+    ) = None,
+    credential_storage: (
+        Callable[[], Mapping[str, object]] | None
+    ) = None,
 ) -> None:
     router = APIRouter()
     dependencies = [Depends(auth_dependency)] if auth_dependency is not None else []
@@ -28,7 +34,16 @@ def register_product_routes(
     @router.get("/api/product/setup", dependencies=dependencies)
     def product_setup() -> dict[str, object]:
         config = active_config() if active_config is not None else AgentConfig.from_env()
-        return build_setup_readiness_report(config, secret_resolver=secret_resolver).to_dict()
+        return build_setup_readiness_report(
+            config,
+            secret_resolver=secret_resolver,
+            secret_status=secret_status,
+            credential_storage=(
+                credential_storage()
+                if credential_storage is not None
+                else None
+            ),
+        ).to_dict()
 
     @router.get("/api/product/provider-certification", dependencies=dependencies)
     def product_provider_certification() -> dict[str, object]:

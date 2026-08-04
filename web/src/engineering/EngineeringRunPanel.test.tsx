@@ -14,8 +14,14 @@ const packet = {
     {
       tool_call_id: "commit_1",
       tool_name: "git.commit",
+      arguments: {
+        message: "repair: commit reviewed candidate",
+        repair_review_id: "repair_review_1"
+      },
       call_digest: "b".repeat(64),
       risk: "high",
+      capability_revision: 7,
+      resource_digest: "d".repeat(64),
       reason: "Commit the reviewed candidate",
       resource_scope: "branch kestrel/repair",
       expected_side_effect: "one local commit",
@@ -25,8 +31,14 @@ const packet = {
     {
       tool_call_id: "publish_1",
       tool_name: "github.pr.create",
+      arguments: {
+        repository: "owner/repo",
+        head: "kestrel/repair"
+      },
       call_digest: "c".repeat(64),
       risk: "high",
+      capability_revision: 9,
+      resource_digest: "e".repeat(64),
       reason: "Publish the reviewed branch",
       resource_scope: "repository owner/repo",
       expected_side_effect: "one pull request",
@@ -130,6 +142,22 @@ describe("EngineeringRunPanel", () => {
     expect(screen.getByRole("img", {
       name: "Browser validation for http://host.kestrel.internal:4173/"
     })).toBeInTheDocument();
+    expect(screen.getByText("tool:git.commit")).toBeVisible();
+    expect(screen.getByText("revision 7")).toBeVisible();
+    expect(screen.getByText("d".repeat(64))).toBeVisible();
+    expect(screen.getByText("commit_1")).toBeVisible();
+    expect(
+      screen.getAllByText("Valid until decision or binding change").length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText(/repair_review_id/),
+    ).not.toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "git.commit exact arguments evidence",
+      }),
+    );
+    expect(screen.getByText(/repair_review_id/)).toBeVisible();
 
     const submit = screen.getByRole("button", { name: "Submit individual decisions" });
     expect(submit).toBeDisabled();
@@ -155,6 +183,109 @@ describe("EngineeringRunPanel", () => {
     expect(onPrepareTool).toHaveBeenCalledWith(
       "github.pr.create",
       githubRequest.publish_tool_request.arguments
+    );
+  });
+
+  // §5.4: candidate selection is exercised end to end at the panel
+  // level — a running fan-out lists isolated candidates, the owner
+  // triggers selection, and the selected candidate is reflected from
+  // the refreshed fan-out projection.
+  it("selects a candidate from trusted fan-out evidence", async () => {
+    const fanout = {
+      fanout_id: "fanout_1",
+      source_task_id: "repair",
+      status: "running",
+      selected_candidate_id: null as string | null,
+      estimated_budget_delta_usd: 0.05,
+      candidates: [
+        {
+          candidate_id: "candidate_a",
+          branch: "kestrel/candidate/a",
+          status: "validated",
+          validation_id: "repair_validation_a",
+          validation_passed: true,
+          reviewer_identities: ["reviewer:local"],
+          changed_file_count: 1,
+          changed_line_count: 4,
+          risk_notes: [],
+          actual_cost_usd: 0.01,
+          latency_seconds: 12
+        },
+        {
+          candidate_id: "candidate_b",
+          branch: "kestrel/candidate/b",
+          status: "validated",
+          validation_id: "repair_validation_b",
+          validation_passed: false,
+          reviewer_identities: [],
+          changed_file_count: 3,
+          changed_line_count: 41,
+          risk_notes: ["touches public API"],
+          actual_cost_usd: 0.02,
+          latency_seconds: 19
+        }
+      ]
+    };
+    const requests: Array<{ path: string; method: string }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ path, method });
+      if (method === "POST" && path.includes("/candidate-fanouts/fanout_1/select")) {
+        return jsonResponse({ ...fanout, status: "selected", selected_candidate_id: "candidate_a" });
+      }
+      if (path.endsWith("/approval-packets")) return jsonResponse({ items: [] });
+      if (path.endsWith("/graph/amendments")) return jsonResponse({ items: [] });
+      if (path.endsWith("/candidate-fanouts")) {
+        const selected = requests.some(
+          (request) => request.method === "POST" && request.path.includes("/select"),
+        );
+        return jsonResponse({
+          items: [selected
+            ? { ...fanout, status: "selected", selected_candidate_id: "candidate_a" }
+            : fanout]
+        });
+      }
+      if (path.endsWith("/browser-validations")) return jsonResponse({ items: [] });
+      if (path.endsWith("/github-change-requests")) return jsonResponse({ items: [] });
+      return jsonResponse({ detail: "not_found" }, 404);
+    }));
+
+    render(
+      <EngineeringRunPanel
+        runId="run_1"
+        refreshToken="0"
+        tasks={[]}
+        defaultBranch="main"
+        onPrepareTool={vi.fn()}
+      />
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: /Candidate comparison/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("kestrel/candidate/a")).toBeInTheDocument();
+    expect(screen.getByText(/Validated · 1 reviewer\(s\)/)).toBeInTheDocument();
+    expect(screen.getByText("Validation failed")).toBeInTheDocument();
+    expect(screen.getByText(/touches public API/)).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select from trusted evidence" }),
+    );
+    await waitFor(() =>
+      expect(requests).toContainEqual(
+        expect.objectContaining({
+          method: "POST",
+          path: expect.stringContaining("/candidate-fanouts/fanout_1/select"),
+        }),
+      ),
+    );
+    // After the post-selection refresh, the selected candidate carries
+    // the durable selected marker.
+    await waitFor(() =>
+      expect(
+        document.querySelector(".candidate.selected strong")?.textContent,
+      ).toBe("kestrel/candidate/a"),
     );
   });
 });

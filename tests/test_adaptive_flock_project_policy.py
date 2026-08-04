@@ -8,6 +8,14 @@ from typing import Any
 import pytest
 
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.project_policy import (
+    ACTIONABLE_RISK_LEVELS,
+    REPEATABILITY_CLASSES,
+    TRUSTED_RECEIPT_TYPES,
+    privacy_exposure_approved,
+    project_authority_digest,
+    validate_repeatability,
+)
 from nested_memvid_agent.projects import ProjectRecord
 from nested_memvid_agent.routing.router import RoutingUnavailableError
 from nested_memvid_agent.routing.run_manager import AdaptiveFlockRunManager
@@ -157,6 +165,48 @@ def test_only_actionable_adaptive_modes_replace_the_direct_provider_gate(
     manager.routing_coordinator = SimpleNamespace(mode=mode)
 
     assert manager._uses_actionable_project_routing() is expected
+
+
+def test_project_authority_digest_is_stable_and_boundary_sensitive(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path, provider_policy={}, cost_budget=None)
+
+    digest = project_authority_digest(project)
+
+    assert digest == project_authority_digest(project)
+    assert len(digest) == 64
+    moved = ProjectRecord(**{**project.__dict__, "repository_path": str(tmp_path / "other")})
+    assert project_authority_digest(moved) != digest
+    revised = ProjectRecord(**{**project.__dict__, "revision": 2})
+    assert project_authority_digest(revised) != digest
+    reclassified = ProjectRecord(**{**project.__dict__, "privacy_class": "approved_cloud"})
+    assert project_authority_digest(reclassified) != digest
+
+
+def test_repeatability_classification_is_a_closed_vocabulary() -> None:
+    assert REPEATABILITY_CLASSES == (
+        "read_only",
+        "isolated_worktree",
+        "qualified_containment",
+    )
+    for value in REPEATABILITY_CLASSES:
+        assert validate_repeatability(value) == value
+    with pytest.raises(ValueError, match="repeatability"):
+        validate_repeatability("networked")
+
+
+def test_actionable_risk_and_trusted_receipt_vocabularies_are_closed() -> None:
+    assert ACTIONABLE_RISK_LEVELS == ("low", "medium")
+    assert TRUSTED_RECEIPT_TYPES == ("review", "test", "validation")
+
+
+def test_privacy_exposure_requires_explicit_owner_approval(tmp_path: Path) -> None:
+    project = _project(tmp_path, provider_policy={}, cost_budget=None)
+
+    assert privacy_exposure_approved(project, ("local_required",)) is True
+    assert privacy_exposure_approved(project, ()) is False
+    assert privacy_exposure_approved(project, ("approved_cloud",)) is False
 
 
 def _project(

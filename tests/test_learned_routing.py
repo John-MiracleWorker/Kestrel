@@ -353,3 +353,37 @@ def _example(
         promotion_id=promotion_id,
         outcome_labels=outcomes,
     )
+
+
+def test_learned_router_config_maps_qualification_thresholds_exactly() -> None:
+    from nested_memvid_agent.routing.learned_router import LearnedRouterConfig
+    from nested_memvid_agent.routing.qualification_models import QualificationThresholds
+
+    thresholds = QualificationThresholds(
+        min_examples_per_scope=7,
+        min_examples_per_target=4,
+        confidence_threshold=0.65,
+        utility_margin=0.12,
+        cost_coverage_threshold=0.75,
+        decay_half_life_days=14,
+    )
+
+    config = LearnedRouterConfig.from_qualification_thresholds(thresholds)
+
+    assert config == LearnedRouterConfig(
+        min_examples=7,
+        min_target_examples=4,
+        confidence_threshold=0.65,
+        activation_margin=0.12,
+        cost_coverage_threshold=0.75,
+        decay_half_life_days=14.0,
+    )
+
+
+def test_learned_router_config_threshold_mapping_uses_required_defaults() -> None:
+    from nested_memvid_agent.routing.learned_router import LearnedRouterConfig
+    from nested_memvid_agent.routing.qualification_models import QualificationThresholds
+
+    config = LearnedRouterConfig.from_qualification_thresholds(QualificationThresholds())
+
+    assert config == LearnedRouterConfig()

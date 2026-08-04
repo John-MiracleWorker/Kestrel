@@ -43,6 +43,12 @@ from .routines import RoutineService
 from .run_manager import RunManager
 from .runtime_models import LLMStreamEvent, ToolCall
 from .runtime_ownership import PrimaryRuntimeOwnership, RuntimeOwnershipError
+from .runtime_profile_lease import (
+    RuntimeLeaseConflict,
+    RuntimeProfileLease,
+    current_runtime_lease_identity,
+    resolve_runtime_profile_root,
+)
 from .runtime_settings import default_runtime_settings_path
 from .secret_broker import build_secret_broker
 from .security_boundary import redact_secrets
@@ -693,11 +699,40 @@ def main() -> None:
         from .server import create_app
 
         _validate_server_bind(args.host, config)
+        profile_root = resolve_runtime_profile_root(
+            config.state_path,
+            config.memory_dir,
+            profile_id="default",
+        )
+        identity = current_runtime_lease_identity(
+            profile_id="default",
+            management="cli",
+            base_url=f"http://{args.host}:{args.port}/",
+        )
         try:
-            app = create_app(config)
-        except RuntimeOwnershipError as exc:
-            raise SystemExit(_runtime_ownership_message()) from exc
-        uvicorn.run(app, host=args.host, port=args.port, access_log=args.access_log)
+            lease = RuntimeProfileLease.acquire(profile_root, identity)
+        except RuntimeLeaseConflict as exc:
+            code = (
+                "profile_owned_by_desktop"
+                if exc.disposition == "attach_desktop"
+                else "runtime_profile_version_conflict"
+                if exc.disposition == "version_conflict"
+                else "runtime_profile_lease_conflict"
+            )
+            raise SystemExit(code) from exc
+        try:
+            try:
+                app = create_app(config)
+            except RuntimeOwnershipError as exc:
+                raise SystemExit(_runtime_ownership_message()) from exc
+            uvicorn.run(
+                app,
+                host=args.host,
+                port=args.port,
+                access_log=args.access_log,
+            )
+        finally:
+            lease.release()
         return
 
     if args.cmd == "channel":

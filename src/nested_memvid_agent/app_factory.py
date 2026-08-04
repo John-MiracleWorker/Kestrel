@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 
 from .agent import AgentDependencies, NestedMV2Agent
 from .config import AgentConfig
 from .event_log import JsonlEventLog
+from .lan_runtime_authority import LanRuntimeAuthorityResolver
 from .layers import (
     LayeredMemorySystem,
     MemoryCleanupIncompleteError,
@@ -27,6 +29,8 @@ def build_agent(
     *,
     state: AgentStateStore | None = None,
     secret_resolver: Callable[[str | None], str | None] | None = None,
+    lan_runtime_authority_resolver: LanRuntimeAuthorityResolver | None = None,
+    lan_runtime_utc_clock: Callable[[], datetime] | None = None,
     close_handler: Callable[[], None] | None = None,
 ) -> NestedMV2Agent:
     register_secret_env_names(
@@ -49,7 +53,19 @@ def build_agent(
             ledger=PromotionLedger(active_state),
             max_file_bytes=config.memory_max_layer_bytes,
         )
-        llm = build_llm_provider(config, secret_resolver=secret_resolver)
+        if lan_runtime_utc_clock is None:
+            llm = build_llm_provider(
+                config,
+                secret_resolver=secret_resolver,
+                lan_runtime_authority_resolver=lan_runtime_authority_resolver,
+            )
+        else:
+            llm = build_llm_provider(
+                config,
+                secret_resolver=secret_resolver,
+                lan_runtime_authority_resolver=lan_runtime_authority_resolver,
+                lan_runtime_utc_clock=lan_runtime_utc_clock,
+            )
         base_registry: ToolRegistry = tools or build_default_tools(config.enabled_tools)
         # Wrap with transparent retry layer for transient failures
         registry: ToolRegistry

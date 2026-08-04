@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -21,6 +21,7 @@ from ..state_store import (
     TaskNodeRecord,
 )
 from .coordinator import DurableRoutingAssignment, DurableRoutingCoordinator
+from .qualification_evidence import classify_failure_code, normalize_provider_attempt
 from .router import RoutingUnavailableError
 
 _TERMINAL_ROUTING_TASK_STATUSES = {"completed", "failed", "cancelled"}
@@ -65,6 +66,10 @@ class AdaptiveFlockRunManager(RunManager):
             skills=skills,
             plugins=plugins,
             secret_resolver=secret_resolver,
+            lan_runtime_authority_resolver=(
+                routing_coordinator.lan_runtime_authority_resolver
+            ),
+            lan_runtime_utc_clock=routing_coordinator.clock,
             recover_startup_work=recover_startup_work,
             enforce_single_owner=enforce_single_owner,
             read_only_observer=read_only_observer,
@@ -217,7 +222,7 @@ class AdaptiveFlockRunManager(RunManager):
                 else f"routing.{phase}_failed"
             )
             self.events.publish(run.run_id, event_type, payload)
-            return config
+            return replace(config, lan_runtime_authority=None)
         event_type = (
             "routing.guardrail_blocked"
             if unavailable
@@ -242,7 +247,13 @@ class AdaptiveFlockRunManager(RunManager):
         subagent = self.state.get_subagent_run(subagent_id)
         task_id = subagent.task_id
         if task_id is None:
-            super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
+            super()._run_subagent(
+                thread_key,
+                replace(config, lan_runtime_authority=None),
+                subagent_id,
+                run_id,
+                session_id,
+            )
             return
         task = self.state.get_task_node(task_id)
         run = self.state.get_run(run_id)
@@ -251,7 +262,13 @@ class AdaptiveFlockRunManager(RunManager):
             "failed",
             "cancelled",
         }:
-            super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
+            super()._run_subagent(
+                thread_key,
+                replace(config, lan_runtime_authority=None),
+                subagent_id,
+                run_id,
+                session_id,
+            )
             return
 
         attempt = max(1, task.attempt_count + 1)
@@ -445,7 +462,13 @@ class AdaptiveFlockRunManager(RunManager):
                 else f"routing.{phase}_failed"
             )
             self.events.publish(run_id, event_type, payload)
-            super()._run_subagent(thread_key, config, subagent_id, run_id, session_id)
+            super()._run_subagent(
+                thread_key,
+                replace(config, lan_runtime_authority=None),
+                subagent_id,
+                run_id,
+                session_id,
+            )
             return
 
         category = "routing_unavailable" if unavailable else "routing_persistence_failed"
@@ -551,6 +574,47 @@ class AdaptiveFlockRunManager(RunManager):
             provider_failure_code,
             default=diagnosis_category,
         )
+        evidence = normalize_provider_attempt(
+            {
+                "subject_id": durable.record.decision_id,
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt": max(1, task.attempt_count),
+                "target_id": str(durable.record.selected_target_id),
+                "provider": str(durable.record.selected_provider),
+                "profile_id": str(
+                    getattr(durable.record, "selected_profile_id", "") or ""
+                ),
+                "model": str(durable.record.selected_model),
+                "request_id": provider_usage.get("provider_request_id")
+                or provider_usage.get("request_id"),
+                "status": task.status,
+                "execution_status": subagent.status,
+                "error_code": provider_failure_code,
+                "validation_passed": validation_passed,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": _optional_non_negative_int(
+                    provider_usage.get("cached_tokens")
+                ),
+                "reasoning_tokens": _optional_non_negative_int(
+                    provider_usage.get("reasoning_tokens")
+                ),
+                "latency_seconds": max(0.0, monotonic() - started_at),
+                "input_cost_per_million_usd": getattr(
+                    durable.record, "input_cost_per_million_usd", None
+                ),
+                "output_cost_per_million_usd": getattr(
+                    durable.record, "output_cost_per_million_usd", None
+                ),
+            }
+        )
+        evidence_refs = _validation_evidence_refs(validation)
+        if evidence.request_id_digest is not None:
+            evidence_refs = (
+                *evidence_refs,
+                f"provider_request:{evidence.request_id_digest}",
+            )
         outcome_labels: tuple[str, ...] = (
             ("validated_success",)
             if validation_passed
@@ -585,7 +649,7 @@ class AdaptiveFlockRunManager(RunManager):
                 escalated=fallback_count > 0,
                 reward_components={"completion": reward},
                 outcome_labels=outcome_labels,
-                evidence_refs=_validation_evidence_refs(validation),
+                evidence_refs=evidence_refs,
             )
         except Exception as exc:  # noqa: BLE001 - routing telemetry must not rewrite task truth
             self.events.publish(
@@ -618,6 +682,10 @@ def _routing_decision_payload(durable: DurableRoutingAssignment) -> dict[str, An
         "score": record.score,
         "reason_codes": list(record.reason_codes),
         "actionable": record.actionable,
+        "activation_grant_id": getattr(record, "activation_grant_id", None),
+        "activation_receipt_id": getattr(record, "activation_receipt_id", None),
+        "activation_effective": bool(getattr(record, "activation_effective", False)),
+        "activation_reason": getattr(record, "activation_reason", None),
         "reused": durable.reused,
     }
 
@@ -661,35 +729,17 @@ def _provider_failure_category(
     *,
     default: str | None,
 ) -> str | None:
+    """Classify a typed provider failure code via the shared taxonomy.
+
+    Unrecognized codes fall back to the task diagnosis category (legacy
+    precedence) and then to ``"unknown"`` — never to task-quality blame.
+    """
     if provider_failure_code is None:
         return default
-    normalized = provider_failure_code.lower()
-    if any(
-        marker in normalized
-        for marker in (
-            "timeout",
-            "rate_limit",
-            "unavailable",
-            "connection",
-            "network",
-            "overload",
-            "transport",
-        )
-    ):
-        return "provider_outage"
-    if any(
-        marker in normalized
-        for marker in (
-            "unsupported",
-            "capability",
-            "context_length",
-            "tool",
-            "vision",
-            "structured_output",
-        )
-    ):
-        return "capability_failure"
-    return default or "provider_failure"
+    category = classify_failure_code(provider_failure_code)
+    if category is None or category == "unknown":
+        return default or category
+    return category
 
 
 def _changed_file_count(result: dict[str, Any]) -> int | None:

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,7 +18,7 @@ from nested_memvid_agent.llm.base import (
     ProviderCapabilities,
     ProviderError,
 )
-from nested_memvid_agent.llm.factory import build_llm_provider
+from nested_memvid_agent.llm.factory import build_llm_provider, provider_health_id
 from nested_memvid_agent.llm.gemini_provider import GeminiProvider
 from nested_memvid_agent.llm.model_catalog import model_catalog_for_provider
 from nested_memvid_agent.llm.ollama_provider import OllamaNativeProvider
@@ -52,6 +57,7 @@ class RecordingProvider(LLMProvider):
 def test_provider_capabilities_have_serializable_metadata() -> None:
     caps = ProviderCapabilities(
         name="test-provider",
+        supports_tools=True,
         supports_native_tools=True,
         supports_streaming=True,
         supports_json_mode=False,
@@ -63,6 +69,7 @@ def test_provider_capabilities_have_serializable_metadata() -> None:
 
     assert caps.to_payload() == {
         "name": "test-provider",
+        "supports_tools": True,
         "supports_native_tools": True,
         "supports_streaming": True,
         "supports_json_mode": False,
@@ -1324,6 +1331,226 @@ def test_openai_responses_provider_keeps_json_envelope_fallback(monkeypatch: pyt
     assert response.content == "fallback"
     assert response.tool_calls[0].name == "memory.search"
     assert response.tool_calls[0].arguments == {"query": "fallback"}
+
+
+def _lan_factory_fixture():
+    import test_lan_openai_compatible_provider as lan_cases
+
+    authority = lan_cases._authority()
+    return authority, lan_cases.Resolver(authority)
+
+
+def test_provider_capabilities_supports_tools_defaults_true_and_fallback_uses_and() -> None:
+    default = ProviderCapabilities(name="default")
+    tool_free = ProviderCapabilities(name="tool-free", supports_tools=False)
+
+    assert default.supports_tools is True
+    assert default.to_payload()["supports_tools"] is True
+
+    class CapabilityProvider(RecordingProvider):
+        def __init__(self, capabilities: ProviderCapabilities) -> None:
+            super().__init__()
+            self._capabilities = capabilities
+
+        @property
+        def capabilities(self) -> ProviderCapabilities:
+            return self._capabilities
+
+    primary = CapabilityProvider(default)
+    secondary = CapabilityProvider(tool_free)
+    assert FallbackLLMProvider(primary, secondary).capabilities.supports_tools is False
+
+
+def test_factory_builds_lan_provider_only_with_exact_snapshot_and_same_resolver() -> None:
+    from nested_memvid_agent.llm.lan_openai_compatible_provider import (
+        LanOpenAICompatibleProvider,
+    )
+
+    authority, resolver = _lan_factory_fixture()
+    config = AgentConfig(
+        provider="lan-openai-compatible",
+        model="alpha",
+        base_url="http://192.168.50.8:1234/v1",
+        api_key_env=None,
+        fallback_provider=None,
+        stream=False,
+        lan_runtime_authority=authority,
+    )
+
+    provider = build_llm_provider(
+        config,
+        lan_runtime_authority_resolver=resolver,
+        lan_runtime_utc_clock=lambda: authority.fresh_until_datetime
+        - timedelta(seconds=1),
+    )
+
+    assert isinstance(provider, ResilientLLMProvider)
+    assert isinstance(provider.inner, LanOpenAICompatibleProvider)
+    assert provider.inner.authority is authority
+    assert provider.inner.authority_resolver is resolver
+    assert provider.provider_id == provider_health_id(config)
+    assert resolver.calls == [authority.reviewed_target_id]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_authority",
+        "missing_resolver",
+        "api_key",
+        "fallback",
+        "stream",
+        "wrong_model",
+        "wrong_host",
+        "wrong_port",
+        "ordinary_with_authority",
+        "lan_as_fallback",
+    ),
+)
+def test_factory_lan_preflight_fails_before_resolver_or_secret_lookup(
+    mutation: str,
+) -> None:
+    authority, _stable = _lan_factory_fixture()
+    config = AgentConfig(
+        provider="lan-openai-compatible",
+        model="alpha",
+        base_url="http://192.168.50.8:1234/v1",
+        lan_runtime_authority=authority,
+    )
+    resolver_calls: list[str] = []
+    secret_calls: list[str | None] = []
+
+    def resolver(target_id: str):
+        resolver_calls.append(target_id)
+        raise AssertionError("invalid config must fail before authority resolution")
+
+    def secret(reference: str | None) -> str | None:
+        secret_calls.append(reference)
+        raise AssertionError("LAN runtime must never resolve credentials")
+
+    active_resolver = resolver
+    if mutation == "missing_authority":
+        config = replace(config, lan_runtime_authority=None)
+    elif mutation == "missing_resolver":
+        active_resolver = None
+    elif mutation == "api_key":
+        config = replace(config, api_key_env="LAN_SECRET")
+    elif mutation == "fallback":
+        config = replace(config, fallback_provider="mock", fallback_model="mock")
+    elif mutation == "stream":
+        config = replace(config, stream=True)
+    elif mutation == "wrong_model":
+        config = replace(config, model="beta")
+    elif mutation == "wrong_host":
+        config = replace(config, base_url="http://192.168.50.9:1234/v1")
+    elif mutation == "wrong_port":
+        config = replace(config, base_url="http://192.168.50.8:8000/v1")
+    elif mutation == "ordinary_with_authority":
+        config = replace(config, provider="mock", base_url=None)
+    elif mutation == "lan_as_fallback":
+        config = replace(
+            config,
+            provider="mock",
+            model="mock",
+            base_url=None,
+            lan_runtime_authority=None,
+            fallback_provider="lan-openai-compatible",
+            fallback_model="alpha",
+            fallback_base_url="http://192.168.50.8:1234/v1",
+        )
+        assert config.lan_runtime_authority is None
+    else:
+        raise AssertionError(f"unhandled mutation: {mutation}")
+
+    with pytest.raises((TypeError, ValueError, ProviderError)):
+        build_llm_provider(
+            config,
+            secret_resolver=secret,
+            lan_runtime_authority_resolver=active_resolver,
+        )
+
+    assert resolver_calls == []
+    assert secret_calls == []
+
+
+def test_lan_health_identity_is_full_domain_separated_and_re_review_isolated() -> None:
+    authority, _resolver = _lan_factory_fixture()
+    base_url = "http://192.168.50.8:1234/v1"
+    config = AgentConfig(
+        provider="lan-openai-compatible",
+        model="alpha",
+        base_url=base_url,
+        lan_runtime_authority=authority,
+    )
+    payload = {
+        "schema": "kestrel.lan.provider-health.v1",
+        "provider_profile_id": authority.provider_profile_id,
+        "model_id": authority.model_id,
+        "base_url": base_url,
+        "material_binding_digest": authority.reviewed_material_binding_digest,
+        "review_digest": authority.review_digest,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    expected = "lan-openai-compatible:" + hashlib.sha256(encoded).hexdigest()
+
+    identity = provider_health_id(config)
+
+    assert identity == expected
+    assert re.fullmatch(r"lan-openai-compatible:[0-9a-f]{64}", identity)
+    assert authority.reviewed_material_binding_digest not in identity
+    assert authority.review_digest not in identity
+
+    re_reviewed = replace(
+        authority,
+        review_digest="sha256:" + "6" * 64,
+    )
+    rematerialized = replace(
+        authority,
+        reviewed_material_binding_digest="sha256:" + "7" * 64,
+    )
+    assert provider_health_id(replace(config, lan_runtime_authority=re_reviewed)) != identity
+    assert provider_health_id(replace(config, lan_runtime_authority=rematerialized)) != identity
+
+
+def test_rereviewed_lan_authority_does_not_inherit_open_circuit_state() -> None:
+    from nested_memvid_agent.llm.resilience import ProviderHealthRegistry
+
+    authority, _resolver = _lan_factory_fixture()
+    config = AgentConfig(
+        provider="lan-openai-compatible",
+        model="alpha",
+        base_url="http://192.168.50.8:1234/v1",
+        lan_runtime_authority=authority,
+    )
+    first_id = provider_health_id(config)
+    second_id = provider_health_id(
+        replace(
+            config,
+            lan_runtime_authority=replace(
+                authority,
+                review_digest="sha256:" + "6" * 64,
+            ),
+        )
+    )
+    registry = ProviderHealthRegistry(clock=lambda: 10.0)
+    registry.record_failure(
+        first_id,
+        failure_class="lan_transport_failed",
+        retryable=True,
+        failure_threshold=1,
+    )
+
+    with pytest.raises(ProviderError, match="circuit"):
+        registry.before_call(first_id, cooldown_seconds=30)
+    registry.before_call(second_id, cooldown_seconds=30)
+    assert registry.snapshot(first_id)["state"] == "open"
+    assert registry.snapshot(second_id)["state"] == "unknown"
 
 
 def test_openai_responses_provider_streams_deltas_and_final_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:

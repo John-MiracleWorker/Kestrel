@@ -56,3 +56,18 @@ jobs:
           path: ${{ runner.temp }}/kestrel-determinism-report.json
           if-no-files-found: error
           retention-days: 14
+      - name: Run twenty identical flock qualification journeys
+        run: >-
+          python scripts/run_flock_qualification_determinism.py
+          --repeats 20
+          --source-commit "${GITHUB_SHA}"
+          --run-root "${RUNNER_TEMP}/kestrel-flock-qualification-runs"
+          --output "${RUNNER_TEMP}/kestrel-flock-qualification-determinism.json"
+      - name: Upload the flock qualification determinism report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-flock-qualification-determinism-${{ github.sha }}
+          path: ${{ runner.temp }}/kestrel-flock-qualification-determinism.json
+          if-no-files-found: error
+          retention-days: 14

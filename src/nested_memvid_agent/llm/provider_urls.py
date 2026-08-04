@@ -1,8 +1,40 @@
 from __future__ import annotations
 
+import ipaddress
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
+if TYPE_CHECKING:
+    from nested_memvid_agent.lan_discovery_models import ResolvedLanEndpoint
+
 DEFAULT_OLLAMA_OPENAI_BASE_URL = "http://localhost:11434/v1"
+
+
+def format_numeric_http_authority(endpoint: ResolvedLanEndpoint) -> str:
+    """Format a numeric HTTP authority without accepting names or userinfo.
+
+    LAN discovery uses this only for its internally constructed ``Host`` header;
+    it is deliberately not a general provider URL helper.
+    """
+
+    from nested_memvid_agent.lan_discovery_models import ResolvedLanEndpoint
+
+    if type(endpoint) is not ResolvedLanEndpoint:
+        raise TypeError("HTTP authority requires an authenticated LAN endpoint")
+    address = endpoint.address
+    port = endpoint.port
+    if type(address) is not str or "%" in address:
+        raise ValueError("LAN endpoint requires an unzoned literal IP address")
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError as exc:
+        raise ValueError("LAN endpoint requires a literal IP address") from exc
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("LAN endpoint requires a valid numeric port")
+    literal = str(parsed)
+    if isinstance(parsed, ipaddress.IPv6Address):
+        return f"[{literal}]:{port}"
+    return f"{literal}:{port}"
 
 
 def validate_provider_http_url(url: str) -> str:
@@ -36,9 +68,7 @@ def normalize_ollama_openai_base_url(base_url: str | None) -> str:
     their routing contract.
     """
 
-    candidate = validate_provider_http_url(
-        base_url or DEFAULT_OLLAMA_OPENAI_BASE_URL
-    ).rstrip("/")
+    candidate = validate_provider_http_url(base_url or DEFAULT_OLLAMA_OPENAI_BASE_URL).rstrip("/")
     parsed = urlsplit(candidate)
     if parsed.path in {"", "/"}:
         return urlunsplit(parsed._replace(path="/v1"))

@@ -59,7 +59,11 @@ def compile_task_contract(
     capabilities = set(_required_capabilities(task, lowered))
     modalities = set(_required_modalities(lowered))
     preferred_tags = set(_preferred_tags(task_family, task.profile))
-    minimum_context = _minimum_context_tokens(task_family, complexity)
+    initial_minimum_context = _minimum_context_tokens(
+        task_family,
+        complexity,
+        risk=task.risk,
+    )
     structured_output_required = _structured_output_required(plan)
 
     guidance = planner_guidance or {}
@@ -74,12 +78,24 @@ def compile_task_contract(
     modalities.update(_string_items(guidance.get("required_modalities")))
     preferred_tags.update(_string_items(guidance.get("preferred_target_tags")))
     proposed_context = _positive_int_or_none(guidance.get("minimum_context_tokens"))
-    if proposed_context is not None:
-        minimum_context = max(minimum_context or 0, proposed_context)
     if _structured_output_required(guidance):
         structured_output_required = True
     preferred_tags.update(_preferred_tags(task_family, task.profile))
-    minimum_context = max(minimum_context or 0, _minimum_context_tokens(task_family, complexity))
+    final_minimum_context = _minimum_context_tokens(
+        task_family,
+        complexity,
+        risk=task.risk,
+    )
+    context_floors = tuple(
+        value
+        for value in (
+            initial_minimum_context,
+            final_minimum_context,
+            proposed_context,
+        )
+        if value is not None
+    )
+    minimum_context = max(context_floors) if context_floors else None
     if "image" in modalities:
         capabilities.add("vision")
     if structured_output_required:
@@ -268,7 +284,14 @@ def _preferred_tags(task_family: str, role: str) -> tuple[str, ...]:
     return tuple(sorted(tags))
 
 
-def _minimum_context_tokens(task_family: str, complexity: float) -> int:
+def _minimum_context_tokens(
+    task_family: str,
+    complexity: float,
+    *,
+    risk: str,
+) -> int | None:
+    if risk == "low" and task_family == "general" and complexity < 0.5:
+        return None
     baseline = 16_000
     if task_family in {"architecture", "security_review", "planning"}:
         baseline = 64_000

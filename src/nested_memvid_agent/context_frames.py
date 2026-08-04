@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -35,6 +36,7 @@ class MV2ContextFrame:
     kind: MemoryKind
     parent_ids: tuple[str, ...] = ()
     child_ids: tuple[str, ...] = ()
+    project_id: str | None = None
     source_uri: str | None = None
     source_span: dict[str, object] = field(default_factory=dict)
     content_hash: str = ""
@@ -66,7 +68,10 @@ def from_memory_record(record: MemoryRecord, frame_type: str = "raw_chunk") -> M
     """Build a context frame from the canonical memory record shape."""
 
     metadata = dict(record.metadata)
-    resolved_frame_type = str(metadata.get("frame_type") or default_frame_type_for_memory(record.kind, record.layer, fallback=frame_type))
+    resolved_frame_type = str(
+        metadata.get("frame_type")
+        or default_frame_type_for_memory(record.kind, record.layer, fallback=frame_type)
+    )
     frame_id = str(metadata.get("frame_id") or record.id)
     return MV2ContextFrame(
         id=frame_id,
@@ -77,6 +82,7 @@ def from_memory_record(record: MemoryRecord, frame_type: str = "raw_chunk") -> M
         kind=record.kind,
         parent_ids=_tuple_str(metadata.get("parent_ids")),
         child_ids=_tuple_str(metadata.get("child_ids")),
+        project_id=_optional_str(metadata.get("project_id")),
         source_uri=_optional_str(metadata.get("source_uri")),
         source_span=_dict_object(metadata.get("source_span")),
         content_hash=str(metadata.get("content_hash") or content_hash_for(record.content)),
@@ -100,6 +106,7 @@ def to_memory_record(frame: MV2ContextFrame) -> MemoryRecord:
         "frame_id": frame.id,
         "parent_ids": list(frame.parent_ids),
         "child_ids": list(frame.child_ids),
+        "project_id": frame.project_id,
         "source_uri": frame.source_uri,
         "source_span": dict(frame.source_span),
         "token_count": frame.token_count,
@@ -111,7 +118,9 @@ def to_memory_record(frame: MV2ContextFrame) -> MemoryRecord:
     }
     evidence = []
     if frame.source_uri:
-        evidence.append(EvidenceRef(source=frame.source_uri, locator=_span_locator(frame.source_span)))
+        evidence.append(
+            EvidenceRef(source=frame.source_uri, locator=_span_locator(frame.source_span))
+        )
     return MemoryRecord(
         id=frame.id,
         title=frame.title,
@@ -126,6 +135,56 @@ def to_memory_record(frame: MV2ContextFrame) -> MemoryRecord:
         created_at=frame.created_at,
         updated_at=frame.updated_at,
     )
+
+
+def make_child_frame(
+    parent: MV2ContextFrame,
+    *,
+    frame_id: str,
+    frame_type: str,
+    title: str,
+    content: str,
+    project_id: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> MV2ContextFrame:
+    """Create a child frame fenced to the parent's project boundary.
+
+    The child inherits the parent's ``project_id`` unless one is given; an
+    explicit mismatch crosses the selected project boundary and is rejected.
+    """
+
+    resolved_project_id = parent.project_id if project_id is None else project_id
+    if resolved_project_id != parent.project_id:
+        raise ValueError(
+            f"child frame {frame_id!r} crosses the project boundary of parent {parent.id!r}"
+        )
+    return MV2ContextFrame(
+        id=frame_id,
+        frame_type=frame_type,
+        title=title,
+        content=content,
+        layer=parent.layer,
+        kind=parent.kind,
+        parent_ids=(parent.id,),
+        project_id=parent.project_id,
+        metadata=dict(metadata or {}),
+    )
+
+
+def direct_frame_lookup(
+    frames: Mapping[str, MV2ContextFrame],
+    frame_id: str,
+    *,
+    project_id: str,
+) -> MV2ContextFrame:
+    """Direct frame-ID lookup fenced to the selected project; fails closed."""
+
+    frame = frames.get(frame_id)
+    if frame is None:
+        raise KeyError(f"unknown frame: {frame_id!r}")
+    if frame.project_id != project_id:
+        raise KeyError(f"frame {frame_id!r} is outside the project boundary {project_id!r}")
+    return frame
 
 
 def make_correction_frame(

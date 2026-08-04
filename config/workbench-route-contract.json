@@ -1,0 +1,78 @@
+{
+  "schema": "kestrel.workbench.routes.v1",
+  "destinations": [
+    {
+      "id": "mission",
+      "default_subroute": "command",
+      "canonical_hash": "#/mission/command"
+    },
+    {
+      "id": "projects",
+      "default_subroute": "overview",
+      "canonical_hash": "#/projects/overview"
+    },
+    {
+      "id": "memory",
+      "default_subroute": "layers",
+      "canonical_hash": "#/memory/layers"
+    },
+    {
+      "id": "flock",
+      "default_subroute": "overview",
+      "canonical_hash": "#/flock/overview"
+    },
+    {
+      "id": "automate",
+      "default_subroute": "routines",
+      "canonical_hash": "#/automate/routines"
+    },
+    {
+      "id": "extend",
+      "default_subroute": "catalog",
+      "canonical_hash": "#/extend/catalog"
+    },
+    {
+      "id": "settings",
+      "default_subroute": "general",
+      "canonical_hash": "#/settings/general"
+    }
+  ],
+  "legacy_routes": [
+    {
+      "legacy_hash": "#mission",
+      "canonical_hash": "#/mission/command"
+    },
+    {
+      "legacy_hash": "#chat",
+      "canonical_hash": "#/mission/history"
+    },
+    {
+      "legacy_hash": "#outcomes",
+      "canonical_hash": "#/mission/outcomes"
+    },
+    {
+      "legacy_hash": "#routines",
+      "canonical_hash": "#/automate/routines"
+    },
+    {
+      "legacy_hash": "#routing",
+      "canonical_hash": "#/flock/routing"
+    },
+    {
+      "legacy_hash": "#advanced",
+      "canonical_hash": "#/extend/capabilities"
+    },
+    {
+      "legacy_hash": "#settings",
+      "canonical_hash": "#/settings/general"
+    },
+    {
+      "legacy_hash": "#workspace",
+      "canonical_hash": "#/mission/command"
+    },
+    {
+      "legacy_hash": "#tools",
+      "canonical_hash": "#/extend/capabilities"
+    }
+  ]
+}

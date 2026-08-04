@@ -4,6 +4,7 @@ import ipaddress
 import json
 import math
 import os
+import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from .runtime_profile_lease import LeaseDisposition
 from .security_boundary import REDACTED, redact_text
 
 _DEFAULT_TOKEN_ENV_NAME = "NEST_AGENT_API_TOKEN"
@@ -46,6 +48,14 @@ class ServerProbe:
     reachable: bool
     healthy: bool
     locked: bool
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ServerCompatibility:
+    disposition: LeaseDisposition
+    profile_id: str | None
+    version: str | None
     detail: str | None = None
 
 
@@ -99,6 +109,88 @@ class KestrelServerClient:
 
     def get_setup_readiness(self) -> dict[str, Any]:
         return self._request_json("GET", "/api/product/setup")
+
+    def probe_desktop_compatibility(
+        self,
+        *,
+        profile_id: str,
+        version: str,
+        launch_nonce_digest: str,
+        base_url: str | None = None,
+    ) -> ServerCompatibility:
+        expected_profile = profile_id.strip()
+        expected_version = version.strip()
+        expected_nonce_digest = launch_nonce_digest.strip().lower()
+        if not expected_profile:
+            raise ValueError("profile ID must not be empty")
+        if not expected_version:
+            raise ValueError("version must not be empty")
+        if not _is_sha256_digest(expected_nonce_digest):
+            raise ValueError("launch nonce digest must be a SHA-256 digest")
+        target_base_url = (
+            self.base_url if base_url is None else _validate_base_url(base_url)
+        )
+        try:
+            payload = self._request_json(
+                "GET",
+                "/api/desktop/readiness",
+                base_url=target_base_url,
+            )
+        except ServerClientError:
+            return ServerCompatibility(
+                disposition="foreign_or_unrelated",
+                profile_id=None,
+                version=None,
+                detail="desktop_readiness_unavailable",
+            )
+        actual_profile = payload.get("profile_id")
+        actual_version = payload.get("sidecar_version")
+        actual_nonce_digest = payload.get("launch_nonce_digest")
+        if (
+            payload.get("schema") != "kestrel.desktop.readiness.v1"
+            or payload.get("ready") is not True
+            or not isinstance(actual_profile, str)
+            or not actual_profile
+            or not isinstance(actual_version, str)
+            or not actual_version
+            or not isinstance(actual_nonce_digest, str)
+            or not _is_sha256_digest(actual_nonce_digest)
+        ):
+            return ServerCompatibility(
+                disposition="foreign_or_unrelated",
+                profile_id=None,
+                version=None,
+                detail="desktop_readiness_invalid",
+            )
+        if actual_profile != expected_profile:
+            return ServerCompatibility(
+                disposition="foreign_or_unrelated",
+                profile_id=actual_profile,
+                version=actual_version,
+                detail="desktop_profile_mismatch",
+            )
+        if actual_version != expected_version:
+            return ServerCompatibility(
+                disposition="version_conflict",
+                profile_id=actual_profile,
+                version=actual_version,
+                detail="desktop_version_mismatch",
+            )
+        if not secrets.compare_digest(
+            actual_nonce_digest,
+            expected_nonce_digest,
+        ):
+            return ServerCompatibility(
+                disposition="foreign_or_unrelated",
+                profile_id=actual_profile,
+                version=actual_version,
+                detail="desktop_nonce_mismatch",
+            )
+        return ServerCompatibility(
+            disposition="attach_desktop",
+            profile_id=actual_profile,
+            version=actual_version,
+        )
 
     def create_run(
         self,
@@ -188,6 +280,7 @@ class KestrelServerClient:
         path: str,
         *,
         payload: Mapping[str, object] | None = None,
+        base_url: str | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Accept": "application/json",
@@ -201,7 +294,7 @@ class KestrelServerClient:
             body = json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = Request(
-            f"{self.base_url}{path}",
+            f"{self.base_url if base_url is None else _validate_base_url(base_url)}{path}",
             data=body,
             headers=headers,
             method=method,
@@ -392,3 +485,10 @@ def _validate_base_url(raw: str) -> str:
         port = 80
     host = f"[{hostname}]" if ":" in hostname else hostname
     return f"http://{host}:{port}"
+
+
+def _is_sha256_digest(value: str) -> bool:
+    return (
+        len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )

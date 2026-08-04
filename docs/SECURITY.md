@@ -40,6 +40,45 @@ NEST_AGENT_CORS_ORIGINS=
 
 Do not loosen these in shared deployments without a separate approval and audit story. The local web server also rejects untrusted `Host` headers and cross-site `Origin` hosts by default; set `NEST_AGENT_TRUSTED_HOSTS` and `NEST_AGENT_CORS_ORIGINS` deliberately when running a split frontend or a non-loopback deployment.
 
+## Desktop Developer Directory Build
+
+The unsigned current-platform developer directory build is local-only and
+non-publishable. It accepts an exact clean Git commit, the literal reviewed
+`electron-builder.developer.yml` configuration, and a bounded local resource
+stage whose canonical receipt, manifest, signature, paths, digests, and complete
+file inventory are revalidated without following links. It builds only the
+current platform's `dir` target into a new output outside the source repository.
+The workflow tests this contract but does not upload the resulting directory.
+
+`electron-builder` is pinned exactly to `26.15.3` as a development dependency.
+Its current development-only dependency closure reports
+GHSA-mh99-v99m-4gvg / CVE-2026-14257, a high-severity unbounded
+`brace-expansion` denial-of-service advisory. A global resolution override is
+not acceptable because the builder closure contains older `minimatch` consumers
+whose CommonJS expectations are incompatible with the newer package export.
+The local directory builder does not accept arbitrary brace patterns from a
+user: its config and input paths are generated from the fixed reviewed contract
+after exact-clean and bounded-input checks.
+
+Electron Builder's package-metadata cleanup is explicitly disabled for scripts
+and keywords. The builder can still filter other dependency metadata or add a
+dependency selected from the development tree, so Kestrel does not trust its
+generated `app/node_modules`: after qualifying that directory beneath the new
+application output, Kestrel replaces it with the already inventoried temporary
+production closure and re-inventories every resulting byte. A linked or escaping
+generated dependency root fails closed before replacement.
+
+CI runs `npm run audit:reviewed`, which requires the production audit to contain
+zero vulnerabilities and separately parses the complete all-dependency audit.
+The reviewed exception accepts only the exact advisory source, name, URL,
+severity, title, range, CWE/CVSS metadata, and propagation paths. Every affected
+lock node must be marked development-only, reachable exclusively from the exact
+`electron-builder@26.15.3` direct root, and unreachable from every other direct
+dependency. Any new advisory, changed metadata, production path, second direct
+root, package override, or builder version fails the gate and requires explicit
+re-review. This exception does not authorize an installer, archive, signature,
+notarization, update feed, publication target, or uploaded artifact.
+
 ## Network Binding
 
 Bind the web/API server to `127.0.0.1` by default:
@@ -49,6 +88,16 @@ nest-agent server --host 127.0.0.1 --port 8765
 ```
 
 If binding to `0.0.0.0`, enable `NEST_AGENT_REQUIRE_API_AUTH=1`, set `NEST_AGENT_API_TOKEN`, put Kestrel behind an authenticated reverse proxy, and keep dangerous tool flags disabled. Startup fails with `unsafe_bind` when a non-loopback host is requested without API auth and a configured token.
+
+## LAN Model Discovery
+
+Explicit LAN model discovery is manual, bounded, and private-scope-only. Nothing is probed until the owner selects an interface, inspects the exact scope and limits in a server-owned preview, and confirms; the confirmed scope cannot be broadened while a scan runs, and cancellation stops new probes. The server re-derives every authority: only RFC1918/link-local/ULA ranges attached to the selected interface are eligible, active probing is capped at 256 hosts across four known model-service ports, and each probe re-authenticates a fresh interface inventory before connecting so address drift stops the scan with `interface_drift`.
+
+The probe transport fails closed against hostile servers: redirects are terminal and never followed, response headers and bodies are byte-capped (32 KiB / 256 KiB), only strict chunked or identity framing is accepted, one absolute deadline bounds every read (slowloris cannot stall a scan), and catalogs are parsed with a strict JSON parser that rejects duplicate members, non-finite constants, and credential-shaped model identifiers. Manual host entry resolves once, accepts only canonical attached literals, and probes the confirmed literal without further DNS, so DNS rebinding cannot move a confirmed target. mDNS advertisements are re-validated server-side, deduplicated per endpoint, bounded to 256 candidates, and dropped when display text carries control characters or credential-shaped content.
+
+Discovery never grants authority. Every imported server/model is a disabled, `unconfirmed` draft with no secret reference; enablement requires a separate owner review with exact revision checks, a privacy acknowledgement that prompts and code leave the computer, and digest-bound evidence. Address, catalog, capability, or freshness drift stales the target and blocks review until a positive refresh. Observations, events, and support surfaces serialize digests and closed public error text only — never raw response bodies, untrusted error details, or credential material.
+
+The adversarial qualification corpus lives in `tests/evals/lan_discovery/hostile_responses.json` and is executed by `tests/test_lan_discovery_security.py`: for every hostile case it proves probe destinations never expand beyond the confirmed scope, no enabled target is ever produced, and a secret sentinel never appears in serialized evidence. Renderer journeys in `desktop/e2e/lan-discovery.spec.ts` run the same contracts against a controlled in-page private-network fixture that never touches the ambient network. Controlled two-machine live evidence (`RUN_LAN_DISCOVERY_INTEGRATION=1`) remains an operator-gated integration step, never a CI default.
 
 ## API Auth
 
@@ -159,6 +208,12 @@ Agent-invoked test, lint, repair validation, and Codex delegation have no host-p
 Repair artifacts live beneath a no-follow, owner-only `.nest` boundary and use receipt schema v2 with the current key at `.nest/repair_receipt_signing.v2.key`. After each isolated validation completes, Kestrel atomically rotates this v2 key before signing the new receipt, invalidating earlier validation/review gates; candidate code never receives the key or live workspace. Schema-v1 receipts, legacy `.nest/repair_receipt_signing.key` signatures, missing/forged OCI attestations, and prior-key artifacts cannot authorize review or commit. The v2 key is a tamper-evident local continuity mechanism, not same-account process isolation; the execution fences above prevent uncontained code from coexisting with it. Full-agent backups include the current signing key plus signed validation/review receipts; memory-only backups deliberately do not. Validation output and evidence are redacted before persistence, and a passing receipt requires identical pre/post branch, HEAD, and content digest. Repair branch commits derive literal blobs and a temporary index from that signed manifest, so repository filters, hooks, signing config, and caller-index races cannot alter the approved tree. `repair.rollback` requires an approval-bound current diff digest, writes a plan journal first, and quarantines overwritten/untracked files before raw HEAD restoration. `git.commit` never pushes and refuses protected branches from `NEST_AGENT_PROTECTED_BRANCHES`.
 
 Stable-learning runtime receipts use a separate owner-only key at `<memory_dir>/.validation-integrity.key`. That key is also create-once, `0600`, single-link, and included in both memory-only and full-agent backups so restored `.mv2` validation envelopes retain their identity. Receipts are bound to the exact candidate record ID, the canonical title/content/kind digest, and the originating run (or session when no run exists); replay against another claim or run is rejected.
+
+## Adaptive Flock Authority Boundary
+
+Learned target selection can never expand task authority. The routing layer only rebinds the provider target fields of `AgentConfig` (`provider`, `model`, `base_url`, `api_key_env`, the fallback target fields, and the LAN runtime authority); every enablement, budget, network, workspace, secrets, skills, plugins, MCP, containment, and memory flag passes through byte-identical. The task contract is compiled from the task alone, so an active durable grant cannot alter required tools, capabilities, privacy class, locality requirements, or the cost ceiling — the contract digest is unchanged by learned routing. The durable task graph node (approval, required tools, risk, acceptance criteria) is never mutated by routing. High/critical-risk scopes are deterministic-only at two independent layers: the coordinator abstains with `high_risk` before any grant lookup, and the activation evaluator refuses effectiveness with `high_risk_deterministic_only` even when an active grant exists.
+
+Adaptive Flock qualification and activation are not memory events. A completed qualification run, its terminal receipt, scope activation, and learned routing under the active grant write zero `.mv2` records on any memory layer, emit zero learning-kernel decisions, and trigger zero mutation-gate evaluations. Qualification evidence can never satisfy the policy-delta hard gates: a policy delta citing Flock qualification evidence still requires an explicit policy instruction, enabled policy-delta activation, replay, and exact-call approval. These invariants are enforced by `tests/test_flock_authority_boundaries.py` (corpus: `tests/evals/adaptive_flock_qualification/authority_matrix.json`), `tests/test_flock_no_policy_memory.py`, and cross-checks in `tests/test_memory_promotion_gates.py` and `tests/test_mutation_gate.py`.
 
 ## Webhooks
 

@@ -1,0 +1,153 @@
+.activation-workspace .activation-preview-form {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+  margin-bottom: 0.75rem;
+}
+
+.activation-packet {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+  border: 1px solid var(--wf-border, currentColor);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  width: 100%;
+}
+
+.activation-packet h3,
+.activation-packet h4,
+.grant-card h4 {
+  margin: 0;
+}
+
+.activation-authority,
+.activation-conditions {
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+}
+
+.activation-scope-list {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.activation-scope-row {
+  border: 1px solid var(--wf-border, currentColor);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.activation-scope-row > label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.activation-scope-reasons,
+.grant-reasons {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.activation-binding-warning,
+.grant-state[role="alert"],
+.revoke-confirm {
+  border: 1px solid var(--wf-border, currentColor);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  margin: 0;
+}
+
+.activation-confirm {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-weight: 600;
+}
+
+.activation-bindings,
+.activation-evidence {
+  margin-top: 0.5rem;
+}
+
+.activation-bindings summary,
+.activation-evidence summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.activation-result {
+  font-weight: 600;
+  margin: 0;
+}
+
+.grant-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.grant-card {
+  border: 1px solid var(--wf-border, currentColor);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+}
+
+.grant-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.grant-facts,
+.grant-bindings ul {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.grant-state {
+  margin: 0;
+}
+
+.grant-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.revoke-confirm {
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+}
+
+.revoke-confirm p {
+  margin: 0;
+}
+
+.revoke-confirm label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.grant-loading {
+  margin: 0.5rem 0;
+}

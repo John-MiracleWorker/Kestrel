@@ -10,6 +10,12 @@ import pytest
 
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.desktop_memory_health import (
+    inspect_desktop_memvid_readiness,
+)
+from nested_memvid_agent.desktop_sidecar import (
+    run_desktop_sidecar_preflight,
+)
 from nested_memvid_agent.event_bus import RunEventBus
 from nested_memvid_agent.layers import LayeredMemorySystem, load_layer_specs
 from nested_memvid_agent.mcp_manager import MCPManager
@@ -29,7 +35,9 @@ def _require_memvid_sdk() -> None:
     pytest.importorskip("memvid_sdk")
 
 
-def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_files(tmp_path: Path) -> None:
+def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_files(
+    tmp_path: Path,
+) -> None:
     # This test seeds the storage adapter below the promotion-policy boundary.
     memory = LayeredMemorySystem.from_backend_factory(
         tmp_path / "memory",
@@ -64,19 +72,28 @@ def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_fi
     reopened = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", MemvidBackend)
     try:
         hits = reopened.retrieve(
-            RetrievalQuery(query="sentinel_memvid_system_81aa", layers=(MemoryLayer.SEMANTIC,), k_per_layer=5)
+            RetrievalQuery(
+                query="sentinel_memvid_system_81aa", layers=(MemoryLayer.SEMANTIC,), k_per_layer=5
+            )
         )
         assert hits
         assert hits[0].record.metadata["frame_id"] == "memvid-system-frame"
-        assert reopened.tombstone(MemoryLayer.SEMANTIC, "memvid-system-fact", reason="integration", superseded_by="next")
+        assert reopened.tombstone(
+            MemoryLayer.SEMANTIC, "memvid-system-fact", reason="integration", superseded_by="next"
+        )
         reopened.seal_all()
     finally:
         reopened.close_all()
 
     final = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", MemvidBackend)
     try:
-        assert final.get_record(MemoryLayer.SEMANTIC, "memvid-system-fact", include_inactive=False) is None
-        inactive = final.get_record(MemoryLayer.SEMANTIC, "memvid-system-fact", include_inactive=True)
+        assert (
+            final.get_record(MemoryLayer.SEMANTIC, "memvid-system-fact", include_inactive=False)
+            is None
+        )
+        inactive = final.get_record(
+            MemoryLayer.SEMANTIC, "memvid-system-fact", include_inactive=True
+        )
         assert inactive is not None
         assert inactive.metadata["active"] is False
         inactive_hits = final.retrieve(
@@ -89,6 +106,54 @@ def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_fi
         assert inactive_hits
     finally:
         final.close_all()
+
+
+def test_desktop_recovery_probe_reopens_exactly_six_memvid_v2_layers(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    receipt = run_desktop_sidecar_preflight(memory_dir).bind(
+        launch_nonce_digest="a" * 64,
+        resource_manifest_digest="sha256:" + ("b" * 64),
+    )
+    before = {
+        str(path.relative_to(memory_dir)): (
+            path.read_bytes() if path.is_file() else None,
+            path.lstat().st_mode,
+            path.lstat().st_size,
+            path.lstat().st_mtime_ns,
+            path.lstat().st_ctime_ns,
+        )
+        for path in (memory_dir, *sorted(memory_dir.rglob("*")))
+    }
+
+    assert (
+        inspect_desktop_memvid_readiness(
+            memory_dir,
+            receipt=receipt,
+            launch_nonce_digest="a" * 64,
+            resource_manifest_digest="sha256:" + ("b" * 64),
+        )
+        is True
+    )
+    assert {
+        str(path.relative_to(memory_dir)): (
+            path.read_bytes() if path.is_file() else None,
+            path.lstat().st_mode,
+            path.lstat().st_size,
+            path.lstat().st_mtime_ns,
+            path.lstat().st_ctime_ns,
+        )
+        for path in (memory_dir, *sorted(memory_dir.rglob("*")))
+    } == before
+    assert {path.name for path in memory_dir.glob("*.mv2")} == {
+        "working.mv2",
+        "episodic.mv2",
+        "semantic.mv2",
+        "procedural.mv2",
+        "self.mv2",
+        "policy.mv2",
+    }
 
 
 def test_memvid_run_manager_serializes_two_runs_and_reopens_each_layer(tmp_path: Path) -> None:
@@ -194,9 +259,7 @@ def test_memvid_autonomous_scheduler_releases_primary_agent_between_workers(
         terminal = _wait_for_terminal_run(state, run.run_id)
         assert terminal == "completed"
         child_statuses = [
-            task.status
-            for task in state.list_task_nodes(run.run_id)
-            if task.parent_id is not None
+            task.status for task in state.list_task_nodes(run.run_id) if task.parent_id is not None
         ]
         assert child_statuses == ["completed", "completed", "completed"]
     finally:
