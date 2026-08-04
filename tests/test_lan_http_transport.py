@@ -1210,6 +1210,9 @@ def test_one_byte_over_http_framing_and_body_limits_is_rejected(response: bytes)
         b"HTTP/1.1 200 OK\r\nX: " + (b"a" * 33_000) + b"\r\n\r\n",
         http_response(200, b"x" * (256 * 1024 + 1)),
     ],
+    # Short IDs: the large byte payloads would otherwise become the test id and
+    # exceed Windows' 32767-char environment-variable limit at setup.
+    ids=["oversized-header", "over-max-body"],
 )
 def test_http_transport_bounds_headers_and_body_and_always_closes(response: bytes) -> None:
     sockets = SocketFactory(response)
