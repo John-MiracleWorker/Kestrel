@@ -2506,7 +2506,7 @@ def _print_plugins(plugins: list[dict[str, Any]], *, json_output: bool) -> None:
 def _print_plugin(plugin: dict[str, Any], *, json_output: bool) -> None:
     plugin = redact_secrets(plugin)
     if json_output:
-        print(json.dumps(plugin, indent=2))
+        print(json.dumps(plugin, indent=2))  # codeql[py/clear-text-logging-sensitive-data] — redacted before logging
         return
     state = "enabled" if plugin["enabled"] else "not enabled"
     print(f"{plugin['id']} [{state}]")

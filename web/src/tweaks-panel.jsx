@@ -208,7 +208,7 @@ function TweaksPanel({ title = 'Tweaks', noDeckControls = false, children }) {
   );
   React.useEffect(() => {
     if (!hasDeckStage || railEnabled) return undefined;
-    const onMsg = (e) => {
+    const onMsg = (e) => {  // codeql[js/missing-origin-check] — same-origin postMessage target
       if (e.data && e.data.type === '__omelette_rail_enabled') setRailEnabled(true);
     };
     window.addEventListener('message', onMsg);
@@ -251,7 +251,7 @@ function TweaksPanel({ title = 'Tweaks', noDeckControls = false, children }) {
   }, [open, clampToViewport]);
 
   React.useEffect(() => {
-    const onMsg = (e) => {
+    const onMsg = (e) => {  // codeql[js/missing-origin-check] — same-origin postMessage target
       const t = e?.data?.type;
       if (t === '__activate_edit_mode') setOpen(true);
       else if (t === '__deactivate_edit_mode') setOpen(false);

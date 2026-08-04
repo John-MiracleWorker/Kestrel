@@ -272,7 +272,7 @@ async function readCanonicalJson(
   await adapter.qualifyOwnerOnly(controlRoot, "directory");
   const before = await lstat(pathValue);
   requireOwnerOnlyFile(before, currentDeveloperOwner(adapter));
-  const handle = await open(
+  const handle = await open(  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
     pathValue,
     fsConstants.O_RDONLY |
       (fsConstants.O_NOFOLLOW ?? 0)

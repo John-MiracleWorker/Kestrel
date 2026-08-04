@@ -768,7 +768,7 @@ def test_exclusive_private_artifact_writer_uses_binary_descriptor(
         if Path(path) == temporary:
             observed_flags.append(flags)
         native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
-        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(
         private_artifacts_module.os,

@@ -11,6 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,6 +43,8 @@ from nested_memvid_agent.service_control import (
     resolve_kestrel_home,
     resolve_service_paths,
 )
+
+_PACKAGE_VERSION = importlib_metadata.version("nested-memvid-agent")
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt",
@@ -798,7 +801,7 @@ def test_start_attaches_only_to_a_verified_compatible_desktop_lease(
         executable_digest="2" * 64,
         launch_nonce_digest="3" * 64,
         base_url="http://127.0.0.1:27654/",
-        version="0.5.0",
+        version=_PACKAGE_VERSION,
         created_at="2026-07-29T12:00:00+00:00",
     )
     lease = RuntimeProfileLease.acquire(profile_root, identity)
@@ -823,7 +826,7 @@ def test_start_attaches_only_to_a_verified_compatible_desktop_lease(
                 ServerCompatibility(
                     disposition="attach_desktop",
                     profile_id="default",
-                    version="0.5.0",
+                    version=_PACKAGE_VERSION,
                 ),
                 expected_compatibility_base_url=identity.base_url,
                 expected_launch_nonce_digest=identity.launch_nonce_digest,
@@ -867,7 +870,7 @@ def test_start_preserves_desktop_compatibility_failure_disposition(
         executable_digest="2" * 64,
         launch_nonce_digest="3" * 64,
         base_url=paths.url,
-        version="0.5.0",
+        version=_PACKAGE_VERSION,
         created_at="2026-07-29T12:00:00+00:00",
     )
     lease = RuntimeProfileLease.acquire(profile_root, identity)
@@ -922,7 +925,7 @@ def test_start_does_not_race_a_cli_lease_before_its_listener_is_ready(
         executable_digest="2" * 64,
         launch_nonce_digest="3" * 64,
         base_url=paths.url,
-        version="0.5.0",
+        version=_PACKAGE_VERSION,
         created_at="2026-07-29T12:00:00+00:00",
     )
     lease = RuntimeProfileLease.acquire(profile_root, identity)
@@ -1971,7 +1974,7 @@ def test_system_port_bindability_rejects_active_ipv6_wildcard_listener() -> None
         try:
             listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("::", 0))
+            listener.bind(("::", 0))  # codeql[py/bind-socket-all-network-interfaces] — test fixture: listener-identity guard
         except OSError as exc:
             pytest.skip(f"dual-stack IPv6 wildcard listener is unavailable: {exc}")
         port = listener.getsockname()[1]

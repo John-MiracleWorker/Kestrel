@@ -393,7 +393,7 @@ def test_changed_path_manifest_opens_literal_bytes_in_binary_mode(
         platform_flags = flags & ~binary_flag
         if flags & binary_flag:
             platform_flags |= platform_binary_flag
-        return real_open(path, platform_flags, mode, dir_fd=dir_fd)
+        return real_open(path, platform_flags, mode, dir_fd=dir_fd)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(repair_integrity_module.os, "O_BINARY", binary_flag, raising=False)
     monkeypatch.setattr(repair_integrity_module.os, "open", open_without_synthetic_flag)

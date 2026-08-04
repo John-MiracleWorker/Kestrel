@@ -213,7 +213,7 @@ async function inspectRegularFile(pathValue, label, maximumBytes = null, collect
   if (maximumBytes !== null && before.size > BigInt(maximumBytes)) {
     throw new Error(`${label} exceeds its size limit`);
   }
-  const handle = await open(
+  const handle = await open(  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
     pathValue,
     fsConstants.O_RDONLY |
       (fsConstants.O_NOFOLLOW ?? 0) |

@@ -63,7 +63,7 @@ def test_in_memory_snapshot_and_created_leaf_are_owner_only(tmp_path: Path) -> N
     assert _mode(memory_dir) == 0o700
     assert _mode(snapshot) == 0o600
 
-    os.chmod(snapshot, 0o644)
+    os.chmod(snapshot, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     reopened = InMemoryBackend(path=path, layer=MemoryLayer.SEMANTIC)
     reopened.open()
     assert _mode(snapshot) == 0o600
@@ -92,7 +92,7 @@ def test_memory_backend_switch_hardens_every_existing_layer_variant(tmp_path: Pa
         )
         for artifact, content in variants:
             artifact.write_bytes(content)
-            os.chmod(artifact, 0o644)
+            os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
             artifacts.append(artifact)
 
     memory = build_memory_system("memory", memory_dir)
@@ -104,7 +104,7 @@ def test_memory_backend_switch_hardens_every_existing_layer_variant(tmp_path: Pa
 def test_existing_custom_memory_directory_keeps_its_mode(tmp_path: Path) -> None:
     memory_dir = tmp_path / "custom-memory"
     memory_dir.mkdir(mode=0o755)
-    os.chmod(memory_dir, 0o755)
+    os.chmod(memory_dir, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     backend = InMemoryBackend(
         path=memory_dir / "semantic.mv2",
         layer=MemoryLayer.SEMANTIC,
@@ -132,7 +132,7 @@ def test_in_memory_rejects_aliased_layer_variant_without_mutating_target(
     memory_dir.mkdir()
     outside = tmp_path / "outside.json"
     outside.write_text('[{"content":"private"}]', encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     artifact = memory_dir / artifact_name
     _link(artifact, outside, link_kind)
     before = outside.read_bytes()
@@ -157,7 +157,7 @@ def test_in_memory_rejects_aliased_snapshot_lock_without_mutating_target(
     memory_dir.mkdir()
     outside = tmp_path / "outside-memory-lock"
     outside.write_text("outside lock", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     lock_path = memory_dir / ".semantic.mv2.kestrel.lock"
     _link(lock_path, outside, link_kind)
 
@@ -178,7 +178,7 @@ def test_private_file_rejects_foreign_owner_before_chmod(
 ) -> None:
     artifact = tmp_path / "foreign.memory.json"
     artifact.write_text("private", encoding="utf-8")
-    os.chmod(artifact, 0o644)
+    os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     actual_uid = artifact.stat().st_uid
     monkeypatch.setattr(private_artifacts.os, "geteuid", lambda: actual_uid + 1)
 
@@ -211,7 +211,7 @@ def test_memvid_creation_is_not_precreated_and_artifacts_are_owner_only(
         target = Path(filename)
         create_saw_missing.append(not target.exists())
         target.write_bytes(b"fake mv2")
-        os.chmod(target, 0o644)
+        os.chmod(target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
         return _FakeMemvid()
 
     _install_fake_memvid(monkeypatch, create=fake_create)
@@ -256,7 +256,7 @@ def test_memvid_open_hardens_stale_in_memory_snapshot(
     )
     for artifact, content in variants:
         artifact.write_bytes(content)
-        os.chmod(artifact, 0o644)
+        os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     _install_fake_memvid(monkeypatch)
 
     backend = MemvidBackend(path=path, layer=MemoryLayer.SEMANTIC)
@@ -276,7 +276,7 @@ def test_memvid_rejects_aliased_container_without_mutating_target(
     memory_dir.mkdir()
     outside = tmp_path / "outside.mv2"
     outside.write_bytes(b"outside memvid")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     path = memory_dir / "semantic.mv2"
     _link(path, outside, link_kind)
     calls: list[str] = []
@@ -307,7 +307,7 @@ def test_memvid_rejects_aliased_exact_index_without_mutating_target(
     path.write_bytes(b"fake mv2")
     outside = tmp_path / "outside-index.json"
     outside.write_text('{"records":[]}', encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     _link(path.with_suffix(".mv2.records.json"), outside, link_kind)
     _install_fake_memvid(monkeypatch)
 
@@ -333,7 +333,7 @@ def test_memvid_rejects_aliased_lock_without_mutating_target(
     path.write_bytes(b"fake mv2")
     outside = tmp_path / f"outside-{lock_scope}.lock"
     outside.write_text("outside lock", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     lock_path = (
         tmp_path / ".memory.kestrel-memory.lock"
         if lock_scope == "memory"
@@ -368,7 +368,7 @@ def test_startup_protects_legacy_capsule_root_without_scanning_children(
     runs_dir = tmp_path / "runs"
     run_dir = runs_dir / "legacy-run"
     run_dir.mkdir(parents=True, mode=0o755)
-    os.chmod(run_dir, 0o755)
+    os.chmod(run_dir, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     known = tuple(run_dir / name for name in (
         "complete.mv2",
         "complete.memory.json",
@@ -376,10 +376,10 @@ def test_startup_protects_legacy_capsule_root_without_scanning_children(
     ))
     for artifact in known:
         artifact.write_text("legacy private capsule", encoding="utf-8")
-        os.chmod(artifact, 0o644)
+        os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     unknown = run_dir / "unrelated.txt"
     unknown.write_text("not a capsule artifact", encoding="utf-8")
-    os.chmod(unknown, 0o644)
+    os.chmod(unknown, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     prepare_private_runs_root(runs_dir)
 
@@ -396,7 +396,7 @@ def test_memory_only_build_does_not_touch_unrelated_sibling_runs_directory(
     unrelated_runs.mkdir(mode=0o755)
     marker = unrelated_runs / "unrelated.txt"
     marker.write_text("not this memory runtime", encoding="utf-8")
-    os.chmod(marker, 0o644)
+    os.chmod(marker, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     memory = build_memory_system("memory", tmp_path / "flat-memory")
     memory.close_all()
@@ -411,7 +411,7 @@ def test_memory_artifact_preparation_rejects_escaping_config_before_target_mutat
 ) -> None:
     outside = tmp_path / "outside.mv2"
     outside.write_text("outside memory", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     specs = dict(DEFAULT_LAYER_SPECS)
     specs[MemoryLayer.SEMANTIC] = replace(
         specs[MemoryLayer.SEMANTIC],
@@ -434,7 +434,7 @@ def test_server_bootstrap_repairs_finite_private_artifacts_before_first_request(
     runtime_root = tmp_path / "runtime"
     memory_dir = runtime_root / "memory"
     memory_dir.mkdir(parents=True, mode=0o755)
-    os.chmod(memory_dir, 0o755)
+    os.chmod(memory_dir, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     memory_artifacts = (
         memory_dir / "semantic.mv2",
         memory_dir / "semantic.memory.json",
@@ -442,21 +442,21 @@ def test_server_bootstrap_repairs_finite_private_artifacts_before_first_request(
     )
     for artifact in memory_artifacts:
         artifact.write_text("legacy private memory", encoding="utf-8")
-        os.chmod(artifact, 0o644)
+        os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     runs_dir = runtime_root / "runs"
     legacy_run = runs_dir / "legacy-run"
     legacy_run.mkdir(parents=True, mode=0o755)
-    os.chmod(runs_dir, 0o755)
-    os.chmod(legacy_run, 0o755)
+    os.chmod(runs_dir, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
+    os.chmod(legacy_run, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     legacy_capsule = legacy_run / "complete.memory.json"
     legacy_capsule.write_text("legacy private capsule", encoding="utf-8")
-    os.chmod(legacy_capsule, 0o644)
+    os.chmod(legacy_capsule, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     secret_path = runtime_root / "secrets" / "local_vault.json"
     secret_path.parent.mkdir()
     secret_path.write_text('{"secrets": {}}', encoding="utf-8")
-    os.chmod(secret_path, 0o644)
+    os.chmod(secret_path, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     config = AgentConfig(
         memory_dir=memory_dir,
@@ -491,7 +491,7 @@ def test_lazy_capsule_access_rejects_alias_without_mutating_target(
     run_dir.mkdir(parents=True)
     outside = tmp_path / "outside-legacy-capsule"
     outside.write_text("outside capsule", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     _link(run_dir / "complete.mv2.records.json", outside, link_kind)
 
     prepare_private_runs_root(tmp_path / "runs")
@@ -516,8 +516,8 @@ def test_capsule_read_hardens_legacy_variants(tmp_path: Path) -> None:
     )
     variants = (path, path.with_suffix(".memory.json"))
     for artifact in variants:
-        os.chmod(artifact, 0o644)
-    os.chmod(runs_dir, 0o755)
+        os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
+    os.chmod(runs_dir, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     summary = summarize_run_capsule(runs_dir=runs_dir, run_id="legacy-read")
 
@@ -540,7 +540,7 @@ def test_capsule_summary_rejects_traversal_before_target_mutation(
     outside_run.mkdir(mode=0o755)
     artifact = outside_run / "complete.memory.json"
     artifact.write_text("outside capsule", encoding="utf-8")
-    os.chmod(artifact, 0o644)
+    os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     with pytest.raises(ValueError, match="single safe path component"):
         summarize_run_capsule(runs_dir=runs_dir, run_id=unsafe_run_id)
@@ -558,7 +558,7 @@ def test_capsule_summary_rejects_absolute_run_id_before_target_mutation(tmp_path
     outside_run.mkdir(mode=0o755)
     artifact = outside_run / "complete.memory.json"
     artifact.write_text("absolute outside capsule", encoding="utf-8")
-    os.chmod(artifact, 0o644)
+    os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     with pytest.raises(ValueError, match="single safe path component"):
         summarize_run_capsule(runs_dir=runs_dir, run_id=str(outside_run.resolve()))
@@ -607,13 +607,13 @@ def test_large_capsule_history_startup_is_constant_scope_and_owner_only(
 ) -> None:
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir(mode=0o755)
-    os.chmod(runs_dir, 0o755)
+    os.chmod(runs_dir, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     for index in range(1001):
         run_dir = runs_dir / f"run-{index:04d}"
         run_dir.mkdir()
         artifact = run_dir / "complete.memory.json"
         artifact.write_text("legacy private capsule", encoding="utf-8")
-        os.chmod(artifact, 0o644)
+        os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     def fail_rescan(_path: object) -> object:
         raise AssertionError("startup must not scan historical run children")
@@ -630,7 +630,7 @@ def test_capsule_root_rejects_symlink_without_mutating_target(
 ) -> None:
     outside = tmp_path / "outside-runs"
     outside.mkdir(mode=0o755)
-    os.chmod(outside, 0o755)
+    os.chmod(outside, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     (tmp_path / "runs").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(ValueError, match="directories must not be symbolic links"):
@@ -645,11 +645,11 @@ def test_capsule_summary_rejects_symlinked_root_without_mutating_target(
     outside_root = tmp_path / "outside-runs"
     outside_run = outside_root / "legacy-run"
     outside_run.mkdir(parents=True, mode=0o755)
-    os.chmod(outside_root, 0o755)
-    os.chmod(outside_run, 0o755)
+    os.chmod(outside_root, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
+    os.chmod(outside_run, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     artifact = outside_run / "complete.memory.json"
     artifact.write_text("outside capsule", encoding="utf-8")
-    os.chmod(artifact, 0o644)
+    os.chmod(artifact, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     runs_dir = tmp_path / "runs"
     runs_dir.symlink_to(outside_root, target_is_directory=True)
 
@@ -676,7 +676,7 @@ def test_task_capsule_rejects_aliases_without_mutating_target(
     run_dir.mkdir(parents=True)
     outside = tmp_path / f"outside-{artifact_name}"
     outside.write_text("outside capsule", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     _link(run_dir / artifact_name, outside, link_kind)
     writer = TaskCapsuleWriter(
         runs_dir=tmp_path / "runs",
@@ -700,7 +700,7 @@ def test_memvid_task_capsule_container_and_index_are_owner_only(
         target = Path(filename)
         assert not target.exists()
         target.write_bytes(b"fake capsule mv2")
-        os.chmod(target, 0o644)
+        os.chmod(target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
         return _FakeMemvid()
 
     _install_fake_memvid(monkeypatch, create=fake_create)
@@ -749,7 +749,7 @@ def test_vector_sidecar_rejects_aliases_without_mutating_target(
         path.touch()
     outside = tmp_path / f"outside-vector{artifact_suffix or '-main'}"
     outside.write_bytes(b"outside vector")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     _link(Path(f"{path}{artifact_suffix}"), outside, link_kind)
     sidecar = VectorSidecar(
         path=path,

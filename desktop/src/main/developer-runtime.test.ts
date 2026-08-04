@@ -110,7 +110,7 @@ describe("developer-runtime executable launch", () => {
         }
       );
       await rename(executable, `${executable}.captured`);
-      await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
       await chmod(executable, 0o700);
 
       expect(() =>
@@ -150,7 +150,7 @@ describe("developer-runtime executable launch", () => {
           }
         }
       );
-      await writeFile(executable, "#!/bin/sh\nexit 9\n", { mode: 0o700 });
+      await writeFile(executable, "#!/bin/sh\nexit 9\n", { mode: 0o700 });  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
       await chmod(executable, 0o700);
 
       expect(() =>
@@ -321,10 +321,10 @@ describe("developer-runtime private profile mutation", () => {
       const artifact = join(runtime, "bootstrap.json");
       await writeFile(artifact, "captured", { mode: 0o600 });
       await chmod(artifact, 0o600);
-      const captured = await lstat(artifact);
-      await rename(artifact, join(runtime, "captured.json"));
-      await writeFile(artifact, "replacement", { mode: 0o600 });
-      await chmod(artifact, 0o600);
+      const captured = await lstat(artifact);  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
+      await rename(artifact, join(runtime, "captured.json"));  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
+      await writeFile(artifact, "replacement", { mode: 0o600 });  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
+      await chmod(artifact, 0o600);  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
 
       await adapter.deleteCapturedFile(artifact, {
         dev: captured.dev,

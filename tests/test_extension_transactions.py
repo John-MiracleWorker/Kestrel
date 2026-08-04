@@ -173,7 +173,7 @@ def test_extension_artifact_io_uses_binary_descriptors(
         if Path(path) == artifact:
             observed_flags.append(flags)
         native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
-        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(
         extension_transaction.os,

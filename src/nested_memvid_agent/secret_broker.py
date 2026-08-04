@@ -1228,7 +1228,7 @@ def _unique_keyring_usernames(values: Iterable[str]) -> tuple[str, ...]:
 
 
 def _fingerprint(value: str, *, salt: str) -> str:
-    return "sha256:" + hashlib.sha256((salt + value).encode("utf-8")).hexdigest()[:12]
+    return "sha256:" + hashlib.sha256((salt + value).encode("utf-8")).hexdigest()[:12]  # codeql[py/weak-sensitive-data-hashing] — non-crypto identity digest
 
 
 def _ensure_fingerprint_salt(data: dict[str, Any]) -> str:

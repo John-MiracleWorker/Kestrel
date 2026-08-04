@@ -733,7 +733,7 @@ def test_runtime_settings_store_rejects_file_and_lock_aliases(tmp_path: Path) ->
     outside = tmp_path / "outside-settings.json"
     outside_store = RuntimeSettingsStore(outside)
     outside_store.save(RuntimeSettings.from_config(replace(config, allow_shell=True)))
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     symlink_store = RuntimeSettingsStore(tmp_path / "symlink" / "runtime_settings.json")
     symlink_store.path.parent.mkdir()
@@ -755,7 +755,7 @@ def test_runtime_settings_store_rejects_file_and_lock_aliases(tmp_path: Path) ->
     lock_store.path.parent.mkdir()
     lock_target = tmp_path / "outside-lock-target"
     lock_target.write_text("unchanged", encoding="utf-8")
-    os.chmod(lock_target, 0o644)
+    os.chmod(lock_target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     lock_store.path.with_name(".runtime_settings.json.lock").symlink_to(lock_target)
     with pytest.raises(ValueError, match="symbolic links"):
         lock_store.save(RuntimeSettings.from_config(config))
@@ -771,7 +771,7 @@ def test_runtime_settings_store_hardens_mode_and_rejects_non_owner(
     config = AgentConfig(memory_dir=tmp_path / "memory")
     store = RuntimeSettingsStore(tmp_path / "runtime_settings.json")
     store.save(RuntimeSettings.from_config(config))
-    os.chmod(store.path, 0o644)
+    os.chmod(store.path, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     store.load(config)
 

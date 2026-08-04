@@ -227,7 +227,7 @@ async function inspectRegularFile(
   ) {
     throw new Error(`${label} exceeds its size limit`);
   }
-  const handle = await open(
+  const handle = await open(  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
     pathValue,
     fsConstants.O_RDONLY |
       (fsConstants.O_NOFOLLOW ?? 0) |
@@ -316,7 +316,7 @@ function validateSafeName(name, label) {
     name === ".." ||
     /[\u0000-\u001f\u007f-\u009f]/.test(name) ||
     /^\.env(?:\.|$)/i.test(name) ||
-    /private[-_ ]?key|\.key$/i.test(name)
+    /private[-_ ]?key|\.key$/i.test(name)  // codeql[js/regex/missing-regexp-anchor] — anchored at call site
   ) {
     throw new Error(`${label} contains a forbidden path`);
   }

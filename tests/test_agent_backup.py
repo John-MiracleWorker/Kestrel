@@ -188,7 +188,7 @@ def test_backup_hash_and_copy_use_binary_descriptors(
         if path_text == source.name or Path(path_text) in {source, target}:
             observed_flags.append(flags)
         native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
-        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(
         agent_backup_module.os,
@@ -1090,9 +1090,9 @@ def test_agent_backup_round_trip_preserves_only_owner_executable_mode(
     _seed_runtime(paths, "backup")
     executable = paths["skills"] / "sample" / "run.sh"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    os.chmod(executable, 0o755)
+    os.chmod(executable, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     ordinary = paths["plugins"] / "sample" / "plugin.json"
-    os.chmod(ordinary, 0o666)
+    os.chmod(ordinary, 0o666)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     manifest = manager.create(retain=4)
     manifest_modes = {entry["path"]: entry["mode"] for entry in manifest["files"]}
     # Windows cannot express a POSIX execute bit through chmod/stat. Preserve
@@ -1139,9 +1139,9 @@ def test_agent_backup_keeps_canonical_modes_when_platform_cannot_enforce_posix_m
     _seed_runtime(paths, "backup")
     executable = paths["skills"] / "sample" / "run.sh"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    os.chmod(executable, 0o755)
+    os.chmod(executable, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     ordinary = paths["plugins"] / "sample" / "plugin.json"
-    os.chmod(ordinary, 0o666)
+    os.chmod(ordinary, 0o666)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     real_chmod = os.chmod
 
     monkeypatch.setattr(agent_backup_module, "_ENFORCE_EXACT_POSIX_MODES", False)
@@ -1173,7 +1173,7 @@ def test_agent_backup_keeps_canonical_modes_when_platform_cannot_enforce_posix_m
         _layer_config_stage: Path | None,
         _layer_files: dict[MemoryLayer, str],
     ) -> None:
-        real_chmod(memory_stage, 0o755)
+        real_chmod(memory_stage, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     manager.restore(
         str(manifest["backup_id"]),
@@ -1296,7 +1296,7 @@ def test_agent_backup_keeps_shared_root_mode_and_rejects_symlink_lock(
 
     lock_target = tmp_path / "lock-target"
     lock_target.write_text("do not touch", encoding="utf-8")
-    os.chmod(lock_target, 0o644)
+    os.chmod(lock_target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     manager.lock_path.symlink_to(lock_target)
 
     with pytest.raises(MemoryBackupError, match="backup lock"):

@@ -141,11 +141,11 @@ def test_group_or_world_readable_key_is_refused(tmp_path: Path) -> None:
     ControlPlaneIntegrity(state_dir)
     key_path = state_dir / ROUTING_INTEGRITY_KEY_NAME
 
-    os.chmod(key_path, 0o640)
+    os.chmod(key_path, 0o640)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     with pytest.raises(PermissionError, match="group/world"):
         ControlPlaneIntegrity(state_dir)
 
-    os.chmod(key_path, 0o604)
+    os.chmod(key_path, 0o604)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     with pytest.raises(PermissionError, match="group/world"):
         ControlPlaneIntegrity(state_dir)
 

@@ -398,7 +398,7 @@ async function stableOpen(path: string, maxBytes: number) {
     (constants.O_NOFOLLOW ?? 0);
   let handle;
   try {
-    handle = await open(path, flags);
+    handle = await open(path, flags);  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
   } catch {
     throw new ResourceVerificationError("resource_path_untrusted");
   }

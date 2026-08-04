@@ -729,7 +729,7 @@ async function inspectMappedMacOSExecutable(
   ) {
     return null;
   }
-  const handle = await open(
+  const handle = await open(  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
     canonicalCommand,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
   );

@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 from hashlib import sha256
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 import pytest
 
 from nested_memvid_agent.desktop_bootstrap import consume_desktop_bootstrap
+
+_PACKAGE_VERSION = importlib_metadata.version("nested-memvid-agent")
 
 _MEMORY_LAYERS = [
     "working",
@@ -68,7 +71,7 @@ def test_bootstrap_consumes_private_file_without_leaking_secrets(tmp_path: Path)
         "ready": True,
         "profile_id": "default",
         "launch_nonce_digest": sha256(b"launch-nonce").hexdigest(),
-        "sidecar_version": "0.5.0",
+        "sidecar_version": _PACKAGE_VERSION,
         "state_schema_version": 21,
         "routing_schema_version": 4,
         "memory_layers": list(_MEMORY_LAYERS),

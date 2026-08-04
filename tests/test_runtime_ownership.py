@@ -1917,7 +1917,7 @@ def test_runtime_ownership_rejects_aliased_lock(
     lock_path = runtime_ownership_lock_path(state_path)
     outside = tmp_path / "outside.lock"
     outside.write_text("do-not-touch", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     if link_kind == "symlink":
         lock_path.symlink_to(outside)
     else:

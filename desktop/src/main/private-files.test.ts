@@ -501,7 +501,7 @@ describe("private desktop launch files", () => {
           return;
         }
         await rename(path, capturedOriginal);
-        await writeFile(path, replacementBytes, { mode: 0o600 });
+        await writeFile(path, replacementBytes, { mode: 0o600 });  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
         await chmod(path, 0o600);
         throw new Error("private_exact_delete_identity_changed");
       }

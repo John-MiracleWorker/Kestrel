@@ -450,7 +450,7 @@ async function readPrivateJsonArtifactWithIdentity(
   const flags =
     constants.O_RDONLY |
     (constants.O_NOFOLLOW ?? 0);
-  const handle = await open(path, flags);
+  const handle = await open(path, flags);  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
   try {
     const opened = await handle.stat();
     if (

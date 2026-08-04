@@ -142,7 +142,7 @@ def _provider_identity(
         ).encode("utf-8")
         return f"lan-openai-compatible:{hashlib.sha256(encoded).hexdigest()}"
     endpoint_identity = f"{base_url or '<default>'}\0{api_key_env or '<provider-default>'}"
-    digest = hashlib.sha256(endpoint_identity.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(endpoint_identity.encode("utf-8")).hexdigest()[:12]  # codeql[py/weak-sensitive-data-hashing] — non-crypto identity digest
     return f"{provider}:{model}:{digest}"
 
 

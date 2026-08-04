@@ -299,7 +299,7 @@ def test_untracked_manifest_opens_literal_bytes_in_binary_mode(
         platform_flags = flags & ~binary_flag
         if flags & binary_flag:
             platform_flags |= platform_binary_flag
-        return real_open(path, platform_flags, mode)
+        return real_open(path, platform_flags, mode)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(
         mission_control_module.os,

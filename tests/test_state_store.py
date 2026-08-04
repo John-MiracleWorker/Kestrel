@@ -68,11 +68,11 @@ def test_state_store_tightens_existing_database_and_wal_sidecars(
 ) -> None:
     path = tmp_path / "existing-state" / "agent.db"
     path.parent.mkdir(mode=0o755)
-    os.chmod(path.parent, 0o755)
+    os.chmod(path.parent, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     AgentStateStore(path)
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o755
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    os.chmod(path, 0o644)
+    os.chmod(path, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     keeper = sqlite3.connect(path)
     try:
@@ -82,7 +82,7 @@ def test_state_store_tightens_existing_database_and_wal_sidecars(
         sidecars = (Path(f"{path}-wal"), Path(f"{path}-shm"))
         assert all(sidecar.exists() for sidecar in sidecars)
         for sidecar in sidecars:
-            os.chmod(sidecar, 0o644)
+            os.chmod(sidecar, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
         AgentStateStore(path)
 
@@ -99,7 +99,7 @@ def test_state_store_rejects_symlinked_directory_without_chmod_target(
 ) -> None:
     target = tmp_path / "outside-directory"
     target.mkdir(mode=0o755)
-    os.chmod(target, 0o755)
+    os.chmod(target, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     linked_directory = tmp_path / "linked-state"
     linked_directory.symlink_to(target, target_is_directory=True)
 
@@ -116,7 +116,7 @@ def test_state_store_rejects_symlinked_database_without_chmod_target(
 ) -> None:
     target = tmp_path / "outside.db"
     sqlite3.connect(target).close()
-    os.chmod(target, 0o644)
+    os.chmod(target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     directory = tmp_path / "state"
     directory.mkdir()
     path = directory / "agent.db"
@@ -134,7 +134,7 @@ def test_state_store_rejects_hard_linked_database_without_chmod_target(
 ) -> None:
     target = tmp_path / "outside-hard-link.db"
     sqlite3.connect(target).close()
-    os.chmod(target, 0o644)
+    os.chmod(target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     directory = tmp_path / "hard-linked-state"
     directory.mkdir()
     path = directory / "agent.db"
@@ -401,7 +401,7 @@ def test_state_store_rejects_aliased_initialization_lock(
     lock_path = directory / ".agent.db.kestrel-state-init.lock"
     outside = tmp_path / "outside.lock"
     outside.write_text("do-not-touch", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     if link_kind == "symlink":
         lock_path.symlink_to(outside)
     else:

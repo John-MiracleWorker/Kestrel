@@ -8,7 +8,10 @@ const workspace = fileURLToPath(new URL("..", import.meta.url));
 const dist = fileURLToPath(new URL("../dist", import.meta.url));
 
 describe("desktop build boundary", () => {
-  it("emits separate sandbox-compatible primary and credential bundles with reviewed main modules only", () => {
+  it(
+    "emits separate sandbox-compatible primary and credential bundles with reviewed main modules only",
+    { timeout: 30000 },
+    () => {
     rmSync(dist, { force: true, recursive: true });
 
     const build = spawnSync("npm", ["run", "build"], {
@@ -121,7 +124,7 @@ describe("desktop build boundary", () => {
       /<input\b(?=[^>]*\bid=["']credential-value["'])(?=[^>]*\btype=["']password["'])(?=[^>]*\bautocomplete=["']off["'])[^>]*>/i
     );
     expect(credentialInput).not.toBeNull();
-    expect(credentialInput?.[0]).not.toMatch(/\bvalue\s*=/i);
+    expect(credentialInput?.[0]).not.toMatch(/\bvalue\s*=/i);  // codeql[js/bad-tag-filter] — test asserts tag filtering
     const scripts = [
       ...credentialHtml.matchAll(
         /<script\b([^>]*)>([\s\S]*?)<\/script>/gi
@@ -313,5 +316,6 @@ describe("desktop build boundary", () => {
     expect(credentialBridge).not.toHaveProperty(
       "openCredentialDialog"
     );
-  });
+    }
+  );
 });

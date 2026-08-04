@@ -731,5 +731,6 @@ def test_pyproject_declares_exact_release_build_frontends() -> None:
     assert pyproject["dependency-groups"]["release"] == [
         "cyclonedx-bom==7.3.0",
         "pip-audit==2.10.1",
+        "pyinstaller==6.21.0",
         "twine==6.2.0",
     ]

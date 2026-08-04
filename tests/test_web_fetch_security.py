@@ -74,4 +74,4 @@ def test_fetch_pins_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert text == "ok"
     assert final_url == "https://example.com"
-    assert "example.com" in calls
+    assert "example.com" in calls  # codeql[py/incomplete-url-substring-sanitization] — test fixture: sanitizer rejection

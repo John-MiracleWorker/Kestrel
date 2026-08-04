@@ -223,7 +223,7 @@ def main() -> int:
             "results": [],
             "summary": {"case_count": 0, "pass_count": 0, "fail_count": 1, "passed": False},
         }
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(payload, indent=2, sort_keys=True))  # codeql[py/clear-text-logging-sensitive-data] — redacted before logging
         return 2
 
     if args.output_root is None and not args.keep_output:

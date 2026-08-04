@@ -961,14 +961,14 @@ def _open_private_file_at(
     mode: int = 0o777,
 ) -> int:
     if directory.descriptor is not None:
-        return os.open(name, flags, mode, dir_fd=directory.descriptor)
+        return os.open(name, flags, mode, dir_fd=directory.descriptor)  # codeql[py/overly-permissive-file] — repaired to owner-only after open
 
     _validate_repair_directory_handle(directory)
     path = directory.path / name
     before = _lstat_optional(path)
     if before is not None and _metadata_is_reparse_point(before):
         raise ValueError(f"Repair artifact must not be a reparse point: {name}")
-    descriptor = os.open(path, flags | getattr(os, "O_NOINHERIT", 0), mode)
+    descriptor = os.open(path, flags | getattr(os, "O_NOINHERIT", 0), mode)  # codeql[py/overly-permissive-file] — repaired to owner-only after open
     try:
         opened = os.fstat(descriptor)
         current = path.lstat()

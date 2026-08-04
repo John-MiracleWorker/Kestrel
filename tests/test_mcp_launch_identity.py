@@ -75,7 +75,7 @@ def test_launch_artifact_byte_io_uses_binary_descriptors(
         if Path(path) in {source, destination}:
             observed_flags.append(flags)
         native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
-        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(mcp_module.os, "O_BINARY", synthetic_binary_flag, raising=False)
     monkeypatch.setattr(mcp_module.os, "open", open_without_synthetic_flag)

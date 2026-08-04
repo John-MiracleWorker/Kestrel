@@ -95,7 +95,7 @@ def test_secret_broker_repairs_existing_vault_before_first_read(tmp_path: Path) 
         ),
         encoding="utf-8",
     )
-    os.chmod(path, 0o644)
+    os.chmod(path, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     broker = SecretBroker(path)
 
@@ -139,7 +139,7 @@ def test_secret_broker_rejects_vault_alias_without_mutating_target(
 ) -> None:
     outside = tmp_path / "outside-vault.json"
     outside.write_text('{"secrets": {"token": {"value": "outside-secret"}}}', encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     path = tmp_path / "vault.json"
     if link_kind == "symlink":
         path.symlink_to(outside)
@@ -163,7 +163,7 @@ def test_secret_broker_rejects_lock_alias_without_mutating_target(
 ) -> None:
     outside = tmp_path / "outside-vault-lock"
     outside.write_text("outside lock", encoding="utf-8")
-    os.chmod(outside, 0o644)
+    os.chmod(outside, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     lock_path = tmp_path / ".vault.json.lock"
     if link_kind == "symlink":
         lock_path.symlink_to(outside)

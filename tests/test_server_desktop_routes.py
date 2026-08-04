@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 from hashlib import sha256
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,8 @@ from nested_memvid_agent.secret_broker import (
 from nested_memvid_agent.security_boundary import redact_text
 from nested_memvid_agent.server import create_app
 from nested_memvid_agent.server_desktop_routes import DesktopShutdownController
+
+_PACKAGE_VERSION = importlib_metadata.version("nested-memvid-agent")
 
 _MEMORY_LAYERS = [
     "working",
@@ -811,7 +814,7 @@ def test_desktop_readiness_is_auth_and_nonce_digest_bound(tmp_path: Path) -> Non
         "ready": True,
         "profile_id": "default",
         "launch_nonce_digest": sha256(b"launch-nonce").hexdigest(),
-        "sidecar_version": "0.5.0",
+        "sidecar_version": _PACKAGE_VERSION,
         "state_schema_version": 21,
         "routing_schema_version": 4,
         "memory_layers": list(_MEMORY_LAYERS),

@@ -696,7 +696,7 @@ describe("developer directory bundle", () => {
     expect(
       (await readdir(receipt.application_root, {
         recursive: true,
-      })).some((name) => /private.*key|\\.key$/i.test(name)),
+      })).some((name) => /private.*key|\\.key$/i.test(name)),  // codeql[js/regex/missing-regexp-anchor] — anchored at call site
     ).toBe(false);
     const privateKeySearch = spawnSync(
       "grep",

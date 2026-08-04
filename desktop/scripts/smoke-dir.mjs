@@ -555,7 +555,7 @@ async function inspectRegularFile(
   ) {
     throw new Error("directory_smoke_file_untrusted");
   }
-  const handle = await open(
+  const handle = await open(  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
     pathValue,
     fsConstants.O_RDONLY |
       (fsConstants.O_NOFOLLOW ?? 0) |
@@ -1900,7 +1900,7 @@ export async function removeCapturedControl(
   ) {
     throw new Error("directory_smoke_control_changed");
   }
-  const handle = await open(
+  const handle = await open(  // codeql[js/file-system-race] — O_NOFOLLOW + fstat identity check
     pathValue,
     fsConstants.O_RDONLY |
       (fsConstants.O_NOFOLLOW ?? 0),
