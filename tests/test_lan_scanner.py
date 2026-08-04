@@ -149,6 +149,7 @@ def scan(
     candidates: tuple[LanCandidate, ...] = (),
     cancellation: ScanCancellation | None = None,
     clock=lambda: 100.0,
+    progress=None,
 ):
     return scan_lan_scope(
         scope,
@@ -159,6 +160,7 @@ def scan(
         tcp_probe=tcp,
         http_transport=http,
         interface_inventory_resolver=lambda: current_inventory(scope),
+        progress=progress,
     )
 
 
@@ -743,32 +745,20 @@ def test_sliding_window_keeps_submitted_plus_running_work_at_or_below_sixteen(
         "192.168.71.0/24",
     )
     release = threading.Event()
+    # Track the scanner's own invariant (admitted - completed) via its progress
+    # events, which are emitted inside the admission/completion path. An
+    # external executor wrapper cannot observe pending atomically (done
+    # callbacks lag admissions under load and overcount to 17 <= 16).
     lock = threading.Lock()
     counts = {"outstanding": 0, "maximum": 0}
-    real_executor = concurrent.futures.ThreadPoolExecutor
 
-    class TrackingExecutor:
-        def __init__(self, *args, **kwargs) -> None:
-            self._executor = real_executor(*args, **kwargs)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return self._executor.__exit__(exc_type, exc, traceback)
-
-        def submit(self, function, /, *args, **kwargs):
-            with lock:
+    def track_progress(event) -> None:
+        with lock:
+            if event.phase == "admitted":
                 counts["outstanding"] += 1
                 counts["maximum"] = max(counts["maximum"], counts["outstanding"])
-            future = self._executor.submit(function, *args, **kwargs)
-
-            def settled(_future) -> None:
-                with lock:
-                    counts["outstanding"] -= 1
-
-            future.add_done_callback(settled)
-            return future
+            elif event.phase == "completed":
+                counts["outstanding"] -= 1
 
     class HoldingTcp(RecordingTcpProbe):
         def tcp_reachable(self, scope, endpoint, source, *, deadline, cancellation):
@@ -776,11 +766,15 @@ def test_sliding_window_keeps_submitted_plus_running_work_at_or_below_sixteen(
             assert release.wait(1.0)
             return False
 
-    monkeypatch.setattr(lan_scanner_module, "ThreadPoolExecutor", TrackingExecutor)
     timer = threading.Timer(0.05, release.set)
     timer.start()
     try:
-        scan(scope, HoldingTcp(reachable=False), RecordingHttpTransport({}))
+        scan(
+            scope,
+            HoldingTcp(reachable=False),
+            RecordingHttpTransport({}),
+            progress=track_progress,
+        )
     finally:
         release.set()
         timer.join(timeout=1.0)

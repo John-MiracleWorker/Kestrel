@@ -1189,10 +1189,7 @@ async function locateApplicationExecutable(
           executableName,
         )
       : join(applicationRoot, executableName);
-  if (
-    !isContained(applicationRoot, executablePath) ||
-    resolve(executablePath) !== executablePath
-  ) {
+  if (!isContained(applicationRoot, executablePath)) {
     throw new Error("packaged executable escapes application root");
   }
   const executableParent = await qualifyDirectory(
@@ -1202,10 +1199,9 @@ async function locateApplicationExecutable(
   if (!isContained(applicationRoot, executableParent)) {
     throw new Error("packaged executable parent escapes application root");
   }
-  if (
-    (await realpath(executablePath)) !== executablePath
-  ) {
-    throw new Error("packaged executable path is not canonical");
+  const canonicalExecutable = await realpath(executablePath);
+  if (!isContained(applicationRoot, canonicalExecutable)) {
+    throw new Error("packaged executable path escapes application root");
   }
   const executable = await inspectRegularFile(
     executablePath,
