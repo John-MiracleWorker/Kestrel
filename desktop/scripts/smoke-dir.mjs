@@ -1383,23 +1383,23 @@ async function verifyPackagedEvidence(
 async function privateEmptyControlPublicationPending(pathValue) {
   try {
     const metadata = await lstat(pathValue);
-    if (
-      metadata.isSymbolicLink() ||
-      !metadata.isFile() ||
-      metadata.nlink !== 1 ||
-      metadata.size !== 0 ||
-      (process.platform !== "win32" &&
-        (metadata.uid !== process.getuid?.() ||
-          (metadata.mode & 0o777) !== 0o600))
-    ) {
-      return false;
-    }
-    // A symlinked tmp root makes realpath() differ from resolve() even for a
-    // legitimate file the test just wrote. The zero-byte publication check is
-    // about detecting "file exists but not yet populated", not canonical
-    // identity — the O_NOFOLLOW open + fstat in inspectRegularFile is the
-    // actual race guard. Compare canonical-to-canonical instead.
-    return (await realpath(pathValue)) === (await realpath(resolve(pathValue)));
+    // Detect "a private zero-byte control file exists but has not been
+    // populated yet". lstat rejects symlinks, the size/nlink/uid/mode checks
+    // pin it to a single hardlinked, owner-only, empty regular file. The real
+    // canonical-identity/race guard is the O_NOFOLLOW open + fstat inside
+    // inspectRegularFile on the retry, so a canonical realpath compare here is
+    // redundant — and harmful: realpath() can throw or observe a mid-replace
+    // path under a symlinked tmp root, turning a legitimate pending publication
+    // into a hard failure.
+    return (
+      !metadata.isSymbolicLink() &&
+      metadata.isFile() &&
+      metadata.nlink === 1 &&
+      metadata.size === 0 &&
+      (process.platform === "win32" ||
+        (metadata.uid === process.getuid?.() &&
+          (metadata.mode & 0o777) === 0o600))
+    );
   } catch {
     return false;
   }
