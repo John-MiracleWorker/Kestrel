@@ -1000,7 +1000,6 @@ def test_genuine_adaptive_lan_assignment_keeps_typed_authority_only_in_process(
         authority.endpoint.address,
         authority.scope.network,
         authority.os_interface_identity,
-        str(authority.interface_index),
         authority.endpoint_binding_digest,
         authority.endpoint_fingerprint,
         authority.reviewed_material_binding_digest,
@@ -1015,6 +1014,16 @@ def test_genuine_adaptive_lan_assignment_keeps_typed_authority_only_in_process(
         assert value not in rendered_surfaces
         assert value not in rendered_log
         assert value.encode() not in capsule_bytes
+    # The interface_index is a bare integer; a plain substring check would
+    # false-positive whenever a hex digest (or any number) happens to contain
+    # the digit run (e.g. "...27319bdd..." contains "7319"). Assert it never
+    # appears as a *delimited token* — bounded by a non-digit on each side —
+    # which is how a real leak would render, without matching hex substrings.
+    ifindex_token = str(authority.interface_index)
+    token_pattern = re.compile(rf"(?<![0-9A-Fa-f]){re.escape(ifindex_token)}(?![0-9A-Fa-f])")
+    assert not token_pattern.search(rendered_surfaces)
+    assert not token_pattern.search(rendered_log)
+    assert not token_pattern.search(capsule_bytes.decode("utf-8", errors="replace"))
 
 
 def test_state_store_terminal_run_states_are_immutable_even_for_same_status(tmp_path: Path) -> None:
