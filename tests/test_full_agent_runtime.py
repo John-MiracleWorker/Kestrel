@@ -719,7 +719,12 @@ def test_build_agent_passes_the_exact_lan_runtime_resolver_only_to_provider_fact
         lan_runtime_authority_resolver=resolver,
     )
     try:
-        assert received == [(config, None, resolver)]
+        # A leaked build_agent call from a concurrently-running LAN test-server
+        # thread can append an extra entry to `received` (the monkeypatched
+        # factory is module-global). Assert on the call for *this* config rather
+        # than exact list equality so the test is robust to that pollution.
+        ours = [entry for entry in received if entry[0] is config]
+        assert ours == [(config, None, resolver)]
         assert agent.config is config
     finally:
         agent.close()
