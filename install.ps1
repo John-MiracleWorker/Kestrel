@@ -193,7 +193,7 @@ foreach ($candidate in $pythonCandidates) {
     if ($null -eq $candidateExecutable) {
         continue
     }
-    $pythonArguments = @($candidate.prefix) + @(
+    $pythonArguments = @() + $candidate.prefix + @(
         "-c",
         'import struct,sys;print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{struct.calcsize(''P'') * 8}")'
     )
@@ -205,7 +205,7 @@ foreach ($candidate in $pythonCandidates) {
     if (-not $pythonMatch.Success) {
         continue
     }
-    $pipArguments = @($candidate.prefix) + @("-m", "pip", "--version")
+    $pipArguments = @() + $candidate.prefix + @("-m", "pip", "--version")
     $pipProbe = Invoke-BoundedProbe -Executable $candidateExecutable -Arguments $pipArguments
     if ($pipProbe.exit_code -eq 0 -and $pipProbe.stdout -match '^pip\s+[0-9]') {
         $pythonSelection = [ordered] @{
