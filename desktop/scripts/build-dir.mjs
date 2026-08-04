@@ -1197,7 +1197,11 @@ async function locateApplicationExecutable(
   // symlinked CI tmp roots even for legitimate layouts — canonicalize first.
   const executableParent = await realpath(dirname(executablePath));
   if (!isContained(applicationRoot, executableParent)) {
-    throw new Error("packaged executable parent escapes application root");
+    throw new Error(
+      `packaged executable parent escapes application root ` +
+        `[appRoot=${applicationRoot} parent=${executableParent} ` +
+        `exe=${executablePath} tmp=${process.env.TMPDIR ?? "unset"}]`,
+    );
   }
   const canonicalExecutable = await realpath(executablePath);
   if (!isContained(applicationRoot, canonicalExecutable)) {
