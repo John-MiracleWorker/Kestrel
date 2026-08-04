@@ -69,15 +69,19 @@ def _git_fixture(root: Path) -> str:
 
 
 def _write_json(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        encoding="utf-8",
+    # Write bytes (not write_text) so Windows text mode can't translate the
+    # trailing \n to \r\n — the validator compares against the exact canonical
+    # byte form and would reject the receipt as "not canonical".
+    path.write_bytes(
+        (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8"),
     )
 
 
