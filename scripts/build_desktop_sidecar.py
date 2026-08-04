@@ -313,7 +313,15 @@ def _read_regular_bounded(
         raise ValueError(f"not a unique regular file: {path}")
     if maximum is not None and before.st_size > maximum:
         raise ValueError(f"file exceeds {maximum} bytes: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        # O_BINARY: without it Windows opens in text mode and translates
+        # \r\n -> \n, so the bytes read no longer match st_size and the digest
+        # is computed over translated content. Binary mode keeps read == size.
+        | getattr(os, "O_BINARY", 0)
+    )
     descriptor = os.open(candidate, flags)
     chunks: list[bytes] = []
     digest = hashlib.sha256()

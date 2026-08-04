@@ -119,7 +119,14 @@ def read_desktop_regular_bounded(path: Path, maximum: int, label: str) -> bytes:
         raise ValueError(f"{label} must be a unique regular file")
     if before.st_size > maximum:
         raise ValueError(f"{label} exceeds its size limit")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        # O_BINARY: without it Windows opens in text mode and translates
+        # \r\n -> \n, so bytes read no longer match st_size.
+        | getattr(os, "O_BINARY", 0)
+    )
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)

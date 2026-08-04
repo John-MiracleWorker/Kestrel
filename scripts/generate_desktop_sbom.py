@@ -35,7 +35,14 @@ def _read_regular_bytes(path: Path, *, maximum: int = MAX_INPUT_BYTES) -> bytes:
         raise ValueError(f"input must be a regular non-symlink file: {path}")
     if before.st_size > maximum:
         raise ValueError(f"input exceeds {maximum} bytes: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        # O_BINARY: without it Windows opens in text mode and translates
+        # \r\n -> \n, so bytes read no longer match st_size.
+        | getattr(os, "O_BINARY", 0)
+    )
     descriptor = os.open(candidate, flags)
     try:
         opened = os.fstat(descriptor)
