@@ -1192,16 +1192,16 @@ async function locateApplicationExecutable(
   if (!isContained(applicationRoot, executablePath)) {
     throw new Error("packaged executable escapes application root");
   }
-  // The executable's parent must be a real directory contained in the app
-  // root. qualifyDirectory() demands byte-canonical paths, which fails under
-  // symlinked CI tmp roots even for legitimate layouts — canonicalize first.
+  // The executable's parent must not escape the app root. On Linux/Windows
+  // the executable sits AT the root (parent === root, which isContained
+  // rejects as not-strictly-inside); on macOS it's under Contents/MacOS.
+  // realpath both sides so symlinked tmp roots compare canonical-to-canonical.
   const executableParent = await realpath(dirname(executablePath));
-  if (!isContained(applicationRoot, executableParent)) {
-    throw new Error(
-      `packaged executable parent escapes application root ` +
-        `[appRoot=${applicationRoot} parent=${executableParent} ` +
-        `exe=${executablePath} tmp=${process.env.TMPDIR ?? "unset"}]`,
-    );
+  if (
+    executableParent !== applicationRoot &&
+    !isContained(applicationRoot, executableParent)
+  ) {
+    throw new Error("packaged executable parent escapes application root");
   }
   const canonicalExecutable = await realpath(executablePath);
   if (!isContained(applicationRoot, canonicalExecutable)) {
