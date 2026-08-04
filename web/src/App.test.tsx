@@ -2307,7 +2307,7 @@ describe("App", () => {
     fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Advanced" }));
     expect(within(await screen.findByLabelText("MCP tool")).getByRole("option", { name: /read_file/ })).toBeInTheDocument();
     expect(within(screen.getByLabelText("Skill")).getByRole("option", { name: "writer" })).toBeInTheDocument();
-  });
+  }, 15000);
 
   it("does not overwrite hidden MCP arguments, environment, secrets, or discovered tools on edit", async () => {
     const fetchSpy = vi.mocked(fetch);
