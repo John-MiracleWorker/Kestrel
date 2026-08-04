@@ -4,6 +4,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -101,11 +102,15 @@ describe("Setup Center keyboard journey", () => {
     ).toBeLessThan(skipIndex);
 
     // Skipping the project advances to Safety and restores focus on the new
-    // stage heading — the load-bearing focus-restoration assertion.
+    // stage heading — the load-bearing focus-restoration assertion. Focus is
+    // restored asynchronously (React state + effect), so poll rather than
+    // assert synchronously to avoid a focus-timing flake under CI load.
     fireEvent.click(screen.getByRole("button", { name: "Do this later" }));
-    expect(
-      screen.getByRole("heading", { name: "Review safety defaults" }),
-    ).toHaveFocus();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Review safety defaults" }),
+      ).toHaveFocus(),
+    );
     expect(
       screen.getByRole("button", { name: /Step 4.*Safety/i }),
     ).toHaveAttribute("aria-current", "step");
@@ -114,7 +119,7 @@ describe("Setup Center keyboard journey", () => {
     const readinessHeading = await screen.findByRole("heading", {
       name: "Review first mission readiness",
     });
-    expect(readinessHeading).toHaveFocus();
+    await waitFor(() => expect(readinessHeading).toHaveFocus());
     expect(
       screen.getByRole("button", { name: /Step 5.*First mission/i }),
     ).toHaveAttribute("aria-current", "step");
@@ -134,19 +139,25 @@ describe("Setup Center keyboard journey", () => {
 
     await screen.findByRole("heading", { name: "Add a project" });
     fireEvent.click(screen.getByRole("button", { name: "Do this later" }));
-    expect(
-      screen.getByRole("heading", { name: "Review safety defaults" }),
-    ).toHaveFocus();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Review safety defaults" }),
+      ).toHaveFocus(),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: /Step 1.*Core/i }));
-    expect(
-      screen.getByRole("heading", { name: "Check the bundled core" }),
-    ).toHaveFocus();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Check the bundled core" }),
+      ).toHaveFocus(),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: /Step 3.*Project/i }));
-    expect(
-      screen.getByRole("heading", { name: "Add a project" }),
-    ).toHaveFocus();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Add a project" }),
+      ).toHaveFocus(),
+    );
   });
 });
 

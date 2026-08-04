@@ -303,9 +303,10 @@ describe("SetupCenter", () => {
       screen.getByRole("button", { name: "Continue with Demo" }),
     );
 
-    expect(
-      await screen.findByRole("heading", { name: "Add a project" }),
-    ).toHaveFocus();
+    const projectHeading = await screen.findByRole("heading", {
+      name: "Add a project",
+    });
+    await waitFor(() => expect(projectHeading).toHaveFocus());
     expect(api.saveIntelligence).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: "mock",
@@ -317,11 +318,13 @@ describe("SetupCenter", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Do this later" }),
     );
-    expect(
-      screen.getByRole("heading", {
-        name: "Review safety defaults",
-      }),
-    ).toHaveFocus();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", {
+          name: "Review safety defaults",
+        }),
+      ).toHaveFocus(),
+    );
     expect(
       screen.getByRole("button", {
         name: /Step 3.*skipped.*Project/i,
