@@ -1224,6 +1224,10 @@ def test_sixteen_mib_response_bound_is_enforced_on_actual_bytes(
         + (b"0" * MAX_HTTP_CHUNK_LINE_BYTES)
         + b"1\r\nx\r\n0\r\n\r\n",
     ),
+    # Short stable IDs: several payloads are many-KB byte strings whose raw
+    # repr would become the test id, blowing past Windows' 32767-char
+    # environment-variable limit when pytest exports PYTEST_CURRENT_TEST.
+    ids=lambda response: f"case-{len(response)}-{response[:12].hex()}",
 )
 def test_hostile_http_framing_is_rejected_and_socket_is_closed(response: bytes) -> None:
     authority = _authority()

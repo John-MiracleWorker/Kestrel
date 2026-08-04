@@ -1122,6 +1122,16 @@ def test_single_exact_chunked_response_without_extensions_or_trailers_is_accepte
         ),
         b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + (b"x" * MAX_PROBE_RESPONSE_BYTES),
     ],
+    # Short stable IDs: the raw byte payloads (up to 256 KiB) otherwise become
+    # the parametrized test id, which pytest exports via PYTEST_CURRENT_TEST
+    # and exceeds Windows' 32767-char environment-variable limit at setup.
+    ids=[
+        "status-line-4096",
+        "headers-63",
+        "single-header-8190",
+        "chunked-1023",
+        "max-probe-body",
+    ],
 )
 def test_exact_http_framing_and_body_limits_are_accepted(response: bytes) -> None:
     sockets = SocketFactory(response)
@@ -1161,6 +1171,15 @@ def test_exact_http_framing_and_body_limits_are_accepted(response: bytes) -> Non
             + b"1\r\nx\r\n0\r\n\r\n"
         ),
         b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + (b"x" * (MAX_PROBE_RESPONSE_BYTES + 1)),
+    ],
+    # See test_exact_http_framing_and_body_limits_are_accepted — short IDs keep
+    # the parametrized test id under Windows' environment-variable limit.
+    ids=[
+        "status-line-4097",
+        "headers-64",
+        "single-header-8191",
+        "chunked-1024",
+        "over-max-probe-body",
     ],
 )
 def test_one_byte_over_http_framing_and_body_limits_is_rejected(response: bytes) -> None:

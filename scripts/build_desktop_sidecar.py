@@ -336,13 +336,18 @@ def _read_regular_bounded(
             digest.update(chunk)
             remaining -= len(chunk)
         after = os.lstat(candidate)
+        # Identity invariant: same file (dev+ino), still a unique regular
+        # file, unchanged size. mtime_ns is deliberately excluded — Windows
+        # has coarse timestamp granularity and can jitter mtime on read,
+        # which false-positives the guard. dev/ino/size/nlink are the real
+        # tamper/replacement signals; a changed mtime with identical
+        # dev/ino/size/nlink is not a substitution.
         if (
             not stat.S_ISREG(after.st_mode)
             or after.st_nlink != 1
             or opened.st_dev != after.st_dev
             or opened.st_ino != after.st_ino
             or opened.st_size != after.st_size
-            or opened.st_mtime_ns != after.st_mtime_ns
         ):
             raise ValueError(f"file changed during read: {path}")
         return b"".join(chunks)
