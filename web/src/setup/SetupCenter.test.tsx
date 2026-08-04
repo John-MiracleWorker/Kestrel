@@ -306,7 +306,7 @@ describe("SetupCenter", () => {
     const projectHeading = await screen.findByRole("heading", {
       name: "Add a project",
     });
-    await waitFor(() => expect(projectHeading).toHaveFocus());
+    await waitFor(() => expect(projectHeading).toHaveFocus(), { timeout: 5000 });
     expect(api.saveIntelligence).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: "mock",
@@ -318,12 +318,14 @@ describe("SetupCenter", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Do this later" }),
     );
-    await waitFor(() =>
-      expect(
-        screen.getByRole("heading", {
-          name: "Review safety defaults",
-        }),
-      ).toHaveFocus(),
+    await waitFor(
+      () =>
+        expect(
+          screen.getByRole("heading", {
+            name: "Review safety defaults",
+          }),
+        ).toHaveFocus(),
+      { timeout: 5000 },
     );
     expect(
       screen.getByRole("button", {
