@@ -327,14 +327,21 @@ def _read_regular_bounded(
             or opened.st_size != before.st_size
         ):
             raise ValueError(f"file changed during open: {path}")
-        remaining = opened.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+        expected = opened.st_size
+        read_total = 0
+        # Read to real EOF rather than trusting the pre-read size to bound the
+        # loop: Windows reports a stale st_size under delayed write-back, so a
+        # fixed-count loop can hit a legitimate short/empty read and misread it
+        # as truncation. EOF terminates; we then reconcile the byte count.
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
-                raise ValueError(f"file changed during read: {path}")
+                break
             chunks.append(chunk)
             digest.update(chunk)
-            remaining -= len(chunk)
+            read_total += len(chunk)
+        if read_total != expected:
+            raise ValueError(f"file changed during read: {path}")
         after = os.lstat(candidate)
         # Identity invariant: same file (dev+ino), still a unique regular
         # file, unchanged size. mtime_ns is deliberately excluded — Windows

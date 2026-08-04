@@ -48,21 +48,27 @@ def _read_regular_bytes(path: Path, *, maximum: int = MAX_INPUT_BYTES) -> bytes:
         ):
             raise ValueError(f"input changed during open: {path}")
         chunks: list[bytes] = []
-        remaining = opened.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+        expected = opened.st_size
+        read_total = 0
+        # Read to real EOF; Windows can return short reads, and a stale
+        # pre-read size must not drive the loop. Reconcile the count after.
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
-                raise ValueError(f"input changed during read: {path}")
+                break
             chunks.append(chunk)
-            remaining -= len(chunk)
+            read_total += len(chunk)
+        if read_total != expected:
+            raise ValueError(f"input changed during read: {path}")
         after = os.lstat(candidate)
+        # mtime_ns excluded: Windows coarse timestamp granularity jitters it on
+        # read. dev/ino/size/nlink are the substitution signals.
         if (
             not stat.S_ISREG(after.st_mode)
             or after.st_nlink != 1
             or opened.st_dev != after.st_dev
             or opened.st_ino != after.st_ino
             or opened.st_size != after.st_size
-            or opened.st_mtime_ns != after.st_mtime_ns
         ):
             raise ValueError(f"input changed during read: {path}")
         return b"".join(chunks)
