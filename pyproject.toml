@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nested-memvid-agent"
-version = "0.5.1"
+version = "0.5.2"
 description = "Kestrel: a local-first, memory-native AI engineering agent runtime."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -39,7 +39,7 @@ keyring = ["keyring>=25.6.0"]
 dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "build==1.5.0", "cryptography>=48.0.1", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "pygments>=2.20.0"]
 
 [dependency-groups]
-release = ["cyclonedx-bom==7.3.0", "pip-audit==2.10.1", "twine==6.2.0"]
+release = ["cyclonedx-bom==7.3.0", "pip-audit==2.10.1", "pyinstaller==6.21.0", "twine==6.2.0"]
 
 [project.scripts]
 nested-memvid = "nested_memvid_agent.cli:main"

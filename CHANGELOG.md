@@ -6,6 +6,26 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-03
+
+### Added
+
+- Adaptive Flock Qualification + Activation: owner-run bounded qualification with
+  HMAC-signed terminal receipts, per-scope activation grants, drift/decay/stale-target
+  suspension with static fallback, terminal revocation, and a deterministic 20-replay
+  qualification gate. Learned routing requires a durable grant; qualification alone
+  grants no authority.
+- Flock GUI workspaces for qualification drafts, run progress, per-scope results,
+  and activation management (grant cards with server-verified effectiveness).
+- Live-provider qualification evidence runner producing redacted release evidence
+  reports bound to source commit and installed artifact digest.
+
+### Security
+
+- Hardened grant creation against in-process forgery (authority-bound ledger API),
+  propagated per-attempt evidence kind into live reports, and required checked
+  revisions on grant revocation. Independent adversarial review verdict: SOUND.
+
 ## [0.5.1] - 2026-07-29
 
 ### Fixed
@@ -407,7 +427,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.11...v0.5.0
 [0.4.11]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.10...v0.4.11

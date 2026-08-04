@@ -13,7 +13,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_DISTRIBUTION = "nested-memvid-agent"
 WEB_PACKAGE = "kestrel-web"
-PUBLISHED_RELEASE = "0.5.1"
+PUBLISHED_RELEASE = "0.5.2"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
