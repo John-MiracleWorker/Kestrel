@@ -309,7 +309,9 @@ export function RoutingCenter({
             />
             <p className="muted">
               Routing is launch-controlled. Inventory changes affect future attempts and never expand a task&apos;s tools,
-              workspace, approvals, or privacy policy.
+              workspace, approvals, or privacy policy. Learned-route activation is owner-confirmed per exact scope
+              under <a href="#/flock/activations">Scoped activation</a>; enabling a provider or target here never
+              activates a grant.
             </p>
           </>
         ) : (
@@ -475,7 +477,19 @@ export function RoutingCenter({
         </div>
       </Panel>
 
-      <Panel title="Model Targets" icon={<Cpu size={19} />}>
+      <Panel
+        title="Model Targets"
+        icon={<Cpu size={19} />}
+        actions={
+          <a className="btn subtle" href="#/flock/lan">
+            Discover LAN models
+          </a>
+        }
+      >
+        <p className="muted">
+          LAN targets are reviewed and enabled in LAN discovery; Kestrel never
+          enables a discovered network model from this inventory.
+        </p>
         <form className="stack-form" onSubmit={saveTarget}>
           <div className="field-row">
             <Field label="Target ID">
@@ -662,6 +676,15 @@ export function RoutingCenter({
                 />
                 <StatusBadge value={target.health} />
                 <span>{target.capability_tags.join(" · ") || "No capability tags"}</span>
+                {typeof target.metadata.lan_discovery === "object" && target.metadata.lan_discovery !== null ? (
+                  <InlineMeta
+                    items={[
+                      "LAN discovery",
+                      target.enabled ? "enabled" : "disabled",
+                      `trust ${target.trust_class}`
+                    ]}
+                  />
+                ) : null}
               </button>
             ))
           )}
@@ -792,6 +815,11 @@ function RoutingRunHistory({ report }: { report: RoutingRunReport }) {
               {" · "}
               route regret {formatUsd(shadow.route_regret_usd)}
             </span>
+            {shadow.activated ? (
+              <a className="btn subtle" href="#/flock/activations">
+                Grant &amp; receipt evidence
+              </a>
+            ) : null}
           </div>
         );
       })}

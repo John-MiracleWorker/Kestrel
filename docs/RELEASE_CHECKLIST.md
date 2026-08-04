@@ -170,6 +170,45 @@ turn current credential presence into assurance or invalidate exact historical e
 secret cleanup. Run the setup/deployment readiness gate separately before shipping a profile that
 must call that provider. Only requirement names are emitted.
 
+## Flock Qualification Evidence
+
+A release that claims Adaptive Flock learned-routing qualification must retain both evidence tiers
+on the exact candidate (see `docs/FLOCK_QUALIFICATION_OPERATIONS.md` for the full contract):
+
+1. The deterministic mock gate at the release commit, proving twenty identical receipt projections
+   with zero guardrail violations:
+
+   ```bash
+   python scripts/run_flock_qualification_determinism.py \
+     --repeats 20 \
+     --source-commit "$RELEASE_COMMIT_SHA" \
+     --output "$ARTIFACT_DIR/flock-qualification-determinism.json"
+   ```
+
+2. A separately authorized live installed-artifact qualification with at least two real eligible
+   targets, collected explicitly (never by default, never activating learned routing):
+
+   ```bash
+   python scripts/run_flock_live_qualification.py \
+     --run-id "$RUN_ID" \
+     --expected-receipt-id "$RECEIPT_ID" \
+     --expected-receipt-digest "$RECEIPT_DIGEST" \
+     --installed-artifact-digest "$ARTIFACT_SHA256" \
+     --project-digest "$PROJECT_DIGEST" \
+     --tree-digest "$TREE_DIGEST" \
+     --state-dir .nest/state \
+     --output "$ARTIFACT_DIR/flock-live-qualification.json" \
+     --confirm-live-qualification
+   ```
+
+The live report must be schema `kestrel.flock_live_qualification.v1`, bound to the source commit,
+the exact installed artifact digest, platform/architecture, provider profile/model subject
+digests, project/tree digests, the authenticated receipt digest, exact attempt grants, fully
+resolved costs, a 20/20 single-projection replay, and zero guardrail violations. Mock evidence
+never certifies production provider qualification; a skipped or unconfigured
+`RUN_FLOCK_LIVE_QUALIFICATION=1` gate means the release makes no live Flock claim. Preserve the
+receipt and the redacted report; never include raw secrets or source content.
+
 ## Packaging Validation
 
 ```bash

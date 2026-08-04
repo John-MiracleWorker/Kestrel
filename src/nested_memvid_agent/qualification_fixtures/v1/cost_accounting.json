@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "fixture_id": "cost_accounting_v1",
+  "task_family": "cost_accounting",
+  "risk": "low",
+  "capabilities": [
+    "usage_accounting"
+  ],
+  "task_contract": {
+    "prompt": "Account for exact integer micro-USD usage of every replay run and admit runs only while the cumulative reserved spend stays within the run cap.",
+    "required_output_keys": [
+      "admitted",
+      "cost_micros"
+    ]
+  },
+  "replay": {
+    "seed": 20260729,
+    "runs": 20,
+    "targets": [
+      "fixture_cost_primary"
+    ],
+    "expected_total_micros": 2200,
+    "script": [
+      {
+        "outcome": "success",
+        "category": "cost_reconciled",
+        "output_keys": [
+          "admitted",
+          "cost_micros"
+        ],
+        "input_tokens": 125,
+        "output_tokens": 50
+      }
+    ]
+  },
+  "validator": {
+    "id": "cost_reconciliation",
+    "parameters": {
+      "input_per_million_micros": 400000,
+      "output_per_million_micros": 1200000,
+      "cap_micros": 2200
+    }
+  },
+  "expected": {
+    "outcome": "success",
+    "category": "cost_reconciled"
+  }
+}

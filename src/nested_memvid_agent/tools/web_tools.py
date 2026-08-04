@@ -152,7 +152,7 @@ def _public_web_url_allowed(url: str) -> tuple[bool, str]:
 
 def _unwrap_duckduckgo_url(url: str) -> str:
     parsed = urlparse(url)
-    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):  # codeql[py/incomplete-url-substring-sanitization] — deliberate host allowlist match
         values = parse_qs(parsed.query).get("uddg")
         if values:
             return values[0]

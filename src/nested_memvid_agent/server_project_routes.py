@@ -8,6 +8,7 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+from .project_setup import build_project_setup_draft
 from .projects import (
     ProjectConflictError,
     export_project,
@@ -20,6 +21,7 @@ from .server_models import (
     ProjectCreateRequest,
     ProjectImportRequest,
     ProjectIndexRebuildRequest,
+    ProjectSetupDraftRequest,
     ProjectUpdateRequest,
 )
 
@@ -87,6 +89,24 @@ def register_project_routes(
             for item in state.list_projects(include_archived=include_archived)
         ]
         return {"items": items, "count": len(items)}
+
+    @app.post("/api/projects/setup-draft")  # type: ignore[untyped-decorator]
+    def inspect_project_setup_draft(
+        request: ProjectSetupDraftRequest,
+    ) -> dict[str, Any]:
+        active = config()
+        try:
+            return build_project_setup_draft(
+                repository_path=request.repository_path,
+                provider=str(active.provider),
+                model=str(active.model),
+                base_url=active.base_url,
+                capability_catalog=_catalog(state=state, runs=runs),
+                direct_estimated_cost_usd=request.direct_estimated_cost_usd,
+                cost_budget=request.cost_budget,
+            )
+        except (PermissionError, ValueError) as exc:
+            raise http_exception(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects", status_code=201)  # type: ignore[untyped-decorator]
     def create_project(request: ProjectCreateRequest) -> dict[str, Any]:

@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import Depends, Request
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from .lan_discovery_service import (
+    LanDiscoveryConflict,
+    LanDiscoveryService,
+    LanImportConfirmation,
+    LanImportResult,
+    LanImportSelector,
+    LanReviewConfirmation,
+    LanReviewOptions,
+    LanReviewResult,
+)
 from .provider_probe import (
     MAX_DISCOVERY_MODELS,
     MAX_PROBE_TIMEOUT_SECONDS,
@@ -19,14 +32,262 @@ from .provider_probe import (
 )
 from .routing.ledger import RoutingLedger
 from .routing.ledger_records import ModelTargetEntry, RoutingRevisionConflict
+from .routing.ledger_registry import _lan_is_managed_metadata
 from .routing.models import ModelTarget, ProviderProfile, RoutePolicy, RoutingMode
 from .routing.router import RoutingUnavailableError
 from .routing.runtime import AdaptiveFlockRuntimeConfig
 from .routing.service import AdaptiveFlockRoutingService
+from .server_support import RequestBodyTooLarge
 
 RoutingLocality = Literal["local", "cloud", "hybrid"]
 RoutingHealth = Literal["unknown", "healthy", "degraded", "open", "unavailable"]
 RoutingPrivacy = Literal["local_required", "local_preferred", "approved_cloud", "any"]
+
+_LAN_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_LAN_SCAN_ID_PATTERN = r"^lan_[0-9a-f]{32}$"
+_LAN_PROFILE_ID_PATTERN = r"^lan-provider-[0-9a-f]{64}$"
+_LAN_TARGET_ID_PATTERN = r"^lan-target-[0-9a-f]{64}$"
+MAX_LAN_MUTATION_BODY_BYTES = 32 * 1024
+LAN_MUTATION_OWNER_PRINCIPAL = "owner:local-runtime:v1"
+LAN_REDACTED_QUERY_SCOPE_KEY = "kestrel.lan_query_present"
+LAN_REJECTED_PATH_SCOPE_KEY = "kestrel.lan_path_rejected"
+_LAN_IMPORT_PATHS = frozenset(
+    {
+        "/api/routing/lan/import",
+        "/api/routing/lan/import/",
+        "/api/routing/lan/import/preview",
+        "/api/routing/lan/import/preview/",
+    }
+)
+_LAN_STATIC_PATHS = frozenset(
+    {
+        "/api/routing/lan/interfaces",
+        "/api/routing/lan/interfaces/",
+        "/api/routing/lan/preview",
+        "/api/routing/lan/preview/",
+        "/api/routing/lan/scans",
+        "/api/routing/lan/scans/",
+        "/api/routing/lan/manual-probe",
+        "/api/routing/lan/manual-probe/",
+        *_LAN_IMPORT_PATHS,
+    }
+)
+_LAN_SCAN_PATH_PATTERN = re.compile(
+    r"^/api/routing/lan/scans/lan_[0-9a-f]{32}(?:/?|/(?:start|cancel|events)/?)$"
+)
+_LAN_NAMESPACE_PREFIX = "/api/routing/lan"
+_LAN_REDACTED_PATH = "/api/routing/lan/redacted"
+_LAN_REVIEW_PATH_PREFIX = "/api/routing/lan/targets/"
+_LAN_REVIEW_PATH_SUFFIXES = (
+    "/review/preview",
+    "/review/preview/",
+    "/review",
+    "/review/",
+)
+_LAN_FORBIDDEN_IDENTITY_HEADERS = frozenset(
+    {
+        "x-kestrel-owner-principal",
+        "x-owner-principal",
+        "x-authenticated-principal",
+    }
+)
+LanAffinityRequest = Annotated[str, Field(min_length=1, max_length=64, strict=True)]
+LanRouteRequest = TypeVar("LanRouteRequest", bound=BaseModel)
+
+
+def classify_lan_mutation_path(path: str) -> tuple[bool, bool, str]:
+    """Return LAN sensitivity, rejection state, and an access-log-safe path."""
+
+    if type(path) is not str:
+        return False, False, ""
+    if path in _LAN_STATIC_PATHS or _LAN_SCAN_PATH_PATTERN.fullmatch(path) is not None:
+        return True, False, path
+    if path.startswith(_LAN_REVIEW_PATH_PREFIX):
+        for suffix in _LAN_REVIEW_PATH_SUFFIXES:
+            if not path.endswith(suffix):
+                continue
+            target_id = path[len(_LAN_REVIEW_PATH_PREFIX) : -len(suffix)]
+            if re.fullmatch(_LAN_TARGET_ID_PATTERN, target_id) is not None:
+                return True, False, path
+            return True, True, _LAN_REDACTED_PATH
+    if path == _LAN_NAMESPACE_PREFIX or path.startswith(_LAN_NAMESPACE_PREFIX + "/"):
+        return True, True, _LAN_REDACTED_PATH
+    return False, False, path
+
+
+def _lan_request_is_rejected(http_request: Request) -> bool:
+    if (
+        http_request.scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
+        or http_request.scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
+        or bool(http_request.query_params)
+    ):
+        return True
+    raw_headers = http_request.scope.get("headers", ())
+    return any(
+        isinstance(name, bytes)
+        and name.decode("latin-1").lower() in _LAN_FORBIDDEN_IDENTITY_HEADERS
+        for name, _value in raw_headers
+    )
+
+
+async def _cache_bounded_lan_request_body(http_request: Request) -> bytes:
+    body = bytearray()
+    sentinel_limit = MAX_LAN_MUTATION_BODY_BYTES + 1
+    async for chunk in http_request.stream():
+        remaining = sentinel_limit - len(body)
+        if remaining > 0:
+            body.extend(chunk[:remaining])
+        if len(body) > MAX_LAN_MUTATION_BODY_BYTES or len(chunk) > remaining:
+            http_request._body = bytes(body)
+            raise RequestBodyTooLarge("LAN request body exceeds 32 KiB")
+    http_request._body = bytes(body)
+    return bytes(body)
+
+
+async def _require_lan_get_request(
+    http_request: Request,
+    *,
+    http_exception: Callable[..., Exception],
+    query_error_code: str = "lan_request_rejected",
+) -> None:
+    if (
+        http_request.scope.get(LAN_REJECTED_PATH_SCOPE_KEY) is True
+        or http_request.scope.get(LAN_REDACTED_QUERY_SCOPE_KEY) is True
+    ):
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    if http_request.query_params:
+        raise http_exception(status_code=400, detail={"code": query_error_code})
+    raw_headers = http_request.scope.get("headers", ())
+    if any(
+        isinstance(name, bytes)
+        and name.decode("latin-1").lower() in _LAN_FORBIDDEN_IDENTITY_HEADERS
+        for name, _value in raw_headers
+    ):
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    header_names = [
+        name.decode("latin-1").lower() for name, _value in raw_headers if isinstance(name, bytes)
+    ]
+    if "transfer-encoding" in header_names:
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    content_lengths = [
+        value
+        for name, value in raw_headers
+        if isinstance(name, bytes) and name.decode("latin-1").lower() == "content-length"
+    ]
+    if len(content_lengths) > 1:
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    if content_lengths:
+        try:
+            declared = int(content_lengths[0].decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise http_exception(
+                status_code=400,
+                detail={"code": "lan_request_rejected"},
+            ) from exc
+        if declared != 0:
+            raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    try:
+        body = await _cache_bounded_lan_request_body(http_request)
+    except RequestBodyTooLarge as exc:
+        raise http_exception(
+            status_code=400,
+            detail={"code": "lan_request_rejected"},
+        ) from exc
+    if body:
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+
+
+def _reject_lan_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_lan_nonfinite_constant(value: str) -> object:
+    del value
+    raise ValueError("non-finite JSON constant")
+
+
+def _lan_json_nesting_exceeds(raw_body: bytes, *, maximum: int = 64) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw_body:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in {0x5B, 0x7B}:
+            depth += 1
+            if depth > maximum:
+                return True
+        elif byte in {0x5D, 0x7D}:
+            depth -= 1
+    return False
+
+
+async def _parse_lan_json_request(
+    http_request: Request,
+    model_type: type[BaseModel],
+    *,
+    http_exception: Callable[..., Exception],
+) -> BaseModel:
+    if _lan_request_is_rejected(http_request):
+        raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+    content_length = http_request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise http_exception(
+                status_code=400,
+                detail={"code": "lan_request_rejected"},
+            ) from exc
+        if declared_length < 0:
+            raise http_exception(status_code=400, detail={"code": "lan_request_rejected"})
+        if declared_length > MAX_LAN_MUTATION_BODY_BYTES:
+            raise http_exception(status_code=413, detail={"code": "lan_request_too_large"})
+    try:
+        raw_body = await _cache_bounded_lan_request_body(http_request)
+    except RequestBodyTooLarge as exc:
+        raise http_exception(
+            status_code=413,
+            detail={"code": "lan_request_too_large"},
+        ) from exc
+    try:
+        if _lan_json_nesting_exceeds(raw_body):
+            raise ValueError("JSON nesting exceeds the LAN request limit")
+        payload = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=_reject_lan_duplicate_keys,
+            parse_constant=_reject_lan_nonfinite_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise http_exception(
+            status_code=400,
+            detail={"code": "lan_request_invalid_json"},
+        ) from exc
+    try:
+        return model_type.model_validate(payload, strict=True)
+    except ValidationError as exc:
+        raise http_exception(
+            status_code=422,
+            detail={"code": "lan_request_invalid"},
+        ) from exc
+
+
+def _is_lan_managed_conflict(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return message.startswith("lan ") or "lan_discovery" in message
 
 
 class ProviderProfileRequest(BaseModel):
@@ -42,7 +303,7 @@ class ProviderProfileRequest(BaseModel):
     trust_class: str = "standard"
     max_concurrency: int = Field(default=1, ge=1, le=1024)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    expected_revision: int | None = Field(default=None, ge=0)
+    expected_revision: int | None = Field(default=None, ge=0, strict=True)
 
 
 class ModelTargetRequest(BaseModel):
@@ -74,7 +335,7 @@ class ModelTargetRequest(BaseModel):
     recent_failure_rate: float = Field(default=0.0, ge=0, le=1)
     predicted_success: float | None = Field(default=None, ge=0, le=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    expected_revision: int | None = Field(default=None, ge=0)
+    expected_revision: int | None = Field(default=None, ge=0, strict=True)
 
 
 class RoutePolicyRequest(BaseModel):
@@ -97,7 +358,7 @@ class RoutePolicyRequest(BaseModel):
     minimum_quality_by_risk: dict[str, int] = Field(
         default_factory=lambda: {"low": 1, "medium": 2, "high": 3, "critical": 4}
     )
-    expected_revision: int | None = Field(default=None, ge=0)
+    expected_revision: int | None = Field(default=None, ge=0, strict=True)
 
 
 class RoutingPreviewRequest(BaseModel):
@@ -117,7 +378,7 @@ class ProviderDiscoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider_profile_id: str = Field(min_length=1, max_length=240)
-    expected_profile_revision: int = Field(ge=1)
+    expected_profile_revision: int = Field(ge=1, strict=True)
     max_models: int = Field(default=4, ge=1, le=MAX_DISCOVERY_MODELS)
     timeout_seconds: float = Field(
         default=2.0,
@@ -128,6 +389,149 @@ class ProviderDiscoveryRequest(BaseModel):
     probe_capabilities: bool = True
 
 
+class LanImportSelectorRouteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: str = Field(pattern=_LAN_SCAN_ID_PATTERN, strict=True)
+    endpoint_id: str = Field(pattern=_LAN_DIGEST_PATTERN, strict=True)
+    replacement_provider_profile_id: str | None = Field(
+        default=None,
+        pattern=_LAN_PROFILE_ID_PATTERN,
+        strict=True,
+    )
+
+    @model_validator(mode="after")
+    def validate_exact_selector(self) -> LanImportSelectorRouteRequest:
+        if (
+            re.fullmatch(_LAN_SCAN_ID_PATTERN, self.scan_id) is None
+            or re.fullmatch(_LAN_DIGEST_PATTERN, self.endpoint_id) is None
+            or (
+                self.replacement_provider_profile_id is not None
+                and re.fullmatch(
+                    _LAN_PROFILE_ID_PATTERN,
+                    self.replacement_provider_profile_id,
+                )
+                is None
+            )
+        ):
+            raise ValueError("LAN import selector is invalid")
+        return self
+
+
+class LanImportConfirmationRouteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selector: LanImportSelectorRouteRequest
+    preview_digest: str = Field(pattern=_LAN_DIGEST_PATTERN, strict=True)
+    confirmed: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def validate_explicit_confirmation(self) -> LanImportConfirmationRouteRequest:
+        if (
+            re.fullmatch(_LAN_DIGEST_PATTERN, self.preview_digest) is None
+            or self.confirmed is not True
+        ):
+            raise ValueError("LAN import confirmation is invalid")
+        return self
+
+
+def _validate_lan_review_affinities(*groups: list[str]) -> None:
+    for values in groups:
+        if values != sorted(set(values)):
+            raise ValueError("LAN review affinities must be unique and ordered")
+        if any(
+            not value
+            or unicodedata.normalize("NFC", value) != value
+            or any(unicodedata.category(character).startswith("C") for character in value)
+            or len(value.encode("utf-8")) > 64
+            for value in values
+        ):
+            raise ValueError("LAN review affinity exceeds 64 UTF-8 bytes")
+
+
+class LanReviewPreviewRouteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intended_roles: list[LanAffinityRequest] = Field(max_length=16)
+    task_family_affinities: list[LanAffinityRequest] = Field(max_length=16)
+    enabled: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def validate_closed_sequences(self) -> LanReviewPreviewRouteRequest:
+        _validate_lan_review_affinities(
+            self.intended_roles,
+            self.task_family_affinities,
+        )
+        return self
+
+
+class LanReviewConfirmationRouteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intended_roles: list[LanAffinityRequest] = Field(max_length=16)
+    task_family_affinities: list[LanAffinityRequest] = Field(max_length=16)
+    enabled: bool = Field(strict=True)
+    preview_digest: str = Field(pattern=_LAN_DIGEST_PATTERN, strict=True)
+    privacy_acknowledged: bool = Field(strict=True)
+    confirmed: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def validate_explicit_confirmation(self) -> LanReviewConfirmationRouteRequest:
+        if (
+            re.fullmatch(_LAN_DIGEST_PATTERN, self.preview_digest) is None
+            or self.privacy_acknowledged is not True
+            or self.confirmed is not True
+        ):
+            raise ValueError("LAN review confirmation is invalid")
+        _validate_lan_review_affinities(
+            self.intended_roles,
+            self.task_family_affinities,
+        )
+        return self
+
+
+def _lan_import_selector_payload(selector: LanImportSelector) -> dict[str, object]:
+    return {
+        "scan_id": selector.scan_id,
+        "endpoint_id": selector.endpoint_id,
+        "replacement_provider_profile_id": selector.replacement_provider_profile_id,
+    }
+
+
+def _lan_import_result_payload(result: LanImportResult) -> dict[str, object]:
+    return {
+        "profile": None if result.profile is None else result.profile.to_public_payload(),
+        "targets": [item.to_public_payload() for item in result.targets],
+        "observation_digest": result.observation_digest,
+        "endpoint_fingerprint": result.endpoint_fingerprint,
+        "outage_observed": result.outage_observed,
+        "affected_target_ids": list(result.affected_target_ids),
+        "invalidated_binding_digests": list(result.invalidated_binding_digests),
+        "stale_reasons_by_target": [
+            {"target_id": target_id, "reasons": list(reasons)}
+            for target_id, reasons in result.stale_reasons_by_target
+        ],
+    }
+
+
+def _lan_review_options_payload(options: LanReviewOptions) -> dict[str, object]:
+    return {
+        "target_id": options.target_id,
+        "intended_roles": list(options.intended_roles),
+        "task_family_affinities": list(options.task_family_affinities),
+        "enabled": options.enabled,
+    }
+
+
+def _lan_review_result_payload(result: LanReviewResult) -> dict[str, object]:
+    return {
+        "profile": result.profile.to_public_payload(),
+        "target": result.target.to_public_payload(),
+        "privacy_acknowledgement_digest": result.privacy_acknowledgement_digest,
+        "material_binding_digest": result.material_binding_digest,
+    }
+
+
 def register_routing_routes(
     app: Any,
     *,
@@ -135,8 +539,294 @@ def register_routing_routes(
     runtime: AdaptiveFlockRuntimeConfig,
     http_exception: Callable[..., Exception],
     provider_probe_service: ProviderProbeService | None = None,
+    lan_discovery_service: LanDiscoveryService | None = None,
+    lan_owner_principal: str | None = None,
 ) -> None:
+    if (lan_discovery_service is None) != (lan_owner_principal is None):
+        raise ValueError(
+            "LAN discovery service and fixed owner principal must be provided as a pair"
+        )
+    if lan_owner_principal is not None and lan_owner_principal != LAN_MUTATION_OWNER_PRINCIPAL:
+        raise ValueError("LAN mutation routes require the fixed local-runtime owner")
     discovery_service = provider_probe_service or ProviderProbeService()
+
+    async def parse_lan_request(
+        http_request: Request,
+        model_type: type[LanRouteRequest],
+    ) -> LanRouteRequest:
+        parsed = await _parse_lan_json_request(
+            http_request,
+            model_type,
+            http_exception=http_exception,
+        )
+        if not isinstance(parsed, model_type):
+            raise RuntimeError("LAN parser returned the wrong request type")
+        return parsed
+
+    async def parse_lan_import_preview_request(
+        http_request: Request,
+    ) -> LanImportSelectorRouteRequest:
+        return await parse_lan_request(http_request, LanImportSelectorRouteRequest)
+
+    async def parse_lan_import_confirmation_request(
+        http_request: Request,
+    ) -> LanImportConfirmationRouteRequest:
+        return await parse_lan_request(http_request, LanImportConfirmationRouteRequest)
+
+    async def parse_lan_review_preview_request(
+        http_request: Request,
+    ) -> LanReviewPreviewRouteRequest:
+        return await parse_lan_request(http_request, LanReviewPreviewRouteRequest)
+
+    async def parse_lan_review_confirmation_request(
+        http_request: Request,
+    ) -> LanReviewConfirmationRouteRequest:
+        return await parse_lan_request(http_request, LanReviewConfirmationRouteRequest)
+
+    if lan_discovery_service is not None and lan_owner_principal is not None:
+
+        @app.post(  # type: ignore[untyped-decorator]
+            "/api/routing/lan/import/preview",
+        )
+        def preview_lan_import(
+            request: LanImportSelectorRouteRequest = Depends(  # noqa: B008
+                parse_lan_import_preview_request
+            ),
+        ) -> dict[str, Any]:
+            try:
+                selector = LanImportSelector(
+                    scan_id=request.scan_id,
+                    endpoint_id=request.endpoint_id,
+                    replacement_provider_profile_id=(request.replacement_provider_profile_id),
+                )
+            except ValueError as exc:
+                raise http_exception(
+                    status_code=422,
+                    detail={"code": "lan_request_invalid"},
+                ) from exc
+            try:
+                preview = lan_discovery_service.prepare_lan_import(
+                    selector,
+                    authenticated_owner_principal=lan_owner_principal,
+                )
+            except KeyError as exc:
+                raise http_exception(
+                    status_code=404,
+                    detail={"code": "lan_resource_not_found"},
+                ) from exc
+            except (LanDiscoveryConflict, ValueError) as exc:
+                raise http_exception(
+                    status_code=409,
+                    detail={"code": "lan_evidence_conflict"},
+                ) from exc
+            replacement = preview.authority.replacement
+            return {
+                "selector": _lan_import_selector_payload(preview.selector),
+                "preview_digest": preview.preview_digest,
+                "evidence_expires_at": preview.evidence_expires_at,
+                "authority": {
+                    "expected_terminal_receipt_digest": (
+                        preview.authority.expected_terminal_receipt_digest
+                    ),
+                    "expected_observation_digest": (preview.authority.expected_observation_digest),
+                    "expected_profile_revision": (preview.authority.expected_profile_revision),
+                    "expected_target_revisions": [
+                        {"resource_id": item.resource_id, "revision": item.revision}
+                        for item in preview.authority.expected_target_revisions
+                    ],
+                    "endpoint_fingerprint": preview.authority.endpoint_fingerprint,
+                    "replacement": (
+                        None
+                        if replacement is None
+                        else {
+                            "provider_profile_id": replacement.provider_profile_id,
+                            "expected_profile_revision": (replacement.expected_profile_revision),
+                            "expected_endpoint_fingerprint": (
+                                replacement.expected_endpoint_fingerprint
+                            ),
+                            "expected_material_binding_digests": list(
+                                replacement.expected_material_binding_digests
+                            ),
+                        }
+                    ),
+                },
+                "result": _lan_import_result_payload(preview.result),
+                "requires_confirmation": preview.requires_confirmation,
+            }
+
+        @app.post(  # type: ignore[untyped-decorator]
+            "/api/routing/lan/import",
+        )
+        def confirm_lan_import(
+            request: LanImportConfirmationRouteRequest = Depends(  # noqa: B008
+                parse_lan_import_confirmation_request
+            ),
+        ) -> dict[str, Any]:
+            try:
+                confirmation = LanImportConfirmation(
+                    selector=LanImportSelector(
+                        scan_id=request.selector.scan_id,
+                        endpoint_id=request.selector.endpoint_id,
+                        replacement_provider_profile_id=(
+                            request.selector.replacement_provider_profile_id
+                        ),
+                    ),
+                    preview_digest=request.preview_digest,
+                    confirmed=request.confirmed,
+                )
+            except ValueError as exc:
+                raise http_exception(
+                    status_code=422,
+                    detail={"code": "lan_request_invalid"},
+                ) from exc
+            try:
+                confirmation_result = lan_discovery_service.confirm_lan_import(
+                    confirmation,
+                    authenticated_owner_principal=lan_owner_principal,
+                )
+            except KeyError as exc:
+                raise http_exception(
+                    status_code=404,
+                    detail={"code": "lan_resource_not_found"},
+                ) from exc
+            except (LanDiscoveryConflict, ValueError) as exc:
+                raise http_exception(
+                    status_code=409,
+                    detail={"code": "lan_evidence_conflict"},
+                ) from exc
+            return {
+                "preview_digest": confirmation_result.preview_digest,
+                "result": _lan_import_result_payload(confirmation_result.result),
+            }
+
+        @app.post(  # type: ignore[untyped-decorator]
+            "/api/routing/lan/targets/{target_id}/review/preview",
+        )
+        def preview_lan_review(
+            target_id: str,
+            request: LanReviewPreviewRouteRequest = Depends(  # noqa: B008
+                parse_lan_review_preview_request
+            ),
+        ) -> dict[str, Any]:
+            if re.fullmatch(_LAN_TARGET_ID_PATTERN, target_id) is None:
+                raise http_exception(
+                    status_code=422,
+                    detail={"code": "lan_request_rejected"},
+                )
+            try:
+                options = LanReviewOptions(
+                    target_id=target_id,
+                    intended_roles=tuple(request.intended_roles),
+                    task_family_affinities=tuple(request.task_family_affinities),
+                    enabled=request.enabled,
+                )
+            except ValueError as exc:
+                raise http_exception(
+                    status_code=422,
+                    detail={"code": "lan_request_invalid"},
+                ) from exc
+            try:
+                preview = lan_discovery_service.prepare_lan_review(
+                    options,
+                    authenticated_owner_principal=lan_owner_principal,
+                )
+            except KeyError as exc:
+                raise http_exception(
+                    status_code=404,
+                    detail={"code": "lan_resource_not_found"},
+                ) from exc
+            except (LanDiscoveryConflict, ValueError) as exc:
+                raise http_exception(
+                    status_code=409,
+                    detail={"code": "lan_review_conflict"},
+                ) from exc
+            return {
+                "options": _lan_review_options_payload(preview.options),
+                "preview_digest": preview.preview_digest,
+                "evidence_expires_at": preview.evidence_expires_at,
+                "authority": {
+                    "provider_profile_id": preview.authority.provider_profile_id,
+                    "expected_profile_revision": (preview.authority.expected_profile_revision),
+                    "expected_target_revision": (preview.authority.expected_target_revision),
+                    "expected_terminal_receipt_digest": (
+                        preview.authority.expected_terminal_receipt_digest
+                    ),
+                    "expected_observation_digest": (preview.authority.expected_observation_digest),
+                    "expected_endpoint_fingerprint": (
+                        preview.authority.expected_endpoint_fingerprint
+                    ),
+                    "expected_material_binding_digest": (
+                        preview.authority.expected_material_binding_digest
+                    ),
+                    "expected_stale_reasons": list(preview.authority.expected_stale_reasons),
+                    "trust_class": preview.authority.trust_class,
+                    "privacy_acknowledgement_digest": (
+                        preview.authority.privacy_acknowledgement_digest
+                    ),
+                    "review_digest": preview.authority.review_digest,
+                    "reviewed_material_binding_digest": (
+                        preview.authority.reviewed_material_binding_digest
+                    ),
+                    "reviewed_runtime_interface_binding_digest": (
+                        preview.authority.reviewed_runtime_interface_binding_digest
+                    ),
+                },
+                "profile": preview.profile.to_public_payload(),
+                "target": preview.target.to_public_payload(),
+                "requires_privacy_acknowledgement": (preview.requires_privacy_acknowledgement),
+                "requires_confirmation": preview.requires_confirmation,
+            }
+
+        @app.post(  # type: ignore[untyped-decorator]
+            "/api/routing/lan/targets/{target_id}/review",
+        )
+        def confirm_lan_review(
+            target_id: str,
+            request: LanReviewConfirmationRouteRequest = Depends(  # noqa: B008
+                parse_lan_review_confirmation_request
+            ),
+        ) -> dict[str, Any]:
+            if re.fullmatch(_LAN_TARGET_ID_PATTERN, target_id) is None:
+                raise http_exception(
+                    status_code=422,
+                    detail={"code": "lan_request_rejected"},
+                )
+            try:
+                confirmation = LanReviewConfirmation(
+                    options=LanReviewOptions(
+                        target_id=target_id,
+                        intended_roles=tuple(request.intended_roles),
+                        task_family_affinities=tuple(request.task_family_affinities),
+                        enabled=request.enabled,
+                    ),
+                    preview_digest=request.preview_digest,
+                    privacy_acknowledged=request.privacy_acknowledged,
+                    confirmed=request.confirmed,
+                )
+            except ValueError as exc:
+                raise http_exception(
+                    status_code=422,
+                    detail={"code": "lan_request_invalid"},
+                ) from exc
+            try:
+                confirmation_result = lan_discovery_service.confirm_lan_review(
+                    confirmation,
+                    authenticated_owner_principal=lan_owner_principal,
+                )
+            except KeyError as exc:
+                raise http_exception(
+                    status_code=404,
+                    detail={"code": "lan_resource_not_found"},
+                ) from exc
+            except (LanDiscoveryConflict, ValueError) as exc:
+                raise http_exception(
+                    status_code=409,
+                    detail={"code": "lan_review_conflict"},
+                ) from exc
+            return {
+                "preview_digest": confirmation_result.preview_digest,
+                "result": _lan_review_result_payload(confirmation_result.result),
+            }
 
     @app.get("/api/routing/status")  # type: ignore[untyped-decorator]
     def routing_status() -> dict[str, object]:
@@ -195,7 +885,8 @@ def register_routing_routes(
         except RoutingRevisionConflict as exc:
             raise http_exception(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
-            raise http_exception(status_code=400, detail=str(exc)) from exc
+            status_code = 409 if _is_lan_managed_conflict(exc) else 400
+            raise http_exception(status_code=status_code, detail=str(exc)) from exc
 
     @app.get("/api/routing/targets")  # type: ignore[untyped-decorator]
     def list_model_targets(enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -259,16 +950,15 @@ def register_routing_routes(
         except RoutingRevisionConflict as exc:
             raise http_exception(status_code=409, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
-            raise http_exception(status_code=400, detail=str(exc)) from exc
+            status_code = 409 if _is_lan_managed_conflict(exc) else 400
+            raise http_exception(status_code=status_code, detail=str(exc)) from exc
 
     @app.get("/api/routing/discovery/presets")  # type: ignore[untyped-decorator]
     def discovery_presets() -> dict[str, object]:
         return {
             "schema": "kestrel.routing.constraint_presets.v1",
             "effect": "filter_or_rank_only",
-            "presets": [
-                preset.to_public_payload() for preset in routing_constraint_presets()
-            ],
+            "presets": [preset.to_public_payload() for preset in routing_constraint_presets()],
         }
 
     @app.post("/api/routing/discovery")  # type: ignore[untyped-decorator]
@@ -280,6 +970,13 @@ def register_routing_routes(
             raise http_exception(
                 status_code=404,
                 detail=f"unknown provider profile: {request.provider_profile_id}",
+            )
+        if request.provider_profile_id.startswith(
+            ("lan-provider-", "lan-target-")
+        ) or _lan_is_managed_metadata(profile_entry.profile.metadata):
+            raise http_exception(
+                status_code=409,
+                detail="lan managed profile requires the specialized LAN service",
             )
         if profile_entry.revision != request.expected_profile_revision:
             raise http_exception(
@@ -312,10 +1009,7 @@ def register_routing_routes(
         # disabled-draft changes. This avoids applying results to an edited
         # profile in the common concurrent-update case.
         current_profile = ledger.get_provider_profile(request.provider_profile_id)
-        if (
-            current_profile is None
-            or current_profile.revision != request.expected_profile_revision
-        ):
+        if current_profile is None or current_profile.revision != request.expected_profile_revision:
             current_revision = 0 if current_profile is None else current_profile.revision
             raise http_exception(
                 status_code=409,
@@ -362,8 +1056,7 @@ def register_routing_routes(
     @app.get("/api/routing/policies")  # type: ignore[untyped-decorator]
     def list_route_policies(enabled_only: bool = False) -> list[dict[str, Any]]:
         return [
-            item.to_public_payload()
-            for item in ledger.list_policies(enabled_only=enabled_only)
+            item.to_public_payload() for item in ledger.list_policies(enabled_only=enabled_only)
         ]
 
     @app.post("/api/routing/policies")  # type: ignore[untyped-decorator]
@@ -412,9 +1105,7 @@ def register_routing_routes(
                     f"route policy is unavailable: {policy_id}",
                     reason_codes=("route_policy_unavailable",),
                 )
-            preview_mode: RoutingMode = (
-                "shadow" if runtime.mode == "off" else runtime.mode
-            )
+            preview_mode: RoutingMode = "shadow" if runtime.mode == "off" else runtime.mode
             service = AdaptiveFlockRoutingService(
                 profiles=[item.profile for item in ledger.list_provider_profiles()],
                 targets=[item.target for item in ledger.list_model_targets()],
@@ -463,16 +1154,13 @@ def register_routing_routes(
             "run_id": run_id,
             "task_id": task_id,
             "decisions": [
-                item.to_payload()
-                for item in ledger.list_decisions(run_id=run_id, task_id=task_id)
+                item.to_payload() for item in ledger.list_decisions(run_id=run_id, task_id=task_id)
             ],
             "outcomes": [
-                item.to_payload()
-                for item in ledger.list_outcomes(run_id=run_id, task_id=task_id)
+                item.to_payload() for item in ledger.list_outcomes(run_id=run_id, task_id=task_id)
             ],
             "shadows": [
-                item.to_payload()
-                for item in ledger.list_shadows(run_id=run_id, task_id=task_id)
+                item.to_payload() for item in ledger.list_shadows(run_id=run_id, task_id=task_id)
             ],
             "calibrations": [
                 item.to_payload()
@@ -495,9 +1183,7 @@ def _plan_discovered_targets(
         if entry.target.provider_profile_id == profile.profile_id
     ]
     managed_by_model = {
-        entry.target.model: entry
-        for entry in entries
-        if _is_discovery_managed(entry)
+        entry.target.model: entry for entry in entries if _is_discovery_managed(entry)
     }
     updates: list[tuple[ModelTarget, int]] = []
     created_count = 0
@@ -535,10 +1221,7 @@ def _plan_discovered_targets(
     stale_target_ids: list[str] = []
     if discovery.catalog_complete:
         for entry in entries:
-            if (
-                not _is_discovery_managed(entry)
-                or entry.target.model in available_models
-            ):
+            if not _is_discovery_managed(entry) or entry.target.model in available_models:
                 continue
             previous = entry.target.metadata.get("discovery")
             previous_metadata = previous if isinstance(previous, dict) else {}

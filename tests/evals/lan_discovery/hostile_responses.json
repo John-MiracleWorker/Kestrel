@@ -1,0 +1,973 @@
+{
+  "schema": "kestrel.lan-hostile-corpus.v1",
+  "secret_sentinel": "sk-kestrelhostilesentinel00",
+  "fixture": {
+    "interface_os_identity": "darwin:en90",
+    "interface_display_name": "Hostile qualification adapter",
+    "interface_address": "192.168.90.1/29",
+    "interface_index": 9,
+    "network": "192.168.90.0/30",
+    "probe_host": "192.168.90.2",
+    "probe_port": 11434,
+    "allowed_hosts": [
+      "192.168.90.1",
+      "192.168.90.2"
+    ],
+    "known_ports": [
+      1234,
+      8000,
+      8080,
+      11434
+    ]
+  },
+  "cases": [
+    {
+      "case_id": "public_range_global_unicast",
+      "category": "public_range_rejection",
+      "summary": "A global-unicast /30 must never become a probe scope.",
+      "boundary": "scope",
+      "params": {
+        "network": "8.8.8.0/30"
+      },
+      "expected": {
+        "error_match": "private interface scope"
+      }
+    },
+    {
+      "case_id": "public_range_test_net_documentation",
+      "category": "public_range_rejection",
+      "summary": "TEST-NET-1 (192.0.2.0/24) is public and must be rejected even though it is unroutable.",
+      "boundary": "scope",
+      "params": {
+        "network": "192.0.2.0/24"
+      },
+      "expected": {
+        "error_match": "private interface scope"
+      }
+    },
+    {
+      "case_id": "private_range_not_attached_to_interface",
+      "category": "public_range_rejection",
+      "summary": "An RFC1918 range the selected interface is not attached to must be rejected.",
+      "boundary": "scope",
+      "params": {
+        "network": "10.200.0.0/24"
+      },
+      "expected": {
+        "error_match": "attached to the selected interface"
+      }
+    },
+    {
+      "case_id": "private_range_over_256_hosts",
+      "category": "public_range_rejection",
+      "summary": "An attached private range wider than 256 active hosts must be rejected.",
+      "boundary": "scope",
+      "params": {
+        "interface_address": "10.90.0.1/16",
+        "network": "10.90.0.0/16"
+      },
+      "expected": {
+        "error_match": "at most 256 hosts"
+      }
+    },
+    {
+      "case_id": "unspecified_default_route",
+      "category": "public_range_rejection",
+      "summary": "0.0.0.0/0 must never become a probe scope.",
+      "boundary": "scope",
+      "params": {
+        "network": "0.0.0.0/0"
+      },
+      "expected": {
+        "error_match": "private interface scope"
+      }
+    },
+    {
+      "case_id": "ipv6_global_unicast",
+      "category": "public_range_rejection",
+      "summary": "An IPv6 global-unicast (documentation) prefix must be rejected; only ULA/link-local are eligible.",
+      "boundary": "scope",
+      "params": {
+        "interface_address": "2001:db8::1/64",
+        "network": "2001:db8::/64"
+      },
+      "expected": {
+        "error_match": "private interface scope"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_public",
+      "category": "dns_rebinding_simulation",
+      "summary": "A resolver answer that points at a public address after the owner typed a local name must fail closed.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "answers": [
+          "8.8.8.8"
+        ]
+      },
+      "expected": {
+        "error_match": "not an eligible attached literal"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_unattached_private",
+      "category": "dns_rebinding_simulation",
+      "summary": "A resolver answer on a different private subnet than the confirmed interface must fail closed.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "answers": [
+          "192.168.99.20"
+        ]
+      },
+      "expected": {
+        "error_match": "not an eligible attached literal"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_loopback",
+      "category": "dns_rebinding_simulation",
+      "summary": "A resolver answer of 127.0.0.1 (classic DNS-rebinding target) must fail closed.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "answers": [
+          "127.0.0.1"
+        ]
+      },
+      "expected": {
+        "error_match": "not an eligible attached literal"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_cloud_metadata",
+      "category": "dns_rebinding_simulation",
+      "summary": "A resolver answer of the link-local cloud metadata endpoint must fail closed when it is not attached.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "answers": [
+          "169.254.169.254"
+        ]
+      },
+      "expected": {
+        "error_match": "not an eligible attached literal"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_hostname_not_literal",
+      "category": "dns_rebinding_simulation",
+      "summary": "A resolver that answers with another hostname instead of a literal must fail closed.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "answers": [
+          "evil-twin.local"
+        ]
+      },
+      "expected": {
+        "error_match": "not an eligible attached literal"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_noncanonical_literal",
+      "category": "dns_rebinding_simulation",
+      "summary": "A zero-padded (non-canonical) literal answer must fail closed.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "answers": [
+          "192.168.090.002"
+        ]
+      },
+      "expected": {
+        "error_match": "not an eligible attached literal"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_duplicate",
+      "category": "dns_rebinding_simulation",
+      "summary": "Duplicate resolver answers must fail closed rather than being silently deduplicated.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "answers": [
+          "192.168.90.2",
+          "192.168.90.2"
+        ]
+      },
+      "expected": {
+        "error_match": "no eligible attached addresses"
+      }
+    },
+    {
+      "case_id": "rebinding_answer_flood",
+      "category": "dns_rebinding_simulation",
+      "summary": "More than 16 resolver answers must fail closed regardless of eligibility.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "model.local",
+        "interface_address": "192.168.90.1/24",
+        "answers": [
+          "192.168.90.2",
+          "192.168.90.3",
+          "192.168.90.4",
+          "192.168.90.5",
+          "192.168.90.6",
+          "192.168.90.7",
+          "192.168.90.8",
+          "192.168.90.9",
+          "192.168.90.10",
+          "192.168.90.11",
+          "192.168.90.12",
+          "192.168.90.13",
+          "192.168.90.14",
+          "192.168.90.15",
+          "192.168.90.16",
+          "192.168.90.17",
+          "192.168.90.18"
+        ]
+      },
+      "expected": {
+        "error_match": "no eligible attached addresses"
+      }
+    },
+    {
+      "case_id": "redirect_301_to_public",
+      "category": "redirect",
+      "summary": "A 301 toward a public host must be terminal: never followed, no second socket.",
+      "boundary": "transport_and_scanner",
+      "params": {
+        "status_code": 301,
+        "location": "http://8.8.8.8:11434/api/tags"
+      },
+      "expected": {
+        "transport_failure": "redirect_rejected",
+        "sockets_opened": 1,
+        "scanner_failure": "redirect_rejected"
+      }
+    },
+    {
+      "case_id": "redirect_302_to_cloud_metadata",
+      "category": "redirect",
+      "summary": "A 302 toward the link-local cloud metadata endpoint must be terminal.",
+      "boundary": "transport_and_scanner",
+      "params": {
+        "status_code": 302,
+        "location": "http://169.254.169.254/latest/meta-data"
+      },
+      "expected": {
+        "transport_failure": "redirect_rejected",
+        "sockets_opened": 1,
+        "scanner_failure": "redirect_rejected"
+      }
+    },
+    {
+      "case_id": "redirect_307_self_loop",
+      "category": "redirect",
+      "summary": "A 307 pointing back at the probe URL must be terminal (no redirect loop).",
+      "boundary": "transport_and_scanner",
+      "params": {
+        "status_code": 307,
+        "location": "http://192.168.90.2:11434/api/tags"
+      },
+      "expected": {
+        "transport_failure": "redirect_rejected",
+        "sockets_opened": 1,
+        "scanner_failure": "redirect_rejected"
+      }
+    },
+    {
+      "case_id": "redirect_308_to_loopback",
+      "category": "redirect",
+      "summary": "A 308 toward loopback must be terminal.",
+      "boundary": "transport_and_scanner",
+      "params": {
+        "status_code": 308,
+        "location": "http://127.0.0.1:11434/api/tags"
+      },
+      "expected": {
+        "transport_failure": "redirect_rejected",
+        "sockets_opened": 1,
+        "scanner_failure": "redirect_rejected"
+      }
+    },
+    {
+      "case_id": "oversize_declared_content_length",
+      "category": "oversize_response",
+      "summary": "A declared Content-Length above the 256 KiB cap must be rejected before the body is read.",
+      "boundary": "transport",
+      "params": {
+        "wire": "content_length",
+        "declared_length": 262145,
+        "body_bytes": 0
+      },
+      "expected": {
+        "transport_failure": "response_too_large"
+      }
+    },
+    {
+      "case_id": "oversize_chunked_total",
+      "category": "oversize_response",
+      "summary": "A chunked body whose chunks sum above the cap must be rejected.",
+      "boundary": "transport",
+      "params": {
+        "wire": "chunked",
+        "chunk_sizes": [
+          100000,
+          100000,
+          100000
+        ]
+      },
+      "expected": {
+        "transport_failure": "response_too_large"
+      }
+    },
+    {
+      "case_id": "oversize_single_chunk_declaration",
+      "category": "oversize_response",
+      "summary": "A single declared chunk larger than the remaining budget must be rejected at declaration.",
+      "boundary": "transport",
+      "params": {
+        "wire": "chunked",
+        "chunk_sizes": [
+          262145
+        ]
+      },
+      "expected": {
+        "transport_failure": "response_too_large"
+      }
+    },
+    {
+      "case_id": "chunked_extension_rejected",
+      "category": "oversize_response",
+      "summary": "Chunk extensions are outside the accepted framing and must be rejected.",
+      "boundary": "transport",
+      "params": {
+        "wire": "chunked_extension"
+      },
+      "expected": {
+        "transport_failure": "http_protocol_rejected"
+      }
+    },
+    {
+      "case_id": "chunked_trailer_rejected",
+      "category": "oversize_response",
+      "summary": "Chunk trailers are outside the accepted framing and must be rejected.",
+      "boundary": "transport",
+      "params": {
+        "wire": "chunked_trailer"
+      },
+      "expected": {
+        "transport_failure": "http_protocol_rejected"
+      }
+    },
+    {
+      "case_id": "content_encoding_gzip_rejected",
+      "category": "oversize_response",
+      "summary": "A gzip-encoded (potentially bomb-capable) response must be rejected.",
+      "boundary": "transport",
+      "params": {
+        "wire": "content_encoding",
+        "encoding": "gzip",
+        "body_b64": "e30="
+      },
+      "expected": {
+        "transport_failure": "unsupported_content_encoding"
+      }
+    },
+    {
+      "case_id": "slowloris_drip_feed",
+      "category": "slowloris_deadline",
+      "summary": "A server dripping one byte per read must hit the absolute HTTP deadline and never complete.",
+      "boundary": "transport",
+      "params": {
+        "mode": "drip",
+        "clock_step_seconds": 0.3
+      },
+      "expected": {
+        "transport_failure": "http_timeout"
+      }
+    },
+    {
+      "case_id": "slowloris_bytes_after_deadline_never_consumed",
+      "category": "slowloris_deadline",
+      "summary": "Bytes that arrive only after the absolute deadline must never be consumed.",
+      "boundary": "transport",
+      "params": {
+        "mode": "late_bytes"
+      },
+      "expected": {
+        "transport_failure": "http_timeout"
+      }
+    },
+    {
+      "case_id": "slowloris_trickle_body_after_head",
+      "category": "slowloris_deadline",
+      "summary": "A complete head followed by a body that stalls must hit the deadline mid-body.",
+      "boundary": "transport",
+      "params": {
+        "mode": "drip",
+        "clock_step_seconds": 0.7,
+        "body_only": true
+      },
+      "expected": {
+        "transport_failure": "http_timeout"
+      }
+    },
+    {
+      "case_id": "malformed_catalog_not_json",
+      "category": "malformed_json",
+      "summary": "A non-JSON catalog body must be rejected with no models discovered.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "dGhpcyBpcyBub3QganNvbg=="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_truncated",
+      "category": "malformed_json",
+      "summary": "A truncated JSON catalog must be rejected.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbeyJuYW1lIjogImFscGhhIg=="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_duplicate_member",
+      "category": "malformed_json",
+      "summary": "Duplicate JSON object members must be rejected (strict parser).",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbXSwgIm1vZGVscyI6IFtdfQ=="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_non_finite_constant",
+      "category": "malformed_json",
+      "summary": "NaN/Infinity constants must be rejected (strict parser).",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbTmFOXX0="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_top_level_array",
+      "category": "malformed_json",
+      "summary": "A top-level JSON array is not a catalog object and must be rejected.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "W3sibmFtZSI6ICJhbHBoYSJ9XQ=="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_invalid_utf8",
+      "category": "malformed_json",
+      "summary": "Invalid UTF-8 inside a catalog must be rejected.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbeyJuYW1lIjogIv/+In1dfQ=="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_deep_nesting",
+      "category": "malformed_json",
+      "summary": "A deeply nested document must be rejected without exhausting the parser.",
+      "boundary": "scanner",
+      "params": {
+        "body_generator": "deep_nesting",
+        "depth": 5000
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_wrong_member_type",
+      "category": "malformed_json",
+      "summary": "A catalog whose models member is an object instead of a list must be rejected.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiB7Im5hbWUiOiAiYWxwaGEifX0="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_catalog_untyped_entries",
+      "category": "malformed_json",
+      "summary": "A catalog with no typed model entries must not establish a schema.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbeyJuYW1lIjogN30sIHsibmFtZSI6IHRydWV9XX0="
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": []
+      }
+    },
+    {
+      "case_id": "malformed_generation_body",
+      "category": "malformed_json",
+      "summary": "A malformed generation response must not count as an observed capability pass.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbeyJuYW1lIjogImFscGhhIn1dfQ==",
+        "generation_body_b64": "bm90IGpzb24="
+      },
+      "expected": {
+        "failure_category": "generation_response_invalid",
+        "catalog": [
+          "alpha"
+        ],
+        "generation_passed": false
+      }
+    },
+    {
+      "case_id": "duplicate_advertisement_same_endpoint",
+      "category": "duplicate_mdns",
+      "summary": "Two advertisements for the same address/port must reconcile to exactly one candidate.",
+      "boundary": "mdns",
+      "params": {
+        "records": [
+          {
+            "instance": "First",
+            "address": "192.168.90.2",
+            "port": 11434
+          },
+          {
+            "instance": "Second",
+            "address": "192.168.90.2",
+            "port": 11434
+          }
+        ]
+      },
+      "expected": {
+        "candidate_count": 1,
+        "unique_endpoints": true
+      }
+    },
+    {
+      "case_id": "duplicate_advertisement_conflicting_metadata",
+      "category": "duplicate_mdns",
+      "summary": "Duplicate advertisements with conflicting display metadata must still yield one bounded candidate.",
+      "boundary": "mdns",
+      "params": {
+        "records": [
+          {
+            "instance": "First",
+            "address": "192.168.90.2",
+            "port": 11434,
+            "properties": {
+              "display_name": "Legit"
+            }
+          },
+          {
+            "instance": "Second",
+            "address": "192.168.90.2",
+            "port": 11434,
+            "properties": {
+              "display_name": "Evil Twin"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "candidate_count": 1,
+        "unique_endpoints": true
+      }
+    },
+    {
+      "case_id": "advertisement_flood_retains_bound",
+      "category": "duplicate_mdns",
+      "summary": "A flood of 300 distinct advertisements must be bounded to the top 256 canonical endpoints.",
+      "boundary": "mdns",
+      "params": {
+        "flood_distinct_count": 300,
+        "interface_address": "192.168.90.1/24"
+      },
+      "expected": {
+        "candidate_count": 256,
+        "unique_endpoints": true
+      }
+    },
+    {
+      "case_id": "advertisement_control_characters_contained",
+      "category": "duplicate_mdns",
+      "summary": "An advertisement whose instance name carries terminal control characters must be dropped without failing the collection.",
+      "boundary": "mdns",
+      "params": {
+        "records": [
+          {
+            "instance": "Good",
+            "address": "192.168.90.2",
+            "port": 11434
+          },
+          {
+            "instance": "Evil\u001b[2J Clear",
+            "address": "192.168.90.3",
+            "port": 11434
+          }
+        ]
+      },
+      "expected": {
+        "candidate_count": 1,
+        "unique_endpoints": true
+      }
+    },
+    {
+      "case_id": "interface_address_removed_mid_probe",
+      "category": "interface_change",
+      "summary": "If the confirmed address leaves the interface between TCP and HTTP phases, probing must stop with interface_drift.",
+      "boundary": "scanner_manual",
+      "params": {
+        "drift": "address_removed"
+      },
+      "expected": {
+        "failure_category": "interface_drift",
+        "http_requests": 0
+      }
+    },
+    {
+      "case_id": "interface_index_rollover_same_addresses",
+      "category": "interface_change",
+      "summary": "An interface-index rollover with unchanged addresses is not address drift: probing may continue, but only to the exact confirmed destinations.",
+      "boundary": "scanner_manual",
+      "params": {
+        "drift": "index_changed"
+      },
+      "expected": {
+        "failure_category": "catalog_empty",
+        "http_requests": 1
+      }
+    },
+    {
+      "case_id": "interface_removed_mid_probe",
+      "category": "interface_change",
+      "summary": "A disappearing interface mid-probe must be treated as drift.",
+      "boundary": "scanner_manual",
+      "params": {
+        "drift": "interface_removed"
+      },
+      "expected": {
+        "failure_category": "interface_drift",
+        "http_requests": 0
+      }
+    },
+    {
+      "case_id": "cancelled_before_start",
+      "category": "cancellation",
+      "summary": "A pre-cancelled scan must probe nothing.",
+      "boundary": "scanner",
+      "params": {
+        "mode": "pre_cancelled"
+      },
+      "expected": {
+        "failure_category": "cancelled",
+        "max_destinations": 0
+      }
+    },
+    {
+      "case_id": "cancelled_after_first_tcp",
+      "category": "cancellation",
+      "summary": "Cancellation observed on the first probe must stop all further admissions.",
+      "boundary": "scanner",
+      "params": {
+        "mode": "cancel_on_first_tcp"
+      },
+      "expected": {
+        "failure_category": "cancelled",
+        "max_destinations": 1
+      }
+    },
+    {
+      "case_id": "cancelled_by_progress_sink",
+      "category": "cancellation",
+      "summary": "A progress sink that cancels must bound the scan without new probes.",
+      "boundary": "scanner",
+      "params": {
+        "mode": "progress_cancels"
+      },
+      "expected": {
+        "failure_category": "cancelled",
+        "max_destinations": 1
+      }
+    },
+    {
+      "case_id": "outage_within_freshness_is_noop",
+      "category": "stale_results",
+      "summary": "An outage observed while prior evidence is still fresh must not stale the target.",
+      "boundary": "service",
+      "params": {
+        "mode": "outage_within_freshness",
+        "outage_age_seconds": 30
+      },
+      "expected": {
+        "target_stale": false,
+        "review_blocked": false,
+        "target_enabled": false
+      }
+    },
+    {
+      "case_id": "outage_after_expiry_stales_and_blocks_enable",
+      "category": "stale_results",
+      "summary": "Once evidence expires, an outage must stale the target and owner review must be blocked until a positive refresh.",
+      "boundary": "service",
+      "params": {
+        "mode": "outage_after_expiry",
+        "outage_age_seconds": 301
+      },
+      "expected": {
+        "target_stale": true,
+        "review_blocked": true,
+        "target_enabled": false
+      }
+    },
+    {
+      "case_id": "review_with_wrong_stale_expectation",
+      "category": "stale_results",
+      "summary": "A review that claims the target is fresh when it is stale must conflict without mutation.",
+      "boundary": "service",
+      "params": {
+        "mode": "wrong_stale_expectation",
+        "outage_age_seconds": 301
+      },
+      "expected": {
+        "target_stale": true,
+        "review_blocked": true,
+        "target_enabled": false
+      }
+    },
+    {
+      "case_id": "catalog_model_name_contains_token",
+      "category": "secret_reflection",
+      "summary": "A model id embedding a credential-shaped token must be excluded; the scan still cannot leak it.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbeyJuYW1lIjogImFscGhhIn0sIHsibmFtZSI6ICIke1NFTlRJTkVMfSJ9XX0=",
+        "generation_body_b64": "eyJyZXNwb25zZSI6ICJPSyIsICJkb25lIjogdHJ1ZX0="
+      },
+      "expected": {
+        "failure_category": null,
+        "catalog": [
+          "alpha"
+        ],
+        "catalog_complete": false,
+        "sentinel_absent": true
+      }
+    },
+    {
+      "case_id": "catalog_all_models_hostile",
+      "category": "secret_reflection",
+      "summary": "A catalog whose every model id is credential-shaped must fail as invalid with no leak.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbeyJuYW1lIjogIiR7U0VOVElORUx9In0sIHsibmFtZSI6ICJCZWFyZXIgJHtTRU5USU5FTH0ifV19"
+      },
+      "expected": {
+        "failure_category": "catalog_invalid",
+        "catalog": [],
+        "sentinel_absent": true
+      }
+    },
+    {
+      "case_id": "generation_echoes_secret",
+      "category": "secret_reflection",
+      "summary": "A generation body echoing an Authorization header must fail validation and never be stored.",
+      "boundary": "scanner",
+      "params": {
+        "catalog_body_b64": "eyJtb2RlbHMiOiBbeyJuYW1lIjogImFscGhhIn1dfQ==",
+        "generation_body_b64": "eyJyZXNwb25zZSI6ICJPSyBBdXRob3JpemF0aW9uOiBCZWFyZXIgJHtTRU5USU5FTH0iLCAiZG9uZSI6IHRydWV9"
+      },
+      "expected": {
+        "failure_category": "generation_response_invalid",
+        "catalog": [
+          "alpha"
+        ],
+        "sentinel_absent": true
+      }
+    },
+    {
+      "case_id": "transport_error_detail_discarded",
+      "category": "secret_reflection",
+      "summary": "An untrusted transport error detail containing a secret must be discarded; only the closed public text survives.",
+      "boundary": "scanner",
+      "params": {
+        "mode": "transport_error_detail"
+      },
+      "expected": {
+        "failure_category": "http_protocol_rejected",
+        "sentinel_absent": true
+      }
+    },
+    {
+      "case_id": "mdns_instance_name_secret",
+      "category": "secret_reflection",
+      "summary": "An mDNS instance name carrying a credential-shaped token must be dropped.",
+      "boundary": "mdns",
+      "params": {
+        "records": [
+          {
+            "instance": "${SENTINEL}",
+            "address": "192.168.90.2",
+            "port": 11434
+          }
+        ]
+      },
+      "expected": {
+        "candidate_count": 0,
+        "sentinel_absent": true
+      }
+    },
+    {
+      "case_id": "manual_host_with_credential",
+      "category": "secret_reflection",
+      "summary": "A manual host input carrying credential material must be rejected before any resolution.",
+      "boundary": "manual_probe",
+      "params": {
+        "host": "${SENTINEL}",
+        "answers": []
+      },
+      "expected": {
+        "error_match": "canonical local name",
+        "sentinel_absent": true
+      }
+    },
+    {
+      "case_id": "import_with_future_profile_revision",
+      "category": "revision_races",
+      "summary": "An import claiming a future profile revision must conflict and write nothing.",
+      "boundary": "service",
+      "params": {
+        "mode": "import_future_profile_revision",
+        "claimed_profile_revision": 99
+      },
+      "expected": {
+        "conflict": true,
+        "mutation": false
+      }
+    },
+    {
+      "case_id": "review_with_stale_target_revision",
+      "category": "revision_races",
+      "summary": "A review against a stale target revision must conflict and leave the target untouched.",
+      "boundary": "service",
+      "params": {
+        "mode": "review_stale_target_revision",
+        "revision_skew": 1
+      },
+      "expected": {
+        "conflict": true,
+        "mutation": false
+      }
+    },
+    {
+      "case_id": "forged_bool_revision",
+      "category": "revision_races",
+      "summary": "A bool masquerading as an integer revision must be rejected at the value boundary.",
+      "boundary": "service",
+      "params": {
+        "mode": "forged_bool_revision"
+      },
+      "expected": {
+        "value_error": true,
+        "mutation": false
+      }
+    },
+    {
+      "case_id": "import_yields_disabled_unconfirmed_drafts",
+      "category": "target_enablement_bypass",
+      "summary": "A positive import must create only disabled, unconfirmed drafts with no secret reference.",
+      "boundary": "service",
+      "params": {
+        "mode": "import_draft_posture"
+      },
+      "expected": {
+        "profile_enabled": false,
+        "targets_enabled": 0,
+        "trust_class": "unconfirmed",
+        "secret_ref": null
+      }
+    },
+    {
+      "case_id": "enable_flip_on_review_digests",
+      "category": "target_enablement_bypass",
+      "summary": "Flipping enabled=true on a review whose digests were derived for enabled=false must conflict.",
+      "boundary": "service",
+      "params": {
+        "mode": "enable_flip_on_review_digests"
+      },
+      "expected": {
+        "conflict": true,
+        "target_enabled": false
+      }
+    },
+    {
+      "case_id": "trust_class_forgery",
+      "category": "target_enablement_bypass",
+      "summary": "A review request with a trust class other than operator_confirmed must be rejected at the value boundary.",
+      "boundary": "service",
+      "params": {
+        "mode": "trust_class_forgery",
+        "forged_trust_class": "system_confirmed"
+      },
+      "expected": {
+        "value_error": true,
+        "target_enabled": false
+      }
+    },
+    {
+      "case_id": "privacy_acknowledgement_missing",
+      "category": "target_enablement_bypass",
+      "summary": "A review without the privacy acknowledgement must conflict and never enable.",
+      "boundary": "service",
+      "params": {
+        "mode": "privacy_acknowledgement_missing"
+      },
+      "expected": {
+        "conflict": true,
+        "target_enabled": false
+      }
+    },
+    {
+      "case_id": "route_confirmation_requires_explicit_owner_gates",
+      "category": "target_enablement_bypass",
+      "summary": "The route model must reject confirmations that are not explicit (confirmed/privacy flags).",
+      "boundary": "route_model",
+      "params": {
+        "mode": "route_confirmation_gates"
+      },
+      "expected": {
+        "validation_error": true
+      }
+    }
+  ]
+}

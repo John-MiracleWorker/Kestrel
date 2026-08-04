@@ -12,19 +12,57 @@ import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 if not __package__:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts.generate_desktop_resource_manifest import canonical_manifest_bytes
+from scripts.verify_desktop_resource_manifest import (
+    DesktopManifestIdentity,
+    load_desktop_manifest_identity,
+    load_desktop_public_key,
+    read_desktop_regular_bounded,
+    verify_release_resource_manifest,
+)
 from scripts.verify_release_payload import verify_release_payload
 
 OCI_RECORD_NAME = "oci-image-digests.json"
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_DESKTOP_MANIFEST_SCHEMA = "kestrel.desktop.resources.v1"
+_DESKTOP_QUALIFICATION_SCHEMA = "kestrel.desktop.qualification.v1"
+_DESKTOP_DIRECTORY_SMOKE_SCHEMA = "kestrel.desktop.directory-smoke.v1"
+_DESKTOP_QUALIFICATION_SIGNATURE_PREFIX = (
+    b"kestrel.desktop.qualification.signature.v1\0"
+)
+_MAX_DESKTOP_QUALIFICATION_BYTES = 64 * 1024
+_DESKTOP_QUALIFICATION_KEYS = frozenset(
+    {
+        "schema",
+        "build_mode",
+        "key_id",
+        "signed",
+        "source_commit",
+        "qualified",
+        "resource_manifest_digest",
+    }
+)
+
+
+def desktop_qualification_signature_bytes(
+    receipt: dict[str, object],
+) -> bytes:
+    """Domain-separate qualification signatures from manifest signatures."""
+
+    return _DESKTOP_QUALIFICATION_SIGNATURE_PREFIX + canonical_manifest_bytes(receipt)
 
 
 def _sha256(path: Path) -> str:
@@ -54,6 +92,82 @@ def _require_digest(value: object, *, label: str) -> str:
     if not _DIGEST_RE.fullmatch(digest):
         raise ValueError(f"invalid {label}: {digest!r}")
     return digest
+
+
+def validate_desktop_publication_evidence(
+    staged_root: Path,
+    qualification_evidence: list[tuple[object, bytes]],
+    *,
+    expected_identity: DesktopManifestIdentity,
+    trusted_public_keys: Mapping[str, Ed25519PublicKey],
+) -> dict[str, object]:
+    """Cryptographically bind a release bundle and its qualification receipts."""
+
+    if (
+        expected_identity.build_mode == "developer"
+        or expected_identity.key_id == "developer"
+    ):
+        raise ValueError("developer desktop manifest cannot be published")
+    manifest = verify_release_resource_manifest(
+        staged_root,
+        expected_identity=expected_identity,
+        trusted_public_keys=trusted_public_keys,
+    )
+    if (
+        manifest.get("schema") != _DESKTOP_MANIFEST_SCHEMA
+        or manifest.get("build_mode") != "release"
+        or manifest.get("key_id") != "release"
+    ):
+        raise ValueError("desktop publication manifest is not release signed")
+    source_commit = manifest.get("source_commit")
+    if not isinstance(source_commit, str) or not _SHA_RE.fullmatch(source_commit):
+        raise ValueError("desktop publication source commit is invalid")
+    manifest_digest = (
+        f"sha256:{hashlib.sha256(canonical_manifest_bytes(manifest)).hexdigest()}"
+    )
+    if not qualification_evidence:
+        raise ValueError("desktop publication requires qualification evidence")
+    public_key = trusted_public_keys.get("release")
+    if not isinstance(public_key, Ed25519PublicKey):
+        raise ValueError("desktop qualification signing key is untrusted")
+    for receipt, signature in qualification_evidence:
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("schema") == _DESKTOP_DIRECTORY_SMOKE_SCHEMA
+        ):
+            raise ValueError(
+                "developer desktop directory smoke cannot be published"
+            )
+        if not isinstance(receipt, dict) or set(receipt) != _DESKTOP_QUALIFICATION_KEYS:
+            raise ValueError("desktop qualification receipt must be an object")
+        if receipt.get("schema") != _DESKTOP_QUALIFICATION_SCHEMA:
+            raise ValueError("desktop qualification receipt schema is invalid")
+        if receipt.get("build_mode") == "developer" or receipt.get("key_id") == "developer":
+            raise ValueError("developer desktop qualification cannot be published")
+        if receipt.get("build_mode") != "release" or receipt.get("key_id") != "release":
+            raise ValueError("desktop qualification is not release signed")
+        if receipt.get("signed") is not True:
+            raise ValueError("unsigned desktop qualification cannot be published")
+        if receipt.get("qualified") is not True:
+            raise ValueError("desktop qualification did not pass")
+        if receipt.get("source_commit") != source_commit:
+            raise ValueError("desktop qualification source commit mismatch")
+        if receipt.get("resource_manifest_digest") != manifest_digest:
+            raise ValueError("desktop qualification resource manifest digest mismatch")
+        if not isinstance(signature, bytes) or len(signature) != 64:
+            raise ValueError("unsigned desktop qualification cannot be published")
+        try:
+            public_key.verify(
+                signature,
+                desktop_qualification_signature_bytes(receipt),
+            )
+        except InvalidSignature as exc:
+            raise ValueError("desktop qualification signature is invalid") from exc
+    return {
+        "source_commit": source_commit,
+        "qualification_count": len(qualification_evidence),
+        "resource_manifest_digest": manifest_digest,
+    }
 
 
 def build_oci_record(
@@ -321,6 +435,21 @@ def _load_json(path: Path) -> object:
         raise ValueError(f"invalid JSON in {path}: {exc}") from exc
 
 
+def _load_desktop_qualification_receipt(path: Path) -> object:
+    try:
+        return json.loads(
+            read_desktop_regular_bounded(
+                path,
+                _MAX_DESKTOP_QUALIFICATION_BYTES,
+                "desktop qualification receipt",
+            ).decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"invalid desktop qualification receipt JSON in {path}"
+        ) from exc
+
+
 def _write_github_output(name: str, value: str) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -363,6 +492,23 @@ def main() -> int:
     pypi.add_argument("--project", required=True)
     pypi.add_argument("--expected-version", required=True)
     pypi.add_argument("--api-base", default="https://pypi.org/pypi")
+
+    desktop = subparsers.add_parser("verify-desktop-evidence")
+    desktop.add_argument("staged_root", type=Path)
+    desktop.add_argument("--identity", required=True, type=Path)
+    desktop.add_argument("--public-key", required=True, type=Path)
+    desktop.add_argument(
+        "--qualification-receipt",
+        action="append",
+        required=True,
+        type=Path,
+    )
+    desktop.add_argument(
+        "--qualification-signature",
+        action="append",
+        required=True,
+        type=Path,
+    )
 
     args = parser.parse_args()
     try:
@@ -418,6 +564,36 @@ def main() -> int:
             _write_github_output("upload_required", required)
             _write_github_output("upload_count", str(len(missing)))
             print(json.dumps({"missing": [path.name for path in missing]}, sort_keys=True))
+        elif args.command == "verify-desktop-evidence":
+            if len(args.qualification_receipt) != len(
+                args.qualification_signature
+            ):
+                raise ValueError(
+                    "desktop qualification receipt/signature count mismatch"
+                )
+            identity = load_desktop_manifest_identity(args.identity)
+            public_key = load_desktop_public_key(args.public_key)
+            report = validate_desktop_publication_evidence(
+                args.staged_root,
+                [
+                    (
+                        _load_desktop_qualification_receipt(receipt_path),
+                        read_desktop_regular_bounded(
+                            signature_path,
+                            4 * 1024,
+                            "desktop qualification signature",
+                        ),
+                    )
+                    for receipt_path, signature_path in zip(
+                        args.qualification_receipt,
+                        args.qualification_signature,
+                        strict=True,
+                    )
+                ],
+                expected_identity=identity,
+                trusted_public_keys={identity.key_id: public_key},
+            )
+            print(json.dumps(report, sort_keys=True))
         else:  # pragma: no cover
             raise AssertionError(args.command)
     except (OSError, ValueError) as exc:

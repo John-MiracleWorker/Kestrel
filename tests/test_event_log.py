@@ -30,7 +30,7 @@ def test_event_log_repairs_file_without_changing_existing_custom_directory(
 ) -> None:
     directory = tmp_path / "custom-logs"
     directory.mkdir(mode=0o755)
-    os.chmod(directory, 0o755)
+    os.chmod(directory, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     path = directory / "events.jsonl"
     path.write_text(
         json.dumps(
@@ -44,7 +44,7 @@ def test_event_log_repairs_file_without_changing_existing_custom_directory(
         + "\n",
         encoding="utf-8",
     )
-    os.chmod(path, 0o644)
+    os.chmod(path, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     log = JsonlEventLog(path)
     log.append(AgentEvent(id="evt_appended", type="appended", payload={}))
@@ -60,7 +60,7 @@ def test_event_log_rejects_symlinked_directory_without_mutating_target(
 ) -> None:
     target = tmp_path / "outside-logs"
     target.mkdir(mode=0o755)
-    os.chmod(target, 0o755)
+    os.chmod(target, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     linked_directory = tmp_path / "linked-logs"
     linked_directory.symlink_to(target, target_is_directory=True)
 
@@ -77,7 +77,7 @@ def test_event_log_rejects_symlinked_file_without_mutating_target(
 ) -> None:
     target = tmp_path / "outside-events.jsonl"
     target.write_text("outside\n", encoding="utf-8")
-    os.chmod(target, 0o644)
+    os.chmod(target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     directory = tmp_path / "logs"
     directory.mkdir()
     path = directory / "events.jsonl"
@@ -94,7 +94,7 @@ def test_event_log_rejects_symlinked_file_without_mutating_target(
 def test_event_log_rejects_hard_link_without_mutating_target(tmp_path: Path) -> None:
     target = tmp_path / "outside-hard-link.jsonl"
     target.write_text("outside\n", encoding="utf-8")
-    os.chmod(target, 0o644)
+    os.chmod(target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     directory = tmp_path / "hard-linked-logs"
     directory.mkdir()
     path = directory / "events.jsonl"
@@ -113,7 +113,7 @@ def test_event_log_rejects_nonregular_path_without_chmod(tmp_path: Path) -> None
     directory.mkdir()
     path = directory / "events.jsonl"
     path.mkdir(mode=0o755)
-    os.chmod(path, 0o755)
+    os.chmod(path, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     with pytest.raises(ValueError, match="event log must be a regular file"):
         JsonlEventLog(path)

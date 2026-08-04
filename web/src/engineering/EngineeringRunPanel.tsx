@@ -10,14 +10,18 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { getJson, postJson } from "../api";
 import { InlineMeta, StatusBadge } from "../components";
+import { EvidenceDrawer } from "../mission/EvidenceDrawer";
 import type { TaskNode } from "../types";
 import "./engineering.css";
 
 type ApprovalPacketCall = {
   tool_call_id: string;
   tool_name: string;
+  arguments: Record<string, unknown>;
   call_digest: string;
   risk: string;
+  capability_revision: number;
+  resource_digest: string;
   reason: string;
   resource_scope: string;
   expected_side_effect: string;
@@ -554,13 +558,65 @@ function ApprovalPacketCard({
       ]} />
       {packet.calls.map((call) => (
         <div className="approval-packet-call" key={call.tool_call_id}>
+          {(() => {
+            const bindingComplete = completeCallBinding(call);
+            return (
+              <>
           <div>
             <strong>{call.tool_name}</strong>
             <StatusBadge value={call.risk} />
           </div>
           <p>{call.reason}</p>
-          <small>{call.resource_scope} · {call.expected_side_effect}</small>
-          <small>Rollback: {call.rollback}</small>
+          {!bindingComplete ? (
+            <p className="engineering-failure">
+              Immutable call evidence is incomplete. Approval is disabled;
+              deny this call and request a fresh packet.
+            </p>
+          ) : null}
+          <dl className="approval-packet-facts">
+            <div>
+              <dt>Exact call</dt>
+              <dd>
+                <code>{call.tool_call_id}</code>
+                <code>{call.call_digest}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>Capability</dt>
+              <dd>
+                <code>{`tool:${call.tool_name}`}</code>
+                <span>{`revision ${call.capability_revision}`}</span>
+              </dd>
+            </div>
+            <div>
+              <dt>Target resource</dt>
+              <dd>
+                <span>{call.resource_scope}</span>
+                <code>{call.resource_digest}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>Validity</dt>
+              <dd>Valid until decision or binding change</dd>
+            </div>
+            <div>
+              <dt>Consequence</dt>
+              <dd>{call.expected_side_effect}</dd>
+            </div>
+            <div>
+              <dt>Rollback</dt>
+              <dd>{call.rollback}</dd>
+            </div>
+          </dl>
+          <EvidenceDrawer
+            title={`Arguments for ${call.tool_name}`}
+            records={[
+              {
+                label: `${call.tool_name} exact arguments`,
+                value: call.arguments,
+              },
+            ]}
+          />
           {packet.status === "pending" ? (
             <div role="group" aria-label={`Decision for ${call.tool_name}`}>
               <button
@@ -578,6 +634,7 @@ function ApprovalPacketCard({
                 type="button"
                 className={decisions[call.tool_call_id] === true ? "active" : ""}
                 aria-pressed={decisions[call.tool_call_id] === true}
+                disabled={!bindingComplete}
                 onClick={() => setDecisions((current) => ({
                   ...current,
                   [call.tool_call_id]: true
@@ -587,6 +644,9 @@ function ApprovalPacketCard({
               </button>
             </div>
           ) : null}
+              </>
+            );
+          })()}
         </div>
       ))}
       {packet.status === "pending" ? (
@@ -595,6 +655,20 @@ function ApprovalPacketCard({
         </button>
       ) : null}
     </article>
+  );
+}
+
+function completeCallBinding(call: ApprovalPacketCall): boolean {
+  return Boolean(
+    call.tool_call_id &&
+      call.tool_name &&
+      call.arguments &&
+      typeof call.arguments === "object" &&
+      !Array.isArray(call.arguments) &&
+      /^[a-f0-9]{64}$/i.test(call.call_digest) &&
+      Number.isSafeInteger(call.capability_revision) &&
+      call.capability_revision >= 0 &&
+      /^[a-f0-9]{64}$/i.test(call.resource_digest),
   );
 }
 

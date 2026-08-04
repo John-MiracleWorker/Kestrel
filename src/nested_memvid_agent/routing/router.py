@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
+from ..lan_runtime_authority import LAN_OPENAI_RUNTIME_HARDENING_VERSION
+from .ledger_registry import (
+    _has_reserved_lan_prefix,
+    _lan_is_managed_metadata,
+    _parse_lan_timestamp,
+    _validate_managed_lan_target_model,
+)
 from .models import (
     AgentTaskContract,
     ModelTarget,
@@ -25,6 +34,41 @@ class ReviewDiversityContext:
     model_family: str | None = None
 
 
+@dataclass(frozen=True)
+class EligibilityEvaluation:
+    """Result of the normal hard eligibility filter for one target.
+
+    Ordinary routing and Flock qualification preview both call
+    :func:`evaluate_target_eligibility`; there is no parallel approximation.
+    """
+
+    target: ModelTarget
+    eligible: bool
+    reason_codes: tuple[str, ...]
+
+
+def evaluate_target_eligibility(
+    contract: AgentTaskContract,
+    target: ModelTarget,
+    policy: RoutePolicy,
+    *,
+    review_context: ReviewDiversityContext | None = None,
+    now: datetime,
+) -> EligibilityEvaluation:
+    """Evaluate *target* against *contract* with the normal hard filters."""
+
+    reasons = _ineligibility_reasons(
+        contract,
+        target,
+        policy,
+        review_context=review_context,
+        now=now,
+    )
+    if reasons:
+        return EligibilityEvaluation(target=target, eligible=False, reason_codes=reasons)
+    return EligibilityEvaluation(target=target, eligible=True, reason_codes=("eligible",))
+
+
 def route_task(
     contract: AgentTaskContract,
     targets: tuple[ModelTarget, ...] | list[ModelTarget],
@@ -33,16 +77,31 @@ def route_task(
     mode: RoutingMode = "shadow",
     direct_target_id: str | None = None,
     review_context: ReviewDiversityContext | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> RouteDecision:
     active_policy = policy or RoutePolicy()
+    now = (clock or (lambda: datetime.now(UTC)))()
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("routing clock must return an aware datetime")
+    now = now.astimezone(UTC)
     candidates = tuple(
-        _candidate(contract, target, active_policy, review_context=review_context)
+        _candidate(
+            contract,
+            target,
+            active_policy,
+            review_context=review_context,
+            now=now,
+        )
         for target in sorted(targets, key=lambda item: item.target_id)
     )
     eligible = [candidate for candidate in candidates if candidate.eligible]
     if direct_target_id is not None:
         selected = next(
-            (candidate for candidate in candidates if candidate.target.target_id == direct_target_id),
+            (
+                candidate
+                for candidate in candidates
+                if candidate.target.target_id == direct_target_id
+            ),
             None,
         )
         if selected is None:
@@ -95,10 +154,22 @@ def _candidate(
     policy: RoutePolicy,
     *,
     review_context: ReviewDiversityContext | None,
+    now: datetime,
 ) -> RouteCandidate:
-    reasons = _ineligibility_reasons(contract, target, policy, review_context=review_context)
-    if reasons:
-        return RouteCandidate(target=target, eligible=False, score=None, reason_codes=reasons)
+    evaluation = evaluate_target_eligibility(
+        contract,
+        target,
+        policy,
+        review_context=review_context,
+        now=now,
+    )
+    if not evaluation.eligible:
+        return RouteCandidate(
+            target=target,
+            eligible=False,
+            score=None,
+            reason_codes=evaluation.reason_codes,
+        )
     components = _score_components(contract, target, policy, review_context=review_context)
     score = round(sum(components.values()), 8)
     return RouteCandidate(
@@ -116,8 +187,9 @@ def _ineligibility_reasons(
     policy: RoutePolicy,
     *,
     review_context: ReviewDiversityContext | None,
+    now: datetime,
 ) -> tuple[str, ...]:
-    reasons: list[str] = []
+    reasons = list(managed_lan_target_guard_reasons(target, now=now))
     if not target.enabled:
         reasons.append("target_disabled")
     if target.health in {"open", "unavailable"}:
@@ -165,7 +237,10 @@ def _ineligibility_reasons(
     if contract.maximum_cost_usd is not None and target.estimated_cost_usd is None:
         reasons.append("cost_unknown_under_hard_budget")
     if contract.role == "reviewer" and review_context is not None:
-        if policy.require_different_target_for_review and target.target_id == review_context.target_id:
+        if (
+            policy.require_different_target_for_review
+            and target.target_id == review_context.target_id
+        ):
             reasons.append("review_target_not_independent")
         target_family = str(target.metadata.get("model_family", "")).strip()
         if (
@@ -176,6 +251,42 @@ def _ineligibility_reasons(
         ):
             reasons.append("review_model_family_not_independent")
     return tuple(sorted(set(reasons)))
+
+
+def managed_lan_target_guard_reasons(
+    target: ModelTarget,
+    *,
+    now: datetime,
+) -> tuple[str, ...]:
+    """Return closed independent guard reasons for a discovery-managed LAN target."""
+
+    marker = (
+        _has_reserved_lan_prefix(target.target_id)
+        or _has_reserved_lan_prefix(target.provider_profile_id)
+        or _lan_is_managed_metadata(target.metadata)
+    )
+    if not marker:
+        return ()
+    try:
+        protected = _validate_managed_lan_target_model(target)
+        reviewed = protected["reviewed"]
+        fresh_until = _parse_lan_timestamp(protected["fresh_until"], "fresh_until")
+        stale_reasons = protected["stale_reasons"]
+    except (KeyError, TypeError, ValueError):
+        return ("lan_binding_invalid",)
+
+    reasons: list[str] = []
+    if not target.enabled:
+        reasons.append("lan_target_disabled")
+    if now >= fresh_until:
+        reasons.append("lan_evidence_expired")
+    if stale_reasons:
+        reasons.append("lan_binding_stale")
+    if not reviewed:
+        reasons.append("lan_owner_review_required")
+    if protected["runtime_hardening"] != LAN_OPENAI_RUNTIME_HARDENING_VERSION:
+        reasons.append("lan_runtime_hardening_unavailable")
+    return tuple(reasons)
 
 
 def _score_components(

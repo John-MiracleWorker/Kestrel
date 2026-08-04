@@ -1,0 +1,20 @@
+{
+  "corpus_digest": "e27013e46546fda9c4f20c9768487e55343e4a7a6865356c05850e8072a03661",
+  "corpus_id": "flock_qualification",
+  "corpus_version": "v1",
+  "fixtures": {
+    "abstention_v1": {
+      "file": "abstention.json",
+      "sha256": "ba5dd09551df6a2d59475db690d55547e9ac7c6ac3c15016d9a3abccdb6ec902"
+    },
+    "cost_accounting_v1": {
+      "file": "cost_accounting.json",
+      "sha256": "7a32987a413f9cba38b061531f708a94c4266065efd5ad998ef3329271ea7a37"
+    },
+    "routing_guardrails_v1": {
+      "file": "routing_guardrails.json",
+      "sha256": "5128704ac354f69209561e0b2a5ee9bf145b161c5726bcc06329c9d3a7bbd966"
+    }
+  },
+  "schema_version": 1
+}

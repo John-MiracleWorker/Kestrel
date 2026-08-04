@@ -6,7 +6,7 @@ import os
 import re
 import secrets
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module
@@ -88,6 +88,8 @@ class SecretBroker:
     `resolve()` for runtime injection into channels, MCP processes, or provider
     adapters.
     """
+
+    desktop_readiness: Any | None = None
 
     def __init__(self, vault_path: Path, *, allowed_env_names: set[str] | None = None) -> None:
         self.vault_path = Path(vault_path)
@@ -226,6 +228,51 @@ class SecretBroker:
         env_configured = bool(os.getenv(ref, "").strip())
         return {"source_env": ref, "configured": env_configured, "validated": False, "source": "env" if env_configured else "missing"}
 
+    def metadata_status(self, name_or_ref: str | None) -> dict[str, Any]:
+        """Project configuration metadata without routing through `resolve()`."""
+
+        ref = (name_or_ref or "").strip()
+        if not ref:
+            return {"configured": False}
+        data = self._read()
+        record: dict[str, Any] | None = None
+        if is_secret_ref(ref):
+            record = self._record_from_data(
+                data,
+                ref.removeprefix(_SECRET_REF_PREFIX),
+            )
+        else:
+            record = next(
+                (
+                    candidate
+                    for candidate in self._records_from_data(data)
+                    if str(candidate.get("name", "")).strip() == ref
+                ),
+                None,
+            )
+        if record is not None:
+            sid = str(record.get("id", ""))
+            return {
+                "id": sid,
+                "name": str(record.get("name", "")),
+                "secret_ref": f"{_SECRET_REF_PREFIX}{sid}",
+                "configured": bool(
+                    str(record.get("value", "")).strip()
+                ),
+                "validated": bool(record.get("validated", False)),
+                "source": "broker",
+            }
+        configured = (
+            ref in self.allowed_env_names
+            and bool(os.getenv(ref, "").strip())
+        )
+        return {
+            "source_env": ref,
+            "configured": configured,
+            "validated": False,
+            "source": "env" if configured else "missing",
+        }
+
     def _record(self, secret_id: str) -> dict[str, Any] | None:
         return self._record_from_data(self._read(), secret_id)
 
@@ -351,6 +398,8 @@ class KeyringSecretBroker(SecretBroker):
         allowed_env_names: set[str] | None = None,
         keyring: _KeyringModule | None = None,
         service_name: str = "kestrel.secret_broker",
+        reconcile_on_init: bool = True,
+        on_live_operation_success: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(vault_path, allowed_env_names=allowed_env_names)
         self.keyring: _KeyringModule
@@ -361,7 +410,13 @@ class KeyringSecretBroker(SecretBroker):
         else:
             self.keyring = keyring
         self.service_name = service_name
-        self._reconcile_keyring_state()
+        self._keyring_success_serial = 0
+        self._on_live_operation_success = on_live_operation_success
+        self._deferred_reconciliation_lock = Lock()
+        self._reconciliation_complete = False
+        if reconcile_on_init:
+            self._reconcile_keyring_state()
+            self._reconciliation_complete = True
 
     def store_secret(
         self,
@@ -372,12 +427,14 @@ class KeyringSecretBroker(SecretBroker):
         secret_id: str | None = None,
         validate: bool = False,
     ) -> dict[str, Any]:
+        success_serial = self._keyring_success_serial
         clean_name = name.strip()
         clean_value = value.strip()
         if not clean_name:
             raise ValueError("Secret name is required.")
         if not clean_value:
             raise ValueError("Secret value is required.")
+        self._ensure_reconciled_for_live_operation()
         with self._vault_lock(exclusive=True):
             data = self._read_unlocked()
             self._prepare_keyring_metadata_unlocked(data)
@@ -413,6 +470,7 @@ class KeyringSecretBroker(SecretBroker):
                     new_username,
                     clean_value,
                 )
+                self._record_keyring_success()
             except Exception:
                 self._abort_uncommitted_version(sid, new_username)
             record = {
@@ -438,9 +496,13 @@ class KeyringSecretBroker(SecretBroker):
             except BaseException as exc:
                 self._recover_failed_version_commit(sid, new_username, exc)
             self._finish_pending_cleanup(data, secret_id=sid, operation="store")
-        return self._public(record, salt=salt)
+        result = self._public(record, salt=salt)
+        self._publish_live_success(success_serial)
+        return result
 
     def delete_secret(self, secret_id: str) -> None:
+        success_serial = self._keyring_success_serial
+        self._ensure_reconciled_for_live_operation()
         with self._vault_lock(exclusive=True):
             data = self._read_unlocked()
             self._prepare_keyring_metadata_unlocked(data)
@@ -479,8 +541,11 @@ class KeyringSecretBroker(SecretBroker):
                 sid=sid,
                 record=record,
             )
+        self._publish_live_success(success_serial)
 
     def validate_secret(self, secret_id: str) -> dict[str, Any]:
+        success_serial = self._keyring_success_serial
+        self._ensure_reconciled_for_live_operation()
         with self._vault_lock(exclusive=True):
             data = self._read_unlocked()
             records = data.setdefault("secrets", {})
@@ -501,17 +566,26 @@ class KeyringSecretBroker(SecretBroker):
             record["last_validated_at"] = now
             record["updated_at"] = now
             self._write_unlocked(data)
-        return self._public(record, salt=salt)
+        result = self._public(record, salt=salt)
+        self._publish_live_success(success_serial)
+        return result
 
     def resolve(self, name_or_ref: str | None) -> str | None:
         ref = (name_or_ref or "").strip()
         if not ref:
             return None
+        success_serial = self._keyring_success_serial
+        self._ensure_reconciled_for_live_operation()
+
+        def finish(value: str | None) -> str | None:
+            self._publish_live_success(success_serial)
+            return value
+
         if is_secret_ref(ref):
             record = self._record(ref.removeprefix(_SECRET_REF_PREFIX))
             if record is None:
-                return None
-            return self._record_keyring_value(record)
+                return finish(None)
+            return finish(self._record_keyring_value(record))
         records = self._records()
         # Once a broker-owned name has a durable deletion tombstone, do not
         # silently substitute an environment value while keyring cleanup is
@@ -522,14 +596,61 @@ class KeyringSecretBroker(SecretBroker):
             and self._record_state(record) == _KEYRING_STATE_PENDING_DELETE
             for record in records
         ):
-            return None
+            return finish(None)
         env_value = os.getenv(ref, "").strip()
         if env_value:
-            return _tracked_secret_value(env_value)
+            return finish(_tracked_secret_value(env_value))
         for record in records:
             if str(record.get("name", "")).strip() == ref:
-                return self._record_keyring_value(record)
-        return None
+                return finish(self._record_keyring_value(record))
+        return finish(None)
+
+    def metadata_status(self, name_or_ref: str | None) -> dict[str, Any]:
+        """Inspect only durable keyring pointers; never retrieve a value."""
+
+        ref = (name_or_ref or "").strip()
+        if not ref:
+            return {"configured": False}
+        data = self._read()
+        record: dict[str, Any] | None = None
+        if is_secret_ref(ref):
+            record = self._record_from_data(
+                data,
+                ref.removeprefix(_SECRET_REF_PREFIX),
+            )
+        else:
+            record = next(
+                (
+                    candidate
+                    for candidate in self._records_from_data(data)
+                    if str(candidate.get("name", "")).strip() == ref
+                ),
+                None,
+            )
+        if record is not None:
+            sid = str(record.get("id", ""))
+            configured = (
+                self._record_state(record)
+                == _KEYRING_STATE_ACTIVE
+            )
+            return {
+                "id": sid,
+                "name": str(record.get("name", "")),
+                "secret_ref": f"{_SECRET_REF_PREFIX}{sid}",
+                "configured": configured,
+                "validated": bool(record.get("validated", False)),
+                "source": "keyring",
+            }
+        configured = (
+            ref in self.allowed_env_names
+            and bool(os.getenv(ref, "").strip())
+        )
+        return {
+            "source_env": ref,
+            "configured": configured,
+            "validated": False,
+            "source": "env" if configured else "missing",
+        }
 
     def _public(self, record: dict[str, Any], *, salt: str | None = None) -> dict[str, Any]:
         secret_id = str(record.get("id", ""))
@@ -565,7 +686,33 @@ class KeyringSecretBroker(SecretBroker):
         if not _valid_legacy_keyring_identifier(username):
             return None
         value = self.keyring.get_password(self.service_name, username)
+        self._record_keyring_success()
         return _tracked_secret_value(value)
+
+    def _record_keyring_success(self) -> None:
+        self._keyring_success_serial += 1
+
+    def _ensure_reconciled_for_live_operation(self) -> None:
+        if self._reconciliation_complete:
+            return
+        with self._deferred_reconciliation_lock:
+            if self._reconciliation_complete:
+                return
+            self._reconcile_keyring_state()
+            self._reconciliation_complete = True
+
+    def _publish_live_success(self, previous_serial: int) -> None:
+        if (
+            self._keyring_success_serial <= previous_serial
+            or self._on_live_operation_success is None
+        ):
+            return
+        try:
+            self._on_live_operation_success()
+        except Exception:
+            # Readiness publication cannot turn a completed secret operation
+            # into a reported failure.
+            return
 
     def _allocate_versioned_username(self, data: dict[str, Any], sid: str) -> str:
         records = data.get("secrets", {})
@@ -586,6 +733,7 @@ class KeyringSecretBroker(SecretBroker):
                 continue
             try:
                 existing = self.keyring.get_password(self.service_name, candidate)
+                self._record_keyring_success()
             except Exception:
                 raise RuntimeError(
                     f"Unable to verify a new keyring username for secret id {sid}."
@@ -964,6 +1112,7 @@ class KeyringSecretBroker(SecretBroker):
             return False
         try:
             self.keyring.delete_password(self.service_name, username)
+            self._record_keyring_success()
             return True
         except Exception:
             try:
@@ -1010,6 +1159,12 @@ def build_secret_broker(
 ) -> SecretBroker:
     env_backend = os.getenv("NEST_AGENT_SECRET_BACKEND") or "json"
     selected = (backend or env_backend).strip().lower()
+    if selected == "desktop":
+        from .desktop_credentials import build_desktop_secret_broker
+
+        return build_desktop_secret_broker(
+            Path(vault_path).parent.parent
+        )
     if selected in {"", "json", "file", "local"}:
         return SecretBroker(vault_path, allowed_env_names=allowed_env_names)
     if selected == "keyring":
@@ -1073,7 +1228,7 @@ def _unique_keyring_usernames(values: Iterable[str]) -> tuple[str, ...]:
 
 
 def _fingerprint(value: str, *, salt: str) -> str:
-    return "sha256:" + hashlib.sha256((salt + value).encode("utf-8")).hexdigest()[:12]
+    return "sha256:" + hashlib.sha256((salt + value).encode("utf-8")).hexdigest()[:12]  # codeql[py/weak-sensitive-data-hashing] — non-crypto identity digest
 
 
 def _ensure_fingerprint_salt(data: dict[str, Any]) -> str:

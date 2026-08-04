@@ -133,6 +133,71 @@ def test_routing_preview_explains_task_without_executing_model(tmp_path: Path) -
         assert build.runs.mcp.shutdown()
 
 
+def test_service_evaluate_targets_matches_route_task_candidates() -> None:
+    from datetime import UTC, datetime
+
+    from nested_memvid_agent.routing import (
+        AdaptiveFlockRoutingService,
+        AgentTaskContract,
+        ModelTarget,
+        ProviderProfile,
+        route_task,
+    )
+
+    clock = lambda: datetime(2026, 8, 1, 12, 0, tzinfo=UTC)  # noqa: E731
+    profile = ProviderProfile(
+        profile_id="local",
+        display_name="Local server",
+        adapter="openai-compatible",
+        base_url="http://127.0.0.1:1234/v1",
+        locality="local",
+    )
+    healthy = ModelTarget(
+        target_id="local-healthy",
+        provider_profile_id="local",
+        provider="openai-compatible",
+        model="qwen-coder",
+        locality="local",
+        health="healthy",
+        quality_tier=3,
+    )
+    disabled = ModelTarget(
+        target_id="local-disabled",
+        provider_profile_id="local",
+        provider="openai-compatible",
+        model="qwen-coder",
+        enabled=False,
+        locality="local",
+        health="healthy",
+        quality_tier=3,
+    )
+    service = AdaptiveFlockRoutingService(
+        profiles=[profile],
+        targets=[healthy, disabled],
+        mode="shadow",
+        clock=clock,
+    )
+    contract = AgentTaskContract(
+        task_id="task-parity",
+        run_id="run-parity",
+        role="worker",
+        task_family="repository_inspection",
+        objective="Compare eligibility evaluation with ordinary routing.",
+        complexity=0.2,
+        ambiguity=0.1,
+        risk="low",
+        local_required=True,
+    )
+    evaluations = service.evaluate_targets(contract)
+    decision = route_task(contract, [healthy, disabled], clock=clock)
+    candidates = {candidate.target.target_id: candidate for candidate in decision.candidates}
+    assert {evaluation.target.target_id for evaluation in evaluations} == set(candidates)
+    for evaluation in evaluations:
+        candidate = candidates[evaluation.target.target_id]
+        assert evaluation.eligible == candidate.eligible
+        assert evaluation.reason_codes == candidate.reason_codes
+
+
 def test_routing_preview_returns_rejection_reasons_when_no_target_is_eligible(
     tmp_path: Path,
 ) -> None:

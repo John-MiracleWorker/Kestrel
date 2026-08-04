@@ -26,6 +26,7 @@ jobs:
             dir --redact=100 --no-banner .
 
   python:
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +76,12 @@ jobs:
         run: shellcheck install.sh scripts/*.sh
       - name: Tests
         run: pytest -q
+      - name: LAN discovery adversarial security suite
+        run: >-
+          pytest -q
+          tests/test_lan_discovery_security.py
+          tests/test_lan_scanner.py
+          tests/test_server_lan_discovery_routes.py
       - name: Preload digest-pinned golden validation image
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         env:
@@ -240,6 +247,54 @@ jobs:
       - name: Build web
         run: npm run build
         working-directory: web
+
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+      - name: Typecheck desktop
+        run: npm run test:typecheck
+        working-directory: desktop
+      - name: Test desktop
+        run: npm test
+        working-directory: desktop
+      - name: Validate developer directory bundle contracts
+        run: npm run test:build-dir
+        working-directory: desktop
+      - name: Audit desktop dependencies
+        run: npm run audit:reviewed
+        working-directory: desktop
+      - name: Check desktop dependency licenses
+        run: npm run licenses:check
+        working-directory: desktop
+      - name: Build desktop contracts
+        run: npm run build
+        working-directory: desktop
+      - name: Build web renderer for e2e
+        run: npm ci && npm run build
+        working-directory: web
+      - name: Install Playwright chromium
+        run: npx playwright install chromium --with-deps
+        working-directory: desktop
+      - name: Run installed-renderer e2e journeys
+        run: npm run e2e
+        working-directory: desktop
+      - name: Run LAN discovery adversarial e2e journeys
+        run: npm run e2e -- lan-discovery
+        working-directory: desktop
+      - name: Run deterministic flock qualification e2e journeys
+        run: npm run e2e -- flock-qualification
+        working-directory: desktop
 
   codeql:
     name: CodeQL

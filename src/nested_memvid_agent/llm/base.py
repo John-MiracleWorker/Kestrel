@@ -17,6 +17,7 @@ class ProviderError(RuntimeError):
 @dataclass(frozen=True)
 class ProviderCapabilities:
     name: str
+    supports_tools: bool = True
     supports_native_tools: bool = False
     supports_streaming: bool = False
     supports_json_mode: bool = False
@@ -28,6 +29,7 @@ class ProviderCapabilities:
     def to_payload(self) -> dict[str, object]:
         return {
             "name": self.name,
+            "supports_tools": self.supports_tools,
             "supports_native_tools": self.supports_native_tools,
             "supports_streaming": self.supports_streaming,
             "supports_json_mode": self.supports_json_mode,
@@ -84,6 +86,7 @@ class FallbackLLMProvider(LLMProvider):
         secondary = self.secondary.capabilities
         return ProviderCapabilities(
             name=f"fallback:{primary.name}->{secondary.name}",
+            supports_tools=primary.supports_tools and secondary.supports_tools,
             supports_native_tools=primary.supports_native_tools and secondary.supports_native_tools,
             supports_streaming=primary.supports_streaming and secondary.supports_streaming,
             supports_json_mode=primary.supports_json_mode and secondary.supports_json_mode,

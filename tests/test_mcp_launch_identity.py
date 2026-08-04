@@ -75,7 +75,7 @@ def test_launch_artifact_byte_io_uses_binary_descriptors(
         if Path(path) in {source, destination}:
             observed_flags.append(flags)
         native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
-        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(mcp_module.os, "O_BINARY", synthetic_binary_flag, raising=False)
     monkeypatch.setattr(mcp_module.os, "open", open_without_synthetic_flag)
@@ -1146,7 +1146,11 @@ def test_keyring_metadata_does_not_block_stdio_approval(tmp_path: Path) -> None:
     assert approved["vetting"]["connect_approved"] is True
 
 
-def test_keyring_records_block_stdio_without_resolving_values(tmp_path: Path) -> None:
+@pytest.mark.parametrize("secret_backend", ["keyring", "desktop"])
+def test_keyring_records_block_stdio_without_resolving_values(
+    tmp_path: Path,
+    secret_backend: str,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     metadata = workspace / "keyring-metadata.json"
@@ -1172,7 +1176,7 @@ def test_keyring_records_block_stdio_without_resolving_values(tmp_path: Path) ->
         AgentStateStore(tmp_path / "state.db"),
         workspace=workspace,
         secret_store_path=metadata,
-        secret_backend="keyring",
+        secret_backend=secret_backend,
         secret_resolver=lambda ref: resolved.append(ref) or "unreachable",
     )
     manager.add_server(

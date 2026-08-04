@@ -17,3 +17,6 @@ ae2bb227c10818a90e81ffd7c8473cca065af8ec:tests/test_security_boundary.py:generic
 4082624696a3420f263faa83bf63f1f4b66550a1:tests/test_security_boundary.py:generic-api-key:134
 bd646c1352dd95768614b488f0caf1e883395cfc:tests/test_learning_architecture_eval.py:generic-api-key:52
 bd646c1352dd95768614b488f0caf1e883395cfc:tests/test_learning_architecture_eval.py:generic-api-key:74
+
+# Synthetic token proving provider-error redaction is digested and never persisted raw.
+tests/test_flock_qualification_evidence.py:generic-api-key:169

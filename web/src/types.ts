@@ -1,3 +1,9 @@
+export type DesktopRuntimeMarker = Readonly<{
+  schema: "kestrel.desktop.runtime.v1";
+  baseUrl: string;
+  generation: number;
+}>;
+
 export type Run = {
   run_id: string;
   project_id?: string | null;
@@ -46,6 +52,10 @@ export type Approval = {
   tool_name: string;
   arguments: Record<string, unknown>;
   risk: string;
+  principal?: string;
+  expires_at?: string | null;
+  capability_revision?: number;
+  resource_digest?: string;
   status: string;
   decision?: Record<string, unknown> | null;
   result?: Record<string, unknown> | null;
@@ -618,6 +628,43 @@ export type SetupReadinessCheck = {
   recovery: string;
 };
 
+export type DesktopCredentialStorageReadiness = {
+  schema: "kestrel.desktop_credential_readiness.v1";
+  state:
+    | "available"
+    | "session_only"
+    | "locked_vault_required"
+    | "unavailable";
+  backend: string | null;
+  persistence: "persistent" | "session" | "none";
+  reason: string;
+  remediation: string;
+};
+
+export type DesktopRecoveryReason =
+  | "sidecar_unavailable"
+  | "sidecar_unverified"
+  | "payload_verification_failed"
+  | "profile_conflict"
+  | "version_incompatible"
+  | "state_incompatible"
+  | "state_corrupt"
+  | "memvid_reopen_failed"
+  | "sidecar_crash_loop"
+  | "credential_backend_unavailable"
+  | "reconciliation_required";
+
+export type DesktopRecoveryActionResult =
+  | { accepted: true }
+  | {
+      accepted: false;
+      reason:
+        | "not_in_recovery"
+        | "recovery_blocked"
+        | "retry_rate_limited"
+        | "retry_failed";
+    };
+
 export type SetupReadinessReport = {
   schema: string;
   ready: boolean;
@@ -627,6 +674,7 @@ export type SetupReadinessReport = {
   fail_count: number;
   checks: SetupReadinessCheck[];
   next_action: string;
+  credential_storage?: DesktopCredentialStorageReadiness;
 };
 
 export type ApiResult = Record<string, unknown>;

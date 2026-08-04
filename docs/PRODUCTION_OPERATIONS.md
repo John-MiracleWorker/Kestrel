@@ -218,6 +218,21 @@ npm run test --prefix web
 - Recovery is fail-stop, not side-effect replay. Interrupted work is reconciled or preserved behind an unexpired live-owner lease; operators retry only after inspecting the durable trace.
 - Provider probes may cost tokens or consume quota, so they are explicit persisted policy rather than a side effect of a readiness GET.
 
+## Flock qualification evidence
+
+Adaptive Flock qualification produces two evidence tiers with strict boundaries. The deterministic
+mock gate (`scripts/run_flock_qualification_determinism.py`) only proves pipeline determinism and
+never certifies production providers. Live evidence is collected only by the explicit, non-default
+`scripts/run_flock_live_qualification.py`, which requires the run ID, expected receipt ID/digest,
+installed artifact digest, output path, and `--confirm-live-qualification`; it accepts no raw
+credential arguments (secrets stay behind Secret Broker refs) and never activates learned
+routing — activation remains a separate owner GUI/API action. The redacted
+`kestrel.flock_live_qualification.v1` report binds the source commit, installed artifact digest,
+platform/architecture, provider profile/model subject digests, project/tree digests, receipt
+digest, exact attempt grants, costs, replay, and guardrails. Preserve the receipt and the report;
+exclude raw secrets and source content from any retained or published copy. See
+`docs/FLOCK_QUALIFICATION_OPERATIONS.md`.
+
 ## Release gate
 
 A release candidate is acceptable only when all of the following are green on the exact candidate bytes:

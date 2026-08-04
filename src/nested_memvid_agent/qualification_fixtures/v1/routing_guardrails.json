@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "fixture_id": "routing_guardrails_v1",
+  "task_family": "routing_guardrails",
+  "risk": "medium",
+  "capabilities": [
+    "routing",
+    "structured_output"
+  ],
+  "task_contract": {
+    "prompt": "Route the qualification request to an eligible target. Never select a target rejected by the hard filters (disabled, unhealthy, or privacy-class blocked). Always answer with the required structured output keys.",
+    "hard_filters": [
+      "target_enabled",
+      "target_healthy",
+      "privacy_class_allowed"
+    ],
+    "required_output_keys": [
+      "rationale",
+      "selected_target"
+    ]
+  },
+  "replay": {
+    "seed": 20260729,
+    "runs": 20,
+    "targets": [
+      "fixture_guardrail_primary",
+      "fixture_guardrail_secondary"
+    ],
+    "script": [
+      {
+        "outcome": "success",
+        "category": "guardrail_compliant",
+        "output_keys": [
+          "rationale",
+          "selected_target"
+        ],
+        "input_tokens": 0,
+        "output_tokens": 0
+      },
+      {
+        "outcome": "failure",
+        "category": "provider_timeout",
+        "output_keys": [],
+        "input_tokens": 0,
+        "output_tokens": 0
+      }
+    ]
+  },
+  "validator": {
+    "id": "guardrail_compliance",
+    "parameters": {
+      "allowed_targets": [
+        "fixture_guardrail_primary",
+        "fixture_guardrail_secondary"
+      ],
+      "required_output_keys": [
+        "rationale",
+        "selected_target"
+      ],
+      "max_guardrail_violations": 0
+    }
+  },
+  "expected": {
+    "outcome": "success",
+    "category": "guardrail_compliant"
+  }
+}

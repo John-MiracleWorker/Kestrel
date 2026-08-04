@@ -18,7 +18,7 @@ param(
     [string] $Path = "Auto",
 
     [ValidatePattern("^[0-9]+(?:\.[0-9]+)+(?:[A-Za-z0-9.+-]*)?$")]
-    [string] $Version = "0.5.1",
+    [string] $Version = "0.5.2",
 
     [switch] $Json
 )
@@ -76,6 +76,11 @@ function Invoke-BoundedProbe {
         [Parameter(Mandatory = $true)][string] $Executable,
         [Parameter(Mandatory = $true)][string[]] $Arguments
     )
+
+    # Defense in depth: drop any null/empty elements so a caller that built the
+    # array with a $null prefix can't trip "Cannot bind argument ... empty
+    # string" downstream in ArgumentList/ConvertTo-ProcessArgument.
+    $Arguments = @($Arguments | Where-Object { -not [string]::IsNullOrEmpty($_) })
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $Executable
@@ -193,9 +198,15 @@ foreach ($candidate in $pythonCandidates) {
     if ($null -eq $candidateExecutable) {
         continue
     }
-    $pythonArguments = @($candidate.prefix) + @(
-        "-c",
-        'import struct,sys;print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{struct.calcsize(''P'') * 8}")'
+    # @() + $candidate.prefix can yield a leading $null when prefix is an empty
+    # array (hashtable array properties surface as $null), and a $null element
+    # binds to [string] as an empty string -> "Cannot bind argument ... empty
+    # string". Strip null/empty entries before binding.
+    $pythonArguments = @(
+        @() + $candidate.prefix + @(
+            "-c",
+            'import struct,sys;print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{struct.calcsize(''P'') * 8}")'
+        ) | Where-Object { -not [string]::IsNullOrEmpty($_) }
     )
     $pythonProbe = Invoke-BoundedProbe -Executable $candidateExecutable -Arguments $pythonArguments
     $pythonMatch = [regex]::Match(
@@ -205,7 +216,10 @@ foreach ($candidate in $pythonCandidates) {
     if (-not $pythonMatch.Success) {
         continue
     }
-    $pipArguments = @($candidate.prefix) + @("-m", "pip", "--version")
+    $pipArguments = @(
+        @() + $candidate.prefix + @("-m", "pip", "--version") |
+            Where-Object { -not [string]::IsNullOrEmpty($_) }
+    )
     $pipProbe = Invoke-BoundedProbe -Executable $candidateExecutable -Arguments $pipArguments
     if ($pipProbe.exit_code -eq 0 -and $pipProbe.stdout -match '^pip\s+[0-9]') {
         $pythonSelection = [ordered] @{

@@ -1,0 +1,105 @@
+/* Projects workspace — Wildflower product surface.
+   Loaded after legacy CSS so semantic tokens and shell layout win. */
+
+.projects-overview,
+.projects-editor,
+.projects-index,
+.projects-history {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.projects-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.projects-table th {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-strong);
+  color: var(--ink-muted);
+  font-weight: 600;
+  text-align: left;
+}
+
+.projects-table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.projects-table tr[data-selected="true"] td {
+  background: color-mix(in srgb, var(--surface-raised, var(--surface)) 60%, transparent);
+}
+
+.projects-select {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.projects-select strong {
+  color: var(--accent, inherit);
+}
+
+.projects-facts {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.projects-facts > div {
+  display: grid;
+  grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: start;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.projects-facts dt {
+  color: var(--ink-muted);
+  font-weight: 600;
+}
+
+.projects-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.projects-path {
+  display: block;
+}
+
+.projects-authority-preview {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-medium);
+}
+
+.projects-authority-preview h3 {
+  margin: 0;
+  font: 650 1.15rem/1.2 var(--serif, serif);
+}
+
+.projects-index-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.projects-move-storage {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+}

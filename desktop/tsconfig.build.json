@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": false,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": [
+    "src/contracts.ts",
+    "src/preload.ts",
+    "src/main.ts",
+    "src/main/**/*.ts"
+  ],
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/main/credential-ipc.ts"
+  ]
+}

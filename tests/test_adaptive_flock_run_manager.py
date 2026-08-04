@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -276,6 +277,52 @@ def test_constrained_unavailable_router_fails_before_provider_execution(monkeypa
     assert "routing.guardrail_blocked" in {
         event_type for _, event_type, _ in events.items
     }
+
+
+def test_terminal_outcome_normalizes_provider_failure_evidence(monkeypatch: Any) -> None:
+    state = _State()
+    events = _Events()
+    coordinator = _Coordinator()
+    manager = _manager(state, events, coordinator)
+
+    def parent_run(*_args: Any, **_kwargs: Any) -> None:
+        state.task = replace(
+            state.task,
+            status="failed",
+            result={
+                "acceptance_validation": {
+                    "passed": False,
+                    "failure_codes": ["tests_failed"],
+                },
+                "provider_usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "provider_failure_codes": ["rate_limit_exceeded"],
+                    "provider_request_id": "req-raw-99",
+                },
+            },
+        )
+        state.subagent = replace(state.subagent, status="failed")
+
+    monkeypatch.setattr(RunManager, "_run_subagent", parent_run)
+    monkeypatch.setattr(AdaptiveFlockRunManager, "_is_cancelled", lambda _self, _run_id: False)
+
+    manager._run_subagent(
+        "thread",
+        AgentConfig(provider="mock", model="baseline"),
+        "subagent-route",
+        "run-route",
+        "session-route",
+    )
+
+    outcome = coordinator.outcomes[0]
+    assert outcome["failure_category"] == "provider_rate_limit"
+    assert outcome["provider_failure_code"] == "rate_limit_exceeded"
+    assert outcome["input_tokens"] == 120
+    assert outcome["output_tokens"] == 30
+    expected_digest = hashlib.sha256(b"req-raw-99").hexdigest()
+    assert f"provider_request:{expected_digest}" in outcome["evidence_refs"]
+    assert "req-raw-99" not in str(outcome["evidence_refs"])
 
 
 def test_approval_block_does_not_record_terminal_route_outcome(monkeypatch: Any) -> None:

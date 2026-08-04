@@ -21,6 +21,9 @@ from datetime import UTC, datetime
 from math import exp, isfinite, log
 from typing import Any
 
+from .qualification_evidence import PROVIDER_SIDE_FAILURE_CATEGORIES
+from .qualification_models import QualificationThresholds
+
 
 @dataclass(frozen=True)
 class LearnedRouterConfig:
@@ -49,6 +52,30 @@ class LearnedRouterConfig:
             raise ValueError("cost_coverage_threshold must be between 0 and 1")
         if self.decay_half_life_days <= 0:
             raise ValueError("decay_half_life_days must be positive")
+
+    @classmethod
+    def from_qualification_thresholds(
+        cls,
+        thresholds: QualificationThresholds,
+    ) -> LearnedRouterConfig:
+        """Map snapshotted qualification thresholds onto router config exactly.
+
+        Qualification evaluation reuses the learned router's utility math and
+        decay semantics, so every threshold the owner tuned for qualification
+        must be applied verbatim: support, confidence, utility margin, cost
+        coverage, and decay half-life are mapped one-to-one with no implicit
+        defaults. Router-only gates (hard filters, high-risk families, replay
+        gate) stay at their explicit router defaults; qualification enforces
+        its own risk, coverage, guardrail, and binding rules.
+        """
+        return cls(
+            min_examples=thresholds.min_examples_per_scope,
+            min_target_examples=thresholds.min_examples_per_target,
+            confidence_threshold=thresholds.confidence_threshold,
+            activation_margin=thresholds.utility_margin,
+            cost_coverage_threshold=thresholds.cost_coverage_threshold,
+            decay_half_life_days=float(thresholds.decay_half_life_days),
+        )
 
 
 @dataclass(frozen=True)
@@ -130,8 +157,10 @@ class LearnedRouterState:
         """Build deterministic state from a list of routing examples.
 
         The state is order-independent: shuffling the input examples produces
-        the same state. Provider outages (failure_category == 'provider_outage')
-        do not count against task quality.
+        the same state. Provider-side failures (``provider_outage`` and
+        ``provider_rate_limit``) do not count against task quality: they are
+        excluded from validation rates, cost/latency averages, and effective
+        sample sizes.
         """
         if not examples:
             return cls(config_digest=_config_digest(config))
@@ -149,10 +178,10 @@ class LearnedRouterState:
 
         target_scores: dict[str, TargetScore] = {}
         for target_id, target_exs in sorted(target_examples.items()):
-            # Separate provider outages from task-quality outcomes
+            # Separate provider-side failures from task-quality outcomes
             task_quality_exs = [
                 ex for ex in target_exs
-                if ex.failure_category != "provider_outage"
+                if ex.failure_category not in PROVIDER_SIDE_FAILURE_CATEGORIES
             ]
 
             # Validation rate is based on task-quality outcomes only
@@ -203,7 +232,7 @@ class LearnedRouterState:
                 effective_sample_size=round(
                     sum(
                         _example_weight(ex, reference_time=reference_time, config=config)
-                        for ex in target_exs
+                        for ex in task_quality_exs
                     ),
                     8,
                 ),

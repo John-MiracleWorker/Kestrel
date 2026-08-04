@@ -36,6 +36,7 @@ def _make_config(
     worktree_path: str | None = None,
     branch: str = "feature/test-1",
     trust_domain: str = "local",
+    containment: str = "isolated_worktree",
 ) -> NativeWorkerConfig:
     return NativeWorkerConfig(
         worker_id=worker_id,
@@ -43,6 +44,7 @@ def _make_config(
         branch=branch,
         objective="rename variable foo to bar in src/app.py",
         trust_domain=trust_domain,
+        containment=containment,
         command="codex --quiet --print",
     )
 
@@ -255,6 +257,42 @@ class TestMergeProposalGuard:
         merge_proposals = [a for a in artifacts if a.kind == "merge_proposal"]
         assert len(merge_proposals) == 1
         assert merge_proposals[0].metadata.get("pushed_remote") is False
+
+
+# ---------------------------------------------------------------------------
+# Candidate code never falls back to host containment (Adaptive Flock Task 8)
+# ---------------------------------------------------------------------------
+
+class TestNativeWorkerContainment:
+    def test_default_containment_is_isolated_worktree(self):
+        config = _make_config()
+        assert config.containment == "isolated_worktree"
+
+    def test_qualified_containment_is_accepted(self):
+        config = NativeWorkerConfig(
+            worker_id="worker-qc",
+            worktree_path="/tmp/worktree-qc",
+            branch="feature/qc",
+            objective="run inside qualified containment",
+            containment="qualified_containment",
+        )
+        adapter = NativeWorkerAdapter()
+        worker = adapter.start(config)
+        assert worker.config.containment == "qualified_containment"
+
+    def test_host_execution_is_rejected(self):
+        with pytest.raises(ValueError, match="containment_required"):
+            NativeWorkerConfig(
+                worker_id="worker-host",
+                worktree_path="/tmp/worktree-host",
+                branch="feature/host",
+                objective="must never execute on the host",
+                containment="host",
+            )
+
+    def test_read_only_containment_is_rejected_for_mutating_workers(self):
+        with pytest.raises(ValueError, match="containment_required"):
+            _make_config(containment="read_only")
 
 
 # ---------------------------------------------------------------------------

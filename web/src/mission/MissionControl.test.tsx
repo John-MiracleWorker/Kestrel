@@ -1,7 +1,8 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import axe from "axe-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { requestMatchesLegacyContract } from "../testing/apiFixtures";
 import type { Run, TaskGraph } from "../types";
 import { MissionControl } from "./MissionControl";
 import type { MissionLaunch, MissionPreflight, ProjectProfile } from "./types";
@@ -114,6 +115,260 @@ describe("MissionControl", () => {
     vi.unstubAllGlobals();
   });
 
+  function renderMissionControl(
+    overrides: Partial<Parameters<typeof MissionControl>[0]> = {},
+  ) {
+    return render(
+      <MissionControl
+        runs={[]}
+        activeRun={null}
+        taskGraph={null}
+        approvals={[]}
+        events={[]}
+        onLaunch={async () => undefined}
+        onOpenRun={() => undefined}
+        onOpenHistory={() => undefined}
+        onOpenAdvanced={() => undefined}
+        onOpenDiagnostics={() => undefined}
+        onPrepareTool={() => undefined}
+        onDecideApproval={() => undefined}
+        onContinueConversation={async () => undefined}
+        onAuthRequired={() => undefined}
+        {...overrides}
+      />,
+    );
+  }
+
+  // P1-3: an out-of-order (older) preflight response that resolves after
+  // the objective was edited must not repopulate launch authority for
+  // the new objective.
+  it("ignores a stale preflight response that resolves after the objective changed", async () => {
+    const deferred: Array<{
+      body: Record<string, unknown>;
+      resolve: (response: Response) => void;
+    }> = [];
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") {
+        return Promise.resolve(jsonResponse({ items: [project], count: 1 }));
+      }
+      if (path.endsWith("/mission/preflight") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Promise<Response>((resolve) => {
+          deferred.push({ body, resolve });
+        });
+      }
+      return Promise.resolve(jsonResponse({ detail: "not_found" }, 404));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onLaunch = vi.fn<(mission: MissionLaunch) => Promise<void>>(async () => undefined);
+
+    renderMissionControl({ onLaunch });
+
+    await screen.findByRole("option", { name: "Kestrel" });
+    const objectiveInput = screen.getByLabelText("Objective");
+    fireEvent.change(objectiveInput, {
+      target: { value: preflight.objective },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    await waitFor(() => expect(deferred).toHaveLength(1));
+
+    // Edit the objective while the review is in flight; launch authority
+    // for the old objective must be dropped immediately.
+    fireEvent.change(objectiveInput, {
+      target: { value: "Changed objective after review started" },
+    });
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
+
+    // The stale response arrives late and must be rejected. Wrap the
+    // out-of-band resolution in act() so the rejection state flush
+    // (preflightPending clearing) is committed before asserting.
+    await act(async () => {
+      deferred[0]?.resolve(
+        jsonResponse({ ...preflight, objective: preflight.objective }),
+      );
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Start mission" }),
+      ).toBeDisabled(),
+    );
+    expect(screen.queryByText("Ready to start")).not.toBeInTheDocument();
+
+    // A fresh review for the changed objective is accepted. Wait for
+    // the in-flight review state to clear before requesting it.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Review mission" }),
+      ).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    await waitFor(() => expect(deferred).toHaveLength(2));
+    await act(async () => {
+      deferred[1]?.resolve(
+        jsonResponse({
+          ...preflight,
+          objective: "Changed objective after review started",
+        }),
+      );
+    });
+    expect(await screen.findByText("Ready to start")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Start mission" }));
+    await waitFor(() => expect(onLaunch).toHaveBeenCalledTimes(1));
+    expect(onLaunch.mock.calls[0]?.[0].objective).toBe(
+      "Changed objective after review started",
+    );
+  });
+
+  // P1-3: a failed re-review must not leave an earlier can_start
+  // projection available for launch.
+  it("clears launch authority when a re-review fails after a successful review", async () => {
+    let preflightCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") {
+        return jsonResponse({ items: [project], count: 1 });
+      }
+      if (path.endsWith("/mission/preflight") && init?.method === "POST") {
+        preflightCalls += 1;
+        if (preflightCalls === 1) return jsonResponse(preflight);
+        throw new Error("preflight service unavailable");
+      }
+      return jsonResponse({ detail: "not_found" }, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onLaunch = vi.fn<(mission: MissionLaunch) => Promise<void>>(async () => undefined);
+
+    renderMissionControl({ onLaunch });
+
+    await screen.findByRole("option", { name: "Kestrel" });
+    fireEvent.change(screen.getByLabelText("Objective"), {
+      target: { value: preflight.objective },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    expect(await screen.findByText("Ready to start")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    await waitFor(() => expect(preflightCalls).toBe(2));
+    await screen.findByText(/preflight service unavailable/i);
+
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
+    expect(screen.queryByText("Ready to start")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Start mission" }));
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
+  // P1-3: launchMission must re-verify that the accepted projection still
+  // matches the current objective before posting a run.
+  it("refuses to launch when the objective changed after review without re-review", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") {
+        return jsonResponse({ items: [project], count: 1 });
+      }
+      if (path.endsWith("/mission/preflight") && init?.method === "POST") {
+        return jsonResponse(preflight);
+      }
+      return jsonResponse({ detail: "not_found" }, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onLaunch = vi.fn<(mission: MissionLaunch) => Promise<void>>(async () => undefined);
+
+    renderMissionControl({ onLaunch });
+
+    await screen.findByRole("option", { name: "Kestrel" });
+    fireEvent.change(screen.getByLabelText("Objective"), {
+      target: { value: preflight.objective },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    expect(await screen.findByText("Ready to start")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeEnabled();
+
+    // Change the objective after review; the accepted projection no longer
+    // matches the current input, so launch must be refused.
+    fireEvent.change(screen.getByLabelText("Objective"), {
+      target: { value: "Unreviewed objective edit" },
+    });
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Start mission" }));
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
+  // P1-3: a template change after review invalidates the projection for
+  // the previously reviewed template.
+  it("refuses to launch when the template changed after review without re-review", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") {
+        return jsonResponse({ items: [project], count: 1 });
+      }
+      if (path.endsWith("/mission/preflight") && init?.method === "POST") {
+        return jsonResponse(preflight);
+      }
+      return jsonResponse({ detail: "not_found" }, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onLaunch = vi.fn<(mission: MissionLaunch) => Promise<void>>(async () => undefined);
+
+    renderMissionControl({ onLaunch });
+
+    await screen.findByRole("option", { name: "Kestrel" });
+    fireEvent.change(screen.getByLabelText("Objective"), {
+      target: { value: preflight.objective },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    expect(await screen.findByText("Ready to start")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /Explain repo/i }));
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Start mission" }));
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
+  // P1-3: if the project revision drifts (re-indexed elsewhere) the
+  // accepted projection bound to the old revision must not launch.
+  it("refuses to launch when the project revision drifts after review", async () => {
+    let projectsCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") {
+        projectsCalls += 1;
+        return jsonResponse({
+          items: [projectsCalls === 1 ? project : { ...project, revision: 2 }],
+          count: 1,
+        });
+      }
+      if (path.endsWith("/mission/preflight") && init?.method === "POST") {
+        return jsonResponse(preflight);
+      }
+      return jsonResponse({ detail: "not_found" }, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onLaunch = vi.fn<(mission: MissionLaunch) => Promise<void>>(async () => undefined);
+
+    renderMissionControl({ onLaunch });
+
+    await screen.findByRole("option", { name: "Kestrel" });
+    fireEvent.change(screen.getByLabelText("Objective"), {
+      target: { value: preflight.objective },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    expect(await screen.findByText("Ready to start")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeEnabled();
+
+    // Simulate a project refresh returning a bumped revision.
+    fireEvent.click(screen.getByRole("button", { name: "Refresh projects" }));
+    await waitFor(() => expect(projectsCalls).toBe(2));
+
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Start mission" }));
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
   it("keeps project, plan, proof forecast, editing, and launch in one task-first flow", async () => {
     const onLaunch = vi.fn<(mission: MissionLaunch) => Promise<void>>(async () => undefined);
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -152,34 +407,38 @@ describe("MissionControl", () => {
         onOpenAdvanced={() => undefined}
         onOpenDiagnostics={() => undefined}
         onPrepareTool={() => undefined}
+        onDecideApproval={() => undefined}
+        onContinueConversation={async () => undefined}
         onAuthRequired={() => undefined}
       />
     );
 
     expect(await screen.findByRole("option", { name: "Kestrel" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "What should Kestrel accomplish?" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
 
-    fireEvent.change(screen.getByLabelText("Engineering objective"), {
+    fireEvent.change(screen.getByLabelText("Objective"), {
       target: { value: preflight.objective }
     });
-    fireEvent.click(screen.getByRole("button", { name: "Inspect plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
 
     expect(await screen.findByText("Map the failure")).toBeInTheDocument();
-    expect(screen.getAllByText("2 local changes")).toHaveLength(2);
+    expect(
+      screen.getAllByText(/2 local changes/).length,
+    ).toBeGreaterThan(0);
     expect(screen.getByText("Local model ready")).toBeInTheDocument();
-    expect(screen.getByText("Ready to run")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run mission" })).toBeEnabled();
+    expect(screen.getByText("Ready to start")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeEnabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit acceptance plan" }));
     const title = screen.getByLabelText("Task 1 title");
     fireEvent.change(title, { target: { value: "Map the auth failure" } });
     expect(screen.getByRole("button", { name: "Finish editing plan" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Finish editing" }));
     await waitFor(() => expect(
-      screen.getByRole("button", { name: "Run mission" })
+      screen.getByRole("button", { name: "Start mission" })
     ).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Run mission" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start mission" }));
 
     await waitFor(() => expect(onLaunch).toHaveBeenCalledTimes(1));
     expect(onLaunch.mock.calls[0]?.[0].plan[0]?.title).toBe("Map the auth failure");
@@ -187,11 +446,41 @@ describe("MissionControl", () => {
       `/api/projects/${project.project_id}/mission/preflight`,
       expect.objectContaining({ method: "POST" })
     );
+    const initialPreflightCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input) ===
+          `/api/projects/${project.project_id}/mission/preflight` &&
+        init?.method === "POST" &&
+        !Object.hasOwn(
+          JSON.parse(String(init.body ?? "{}")),
+          "mission_plan",
+        ),
+    );
+    expect(
+      initialPreflightCall &&
+        requestMatchesLegacyContract("missionPreflight", {
+          path: String(initialPreflightCall[0]),
+          method: String(initialPreflightCall[1]?.method ?? "GET"),
+          body: JSON.parse(
+            String(initialPreflightCall[1]?.body ?? "{}"),
+          ),
+        }),
+    ).toBe(true);
     const reboundCall = fetchMock.mock.calls.find(([_input, init]) => {
       const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}"));
       return Array.isArray(body.mission_plan);
     });
     expect(reboundCall).toBeDefined();
+    expect(onLaunch.mock.calls[0]?.[0]).toMatchObject({
+      project: { revision: 1 },
+      preflight: {
+        project_revision: 1,
+        launch_binding: {
+          schema: "kestrel.mission_launch_binding.v1",
+          project_revision: 1,
+        },
+      },
+    });
 
     const report = await axe.run(container);
     expect(report.violations).toEqual([]);
@@ -224,18 +513,20 @@ describe("MissionControl", () => {
         onOpenAdvanced={() => undefined}
         onOpenDiagnostics={() => undefined}
         onPrepareTool={() => undefined}
+        onDecideApproval={() => undefined}
+        onContinueConversation={async () => undefined}
         onAuthRequired={() => undefined}
       />
     );
 
     await screen.findByRole("option", { name: "Kestrel" });
-    fireEvent.change(screen.getByLabelText("Engineering objective"), {
+    fireEvent.change(screen.getByLabelText("Objective"), {
       target: { value: preflight.objective }
     });
-    fireEvent.click(screen.getByRole("button", { name: "Inspect plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
 
     expect(await screen.findByText("Connect and validate a provider target.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
   });
 
   it("rebuilds a missing project index through the revision-bound project API", async () => {
@@ -304,15 +595,17 @@ describe("MissionControl", () => {
         onOpenAdvanced={() => undefined}
         onOpenDiagnostics={() => undefined}
         onPrepareTool={() => undefined}
+        onDecideApproval={() => undefined}
+        onContinueConversation={async () => undefined}
         onAuthRequired={() => undefined}
       />
     );
 
     await screen.findByRole("option", { name: "Kestrel" });
-    fireEvent.change(screen.getByLabelText("Engineering objective"), {
+    fireEvent.change(screen.getByLabelText("Objective"), {
       target: { value: preflight.objective }
     });
-    fireEvent.click(screen.getByRole("button", { name: "Inspect plan" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
     const rebuild = await screen.findByRole("button", {
       name: "Rebuild project index"
     });
@@ -327,6 +620,60 @@ describe("MissionControl", () => {
     expect(JSON.parse(String((rebuildCall?.[1] as RequestInit | undefined)?.body))).toEqual({
       expected_project_revision: 1
     });
+  });
+
+  // P2-1: an existing active run reloaded with no in-memory preflight
+  // must render a distinct durable active-run authority snapshot —
+  // never the compose-time "Not inspected"/"Review required" language.
+  it("renders a durable active-run authority snapshot after reload", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input), "http://kestrel.test").pathname;
+      if (path === "/api/projects") return jsonResponse({ items: [project], count: 1 });
+      return jsonResponse({ detail: path }, 404);
+    }));
+    const run: Run = {
+      run_id: "run_active_reload",
+      project_id: project.project_id,
+      status: "running",
+      message: "Fix the failing authentication test",
+      session_id: "session_active_reload",
+      workspace: project.repository_path,
+      provider: "local",
+      model: "local",
+      assistant_message: "Working through the acceptance plan.",
+      tool_count: 2,
+      context_chars: 800,
+      stop_reason: "",
+      created_at: "2026-07-27T12:00:00Z",
+      updated_at: "2026-07-27T12:05:00Z"
+    };
+
+    renderMissionControl({ runs: [run], activeRun: run });
+
+    // Durable project/run evidence is shown.
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Selected repository"),
+      ).toHaveTextContent("/tmp/kestrel"),
+    );
+    expect(screen.getByText("Active run")).toBeInTheDocument();
+    // The launch-time binding is not persisted in the current Run
+    // projection; that absence must be stated explicitly rather than
+    // substituting compose-time preflight language.
+    expect(
+      screen.getAllByText(
+        /launch-time binding not persisted in current projection/i,
+      ).length,
+    ).toBeGreaterThan(0);
+    // Compose-time "never inspected" language must not appear.
+    expect(
+      screen.queryByText(/no run can start until/i),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Not inspected")).not.toBeInTheDocument();
+    // The read-only active-run context never offers a launch action.
+    expect(
+      screen.queryByRole("button", { name: "Start mission" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps completed repair proof and gated acceptance in the mission timeline", async () => {
@@ -443,14 +790,22 @@ describe("MissionControl", () => {
         onOpenAdvanced={() => undefined}
         onOpenDiagnostics={() => undefined}
         onPrepareTool={onPrepareTool}
+        onDecideApproval={() => undefined}
+        onContinueConversation={async () => undefined}
         onAuthRequired={() => undefined}
       />
     );
 
-    expect(await screen.findByRole("option", { name: "Kestrel" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Selected repository"),
+      ).toHaveTextContent("/tmp/kestrel"),
+    );
     expect(screen.getByLabelText("Repair Patch Review")).toBeInTheDocument();
     expect(screen.getByText("Authentication regression passes")).toBeInTheDocument();
-    expect(screen.getByText(/\+return True/)).toBeInTheDocument();
+    expect(
+      screen.getByText("+return True", { selector: ".diff-add" }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Prepare exact-call patch export" }));
     expect(onPrepareTool).toHaveBeenCalledWith("git.export_patch", {
       repair_review_id: reviewId,

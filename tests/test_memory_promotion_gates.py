@@ -323,3 +323,47 @@ def _with_unsafe_test_envelope(record: MemoryRecord, source_id: str) -> MemoryRe
     }
     record.evidence.append(EvidenceRef(source="memory_record", locator=source_id))
     return record
+
+
+def test_flock_qualification_and_activation_write_zero_records_across_layers(tmp_path: Path) -> None:
+    """Adaptive Flock plan, Task 21: a completed Flock qualification run,
+    scope activation, and learned routing under the active grant never reach
+    the promotion-gated memory system — zero writes on any layer and zero
+    learning-kernel decisions, even with policy writes enabled.
+    """
+    from test_flock_no_policy_memory import run_completed_qualification_and_activation
+
+    writes: list[MemoryRecord] = []
+
+    def spying_factory(*, path: Path, layer: MemoryLayer, **kwargs: object) -> InMemoryBackend:
+        backend = InMemoryBackend(path=path, layer=layer, **kwargs)
+        original_put = backend.put
+
+        def put(record: MemoryRecord) -> str:
+            writes.append(record)
+            return original_put(record)
+
+        backend.put = put  # type: ignore[method-assign]
+        return backend
+
+    memory = LayeredMemorySystem.from_backend_factory(
+        tmp_path / "memory",
+        spying_factory,
+        enforce_stable_write_integrity=False,
+    )
+    kernel = NestedLearningKernel()
+    signals: list[LearningSignal] = []
+    original_decide = kernel.decide
+
+    def spied_decide(signal: LearningSignal, *, action: str = "write"):
+        signals.append(signal)
+        return original_decide(signal, action=action)
+
+    kernel.decide = spied_decide  # type: ignore[method-assign]
+
+    run_completed_qualification_and_activation(tmp_path)
+
+    assert writes == []
+    assert signals == []
+    for layer in MemoryLayer:
+        assert list(memory.iter_records(layer)) == []

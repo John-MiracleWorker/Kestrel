@@ -6,7 +6,12 @@ import pytest
 
 from nested_memvid_agent.llm.base import LLMProvider, ProviderError
 from nested_memvid_agent.llm.parser import ControlMessageError
-from nested_memvid_agent.llm.resilience import ProviderHealthRegistry, ResilientLLMProvider
+from nested_memvid_agent.llm.resilience import (
+    ProviderHealthRegistry,
+    ResilientLLMProvider,
+    classify_provider_error,
+)
+from nested_memvid_agent.routing.qualification_evidence import normalize_provider_attempt
 from nested_memvid_agent.runtime_models import LLMResponse
 
 
@@ -129,3 +134,45 @@ def test_abandoned_half_open_stream_releases_the_probe_slot() -> None:
 
     assert resilient.generate([], []).content == "recovered"
     assert registry.snapshot("primary")["state"] == "healthy"
+
+
+def test_classified_provider_errors_normalize_to_typed_failure_categories() -> None:
+    timeout = classify_provider_error(
+        ProviderError("upstream timeout", code="TimeoutError", retryable=True)
+    )
+    assert timeout.code == "timeout"
+    timeout_evidence = normalize_provider_attempt(
+        {
+            "subject_id": "decision-resilience-timeout",
+            "run_id": "run-resilience",
+            "task_id": "task-resilience",
+            "target_id": "primary",
+            "provider": "primary",
+            "profile_id": "profile-primary",
+            "model": "model-primary",
+            "status": "provider_error",
+            "error_code": timeout.code,
+            "error": str(timeout),
+        }
+    )
+    assert timeout_evidence.failure_category == "provider_outage"
+
+    limited = classify_provider_error(
+        ProviderError("HTTP 429 too many requests", code="HTTPError", retryable=True)
+    )
+    assert limited.code == "rate_limit"
+    limited_evidence = normalize_provider_attempt(
+        {
+            "subject_id": "decision-resilience-rate-limit",
+            "run_id": "run-resilience",
+            "task_id": "task-resilience",
+            "target_id": "primary",
+            "provider": "primary",
+            "profile_id": "profile-primary",
+            "model": "model-primary",
+            "status": "provider_error",
+            "error_code": limited.code,
+            "error": str(limited),
+        }
+    )
+    assert limited_evidence.failure_category == "provider_rate_limit"

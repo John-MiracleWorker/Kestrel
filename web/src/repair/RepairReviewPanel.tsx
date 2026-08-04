@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { InlineMeta, StatusBadge } from "../components";
+import { EvidenceDrawer } from "../mission/EvidenceDrawer";
 import type { TaskNode } from "../types";
 
 export function RepairReviewPanel({
@@ -264,6 +265,35 @@ export function RepairReviewPanel({
           </div>
         )}
       </div>
+      <EvidenceDrawer
+        title="Repair evidence records"
+        records={[
+          ...(validationArtifact
+            ? [
+                {
+                  label: "Validation receipt",
+                  value: validationArtifact,
+                },
+              ]
+            : []),
+          ...(reviewArtifact
+            ? [
+                {
+                  label: "Signed review receipt",
+                  value: reviewArtifact,
+                },
+              ]
+            : []),
+          ...(rollbackResult
+            ? [
+                {
+                  label: "Rollback receipt",
+                  value: rollbackResult,
+                },
+              ]
+            : []),
+        ]}
+      />
     </section>
   );
 }

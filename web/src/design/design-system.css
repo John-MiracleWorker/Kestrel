@@ -1,0 +1,400 @@
+.wf-button {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 2.5rem;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-small);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-offset);
+  font: 700 0.9rem/1.1 var(--sans);
+  letter-spacing: 0.005em;
+  cursor: pointer;
+  transition:
+    transform var(--motion-fast) ease,
+    box-shadow var(--motion-fast) ease,
+    border-color var(--motion-fast) ease,
+    background var(--motion-fast) ease;
+}
+
+.wf-button-small {
+  min-height: 2rem;
+  padding: 0.4rem 0.65rem;
+  font-size: 0.8rem;
+}
+
+.wf-button-primary {
+  border-color: var(--action);
+  background: var(--action);
+  color: var(--on-action);
+}
+
+.wf-button-secondary {
+  background: var(--surface);
+}
+
+.wf-button-quiet {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--structural);
+}
+
+.wf-button-danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: var(--on-action);
+}
+
+.wf-button:hover:not(:disabled) {
+  border-color: var(--focus);
+}
+
+.wf-button:active:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+
+.wf-button:focus-visible,
+.wf-disclosure-trigger:focus-visible {
+  outline: 2px solid var(--surface);
+  outline-offset: 1px;
+  box-shadow:
+    0 0 0 4px var(--focus),
+    var(--shadow-offset);
+}
+
+.wf-button:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.wf-button-spinner {
+  /* Keyframe-loop allowlist: wf-spin — indefinite status spinner, covered by the
+     global 1ms reduce override in tokens.css; not a --motion-* candidate. */
+  animation: wf-spin 900ms linear infinite;
+}
+
+@keyframes wf-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.wf-card {
+  display: grid;
+  min-width: 0;
+  overflow: clip;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-large) var(--radius-medium)
+    calc(var(--radius-large) + 0.2rem) var(--radius-medium);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-offset);
+}
+
+.wf-card.panel {
+  gap: 0;
+  padding: 0;
+}
+
+.wf-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  min-width: 0;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.wf-card-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.2rem;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.wf-card-icon {
+  display: inline-grid;
+  color: var(--action);
+}
+
+.wf-card-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.wf-card-body {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+  padding: var(--space-5);
+}
+
+.wf-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: fit-content;
+  max-width: 100%;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  font: 700 0.75rem/1.2 var(--sans);
+  white-space: nowrap;
+}
+
+.wf-status-healthy {
+  border-color: var(--success);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.wf-status-blocked {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.wf-status-waiting {
+  border-color: var(--info);
+  background: var(--info-soft);
+  color: var(--info);
+}
+
+.wf-status-caution {
+  border-color: var(--caution);
+  background: var(--caution-soft);
+  color: var(--caution);
+}
+
+.wf-status-inactive {
+  color: var(--muted-ink);
+}
+
+.wf-status-icon {
+  flex: none;
+}
+
+.wf-disclosure {
+  overflow: clip;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  background: var(--surface);
+}
+
+.wf-disclosure-trigger {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.65rem 0.8rem;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 700 0.9rem/1.2 var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+
+.wf-disclosure-chevron {
+  flex: none;
+  transition: transform var(--motion-standard) ease;
+}
+
+.wf-disclosure-trigger[aria-expanded="true"] .wf-disclosure-chevron {
+  transform: rotate(180deg);
+}
+
+.wf-disclosure-content {
+  padding: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.wf-field {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+  color: var(--ink);
+}
+
+.wf-field-label {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.wf-field-control {
+  min-width: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-small);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.wf-field-control:focus-visible {
+  outline: 2px solid var(--surface);
+  outline-offset: 1px;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 4px var(--focus);
+}
+
+:is(.page-shell, .panel)
+  :is(input, select, textarea).wf-field-control:focus-visible {
+  outline: 2px solid var(--surface);
+  outline-offset: 1px;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 4px var(--focus);
+}
+
+.wf-field-hint,
+.wf-field-error {
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.wf-field-hint {
+  color: var(--muted-ink);
+}
+
+.wf-field-error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.wf-notice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--info);
+  border-radius: var(--radius-medium);
+  background: var(--info-soft);
+  color: var(--info);
+}
+
+.wf-notice-success {
+  border-color: var(--success);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.wf-notice-caution {
+  border-color: var(--caution);
+  background: var(--caution-soft);
+  color: var(--caution);
+}
+
+.wf-notice-danger {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.wf-notice-content {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.wf-notice-title {
+  color: var(--ink);
+}
+
+.wf-notice-body {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.wf-notice-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.wf-empty-state {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-3);
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-5);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-medium);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  color: var(--muted-ink);
+}
+
+.wf-empty-state-title {
+  margin: 0;
+  color: var(--ink);
+  font: 650 1.15rem/1.2 var(--serif);
+}
+
+.wf-empty-state-body {
+  max-width: 62ch;
+}
+
+.wf-empty-state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.wf-skeleton {
+  display: grid;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.wf-skeleton-line {
+  display: block;
+  width: max(42%, calc(100% - var(--wf-skeleton-line) * 13%));
+  height: 0.8rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: linear-gradient(
+    100deg,
+    var(--surface-sunken) 20%,
+    var(--surface-raised) 45%,
+    var(--surface-sunken) 70%
+  );
+  background-size: 220% 100%;
+  /* Keyframe-loop allowlist: wf-skeleton-shift — indefinite skeleton shimmer,
+     covered by the global 1ms reduce override in tokens.css. */
+  animation: wf-skeleton-shift 1.5s ease-in-out infinite;
+}
+
+@keyframes wf-skeleton-shift {
+  to {
+    background-position-x: -220%;
+  }
+}
+
+:root[data-reduced-motion="reduce"] .wf-button:active:not(:disabled) {
+  transform: none;
+  box-shadow: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-button:active:not(:disabled) {
+    transform: none;
+    box-shadow: none;
+  }
+}

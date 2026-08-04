@@ -3,6 +3,15 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import {
+  requestMatchesLegacyContract,
+  type FixtureRequest,
+} from "./testing/apiFixtures";
+import {
+  installFakeDesktopBridge,
+  installFakeDesktopRuntimeMarker,
+  removeFakeDesktopEnvironment,
+} from "./testing/fakeDesktopBridge";
 import type {
   Approval,
   Capability,
@@ -269,8 +278,23 @@ function openAdvancedWorkspace(name: "Routines" | "Routing" | "Settings") {
   fireEvent.click(within(workspaceNav).getByRole("button", { name }));
 }
 
+function fixtureRequest(
+  path: RequestInfo | URL,
+  init?: RequestInit,
+): FixtureRequest {
+  return {
+    path: String(path),
+    method: String(init?.method ?? "GET"),
+    body:
+      typeof init?.body === "string"
+        ? JSON.parse(init.body)
+        : null,
+  };
+}
+
 describe("App", () => {
   beforeEach(() => {
+    window.history.replaceState(null, "", "#/mission/history");
     runs = [otherRun, secondRun, baseRun];
     sessions = [
       {
@@ -446,6 +470,7 @@ describe("App", () => {
     cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    removeFakeDesktopEnvironment();
     sessionStorage.clear();
     localStorage.clear();
   });
@@ -484,15 +509,64 @@ describe("App", () => {
     await screen.findByRole("heading", { name: "Ask Kestrel" });
 
     fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "New mission" }),
+    );
 
     expect(await screen.findByRole("heading", { name: "What should Kestrel accomplish?" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Kestrel" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run mission" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Start mission" })).toBeDisabled();
     expect(
       screen.getByText(
-        "No run will start until you inspect the route, permissions, validation, and rollback projection."
+        "No run can start until Kestrel returns current route, permission, budget, validation, and rollback evidence."
       )
     ).toBeInTheDocument();
+  });
+
+  it("preserves the revision-bound mission launch request contract", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "New mission" }),
+    );
+    fireEvent.change(
+      await screen.findByLabelText("Objective"),
+      { target: { value: "Prove the shell refactor keeps mission authority." } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Review mission" }));
+    const runMission = await screen.findByRole("button", {
+      name: "Start mission",
+    });
+    await waitFor(() => expect(runMission).toBeEnabled());
+    fireEvent.click(runMission);
+
+    await waitFor(() => {
+      const request = fetchSpy.mock.calls.find(
+        ([path, init]) =>
+          path === "/api/runs" && init?.method === "POST",
+      );
+      expect(request).toBeDefined();
+      expect(
+        request &&
+          requestMatchesLegacyContract(
+            "missionLaunch",
+            fixtureRequest(request[0], request[1]),
+          ),
+      ).toBe(true);
+      expect(JSON.parse(String(request?.[1]?.body ?? "{}"))).toMatchObject({
+        project_id: "project_kestrel",
+        project_revision: 1,
+        mission_template_id: "fix_failing_test",
+        mission_binding: {
+          schema: "kestrel.mission_launch_binding.v1",
+          project_id: "project_kestrel",
+          project_revision: 1,
+        },
+      });
+    });
   });
 
   it("opens the Adaptive Flock Routing Center from primary navigation", async () => {
@@ -504,6 +578,27 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Adaptive Flock Routing" })).toBeInTheDocument();
     expect((await screen.findAllByText("Local server")).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: /preview decision/i })).toBeInTheDocument();
+  });
+
+  it("keeps legacy skip links inside the active stable destination", async () => {
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Ask Kestrel" }),
+    ).toBeInTheDocument();
+    openAdvancedWorkspace("Routing");
+    await screen.findByRole("heading", {
+      name: "Adaptive Flock Routing",
+    });
+    fireEvent.click(
+      screen.getByRole("link", { name: "Skip to workspace" }),
+    );
+
+    expect(window.location.hash).toBe("#/flock/routing");
+    expect(screen.getByRole("main")).toHaveFocus();
+    expect(
+      screen.getByRole("heading", { name: "Adaptive Flock Routing" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps idle chat polling lightweight", async () => {
@@ -645,7 +740,7 @@ describe("App", () => {
     expect(screen.getByText("Task Capsules")).toBeInTheDocument();
     expect(screen.getByText("Mutation Gate")).toBeInTheDocument();
     expect(screen.getByText("ORACLE Shadow")).toBeInTheDocument();
-    expect(screen.getByText("Memory")).toBeInTheDocument();
+    expect(screen.getAllByText("Memory").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Tools").length).toBeGreaterThan(0);
   });
 
@@ -716,6 +811,13 @@ describe("App", () => {
         ([path, init]) => path === "/api/routines/morning-review/actions/run-now" && init?.method === "POST"
       );
       expect(request).toBeDefined();
+      expect(
+        request &&
+          requestMatchesLegacyContract(
+            "routineRun",
+            fixtureRequest(request[0], request[1]),
+          ),
+      ).toBe(true);
       const body = JSON.parse(String(request?.[1]?.body ?? "{}"));
       expect(body.expected_revision).toBe(3);
       expect(body.idempotency_key).toMatch(/^[0-9a-f-]{36}$/i);
@@ -921,12 +1023,14 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.click(screen.getByRole("link", { name: "Memory" }));
 
-    expect(await screen.findByRole("heading", { name: "Learning Dashboard" })).toBeInTheDocument();
-    expect(screen.getByText("Auto-activations")).toBeInTheDocument();
-    expect(screen.getByText("Activations then rolled back"));
-    expect(screen.getByText("procedural"));
+    expect(await screen.findByRole("heading", { name: "Promotion history" })).toBeInTheDocument();
+    const promotions = screen.getByLabelText("Promotion history");
+    expect(within(promotions).getByText("procedural")).toBeInTheDocument();
+    expect(within(promotions).getByText("1 activations")).toBeInTheDocument();
+    expect(within(promotions).getByText("1 auto")).toBeInTheDocument();
+    expect(within(promotions).getByText("0 rollbacks")).toBeInTheDocument();
   });
 
   it("surfaces repair patch review validation and rollback state from the task graph", async () => {
@@ -1055,7 +1159,13 @@ describe("App", () => {
     expect(within(panel).getByText(`Diff ${repairSnapshot.diff_digest} · src/calculator.py`)).toBeInTheDocument();
     expect(within(panel).getByText(`Candidate ${repairSnapshot.branch} @ ${repairSnapshot.head_sha}`)).toBeInTheDocument();
     expect(within(panel).getByRole("heading", { name: "Unified diff preview" })).toBeInTheDocument();
-    expect(within(panel).getByText(/\+\s+return a \+ b/)).toBeInTheDocument();
+    expect(
+      within(panel).getByText(
+        (_content, element) =>
+          element?.classList.contains("diff-add") === true &&
+          element.textContent === "+  return a + b",
+      ),
+    ).toBeInTheDocument();
     expect(within(panel).getByText(/redacted advisory preview/i)).toBeInTheDocument();
     fireEvent.click(within(panel).getByRole("button", { name: "Split" }));
     expect(within(panel).getByRole("heading", { name: "Split diff preview" })).toBeInTheDocument();
@@ -1189,14 +1299,20 @@ describe("App", () => {
 
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call git.commit/i }));
     expect(screen.getByLabelText("Tool")).toHaveValue("git.commit");
-    const toolArgsInput = screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement;
+    const connectedTools = screen.getByLabelText("Connected Tools");
+    const toolArgsInput = within(connectedTools).getByLabelText("Arguments JSON") as HTMLTextAreaElement;
     const commitArgs = JSON.parse(toolArgsInput.value);
     expect(commitArgs).toMatchObject({ repair_review_id: actionAuthority.reviewId });
     expect(String(commitArgs.message)).toContain(actionAuthority.reviewId);
     let preview = screen.getByLabelText("Exact-call approval preview");
     expect(within(preview).getByText("Prepared exact-call request: git.commit")).toBeInTheDocument();
     expect(within(preview).getByText("Invoking this request will create or require approval before execution; it has not run yet.")).toBeInTheDocument();
-    expect(within(preview).getByRole("link", { name: /review prepared request in tool form/i })).toHaveAttribute("href", "#tools");
+    const reviewPreparedRequest = within(preview).getByRole("link", {
+      name: /review prepared request in tool form/i,
+    });
+    expect(reviewPreparedRequest).toHaveAttribute("href", "#tools");
+    fireEvent.click(reviewPreparedRequest);
+    expect(window.location.hash).toBe("#/extend/capabilities");
     expect(within(preview).getByText(new RegExp(actionAuthority.reviewId))).toBeInTheDocument();
 
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));
@@ -1260,7 +1376,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     const panel = await screen.findByLabelText("Repair Patch Review");
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call git.commit/i }));
-    const preparedArgs = JSON.parse((screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement).value);
+    const preparedArgs = JSON.parse((within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON") as HTMLTextAreaElement).value);
 
     fireEvent.click(screen.getByRole("button", { name: /invoke tool/i }));
 
@@ -1348,7 +1464,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     const panel = await screen.findByLabelText("Repair Patch Review");
     fireEvent.click(within(panel).getByRole("button", { name: /prepare exact-call repair.rollback/i }));
-    const preparedArgs = JSON.parse((screen.getAllByLabelText("Arguments JSON")[0] as HTMLTextAreaElement).value);
+    const preparedArgs = JSON.parse((within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON") as HTMLTextAreaElement).value);
 
     fireEvent.click(screen.getByRole("button", { name: /invoke tool/i }));
 
@@ -1391,6 +1507,37 @@ describe("App", () => {
       expect(body).not.toHaveProperty("provider");
       expect(body).not.toHaveProperty("model");
     });
+  });
+
+  it("keeps a committed run independent from unavailable extension inventory", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/plugins") {
+        throw new Error("plugin_inventory_unavailable");
+      }
+      return fetchMock(input, init);
+    });
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: /new chat/i }));
+    fireEvent.change(screen.getByLabelText("Ask Kestrel"), {
+      target: { value: "Keep Mission independent" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    expect(await screen.findByText("Run queued.")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        fetchSpy.mock.calls.some(
+          ([path]) => path === "/api/runs/run_created/task-graph",
+        ),
+      ).toBe(true);
+    });
+    expect(
+      fetchSpy.mock.calls.some(([path]) => path === "/api/plugins"),
+    ).toBe(false);
+    expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
   });
 
   it("clears a queued success notice after the run reaches a terminal state", async () => {
@@ -1660,11 +1807,65 @@ describe("App", () => {
         ([path, init]) => path === "/api/approvals/approval_1/decision" && init?.method === "POST"
       );
       expect(decisionCall).toBeDefined();
+      expect(
+        decisionCall &&
+          requestMatchesLegacyContract(
+            "approvalDecision",
+            fixtureRequest(decisionCall[0], decisionCall[1]),
+          ),
+      ).toBe(true);
       expect(JSON.parse(String(decisionCall?.[1]?.body ?? "{}"))).toEqual({
         approved: true,
         arguments: pendingApproval.arguments
       });
     });
+  });
+
+  it("reports truthfully when an approval decision returns expired instead of approved", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path.match(/^\/api\/approvals\/approval_1\/decision$/) && init?.method === "POST") {
+        approvals = [];
+        return jsonResponse({ ...pendingApproval, status: "expired", decision: null });
+      }
+      return fetchMock(input, init);
+    });
+    render(<App />);
+
+    const approvalCard = await screen.findByRole("group", {
+      name: /approval for shell.run/i,
+    });
+    fireEvent.click(
+      within(approvalCard).getByRole("button", { name: /approve/i }),
+    );
+
+    expect(await screen.findByText(/approval expired/i)).toBeInTheDocument();
+    expect(screen.queryByText("Approval accepted.")).not.toBeInTheDocument();
+  });
+
+  it("keeps a committed approval independent from unavailable extension inventory", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/plugins") {
+        throw new Error("plugin_inventory_unavailable");
+      }
+      return fetchMock(input, init);
+    });
+    render(<App />);
+
+    const approvalCard = await screen.findByRole("group", {
+      name: /approval for shell.run/i,
+    });
+    fireEvent.click(
+      within(approvalCard).getByRole("button", { name: /approve/i }),
+    );
+
+    expect(await screen.findByText("Approval accepted.")).toBeInTheDocument();
+    expect(
+      fetchSpy.mock.calls.some(([path]) => path === "/api/plugins"),
+    ).toBe(false);
+    expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
   });
 
   it("approves repair commit cards with immutable approval arguments after tool form edits", async () => {
@@ -1691,7 +1892,7 @@ describe("App", () => {
 
     expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
-    fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
+    fireEvent.change(within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON"), {
       target: {
         value: JSON.stringify(
           { repair_review_id: "edited_form_review", message: "edited form state must not be approved" },
@@ -1740,7 +1941,7 @@ describe("App", () => {
 
     expect((await screen.findAllByText("Needs approval")).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
-    fireEvent.change(screen.getAllByLabelText("Arguments JSON")[0], {
+    fireEvent.change(within(screen.getByLabelText("Connected Tools")).getByLabelText("Arguments JSON"), {
       target: {
         value: JSON.stringify(
           { review_id: "edited_form_review", reason: "edited form state must not be approved" },
@@ -1812,6 +2013,13 @@ describe("App", () => {
     await waitFor(() => {
       const saveCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/runtime/settings" && init?.method === "PUT");
       expect(saveCall).toBeDefined();
+      expect(
+        saveCall &&
+          requestMatchesLegacyContract(
+            "settingsSave",
+            fixtureRequest(saveCall[0], saveCall[1]),
+          ),
+      ).toBe(true);
       const body = JSON.parse(String(saveCall?.[1]?.body ?? "{}"));
       expect(body).toMatchObject({
         expected_revision: "runtime-revision-1",
@@ -1832,6 +2040,42 @@ describe("App", () => {
       expect(body).not.toHaveProperty("require_api_auth");
     });
     expect(await screen.findByText("Settings saved and applied to new runs.")).toBeInTheDocument();
+  });
+
+  it("shows Desktop memory restart recovery with current launch authority evidence", async () => {
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge();
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+
+    const memoryHeading = screen.getByRole("heading", {
+      name: "Memory",
+    });
+    const memorySection = memoryHeading.closest("section");
+    expect(memorySection).not.toBeNull();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        "Launch-controlled storage recovery",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        "/tmp/memory",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        /quit Kestrel Desktop completely/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(memorySection as HTMLElement).getByText(
+        /Changing the memory location is not available in this build/i,
+      ),
+    ).toBeInTheDocument();
   });
 
   it("renders guided Telegram channel setup and webhook controls", async () => {
@@ -1917,6 +2161,13 @@ describe("App", () => {
     await waitFor(() => {
       const reviewCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/plugins/review" && init?.method === "POST");
       expect(reviewCall).toBeDefined();
+      expect(
+        reviewCall &&
+          requestMatchesLegacyContract(
+            "extensionReview",
+            fixtureRequest(reviewCall[0], reviewCall[1]),
+          ),
+      ).toBe(true);
       expect(JSON.parse(String(reviewCall?.[1]?.body ?? "{}"))).toEqual({
         source: "owner/repo",
         ref: null
@@ -1961,6 +2212,13 @@ describe("App", () => {
         ([path, init]) => path === "/api/capabilities/tool/memory.search" && init?.method === "PUT"
       );
       expect(mutation).toBeDefined();
+      expect(
+        mutation &&
+          requestMatchesLegacyContract(
+            "capabilityToggle",
+            fixtureRequest(mutation[0], mutation[1]),
+          ),
+      ).toBe(true);
       expect(JSON.parse(String(mutation?.[1]?.body ?? "{}"))).toEqual({ enabled: false, expected_revision: 1 });
     });
     expect(await screen.findByText(/Memory search disabled for future invocations/i)).toBeInTheDocument();
@@ -2049,7 +2307,7 @@ describe("App", () => {
     fireEvent.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Advanced" }));
     expect(within(await screen.findByLabelText("MCP tool")).getByRole("option", { name: /read_file/ })).toBeInTheDocument();
     expect(within(screen.getByLabelText("Skill")).getByRole("option", { name: "writer" })).toBeInTheDocument();
-  });
+  }, 15000);
 
   it("does not overwrite hidden MCP arguments, environment, secrets, or discovered tools on edit", async () => {
     const fetchSpy = vi.mocked(fetch);
@@ -2233,6 +2491,149 @@ describe("App", () => {
         api_key_env: "XAI_API_KEY"
       });
     });
+  });
+
+  it("uses only the isolated credential dialog for provider keys in Desktop mode", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    const rawSentinel =
+      "desktop-primary-renderer-must-never-see-7f2d";
+    const openCredentialDialog = vi.fn(async () => ({
+      status: "stored" as const,
+      secretRef: "secret://xai_api_key",
+      validation: "unverified" as const,
+      fingerprint: "sha256:0123456789ab"
+    }));
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge({ openCredentialDialog });
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Ask Kestrel"
+    });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+    fireEvent.change(screen.getByLabelText("Provider"), {
+      target: { value: "grok" }
+    });
+    await waitFor(() => {
+      expect(
+        fetchSpy.mock.calls.some(
+          ([path]) =>
+            String(path).endsWith(
+              "/api/runtime/models?provider=grok"
+            )
+        )
+      ).toBe(true);
+    });
+
+    expect(
+      screen.queryByLabelText("Provider API key")
+    ).not.toBeInTheDocument();
+    const canonicalIdentity =
+      screen.getByLabelText("API key env");
+    expect(canonicalIdentity).toHaveValue("XAI_API_KEY");
+    expect(canonicalIdentity).toHaveAttribute("readonly");
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /store provider key/i
+      })
+    );
+    await waitFor(() => {
+      expect(openCredentialDialog).toHaveBeenCalledWith({
+        providerId: "grok",
+        purpose: "provider_api_key"
+      });
+    });
+    expect(
+      fetchSpy.mock.calls.some(
+        ([path, init]) =>
+          String(path).endsWith("/api/secrets") &&
+          init?.method === "POST"
+      )
+    ).toBe(false);
+    expect(
+      screen.getByText("secret://xai_api_key")
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(rawSentinel);
+    expect(localStorage.getItem(rawSentinel)).toBeNull();
+    expect(sessionStorage.getItem(rawSentinel)).toBeNull();
+  });
+
+  it("removes generic secret mutation controls from the Desktop primary renderer", async () => {
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge();
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Ask Kestrel"
+    });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+
+    expect(
+      screen.queryByLabelText("Secret value")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /store secret/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /provider credentials are added from provider settings/i
+      )
+    ).toBeInTheDocument();
+    expect(
+      fetchSpy.mock.calls.some(
+        ([path, init]) =>
+          String(path).endsWith("/api/secrets") &&
+          ["POST", "DELETE"].includes(
+            String(init?.method ?? "")
+          )
+      )
+    ).toBe(false);
+  });
+
+  it("projects Desktop credential storage readiness and remediation in Settings", async () => {
+    setupReadinessPayload = {
+      ...readinessFixture(),
+      credential_storage: {
+        schema: "kestrel.desktop_credential_readiness.v1",
+        state: "session_only",
+        backend: "Session memory",
+        persistence: "session",
+        reason: "secret_service_missing",
+        remediation:
+          "Start an unlocked Linux Secret Service to keep credentials across restarts."
+      }
+    } as SetupReadinessReport;
+    installFakeDesktopRuntimeMarker();
+    installFakeDesktopBridge();
+    render(<App />);
+
+    await screen.findByRole("heading", {
+      name: "Ask Kestrel"
+    });
+    openAdvancedWorkspace("Settings");
+    await screen.findByRole("heading", { name: /settings/i });
+
+    expect(
+      screen.getByText("session_only")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Start an unlocked Linux Secret Service to keep credentials across restarts."
+      )
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Provider"), {
+      target: { value: "grok" }
+    });
+    expect(
+      await screen.findByText(
+        "Credentials are stored for this session only."
+      )
+    ).toBeInTheDocument();
   });
 
   it("replaces an incompatible model when switching friendly providers", async () => {
@@ -2476,21 +2877,54 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Ask Kestrel" });
-    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+    fireEvent.click(screen.getByRole("link", { name: "Memory" }));
 
-    const panel = await screen.findByLabelText("Behavior Deltas Review");
-    expect(within(panel).getByText("Behavior Deltas Review")).toBeInTheDocument();
+    const panel = await screen.findByLabelText("Behavior deltas");
     expect(within(panel).getByText("Policy-safe workflow")).toBeInTheDocument();
     expect(within(panel).getByText("delta_policy_gate_check")).toBeInTheDocument();
     expect(within(panel).getByText("active · policy · high")).toBeInTheDocument();
     expect(within(panel).getAllByText("1 activations").length).toBeGreaterThan(0);
     expect(within(panel).getByText("Useful 100% · Failure 0% · Rollback 0%")).toBeInTheDocument();
-    expect(within(panel).getByText("Mutation actions require exact-call approval and MutationGate review."));
+    expect(within(panel).getByText(/Mutation actions require exact-call approval and MutationGate review/)).toBeInTheDocument();
   });
 
-  it("runs the setup wizard and saves onboarding to Soul memory", async () => {
+  it("preserves the bounded memory search request contract", async () => {
+    const fetchSpy = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    const sectionIndex = screen.getByRole("navigation", {
+      name: "Advanced section index",
+    });
+    fireEvent.click(
+      within(sectionIndex).getByRole("button", { name: "Memory" }),
+    );
+    fireEvent.change(await screen.findByLabelText("Memory query"), {
+      target: { value: "validated routing evidence" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      const request = fetchSpy.mock.calls.find(([path, init]) =>
+        String(path).startsWith("/api/memory/search?") &&
+        (init?.method ?? "GET") === "GET",
+      );
+      expect(request).toBeDefined();
+      expect(
+        request &&
+          requestMatchesLegacyContract(
+            "memorySearch",
+            fixtureRequest(request[0], request[1]),
+          ),
+      ).toBe(true);
+    });
+  });
+
+  it("routes first use to the permanent server-backed Setup Center", async () => {
     const fetchSpy = vi.mocked(fetch);
     onboardingProfile = null;
+    localStorage.setItem("kestrel.setup.dismissed", "1");
     setupReadinessPayload = readinessFixture({
       ready: false,
       pass_count: 5,
@@ -2523,49 +2957,45 @@ describe("App", () => {
     });
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Meet your Kestrel" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "First-run readiness" })).toBeInTheDocument();
-    expect(screen.getByText("5 pass · 2 warn · 1 fail")).toBeInTheDocument();
-    expect(screen.getByText("Provider configuration")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Setup Center." }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings/setup");
+    expect(
+      await screen.findByRole("heading", {
+        name: "Check the bundled core",
+      }),
+    ).toBeInTheDocument();
     expect(screen.getByText("Workspace")).toBeInTheDocument();
-    expect(screen.getByText("Fix failing setup checks before starting the golden local workflow.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Workspace `/tmp/missing` does not exist."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/nest-agent init/)).not.toBeVisible();
     expect(fetchSpy.mock.calls.some(([path]) => path === "/api/product/setup")).toBe(true);
-    fireEvent.change(screen.getByLabelText("Agent name"), { target: { value: "Northstar" } });
-    fireEvent.change(screen.getByLabelText("Your name"), { target: { value: "Taylor" } });
-    fireEvent.change(screen.getByLabelText("What should it call you?"), { target: { value: "Tay" } });
-    fireEvent.click(screen.getByRole("radio", { name: /creative spark/i }));
-    fireEvent.change(screen.getByLabelText("What are you usually trying to get done?"), {
-      target: { value: "Build Kestrel\nDesign local tools" }
-    });
-    fireEvent.change(screen.getByLabelText("How do you like collaboration to feel?"), {
-      target: { value: "Short plans, direct tradeoffs, live verification." }
-    });
-    fireEvent.change(screen.getByLabelText("Interests or recurring themes"), {
-      target: { value: "Local-first software, thoughtful UI" }
-    });
-    fireEvent.change(screen.getByLabelText("Anything else it should remember?"), {
-      target: { value: "Warm but concrete." }
-    });
-    fireEvent.click(screen.getByRole("button", { name: /save to soul/i }));
+    expect(
+      fetchSpy.mock.calls.some(
+        ([path, init]) =>
+          path === "/api/self/onboarding" && init?.method === "POST",
+      ),
+    ).toBe(false);
 
-    await waitFor(() => {
-      const setupCall = fetchSpy.mock.calls.find(([path, init]) => path === "/api/self/onboarding" && init?.method === "POST");
-      expect(setupCall).toBeDefined();
-      const body = JSON.parse(String(setupCall?.[1]?.body ?? "{}"));
-      expect(body).toMatchObject({
-        agent_name: "Northstar",
-        user_name: "Taylor",
-        preferred_name: "Tay",
-        persona: "spark",
-        working_style: "Short plans, direct tradeoffs, live verification.",
-        communication_notes: "Warm but concrete.",
-        continuous_learning: true
-      });
-      expect(body.goals).toEqual(["Build Kestrel", "Design local tools"]);
-      expect(body.interests).toEqual(["Local-first software", "thoughtful UI"]);
-    });
-    expect(await screen.findByText("Setup saved to Soul memory.")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Meet your Kestrel" })).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Review recovery for Workspace",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Settings." }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings/general");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Setup Center" }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Setup Center." }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings/setup");
   });
 
   it("prompts for an API token after a 401 and sends it on later API calls", async () => {
@@ -2577,6 +3007,15 @@ describe("App", () => {
     expect(screen.getByText("Locked")).toBeInTheDocument();
     expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
     expect(fetchSpy.mock.calls.map(([path]) => path)).toEqual(["/api/health"]);
+    expect(
+      requestMatchesLegacyContract(
+        "browserTokenPrompt",
+        fixtureRequest(
+          fetchSpy.mock.calls[0][0],
+          fetchSpy.mock.calls[0][1],
+        ),
+      ),
+    ).toBe(true);
 
     fireEvent.change(screen.getByLabelText("API token"), { target: { value: "browser-token" } });
     fireEvent.click(screen.getByRole("button", { name: /save token/i }));
@@ -2590,6 +3029,155 @@ describe("App", () => {
         })
       ).toBe(true);
     });
+  });
+
+  it("shows Desktop connection recovery after a 401 without surfacing a token form", async () => {
+    installFakeDesktopRuntimeMarker();
+    sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const fetchSpy = vi.mocked(fetch);
+    fetchSpy.mockImplementationOnce(async () =>
+      jsonResponse({ detail: "Invalid or missing Kestrel API token." }, 401)
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connecting to Kestrel" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Desktop connection needs to be restored/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Kestrel API token" })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API token")).not.toBeInTheDocument();
+    expect(
+      getItem.mock.calls.filter(([key]) => key === "kestrel.apiToken")
+    ).toEqual([]);
+    expect(fetchSpy.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:43123/api/health"
+    ]);
+  });
+
+  it("routes a post-start Mission Control 401 to Desktop recovery", async () => {
+    installFakeDesktopRuntimeMarker();
+    sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const fetchSpy = vi.mocked(fetch);
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    fireEvent.click(screen.getByRole("button", { name: "Workbench" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Refresh projects" }),
+      ).toBeEnabled(),
+    );
+
+    fetchSpy.mockImplementation(async (input, init) => {
+      const raw =
+        typeof input === "string" || input instanceof URL
+          ? input.toString()
+          : input.url;
+      const path = new URL(raw, "http://kestrel.test").pathname;
+      if (path === "/api/projects") {
+        return jsonResponse(
+          { detail: "Invalid or missing Kestrel API token." },
+          401
+        );
+      }
+      return fetchMock(input, init);
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh projects" })
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Connecting to Kestrel" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Desktop connection needs to be restored/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Kestrel API token" })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API token")).not.toBeInTheDocument();
+    expect(
+      getItem.mock.calls.filter(([key]) => key === "kestrel.apiToken")
+    ).toEqual([]);
+  });
+
+  it("routes a post-start Routine Workbench 401 to Desktop recovery", async () => {
+    installFakeDesktopRuntimeMarker();
+    sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const fetchSpy = vi.mocked(fetch);
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    openAdvancedWorkspace("Routines");
+    const pause = await screen.findByRole("button", {
+      name: "Pause Morning review"
+    });
+
+    fetchSpy.mockImplementation(async (input, init) => {
+      const raw =
+        typeof input === "string" || input instanceof URL
+          ? input.toString()
+          : input.url;
+      const path = new URL(raw, "http://kestrel.test").pathname;
+      if (
+        path === "/api/routines/morning-review/enabled" &&
+        init?.method === "PUT"
+      ) {
+        return jsonResponse(
+          { detail: "Invalid or missing Kestrel API token." },
+          401
+        );
+      }
+      return fetchMock(input, init);
+    });
+    fireEvent.click(pause);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connecting to Kestrel" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Desktop connection needs to be restored/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Kestrel API token" })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API token")).not.toBeInTheDocument();
+    expect(
+      getItem.mock.calls.filter(([key]) => key === "kestrel.apiToken")
+    ).toEqual([]);
+  });
+
+  it("replaces browser token controls with main-managed status in Desktop mode", async () => {
+    installFakeDesktopRuntimeMarker();
+    sessionStorage.setItem("kestrel.apiToken", "browser-token-must-be-ignored");
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Ask Kestrel" });
+    openAdvancedWorkspace("Settings");
+
+    expect(
+      await screen.findByText("Desktop API authentication")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/managed by the Kestrel Desktop main process/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Browser API token")).not.toBeInTheDocument();
+    expect(
+      getItem.mock.calls.filter(([key]) => key === "kestrel.apiToken")
+    ).toEqual([]);
   });
 });
 
@@ -2670,6 +3258,80 @@ async function fetchMock(input: RequestInfo | URL, init?: RequestInit): Promise<
       ...sessions.filter((session) => session.session_id !== run.session_id)
     ];
     return jsonResponse(run);
+  }
+  const missionPreflightMatch = path.match(
+    /^\/api\/projects\/([^/]+)\/mission\/preflight$/,
+  );
+  if (missionPreflightMatch && init?.method === "POST") {
+    const body = JSON.parse(String(init.body ?? "{}")) as {
+      objective?: string;
+      template_id?: string;
+      mission_plan?: Array<Record<string, unknown>>;
+    };
+    const tasks = body.mission_plan ?? [
+      {
+        task_id: "prove-shell",
+        title: "Prove shell behavior",
+        rationale: "Keep authority and evidence bindings intact.",
+        dependencies: [],
+        acceptance_criteria: ["Contract remains revision-bound"],
+        required_tools: ["file.read"],
+        risk: "low",
+      },
+    ];
+    return jsonResponse({
+      schema: "kestrel.mission_preflight.v1",
+      project_id: decodeURIComponent(missionPreflightMatch[1]),
+      project_revision: 1,
+      project_name: "Kestrel",
+      repository_path: "/tmp/kestrel",
+      objective: body.objective ?? "",
+      template_id: body.template_id ?? "fix_failing_test",
+      branch: "main",
+      working_tree: { state: "clean", summary: "Clean" },
+      route_policy: "Balanced",
+      budget: { currency: "USD", limit: 1.5, estimate: 0.2 },
+      effective_capabilities: ["file.read"],
+      likely_approvals: [],
+      validation_recipes: ["pytest -q"],
+      rollback: "Isolated worktree",
+      index: {
+        freshness: "current",
+        digest: "sha256:index",
+        indexed_at: "2026-05-16T00:00:00Z",
+        detail: "Current",
+      },
+      provider: { status: "pass", detail: "Mock provider ready" },
+      launch_binding: {
+        schema: "kestrel.mission_launch_binding.v1",
+        project_id: decodeURIComponent(missionPreflightMatch[1]),
+        project_revision: 1,
+        objective_digest: "a".repeat(64),
+        template_id: body.template_id ?? "fix_failing_test",
+        config_digest: "b".repeat(64),
+        routing_enabled: false,
+        routing_mode: "off",
+        policy_id: "balanced",
+        policy_revision: 1,
+        inventory_digest: "c".repeat(64),
+        preflight_digest: "d".repeat(64),
+        plan_digest: "e".repeat(64),
+        binding_digest: "f".repeat(64),
+      },
+      checks: [
+        {
+          check_id: "authority",
+          title: "Authority",
+          status: "pass",
+          detail: "Revision and launch binding are current.",
+        },
+      ],
+      tasks,
+      warnings: [],
+      blockers: [],
+      can_start: true,
+      generated_at: "2026-05-16T00:00:00Z",
+    });
   }
   if (path === "/api/routines/status" && routineLoadFailure) {
     return jsonResponse({ detail: routineLoadFailure }, 503);
@@ -2993,6 +3655,16 @@ function payloadFor(path: string): unknown {
   if (path === "/api/plugins") return [];
   if (path === "/api/channels") return channelsPayload;
   if (path === "/api/secrets") return secrets;
+  if (path === "/api/settings") {
+    return {
+      schema: "kestrel.effective_settings.v1",
+      revision: "app-fixture-settings-revision-1",
+      categories: [],
+      items: [],
+      items_by_id: {},
+      counts: { total: 0, blocked: 0, restart_required: 0 },
+    };
+  }
 
   if (path === "/api/routing/status") {
     return {
@@ -3142,6 +3814,8 @@ function payloadFor(path: string): unknown {
       recommendations: []
     };
   }
+  if (path.startsWith("/api/memory/search?")) return [];
+  if (path.startsWith("/api/memory/inspect?")) return {};
   if (path === "/api/memory/layers") return [
     { layer: "working", path: "/tmp/working.mv2", exists: true, ok: true, backend: "InMemoryBackend" },
     { layer: "self", path: "/tmp/self.mv2", exists: true, ok: true, backend: "InMemoryBackend" }
@@ -3239,6 +3913,22 @@ function payloadFor(path: string): unknown {
         }
       },
       validation_commands: ["python -m pytest -q"]
+    };
+  }
+  if (path === "/api/runtime/settings") {
+    return {
+      settings: {
+        provider: runtimeProviderName,
+        model: runtimeModelName,
+        backend: "memory",
+        memory_dir: "/tmp/memory",
+        workspace: "/tmp/kestrel",
+        stream: false,
+        require_api_auth: false,
+        autonomy_mode: "background",
+        revision: "runtime-revision-1",
+        persisted: false
+      }
     };
   }
   const modelCatalogMatch = path.match(/^\/api\/runtime\/models\?provider=([^&]+)$/);

@@ -14,6 +14,10 @@ import pytest
 
 from nested_memvid_agent import agent_backup as agent_backup_module
 from nested_memvid_agent.agent_backup import AgentBackupManager
+from nested_memvid_agent.control_plane_integrity import (
+    ROUTING_INTEGRITY_KEY_NAME,
+    ControlPlaneIntegrity,
+)
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayerSpec, load_layer_specs
 from nested_memvid_agent.memory_backup import MemoryBackupError
 from nested_memvid_agent.models import MemoryLayer
@@ -21,11 +25,21 @@ from nested_memvid_agent.repair_integrity import (
     load_repair_artifact,
     write_repair_artifact,
 )
+from nested_memvid_agent.routing.qualification_ledger import QualificationLedger
+from nested_memvid_agent.routing.qualification_models import (
+    CorpusItem,
+    CorpusManifest,
+    MoneyMicros,
+    QualificationScope,
+    QualificationThresholds,
+)
+from nested_memvid_agent.routing.qualification_records import QualificationRunDraft
 from nested_memvid_agent.runtime_ownership import (
     RUNTIME_OWNERSHIP_ERROR,
     PrimaryRuntimeOwnership,
     RuntimeOwnershipError,
 )
+from nested_memvid_agent.state_store import AgentStateStore
 
 
 def _windows_junction(link: Path, target: Path) -> None:
@@ -174,7 +188,7 @@ def test_backup_hash_and_copy_use_binary_descriptors(
         if path_text == source.name or Path(path_text) in {source, target}:
             observed_flags.append(flags)
         native_flags = (flags & ~synthetic_binary_flag) | native_binary_flag
-        return real_open(path, native_flags, mode, dir_fd=dir_fd)
+        return real_open(path, native_flags, mode, dir_fd=dir_fd)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     monkeypatch.setattr(
         agent_backup_module.os,
@@ -1076,9 +1090,9 @@ def test_agent_backup_round_trip_preserves_only_owner_executable_mode(
     _seed_runtime(paths, "backup")
     executable = paths["skills"] / "sample" / "run.sh"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    os.chmod(executable, 0o755)
+    os.chmod(executable, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     ordinary = paths["plugins"] / "sample" / "plugin.json"
-    os.chmod(ordinary, 0o666)
+    os.chmod(ordinary, 0o666)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     manifest = manager.create(retain=4)
     manifest_modes = {entry["path"]: entry["mode"] for entry in manifest["files"]}
     # Windows cannot express a POSIX execute bit through chmod/stat. Preserve
@@ -1125,9 +1139,9 @@ def test_agent_backup_keeps_canonical_modes_when_platform_cannot_enforce_posix_m
     _seed_runtime(paths, "backup")
     executable = paths["skills"] / "sample" / "run.sh"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    os.chmod(executable, 0o755)
+    os.chmod(executable, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     ordinary = paths["plugins"] / "sample" / "plugin.json"
-    os.chmod(ordinary, 0o666)
+    os.chmod(ordinary, 0o666)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     real_chmod = os.chmod
 
     monkeypatch.setattr(agent_backup_module, "_ENFORCE_EXACT_POSIX_MODES", False)
@@ -1159,7 +1173,7 @@ def test_agent_backup_keeps_canonical_modes_when_platform_cannot_enforce_posix_m
         _layer_config_stage: Path | None,
         _layer_files: dict[MemoryLayer, str],
     ) -> None:
-        real_chmod(memory_stage, 0o755)
+        real_chmod(memory_stage, 0o755)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
 
     manager.restore(
         str(manifest["backup_id"]),
@@ -1282,7 +1296,7 @@ def test_agent_backup_keeps_shared_root_mode_and_rejects_symlink_lock(
 
     lock_target = tmp_path / "lock-target"
     lock_target.write_text("do not touch", encoding="utf-8")
-    os.chmod(lock_target, 0o644)
+    os.chmod(lock_target, 0o644)  # codeql[py/overly-permissive-file] — test fixture: proves permission repair
     manager.lock_path.symlink_to(lock_target)
 
     with pytest.raises(MemoryBackupError, match="backup lock"):
@@ -1308,3 +1322,204 @@ def test_agent_backup_resolves_symlinked_parent_before_overlap_check(
             state_path=tmp_path / "runtime" / "state" / "agent.db",
             backup_root=parent_alias / "backups",
         )
+
+
+# -- Adaptive Flock Task 3: routing integrity key travels with SQLite state -----
+
+
+def _seed_state_with_receipt(state_path: Path, value: str) -> str:
+    """Seed a schema-v4 state database holding one qualification receipt."""
+
+    state = AgentStateStore(state_path)
+    ledger = QualificationLedger(state)
+    run = ledger.create_run(_backup_run_draft())
+    receipt = ledger.append_receipt(run.run_id, "case_result", {"value": value})
+    return receipt.receipt_id
+
+
+def _backup_run_draft(run_id: str = "qual_run_1") -> QualificationRunDraft:
+    return QualificationRunDraft(
+        run_id=run_id,
+        owner_principal="owner@example.test",
+        scope=QualificationScope(
+            project_id="project-alpha",
+            task_family="repository_inspection",
+            risk="low",
+            capabilities=("repository_inspection",),
+            policy_id="balanced",
+            policy_revision=1,
+            target_ids=("local-critic", "local-scout"),
+            target_inventory_digest="1" * 64,
+            price_digest="2" * 64,
+            learned_config_digest="3" * 64,
+            project_authority_digest="4" * 64,
+        ),
+        corpus=CorpusManifest(
+            schema_version=1,
+            items=(
+                CorpusItem(
+                    item_id="corpus_item_1",
+                    task_family="repository_inspection",
+                    risk="low",
+                    capabilities=("repository_inspection",),
+                    task_contract_digest="a" * 64,
+                    acceptance_plan_digest="b" * 64,
+                    evidence_kind="synthetic",
+                ),
+            ),
+        ),
+        thresholds=QualificationThresholds(),
+        target_snapshot={"targets": ["local-critic", "local-scout"]},
+        price_snapshot={"source": "operator_verified"},
+        policy_payload={"policy_id": "balanced", "revision": 1},
+        learned_payload={"state": "disabled"},
+        project_authority={"principal": "owner@example.test"},
+        build={"version": "0.5.0", "git": "20f0565"},
+        max_spend=MoneyMicros.from_usd_text("50.00"),
+        effective_stop_cap=MoneyMicros.from_usd_text("25.00"),
+        attempt_ceiling=MoneyMicros.from_usd_text("5.00"),
+    )
+
+
+class _AgentBackupManifestView:
+    """Component-relative manifest paths (``state/agent.db`` style)."""
+
+    def __init__(self, manifest: dict[str, object]) -> None:
+        self._manifest = manifest
+
+    @property
+    def paths(self) -> set[str]:
+        # Normalize to POSIX separators so the ``state/agent.db``-style
+        # assertions hold on Windows (where str(Path) yields backslashes).
+        return {
+            Path(*Path(str(entry["path"])).parts[1:]).as_posix()
+            for entry in self._manifest["files"]  # type: ignore[index]
+        }
+
+
+def create_agent_backup_with_routing_receipt(tmp_path: Path) -> _AgentBackupManifestView:
+    manager, paths = _manager(tmp_path)
+    _seed_memory(paths["memory"], "routing")
+    _seed_state_with_receipt(paths["state"], "routing")
+    ControlPlaneIntegrity(paths["state"].parent)
+    manifest = manager.create()
+    return _AgentBackupManifestView(manifest)
+
+
+def test_backup_keeps_state_and_routing_key_together(tmp_path: Path) -> None:
+    manifest = create_agent_backup_with_routing_receipt(tmp_path)
+    assert "state/agent.db" in manifest.paths
+    assert f"state/{ROUTING_INTEGRITY_KEY_NAME}" in manifest.paths
+
+
+def test_agent_backup_refuses_receipts_without_routing_key(tmp_path: Path) -> None:
+    manager, paths = _manager(tmp_path)
+    _seed_memory(paths["memory"], "nokey")
+    _seed_state_with_receipt(paths["state"], "nokey")
+    assert not (paths["state"].parent / ROUTING_INTEGRITY_KEY_NAME).exists()
+
+    with pytest.raises(MemoryBackupError, match="routing integrity key"):
+        manager.create()
+
+
+def test_agent_restore_replaces_state_and_routing_key_from_one_manifest(
+    tmp_path: Path,
+) -> None:
+    manager, paths = _manager(tmp_path)
+    _seed_memory(paths["memory"], "original")
+    original_receipt_id = _seed_state_with_receipt(paths["state"], "original")
+    ControlPlaneIntegrity(paths["state"].parent)
+    key_path = paths["state"].parent / ROUTING_INTEGRITY_KEY_NAME
+    original_key = key_path.read_bytes()
+    manifest = manager.create()
+
+    # Diverge live state and live key after the backup.
+    key_path.unlink()
+    paths["state"].unlink()
+    for sidecar in ("-wal", "-shm", "-journal"):
+        paths["state"].with_name(paths["state"].name + sidecar).unlink(missing_ok=True)
+    _seed_state_with_receipt_diverged(paths["state"])
+    ControlPlaneIntegrity(paths["state"].parent)
+    assert key_path.read_bytes() != original_key
+
+    restored = manager.restore(str(manifest["backup_id"]))
+
+    assert "routing_integrity_key" in restored["restored_components"]
+    assert "state" in restored["restored_components"]
+    assert key_path.read_bytes() == original_key
+    with closing(sqlite3.connect(paths["state"])) as connection:
+        rows = connection.execute(
+            "SELECT receipt_id FROM routing_qualification_receipts"
+        ).fetchall()
+    assert [str(row[0]) for row in rows] == [original_receipt_id]
+
+
+def _seed_state_with_receipt_diverged(state_path: Path) -> None:
+    state = AgentStateStore(state_path)
+    ledger = QualificationLedger(state)
+    run = ledger.create_run(_backup_run_draft(run_id="qual_run_diverged"))
+    ledger.append_receipt(run.run_id, "case_result", {"value": "diverged"})
+
+
+def test_agent_backup_validation_rejects_manifest_missing_routing_key(
+    tmp_path: Path,
+) -> None:
+    manager, paths = _manager(tmp_path)
+    _seed_memory(paths["memory"], "paired")
+    _seed_state_with_receipt(paths["state"], "paired")
+    ControlPlaneIntegrity(paths["state"].parent)
+    manifest = manager.create()
+
+    # Strip the key from the manifest and from the backup tree, leaving the
+    # receipt-bearing database behind: the pair no longer belongs together.
+    backup_dir = paths["backups"] / str(manifest["backup_id"])
+    manifest_path = backup_dir / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    key_entry = f"components/state/{ROUTING_INTEGRITY_KEY_NAME}"
+    payload["files"] = [entry for entry in payload["files"] if entry["path"] != key_entry]
+    payload["components"]["routing_integrity_key"] = {
+        "kind": "file",
+        "present": False,
+        "required": False,
+        "file_count": 0,
+        "target_name": ROUTING_INTEGRITY_KEY_NAME,
+    }
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    (backup_dir / "components" / "state" / ROUTING_INTEGRITY_KEY_NAME).unlink()
+
+    validation = manager.validate(str(manifest["backup_id"]))
+
+    assert validation["ok"] is False
+    assert "routing_integrity_key_missing" in validation["errors"]
+    with pytest.raises(MemoryBackupError, match="validation failed"):
+        manager.restore(str(manifest["backup_id"]))
+
+
+def test_agent_restore_legacy_backup_without_routing_key_removes_live_key(
+    tmp_path: Path,
+) -> None:
+    manager, paths = _manager(tmp_path)
+    _seed_runtime(paths, "legacy-nokey")
+    manifest = manager.create()
+    assert "routing_integrity_key" in manifest["components"]
+
+    # Emulate a pre-Task-3 backup that predates the routing key component.
+    backup_dir = paths["backups"] / str(manifest["backup_id"])
+    manifest_path = backup_dir / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del payload["components"]["routing_integrity_key"]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # Live key material appears only after the backup was taken.
+    ControlPlaneIntegrity(paths["state"].parent)
+    key_path = paths["state"].parent / ROUTING_INTEGRITY_KEY_NAME
+    assert key_path.is_file()
+
+    validation = manager.validate(str(manifest["backup_id"]))
+    assert validation["ok"] is True
+    assert any("routing_integrity_key" in warning for warning in validation["migration_warnings"])
+
+    restored = manager.restore(str(manifest["backup_id"]))
+
+    assert "routing_integrity_key" in restored["removed_components"]
+    assert not key_path.exists()

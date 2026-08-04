@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any, cast
+
+from fastapi import Depends
 
 from .server_models import SecretStoreRequest
 
@@ -12,7 +15,19 @@ def register_secret_routes(
     http_exception: Any,
     secret_broker: Any,
     sensitive_material_transition: Any | None = None,
+    mutation_dependency: Callable[..., Any] | None = None,
 ) -> None:
+    def mutation_route(
+        route_factory: Callable[..., Any],
+        path: str,
+    ) -> Any:
+        if mutation_dependency is None:
+            return route_factory(path)
+        return route_factory(
+            path,
+            dependencies=[Depends(mutation_dependency)],
+        )
+
     @app.get("/api/secrets")  # type: ignore[untyped-decorator]
     def list_secrets() -> list[dict[str, object]]:
         return cast(list[dict[str, object]], secret_broker.list_secrets())
@@ -24,7 +39,10 @@ def register_secret_routes(
         except KeyError as exc:
             raise http_exception(status_code=404, detail="secret_not_found") from exc
 
-    @app.post("/api/secrets")  # type: ignore[untyped-decorator]
+    @mutation_route(  # type: ignore[untyped-decorator]
+        app.post,
+        "/api/secrets",
+    )
     def store_secret(request: SecretStoreRequest) -> dict[str, object]:
         try:
             transition = (
@@ -54,7 +72,10 @@ def register_secret_routes(
                 raise http_exception(status_code=400, detail=str(exc)) from exc
             raise
 
-    @app.post("/api/secrets/{secret_id}/validate")  # type: ignore[untyped-decorator]
+    @mutation_route(  # type: ignore[untyped-decorator]
+        app.post,
+        "/api/secrets/{secret_id}/validate",
+    )
     def validate_secret(secret_id: str) -> dict[str, object]:
         try:
             return cast(dict[str, object], secret_broker.validate_secret(secret_id))
@@ -63,7 +84,10 @@ def register_secret_routes(
         except ValueError as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
 
-    @app.delete("/api/secrets/{secret_id}")  # type: ignore[untyped-decorator]
+    @mutation_route(  # type: ignore[untyped-decorator]
+        app.delete,
+        "/api/secrets/{secret_id}",
+    )
     def delete_secret(secret_id: str) -> dict[str, bool]:
         try:
             secret_broker.delete_secret(secret_id)

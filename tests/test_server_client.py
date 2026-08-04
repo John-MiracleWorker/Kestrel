@@ -115,6 +115,180 @@ def test_client_probes_health_and_reads_runtime_payloads() -> None:
     ]
 
 
+def test_desktop_compatibility_probe_checks_profile_and_version_without_exposing_token() -> None:
+    token = "desktop-compatibility-token-secret"
+    routes: dict[tuple[str, str], Route] = {
+        (
+            "GET",
+            "/api/desktop/readiness",
+        ): (
+            200,
+            {
+                "schema": "kestrel.desktop.readiness.v1",
+                "ready": True,
+                "profile_id": "default",
+                "launch_nonce_digest": "a" * 64,
+                "sidecar_version": "0.5.0",
+                "state_schema_version": 21,
+                "routing_schema_version": 2,
+                "memory_layers": [
+                    "working",
+                    "episodic",
+                    "semantic",
+                    "procedural",
+                    "self",
+                    "policy",
+                ],
+            },
+        ),
+    }
+    environ = {
+        "NEST_AGENT_API_AUTH_TOKEN_ENV": "DESKTOP_COMPATIBILITY_TOKEN",
+        "DESKTOP_COMPATIBILITY_TOKEN": token,
+    }
+    with _http_server(routes) as (base_url, requests):
+        result = KestrelServerClient(
+            base_url,
+            environ=environ,
+        ).probe_desktop_compatibility(
+            profile_id="default",
+            version="0.5.0",
+            launch_nonce_digest="a" * 64,
+        )
+
+    assert result.disposition == "attach_desktop"
+    assert result.profile_id == "default"
+    assert result.version == "0.5.0"
+    assert token not in repr(result)
+    assert token not in str(result.detail)
+    assert requests[0]["headers"]["authorization"] == f"Bearer {token}"
+
+
+def test_desktop_compatibility_probe_uses_the_lease_base_url() -> None:
+    readiness = {
+        "schema": "kestrel.desktop.readiness.v1",
+        "ready": True,
+        "profile_id": "default",
+        "launch_nonce_digest": "a" * 64,
+        "sidecar_version": "0.5.0",
+        "state_schema_version": 21,
+        "routing_schema_version": 2,
+        "memory_layers": [
+            "working",
+            "episodic",
+            "semantic",
+            "procedural",
+            "self",
+            "policy",
+        ],
+    }
+    configured_routes: dict[tuple[str, str], Route] = {
+        ("GET", "/api/desktop/readiness"): (200, readiness),
+    }
+    lease_routes: dict[tuple[str, str], Route] = {
+        ("GET", "/api/desktop/readiness"): (200, readiness),
+    }
+    with _http_server(configured_routes) as (configured_url, configured_requests):
+        with _http_server(lease_routes) as (lease_url, lease_requests):
+            result = KestrelServerClient(
+                configured_url,
+            ).probe_desktop_compatibility(
+                profile_id="default",
+                version="0.5.0",
+                launch_nonce_digest="a" * 64,
+                base_url=lease_url,
+            )
+
+    assert result.disposition == "attach_desktop"
+    assert configured_requests == []
+    assert [request["path"] for request in lease_requests] == [
+        "/api/desktop/readiness"
+    ]
+
+
+def test_desktop_compatibility_probe_rejects_a_nonce_mismatch_without_exposing_it() -> None:
+    expected_nonce_digest = "b" * 64
+    routes: dict[tuple[str, str], Route] = {
+        (
+            "GET",
+            "/api/desktop/readiness",
+        ): (
+            200,
+            {
+                "schema": "kestrel.desktop.readiness.v1",
+                "ready": True,
+                "profile_id": "default",
+                "launch_nonce_digest": "a" * 64,
+                "sidecar_version": "0.5.0",
+                "state_schema_version": 21,
+                "routing_schema_version": 2,
+                "memory_layers": [
+                    "working",
+                    "episodic",
+                    "semantic",
+                    "procedural",
+                    "self",
+                    "policy",
+                ],
+            },
+        ),
+    }
+    with _http_server(routes) as (base_url, _requests):
+        result = KestrelServerClient(base_url).probe_desktop_compatibility(
+            profile_id="default",
+            version="0.5.0",
+            launch_nonce_digest=expected_nonce_digest,
+        )
+
+    assert result.disposition == "foreign_or_unrelated"
+    assert result.detail == "desktop_nonce_mismatch"
+    assert expected_nonce_digest not in repr(result)
+    assert expected_nonce_digest not in str(result.detail)
+
+
+def test_desktop_compatibility_probe_rejects_wrong_profile_or_version() -> None:
+    routes: dict[tuple[str, str], Route] = {
+        (
+            "GET",
+            "/api/desktop/readiness",
+        ): (
+            200,
+            {
+                "schema": "kestrel.desktop.readiness.v1",
+                "ready": True,
+                "profile_id": "other",
+                "launch_nonce_digest": "a" * 64,
+                "sidecar_version": "0.4.11",
+                "state_schema_version": 21,
+                "routing_schema_version": 2,
+                "memory_layers": [
+                    "working",
+                    "episodic",
+                    "semantic",
+                    "procedural",
+                    "self",
+                    "policy",
+                ],
+            },
+        ),
+    }
+    with _http_server(routes) as (base_url, _requests):
+        client = KestrelServerClient(base_url)
+        version = client.probe_desktop_compatibility(
+            profile_id="other",
+            version="0.5.0",
+            launch_nonce_digest="a" * 64,
+        )
+        profile = client.probe_desktop_compatibility(
+            profile_id="default",
+            version="0.4.11",
+            launch_nonce_digest="a" * 64,
+        )
+
+    assert version.disposition == "version_conflict"
+    assert profile.disposition == "foreign_or_unrelated"
+
+
 def test_client_uses_the_configured_bearer_token_without_exposing_it() -> None:
     token = "kestrel-client-token-secret-value"
     routes: dict[tuple[str, str], Route] = {

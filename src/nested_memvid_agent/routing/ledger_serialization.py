@@ -79,6 +79,10 @@ def _next_revision(
     expected_revision: int | None,
     now: str,
 ) -> tuple[int, str]:
+    if expected_revision is not None and (
+        type(expected_revision) is not int or expected_revision < 0
+    ):
+        raise ValueError("expected revision must be an exact non-negative integer")
     if row is None:
         if expected_revision not in {None, 0}:
             raise RoutingRevisionConflict(resource, resource_id, 0)
@@ -206,12 +210,8 @@ def _target_entry_from_row(row: sqlite3.Row) -> ModelTargetEntry:
             latency_tier=int(row["latency_tier"]),
             operator_priority=int(row["operator_priority"]),
             estimated_cost_usd=_optional_float(row["estimated_cost_usd"]),
-            input_cost_per_million_usd=_optional_float(
-                row["input_cost_per_million_usd"]
-            ),
-            output_cost_per_million_usd=_optional_float(
-                row["output_cost_per_million_usd"]
-            ),
+            input_cost_per_million_usd=_optional_float(row["input_cost_per_million_usd"]),
+            output_cost_per_million_usd=_optional_float(row["output_cost_per_million_usd"]),
             health=str(row["health"]),  # type: ignore[arg-type]
             recent_failure_rate=float(row["recent_failure_rate"]),
             predicted_success=_optional_float(row["predicted_success"]),
@@ -257,12 +257,8 @@ def _decision_entry_from_row(row: sqlite3.Row) -> RouteDecisionEntry:
         score=float(row["score"]),
         predicted_success=_optional_float(row["predicted_success"]),
         estimated_cost_usd=_optional_float(row["estimated_cost_usd"]),
-        input_cost_per_million_usd=_optional_float(
-            row["input_cost_per_million_usd"]
-        ),
-        output_cost_per_million_usd=_optional_float(
-            row["output_cost_per_million_usd"]
-        ),
+        input_cost_per_million_usd=_optional_float(row["input_cost_per_million_usd"]),
+        output_cost_per_million_usd=_optional_float(row["output_cost_per_million_usd"]),
         project_id=_optional_str(row["project_id"]),
         task_family=str(row["task_family"]),
         risk=str(row["risk"]),
@@ -275,6 +271,10 @@ def _decision_entry_from_row(row: sqlite3.Row) -> RouteDecisionEntry:
         created_at=str(row["created_at"]),
         started_at=_optional_str(row["started_at"]),
         finished_at=_optional_str(row["finished_at"]),
+        activation_grant_id=_optional_str(row["activation_grant_id"]),
+        activation_receipt_id=_optional_str(row["activation_receipt_id"]),
+        activation_effective=bool(row["activation_effective"]),
+        activation_reason=_optional_str(row["activation_reason"]),
     )
 
 
@@ -413,6 +413,10 @@ def _decision_request_identity(entry: RouteDecisionEntry) -> tuple[object, ...]:
         _json(list(entry.candidate_snapshot)),
         1 if entry.actionable else 0,
         entry.router_version,
+        entry.activation_grant_id,
+        entry.activation_receipt_id,
+        1 if entry.activation_effective else 0,
+        entry.activation_reason,
     )
 
 
@@ -448,6 +452,10 @@ def _decision_request_identity_values(values: tuple[object, ...]) -> tuple[objec
         values[28],
         values[29],
         values[30],
+        values[34],
+        values[35],
+        values[36],
+        values[37],
     )
 
 
@@ -539,7 +547,9 @@ def _validate_outcome_numbers(
         ("changed_file_count", changed_file_count),
         ("retry_count", retry_count),
     ):
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
             raise ValueError(f"{name} must be a non-negative integer")
 
 

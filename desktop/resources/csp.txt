@@ -1,0 +1,10 @@
+default-src 'none';
+script-src 'self';
+style-src 'self';
+font-src 'self';
+img-src 'self' data: blob:;
+connect-src http://127.0.0.1:*;
+object-src 'none';
+base-uri 'none';
+form-action 'none';
+frame-ancestors 'none';
