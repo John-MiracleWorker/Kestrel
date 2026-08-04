@@ -6,18 +6,20 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
-## [0.5.3] - 2026-08-04
+## [0.5.4] - 2026-08-04
 
 ### Fixed
 
-- Recovery release for the burned `v0.5.2` tag. The `v0.5.2` tag was created on a
-  commit whose main-branch CI had not yet gone green (a Windows `install.ps1`
-  doctor probe that passed an empty docker context when the daemon was
-  unreachable, plus two test-only flakes), so the tag-triggered release workflow
-  correctly refused to publish. The release tag ruleset makes `v*` tags
-  immutable, so `v0.5.2` could not be re-pointed at the fixed commit. This
-  release carries the identical Adaptive Flock feature set on a fully green
-  commit.
+- Recovery release for the burned `v0.5.2` and `v0.5.3` tags. Both were created on
+  commits whose release evidence had not yet satisfied the release workflow's
+  ordering gates when the tag push fired: `v0.5.2`'s commit had not finished a
+  green main-branch CI run (a Windows `install.ps1` doctor probe that passed an
+  empty docker context when the daemon was unreachable, plus two test-only
+  flakes), and `v0.5.3`'s tag push raced its commit's release-rehearsal run by
+  seconds, failing the rehearsal-before-release ordering check. The release tag
+  ruleset makes `v*` tags immutable, so neither could be re-pointed. This release
+  carries the identical Adaptive Flock feature set on a commit whose CI and
+  release-rehearsal evidence were both green before the tag was pushed.
 
 ### Added
 
@@ -438,8 +440,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.3...HEAD
-[0.5.3]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...v0.5.3
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...v0.5.4
 [0.5.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.11...v0.5.0
 [0.4.11]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.10...v0.4.11
