@@ -1394,7 +1394,12 @@ async function privateEmptyControlPublicationPending(pathValue) {
     ) {
       return false;
     }
-    return (await realpath(pathValue)) === resolve(pathValue);
+    // A symlinked tmp root makes realpath() differ from resolve() even for a
+    // legitimate file the test just wrote. The zero-byte publication check is
+    // about detecting "file exists but not yet populated", not canonical
+    // identity — the O_NOFOLLOW open + fstat in inspectRegularFile is the
+    // actual race guard. Compare canonical-to-canonical instead.
+    return (await realpath(pathValue)) === (await realpath(resolve(pathValue)));
   } catch {
     return false;
   }
