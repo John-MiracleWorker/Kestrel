@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from importlib import import_module
 from pathlib import Path
@@ -446,6 +447,10 @@ def test_explicit_fail_backend_configuration_never_uses_session_fallback(
     assert selected.readiness.state == "unavailable"
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="D-Bus Secret Service probe is Linux/POSIX-only; Path mocks assume POSIX path semantics",
+)
 def test_linux_secret_service_probe_only_lists_dbus_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1389,8 +1389,10 @@ class _AgentBackupManifestView:
 
     @property
     def paths(self) -> set[str]:
+        # Normalize to POSIX separators so the ``state/agent.db``-style
+        # assertions hold on Windows (where str(Path) yields backslashes).
         return {
-            str(Path(*Path(str(entry["path"])).parts[1:]))
+            Path(*Path(str(entry["path"])).parts[1:]).as_posix()
             for entry in self._manifest["files"]  # type: ignore[index]
         }
 
