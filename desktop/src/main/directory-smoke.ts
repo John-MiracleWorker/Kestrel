@@ -266,7 +266,13 @@ async function readCanonicalJson(
   adapter: DeveloperRuntimePrivateFileAdapter,
   controlRoot: string
 ): Promise<unknown> {
-  if (!isContained(controlRoot, pathValue)) {
+  // controlRoot may be built from a non-canonical userDataPath while the
+  // on-disk control files land under the canonical (realpath) anchor —
+  // symlinked tmp roots make these differ. Canonicalize both sides before
+  // the containment check; containment remains the trust invariant.
+  const canonicalRoot = await realpath(controlRoot);
+  const canonicalPath = await realpath(pathValue);
+  if (!isContained(canonicalRoot, canonicalPath)) {
     throw new Error("desktop_directory_smoke_control_untrusted");
   }
   await adapter.qualifyOwnerOnly(controlRoot, "directory");
