@@ -1,0 +1,4 @@
+# Shipped digest-bound Flock qualification fixtures are hashed byte-for-byte;
+# forcing LF keeps the recorded sha256 stable across Windows CRLF checkouts.
+src/nested_memvid_agent/qualification_fixtures/**/*.json text eol=lf
+src/nested_memvid_agent/qualification_fixtures/**/*.jsonl text eol=lf
