@@ -18,11 +18,11 @@ from pytest import MonkeyPatch, raises
 from nested_memvid_agent.agent_backup import AgentBackupManager
 from nested_memvid_agent.cli import (
     _cli_run_idle_timeout_seconds,
+    _lease_base_url,
     _print_plugin,
     _run_exit_code,
     _shutdown_run_manager,
     _validate_server_bind,
-    _lease_base_url,
     _wait_for_run,
     main,
 )
