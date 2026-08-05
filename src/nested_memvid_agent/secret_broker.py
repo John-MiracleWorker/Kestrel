@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -338,9 +339,10 @@ class SecretBroker:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, self.vault_path)
+            _replace_with_retries(temp_path, self.vault_path)
             harden_private_file(self.vault_path)
             _fsync_directory(self.vault_path.parent)
+
         except BaseException:
             try:
                 os.close(fd)
@@ -1243,6 +1245,18 @@ def _ensure_fingerprint_salt(data: dict[str, Any]) -> str:
 def _salt_for_public_payload(data: dict[str, Any]) -> str:
     salt = data.get("fingerprint_salt")
     return salt if isinstance(salt, str) else ""
+
+
+def _replace_with_retries(source_path: Path, destination_path: Path) -> None:
+    max_attempts = 6 if os.name == "nt" else 1
+    for attempt in range(max_attempts):
+        try:
+            os.replace(source_path, destination_path)
+            return
+        except PermissionError:
+            if attempt == max_attempts - 1 or os.name != "nt":
+                raise
+            time.sleep(0.01 * (2 ** attempt))
 
 
 def _thread_lock_for(vault_path: Path) -> RLock:
