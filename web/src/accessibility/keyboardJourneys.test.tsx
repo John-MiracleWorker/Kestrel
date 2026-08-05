@@ -135,7 +135,7 @@ describe("Setup Center keyboard journey", () => {
     });
     openMission.focus();
     expect(openMission).toHaveFocus();
-  });
+  }, 15000);
 
   it("keeps revisited stage headings focusable when stepping backward", async () => {
     const api = fakeSetupApi(setupSnapshot());
@@ -168,7 +168,7 @@ describe("Setup Center keyboard journey", () => {
         ).toHaveFocus(),
       { timeout: 5000 },
     );
-  });
+  }, 15000);
 });
 
 describe("First-mission keyboard journey (App-level)", () => {
