@@ -363,9 +363,13 @@ describe("SetupCenter", () => {
       projectStep.querySelector(".setup-progress-marker svg"),
     ).not.toHaveClass("lucide-check");
     fireEvent.click(projectStep);
-    expect(
-      screen.getByRole("heading", { name: "Add a project" }),
-    ).toHaveFocus();
+    await waitFor(
+      () =>
+        expect(
+          screen.getByRole("heading", { name: "Add a project" }),
+        ).toHaveFocus(),
+      { timeout: 5000 },
+    );
   });
 
   it("does not shrink the unlocked frontier when continuing from a revisited stage", async () => {
@@ -395,9 +399,13 @@ describe("SetupCenter", () => {
     });
     expect(projectStep).toBeEnabled();
     fireEvent.click(projectStep);
-    expect(
-      screen.getByRole("heading", { name: "Add a project" }),
-    ).toHaveFocus();
+    await waitFor(
+      () =>
+        expect(
+          screen.getByRole("heading", { name: "Add a project" }),
+        ).toHaveFocus(),
+      { timeout: 5000 },
+    );
   });
 
   it("keeps command recovery inside Advanced diagnostics", async () => {

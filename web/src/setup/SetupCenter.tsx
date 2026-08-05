@@ -125,11 +125,32 @@ export function SetupCenter({
   useEffect(() => {
     if (!focusNextStageRef.current) return;
     focusNextStageRef.current = false;
-    const heading =
-      stagePanelRef.current?.querySelector<HTMLElement>(
-        "[data-setup-stage-heading]",
-      );
-    heading?.focus();
+    // The new stage's heading may not be committed to the DOM in the same frame
+    // this effect runs (React commits currentStage's render after this effect is
+    // scheduled). Defer to the next animation frame and retry briefly so focus
+    // reliably lands on the freshly-mounted heading rather than a stale/absent
+    // node — this was the source of an intermittent CI focus flake.
+    let cancelled = false;
+    let attempts = 0;
+    const focusHeading = () => {
+      if (cancelled) return;
+      const heading =
+        stagePanelRef.current?.querySelector<HTMLElement>(
+          "[data-setup-stage-heading]",
+        );
+      if (heading) {
+        heading.focus();
+        return;
+      }
+      attempts += 1;
+      if (attempts < 10) {
+        requestAnimationFrame(focusHeading);
+      }
+    };
+    requestAnimationFrame(focusHeading);
+    return () => {
+      cancelled = true;
+    };
   }, [currentStage]);
 
   const progressItems = useMemo(
