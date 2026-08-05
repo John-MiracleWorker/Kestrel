@@ -707,7 +707,7 @@ def main() -> None:
         identity = current_runtime_lease_identity(
             profile_id="default",
             management="cli",
-            base_url=f"http://{args.host}:{args.port}/",
+            base_url=_lease_base_url(args.host, args.port),
         )
         try:
             lease = RuntimeProfileLease.acquire(profile_root, identity)
@@ -1628,6 +1628,25 @@ def _is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(normalized).is_loopback
     except ValueError:
         return False
+
+
+def _is_unspecified_host(host: str) -> bool:
+    """True when the bind host is a wildcard (0.0.0.0 / ::) that accepts all
+    interfaces. Such an address is a bind target, not a connectable address, so
+    the runtime's self-referential lease URL must use loopback instead."""
+    normalized = host.strip().lower()
+    try:
+        return ipaddress.ip_address(normalized).is_unspecified
+    except ValueError:
+        return False
+
+
+def _lease_base_url(host: str, port: int) -> str:
+    """Self-referential URL the running runtime advertises in its lease. When the
+    server binds a wildcard interface (e.g. Docker's --host 0.0.0.0), the runtime
+    reaches itself via loopback; otherwise it uses the bound host verbatim."""
+    connect_host = "127.0.0.1" if _is_unspecified_host(host) else host
+    return f"http://{connect_host}:{port}/"
 
 
 def _load_channel_payload(args: argparse.Namespace) -> dict[str, Any]:
