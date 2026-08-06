@@ -6,6 +6,17 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-08-06
+
+### Fixed
+
+- Recovery release for the v0.5.5 tag, whose release workflow failed at the OCI
+  digest binding step because the publish job ran `release_publication_guard.py`
+  without installing its dependencies (`cryptography`). The publish job now
+  installs the same hash-locked build bootstrap and Python dependencies as the
+  build job before validating or publishing anything. Carries the identical
+  v0.5.5 feature set.
+
 ## [0.5.5] - 2026-08-06
 
 ### Fixed
@@ -459,7 +470,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...v0.5.4
 [0.5.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.0...v0.5.1
