@@ -21,7 +21,7 @@ def test_package_metadata_identifies_kestrel_release() -> None:
     project = pyproject["project"]
     locked_versions = {package["name"]: package["version"] for package in lock["package"]}
 
-    assert project["version"] == "0.5.4"
+    assert project["version"] == "0.5.5"
     assert "pip>=26.1.2" in project["dependencies"]
     assert "setuptools>=83.0.0" in project["dependencies"]
     assert "tzdata>=2026.3" in project["dependencies"]
@@ -48,16 +48,16 @@ def test_python_and_web_release_metadata_stay_aligned() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert PUBLISHED_RELEASE == "0.5.4"
-    assert "nested-memvid-agent 0.5.4 release" in result.stdout
-    assert "stable release metadata v0.5.4" in result.stdout
-    assert "kestrel-web 0.5.4" in result.stdout
+    assert PUBLISHED_RELEASE == "0.5.5"
+    assert "nested-memvid-agent 0.5.5 release" in result.stdout
+    assert "stable release metadata v0.5.5" in result.stdout
+    assert "kestrel-web 0.5.5" in result.stdout
 
 
 def test_release_metadata_gate_rejects_development_line() -> None:
     errors = _release_mode_errors(
-        version="0.5.4",
-        release_tag="v0.5.4",
+        version="0.5.5",
+        release_tag="v0.5.5",
         is_current_release=False,
         changelog="## [Unreleased]\n",
     )
@@ -68,10 +68,10 @@ def test_release_metadata_gate_rejects_development_line() -> None:
 
 def test_release_metadata_gate_accepts_exact_published_dated_release() -> None:
     errors = _release_mode_errors(
-        version="0.5.4",
-        release_tag="v0.5.4",
+        version="0.5.5",
+        release_tag="v0.5.5",
         is_current_release=True,
-        changelog="## [0.5.4] - 2026-07-20\n",
+        changelog="## [0.5.5] - 2026-07-20\n",
     )
 
     assert errors == []
@@ -370,11 +370,11 @@ def test_deployment_docs_cover_release_and_memory_operations() -> None:
 
     assert (
         "curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/"
-        "v0.5.4/install.sh | bash"
+        "v0.5.5/install.sh | bash"
     ) in deployment
-    assert "`v0.5.4` is the current stable release" in deployment
+    assert "`v0.5.5` is the current stable release" in deployment
     assert "release artifacts are not claimed to exist" in deployment
-    assert "releases/download/v0.5.4/install.sh" in deployment
+    assert "releases/download/v0.5.5/install.sh" in deployment
     assert "releases/download/v0.3.1/install.sh" not in deployment
     assert "/Kestrel/main/install.sh" not in deployment
     assert "KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash" in deployment
@@ -406,7 +406,7 @@ def test_readme_leads_with_the_everyday_kestrel_launch_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     expected_release_command = (
         "curl -fsSL "
-        "https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.4/install.sh \\\n"
+        "https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.5/install.sh \\\n"
         "  | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash"
     )
 

@@ -6,6 +6,21 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-08-06
+
+### Fixed
+
+- Windows cross-process vault writes: retry the atomic temp→vault replacement with
+  bounded exponential backoff when another process holds the vault open
+  (`PermissionError [WinError 5]`), so concurrent `store_secret` callers no longer
+  lose records or crash on lock contention. Non-Windows keeps single-attempt
+  semantics.
+- IPv6 lease URLs: map the `::` wildcard bind to the bracketed IPv6 loopback
+  authority `http://[::1]:<port>/` (Uvicorn binds `::` with `IPV6_V6ONLY`, so the
+  previous `127.0.0.1` self-URL advertised a dead endpoint), and bracket explicit
+  IPv6 host literals per RFC 3986 so `--host ::1` no longer publishes a malformed
+  lease URL. IPv4 wildcard binds still map to `127.0.0.1`.
+
 ## [0.5.4] - 2026-08-04
 
 ### Fixed
@@ -440,7 +455,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...v0.5.4
 [0.5.1]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.4.11...v0.5.0
