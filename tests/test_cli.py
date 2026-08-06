@@ -971,8 +971,9 @@ def test_lease_base_url_maps_wildcard_bind_to_loopback() -> None:
     lease URL must stay a connectable loopback address (the release health
     probe crashed on `ValueError: base_url must be an HTTP loopback URL`)."""
     assert _lease_base_url("0.0.0.0", 8765) == "http://127.0.0.1:8765/"
-    assert _lease_base_url("::", 8765) == "http://127.0.0.1:8765/"
+    assert _lease_base_url("::", 8765) == "http://[::1]:8765/"
     assert _lease_base_url("127.0.0.1", 8765) == "http://127.0.0.1:8765/"
+    assert _lease_base_url("::1", 8765) == "http://[::1]:8765/"
     assert _lease_base_url("localhost", 9000) == "http://localhost:9000/"
 
 
