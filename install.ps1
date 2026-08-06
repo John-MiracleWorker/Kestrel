@@ -18,7 +18,7 @@ param(
     [string] $Path = "Auto",
 
     [ValidatePattern("^[0-9]+(?:\.[0-9]+)+(?:[A-Za-z0-9.+-]*)?$")]
-    [string] $Version = "0.5.4",
+    [string] $Version = "0.5.5",
 
     [switch] $Json
 )
