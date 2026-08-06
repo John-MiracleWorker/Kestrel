@@ -10,7 +10,7 @@
   <img alt="Memvid v2" src="https://img.shields.io/badge/Memory-Memvid%20v2%20.mv2-6f42c1">
   <img alt="Local first" src="https://img.shields.io/badge/Runtime-local--first-059669">
   <img alt="Supported profile" src="https://img.shields.io/badge/Profile-single--user%20local%2Fprivate-0f766e">
-  <img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-blue">
+  <img alt="License MIT" src="https://img.shields.io/badge/License-MIT-blue">
 </p>
 
 Kestrel is a **memory-native AI engineering agent runtime** for developers who want more than a stateless coding assistant or a thin chatbot wrapped around tools.
@@ -31,16 +31,16 @@ It combines:
 
 Kestrel is currently designed for **one trusted user running one local or privately networked node**. It is not yet a hosted, multi-user, or multi-tenant agent platform.
 
-`v0.5.6` is the current stable release for that supported profile: one trusted user, one Kestrel server or worker process, and one local or privately networked node. This source tree contains tag-ready release metadata; the installer and exact-tag artifacts become available once the `v0.5.6` release workflow publishes them.
+`v0.5.7` is the current stable release for that supported profile: one trusted user, one Kestrel server or worker process, and one local or privately networked node. This source tree contains tag-ready release metadata; the installer and exact-tag artifacts become available once the `v0.5.7` release workflow publishes them.
 
 ---
 
 ## Install and Open Kestrel
 
-Once the matching `v0.5.6` tag and exact-tag assets have been published, the everyday install-and-open path is:
+Once the matching `v0.5.7` tag and exact-tag assets have been published, the everyday install-and-open path is:
 
 ```bash
-curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.6/install.sh \
+curl -fsSL https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.7/install.sh \
   | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
@@ -340,13 +340,13 @@ Open [http://127.0.0.1:8765](http://127.0.0.1:8765).
 
 ## Advanced Installer Controls
 
-The repository contains `v0.5.6` release metadata, but release commands should only be used after the matching Git tag and exact-tag artifacts have been published.
+The repository contains `v0.5.7` release metadata, but release commands should only be used after the matching Git tag and exact-tag artifacts have been published.
 
 The installer is conservative by default: it does not start the server or open a browser unless explicitly enabled.
 
 ```bash
 curl -fsSL \
-  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.6/install.sh \
+  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.7/install.sh \
   | bash
 ```
 
@@ -354,7 +354,7 @@ To explicitly start the local workbench and open a browser during installation, 
 
 ```bash
 curl -fsSL \
-  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.6/install.sh \
+  https://github.com/John-MiracleWorker/Kestrel/releases/download/v0.5.7/install.sh \
   | KESTREL_START_SERVER=1 KESTREL_OPEN_BROWSER=1 bash
 ```
 
@@ -740,4 +740,4 @@ Good contribution areas include provider hardening, MCP transport fixtures, eval
 
 ## License
 
-Kestrel is licensed under the [Apache License 2.0](LICENSE).
+Kestrel is licensed under the [MIT License](LICENSE).

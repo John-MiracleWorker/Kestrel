@@ -6,6 +6,15 @@ All notable changes to Kestrel are documented in this file. The format is based 
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-08-06
+
+### Changed
+
+- Relicensed Kestrel from Apache-2.0 to MIT. The v0.5.6 tag and its release
+  pipeline were superseded before publication; this release carries the
+  identical v0.5.6 feature set (Windows vault write retry, IPv6 lease URL
+  fixes, SetupCenter focus fix) plus the permissive MIT license.
+
 ## [0.5.6] - 2026-08-06
 
 ### Fixed
@@ -470,7 +479,8 @@ All notable changes to Kestrel are documented in this file. The format is based 
 - First tagged Kestrel-branded local alpha release with the conversational runtime, layered Memvid v2
   memory, workbench, tools and approvals, deterministic mock path, installer, and release artifacts.
 
-[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.7...HEAD
+[0.5.7]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/John-MiracleWorker/Kestrel/compare/v0.5.1...v0.5.4
