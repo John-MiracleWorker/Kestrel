@@ -18,6 +18,7 @@ from pytest import MonkeyPatch, raises
 from nested_memvid_agent.agent_backup import AgentBackupManager
 from nested_memvid_agent.cli import (
     _cli_run_idle_timeout_seconds,
+    _lease_base_url,
     _print_plugin,
     _run_exit_code,
     _shutdown_run_manager,
@@ -963,6 +964,17 @@ def test_server_non_loopback_requires_api_auth_token(monkeypatch: MonkeyPatch) -
         AgentConfig(require_api_auth=True, api_auth_token_env="KESTREL_BIND_TEST_TOKEN"),
     )
     _validate_server_bind("127.0.0.1", AgentConfig(require_api_auth=False))
+
+
+def test_lease_base_url_maps_wildcard_bind_to_loopback() -> None:
+    """Docker binds the server on 0.0.0.0, but the runtime's self-referential
+    lease URL must stay a connectable loopback address (the release health
+    probe crashed on `ValueError: base_url must be an HTTP loopback URL`)."""
+    assert _lease_base_url("0.0.0.0", 8765) == "http://127.0.0.1:8765/"
+    assert _lease_base_url("::", 8765) == "http://[::1]:8765/"
+    assert _lease_base_url("127.0.0.1", 8765) == "http://127.0.0.1:8765/"
+    assert _lease_base_url("::1", 8765) == "http://[::1]:8765/"
+    assert _lease_base_url("localhost", 9000) == "http://localhost:9000/"
 
 
 def test_context_subcommand_compiles_prompt(

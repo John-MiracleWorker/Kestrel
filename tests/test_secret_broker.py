@@ -765,3 +765,34 @@ def test_secret_broker_cross_process_writes_do_not_lose_records(tmp_path: Path) 
     }
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_secret_broker_replace_with_retries_on_windows_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import nested_memvid_agent.secret_broker as secret_broker_module
+
+    source = tmp_path / "vault-source.json"
+    destination = tmp_path / "vault-destination.json"
+    source.write_text("{}\n")
+
+    attempts = {"count": 0}
+    original_replace = secret_broker_module.os.replace
+
+    def flaky_replace(_src: str | Path, _dst: str | Path) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise PermissionError(13, "simulated file-lock contention")
+        return original_replace(_src, _dst)
+
+    monkeypatch.setattr(secret_broker_module.os, "name", "nt")
+    monkeypatch.setattr(
+        secret_broker_module.os,
+        "replace",
+        flaky_replace,  # type: ignore[attr-defined]
+    )
+
+    secret_broker_module._replace_with_retries(source, destination)
+
+    assert attempts["count"] == 2
+    assert destination.read_text() == "{}\n"

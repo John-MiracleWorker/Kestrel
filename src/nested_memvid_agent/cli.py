@@ -707,7 +707,7 @@ def main() -> None:
         identity = current_runtime_lease_identity(
             profile_id="default",
             management="cli",
-            base_url=f"http://{args.host}:{args.port}/",
+            base_url=_lease_base_url(args.host, args.port),
         )
         try:
             lease = RuntimeProfileLease.acquire(profile_root, identity)
@@ -1628,6 +1628,26 @@ def _is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(normalized).is_loopback
     except ValueError:
         return False
+
+
+def _lease_base_url(host: str, port: int) -> str:
+    """Self-referential URL the running runtime advertises in its lease. When the
+    server binds a wildcard interface (e.g. Docker's --host 0.0.0.0), the runtime
+    reaches itself via loopback; otherwise it uses the bound host verbatim.
+    IPv6 literals are bracketed because RFC 3986 requires brackets in an HTTP
+    authority."""
+    normalized = host.strip().lower()
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return f"http://{normalized}:{port}/"
+    if address.is_unspecified:
+        connect_host = "::1" if address.version == 6 else "127.0.0.1"
+    else:
+        connect_host = normalized
+    if address.version == 6:
+        connect_host = f"[{connect_host}]"
+    return f"http://{connect_host}:{port}/"
 
 
 def _load_channel_payload(args: argparse.Namespace) -> dict[str, Any]:
