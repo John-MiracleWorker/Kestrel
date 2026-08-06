@@ -20,6 +20,10 @@ All notable changes to Kestrel are documented in this file. The format is based 
   previous `127.0.0.1` self-URL advertised a dead endpoint), and bracket explicit
   IPv6 host literals per RFC 3986 so `--host ::1` no longer publishes a malformed
   lease URL. IPv4 wildcard binds still map to `127.0.0.1`.
+- Setup workbench focus restoration defers to the next animation frame and retries
+  briefly until the freshly mounted stage heading exists, ending the recurring
+  React Testing Library `toHaveFocus()` CI flake at the wizard stage-transition
+  boundary.
 
 ## [0.5.4] - 2026-08-04
 
