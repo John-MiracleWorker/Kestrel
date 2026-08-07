@@ -32,6 +32,14 @@ python benchmarks/unified_memory_benchmark.py \
   --output benchmark_results/unified-memory.json
 ```
 
+Run the flat-transcript comparative benchmark (Kestrel vs flat TF-IDF RAG vs
+recency-biased flat transcript, including the recency-stress scenario):
+
+```bash
+python benchmarks/memory_benchmark_transcript.py \
+  --output benchmark_results/memory-transcript.json
+```
+
 The unified runner always attempts the built-in lexical Kestrel and TF-IDF backends first. Dense
 VectorRAG, Qdrant, and Chroma are optional; when their local packages are absent, the JSON report
 records an explicit `skipped` row and an install hint instead of crashing at import time. Missing
@@ -89,6 +97,32 @@ absolute Recall@k, Precision@k, and MRR floors, and Kestrel quality that is not 
 The small runner uses `kestrel.memory-quality-floor.v1` (0.80 / 0.20 / 0.75); the large runner uses
 `kestrel.large-memory-quality-floor.v1` (0.30 / 0.06 / 0.15). A zero-result retriever therefore
 cannot produce a successful process exit even if the comparison baseline is also zero.
+
+### Flat-Transcript Benchmark (`memory_benchmark_transcript.py`)
+
+Three-way comparative benchmark on the same corpus and ground-truth queries:
+
+1. **Kestrel** 6-layer Memvid memory (layer-aware retrieval)
+2. **Flat TF-IDF RAG** (document store, cosine similarity, no layers)
+3. **Flat transcript** (recency-biased chronological transcript — the
+   "typical agent memory" proxy for chat-log style runtimes such as Hermes
+   or OpenClaw: one transcript, no layers, no promotion, no trust ordering,
+   recent entries win ties)
+
+Two phases:
+
+- **Baseline corpus**: the standard memory corpus.
+- **Recency stress**: the same corpus with a burst of recent episodic
+  "conversation chatter" appended after the facts. This models a real agent
+  whose recent chat history buries older important facts. Kestrel's
+  layer-aware retrieval ignores cross-layer chatter; the flat transcript's
+  recency bias does not.
+
+The acceptance gate requires Kestrel to meet the absolute floors and to be
+at or above BOTH flat baselines on Recall@k and MRR in the stressed phase.
+The expected outcome is that the flat transcript degrades measurably more
+than Kestrel under recency stress — the concrete claim behind "layered
+memory keeps important facts retrievable even after a long conversation."
 
 ### Agent Benchmark (`agent_benchmark.py`)
 
