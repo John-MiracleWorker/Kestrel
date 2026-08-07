@@ -105,4 +105,4 @@ Maintainers may ask for a smaller diff, additional evidence, or a design issue b
 large change. Passing CI is necessary but does not guarantee acceptance.
 
 By submitting a contribution, you agree that it may be distributed under the repository's
-[Apache License 2.0](LICENSE).
+[MIT License](LICENSE).

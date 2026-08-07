@@ -696,7 +696,7 @@ def _stage_fixture(tmp_path: Path) -> dict[str, Any]:
     (web_root / "assets/app.js").write_text("export {};\n", encoding="utf-8")
     for name in ("index.html", "form.js", "styles.css", "preload.js"):
         (desktop_root / name).write_text(f"{name}\n", encoding="utf-8")
-    (notices_root / "LICENSE").write_text("Apache-2.0\n", encoding="utf-8")
+    (notices_root / "LICENSE").write_text("MIT\n", encoding="utf-8")
     (notices_root / "THIRD_PARTY_NOTICES.txt").write_text("Notices\n", encoding="utf-8")
     entrypoint = evidence_root / "entry.py"
     spec = evidence_root / "sidecar.spec"
