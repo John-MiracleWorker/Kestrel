@@ -1367,7 +1367,7 @@ def _compatibility_review(compatibility: dict[str, str]) -> dict[str, Any]:
     try:
         current_version = version("nested-memvid-agent")
     except PackageNotFoundError:
-        current_version = "0.5.7"
+        current_version = "0.5.8"
     kestrel_spec = compatibility.get("kestrel", "*")
     compatible = _version_matches(current_version, kestrel_spec)
     return {
@@ -1717,7 +1717,7 @@ def _compatibility(value: object) -> dict[str, str]:
     if len(kestrel) > 128:
         raise PluginError("Plugin compatibility.kestrel is too long.")
     try:
-        _version_matches("0.5.7", kestrel)
+        _version_matches("0.5.8", kestrel)
     except ValueError as exc:
         raise PluginError("Plugin compatibility.kestrel is invalid.") from exc
     return {"kestrel": kestrel}
