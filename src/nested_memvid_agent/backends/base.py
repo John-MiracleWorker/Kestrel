@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +37,19 @@ class MemoryBackend(ABC):
         """Serialize a cross-layer identity check through its first durable write."""
 
         raise NotImplementedError
+
+    def has_any_record_identity(self, record_ids: Collection[str]) -> bool:
+        """Return whether any logical record or frame identity is already present.
+
+        Built-in backends override this with an indexed lookup. The fallback
+        preserves compatibility for custom backends implementing the older
+        record lookup contract.
+        """
+
+        return any(
+            self.get_record(record_id, include_inactive=True) is not None
+            for record_id in record_ids
+        )
 
     @abstractmethod
     def find(

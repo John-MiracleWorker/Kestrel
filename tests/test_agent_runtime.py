@@ -214,21 +214,11 @@ def test_injected_turn_identity_cannot_overwrite_same_or_cross_session_evidence(
 
 def test_concurrent_agents_atomically_reserve_reused_turn_identity(tmp_path: Path) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
-    identity_lookups_complete = Barrier(2)
-    original_get_record = memory.get_record
+    turn_ids_ready = Barrier(2)
 
-    def synchronize_legacy_lookup(
-        layer: MemoryLayer | None,
-        record_id: str,
-        *,
-        include_inactive: bool = True,
-    ) -> MemoryRecord | None:
-        record = original_get_record(layer, record_id, include_inactive=include_inactive)
-        if record_id == "turn_concurrent_reuse_provider_error":
-            identity_lookups_complete.wait(timeout=5)
-        return record
-
-    memory.get_record = synchronize_legacy_lookup  # type: ignore[method-assign]
+    def concurrent_turn_id() -> str:
+        turn_ids_ready.wait(timeout=5)
+        return "turn_concurrent_reuse"
 
     def build_agent(response: str) -> NestedMV2Agent:
         return NestedMV2Agent(
@@ -237,7 +227,7 @@ def test_concurrent_agents_atomically_reserve_reused_turn_identity(tmp_path: Pat
                 llm=MockLLMProvider([LLMResponse(content=response)]),
                 tools=build_default_tools(),
                 config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
-                turn_id_factory=lambda: "turn_concurrent_reuse",
+                turn_id_factory=concurrent_turn_id,
             )
         )
 

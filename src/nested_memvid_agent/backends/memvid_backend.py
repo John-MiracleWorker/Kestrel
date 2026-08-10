@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterable, Iterator
+from collections import Counter
+from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -75,6 +76,8 @@ class MemvidBackend(MemoryBackend):
         # admits only one Memvid-backed agent lifecycle at a time.
         self._operation_lock = RLock()
         self._records: dict[str, MemoryRecord] = {}
+        self._identity_counts: Counter[str] = Counter()
+        self._identity_snapshots: dict[str, frozenset[str]] = {}
         self._inactive_ids: set[str] = set()
         self._canonical_event_count = 0
         self._last_canonical_event_digest: str | None = None
@@ -159,6 +162,7 @@ class MemvidBackend(MemoryBackend):
                 self.mem = None
                 raise
         self._load_exact_index()
+        self._rebuild_identity_index()
 
     def put(self, record: MemoryRecord) -> str:
         with self._operation_lock:
@@ -168,6 +172,10 @@ class MemvidBackend(MemoryBackend):
     def identity_reservation(self) -> Iterator[None]:
         with self._operation_lock:
             yield
+
+    def has_any_record_identity(self, record_ids: Collection[str]) -> bool:
+        with self._operation_lock:
+            return any(self._identity_counts.get(record_id, 0) > 0 for record_id in record_ids)
 
     def _put_record_unlocked(
         self,
@@ -667,11 +675,33 @@ class MemvidBackend(MemoryBackend):
             lock.release()
 
     def _remember_record(self, record: MemoryRecord) -> None:
+        previous_identities = self._identity_snapshots.get(record.id)
+        if previous_identities is not None:
+            self._remove_record_identities(previous_identities)
         self._records[record.id] = record
+        identities = _record_identity_values(record)
+        self._identity_snapshots[record.id] = identities
+        self._identity_counts.update(identities)
         if record.metadata.get("active", True) is False:
             self._inactive_ids.add(record.id)
         else:
             self._inactive_ids.discard(record.id)
+
+    def _remove_record_identities(self, identities: frozenset[str]) -> None:
+        for identity in identities:
+            remaining = self._identity_counts.get(identity, 0) - 1
+            if remaining > 0:
+                self._identity_counts[identity] = remaining
+            else:
+                self._identity_counts.pop(identity, None)
+
+    def _rebuild_identity_index(self) -> None:
+        self._identity_counts = Counter()
+        self._identity_snapshots = {}
+        for record in self._records.values():
+            identities = _record_identity_values(record)
+            self._identity_snapshots[record.id] = identities
+            self._identity_counts.update(identities)
 
     def _exact_record_for_hit(
         self,
@@ -699,6 +729,8 @@ class MemvidBackend(MemoryBackend):
 
     def _load_exact_index(self) -> None:
         self._records = {}
+        self._identity_counts = Counter()
+        self._identity_snapshots = {}
         self._inactive_ids = set()
         self._canonical_event_count = 0
         self._last_canonical_event_digest = None
@@ -897,13 +929,9 @@ class MemvidBackend(MemoryBackend):
         record_payload = event.get("record")
         if isinstance(record_payload, dict):
             record = _record_from_index_payload(record_payload, self.layer)
-            self._records[record.id] = record
             active = event.get("active", record.metadata.get("active", True)) is not False
             record.metadata["active"] = active
-            if active:
-                self._inactive_ids.discard(record.id)
-            else:
-                self._inactive_ids.add(record.id)
+            self._remember_record(record)
         if event_kind == "chain_anchor":
             return
         if event_kind not in {"tombstone", "tombstone_state"}:
@@ -1403,6 +1431,12 @@ def _json_safe(value: Any) -> Any:
 
 def _record_active(record: MemoryRecord, *, inactive_ids: set[str]) -> bool:
     return record.id not in inactive_ids and record.metadata.get("active", True) is not False
+
+
+def _record_identity_values(record: MemoryRecord) -> frozenset[str]:
+    frame_value = record.metadata.get("frame_id")
+    frame_id = "" if frame_value is None else str(frame_value)
+    return frozenset({record.id, frame_id} if frame_id else {record.id})
 
 
 def _exact_fallback_offset(cursor: str | None) -> int:

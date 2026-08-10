@@ -83,6 +83,9 @@ def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_fi
         )
         assert hits
         assert hits[0].record.metadata["frame_id"] == "memvid-system-frame"
+        assert reopened.backends[MemoryLayer.SEMANTIC].has_any_record_identity(
+            frozenset({"memvid-system-frame"})
+        )
         assert reopened.tombstone(
             MemoryLayer.SEMANTIC, "memvid-system-fact", reason="integration", superseded_by="next"
         )
@@ -101,6 +104,9 @@ def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_fi
         )
         assert inactive is not None
         assert inactive.metadata["active"] is False
+        assert final.backends[MemoryLayer.SEMANTIC].has_any_record_identity(
+            frozenset({"memvid-system-fact", "memvid-system-frame"})
+        )
         inactive_hits = final.retrieve(
             RetrievalQuery(
                 query="sentinel_memvid_system_81aa",
@@ -117,21 +123,11 @@ def test_memvid_concurrent_agents_atomically_reserve_reused_turn_identity(
     tmp_path: Path,
 ) -> None:
     memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", MemvidBackend)
-    identity_lookups_complete = Barrier(2)
-    original_get_record = memory.get_record
+    turn_ids_ready = Barrier(2)
 
-    def synchronize_legacy_lookup(
-        layer: MemoryLayer | None,
-        record_id: str,
-        *,
-        include_inactive: bool = True,
-    ) -> MemoryRecord | None:
-        record = original_get_record(layer, record_id, include_inactive=include_inactive)
-        if record_id == "turn_memvid_concurrent_provider_error":
-            identity_lookups_complete.wait(timeout=10)
-        return record
-
-    memory.get_record = synchronize_legacy_lookup  # type: ignore[method-assign]
+    def concurrent_turn_id() -> str:
+        turn_ids_ready.wait(timeout=10)
+        return "turn_memvid_concurrent"
 
     def build_agent(response: str) -> NestedMV2Agent:
         return NestedMV2Agent(
@@ -140,7 +136,7 @@ def test_memvid_concurrent_agents_atomically_reserve_reused_turn_identity(
                 llm=MockLLMProvider([LLMResponse(content=response)]),
                 tools=build_default_tools(),
                 config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
-                turn_id_factory=lambda: "turn_memvid_concurrent",
+                turn_id_factory=concurrent_turn_id,
             )
         )
 

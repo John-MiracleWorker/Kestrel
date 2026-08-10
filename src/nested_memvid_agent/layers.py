@@ -1025,14 +1025,13 @@ class LayeredMemorySystem:
         so the caller can persist the initial frame before leaving this context.
         """
 
-        candidate_ids = tuple(dict.fromkeys(record_ids))
+        candidate_ids = frozenset(record_ids)
         ordered_layers = tuple(sorted(self.backends, key=lambda item: item.value))
         with ExitStack() as reservations:
             for layer in ordered_layers:
                 reservations.enter_context(self.backends[layer].identity_reservation())
             available = not any(
-                self.backends[layer].get_record(record_id, include_inactive=True) is not None
-                for record_id in candidate_ids
+                self.backends[layer].has_any_record_identity(candidate_ids)
                 for layer in ordered_layers
             )
             yield available
