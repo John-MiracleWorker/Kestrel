@@ -131,6 +131,8 @@ class ContextPacker:
     def _select_items(self, hits: list[MemoryHit], request: ContextPackRequest) -> list[PackedContextItem]:
         selected: list[PackedContextItem] = []
         selected_canonical_contents: list[str] = []
+        selected_rendered_contents: list[str] = []
+        selected_linked_child_ids: set[str] = set()
         seen_hashes: set[str] = set()
         used_tokens = estimate_tokens(
             _prompt_scaffold(
@@ -144,9 +146,17 @@ class ContextPacker:
 
         for hit in hits:
             frame = _frame_for(hit)
-            if frame.content_hash in seen_hashes:
+            requires_independent_linked_evidence = _requires_independent_linked_evidence(
+                frame,
+                linked_child_ids=selected_linked_child_ids,
+                selected_contents=selected_rendered_contents,
+            )
+            if frame.content_hash in seen_hashes and not requires_independent_linked_evidence:
                 continue
-            if _too_similar(frame.content, selected_canonical_contents):
+            if (
+                _too_similar(frame.content, selected_canonical_contents)
+                and not requires_independent_linked_evidence
+            ):
                 continue
             should_expand = _should_expand_raw(
                 frame,
@@ -178,6 +188,7 @@ class ContextPacker:
                 if selected:
                     continue
                 content = _truncate_to_tokens(content, max(request.token_budget - used_tokens, 64))
+                canonical_content = content
                 token_count = estimate_tokens(content, request.model_hint)
             selected.append(
                 PackedContextItem(
@@ -192,6 +203,8 @@ class ContextPacker:
             used_tokens += token_count
             seen_hashes.add(frame.content_hash)
             selected_canonical_contents.append(canonical_content)
+            selected_rendered_contents.append(content)
+            selected_linked_child_ids.update(frame.child_ids)
             if used_tokens >= request.token_budget:
                 break
 
@@ -425,6 +438,22 @@ def _too_similar(content: str, existing: list[str]) -> bool:
         if overlap >= 0.88:
             return True
     return False
+
+
+def _requires_independent_linked_evidence(
+    frame: MV2ContextFrame,
+    *,
+    linked_child_ids: set[str],
+    selected_contents: list[str],
+) -> bool:
+    if frame.frame_type not in RAW_FRAME_TYPES | CORRECTION_FRAME_TYPES:
+        return False
+    if frame.id not in linked_child_ids and not frame.parent_ids:
+        return False
+    complete_content = frame.content.strip()
+    return bool(complete_content) and not any(
+        complete_content in selected_content for selected_content in selected_contents
+    )
 
 
 def _detect_conflicts(hits: list[MemoryHit]) -> list[str]:

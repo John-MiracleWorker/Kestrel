@@ -318,6 +318,185 @@ def test_packer_expands_child_raw_frame_from_summary_link(tmp_path: Path) -> Non
     assert expanded.items[0].reason == "expanded_child_frames"
 
 
+def test_packer_keeps_raw_child_omitted_by_summary_truncation() -> None:
+    marker = "truncation-sentinel"
+    exact_tail = "CRITICAL_EXACT_TAIL_OMITTED"
+    shared_prefix = " ".join(f"shared-token-{index:02d}" for index in range(80))
+    child_content = f"{marker} {shared_prefix} {exact_tail}"
+    summary = MemoryRecord(
+        id="summary",
+        title="Summary",
+        # Put the truncation boundary inside padding so truncation leaves room
+        # for the independently retrieved child after the summary is selected.
+        content=(
+            f"{marker} {shared_prefix}"
+            + (" " * 12000)
+            + "omitted summary tail "
+            + ("suffix " * 100)
+        ),
+        layer=MemoryLayer.EPISODIC,
+        kind=MemoryKind.SUMMARY,
+        confidence=0.9,
+        importance=0.9,
+        metadata={
+            "frame_type": "task_summary",
+            "frame_id": "summary",
+            "child_ids": ["raw-child"],
+        },
+    )
+    raw_child = MemoryRecord(
+        id="raw-child",
+        title="Raw child",
+        content=child_content,
+        layer=MemoryLayer.EPISODIC,
+        kind=MemoryKind.FACT,
+        confidence=0.8,
+        importance=0.8,
+        metadata={
+            "frame_type": "raw_chunk",
+            "frame_id": "raw-child",
+            "parent_ids": ["summary"],
+        },
+    )
+
+    class LinkedMemory:
+        def retrieve(self, _query: object) -> list[MemoryHit]:
+            return [
+                MemoryHit(
+                    record=summary,
+                    score=2.0,
+                    source_backend="test",
+                    snippet=summary.content,
+                ),
+                MemoryHit(
+                    record=raw_child,
+                    score=1.0,
+                    source_backend="test",
+                    snippet=raw_child.content,
+                ),
+            ]
+
+        def get_record(
+            self,
+            _layer: MemoryLayer | None,
+            record_id: str,
+            *,
+            include_inactive: bool = True,
+        ) -> MemoryRecord | None:
+            del include_inactive
+            return {"summary": summary, "raw-child": raw_child}.get(record_id)
+
+    packed = ContextPacker(LinkedMemory()).pack(  # type: ignore[arg-type]
+        ContextPackRequest(
+            objective=marker,
+            query=marker,
+            token_budget=1200,
+            expand_raw=True,
+        )
+    )
+
+    assert packed.items[0].frame.id == "summary"
+    assert child_content not in packed.items[0].content
+    assert exact_tail not in packed.items[0].content
+    assert "TRUNCATED_BY_CONTEXT_PACKER" in packed.items[0].content
+    assert [item.frame.id for item in packed.items] == ["summary", "raw-child"]
+    assert exact_tail in packed.prompt
+
+
+def test_packer_checks_linked_evidence_coverage_against_rendered_snippet() -> None:
+    marker = "rendered-content-sentinel"
+
+    class LinkedMemory:
+        def __init__(
+            self,
+            summary: MemoryRecord,
+            linked_evidence: MemoryRecord,
+            rendered_snippet: str,
+        ) -> None:
+            self.summary = summary
+            self.linked_evidence = linked_evidence
+            self.rendered_snippet = rendered_snippet
+
+        def retrieve(self, _query: object) -> list[MemoryHit]:
+            return [
+                MemoryHit(
+                    record=self.summary,
+                    score=2.0,
+                    source_backend="test",
+                    snippet=self.rendered_snippet,
+                ),
+                MemoryHit(
+                    record=self.linked_evidence,
+                    score=1.0,
+                    source_backend="test",
+                    snippet=self.linked_evidence.content,
+                ),
+            ]
+
+        def get_record(
+            self,
+            _layer: MemoryLayer | None,
+            record_id: str,
+            *,
+            include_inactive: bool = True,
+        ) -> MemoryRecord | None:
+            del include_inactive
+            return {
+                self.summary.id: self.summary,
+                self.linked_evidence.id: self.linked_evidence,
+            }.get(record_id)
+
+    for frame_type, kind, confidence in (
+        ("raw_chunk", MemoryKind.FACT, 0.4),
+        ("correction", MemoryKind.CORRECTION, 0.8),
+    ):
+        child_id = f"{frame_type}-child"
+        complete_content = f"{marker} COMPLETE_LINKED_EVIDENCE_{frame_type.upper()}"
+        rendered_snippet = f"{marker} compact snippet"
+        summary = MemoryRecord(
+            id=f"{frame_type}-summary",
+            title="Summary",
+            content=complete_content,
+            layer=MemoryLayer.EPISODIC,
+            kind=MemoryKind.SUMMARY,
+            confidence=0.9,
+            importance=0.9,
+            metadata={
+                "frame_type": "task_summary",
+                "frame_id": f"{frame_type}-summary",
+                "child_ids": [child_id],
+            },
+        )
+        linked_evidence = MemoryRecord(
+            id=child_id,
+            title="Linked evidence",
+            content=complete_content,
+            layer=MemoryLayer.EPISODIC,
+            kind=kind,
+            confidence=confidence,
+            importance=0.8,
+            metadata={
+                "frame_type": frame_type,
+                "frame_id": child_id,
+                "parent_ids": [summary.id],
+            },
+        )
+
+        packed = ContextPacker(
+            LinkedMemory(summary, linked_evidence, rendered_snippet)  # type: ignore[arg-type]
+        ).pack(
+            ContextPackRequest(
+                objective=marker,
+                query=marker,
+                token_budget=1200,
+            )
+        )
+
+        assert packed.items[0].content == rendered_snippet
+        assert [item.frame.id for item in packed.items] == [summary.id, child_id]
+        assert complete_content in packed.prompt
+
+
 def test_packer_excludes_the_current_turn_frame_from_recalled_hits(tmp_path: Path) -> None:
     memory = _memory(tmp_path)
     _put(

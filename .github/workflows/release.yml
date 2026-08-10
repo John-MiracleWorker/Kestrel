@@ -175,6 +175,8 @@ jobs:
           import re
           from pathlib import Path
 
+          from scripts.golden_eval_contract import validate_golden_report
+
           expected_sha = os.environ["RELEASE_COMMIT_SHA"]
           artifact_dir = Path(os.environ["DETERMINISM_ARTIFACT_DIR"])
           report_path = Path(os.environ["DETERMINISM_REPORT"])
@@ -293,6 +295,9 @@ jobs:
           }
           if set(golden_report_paths) != set(expected_golden_report_paths.values()):
               raise SystemExit("determinism golden report artifact layout is not accepted")
+          recomputed_pass_states = []
+          recomputed_projections = []
+          recomputed_signatures = []
           for run in runs:
               repeat = run["repeat"]
               golden_report_path = expected_golden_report_paths[repeat]
@@ -324,7 +329,84 @@ jobs:
                       "determinism golden report digest does not match "
                       f"repeat {repeat}"
                   )
-          outcome_signatures = [run["outcome_signature"] for run in runs]
+              golden_configuration = golden_report.get("configuration")
+              if (
+                  not isinstance(golden_configuration, dict)
+                  or golden_configuration.get("max_case_latency_ms")
+                  != configuration["max_case_latency_ms"]
+              ):
+                  raise SystemExit(
+                      "determinism golden report latency gate does not match "
+                      f"repeat {repeat}"
+                  )
+              try:
+                  recomputed_passed = validate_golden_report(
+                      golden_report,
+                      expected_backend="memory",
+                      expected_seed=configuration["seed"],
+                  )
+              except ValueError as exc:
+                  raise SystemExit(
+                      "determinism golden report contract is invalid for "
+                      f"repeat {repeat}: {exc}"
+                  ) from exc
+              if recomputed_passed is not True:
+                  raise SystemExit(
+                      "determinism golden report acceptance failed for "
+                      f"repeat {repeat}"
+                  )
+              raw_results = golden_report["results"]
+              assert isinstance(raw_results, list)
+              recomputed_failed_cases = sorted(
+                  str(item["name"])
+                  for item in raw_results
+                  if isinstance(item, dict) and item.get("passed") is not True
+              )
+              if run["failed_cases"] != recomputed_failed_cases:
+                  raise SystemExit(
+                      "determinism golden report failed cases do not match "
+                      f"repeat {repeat}"
+                  )
+              cases = []
+              for raw_result in raw_results:
+                  assert isinstance(raw_result, dict)
+                  cases.append(
+                      {
+                          "name": str(raw_result["name"]),
+                          "category": str(raw_result["category"]),
+                          "outcome": {
+                              str(key): value
+                              for key, value in raw_result.items()
+                              if key not in {"name", "category", "latency_ms"}
+                          },
+                      }
+                  )
+              cases.sort(key=lambda item: (item["name"], item["category"]))
+              recomputed_projection = {
+                  "schema": golden_report["schema"],
+                  "configuration": {
+                      key: golden_configuration.get(key)
+                      for key in ("backend", "provider", "model", "seed")
+                  },
+                  "cases": cases,
+              }
+              recomputed_signature = hashlib.sha256(
+                  json.dumps(
+                      recomputed_projection,
+                      sort_keys=True,
+                      separators=(",", ":"),
+                      ensure_ascii=True,
+                  ).encode()
+              ).hexdigest()
+              if run["outcome_signature"] != recomputed_signature:
+                  raise SystemExit(
+                      "determinism golden report projection does not match "
+                      f"repeat {repeat}"
+                  )
+              recomputed_pass_states.append(recomputed_passed)
+              recomputed_projections.append(recomputed_projection)
+              recomputed_signatures.append(recomputed_signature)
+          outcome_signatures = recomputed_signatures
           distinct_signatures = set(outcome_signatures)
           first_signature = outcome_signatures[0]
           derived_streak = 0
@@ -339,7 +421,7 @@ jobs:
           derived_summary = {
               "completed_repeats": len(runs),
               "required_repeats": configuration["required_repeats"],
-              "all_runs_passed": all(run["passed"] is True for run in runs),
+              "all_runs_passed": all(recomputed_pass_states),
               "unique_outcome_signatures": len(distinct_signatures),
               "determinism_streak": derived_streak,
               "observed_flake_count": derived_flake_count,
@@ -348,6 +430,10 @@ jobs:
           if len(distinct_signatures) != 1:
               raise SystemExit("determinism receipt has multiple outcome signatures")
           reference_projection = report["reference_projection"]
+          if reference_projection != recomputed_projections[0]:
+              raise SystemExit(
+                  "determinism receipt reference projection does not match reports"
+              )
           reference_signature = hashlib.sha256(
               json.dumps(
                   reference_projection,

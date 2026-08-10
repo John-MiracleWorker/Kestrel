@@ -10,6 +10,8 @@ from pathlib import Path
 
 import yaml
 
+from scripts.golden_eval_contract import GOLDEN_CASE_CATEGORIES
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -57,7 +59,8 @@ def _determinism_v3_receipt(
     golden_report_sha256: str | None = None,
 ) -> dict[str, object]:
     commit = "a" * 40
-    reference_projection: dict[str, object] = {}
+    golden_reports = _golden_reports()
+    reference_projection = _golden_projection(golden_reports[0])
     outcome_signature = hashlib.sha256(
         json.dumps(
             reference_projection,
@@ -104,7 +107,7 @@ def _determinism_v3_receipt(
                 "golden_report_sha256": (
                     golden_report_sha256
                     if golden_report_sha256 is not None
-                    else _golden_report_sha256(_golden_reports()[repeat - 1])
+                    else _golden_report_sha256(golden_reports[repeat - 1])
                 ),
                 "failed_cases": [],
             }
@@ -114,20 +117,119 @@ def _determinism_v3_receipt(
     }
 
 
-def _golden_reports() -> list[dict[str, object]]:
-    return [
-        {
-            "schema": "kestrel.golden_eval_report.v2",
-            "results": [
+def _golden_reports(
+    *,
+    failed: bool = False,
+    tool_count: int = 1,
+) -> list[dict[str, object]]:
+    reports: list[dict[str, object]] = []
+    failed_name = next(iter(GOLDEN_CASE_CATEGORIES)) if failed else None
+    for repeat in range(1, 21):
+        results: list[dict[str, object]] = []
+        for index, (name, category) in enumerate(GOLDEN_CASE_CATEGORIES.items()):
+            passed = name != failed_name
+            results.append(
                 {
-                    "name": "deterministic-case",
-                    "passed": True,
-                    "latency_ms": float(repeat),
+                    "name": name,
+                    "category": category,
+                    "passed": passed,
+                    "score": 1.0 if passed else 0.0,
+                    "latency_ms": repeat + index / 100,
+                    "memory_hits": 1,
+                    "context_chars": 3,
+                    "tool_count": tool_count,
+                    "cost_estimate_usd": None,
+                    "executed_tools": ["repo.map"],
                 }
-            ],
+            )
+        latency_ms_max = max(float(item["latency_ms"]) for item in results)
+        functional_passed = all(item["passed"] is True for item in results)
+        latency_acceptance = {
+            "measurement_status": "measured",
+            "gate_configured": True,
+            "required": True,
+            "threshold_max_case_latency_ms": 45000.0,
+            "latency_ms_max": latency_ms_max,
+            "passed": True,
         }
-        for repeat in range(1, 21)
-    ]
+        cost_acceptance = {
+            "measurement_status": "unmeasured",
+            "gate_configured": False,
+            "required": False,
+            "measured_case_count": 0,
+            "unmeasured_case_count": len(results),
+            "cost_estimate_usd_total": None,
+            "passed": None,
+            "residual": "fixture",
+        }
+        reports.append(
+            {
+                "schema": "kestrel.golden_eval_report.v2",
+                "configuration": {
+                    "backend": "memory",
+                    "provider": "mock",
+                    "model": "mock",
+                    "seed": 1729,
+                    "max_case_latency_ms": 45000.0,
+                },
+                "results": results,
+                "summary": {
+                    "pass_count": sum(item["passed"] is True for item in results),
+                    "fail_count": sum(item["passed"] is not True for item in results),
+                    "latency_ms_max": latency_ms_max,
+                    "context_chars_max": 3,
+                    "tool_count_total": len(results) * tool_count,
+                    "cost_estimate_usd_total": None,
+                    "categories": {},
+                    "acceptance": {
+                        "latency": dict(latency_acceptance),
+                        "cost": dict(cost_acceptance),
+                    },
+                    "promotion_precision": None,
+                    "false_promotion_count": 0,
+                },
+                "acceptance": {
+                    "functional": {
+                        "required": True,
+                        "passed": functional_passed,
+                    },
+                    "latency": dict(latency_acceptance),
+                    "cost": dict(cost_acceptance),
+                },
+                "passed": functional_passed,
+            }
+        )
+    return reports
+
+
+def _golden_projection(report: dict[str, object]) -> dict[str, object]:
+    raw_results = report["results"]
+    assert isinstance(raw_results, list)
+    cases = []
+    for raw_result in raw_results:
+        assert isinstance(raw_result, dict)
+        cases.append(
+            {
+                "name": raw_result["name"],
+                "category": raw_result["category"],
+                "outcome": {
+                    key: value
+                    for key, value in raw_result.items()
+                    if key not in {"name", "category", "latency_ms"}
+                },
+            }
+        )
+    cases.sort(key=lambda item: (str(item["name"]), str(item["category"])))
+    configuration = report["configuration"]
+    assert isinstance(configuration, dict)
+    return {
+        "schema": report["schema"],
+        "configuration": {
+            key: configuration.get(key)
+            for key in ("backend", "provider", "model", "seed")
+        },
+        "cases": cases,
+    }
 
 
 def _golden_report_sha256(report: dict[str, object]) -> str:
@@ -448,6 +550,8 @@ def test_production_release_requires_exact_sha_reliability_receipts_before_build
     assert 'subject.get("source_commit") != expected_sha' in workflow
     assert 'configuration.get("backend") != "memory"' in workflow
     assert 'configuration.get("max_case_latency_ms") != 45000.0' in workflow
+    assert "validate_golden_report(" in workflow
+    assert "recomputed_projection" in workflow
     assert "if summary != derived_summary" in workflow
 
 
@@ -509,6 +613,69 @@ def test_release_gate_recomputes_each_uploaded_golden_report_digest(
     assert "golden report digest does not match repeat 20" in completed.stderr
 
 
+def test_release_gate_derives_pass_state_from_each_uploaded_golden_report(
+    tmp_path: Path,
+) -> None:
+    receipt = _determinism_v3_receipt()
+    failing_reports = _golden_reports(failed=True)
+    runs = receipt["runs"]
+    assert isinstance(runs, list)
+    for run, golden_report in zip(runs, failing_reports, strict=True):
+        assert isinstance(run, dict)
+        run["golden_report_sha256"] = _golden_report_sha256(golden_report)
+
+    completed = _run_determinism_receipt_gate(
+        tmp_path,
+        receipt,
+        golden_reports=failing_reports,
+    )
+
+    assert completed.returncode != 0
+    assert "golden report acceptance failed for repeat 1" in completed.stderr
+
+
+def test_release_gate_validates_each_uploaded_golden_report_contract(
+    tmp_path: Path,
+) -> None:
+    receipt = _determinism_v3_receipt()
+    malformed_reports = _golden_reports()
+    malformed_reports[0] = {**malformed_reports[0], "untrusted": True}
+    runs = receipt["runs"]
+    assert isinstance(runs, list)
+    assert isinstance(runs[0], dict)
+    runs[0]["golden_report_sha256"] = _golden_report_sha256(malformed_reports[0])
+
+    completed = _run_determinism_receipt_gate(
+        tmp_path,
+        receipt,
+        golden_reports=malformed_reports,
+    )
+
+    assert completed.returncode != 0
+    assert "golden report contract is invalid for repeat 1" in completed.stderr
+
+
+def test_release_gate_derives_projection_from_each_uploaded_golden_report(
+    tmp_path: Path,
+) -> None:
+    receipt = _determinism_v3_receipt()
+    substituted_reports = _golden_reports(tool_count=2)
+    runs = receipt["runs"]
+    assert isinstance(runs, list)
+    for run, golden_report in zip(runs, substituted_reports, strict=True):
+        assert isinstance(run, dict)
+        run["golden_report_sha256"] = _golden_report_sha256(golden_report)
+
+    completed = _run_determinism_receipt_gate(
+        tmp_path,
+        receipt,
+        golden_reports=substituted_reports,
+    )
+
+    assert completed.returncode != 0
+    assert "golden report projection does not match repeat 1" in completed.stderr
+
+
 def test_release_gate_rejects_missing_or_extra_golden_reports(tmp_path: Path) -> None:
     receipt = _determinism_v3_receipt()
     missing = _run_determinism_receipt_gate(
@@ -538,7 +705,7 @@ def test_release_gate_derives_one_distinct_outcome_signature(tmp_path: Path) -> 
     completed = _run_determinism_receipt_gate(tmp_path, receipt)
 
     assert completed.returncode != 0
-    assert "multiple outcome signatures" in completed.stderr
+    assert "golden report projection does not match repeat 20" in completed.stderr
 
 
 def test_release_gate_derives_reference_projection_signature(tmp_path: Path) -> None:
@@ -548,7 +715,7 @@ def test_release_gate_derives_reference_projection_signature(tmp_path: Path) -> 
     completed = _run_determinism_receipt_gate(tmp_path, receipt)
 
     assert completed.returncode != 0
-    assert "reference projection digest" in completed.stderr
+    assert "reference projection does not match reports" in completed.stderr
 
 
 def test_release_gate_rejects_forged_derived_summary(tmp_path: Path) -> None:
