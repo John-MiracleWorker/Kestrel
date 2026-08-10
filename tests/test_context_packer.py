@@ -272,6 +272,8 @@ def test_packer_expands_child_raw_frame_from_summary_link(tmp_path: Path) -> Non
 
     assert "unique child payload" not in compact.prompt
     assert "unique child payload" in expanded.prompt
+    assert "Gamma raw child" not in [item.frame.title for item in expanded.items]
+    assert expanded.prompt.count("unique child payload") == 1
     assert expanded.items[0].reason == "expanded_child_frames"
 
 

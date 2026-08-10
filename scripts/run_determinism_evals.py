@@ -12,6 +12,7 @@ import re
 import sys
 from collections import Counter
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,7 +38,18 @@ MAX_PYTHON_HASH_SEED = 4_294_967_295
 _VOLATILE_CASE_KEYS = frozenset({"latency_ms"})
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
-IterationRunner = Callable[[int, Path, int], dict[str, object]]
+
+@dataclass(frozen=True)
+class IterationInvocation:
+    """One imported golden report plus trusted parent-runner diagnostics."""
+
+    report: dict[str, object]
+    diagnostics: Mapping[str, object]
+
+
+IterationRunner = Callable[
+    [int, Path, int], dict[str, object] | IterationInvocation
+]
 _RUNNER_DIAGNOSTIC_FIELDS = frozenset(
     {
         "status",
@@ -486,7 +498,19 @@ def run_determinism(
         )
         try:
             imported = invoke(iteration, memory_root, seed)
-            report = _redact_json(imported)
+            imported_report: object = imported
+            if isinstance(imported, IterationInvocation):
+                imported_report = imported.report
+                redacted_diagnostics = _redact_json(imported.diagnostics)
+                if isinstance(redacted_diagnostics, dict):
+                    receipt.update(
+                        {
+                            key: value
+                            for key, value in redacted_diagnostics.items()
+                            if key in _RUNNER_DIAGNOSTIC_FIELDS
+                        }
+                    )
+            report = _redact_json(imported_report)
             if not isinstance(report, dict):
                 raise ValueError("golden runner report is not a JSON object")
             derived_passed = validate_golden_report(
@@ -677,7 +701,10 @@ def _subprocess_invoker(
                 "golden runner report is not a JSON object",
                 receipt=receipt,
             )
-        return cast(dict[str, object], _redact_json(payload))
+        return IterationInvocation(
+            report=cast(dict[str, object], _redact_json(payload)),
+            diagnostics=receipt,
+        )
 
     return invoke
 

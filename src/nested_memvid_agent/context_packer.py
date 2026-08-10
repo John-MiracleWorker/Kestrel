@@ -130,6 +130,7 @@ class ContextPacker:
 
     def _select_items(self, hits: list[MemoryHit], request: ContextPackRequest) -> list[PackedContextItem]:
         selected: list[PackedContextItem] = []
+        selected_canonical_contents: list[str] = []
         seen_hashes: set[str] = set()
         used_tokens = estimate_tokens(
             _prompt_scaffold(
@@ -145,7 +146,7 @@ class ContextPacker:
             frame = _frame_for(hit)
             if frame.content_hash in seen_hashes:
                 continue
-            if _too_similar(frame.content, [item.frame.content for item in selected]):
+            if _too_similar(frame.content, selected_canonical_contents):
                 continue
             should_expand = _should_expand_raw(
                 frame,
@@ -157,6 +158,7 @@ class ContextPacker:
                 continue
             expand_children = frame.frame_type in SUMMARY_FRAME_TYPES and (request.expand_raw or needs_exact)
             content = frame.content if should_expand or expand_children else hit.snippet or frame.content
+            canonical_content = frame.content
             reason = _selection_reason(frame, should_expand)
             if should_expand:
                 content = frame.content
@@ -168,6 +170,7 @@ class ContextPacker:
                 )
                 if expanded_content != content:
                     content = expanded_content
+                    canonical_content = expanded_content
                     should_expand = True
                     reason = "expanded_child_frames"
             token_count = max(estimate_tokens(content, request.model_hint), frame.token_count if should_expand else 0)
@@ -188,6 +191,7 @@ class ContextPacker:
             )
             used_tokens += token_count
             seen_hashes.add(frame.content_hash)
+            selected_canonical_contents.append(canonical_content)
             if used_tokens >= request.token_budget:
                 break
 

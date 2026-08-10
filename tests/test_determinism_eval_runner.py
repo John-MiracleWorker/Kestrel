@@ -16,6 +16,7 @@ from scripts.bounded_process import run_bounded_process
 from scripts.golden_eval_contract import validate_golden_report
 from scripts.run_determinism_evals import (
     GoldenRunnerError,
+    IterationInvocation,
     _deterministic_projection,
     _excerpt,
     _subprocess_invoker,
@@ -298,13 +299,75 @@ def test_subprocess_invoker_forwards_backend_to_isolated_golden_runner(
     )
 
     memory_root = tmp_path / "repeat-01" / "memory"
-    report = invoke(1, memory_root, 1729)
+    invocation = invoke(1, memory_root, 1729)
     argv = json.loads(argv_path.read_text(encoding="utf-8"))
 
-    assert report["configuration"]["backend"] == backend
+    assert isinstance(invocation, IterationInvocation)
+    assert invocation.report["configuration"]["backend"] == backend
+    assert invocation.diagnostics["runner_exit_code"] == 0
     assert argv.count("--backend") == 1
     assert argv[argv.index("--backend") + 1] == backend
     assert argv[argv.index("--memory-dir") + 1] == str(memory_root)
+
+
+def test_successful_subprocess_diagnostics_are_written_to_iteration_receipts(
+    tmp_path: Path,
+) -> None:
+    runner = tmp_path / "successful_golden_runner.py"
+    payload = json.dumps(_golden_report(), sort_keys=True)
+    runner.write_text(
+        "\n".join(
+            [
+                "import pathlib, sys",
+                "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])",
+                "output.parent.mkdir(parents=True, exist_ok=True)",
+                f"output.write_text({payload!r}, encoding='utf-8')",
+                "print('successful runner diagnostic')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run_root = tmp_path / "determinism-runs"
+
+    report = run_determinism(
+        repeats=2,
+        seed=1729,
+        backend="memory",
+        run_root=run_root,
+        output=tmp_path / "determinism-report.json",
+        invoke=_subprocess_invoker(
+            backend="memory",
+            workspace=tmp_path,
+            validation_container_image=None,
+            max_case_latency_ms=None,
+            case_timeout_seconds=2.0,
+            iteration_timeout_seconds=5.0,
+            golden_runner=runner,
+        ),
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
+        expected_case_categories=TEST_CASES,
+        iteration_timeout_seconds=5.0,
+    )
+
+    assert report["passed"] is True
+    for receipt_path in sorted(run_root.glob("repeat-*/iteration-receipt.json")):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["status"] == "completed"
+        assert receipt["runner_exit_code"] == 0
+        assert isinstance(receipt["elapsed_seconds"], float)
+        assert receipt["elapsed_seconds"] >= 0.0
+        assert receipt["deadline"] == {
+            "clock": "monotonic",
+            "seconds": 5.0,
+            "exceeded": False,
+        }
+        assert receipt["cleanup"]["succeeded"] is True
+        assert receipt["capture"]["stdout_total_bytes"] > 0
+        assert "successful runner diagnostic" in receipt["stdout"]
 
 
 def test_memvid_runner_failure_writes_a_backend_bound_failed_receipt(

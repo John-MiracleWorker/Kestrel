@@ -451,9 +451,17 @@ streak, and observed flake rate:
 
 ```bash
 DETERMINISM_PARENT="$(mktemp -d)"
+WORKTREE_STATUS="$(git status --porcelain=v1 --untracked-files=normal)"
+if test -n "$WORKTREE_STATUS"; then
+  echo "determinism receipts require a clean worktree" >&2
+  exit 1
+fi
+SOURCE_COMMIT="$(git rev-parse --verify HEAD)"
 python scripts/run_determinism_evals.py \
+  --backend memory \
   --repeats 20 \
   --seed 1729 \
+  --source-commit "$SOURCE_COMMIT" \
   --run-root "$DETERMINISM_PARENT/runs" \
   --output "$DETERMINISM_PARENT/report.json" \
   --validation-container-image "$VALIDATION_IMAGE" \

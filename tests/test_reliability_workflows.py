@@ -234,6 +234,20 @@ def test_release_rehearsal_lane_is_repeatable_and_has_no_publication_authority()
         assert forbidden not in workflow
 
 
+def test_testing_guide_determinism_command_binds_backend_and_source_subject() -> None:
+    guide = (ROOT / "docs" / "TESTING.md").read_text(encoding="utf-8")
+    command_start = guide.index('DETERMINISM_PARENT="$(mktemp -d)"')
+    command_end = guide.index("```", command_start)
+    command = guide[command_start:command_end]
+
+    assert "--backend memory" in command
+    assert 'WORKTREE_STATUS="$(git status --porcelain=v1 --untracked-files=normal)"' in command
+    assert 'if test -n "$WORKTREE_STATUS"; then' in command
+    assert "exit 1" in command
+    assert 'SOURCE_COMMIT="$(git rev-parse --verify HEAD)"' in command
+    assert '--source-commit "$SOURCE_COMMIT"' in command
+
+
 def test_production_release_requires_exact_sha_reliability_receipts_before_build() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
