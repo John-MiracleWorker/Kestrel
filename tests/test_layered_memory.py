@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,7 +11,13 @@ import pytest
 from nested_memvid_agent.backends.base import MemoryBackend
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
 from nested_memvid_agent.layers import LayeredMemorySystem, load_layer_specs
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
+from nested_memvid_agent.models import (
+    MemoryHit,
+    MemoryKind,
+    MemoryLayer,
+    MemoryRecord,
+    RetrievalQuery,
+)
 
 
 def test_layer_write_threshold_blocks_low_confidence_semantic(tmp_path: Path) -> None:
@@ -92,6 +98,47 @@ def test_initial_write_reservation_supports_legacy_custom_backend_record_lookup(
     )
 
     with memory.reserve_record_ids_for_initial_write({"legacy-occupied-id"}) as available:
+        assert available is False
+
+
+def test_initial_write_reservation_supports_pre_reservation_custom_backend(
+    tmp_path: Path,
+) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(tmp_path, PreReservationBackend)
+    legacy_backends: list[PreReservationBackend] = []
+    for backend in memory.backends.values():
+        assert isinstance(backend, PreReservationBackend)
+        legacy_backends.append(backend)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with memory.reserve_record_ids_for_initial_write({"legacy-reserved-id"}) as available:
+            assert available is True
+            assert all(
+                executor.submit(backend.competing_reservation_available).result(timeout=5)
+                is False
+                for backend in legacy_backends
+            )
+            memory.put(
+                MemoryRecord(
+                    id="legacy-reserved-id",
+                    title="Legacy reservation",
+                    content="The fallback reservation remains held through the first write.",
+                    layer=MemoryLayer.WORKING,
+                    confidence=0.5,
+                )
+            )
+            assert all(
+                executor.submit(backend.competing_reservation_available).result(timeout=5)
+                is False
+                for backend in legacy_backends
+            )
+
+        assert all(
+            executor.submit(backend.competing_reservation_available).result(timeout=5) is True
+            for backend in legacy_backends
+        )
+
+    with memory.reserve_record_ids_for_initial_write({"legacy-reserved-id"}) as available:
         assert available is False
 
 
@@ -422,6 +469,79 @@ class LegacyLookupBackend(InMemoryBackend):
     """A pre-bulk-identity custom backend that retains the legacy lookup API."""
 
     has_any_record_identity = MemoryBackend.has_any_record_identity
+
+
+class PreReservationBackend(MemoryBackend):
+    """A custom backend implementing the contract before reservations existed."""
+
+    def __init__(self, path: Path, layer: MemoryLayer, **kwargs: object) -> None:
+        super().__init__(path, layer, **kwargs)
+        self._delegate = InMemoryBackend(path=path, layer=layer, **kwargs)
+
+    def open(self) -> None:
+        self._delegate.open()
+
+    def put(self, record: MemoryRecord) -> str:
+        return self._delegate.put(record)
+
+    def find(
+        self,
+        query: str,
+        k: int = 8,
+        mode: str = "auto",
+        min_relevancy: float = 0.0,
+        *,
+        include_inactive: bool = False,
+    ) -> list[MemoryHit]:
+        return self._delegate.find(
+            query,
+            k,
+            mode,
+            min_relevancy,
+            include_inactive=include_inactive,
+        )
+
+    def upsert(self, record: MemoryRecord) -> str:
+        return self._delegate.upsert(record)
+
+    def tombstone(
+        self,
+        record_id: str,
+        *,
+        reason: str,
+        superseded_by: str | None = None,
+    ) -> bool:
+        return self._delegate.tombstone(
+            record_id,
+            reason=reason,
+            superseded_by=superseded_by,
+        )
+
+    def iter_records(self, *, include_inactive: bool = False) -> Iterable[MemoryRecord]:
+        return self._delegate.iter_records(include_inactive=include_inactive)
+
+    def get_record(
+        self,
+        record_id: str,
+        *,
+        include_inactive: bool = True,
+    ) -> MemoryRecord | None:
+        return self._delegate.get_record(record_id, include_inactive=include_inactive)
+
+    def seal(self) -> None:
+        self._delegate.seal()
+
+    def verify(self) -> bool:
+        return self._delegate.verify()
+
+    def close(self) -> None:
+        self._delegate.close()
+
+    def competing_reservation_available(self) -> bool:
+        acquired = self._identity_reservation_lock.acquire(blocking=False)
+        if acquired:
+            self._identity_reservation_lock.release()
+        return acquired
 
 
 class ReservationProbeBackend(InMemoryBackend):

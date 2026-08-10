@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable
-from contextlib import AbstractContextManager
+from collections.abc import Collection, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
 from ..models import MemoryHit, MemoryLayer, MemoryRecord
 
@@ -23,6 +24,7 @@ class MemoryBackend(ABC):
     def __init__(self, path: Path, layer: MemoryLayer, **_: object) -> None:
         self.path = Path(path)
         self.layer = layer
+        self._identity_reservation_lock = RLock()
 
     @abstractmethod
     def open(self) -> None:
@@ -32,11 +34,16 @@ class MemoryBackend(ABC):
     def put(self, record: MemoryRecord) -> str:
         raise NotImplementedError
 
-    @abstractmethod
-    def identity_reservation(self) -> AbstractContextManager[None]:
-        """Serialize a cross-layer identity check through its first durable write."""
+    @contextmanager
+    def identity_reservation(self) -> Iterator[None]:
+        """Serialize a cross-layer identity check through its first durable write.
 
-        raise NotImplementedError
+        Backends with an existing operation lock should override this method so
+        reservations also exclude writes outside the reservation protocol.
+        """
+
+        with self._identity_reservation_lock:
+            yield
 
     def has_any_record_identity(self, record_ids: Collection[str]) -> bool:
         """Return whether any logical record or frame identity is already present.
