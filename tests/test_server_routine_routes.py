@@ -292,10 +292,10 @@ def test_routine_api_dispatches_internal_run_and_reports_history(
 
     with TestClient(create_app(config)) as client:
         try:
+            assert initial_tick_entered.wait(timeout=_ASYNC_RUN_TIMEOUT_SECONDS)
             ready = client.get("/api/health/ready", headers=headers)
             assert ready.status_code == 200
             assert ready.json()["proactive_routines"]["status"] == "healthy"
-            assert initial_tick_entered.wait(timeout=_ASYNC_RUN_TIMEOUT_SECONDS)
         finally:
             release_initial_tick.set()
         _wait_for_initial_routine_tick(client, headers)
