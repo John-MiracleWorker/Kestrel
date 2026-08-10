@@ -539,15 +539,21 @@ def test_startup_reconciliation_fails_dead_workers_and_preserves_live_workers(
     assert heartbeat_result["worker_heartbeat_at"] != "2000-01-01T00:00:00+00:00"
 
 
-def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path) -> None:
+def test_run_manager_heartbeat_renews_and_releases_its_run_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = AgentConfig(
         memory_dir=tmp_path / "memory",
         state_path=tmp_path / "state.db",
         workspace=tmp_path,
         skills_dir=tmp_path / "skills",
         plugins_dir=tmp_path / "plugins",
-        run_lease_ttl_seconds=2.0,
-        run_heartbeat_interval_seconds=0.05,
+        # Lease expiry behavior is covered with fixed instants in
+        # test_state_store.py. Keep that semantic boundary out of this thread
+        # scheduling test, particularly on busy hosted Windows runners.
+        run_lease_ttl_seconds=5.0,
+        run_heartbeat_interval_seconds=0.01,
     )
     state = AgentStateStore(config.state_path)
     manager = RunManager(
@@ -565,17 +571,28 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path)
         provider="mock",
         model="mock",
     )
+    renewal_succeeded = Event()
+    renewal_records: list[Any] = []
+    renew_run_lease = state.renew_run_lease
+
+    def renew_and_signal(*args: Any, **kwargs: Any) -> Any:
+        renewed = renew_run_lease(*args, **kwargs)
+        if renewed is not None:
+            renewal_records.append(renewed)
+            renewal_succeeded.set()
+        return renewed
+
+    monkeypatch.setattr(state, "renew_run_lease", renew_and_signal)
 
     with manager._run_lease("heartbeat_run", config) as lease:
         assert lease is not None
-        first_heartbeat = state.get_run("heartbeat_run").heartbeat_at
-        renewed = state.get_run("heartbeat_run")
-        deadline = monotonic() + 3.0
-        while renewed.heartbeat_at == first_heartbeat and monotonic() < deadline:
-            sleep(0.01)
-            renewed = state.get_run("heartbeat_run")
+        assert renewal_succeeded.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        renewed = renewal_records[0]
+        assert renewed.run_id == "heartbeat_run"
+        assert renewed.lease_owner == manager._lease_owner
+        assert renewed.lease_generation == lease.lease_generation
         assert renewed.heartbeat_at is not None
-        assert renewed.heartbeat_at != first_heartbeat
+        assert renewed.lease_expires_at is not None
         assert state.acquire_run_lease("heartbeat_run", owner="competitor", ttl_seconds=1) is None
 
     released = state.get_run("heartbeat_run")

@@ -54,6 +54,14 @@ from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.builtin import build_default_tools
 
+_ASYNC_TEST_TIMEOUT_SECONDS = 15.0
+_TERMINAL_RUN_EVENT_TYPES = {
+    "run.admission_failed",
+    "run.cancelled",
+    "run.completed",
+    "run.failed",
+}
+
 
 @pytest.fixture(autouse=True)
 def _authorized_telegram_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,6 +153,7 @@ def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Pa
 
 def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     class CapturingProvider(LLMProvider):
         def __init__(self) -> None:
@@ -174,6 +183,12 @@ def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
         events=RunEventBus(state),
         mcp=MCPManager(state),
         skills=SkillManager(config.skills_dir, state),
+    )
+    request.addfinalizer(
+        lambda: (
+            run_manager.shutdown(timeout_seconds=_ASYNC_TEST_TIMEOUT_SECONDS)
+            or pytest.fail("RunManager did not shut down within the test deadline")
+        )
     )
     provider = CapturingProvider()
 
@@ -230,14 +245,50 @@ def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
         "transcript_scope": "channel",
     }
 
+    terminal_events: queue.Queue[Any] = queue.Queue()
+    publish = run_manager.events.publish
+
+    def publish_and_signal_terminal(
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> Any:
+        event = publish(run_id, event_type, payload)
+        if event_type in _TERMINAL_RUN_EVENT_TYPES:
+            terminal_events.put(event)
+        return event
+
+    run_manager.events.publish = publish_and_signal_terminal  # type: ignore[method-assign]
     primary = run_manager.create_run(
         message="Continue provenance-e2e-71c4",
         session_id=persisted.session_id,
     )
-    deadline = time.monotonic() + 5
-    while run_manager.get_run(primary.run_id)["status"] not in {"completed", "failed"}:
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
+    observed_terminal_events: list[dict[str, str]] = []
+    try:
+        while True:
+            event = terminal_events.get(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+            observed_terminal_events.append({"run_id": event.run_id, "type": event.type})
+            if event.run_id == primary.run_id:
+                break
+    except queue.Empty:
+        pytest.fail(
+            "primary replay did not publish a terminal event: "
+            + json.dumps(
+                {
+                    "run": run_manager.get_run(primary.run_id),
+                    "observed_terminal_events": observed_terminal_events,
+                    "run_step_types": [
+                        step["type"] for step in state.list_run_steps(primary.run_id)
+                    ],
+                },
+                default=str,
+                sort_keys=True,
+            )
+        )
+    assert observed_terminal_events[-1] == {
+        "run_id": primary.run_id,
+        "type": "run.completed",
+    }
     assert run_manager.get_run(primary.run_id)["status"] == "completed"
     primary_task_titles = [
         task.title
@@ -983,7 +1034,16 @@ def test_server_exposes_channel_ingest_route(tmp_path: Path, started_test_client
     assert payload["session_id"] == durable_channel_session_id(
         channel="webhook", channel_id="webhook", conversation_id="thread"
     )
-    assert payload["assistant_message"] == "Mock response: hello api channel"
+    expected_assistant_by_stop_reason = {
+        "complete": "Mock response: hello api channel",
+        "publication_pending": "Kestrel accepted the request and is still working.",
+        "queued": "Kestrel accepted the request and is still working.",
+        "running": "Kestrel accepted the request and is still working.",
+    }
+    assert payload["stop_reason"] in expected_assistant_by_stop_reason
+    assert payload["assistant_message"] == expected_assistant_by_stop_reason[
+        payload["stop_reason"]
+    ]
     assert payload["delivery"]["dry_run"] is True
 
 

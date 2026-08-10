@@ -481,6 +481,58 @@ def test_determinism_jobs_install_hash_locked_dependency_closures() -> None:
         assert logical_commands == commands
 
 
+def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hosts() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "determinism.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    runtime = workflow["jobs"]["runtime-reliability"]
+
+    assert runtime["runs-on"] == "${{ matrix.os }}"
+    assert runtime["strategy"] == {
+        "fail-fast": False,
+        "matrix": {
+            "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+            "python-version": ["3.11"],
+        },
+    }
+    setup = next(
+        step
+        for step in runtime["steps"]
+        if str(step.get("uses", "")).startswith("actions/setup-python@")
+    )
+    assert setup["with"]["python-version"] == "${{ matrix.python-version }}"
+    install = next(
+        step["run"]
+        for step in runtime["steps"]
+        if step.get("name") == "Install runtime reliability dependencies"
+    )
+    assert ".[dev]" in install
+    invocation = next(
+        step["run"]
+        for step in runtime["steps"]
+        if step.get("name") == "Run twenty fresh-process runtime reliability repetitions"
+    )
+    assert "scripts/run_runtime_reliability.py" in invocation
+    assert "--repeats 20" in invocation
+    assert '--source-commit "${{ github.sha }}"' in invocation
+    assert '--workspace "."' in invocation
+    assert "--iteration-timeout-seconds 900" in invocation
+    upload = next(
+        step
+        for step in runtime["steps"]
+        if step.get("name") == "Upload runtime reliability receipts"
+    )
+    assert upload["if"] == "always()"
+    assert upload["with"]["name"] == (
+        "kestrel-runtime-reliability-${{ runner.os }}-${{ github.sha }}"
+    )
+    assert "kestrel-runtime-reliability-report.json" in upload["with"]["path"]
+    assert "iteration-receipt.json" in upload["with"]["path"]
+    assert upload["with"]["if-no-files-found"] == "error"
+
+
 def test_release_rehearsal_lane_is_repeatable_and_has_no_publication_authority() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release-rehearsal.yml").read_text(
         encoding="utf-8"
