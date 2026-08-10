@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event, Lock
 from time import monotonic, sleep
 
 import pytest
@@ -14,6 +15,7 @@ from nested_memvid_agent.routine_limits import (
     MAX_ROUTINE_INTERVAL_SECONDS,
     MAX_ROUTINE_MISFIRE_GRACE_SECONDS,
 )
+from nested_memvid_agent.routines import RoutineService, RoutineTickResult
 from nested_memvid_agent.run_manager import RunManager
 from nested_memvid_agent.security_boundary import register_secret_value
 from nested_memvid_agent.server import create_app
@@ -256,10 +258,10 @@ def test_routine_api_rejects_coercible_and_unbounded_integer_fields(
 
 def test_routine_api_dispatches_internal_run_and_reports_history(
     tmp_path: Path,
-    monkeypatch: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = "routine-dispatch-token-07e4"
-    monkeypatch.setenv("KESTREL_ROUTINE_TEST_TOKEN", token)  # type: ignore[attr-defined]
+    monkeypatch.setenv("KESTREL_ROUTINE_TEST_TOKEN", token)
     headers = {"X-Kestrel-API-Key": token}
     config = _config(
         tmp_path,
@@ -267,11 +269,36 @@ def test_routine_api_dispatches_internal_run_and_reports_history(
         enable_proactive_routines=True,
     )
     due = datetime.now(UTC) - timedelta(seconds=1)
+    initial_tick_entered = Event()
+    release_initial_tick = Event()
+    initial_tick_lock = Lock()
+    initial_tick_pending = True
+    original_tick = RoutineService.tick
+
+    def gated_tick(
+        service: RoutineService,
+        now: datetime | None = None,
+    ) -> RoutineTickResult:
+        nonlocal initial_tick_pending
+        with initial_tick_lock:
+            is_initial_tick = initial_tick_pending
+            initial_tick_pending = False
+        if is_initial_tick:
+            initial_tick_entered.set()
+            assert release_initial_tick.wait(timeout=_ASYNC_RUN_TIMEOUT_SECONDS)
+        return original_tick(service, now=now)
+
+    monkeypatch.setattr(RoutineService, "tick", gated_tick)
 
     with TestClient(create_app(config)) as client:
-        ready = client.get("/api/health/ready", headers=headers)
-        assert ready.status_code == 200
-        assert ready.json()["proactive_routines"]["status"] == "healthy"
+        try:
+            ready = client.get("/api/health/ready", headers=headers)
+            assert ready.status_code == 200
+            assert ready.json()["proactive_routines"]["status"] == "healthy"
+            assert initial_tick_entered.wait(timeout=_ASYNC_RUN_TIMEOUT_SECONDS)
+        finally:
+            release_initial_tick.set()
+        _wait_for_initial_routine_tick(client, headers)
 
         created = client.post(
             "/api/routines",
@@ -602,4 +629,25 @@ def _wait_for_api_run(
     raise AssertionError(
         f"run {run_id} did not finish within {_ASYNC_RUN_TIMEOUT_SECONDS:.0f}s "
         f"(last_status={last_status!r})"
+    )
+
+
+def _wait_for_initial_routine_tick(
+    client: TestClient,
+    headers: dict[str, str],
+) -> dict[str, object]:
+    deadline = monotonic() + _ASYNC_RUN_TIMEOUT_SECONDS
+    last_loop: object = None
+    while monotonic() < deadline:
+        response = client.get("/api/routines/status", headers=headers)
+        assert response.status_code == 200
+        loop = response.json()["loop"]
+        last_loop = loop
+        if loop["tick_count"] >= 1 and not loop["tick_in_progress"]:
+            assert loop["last_error"] is None
+            return loop
+        sleep(0.02)
+    raise AssertionError(
+        "initial routine tick did not finish within "
+        f"{_ASYNC_RUN_TIMEOUT_SECONDS:.0f}s (last_loop={last_loop!r})"
     )
