@@ -1837,12 +1837,31 @@ def test_unsupported_platform_birth_marker_fails_closed_without_proc(
     assert exc_info.value.code == "process_inspection_failed"
 
 
-def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None:
+def test_service_controller_real_process_lifecycle_smoke(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
     if os.name == "nt" or shutil.which("lsof") is None:
         pytest.skip("requires POSIX process inspection with lsof")
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
+    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    request.addfinalizer(reservation.close)
+    reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    reservation.bind(("127.0.0.1", 0))
+    port = reservation.getsockname()[1]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as competitor:
+        with pytest.raises(OSError):
+            competitor.bind(("127.0.0.1", port))
+
+    class ReservationAwareInspector(SystemProcessInspector):
+        def port_is_bindable(self, host: str, candidate_port: int) -> bool:
+            if (
+                reservation.fileno() >= 0
+                and host == "127.0.0.1"
+                and candidate_port == port
+            ):
+                return True
+            return super().port_is_bindable(host, candidate_port)
+
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=port)
     paths.server_executable.write_text(
         "#!/usr/bin/env python3\n"
@@ -1852,6 +1871,7 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
         "listener = socket.socket()\n"
         "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)\n"
         "listener.bind((host, port))\n"
         "listener.listen()\n"
         "print(f'fixture: listening on {host}:{port}', file=sys.stderr, flush=True)\n"
@@ -1873,6 +1893,7 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
     controller = ServiceController(
         paths,
         client=FakeClient(ServerProbe(True, True, False)),
+        inspector=ReservationAwareInspector(),
     )
 
     def diagnostic_text(path: Path, *, encoding: str) -> str:
@@ -1898,6 +1919,7 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
                 f"service fixture failed: {exc}; log={lifecycle_log!r}; "
                 f"metadata={metadata!r}"
             ) from exc
+        reservation.close()
         assert started.state == ServiceState.RUNNING
         assert started.management == ServiceManagement.MANAGED
         assert paths.pid_path.exists()
@@ -1910,6 +1932,7 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         assert not paths.pgid_path.exists()
         assert SystemProcessInspector().listeners(paths.host, paths.port) == ()
     finally:
+        reservation.close()
         try:
             controller.stop(grace_timeout=1, kill_timeout=1, poll_interval=0.05)
         except ServiceControlError:
