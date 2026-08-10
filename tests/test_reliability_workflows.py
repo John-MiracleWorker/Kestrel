@@ -205,14 +205,70 @@ def test_determinism_lane_runs_twenty_seeded_repeats_and_always_uploads_report()
     assert "scripts/run_determinism_evals.py" in workflow
     assert "--repeats 20" in workflow
     assert "--seed 1729" in workflow
-    assert '--source-commit "${GITHUB_SHA}"' in workflow
+    assert '--source-commit "${SOURCE_COMMIT}"' in workflow
     assert "--case-timeout-seconds 60" in workflow
     assert "--iteration-timeout-seconds 1500" in workflow
     assert 'PYTHONHASHSEED: "1729"' in workflow
     assert "if: always()" in workflow
-    assert "kestrel-determinism-${{ matrix.backend }}-${{ github.sha }}" in workflow
+    assert (
+        "kestrel-determinism-${{ matrix.backend }}-${{ env.SOURCE_COMMIT }}" in workflow
+    )
     assert "packages: write" not in workflow
     assert "id-token: write" not in workflow
+
+
+def test_determinism_lane_binds_pr_evidence_to_the_exact_head_commit() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "determinism.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert workflow["env"]["SOURCE_COMMIT"] == (
+        "${{ github.event.pull_request.head.sha || github.sha }}"
+    )
+    for job_name in (
+        "everyday-golden-determinism",
+        "flock-qualification-determinism",
+    ):
+        checkout = next(
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        )
+        assert checkout["with"]["ref"] == "${{ env.SOURCE_COMMIT }}"
+
+    golden = workflow["jobs"]["everyday-golden-determinism"]
+    golden_invocation = next(
+        step["run"]
+        for step in golden["steps"]
+        if step.get("name") == "Run twenty identical everyday golden evaluations"
+    )
+    assert '--source-commit "${SOURCE_COMMIT}"' in golden_invocation
+    golden_upload = next(
+        step
+        for step in golden["steps"]
+        if step.get("name") == "Upload the machine-readable flake report"
+    )
+    assert golden_upload["with"]["name"] == (
+        "kestrel-determinism-${{ matrix.backend }}-${{ env.SOURCE_COMMIT }}"
+    )
+
+    flock = workflow["jobs"]["flock-qualification-determinism"]
+    flock_invocation = next(
+        step["run"]
+        for step in flock["steps"]
+        if step.get("name") == "Run twenty identical flock qualification journeys"
+    )
+    assert '--source-commit "${SOURCE_COMMIT}"' in flock_invocation
+    flock_upload = next(
+        step
+        for step in flock["steps"]
+        if step.get("name") == "Upload the flock qualification determinism report"
+    )
+    assert flock_upload["with"]["name"] == (
+        "kestrel-flock-qualification-determinism-${{ env.SOURCE_COMMIT }}"
+    )
 
 
 def test_golden_determinism_matrix_runs_twenty_memory_and_memvid_repeats() -> None:
@@ -242,7 +298,7 @@ def test_golden_determinism_matrix_runs_twenty_memory_and_memvid_repeats() -> No
     assert "--backend ${{ matrix.backend }}" in invocation
     assert "--repeats 20" in invocation
     assert "--seed 1729" in invocation
-    assert '--source-commit "${GITHUB_SHA}"' in invocation
+    assert '--source-commit "${SOURCE_COMMIT}"' in invocation
     upload = next(
         step
         for step in golden["steps"]
@@ -250,7 +306,7 @@ def test_golden_determinism_matrix_runs_twenty_memory_and_memvid_repeats() -> No
     )
     assert upload["if"] == "always()"
     assert upload["with"]["name"] == (
-        "kestrel-determinism-${{ matrix.backend }}-${{ github.sha }}"
+        "kestrel-determinism-${{ matrix.backend }}-${{ env.SOURCE_COMMIT }}"
     )
     assert "iteration-receipt.json" in upload["with"]["path"]
     assert "golden-report.json" in upload["with"]["path"]
