@@ -2640,6 +2640,129 @@ def test_server_exposes_local_operator_api_parity(
     assert diagnosis.json()["classification"] in {"missing_dependency", "import_error", "unknown"}
 
 
+def test_client_status_wait_uses_public_run_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 0.0
+
+    class DelayedRunClient:
+        def get(self, path: str) -> Any:
+            assert path == "/api/runs/run_delayed"
+            status = (
+                "completed"
+                if clock > _ASYNC_TEST_TIMEOUT_SECONDS
+                else "running"
+            )
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"run_id": "run_delayed", "status": status},
+            )
+
+    def advance(seconds: float) -> None:
+        nonlocal clock
+        del seconds
+        clock = _ASYNC_TEST_TIMEOUT_SECONDS + 0.05
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "monotonic", lambda: clock)
+    monkeypatch.setattr(module, "sleep", advance)
+
+    run = _wait_for_client_status(DelayedRunClient(), "run_delayed", {"completed"})
+
+    assert run["status"] == "completed"
+    assert _ASYNC_TEST_TIMEOUT_SECONDS < clock < _PUBLIC_RUN_TIMEOUT_SECONDS
+
+
+def test_client_status_wait_rejects_terminal_response_after_public_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 0.0
+    late_terminal = {"run_id": "run_late", "status": "completed"}
+
+    class LateTerminalRunClient:
+        def get(self, path: str) -> Any:
+            nonlocal clock
+            assert path == "/api/runs/run_late"
+            clock = _PUBLIC_RUN_TIMEOUT_SECONDS + 0.05
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: late_terminal,
+            )
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "monotonic", lambda: clock)
+
+    with pytest.raises(AssertionError) as caught:
+        _wait_for_client_status(LateTerminalRunClient(), "run_late", {"completed"})
+
+    assert caught.value.args == (
+        {
+            "run_id": "run_late",
+            "expected_statuses": ["completed"],
+            "phase": "api_run_completion",
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": 1,
+            "public_run": late_terminal,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("pending", "expected_phase"),
+    [
+        (
+            {
+                "run_id": "run_pending",
+                "status": "running",
+                "stop_reason": "publication_pending",
+                "publication_pending": True,
+            },
+            "api_publication",
+        ),
+        (
+            {"run_id": "run_pending", "status": "running"},
+            "api_run_completion",
+        ),
+    ],
+)
+def test_client_status_wait_reports_last_public_run(
+    monkeypatch: pytest.MonkeyPatch,
+    pending: dict[str, object],
+    expected_phase: str,
+) -> None:
+    clock = 0.0
+
+    class PendingRunClient:
+        def get(self, path: str) -> Any:
+            assert path == "/api/runs/run_pending"
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: pending,
+            )
+
+    def expire_timeout(_seconds: float) -> None:
+        nonlocal clock
+        clock = _PUBLIC_RUN_TIMEOUT_SECONDS
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "monotonic", lambda: clock)
+    monkeypatch.setattr(module, "sleep", expire_timeout)
+
+    with pytest.raises(AssertionError) as caught:
+        _wait_for_client_status(PendingRunClient(), "run_pending", {"completed", "failed"})
+
+    assert caught.value.args == (
+        {
+            "run_id": "run_pending",
+            "expected_statuses": ["completed", "failed"],
+            "phase": expected_phase,
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": 1,
+            "public_run": pending,
+        },
+    )
+
+
 def test_server_exposes_observability_routes(tmp_path: Path, started_test_client: Any) -> None:
     from fastapi.testclient import TestClient
 
@@ -8037,15 +8160,34 @@ def _wait_until(predicate: Any, timeout: float = _ASYNC_TEST_TIMEOUT_SECONDS) ->
 
 
 def _wait_for_client_status(client: Any, run_id: str, statuses: set[str]) -> dict[str, object]:
-    deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
+    deadline = monotonic() + _PUBLIC_RUN_TIMEOUT_SECONDS
+    last_run: dict[str, object] | None = None
+    poll_count = 0
     while monotonic() < deadline:
         response = client.get(f"/api/runs/{run_id}")
         response.raise_for_status()
-        run = response.json()
-        if str(run["status"]) in statuses:
-            return dict(run)
-        sleep(0.05)
-    raise AssertionError(f"run {run_id} did not reach {statuses}")
+        last_run = dict(response.json())
+        poll_count += 1
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        if str(last_run["status"]) in statuses:
+            return last_run
+        sleep(min(0.05, remaining))
+    publication_pending = last_run is not None and (
+        bool(last_run.get("publication_pending"))
+        or last_run.get("stop_reason") == "publication_pending"
+    )
+    raise AssertionError(
+        {
+            "run_id": run_id,
+            "expected_statuses": sorted(statuses),
+            "phase": "api_publication" if publication_pending else "api_run_completion",
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": poll_count,
+            "public_run": last_run,
+        }
+    )
 
 
 def _wait_for_subagent(
