@@ -98,7 +98,13 @@ def test_correction_case_counts_only_matching_correction_evidence(
             return None
 
     agents = iter((FirstAgent(), ReopenedAgent()))
-    monkeypatch.setattr(golden_runner, "build_agent", lambda _config: next(agents))
+    build_calls: list[dict[str, object]] = []
+
+    def fake_build_agent(_config: AgentConfig, **kwargs: object) -> object:
+        build_calls.append(kwargs)
+        return next(agents)
+
+    monkeypatch.setattr(golden_runner, "build_agent", fake_build_agent)
     golden_runner._configure_ids(1729)
 
     result = _eval_correction_persists(
@@ -109,7 +115,10 @@ def test_correction_case_counts_only_matching_correction_evidence(
     assert result["passed"] is True
     assert result["memory_hits"] == 1
     assert chat_call["run_id"] == "run_golden_seed_correction_correction"
-    assert chat_call["turn_id"] == "turn_golden_seed_correction_correction"
+    turn_id_factory = build_calls[0]["turn_id_factory"]
+    assert callable(turn_id_factory)
+    assert turn_id_factory() == "turn_golden_seed_correction_correction"
+    assert "turn_id" not in chat_call
 
 
 def test_seeded_conflict_case_uses_stable_record_ids_and_timestamps(

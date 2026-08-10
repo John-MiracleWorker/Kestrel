@@ -32,6 +32,7 @@ def build_agent(
     lan_runtime_authority_resolver: LanRuntimeAuthorityResolver | None = None,
     lan_runtime_utc_clock: Callable[[], datetime] | None = None,
     close_handler: Callable[[], None] | None = None,
+    turn_id_factory: Callable[[], str] | None = None,
 ) -> NestedMV2Agent:
     register_secret_env_names(
         {config.api_key_env, config.fallback_api_key_env, config.api_auth_token_env}
@@ -86,6 +87,7 @@ def build_agent(
                 config=config,
                 event_log=event_log,
                 close_handler=close_handler,
+                turn_id_factory=turn_id_factory,
             )
         )
     except MemoryCleanupIncompleteError:

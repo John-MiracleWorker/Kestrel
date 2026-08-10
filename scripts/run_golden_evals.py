@@ -550,13 +550,15 @@ def _case_config(config: AgentConfig, eval_id: str, case_name: str) -> AgentConf
 
 
 def _eval_correction_persists(config: AgentConfig, eval_id: str) -> dict[str, Any]:
-    agent = build_agent(config)
+    agent = build_agent(
+        config,
+        turn_id_factory=lambda: f"turn_{eval_id}_correction",
+    )
     try:
         turn = agent.chat(
             f"Remember: {eval_id} user correction says concise answers are preferred.",
             session_id=eval_id,
             run_id=f"run_{eval_id}_correction",
-            turn_id=f"turn_{eval_id}_correction",
         )
     finally:
         agent.close()

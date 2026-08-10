@@ -83,6 +83,7 @@ class AgentDependencies:
     config: AgentConfig
     event_log: JsonlEventLog | None = None
     close_handler: Callable[[], None] | None = None
+    turn_id_factory: Callable[[], str] | None = None
 
 
 class NestedMV2Agent:
@@ -95,6 +96,7 @@ class NestedMV2Agent:
         self.config = deps.config
         self.event_log = deps.event_log
         self._close_handler = deps.close_handler
+        self._turn_id_factory = deps.turn_id_factory or (lambda: f"turn_{uuid4().hex}")
         self._close_lock = Lock()
         self._closed = False
         self.compiler = ContextCompiler(
@@ -137,7 +139,6 @@ class NestedMV2Agent:
         session_id: str | None = None,
         *,
         run_id: str | None = None,
-        turn_id: str | None = None,
         approval_handler: ApprovalHandler | None = None,
         approved_tool_call_ids: frozenset[str] = frozenset(),
         approved_tool_call_arguments: dict[str, dict[str, Any]] | None = None,
@@ -177,14 +178,26 @@ class NestedMV2Agent:
             or len(resolved_execution_origin) > 256
         ):
             raise ValueError("execution_origin must be an exact non-empty string up to 256 chars")
-        if turn_id is not None and re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", turn_id) is None:
+        turn_frame_id = self._turn_id_factory()
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", turn_frame_id) is None:
             raise ValueError(
                 "turn_id must contain only ASCII letters, digits, dot, underscore, colon, "
                 "or hyphen and be at most 256 chars"
             )
-        turn_frame_id = turn_id or f"turn_{uuid4().hex}"
         summary_frame_id = f"{turn_frame_id}_summary"
         user_frame_id = f"{turn_frame_id}_user"
+        derived_ids = (
+            user_frame_id,
+            summary_frame_id,
+            f"{turn_frame_id}_assistant",
+            f"{turn_frame_id}_correction",
+            f"{turn_frame_id}_provider_error",
+        )
+        if any(
+            self.memory.get_record(None, record_id, include_inactive=True) is not None
+            for record_id in derived_ids
+        ):
+            raise ValueError(f"turn identity already exists: {turn_frame_id}")
         child_frame_ids = [user_frame_id]
         memory_writes: list[str] = []
         executions: list[ToolExecution] = []

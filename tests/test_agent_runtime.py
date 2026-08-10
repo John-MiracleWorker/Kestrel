@@ -120,14 +120,11 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
             llm=MockLLMProvider([LLMResponse(content="hello back")]),
             tools=build_default_tools(),
             config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+            turn_id_factory=lambda: "turn_test_explicit",
         )
     )
 
-    result = agent.chat(
-        "hello",
-        session_id="test",
-        turn_id="turn_test_explicit",
-    )
+    result = agent.chat("hello", session_id="test")
 
     assert result.assistant_message == "hello back"
     assert result.stop_reason == "complete"
@@ -168,11 +165,48 @@ def test_agent_rejects_noncanonical_explicit_turn_id(
             llm=MockLLMProvider([LLMResponse(content="unused")]),
             tools=build_default_tools(),
             config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+            turn_id_factory=lambda: turn_id,
         )
     )
 
     with pytest.raises(ValueError, match="turn_id"):
-        agent.chat("hello", session_id="test", turn_id=turn_id)
+        agent.chat("hello", session_id="test")
+
+
+@pytest.mark.parametrize("second_session", ["session-one", "session-two"])
+def test_injected_turn_identity_cannot_overwrite_same_or_cross_session_evidence(
+    tmp_path: Path,
+    second_session: str,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=MockLLMProvider(
+                [LLMResponse(content="first response"), LLMResponse(content="second response")]
+            ),
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+            turn_id_factory=lambda: "turn_reused",
+        )
+    )
+    agent.chat("first message", session_id="session-one")
+    before = {
+        record.id: record.content
+        for record in memory.iter_records(include_inactive=True)
+        if record.id.startswith("turn_reused_")
+    }
+
+    with pytest.raises(ValueError, match="turn identity already exists"):
+        agent.chat("second message", session_id=second_session)
+
+    after = {
+        record.id: record.content
+        for record in memory.iter_records(include_inactive=True)
+        if record.id.startswith("turn_reused_")
+    }
+    assert after == before
+    assert all("second message" not in content for content in after.values())
 
 
 def test_optional_llm_summary_uses_run_bounds_and_falls_back_without_failing_turn(
