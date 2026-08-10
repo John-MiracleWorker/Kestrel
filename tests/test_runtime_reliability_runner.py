@@ -19,7 +19,7 @@ from scripts.run_runtime_reliability import (
 SOURCE_COMMIT = "a" * 40
 
 
-def _completed_process(*, returncode: int = 0, stdout: str = "3 passed\n") -> BoundedProcessResult:
+def _completed_process(*, returncode: int = 0, stdout: str = "4 passed\n") -> BoundedProcessResult:
     return BoundedProcessResult(
         returncode=returncode,
         stdout=stdout,
@@ -374,6 +374,12 @@ def test_iteration_invoker_uses_a_fresh_interpreter_and_basetemp_per_repeat(
     assert invoke(1, repeat_one) is result
     assert invoke(2, repeat_two) is result
 
+    expected_targets = (
+        "tests/test_channels.py::test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay",
+        "tests/test_channels.py::test_server_exposes_channel_ingest_route",
+        "tests/test_full_agent_runtime.py::test_run_manager_heartbeat_renews_and_releases_its_run_lease",
+        "tests/test_full_agent_runtime.py::test_cross_manager_task_approval_waits_for_origin_lease_and_wakes_scheduler",
+    )
     assert len(calls) == 2
     for repeat_root, call in zip((repeat_one, repeat_two), calls, strict=True):
         assert call["command"] == (
@@ -381,7 +387,7 @@ def test_iteration_invoker_uses_a_fresh_interpreter_and_basetemp_per_repeat(
             "-m",
             "pytest",
             "-q",
-            *RUNTIME_RELIABILITY_TESTS,
+            *expected_targets,
             "--basetemp",
             str(repeat_root / "pytest-tmp"),
         )

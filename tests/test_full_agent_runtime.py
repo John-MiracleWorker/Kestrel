@@ -4672,28 +4672,41 @@ def test_cross_manager_task_approval_waits_for_origin_lease_and_wakes_scheduler(
     )
     manager_a.state.transition_run(run.run_id, "running")
     origin_observed_idle = Event()
+    foreign_lease_observed = Event()
     release_origin_lease = Event()
+    original_state_b_get_run = state_b.get_run
+
+    def observe_foreign_run_lease(observed_run_id: str) -> RunRecord:
+        observed = original_state_b_get_run(observed_run_id)
+        if observed_run_id == run.run_id and observed.lease_owner == manager_a._lease_owner:
+            foreign_lease_observed.set()
+        return observed
+
+    state_b.get_run = observe_foreign_run_lease  # type: ignore[method-assign]
 
     def hold_origin_lease_after_idle_observation() -> None:
         with manager_a._run_lease(run.run_id, manager_a.config) as lease:
             assert lease is not None
             assert manager_a._executable_ready_tasks(run.run_id) == []
             origin_observed_idle.set()
-            assert release_origin_lease.wait(timeout=3)
+            assert release_origin_lease.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         origin = executor.submit(hold_origin_lease_after_idle_observation)
-        assert origin_observed_idle.wait(timeout=3)
+        assert origin_observed_idle.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
         decision = executor.submit(manager_b.approve_task, run.run_id, task.task_id)
-        sleep(0.05)
+        assert foreign_lease_observed.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        held_run = original_state_b_get_run(run.run_id)
+        assert held_run.lease_owner == manager_a._lease_owner
         assert decision.done() is False
         assert state_b.get_task_node(task.task_id).status == "queued"
         release_origin_lease.set()
-        origin.result(timeout=3)
-        approved = decision.result(timeout=5)
+        origin.result(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        final = _wait_for_status(manager_b, run.run_id, {"completed"})
+        approved = decision.result(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
 
     assert approved["scheduler"]["stop_reason"] == "idle"
-    assert state_b.get_run(run.run_id).status == "completed"
+    assert final["status"] == "completed"
     assert state_b.get_task_node(task.task_id).status == "completed"
     assert state_b.get_task_node(root.task_id).status == "completed"
     subagents = state_b.list_subagent_runs(run.run_id)
