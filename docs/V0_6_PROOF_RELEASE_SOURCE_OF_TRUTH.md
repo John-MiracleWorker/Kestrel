@@ -19,6 +19,13 @@ Every requirement and delivery slice uses exactly one status:
 - `qualified` — the change is merged at an exact SHA and every required local,
   hosted, artifact, review, and owner-controlled gate has a durable receipt.
 
+For dependency purposes, a predecessor is **complete** only when its slice is
+`qualified`. A dependent slice may be prepared early only on an isolated,
+stacked branch after the predecessor's local implementation and independent
+review are complete. That preparation may be `in_progress`, but it may not be
+accepted, merged, or used as qualification evidence until every listed
+predecessor is `qualified`.
+
 Focused tests, a locally clean diff, a candidate artifact, a preview, or a
 single green hosted run are evidence inputs. None is independently sufficient
 to mark a release requirement `qualified`.
@@ -57,10 +64,11 @@ that a later similar task used an accepted lesson.
 
 ## Release priorities
 
-Work follows this hard execution order; a slice may not begin until its listed
-predecessor is complete. The foundational release transaction, rehearsal, and
-installed-artifact work is reliability infrastructure, not final release
-qualification or publication:
+Work follows this hard acceptance and merge order. The limited stacked-branch
+preparation described in the status vocabulary is the only permitted overlap;
+it grants no authority and cannot satisfy a dependency. The foundational
+release transaction, rehearsal, and installed-artifact work is reliability
+infrastructure, not final release qualification or publication:
 
 1. S0 canonical program record and S1 deterministic runtime reliability.
 2. S2 exact-SHA candidate/promotion transaction and S3 repeated release
@@ -84,6 +92,9 @@ slice that may qualify and publish the v0.6 release.
   memory layer. Never call `create(path)` on an existing `.mv2` file.
 - Keep SQLite as control-plane state and Memvid as canonical retrieval memory.
 - Keep the conversational CLI and deterministic mock backend/LLM functional.
+  Conversational CLI readiness is a prerequisite: no optional UI slice may be
+  accepted or merged unless the exact predecessor SHA has a durable CLI
+  launch-and-chat receipt.
 - UI state never invents server authority.
 - High-risk operations require explicit config enablement and then human,
   interactive, exact-call approval before each call.
@@ -349,6 +360,9 @@ Final v0.6 qualification requires all of the following at one exact SHA:
 - Exact artifacts on supported Windows/macOS/Linux paths: clean install,
   installed entry point, `kestrel open`, readiness, first mission, and clean
   shutdown.
+- A conversational CLI launch-and-chat receipt must pass at the exact
+  predecessor SHA before any optional UI slice is accepted or merged; UI
+  success cannot substitute for this CLI gate.
 - Complete golden flagship: isolated patch, independent/truthfully-labelled
   review, validation, rejection/approval, exact commit, capsule, promotion
   proposal, and later retrieval/use proof.
@@ -379,10 +393,11 @@ trust.
 
 | Evidence ID | Subject SHA | Merge status | Merged SHA (when merged) | Evidence | Result and limitation |
 | --- | --- | --- | --- | --- | --- |
-| BASE-2026-08-10-A | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | Locked Python 3.13 environment; compile; full pytest invocation | Compile passed. Full pytest failed in two host-supervised `test.run` cases. Root cause and fresh full receipt pending. |
-| HOSTED-2026-08-09-DET | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | GitHub Actions run `31282412494` | Configured Ubuntu/memory repeat passed; not Memvid/cross-platform proof. |
-| HOSTED-2026-08-09-REH | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | GitHub Actions run `31282412490` | One local-simulation rehearsal passed; not a 20-repeat or hosted-publication proof. |
-| HOSTED-2026-08-09-REL | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | GitHub Actions run `31283680648` | Candidate/artifact jobs ran; PyPI environment remained owner-gated when inspected. Not v0.6 evidence. |
-| BASE-2026-08-10-B | `9d8bc3d891859a0598350364f3f30e320814157b` | `unmerged` | — | Full pytest; OCI-backed memory/mock golden validation; CLI mock chat | Full pytest passed; pinned-image golden passed 21/21; CLI mock chat completed. BASE-A remains failed; hosted/cross-platform repeat receipts are still missing, so REL/S1 remain `in_progress`. |
+| BASE-2026-08-10-A | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `uv sync --locked --all-extras --group release --python 3.13`; `python -m compileall -q src tests scripts`; `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q` | Compile passed. Full pytest failed in two host-supervised `test.run` cases. The exact initial environment-output digest was not captured, so this failed receipt remains explicitly incomplete. |
+| HOSTED-2026-08-09-DET | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | [Actions run 31282412494](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31282412494); workflow command `python scripts/run_determinism_evals.py --repeats 20 --seed 1729 --source-commit "${GITHUB_SHA}" --run-root "${RUNNER_TEMP}/kestrel-determinism-runs" --output "${RUNNER_TEMP}/kestrel-determinism-report.json" --workspace . --case-timeout-seconds 60 --iteration-timeout-seconds 1500 --max-case-latency-ms 45000` | Configured Ubuntu/memory repeat passed; not Memvid/cross-platform proof. The artifact digest was not captured during the audit, so this historical receipt remains incomplete. |
+| HOSTED-2026-08-09-REH | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | [Actions run 31282412490](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31282412490); workflow command `python scripts/run_release_rehearsal.py --source-root . --sandbox-root "${RUNNER_TEMP}/kestrel-release-rehearsal" --namespace "kestrel-rehearsal-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --commit "$GITHUB_SHA" --output "${RUNNER_TEMP}/kestrel-release-rehearsal-report.json"` | One local-simulation rehearsal passed; not a 20-repeat or hosted-publication proof. The artifact digest was not captured during the audit, so this historical receipt remains incomplete. |
+| HOSTED-2026-08-09-REL | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | [Actions run 31283680648](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31283680648); exact commands remain encoded in `.github/workflows/release.yml` at this SHA | Candidate/artifact jobs ran; PyPI remained owner-gated. The expanded command list and artifact digests were not captured during the audit, so this historical receipt is explicitly incomplete and is not v0.6 evidence. |
+| BASE-2026-08-10-B | `9d8bc3d891859a0598350364f3f30e320814157b` | `unmerged` | — | Receipt root: `TASK1_RECEIPT_ROOT=/tmp/kestrel-v06-task1-review.oBrMFT`; focused RED/GREEN: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/test_tools.py::test_same_public_call_id_across_runs_keeps_process_tracking_isolated tests/test_tools.py::test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout`; full: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q`; golden: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 NEST_AGENT_VALIDATION_CONTAINER_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3' .venv/bin/python scripts/run_golden_evals.py --backend memory --provider mock --model mock --workspace . --memory-dir "$TASK1_RECEIPT_ROOT/golden-memory" --seed 1729 --output "$TASK1_RECEIPT_ROOT/golden-report.json" --case-timeout-seconds 120`; CLI: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m nested_memvid_agent.cli chat --backend memory --memory-dir "$TASK1_RECEIPT_ROOT/cli-receipt-memory" --provider mock --model mock --workspace . --log-dir "$TASK1_RECEIPT_ROOT/cli-receipt-logs" --state-path "$TASK1_RECEIPT_ROOT/cli-receipt-state/agent.db" --message 'Return a deterministic v0.6 CLI readiness acknowledgement.' --session-id v06_task1_cli_receipt > "$TASK1_RECEIPT_ROOT/cli-output.txt"` | Focused RED failed 2/2 at pre-repair subject `f78ef1b4a54d63b0e49787b80a67133ba2ae4268`; focused GREEN passed 2/2 at this `9d8bc3d` subject. Full pytest passed, but its output digest was not captured, so that local full-test receipt remains incomplete and non-qualifying. A fresh 2026-08-10 golden rerun passed 21/21 with report SHA-256 `a89cbf9e5c1c4cc1b45d0eaa6d6b76fc19c3b21604ca0280c6501c28ce0b3ea4`; the exact CLI command exited 0 with completed mock output SHA-256 `eaacc7efee11acef5f876681943a0260db2aa778bbdd2ec9e5195e71b1746b9e`. BASE-A remains failed; hosted/cross-platform repeat receipts are still missing, so REL/S1 remain `in_progress`. |
+| PR331-2026-08-10-DET | `96d265ef92b4a82ff8cbf815021af5035a1f195b` (synthetic PR merge) | `unmerged` | — | [Actions run 31356774284](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31356774284); determinism artifact SHA-256 `b65c4ea253c800c06e26f9ded7bd31d2f0b73b87d8b587b87260063d5af8d656`; workflow command is the exact HOSTED-DET command above | First-attempt Ubuntu/memory determinism and Flock qualification jobs passed for the PR merge candidate. This is review evidence only: it is not a protected-main SHA, Memvid proof, or cross-platform S1 qualification. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
