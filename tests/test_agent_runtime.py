@@ -123,7 +123,11 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
         )
     )
 
-    result = agent.chat("hello", session_id="test")
+    result = agent.chat(
+        "hello",
+        session_id="test",
+        turn_id="turn_test_explicit",
+    )
 
     assert result.assistant_message == "hello back"
     assert result.stop_reason == "complete"
@@ -133,6 +137,7 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
     working_records = memory.backends[MemoryLayer.WORKING].records
     episodic_records = memory.backends[MemoryLayer.EPISODIC].records
     user_record = next(record for record in working_records if record.title == "User message")
+    assert user_record.id == "turn_test_explicit_user"
     summary_record = next(
         record for record in episodic_records if record.title == "Conversation turn summary"
     )
@@ -146,6 +151,28 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
     assert assistant_record.content == "hello back"
     assert assistant_record.metadata["source_span"]["role"] == "assistant"
     assert assistant_record.id in summary_record.metadata["child_ids"]
+
+
+@pytest.mark.parametrize(
+    "turn_id",
+    ["turn/escape", "turn forged", "turn\nforged", " turn-leading"],
+)
+def test_agent_rejects_noncanonical_explicit_turn_id(
+    tmp_path: Path,
+    turn_id: str,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=MockLLMProvider([LLMResponse(content="unused")]),
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="turn_id"):
+        agent.chat("hello", session_id="test", turn_id=turn_id)
 
 
 def test_optional_llm_summary_uses_run_bounds_and_falls_back_without_failing_turn(

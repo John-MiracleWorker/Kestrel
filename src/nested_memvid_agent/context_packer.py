@@ -145,7 +145,7 @@ class ContextPacker:
             frame = _frame_for(hit)
             if frame.content_hash in seen_hashes:
                 continue
-            if _too_similar(frame.content, [item.content for item in selected]):
+            if _too_similar(frame.content, [item.frame.content for item in selected]):
                 continue
             should_expand = _should_expand_raw(
                 frame,
@@ -244,11 +244,21 @@ class ContextPacker:
         return "\n".join(lines).strip()
 
     @staticmethod
-    def _rank_key(hit: MemoryHit) -> tuple[int, int, float, float, float]:
+    def _rank_key(
+        hit: MemoryHit,
+    ) -> tuple[int, int, float, float, float, str, str]:
         frame = _frame_for(hit)
         layer_rank = len(PACK_LAYER_ORDER) - PACK_LAYER_ORDER.index(frame.layer) if frame.layer in PACK_LAYER_ORDER else 0
         frame_rank = 3 if frame.frame_type in SUMMARY_FRAME_TYPES else 2 if frame.frame_type in CORRECTION_FRAME_TYPES else 1
-        return (layer_rank, frame_rank, hit.score, frame.importance, frame.confidence)
+        return (
+            layer_rank,
+            frame_rank,
+            hit.score,
+            frame.importance,
+            frame.confidence,
+            frame.title.casefold(),
+            frame.content_hash,
+        )
 
     def _content_with_child_frames(
         self,
@@ -416,11 +426,13 @@ def _detect_conflicts(hits: list[MemoryHit]) -> list[str]:
             by_title[_normalize_claim_key(hit.record.title)].append(hit)
 
     for group_id, grouped in sorted(by_group.items()):
+        grouped = sorted(grouped, key=_conflict_member_key)
         if len(grouped) > 1 or any(_frame_for(hit).frame_type == "conflict_set" for hit in grouped):
             titles = "; ".join(hit.record.title for hit in grouped[:4])
             warnings.append(f"conflict_group_id={group_id} has {len(grouped)} retrieved memories: {titles}")
 
-    for title_key, grouped in by_title.items():
+    for title_key, grouped in sorted(by_title.items()):
+        grouped = sorted(grouped, key=_conflict_member_key)
         if len(grouped) < 2:
             continue
         polarities = {_polarity(hit.record.content) for hit in grouped}
@@ -429,6 +441,11 @@ def _detect_conflicts(hits: list[MemoryHit]) -> list[str]:
             warnings.append(f"possible high-confidence disagreement around `{title_key}`: {titles}")
 
     return warnings
+
+
+def _conflict_member_key(hit: MemoryHit) -> tuple[str, str, str]:
+    frame = _frame_for(hit)
+    return (frame.title.casefold(), frame.content_hash, frame.id)
 
 
 def _normalize_claim_key(title: str) -> str:

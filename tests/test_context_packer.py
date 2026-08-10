@@ -5,7 +5,7 @@ from pathlib import Path
 from nested_memvid_agent.backends.in_memory import InMemoryBackend
 from nested_memvid_agent.context_packer import ContextPacker, ContextPackRequest
 from nested_memvid_agent.layers import LayeredMemorySystem
-from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord
+from nested_memvid_agent.models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 
 
 def test_packer_prefers_summaries_over_raw_chunks(tmp_path: Path) -> None:
@@ -102,6 +102,69 @@ def test_packer_detects_conflict_metadata(tmp_path: Path) -> None:
     assert packed.conflict_warnings
     assert "flag-alpha" in packed.conflict_warnings[0]
     assert "conflict_group_id=flag-alpha" in packed.prompt
+
+
+def test_packer_conflict_output_is_independent_of_backend_tie_order_and_snippets() -> None:
+    marker = "golden seeded conflict"
+    enabled = MemoryRecord(
+        id="conflict-enabled",
+        title=f"{marker} enabled",
+        content=f"{marker}: Feature gamma is enabled.",
+        layer=MemoryLayer.SEMANTIC,
+        kind=MemoryKind.FACT,
+        confidence=0.88,
+        importance=0.8,
+        metadata={"conflict_group_id": marker},
+    )
+    disabled = MemoryRecord(
+        id="conflict-disabled",
+        title=f"{marker} disabled",
+        content=f"{marker}: Feature gamma is not enabled.",
+        layer=MemoryLayer.SEMANTIC,
+        kind=MemoryKind.FACT,
+        confidence=0.88,
+        importance=0.8,
+        metadata={"conflict_group_id": marker},
+    )
+    enabled_hit = MemoryHit(
+        record=enabled,
+        score=2.0,
+        source_backend="memvid",
+        snippet=enabled.content + " created_at=volatile-a uri=volatile-a",
+    )
+    disabled_hit = MemoryHit(
+        record=disabled,
+        score=2.0,
+        source_backend="memvid",
+        snippet=disabled.content + " created_at=volatile-b uri=volatile-b",
+    )
+
+    class OrderedMemory:
+        def __init__(self, hits: list[MemoryHit]) -> None:
+            self.hits = hits
+
+        def retrieve(self, _query: object) -> list[MemoryHit]:
+            return list(self.hits)
+
+        def get_record(
+            self,
+            _layer: MemoryLayer | None,
+            _record_id: str,
+            *,
+            include_inactive: bool = True,
+        ) -> MemoryRecord | None:
+            del include_inactive
+            return None
+
+    request = ContextPackRequest(objective=marker, query=marker)
+    forward = ContextPacker(OrderedMemory([enabled_hit, disabled_hit])).pack(request)  # type: ignore[arg-type]
+    reverse = ContextPacker(OrderedMemory([disabled_hit, enabled_hit])).pack(request)  # type: ignore[arg-type]
+
+    assert [item.frame.id for item in forward.items] == [
+        item.frame.id for item in reverse.items
+    ]
+    assert forward.conflict_warnings == reverse.conflict_warnings
+    assert forward.prompt == reverse.prompt
 
 
 def test_packer_surfaces_correction_provenance(tmp_path: Path) -> None:

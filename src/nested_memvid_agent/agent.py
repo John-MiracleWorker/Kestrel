@@ -137,6 +137,7 @@ class NestedMV2Agent:
         session_id: str | None = None,
         *,
         run_id: str | None = None,
+        turn_id: str | None = None,
         approval_handler: ApprovalHandler | None = None,
         approved_tool_call_ids: frozenset[str] = frozenset(),
         approved_tool_call_arguments: dict[str, dict[str, Any]] | None = None,
@@ -176,7 +177,12 @@ class NestedMV2Agent:
             or len(resolved_execution_origin) > 256
         ):
             raise ValueError("execution_origin must be an exact non-empty string up to 256 chars")
-        turn_frame_id = f"turn_{uuid4().hex}"
+        if turn_id is not None and re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", turn_id) is None:
+            raise ValueError(
+                "turn_id must contain only ASCII letters, digits, dot, underscore, colon, "
+                "or hyphen and be at most 256 chars"
+            )
+        turn_frame_id = turn_id or f"turn_{uuid4().hex}"
         summary_frame_id = f"{turn_frame_id}_summary"
         user_frame_id = f"{turn_frame_id}_user"
         child_frame_ids = [user_frame_id]

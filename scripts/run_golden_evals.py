@@ -10,6 +10,7 @@ import subprocess  # nosec B404 - fixed local git fixture commands only
 import sys
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic, perf_counter, sleep
 from typing import Any
@@ -456,6 +457,16 @@ def _new_id(label: str) -> str:
     return hashlib.sha256(f"kestrel-golden-id:{_ID_SEED}:{counter}:{label}".encode()).hexdigest()
 
 
+def _fixture_record_identity(eval_id: str, label: str) -> tuple[str, datetime]:
+    digest = hashlib.sha256(f"kestrel-golden-fixture:{eval_id}:{label}".encode()).hexdigest()
+    record_id = f"mem_{digest[:32]}"
+    timestamp = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(
+        seconds=int(digest[32:40], 16) % 86_400,
+        microseconds=int(digest[40:46], 16) % 1_000_000,
+    )
+    return record_id, timestamp
+
+
 def _write_report(path: Path, rendered: str) -> None:
     path = path.expanduser().resolve(strict=False)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,6 +555,8 @@ def _eval_correction_persists(config: AgentConfig, eval_id: str) -> dict[str, An
         turn = agent.chat(
             f"Remember: {eval_id} user correction says concise answers are preferred.",
             session_id=eval_id,
+            run_id=f"run_{eval_id}_correction",
+            turn_id=f"turn_{eval_id}_correction",
         )
     finally:
         agent.close()
@@ -553,9 +566,15 @@ def _eval_correction_persists(config: AgentConfig, eval_id: str) -> dict[str, An
         hits = reopened.memory.retrieve(
             RetrievalQuery(query=f"{eval_id} concise answers", k_per_layer=3)
         )
+        matching_corrections = [
+            hit
+            for hit in hits
+            if hit.record.kind == MemoryKind.CORRECTION
+            and eval_id.casefold() in f"{hit.record.title} {hit.record.content}".casefold()
+        ]
         return {
-            "passed": bool(hits),
-            "memory_hits": len(hits),
+            "passed": bool(matching_corrections),
+            "memory_hits": len(matching_corrections),
             "context_chars": turn.context_chars,
             "tool_count": len(turn.tool_executions),
         }
@@ -951,18 +970,22 @@ def _eval_conflict_warning(config: AgentConfig, eval_id: str) -> dict[str, Any]:
     )
     try:
         marker = f"{eval_id} conflict"
-        for title, content in [
-            (f"{marker} enabled", f"{marker}: Feature gamma is enabled."),
-            (f"{marker} disabled", f"{marker}: Feature gamma is not enabled."),
+        for label, title, content in [
+            ("enabled", f"{marker} enabled", f"{marker}: Feature gamma is enabled."),
+            ("disabled", f"{marker} disabled", f"{marker}: Feature gamma is not enabled."),
         ]:
+            record_id, timestamp = _fixture_record_identity(eval_id, f"conflict:{label}")
             memory.put(
                 MemoryRecord(
+                    id=record_id,
                     layer=MemoryLayer.SEMANTIC,
                     kind=MemoryKind.FACT,
                     title=title,
                     content=content,
                     confidence=0.88,
                     importance=0.8,
+                    created_at=timestamp,
+                    updated_at=timestamp,
                     metadata={"conflict_group_id": marker},
                 )
             )
