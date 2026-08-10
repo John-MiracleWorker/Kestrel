@@ -118,6 +118,17 @@ def _isolated_repair_validation_stub(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(process_tools, "run_isolated_validation", run_stub)
 
 
+def _use_host_supervised_test_run(monkeypatch: MonkeyPatch) -> None:
+    """Run TestRunTool process-lifecycle fixtures without OCI normalization."""
+
+    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
+        kwargs["require_container_isolation"] = False
+        return _run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(command_tools, "_normalize_python_command", lambda command: command)
+    monkeypatch.setattr(command_tools, "_run_subprocess", host_supervised_run)
+
+
 def test_windows_process_tree_uses_absolute_system_taskkill(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
@@ -1146,14 +1157,7 @@ def test_same_public_call_id_across_runs_keeps_process_tracking_isolated(
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools(("test.run",))
 
-    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
-        kwargs["require_container_isolation"] = False
-        return _run_subprocess(command, **kwargs)
-
-    monkeypatch.setattr(
-        "nested_memvid_agent.tools.command_tools._run_subprocess",
-        host_supervised_run,
-    )
+    _use_host_supervised_test_run(monkeypatch)
 
     def invocation(run_id: str) -> tuple[ToolCall, ToolContext, Path]:
         pid_path = tmp_path / f"{run_id}.pid"
@@ -1226,14 +1230,7 @@ def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
 
-    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
-        kwargs["require_container_isolation"] = False
-        return _run_subprocess(command, **kwargs)
-
-    monkeypatch.setattr(
-        "nested_memvid_agent.tools.command_tools._run_subprocess",
-        host_supervised_run,
-    )
+    _use_host_supervised_test_run(monkeypatch)
     call = ToolCall(
         name="test.run",
         arguments={"command": [sys.executable, str(script)], "timeout": 30},
