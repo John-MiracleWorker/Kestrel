@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -408,6 +409,12 @@ def test_container_cleanup_retry_is_bounded_and_retains_failures(
         extension_runner,
         "_remove_and_confirm_container_absent",
         fail_cleanup,
+    )
+    monotonic_values = iter((100.0, 100.0))
+    monkeypatch.setattr(
+        extension_runner,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
     )
 
     assert quarantine.retry_cleanup(timeout_seconds=float("inf")) is False

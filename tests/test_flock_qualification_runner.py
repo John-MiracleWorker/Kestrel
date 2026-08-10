@@ -583,6 +583,66 @@ def test_pause_wins_completion_revision_race_without_failing_run(
     assert len(terminal) == 1
 
 
+def test_shutdown_pause_retries_concurrent_cap_revision_without_failing_run(
+    state: AgentStateStore,
+    qualification_ledger: QualificationLedger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = run_with_cases(
+        state,
+        qualification_ledger,
+        1,
+        targets=("a", "b"),
+        tmp_path=tmp_path,
+    )
+    gate = threading.Event()
+    executor = recording_executor(gate=gate, block_after=0)
+    runner = _make_runner(state, qualification_ledger, executor, scenario)
+    runner.start(scenario.run_id, wait=False)
+    assert executor.entered.wait(timeout=15.0)
+
+    request_pause = qualification_ledger.request_pause
+    request_revisions: list[int] = []
+
+    def request_after_first_cap_revision(
+        run_id: str,
+        *,
+        expected_revision: int,
+    ) -> QualificationRun:
+        request_revisions.append(expected_revision)
+        if len(request_revisions) == 1:
+            current = qualification_ledger.get_run(run_id)
+            assert current is not None
+            qualification_ledger.update_effective_stop_cap(
+                run_id,
+                expected_revision=current.revision,
+                new_cap=MoneyMicros(current.effective_stop_cap.micros - 1),
+            )
+        return request_pause(run_id, expected_revision=expected_revision)
+
+    monkeypatch.setattr(
+        qualification_ledger,
+        "request_pause",
+        request_after_first_cap_revision,
+    )
+    shutdown_result: list[bool] = []
+    shutdown = threading.Thread(target=lambda: shutdown_result.append(runner.shutdown()))
+    shutdown.start()
+    _wait_until(lambda: runner._shutdown)  # noqa: SLF001 - deterministic lifecycle race
+    gate.set()
+    shutdown.join(timeout=15.0)
+
+    assert not shutdown.is_alive()
+    assert shutdown_result == [True]
+    view = runner.get(scenario.run_id)
+    assert view.status == "paused"
+    assert view.run.effective_stop_cap == MoneyMicros(24_999_999)
+    assert len(request_revisions) == 2
+    assert request_revisions[1] > request_revisions[0]
+    assert qualification_ledger.list_receipts(scenario.run_id) == []
+
+
 def test_resume_skips_terminal_and_inflight_positions(
     state: AgentStateStore,
     qualification_ledger: QualificationLedger,

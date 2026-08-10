@@ -1958,10 +1958,13 @@ def test_service_controller_real_process_lifecycle_smoke(
             ):
                 os.killpg(pgid, signal.SIGKILL)
                 deadline = time.monotonic() + 2
-                while (
-                    time.monotonic() < deadline
-                    and SystemProcessInspector().process(group_leader.pid) is not None
-                ):
+                while time.monotonic() < deadline:
+                    try:
+                        live_group_leader = SystemProcessInspector().process(group_leader.pid)
+                    except ServiceControlError:
+                        break
+                    if live_group_leader is None:
+                        break
                     time.sleep(0.05)
 
 
