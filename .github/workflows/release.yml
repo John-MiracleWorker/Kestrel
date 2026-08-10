@@ -164,12 +164,13 @@ jobs:
           determinism_receipt_dir="${RUNNER_TEMP}/determinism-receipt-${GITHUB_RUN_ID}"
           mkdir "$determinism_receipt_dir"
           gh run download "$DETERMINISM_RUN_ID" \
-            -n "kestrel-determinism-${RELEASE_COMMIT_SHA}" \
+            -n "kestrel-determinism-memory-${RELEASE_COMMIT_SHA}" \
             -D "$determinism_receipt_dir"
           DETERMINISM_REPORT="${determinism_receipt_dir}/kestrel-determinism-report.json" \
             python - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
 
           expected_sha = os.environ["RELEASE_COMMIT_SHA"]
@@ -177,23 +178,72 @@ jobs:
           report = json.loads(report_path.read_text(encoding="utf-8"))
           if not isinstance(report, dict):
               raise SystemExit("determinism receipt is not a JSON object")
-          if report.get("schema") != "kestrel.determinism_eval_report.v2":
+          if set(report) != {
+              "schema",
+              "subject",
+              "configuration",
+              "environment",
+              "summary",
+              "differing_cases",
+              "reference_projection",
+              "runs",
+              "passed",
+          }:
+              raise SystemExit("determinism receipt fields are not accepted")
+          if report.get("schema") != "kestrel.determinism_eval_report.v3":
               raise SystemExit("determinism receipt schema is not accepted")
+          subject = report.get("subject")
           configuration = report.get("configuration")
+          environment = report.get("environment")
           summary = report.get("summary")
           runs = report.get("runs")
-          if not isinstance(configuration, dict) or not isinstance(summary, dict):
+          if (
+              not isinstance(subject, dict)
+              or set(subject) != {"source_commit"}
+              or not isinstance(configuration, dict)
+              or not isinstance(environment, dict)
+              or not isinstance(summary, dict)
+          ):
               raise SystemExit("determinism receipt metadata is incomplete")
-          if configuration.get("source_commit") != expected_sha:
+          if subject.get("source_commit") != expected_sha:
               raise SystemExit("determinism receipt is not bound to the release commit")
+          if set(configuration) != {
+              "backend",
+              "provider",
+              "model",
+              "seed",
+              "required_repeats",
+              "comparison",
+              "case_timeout_seconds",
+              "iteration_timeout_seconds",
+              "max_case_latency_ms",
+          }:
+              raise SystemExit("determinism receipt configuration fields are not accepted")
+          if (
+              configuration.get("backend") != "memory"
+              or configuration.get("provider") != "mock"
+              or configuration.get("model") != "mock"
+          ):
+              raise SystemExit("determinism receipt is not the memory backend mock lane")
           if (
               configuration.get("seed") != 1729
               or configuration.get("required_repeats") != 20
+              or configuration.get("comparison")
+              != "functional_outcomes_excluding_wall_clock_latency"
               or configuration.get("case_timeout_seconds") != 60.0
               or configuration.get("iteration_timeout_seconds") != 1500.0
               or configuration.get("max_case_latency_ms") != 45000.0
           ):
               raise SystemExit("determinism receipt configuration is not release-qualified")
+          if (
+              set(environment) != {"os", "architecture", "python_version"}
+              or environment.get("os") != "Linux"
+              or environment.get("architecture") != "X64"
+              or not isinstance(environment.get("python_version"), str)
+              or re.fullmatch(r"3\.11\.\d+(?:[A-Za-z0-9.+-]*)?", environment["python_version"])
+              is None
+          ):
+              raise SystemExit("determinism receipt environment is not release-qualified")
           if (
               summary.get("completed_repeats") != 20
               or summary.get("required_repeats") != 20
@@ -201,20 +251,41 @@ jobs:
               or summary.get("unique_outcome_signatures") != 1
               or summary.get("determinism_streak") != 20
               or summary.get("observed_flake_count") != 0
+              or summary.get("observed_flake_rate") != 0.0
           ):
               raise SystemExit("determinism receipt does not prove a 20-run stable streak")
+          digest_re = re.compile(r"^[0-9a-f]{64}$")
           if (
               report.get("passed") is not True
+              or report.get("differing_cases") != []
+              or not isinstance(report.get("reference_projection"), dict)
               or not isinstance(runs, list)
               or len(runs) != 20
-              or [run.get("repeat") for run in runs if isinstance(run, dict)]
-              != list(range(1, 21))
               or any(
-                  not isinstance(run, dict) or run.get("passed") is not True
-                  for run in runs
+                  not isinstance(run, dict)
+                  or set(run)
+                  != {
+                      "repeat",
+                      "passed",
+                      "outcome_signature",
+                      "golden_report_sha256",
+                      "failed_cases",
+                  }
+                  or run.get("repeat") != repeat
+                  or run.get("passed") is not True
+                  or run.get("failed_cases") != []
+                  or not isinstance(run.get("outcome_signature"), str)
+                  or digest_re.fullmatch(run["outcome_signature"]) is None
+                  for repeat, run in enumerate(runs, start=1)
               )
           ):
               raise SystemExit("determinism receipt run records are incomplete or failing")
+          if any(
+              not isinstance(run.get("golden_report_sha256"), str)
+              or digest_re.fullmatch(run["golden_report_sha256"]) is None
+              for run in runs
+          ):
+              raise SystemExit("determinism receipt golden report digest is invalid")
           print(f"verified exact-SHA determinism receipt from run {os.environ['DETERMINISM_RUN_ID']}")
           PY
 
