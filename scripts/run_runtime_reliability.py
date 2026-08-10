@@ -85,7 +85,7 @@ def _validate_preflight(
     runner_arch: str,
     python_version: str,
     iteration_timeout_seconds: float,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, dict[str, object]]:
     if repeats < DEFAULT_REPEATS:
         raise ValueError(
             f"runtime reliability qualification requires at least {DEFAULT_REPEATS} repeats"
@@ -103,8 +103,15 @@ def _validate_preflight(
     if not _PYTHON_VERSION_RE.fullmatch(normalized_python):
         raise ValueError("runner Python version must be a concrete semantic version")
 
-    observed_head = resolve_workspace_head(workspace).strip().lower()
-    if observed_head != source_commit:
+    preflight_identity = _workspace_identity(
+        workspace=workspace,
+        source_commit=source_commit,
+        resolve_workspace_head=resolve_workspace_head,
+    )
+    if not preflight_identity["passed"]:
+        observed_head = preflight_identity["observed_head"]
+        if observed_head is None:
+            raise ValueError(str(preflight_identity["error"]))
         raise ValueError(
             "workspace HEAD does not match source commit: "
             f"expected {source_commit}, observed {observed_head or '<empty>'}"
@@ -113,7 +120,33 @@ def _validate_preflight(
         raise FileExistsError(f"runtime reliability run root already exists: {run_root}")
     if output.exists():
         raise FileExistsError(f"runtime reliability report already exists: {output}")
-    return normalized_os, normalized_arch, normalized_python
+    return normalized_os, normalized_arch, normalized_python, preflight_identity
+
+
+def _workspace_identity(
+    *,
+    workspace: Path,
+    source_commit: str,
+    resolve_workspace_head: WorkspaceHeadResolver,
+) -> dict[str, object]:
+    """Record the exact-SHA and clean-worktree result for one observation."""
+
+    try:
+        observed_head = resolve_workspace_head(workspace).strip().lower()
+    except Exception as exc:  # noqa: BLE001 - receipts must preserve fail-closed diagnostics
+        return {
+            "expected_source_commit": source_commit,
+            "observed_head": None,
+            "clean": False,
+            "passed": False,
+            "error": _excerpt(f"{type(exc).__name__}: {exc}"),
+        }
+    return {
+        "expected_source_commit": source_commit,
+        "observed_head": observed_head,
+        "clean": True,
+        "passed": observed_head == source_commit,
+    }
 
 
 def _status(result: BoundedProcessResult) -> str:
@@ -131,8 +164,15 @@ def _iteration_receipt(
     repeat: int,
     source_commit: str,
     result: BoundedProcessResult,
+    workspace_identity: dict[str, object],
 ) -> dict[str, object]:
     status = _status(result)
+    if not all(
+        identity.get("passed") is True
+        for identity in workspace_identity.values()
+        if isinstance(identity, dict)
+    ):
+        status = "workspace_integrity_failed"
     stdout = _excerpt(result.stdout)
     stderr = _excerpt(result.stderr)
     receipt: dict[str, object] = {
@@ -163,6 +203,7 @@ def _iteration_receipt(
         },
         "stdout": stdout,
         "stderr": stderr,
+        "workspace_identity": workspace_identity,
     }
     return cast(dict[str, object], redact_secrets(receipt))
 
@@ -172,6 +213,7 @@ def _iteration_error_receipt(
     repeat: int,
     source_commit: str,
     error: Exception,
+    workspace_identity: dict[str, object],
 ) -> dict[str, object]:
     empty_sha256 = hashlib.sha256(b"").hexdigest()
     receipt: dict[str, object] = {
@@ -195,6 +237,7 @@ def _iteration_error_receipt(
         },
         "stdout": "",
         "stderr": "",
+        "workspace_identity": workspace_identity,
         "error": _excerpt(f"{type(error).__name__}: {error}"),
     }
     return cast(dict[str, object], redact_secrets(receipt))
@@ -251,6 +294,7 @@ def _first_failure(receipt: dict[str, object]) -> dict[str, object]:
             "capture",
             "stdout",
             "stderr",
+            "workspace_identity",
         )
     }
     if "error" in receipt:
@@ -274,7 +318,7 @@ def run_runtime_reliability(
 ) -> dict[str, object]:
     """Run the focused runtime qualification, stopping on the first failure."""
 
-    normalized_os, normalized_arch, normalized_python = _validate_preflight(
+    normalized_os, normalized_arch, normalized_python, preflight_identity = _validate_preflight(
         repeats=repeats,
         source_commit=source_commit,
         workspace=workspace,
@@ -292,24 +336,62 @@ def run_runtime_reliability(
     for repeat in range(1, repeats + 1):
         repeat_root = run_root / f"repeat-{repeat:02d}"
         repeat_root.mkdir()
+        before_identity = _workspace_identity(
+            workspace=workspace,
+            source_commit=source_commit,
+            resolve_workspace_head=resolve_workspace_head,
+        )
+        workspace_identity: dict[str, object] = {"before": before_identity}
+        if before_identity["passed"] is not True:
+            workspace_identity["after"] = before_identity
+            receipt = _iteration_error_receipt(
+                repeat=repeat,
+                source_commit=source_commit,
+                error=ValueError("workspace integrity check failed before repeat"),
+                workspace_identity=workspace_identity,
+            )
+            receipt["status"] = "workspace_integrity_failed"
+            receipt["derived_passed"] = False
+            _write_json(repeat_root / "iteration-receipt.json", receipt)
+            runs.append(receipt)
+            break
         try:
             result = invoke(repeat, repeat_root)
+            after_identity = _workspace_identity(
+                workspace=workspace,
+                source_commit=source_commit,
+                resolve_workspace_head=resolve_workspace_head,
+            )
+            workspace_identity["after"] = after_identity
             receipt = _iteration_receipt(
                 repeat=repeat,
                 source_commit=source_commit,
                 result=result,
+                workspace_identity=workspace_identity,
             )
         except Exception as exc:  # noqa: BLE001 - preserve a fail-closed receipt
+            after_identity = _workspace_identity(
+                workspace=workspace,
+                source_commit=source_commit,
+                resolve_workspace_head=resolve_workspace_head,
+            )
+            workspace_identity["after"] = after_identity
             receipt = _iteration_error_receipt(
                 repeat=repeat,
                 source_commit=source_commit,
                 error=exc,
+                workspace_identity=workspace_identity,
             )
         _write_json(repeat_root / "iteration-receipt.json", receipt)
         runs.append(receipt)
         if not receipt["derived_passed"]:
             break
 
+    final_identity = _workspace_identity(
+        workspace=workspace,
+        source_commit=source_commit,
+        resolve_workspace_head=resolve_workspace_head,
+    )
     failed = [run for run in runs if not run["derived_passed"]]
     consecutive_passes = 0
     for run in runs:
@@ -317,7 +399,12 @@ def run_runtime_reliability(
             break
         consecutive_passes += 1
     first_failure = _first_failure(failed[0]) if failed else None
-    passed = len(runs) == repeats and not failed
+    if first_failure is None and final_identity["passed"] is not True:
+        first_failure = {
+            "status": "workspace_integrity_failed",
+            "workspace_identity": {"final": final_identity},
+        }
+    passed = len(runs) == repeats and not failed and final_identity["passed"] is True
     report: dict[str, object] = {
         "schema": "kestrel.runtime_reliability_report.v1",
         "subject": {"source_commit": source_commit},
@@ -332,12 +419,16 @@ def run_runtime_reliability(
             "runner_arch": normalized_arch,
             "python_version": normalized_python,
         },
+        "workspace_identity": {
+            "preflight": preflight_identity,
+            "final": final_identity,
+        },
         "summary": {
             "passed": passed,
             "completed_repeats": len(runs),
             "required_repeats": repeats,
             "consecutive_passes": consecutive_passes,
-            "failure_count": len(failed),
+            "failure_count": len(failed) + (0 if final_identity["passed"] is True else 1),
             "first_failure": first_failure,
         },
         "runs": runs,

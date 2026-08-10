@@ -549,10 +549,7 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(
         workspace=tmp_path,
         skills_dir=tmp_path / "skills",
         plugins_dir=tmp_path / "plugins",
-        # Lease expiry behavior is covered with fixed instants in
-        # test_state_store.py. Keep that semantic boundary out of this thread
-        # scheduling test, particularly on busy hosted Windows runners.
-        run_lease_ttl_seconds=5.0,
+        run_lease_ttl_seconds=0.05,
         run_heartbeat_interval_seconds=0.01,
     )
     state = AgentStateStore(config.state_path)
@@ -573,15 +570,23 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(
     )
     renewal_succeeded = Event()
     renewal_records: list[Any] = []
+    fixed_now = datetime(2035, 1, 2, 3, 4, 5, tzinfo=UTC)
+    acquire_run_lease = state.acquire_run_lease
     renew_run_lease = state.renew_run_lease
 
+    def acquire_at_fixed_now(*args: Any, **kwargs: Any) -> Any:
+        assert "now" not in kwargs
+        return acquire_run_lease(*args, now=fixed_now, **kwargs)
+
     def renew_and_signal(*args: Any, **kwargs: Any) -> Any:
-        renewed = renew_run_lease(*args, **kwargs)
+        assert "now" not in kwargs
+        renewed = renew_run_lease(*args, now=fixed_now, **kwargs)
         if renewed is not None:
             renewal_records.append(renewed)
             renewal_succeeded.set()
         return renewed
 
+    monkeypatch.setattr(state, "acquire_run_lease", acquire_at_fixed_now)
     monkeypatch.setattr(state, "renew_run_lease", renew_and_signal)
 
     with manager._run_lease("heartbeat_run", config) as lease:
@@ -591,9 +596,14 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(
         assert renewed.run_id == "heartbeat_run"
         assert renewed.lease_owner == manager._lease_owner
         assert renewed.lease_generation == lease.lease_generation
-        assert renewed.heartbeat_at is not None
-        assert renewed.lease_expires_at is not None
-        assert state.acquire_run_lease("heartbeat_run", owner="competitor", ttl_seconds=1) is None
+        assert renewed.heartbeat_at == fixed_now.isoformat()
+        assert renewed.lease_expires_at == (fixed_now + timedelta(seconds=0.05)).isoformat()
+        assert (
+            acquire_run_lease(
+                "heartbeat_run", owner="competitor", ttl_seconds=0.05, now=fixed_now
+            )
+            is None
+        )
 
     released = state.get_run("heartbeat_run")
     assert released.lease_owner is None

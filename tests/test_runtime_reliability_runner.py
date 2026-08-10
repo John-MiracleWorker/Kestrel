@@ -38,12 +38,17 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
     tmp_path: Path,
 ) -> None:
     observed_roots: list[Path] = []
+    identity_checks: list[Path] = []
 
     def invoke(repeat: int, repeat_root: Path) -> BoundedProcessResult:
         assert repeat == len(observed_roots) + 1
         assert repeat_root.is_dir()
         observed_roots.append(repeat_root)
         return _completed_process()
+
+    def resolve_identity(workspace: Path) -> str:
+        identity_checks.append(workspace)
+        return SOURCE_COMMIT
 
     output = tmp_path / "report.json"
     report = run_runtime_reliability(
@@ -53,7 +58,7 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
         invoke=invoke,
         source_commit=SOURCE_COMMIT,
         workspace=tmp_path,
-        resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+        resolve_workspace_head=resolve_identity,
         runner_os="Windows",
         runner_arch="AMD64",
         python_version="3.11.9",
@@ -84,12 +89,27 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
     assert len(report["runs"]) == 20
     assert len(set(observed_roots)) == 20
     assert all(root.parent == tmp_path / "runs" for root in observed_roots)
+    assert identity_checks == [tmp_path] * 42
+    expected_identity = {
+        "expected_source_commit": SOURCE_COMMIT,
+        "observed_head": SOURCE_COMMIT,
+        "clean": True,
+        "passed": True,
+    }
+    assert report["workspace_identity"] == {
+        "preflight": expected_identity,
+        "final": expected_identity,
+    }
     for repeat, run in enumerate(report["runs"], start=1):
         assert run["schema"] == "kestrel.runtime_reliability_iteration.v1"
         assert run["subject"] == {"source_commit": SOURCE_COMMIT}
         assert run["repeat"] == repeat
         assert run["status"] == "completed"
         assert run["derived_passed"] is True
+        assert run["workspace_identity"] == {
+            "before": expected_identity,
+            "after": expected_identity,
+        }
         receipt = json.loads(
             (tmp_path / "runs" / f"repeat-{repeat:02d}" / "iteration-receipt.json").read_text(
                 encoding="utf-8"
@@ -228,6 +248,94 @@ def test_runtime_reliability_records_invoker_errors_fail_closed(tmp_path: Path) 
     assert json.loads(output.read_text(encoding="utf-8")) == report
 
 
+def test_runtime_reliability_rejects_and_records_a_tracked_mutation_after_a_repeat(
+    tmp_path: Path,
+) -> None:
+    workspace = _git_workspace(tmp_path)
+    tracked = workspace / "tracked.txt"
+    source_commit = _commit_file(workspace, tracked, "original\n")
+    invoked: list[int] = []
+
+    def invoke(repeat: int, _repeat_root: Path) -> BoundedProcessResult:
+        invoked.append(repeat)
+        tracked.write_text("mutated\n", encoding="utf-8")
+        return _completed_process()
+
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=invoke,
+        source_commit=source_commit,
+        workspace=workspace,
+        resolve_workspace_head=resolve_git_head,
+        runner_os="Windows",
+        runner_arch="AMD64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    assert invoked == [1]
+    assert report["summary"]["passed"] is False
+    receipt = report["runs"][0]
+    assert receipt["status"] == "workspace_integrity_failed"
+    assert receipt["derived_passed"] is False
+    assert receipt["workspace_identity"]["before"] == {
+        "expected_source_commit": source_commit,
+        "observed_head": source_commit,
+        "clean": True,
+        "passed": True,
+    }
+    assert receipt["workspace_identity"]["after"] == {
+        "expected_source_commit": source_commit,
+        "observed_head": None,
+        "clean": False,
+        "passed": False,
+        "error": "ValueError: workspace contains uncommitted changes; exact-SHA qualification requires a clean checkout",
+    }
+    assert report["workspace_identity"]["final"] == receipt["workspace_identity"]["after"]
+
+
+def test_runtime_reliability_rejects_and_records_a_head_switch_after_a_repeat(
+    tmp_path: Path,
+) -> None:
+    workspace = _git_workspace(tmp_path)
+    tracked = workspace / "tracked.txt"
+    source_commit = _commit_file(workspace, tracked, "first\n")
+    switched_commit = _commit_file(workspace, tracked, "second\n")
+    subprocess.run(["git", "checkout", "--detach", source_commit], cwd=workspace, check=True)
+
+    def invoke(_repeat: int, _repeat_root: Path) -> BoundedProcessResult:
+        subprocess.run(["git", "checkout", "--detach", switched_commit], cwd=workspace, check=True)
+        return _completed_process()
+
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=invoke,
+        source_commit=source_commit,
+        workspace=workspace,
+        resolve_workspace_head=resolve_git_head,
+        runner_os="Windows",
+        runner_arch="AMD64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    receipt = report["runs"][0]
+    assert receipt["status"] == "workspace_integrity_failed"
+    assert receipt["workspace_identity"]["after"] == {
+        "expected_source_commit": source_commit,
+        "observed_head": switched_commit,
+        "clean": True,
+        "passed": False,
+    }
+    assert report["summary"]["first_failure"]["workspace_identity"] == receipt[
+        "workspace_identity"
+    ]
+
+
 def test_iteration_invoker_uses_a_fresh_interpreter_and_basetemp_per_repeat(
     tmp_path: Path,
 ) -> None:
@@ -350,3 +458,38 @@ def test_git_identity_rejects_a_dirty_workspace_claiming_a_clean_commit(
 
     with pytest.raises(ValueError, match="workspace contains uncommitted changes"):
         resolve_git_head(workspace)
+
+
+def _git_workspace(tmp_path: Path) -> Path:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "reliability@example.invalid"],
+        cwd=workspace,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Reliability Test"],
+        cwd=workspace,
+        check=True,
+    )
+    return workspace
+
+
+def _commit_file(workspace: Path, tracked: Path, contents: str) -> str:
+    tracked.write_text(contents, encoding="utf-8")
+    subprocess.run(["git", "add", tracked.name], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", contents.strip()],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()

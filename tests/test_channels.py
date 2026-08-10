@@ -1034,16 +1034,8 @@ def test_server_exposes_channel_ingest_route(tmp_path: Path, started_test_client
     assert payload["session_id"] == durable_channel_session_id(
         channel="webhook", channel_id="webhook", conversation_id="thread"
     )
-    expected_assistant_by_stop_reason = {
-        "complete": "Mock response: hello api channel",
-        "publication_pending": "Kestrel accepted the request and is still working.",
-        "queued": "Kestrel accepted the request and is still working.",
-        "running": "Kestrel accepted the request and is still working.",
-    }
-    assert payload["stop_reason"] in expected_assistant_by_stop_reason
-    assert payload["assistant_message"] == expected_assistant_by_stop_reason[
-        payload["stop_reason"]
-    ]
+    assert payload["stop_reason"] == "complete"
+    assert payload["assistant_message"] == "Mock response: hello api channel"
     assert payload["delivery"]["dry_run"] is True
 
 
