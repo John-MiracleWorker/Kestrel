@@ -92,9 +92,9 @@ slice that may qualify and publish the v0.6 release.
   memory layer. Never call `create(path)` on an existing `.mv2` file.
 - Keep SQLite as control-plane state and Memvid as canonical retrieval memory.
 - Keep the conversational CLI and deterministic mock backend/LLM functional.
-  Conversational CLI readiness is a prerequisite: no optional UI slice may be
-  accepted or merged unless the exact predecessor SHA has a durable CLI
-  launch-and-chat receipt.
+  Conversational CLI readiness is a prerequisite: no optional UI work may
+  start, and no optional UI slice may be accepted or merged, unless the exact
+  predecessor SHA has a durable CLI launch-and-chat receipt.
 - UI state never invents server authority.
 - High-risk operations require explicit config enablement and then human,
   interactive, exact-call approval before each call.
@@ -361,8 +361,8 @@ Final v0.6 qualification requires all of the following at one exact SHA:
   installed entry point, `kestrel open`, readiness, first mission, and clean
   shutdown.
 - A conversational CLI launch-and-chat receipt must pass at the exact
-  predecessor SHA before any optional UI slice is accepted or merged; UI
-  success cannot substitute for this CLI gate.
+  predecessor SHA before optional UI work starts or any optional UI slice is
+  accepted or merged; UI success cannot substitute for this CLI gate.
 - Complete golden flagship: isolated patch, independent/truthfully-labelled
   review, validation, rejection/approval, exact commit, capsule, promotion
   proposal, and later retrieval/use proof.
