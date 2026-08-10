@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 from time import monotonic, sleep
 
 import numpy as np
 import pytest
 
+from nested_memvid_agent.agent import AgentDependencies, NestedMV2Agent
 from nested_memvid_agent.backends.memvid_backend import MemvidBackend
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.desktop_memory_health import (
@@ -18,11 +20,14 @@ from nested_memvid_agent.desktop_sidecar import (
 )
 from nested_memvid_agent.event_bus import RunEventBus
 from nested_memvid_agent.layers import LayeredMemorySystem, load_layer_specs
+from nested_memvid_agent.llm.mock import MockLLMProvider
 from nested_memvid_agent.mcp_manager import MCPManager
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 from nested_memvid_agent.run_manager import RunManager
+from nested_memvid_agent.runtime_models import AgentTurnResult, LLMResponse
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
+from nested_memvid_agent.tools.builtin import build_default_tools
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_MEMVID_INTEGRATION") != "1",
@@ -106,6 +111,67 @@ def test_memvid_layered_memory_creates_one_mv2_per_layer_and_reopens_existing_fi
         assert inactive_hits
     finally:
         final.close_all()
+
+
+def test_memvid_concurrent_agents_atomically_reserve_reused_turn_identity(
+    tmp_path: Path,
+) -> None:
+    memory = LayeredMemorySystem.from_backend_factory(tmp_path / "memory", MemvidBackend)
+    identity_lookups_complete = Barrier(2)
+    original_get_record = memory.get_record
+
+    def synchronize_legacy_lookup(
+        layer: MemoryLayer | None,
+        record_id: str,
+        *,
+        include_inactive: bool = True,
+    ) -> MemoryRecord | None:
+        record = original_get_record(layer, record_id, include_inactive=include_inactive)
+        if record_id == "turn_memvid_concurrent_provider_error":
+            identity_lookups_complete.wait(timeout=10)
+        return record
+
+    memory.get_record = synchronize_legacy_lookup  # type: ignore[method-assign]
+
+    def build_agent(response: str) -> NestedMV2Agent:
+        return NestedMV2Agent(
+            AgentDependencies(
+                memory=memory,
+                llm=MockLLMProvider([LLMResponse(content=response)]),
+                tools=build_default_tools(),
+                config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+                turn_id_factory=lambda: "turn_memvid_concurrent",
+            )
+        )
+
+    def invoke(agent: NestedMV2Agent, message: str) -> AgentTurnResult | ValueError:
+        try:
+            return agent.chat(message, session_id=message)
+        except ValueError as exc:
+            return exc
+
+    try:
+        agents = (build_agent("first response"), build_agent("second response"))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(
+                executor.map(
+                    lambda arguments: invoke(*arguments),
+                    zip(agents, ("first message", "second message"), strict=True),
+                )
+            )
+
+        assert sum(isinstance(outcome, AgentTurnResult) for outcome in outcomes) == 1
+        errors = [outcome for outcome in outcomes if isinstance(outcome, ValueError)]
+        assert len(errors) == 1
+        assert str(errors[0]) == "turn identity already exists: turn_memvid_concurrent"
+        turn_records = [
+            record
+            for record in memory.iter_records(include_inactive=True)
+            if record.id.startswith("turn_memvid_concurrent_")
+        ]
+        assert [record.id for record in turn_records].count("turn_memvid_concurrent_user") == 1
+    finally:
+        memory.close_all()
 
 
 def test_desktop_recovery_probe_reopens_exactly_six_memvid_v2_layers(

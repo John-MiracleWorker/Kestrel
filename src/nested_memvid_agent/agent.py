@@ -193,11 +193,6 @@ class NestedMV2Agent:
             f"{turn_frame_id}_correction",
             f"{turn_frame_id}_provider_error",
         )
-        if any(
-            self.memory.get_record(None, record_id, include_inactive=True) is not None
-            for record_id in derived_ids
-        ):
-            raise ValueError(f"turn identity already exists: {turn_frame_id}")
         child_frame_ids = [user_frame_id]
         memory_writes: list[str] = []
         executions: list[ToolExecution] = []
@@ -219,36 +214,39 @@ class NestedMV2Agent:
             and resolved_transcript_scope == "channel"
         )
 
-        self._event(
-            "turn.start",
-            {
-                "session_id": session,
-                "run_id": active_run_id,
-                "user_message": user_message,
-                "source": source.to_public_dict() if source is not None else None,
-                "turn_origin": resolved_turn_origin,
-                "transcript_scope": resolved_transcript_scope,
-            },
-        )
-        memory_writes.append(
-            self._write_frame(
-                layer=MemoryLayer.WORKING,
-                kind=MemoryKind.OBSERVATION,
-                title="User message",
-                content=user_message,
-                frame_type="raw_chunk",
-                frame_id=user_frame_id,
-                confidence=0.6,
-                session_id=session,
-                parent_ids=(summary_frame_id,),
-                source_uri=f"agent_runtime://sessions/{session}/turns/{turn_frame_id}/user",
-                source_span={"role": "user", "turn_id": turn_frame_id},
-                source=source,
-                channel_evidence=is_native_channel_turn,
-                turn_origin=resolved_turn_origin,
-                transcript_scope=resolved_transcript_scope,
+        with self.memory.reserve_record_ids_for_initial_write(derived_ids) as identity_available:
+            if not identity_available:
+                raise ValueError(f"turn identity already exists: {turn_frame_id}")
+            self._event(
+                "turn.start",
+                {
+                    "session_id": session,
+                    "run_id": active_run_id,
+                    "user_message": user_message,
+                    "source": source.to_public_dict() if source is not None else None,
+                    "turn_origin": resolved_turn_origin,
+                    "transcript_scope": resolved_transcript_scope,
+                },
             )
-        )
+            memory_writes.append(
+                self._write_frame(
+                    layer=MemoryLayer.WORKING,
+                    kind=MemoryKind.OBSERVATION,
+                    title="User message",
+                    content=user_message,
+                    frame_type="raw_chunk",
+                    frame_id=user_frame_id,
+                    confidence=0.6,
+                    session_id=session,
+                    parent_ids=(summary_frame_id,),
+                    source_uri=f"agent_runtime://sessions/{session}/turns/{turn_frame_id}/user",
+                    source_span={"role": "user", "turn_id": turn_frame_id},
+                    source=source,
+                    channel_evidence=is_native_channel_turn,
+                    turn_origin=resolved_turn_origin,
+                    transcript_scope=resolved_transcript_scope,
+                )
+            )
         if _looks_like_correction(user_message):
             correction_frame_id = f"{turn_frame_id}_correction"
             child_frame_ids.append(correction_frame_id)

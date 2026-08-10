@@ -250,7 +250,7 @@ class ContextPacker:
     @staticmethod
     def _rank_key(
         hit: MemoryHit,
-    ) -> tuple[int, int, float, float, float, str, str]:
+    ) -> tuple[int, int, float, float, float, str, str, str]:
         frame = _frame_for(hit)
         layer_rank = len(PACK_LAYER_ORDER) - PACK_LAYER_ORDER.index(frame.layer) if frame.layer in PACK_LAYER_ORDER else 0
         frame_rank = 3 if frame.frame_type in SUMMARY_FRAME_TYPES else 2 if frame.frame_type in CORRECTION_FRAME_TYPES else 1
@@ -262,6 +262,7 @@ class ContextPacker:
             frame.confidence,
             frame.title.casefold(),
             frame.content_hash,
+            hit.record.id,
         )
 
     def _content_with_child_frames(

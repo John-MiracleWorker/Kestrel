@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,12 @@ class MemoryBackend(ABC):
 
     @abstractmethod
     def put(self, record: MemoryRecord) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def identity_reservation(self) -> AbstractContextManager[None]:
+        """Serialize a cross-layer identity check through its first durable write."""
+
         raise NotImplementedError
 
     @abstractmethod

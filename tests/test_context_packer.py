@@ -167,6 +167,47 @@ def test_packer_conflict_output_is_independent_of_backend_tie_order_and_snippets
     assert forward.prompt == reverse.prompt
 
 
+def test_packer_identity_is_independent_of_backend_order_for_exact_ties() -> None:
+    records = [
+        MemoryRecord(
+            id=record_id,
+            title="Identical title",
+            content="identical stable content for a tied retrieval result",
+            layer=MemoryLayer.SEMANTIC,
+            kind=MemoryKind.FACT,
+            confidence=0.9,
+            importance=0.8,
+        )
+        for record_id in ("record-a", "record-b")
+    ]
+    hits = [
+        MemoryHit(
+            record=record,
+            score=2.0,
+            source_backend="test",
+            snippet=record.content,
+        )
+        for record in records
+    ]
+
+    class OrderedMemory:
+        def __init__(self, ordered_hits: list[MemoryHit]) -> None:
+            self.ordered_hits = ordered_hits
+
+        def retrieve(self, _query: object) -> list[MemoryHit]:
+            return list(self.ordered_hits)
+
+    request = ContextPackRequest(objective="identical stable content")
+    forward = ContextPacker(OrderedMemory(hits)).pack(request)  # type: ignore[arg-type]
+    reverse = ContextPacker(OrderedMemory(list(reversed(hits)))).pack(request)  # type: ignore[arg-type]
+
+    assert [item.frame.id for item in forward.items] == [
+        item.frame.id for item in reverse.items
+    ]
+    assert forward.evidence_refs == reverse.evidence_refs
+    assert forward.prompt == reverse.prompt
+
+
 def test_packer_surfaces_correction_provenance(tmp_path: Path) -> None:
     memory = _memory(tmp_path)
     _put(

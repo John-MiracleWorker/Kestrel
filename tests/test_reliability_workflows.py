@@ -54,7 +54,7 @@ def _run_rehearsal_order_gate(
 def _determinism_v3_receipt(
     *,
     backend: str = "memory",
-    golden_report_sha256: str = "b" * 64,
+    golden_report_sha256: str | None = None,
 ) -> dict[str, object]:
     commit = "a" * 40
     reference_projection: dict[str, object] = {}
@@ -101,7 +101,11 @@ def _determinism_v3_receipt(
                 "repeat": repeat,
                 "passed": True,
                 "outcome_signature": outcome_signature,
-                "golden_report_sha256": golden_report_sha256,
+                "golden_report_sha256": (
+                    golden_report_sha256
+                    if golden_report_sha256 is not None
+                    else _golden_report_sha256(_golden_reports()[repeat - 1])
+                ),
                 "failed_cases": [],
             }
             for repeat in range(1, 21)
@@ -110,9 +114,39 @@ def _determinism_v3_receipt(
     }
 
 
+def _golden_reports() -> list[dict[str, object]]:
+    return [
+        {
+            "schema": "kestrel.golden_eval_report.v2",
+            "results": [
+                {
+                    "name": "deterministic-case",
+                    "passed": True,
+                    "latency_ms": float(repeat),
+                }
+            ],
+        }
+        for repeat in range(1, 21)
+    ]
+
+
+def _golden_report_sha256(report: dict[str, object]) -> str:
+    canonical = json.dumps(
+        report,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def _run_determinism_receipt_gate(
     tmp_path: Path,
     receipt: dict[str, object],
+    *,
+    golden_reports: list[dict[str, object]] | None = None,
+    omitted_repeats: frozenset[int] = frozenset(),
+    extra_reports: dict[int, dict[str, object]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
@@ -122,13 +156,35 @@ def _run_determinism_receipt_gate(
     script_start = workflow.index("          import hashlib", receipt_validation)
     script_end = workflow.index("\n          PY", script_start)
     script = textwrap.dedent(workflow[script_start:script_end])
-    report_path = tmp_path / "determinism-report.json"
+    gate_root = tmp_path / f"gate-{len(tuple(tmp_path.iterdir()))}"
+    artifact_root = gate_root / "artifact"
+    run_root = artifact_root / "kestrel-determinism-runs"
+    artifact_root.mkdir(parents=True)
+    report_path = artifact_root / "kestrel-determinism-report.json"
     report_path.write_text(json.dumps(receipt), encoding="utf-8")
+    reports = golden_reports if golden_reports is not None else _golden_reports()
+    for repeat, golden_report in enumerate(reports, start=1):
+        if repeat in omitted_repeats:
+            continue
+        repeat_root = run_root / f"repeat-{repeat:02d}"
+        repeat_root.mkdir(parents=True)
+        (repeat_root / "golden-report.json").write_text(
+            json.dumps(golden_report),
+            encoding="utf-8",
+        )
+    for repeat, golden_report in (extra_reports or {}).items():
+        repeat_root = run_root / f"repeat-{repeat:02d}"
+        repeat_root.mkdir(parents=True, exist_ok=True)
+        (repeat_root / "golden-report.json").write_text(
+            json.dumps(golden_report),
+            encoding="utf-8",
+        )
     environment = os.environ.copy()
     environment.update(
         {
             "RELEASE_COMMIT_SHA": "a" * 40,
             "DETERMINISM_RUN_ID": "4242",
+            "DETERMINISM_ARTIFACT_DIR": str(artifact_root),
             "DETERMINISM_REPORT": str(report_path),
         }
     )
@@ -197,6 +253,7 @@ def test_golden_determinism_matrix_runs_twenty_memory_and_memvid_repeats() -> No
         "kestrel-determinism-${{ matrix.backend }}-${{ github.sha }}"
     )
     assert "iteration-receipt.json" in upload["with"]["path"]
+    assert "golden-report.json" in upload["with"]["path"]
 
     flock = jobs["flock-qualification-determinism"]
     assert "strategy" not in flock
@@ -297,6 +354,63 @@ def test_release_gate_accepts_only_exact_sha_memory_v3_lane_receipt(
     assert "memory backend" in substituted.stderr
     assert malformed_digest.returncode != 0
     assert "golden report digest" in malformed_digest.stderr
+
+
+def test_release_gate_accepts_distinct_golden_digests_for_one_functional_signature(
+    tmp_path: Path,
+) -> None:
+    receipt = _determinism_v3_receipt()
+    runs = receipt["runs"]
+    assert isinstance(runs, list)
+    digests = {
+        run["golden_report_sha256"]
+        for run in runs
+        if isinstance(run, dict)
+    }
+
+    completed = _run_determinism_receipt_gate(tmp_path, receipt)
+
+    assert len(digests) == 20
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_release_gate_recomputes_each_uploaded_golden_report_digest(
+    tmp_path: Path,
+) -> None:
+    receipt = _determinism_v3_receipt()
+    substituted_reports = _golden_reports()
+    substituted_reports[-1] = {
+        **substituted_reports[-1],
+        "substituted": True,
+    }
+
+    completed = _run_determinism_receipt_gate(
+        tmp_path,
+        receipt,
+        golden_reports=substituted_reports,
+    )
+
+    assert completed.returncode != 0
+    assert "golden report digest does not match repeat 20" in completed.stderr
+
+
+def test_release_gate_rejects_missing_or_extra_golden_reports(tmp_path: Path) -> None:
+    receipt = _determinism_v3_receipt()
+    missing = _run_determinism_receipt_gate(
+        tmp_path,
+        receipt,
+        omitted_repeats=frozenset({20}),
+    )
+    extra = _run_determinism_receipt_gate(
+        tmp_path,
+        receipt,
+        extra_reports={21: {"extra": True}},
+    )
+
+    assert missing.returncode != 0
+    assert "golden report artifact count" in missing.stderr
+    assert extra.returncode != 0
+    assert "golden report artifact count" in extra.stderr
 
 
 def test_release_gate_derives_one_distinct_outcome_signature(tmp_path: Path) -> None:

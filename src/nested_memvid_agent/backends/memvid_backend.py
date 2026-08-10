@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from importlib import import_module
@@ -162,6 +163,11 @@ class MemvidBackend(MemoryBackend):
     def put(self, record: MemoryRecord) -> str:
         with self._operation_lock:
             return self._put_record_unlocked(record)
+
+    @contextmanager
+    def identity_reservation(self) -> Iterator[None]:
+        with self._operation_lock:
+            yield
 
     def _put_record_unlocked(
         self,

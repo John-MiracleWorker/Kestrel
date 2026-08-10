@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -41,6 +43,7 @@ from nested_memvid_agent.repair_integrity import (
     write_validation_receipt,
 )
 from nested_memvid_agent.runtime_models import (
+    AgentTurnResult,
     ChatMessage,
     LLMOptions,
     LLMResponse,
@@ -207,6 +210,66 @@ def test_injected_turn_identity_cannot_overwrite_same_or_cross_session_evidence(
     }
     assert after == before
     assert all("second message" not in content for content in after.values())
+
+
+def test_concurrent_agents_atomically_reserve_reused_turn_identity(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    identity_lookups_complete = Barrier(2)
+    original_get_record = memory.get_record
+
+    def synchronize_legacy_lookup(
+        layer: MemoryLayer | None,
+        record_id: str,
+        *,
+        include_inactive: bool = True,
+    ) -> MemoryRecord | None:
+        record = original_get_record(layer, record_id, include_inactive=include_inactive)
+        if record_id == "turn_concurrent_reuse_provider_error":
+            identity_lookups_complete.wait(timeout=5)
+        return record
+
+    memory.get_record = synchronize_legacy_lookup  # type: ignore[method-assign]
+
+    def build_agent(response: str) -> NestedMV2Agent:
+        return NestedMV2Agent(
+            AgentDependencies(
+                memory=memory,
+                llm=MockLLMProvider([LLMResponse(content=response)]),
+                tools=build_default_tools(),
+                config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+                turn_id_factory=lambda: "turn_concurrent_reuse",
+            )
+        )
+
+    def invoke(agent: NestedMV2Agent, message: str) -> AgentTurnResult | ValueError:
+        try:
+            return agent.chat(message, session_id=message)
+        except ValueError as exc:
+            return exc
+
+    agents = (build_agent("first response"), build_agent("second response"))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(
+            executor.map(
+                lambda arguments: invoke(*arguments),
+                zip(agents, ("first message", "second message"), strict=True),
+            )
+        )
+
+    assert sum(isinstance(outcome, AgentTurnResult) for outcome in outcomes) == 1
+    errors = [outcome for outcome in outcomes if isinstance(outcome, ValueError)]
+    assert len(errors) == 1
+    assert str(errors[0]) == "turn identity already exists: turn_concurrent_reuse"
+    turn_records = [
+        record
+        for record in memory.iter_records(include_inactive=True)
+        if record.id.startswith("turn_concurrent_reuse_")
+    ]
+    assert [record.id for record in turn_records].count("turn_concurrent_reuse_user") == 1
+    persisted_messages = {
+        record.content for record in turn_records if record.id == "turn_concurrent_reuse_user"
+    }
+    assert persisted_messages in ({"first message"}, {"second message"})
 
 
 def test_optional_llm_summary_uses_run_bounds_and_falls_back_without_failing_turn(

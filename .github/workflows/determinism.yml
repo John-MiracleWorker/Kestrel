@@ -62,6 +62,7 @@ jobs:
           path: |
             ${{ runner.temp }}/kestrel-determinism-report.json
             ${{ runner.temp }}/kestrel-determinism-runs/repeat-*/iteration-receipt.json
+            ${{ runner.temp }}/kestrel-determinism-runs/repeat-*/golden-report.json
           if-no-files-found: error
           retention-days: 14
 

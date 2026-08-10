@@ -166,7 +166,8 @@ jobs:
           gh run download "$DETERMINISM_RUN_ID" \
             -n "kestrel-determinism-memory-${RELEASE_COMMIT_SHA}" \
             -D "$determinism_receipt_dir"
-          DETERMINISM_REPORT="${determinism_receipt_dir}/kestrel-determinism-report.json" \
+          DETERMINISM_ARTIFACT_DIR="$determinism_receipt_dir" \
+            DETERMINISM_REPORT="${determinism_receipt_dir}/kestrel-determinism-report.json" \
             python - <<'PY'
           import hashlib
           import json
@@ -175,6 +176,7 @@ jobs:
           from pathlib import Path
 
           expected_sha = os.environ["RELEASE_COMMIT_SHA"]
+          artifact_dir = Path(os.environ["DETERMINISM_ARTIFACT_DIR"])
           report_path = Path(os.environ["DETERMINISM_REPORT"])
           report = json.loads(report_path.read_text(encoding="utf-8"))
           if not isinstance(report, dict):
@@ -277,6 +279,51 @@ jobs:
               for run in runs
           ):
               raise SystemExit("determinism receipt golden report digest is invalid")
+          golden_report_paths = sorted(artifact_dir.rglob("golden-report.json"))
+          if len(golden_report_paths) != len(runs):
+              raise SystemExit(
+                  "determinism golden report artifact count does not match runs"
+              )
+          expected_golden_report_paths = {
+              repeat: artifact_dir
+              / "kestrel-determinism-runs"
+              / f"repeat-{repeat:02d}"
+              / "golden-report.json"
+              for repeat in range(1, len(runs) + 1)
+          }
+          if set(golden_report_paths) != set(expected_golden_report_paths.values()):
+              raise SystemExit("determinism golden report artifact layout is not accepted")
+          for run in runs:
+              repeat = run["repeat"]
+              golden_report_path = expected_golden_report_paths[repeat]
+              try:
+                  golden_report = json.loads(
+                      golden_report_path.read_text(encoding="utf-8")
+                  )
+              except (OSError, json.JSONDecodeError) as exc:
+                  raise SystemExit(
+                      f"determinism golden report {repeat} is unreadable: {exc}"
+                  ) from exc
+              if not isinstance(golden_report, dict):
+                  raise SystemExit(
+                      f"determinism golden report {repeat} is not a JSON object"
+                  )
+              # The golden runner writes the already-redacted payload. Recreate the
+              # producer's canonical JSON serialization before hashing that payload.
+              canonical_golden_report = json.dumps(
+                  golden_report,
+                  sort_keys=True,
+                  separators=(",", ":"),
+                  ensure_ascii=True,
+              )
+              recomputed_digest = hashlib.sha256(
+                  canonical_golden_report.encode()
+              ).hexdigest()
+              if recomputed_digest != run["golden_report_sha256"]:
+                  raise SystemExit(
+                      "determinism golden report digest does not match "
+                      f"repeat {repeat}"
+                  )
           outcome_signatures = [run["outcome_signature"] for run in runs]
           distinct_signatures = set(outcome_signatures)
           first_signature = outcome_signatures[0]

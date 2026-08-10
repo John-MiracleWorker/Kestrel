@@ -318,6 +318,11 @@ class InMemoryBackend(MemoryBackend):
             self._mark_mutation(indices_current=True)
         return record.id
 
+    @contextmanager
+    def identity_reservation(self) -> Iterator[None]:
+        with self._state_lock:
+            yield
+
     def upsert(self, record: MemoryRecord) -> str:
         if record.layer != self.layer:
             raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
