@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -11,7 +13,10 @@ import pytest
 import scripts.bounded_process as bounded_process
 from nested_memvid_agent.security_boundary import REDACTED
 from scripts.bounded_process import run_bounded_process
+from scripts.golden_eval_contract import validate_golden_report
 from scripts.run_determinism_evals import (
+    GoldenRunnerError,
+    IterationInvocation,
     _deterministic_projection,
     _excerpt,
     _subprocess_invoker,
@@ -29,6 +34,10 @@ from scripts.run_golden_evals import (
 )
 
 TEST_CASES = {"alpha": "repo_regression", "beta": "repo_regression"}
+SOURCE_COMMIT = "a" * 40
+RUNNER_OS = "Linux"
+RUNNER_ARCH = "X64"
+PYTHON_VERSION = "3.11.13"
 
 
 def _golden_report(
@@ -37,6 +46,7 @@ def _golden_report(
     result_order: tuple[str, ...] = ("beta", "alpha"),
     latency_offset: float = 0.0,
     max_case_latency_ms: float | None = None,
+    backend: str = "memory",
 ) -> dict[str, object]:
     results = []
     for index, name in enumerate(result_order):
@@ -76,7 +86,7 @@ def _golden_report(
     return {
         "schema": "kestrel.golden_eval_report.v2",
         "configuration": {
-            "backend": "memory",
+            "backend": backend,
             "provider": "mock",
             "model": "mock",
             "seed": 1729,
@@ -128,6 +138,396 @@ def _golden_report(
     }
 
 
+def _one_case_report(
+    *,
+    name: str,
+    memory_hits: int,
+    context_chars: int,
+    backend: str = "memory",
+) -> dict[str, object]:
+    report = _golden_report(
+        result_order=("alpha",),
+        backend=backend,
+    )
+    result = report["results"][0]  # type: ignore[index]
+    assert isinstance(result, dict)
+    result["name"] = name
+    result["category"] = "memory_precision_recall"
+    result["memory_hits"] = memory_hits
+    result["context_chars"] = context_chars
+    summary = report["summary"]
+    assert isinstance(summary, dict)
+    summary["context_chars_max"] = context_chars
+    return report
+
+
+def test_golden_report_validation_requires_exact_expected_backend() -> None:
+    categories = {"alpha": "repo_regression"}
+    report = _golden_report(result_order=("alpha",), backend="memory")
+
+    assert (
+        validate_golden_report(
+            report,
+            expected_backend="memory",
+            expected_case_categories=categories,
+            expected_seed=1729,
+        )
+        is True
+    )
+    with pytest.raises(ValueError, match="golden report backend mismatch"):
+        validate_golden_report(
+            report,
+            expected_backend="memvid",
+            expected_case_categories=categories,
+            expected_seed=1729,
+        )
+
+
+def test_passed_retrieval_case_cannot_report_zero_retrieval_evidence() -> None:
+    case = "summary_first_expand_raw_on_demand"
+    report = _one_case_report(name=case, memory_hits=0, context_chars=0)
+
+    with pytest.raises(ValueError, match="retrieval evidence"):
+        validate_golden_report(
+            report,
+            expected_backend="memory",
+            expected_case_categories={case: "memory_precision_recall"},
+            expected_seed=1729,
+        )
+
+
+def test_correction_retrieval_requires_a_hit_but_not_earlier_turn_context() -> None:
+    case = "remember_correction_across_sessions"
+    categories = {case: "memory_precision_recall"}
+
+    assert validate_golden_report(
+        _one_case_report(name=case, memory_hits=1, context_chars=0),
+        expected_backend="memory",
+        expected_case_categories=categories,
+        expected_seed=1729,
+    )
+    with pytest.raises(ValueError, match="retrieval evidence"):
+        validate_golden_report(
+            _one_case_report(name=case, memory_hits=0, context_chars=0),
+            expected_backend="memory",
+            expected_case_categories=categories,
+            expected_seed=1729,
+        )
+
+
+def test_determinism_report_binds_backend_subject_and_environment() -> None:
+    reports = [
+        _golden_report(result_order=("alpha",), backend="memvid"),
+        _golden_report(result_order=("alpha",), backend="memvid"),
+    ]
+    categories = {"alpha": "repo_regression"}
+
+    report = build_determinism_report(
+        reports,
+        required_repeats=2,
+        seed=1729,
+        backend="memvid",
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
+        expected_case_categories=categories,
+    )
+
+    assert report["schema"] == "kestrel.determinism_eval_report.v3"
+    assert report["subject"] == {"source_commit": SOURCE_COMMIT}
+    assert report["configuration"]["backend"] == "memvid"
+    assert report["environment"] == {
+        "os": RUNNER_OS,
+        "architecture": RUNNER_ARCH,
+        "python_version": PYTHON_VERSION,
+    }
+    canonical = json.dumps(
+        reports[0], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    assert report["runs"][0]["golden_report_sha256"] == hashlib.sha256(
+        canonical
+    ).hexdigest()
+
+    substituted = _golden_report(result_order=("alpha",), backend="memory")
+    with pytest.raises(ValueError, match="golden report backend mismatch"):
+        build_determinism_report(
+            [reports[0], substituted],
+            required_repeats=2,
+            seed=1729,
+            backend="memvid",
+            source_commit=SOURCE_COMMIT,
+            runner_os=RUNNER_OS,
+            runner_arch=RUNNER_ARCH,
+            python_version=PYTHON_VERSION,
+            expected_case_categories=categories,
+        )
+
+
+@pytest.mark.parametrize("backend", ["memory", "memvid"])
+def test_subprocess_invoker_forwards_backend_to_isolated_golden_runner(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    runner = tmp_path / "fake_golden_runner.py"
+    payload = json.dumps(
+        _golden_report(result_order=("alpha",), backend=backend),
+        sort_keys=True,
+    )
+    argv_path = tmp_path / "argv.json"
+    runner.write_text(
+        "\n".join(
+            [
+                "import json, pathlib, sys",
+                f"pathlib.Path({str(argv_path)!r}).write_text(json.dumps(sys.argv), encoding='utf-8')",
+                "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])",
+                "output.parent.mkdir(parents=True, exist_ok=True)",
+                f"output.write_text({payload!r}, encoding='utf-8')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    invoke = _subprocess_invoker(
+        backend=backend,
+        workspace=tmp_path,
+        validation_container_image=None,
+        max_case_latency_ms=None,
+        case_timeout_seconds=2.0,
+        iteration_timeout_seconds=5.0,
+        golden_runner=runner,
+    )
+
+    memory_root = tmp_path / "repeat-01" / "memory"
+    invocation = invoke(1, memory_root, 1729)
+    argv = json.loads(argv_path.read_text(encoding="utf-8"))
+
+    assert isinstance(invocation, IterationInvocation)
+    assert invocation.report["configuration"]["backend"] == backend
+    assert invocation.diagnostics["runner_exit_code"] == 0
+    assert argv.count("--backend") == 1
+    assert argv[argv.index("--backend") + 1] == backend
+    assert argv[argv.index("--memory-dir") + 1] == str(memory_root)
+
+
+def test_successful_subprocess_diagnostics_are_written_to_iteration_receipts(
+    tmp_path: Path,
+) -> None:
+    runner = tmp_path / "successful_golden_runner.py"
+    payload = json.dumps(_golden_report(), sort_keys=True)
+    runner.write_text(
+        "\n".join(
+            [
+                "import pathlib, sys",
+                "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])",
+                "output.parent.mkdir(parents=True, exist_ok=True)",
+                f"output.write_text({payload!r}, encoding='utf-8')",
+                "print('successful runner diagnostic')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run_root = tmp_path / "determinism-runs"
+
+    report = run_determinism(
+        repeats=2,
+        seed=1729,
+        backend="memory",
+        run_root=run_root,
+        output=tmp_path / "determinism-report.json",
+        invoke=_subprocess_invoker(
+            backend="memory",
+            workspace=tmp_path,
+            validation_container_image=None,
+            max_case_latency_ms=None,
+            case_timeout_seconds=2.0,
+            iteration_timeout_seconds=5.0,
+            golden_runner=runner,
+        ),
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
+        expected_case_categories=TEST_CASES,
+        iteration_timeout_seconds=5.0,
+    )
+
+    assert report["passed"] is True
+    for receipt_path in sorted(run_root.glob("repeat-*/iteration-receipt.json")):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["status"] == "completed"
+        assert receipt["runner_exit_code"] == 0
+        assert isinstance(receipt["elapsed_seconds"], float)
+        assert receipt["elapsed_seconds"] >= 0.0
+        assert receipt["deadline"] == {
+            "clock": "monotonic",
+            "seconds": 5.0,
+            "exceeded": False,
+        }
+        assert receipt["cleanup"]["succeeded"] is True
+        assert receipt["capture"]["stdout_total_bytes"] > 0
+        assert "successful runner diagnostic" in receipt["stdout"]
+
+
+def test_memvid_runner_failure_writes_a_backend_bound_failed_receipt(
+    tmp_path: Path,
+) -> None:
+    def fail(_iteration: int, _memory: Path, _seed: int) -> dict[str, object]:
+        raise RuntimeError("injected Memvid runner failure")
+
+    output = tmp_path / "determinism-report.json"
+    report = run_determinism(
+        repeats=2,
+        seed=1729,
+        backend="memvid",
+        run_root=tmp_path / "runs",
+        output=output,
+        invoke=fail,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
+        expected_case_categories=TEST_CASES,
+    )
+
+    assert report["schema"] == "kestrel.determinism_eval_report.v3"
+    assert report["configuration"]["backend"] == "memvid"
+    assert report["passed"] is False
+    assert output.is_file()
+    assert all(
+        run["golden_report_sha256"]
+        for run in report["runs"]
+    )
+
+
+def test_runner_diagnostics_cannot_overwrite_iteration_receipt_identity(
+    tmp_path: Path,
+) -> None:
+    def forge(_iteration: int, _memory: Path, _seed: int) -> dict[str, object]:
+        raise GoldenRunnerError(
+            "forged runner failure",
+            receipt={
+                "schema": "attacker.receipt.v9",
+                "backend": "memory",
+                "repeat": 999,
+                "seed": 7,
+                "derived_passed": True,
+                "status": "runner_nonzero",
+                "runner_exit_code": 9,
+                "stderr": "useful runner diagnostic",
+            },
+        )
+
+    run_root = tmp_path / "runs"
+    report = run_determinism(
+        repeats=2,
+        seed=1729,
+        backend="memvid",
+        run_root=run_root,
+        output=tmp_path / "report.json",
+        invoke=forge,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
+        expected_case_categories=TEST_CASES,
+    )
+
+    assert report["passed"] is False
+    for expected_repeat, receipt_path in enumerate(
+        sorted(run_root.glob("repeat-*/iteration-receipt.json")),
+        start=1,
+    ):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["schema"] == "kestrel.determinism_iteration_receipt.v1"
+        assert receipt["backend"] == "memvid"
+        assert receipt["repeat"] == expected_repeat
+        assert receipt["seed"] == 1729
+        assert receipt["derived_passed"] is False
+        assert receipt["status"] == "runner_nonzero"
+        assert receipt["runner_exit_code"] == 9
+        assert receipt["stderr"] == "useful runner diagnostic"
+
+
+def test_cli_rejects_a_missing_source_commit_without_a_traceback(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment.pop("GITHUB_SHA", None)
+
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/run_determinism_evals.py",
+            "--backend",
+            "memory",
+            "--repeats",
+            "2",
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--output",
+            str(tmp_path / "report.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "source-commit" in completed.stderr.lower()
+    assert "traceback" not in completed.stderr.lower()
+    assert not (tmp_path / "runs").exists()
+
+
+def test_cli_requires_an_explicit_backend(tmp_path: Path) -> None:
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/run_determinism_evals.py",
+            "--source-commit",
+            SOURCE_COMMIT,
+            "--repeats",
+            "2",
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--output",
+            str(tmp_path / "report.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "--backend" in completed.stderr
+    assert not (tmp_path / "runs").exists()
+
+
+def test_runner_rejects_unsupported_architecture_before_creating_run_root(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs"
+
+    with pytest.raises(ValueError, match="runner architecture"):
+        run_determinism(
+            repeats=2,
+            seed=1729,
+            backend="memory",
+            run_root=run_root,
+            output=tmp_path / "report.json",
+            invoke=lambda _iteration, _memory, _seed: _golden_report(),
+            source_commit=SOURCE_COMMIT,
+            runner_os=RUNNER_OS,
+            runner_arch="mips64",
+            python_version=PYTHON_VERSION,
+            expected_case_categories=TEST_CASES,
+        )
+
+    assert not run_root.exists()
+
+
 def test_seeded_eval_identifier_is_stable_and_never_looks_like_a_release_id() -> None:
     assert _eval_identifier(1729) == _eval_identifier(1729)
     assert _eval_identifier(1729) != _eval_identifier(1730)
@@ -139,9 +539,15 @@ def test_projection_sorts_cases_and_excludes_wall_clock_measurements() -> None:
     second = _golden_report(result_order=("alpha", "beta"), latency_offset=9000.0)
 
     assert _deterministic_projection(
-        first, expected_case_categories=TEST_CASES
-    ) == _deterministic_projection(second, expected_case_categories=TEST_CASES)
-    assert _deterministic_projection(first, expected_case_categories=TEST_CASES)["cases"] == [
+        first, expected_backend="memory", expected_case_categories=TEST_CASES
+    ) == _deterministic_projection(
+        second, expected_backend="memory", expected_case_categories=TEST_CASES
+    )
+    assert _deterministic_projection(
+        first,
+        expected_backend="memory",
+        expected_case_categories=TEST_CASES,
+    )["cases"] == [
         {
             "category": "repo_regression",
             "name": "alpha",
@@ -178,6 +584,11 @@ def test_determinism_report_fails_when_one_repeat_changes_outcome() -> None:
         reports,
         required_repeats=3,
         seed=1729,
+        backend="memory",
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 
@@ -207,6 +618,11 @@ def test_determinism_report_binds_the_invoked_latency_gate() -> None:
         reports,
         required_repeats=2,
         seed=1729,
+        backend="memory",
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         max_case_latency_ms=45_000.0,
         expected_case_categories=TEST_CASES,
     )
@@ -221,6 +637,11 @@ def test_determinism_report_rejects_a_missing_or_different_latency_gate() -> Non
             [_golden_report(), _golden_report()],
             required_repeats=2,
             seed=1729,
+            backend="memory",
+            source_commit=SOURCE_COMMIT,
+            runner_os=RUNNER_OS,
+            runner_arch=RUNNER_ARCH,
+            python_version=PYTHON_VERSION,
             max_case_latency_ms=45_000.0,
             expected_case_categories=TEST_CASES,
         )
@@ -233,6 +654,11 @@ def test_determinism_report_rejects_a_missing_or_different_latency_gate() -> Non
             ],
             required_repeats=2,
             seed=1729,
+            backend="memory",
+            source_commit=SOURCE_COMMIT,
+            runner_os=RUNNER_OS,
+            runner_arch=RUNNER_ARCH,
+            python_version=PYTHON_VERSION,
             max_case_latency_ms=45_000.0,
             expected_case_categories=TEST_CASES,
         )
@@ -251,9 +677,14 @@ def test_runner_isolates_each_repeat_and_writes_report_on_failure(tmp_path: Path
     report = run_determinism(
         repeats=3,
         seed=1729,
+        backend="memory",
         run_root=tmp_path / "runs",
         output=output,
         invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 
@@ -276,9 +707,14 @@ def test_runner_rejects_seed_outside_python_hash_range_before_writing(
         run_determinism(
             repeats=2,
             seed=-1,
+            backend="memory",
             run_root=run_root,
             output=tmp_path / "report.json",
             invoke=lambda _iteration, _memory, _seed: _golden_report(),
+            source_commit=SOURCE_COMMIT,
+            runner_os=RUNNER_OS,
+            runner_arch=RUNNER_ARCH,
+            python_version=PYTHON_VERSION,
             expected_case_categories=TEST_CASES,
         )
 
@@ -295,9 +731,14 @@ def test_runner_redacts_iteration_errors_from_machine_report(tmp_path: Path) -> 
     run_determinism(
         repeats=2,
         seed=1729,
+        backend="memory",
         run_root=tmp_path / "runs",
         output=output,
         invoke=fail,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 
@@ -311,9 +752,14 @@ def test_runner_failure_receipt_preserves_required_latency_gate(tmp_path: Path) 
     report = run_determinism(
         repeats=2,
         seed=1729,
+        backend="memory",
         run_root=tmp_path / "runs",
         output=tmp_path / "report.json",
         invoke=fail,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
         max_case_latency_ms=45_000.0,
     )
@@ -342,9 +788,14 @@ def test_runner_redacts_complete_imported_and_final_reports(tmp_path: Path) -> N
     report = run_determinism(
         repeats=2,
         seed=1729,
+        backend="memory",
         run_root=tmp_path / "runs",
         output=output,
         invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 
@@ -384,6 +835,11 @@ def test_forged_top_level_pass_cannot_override_failed_case() -> None:
         [forged, forged],
         required_repeats=2,
         seed=1729,
+        backend="memory",
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 
@@ -399,6 +855,11 @@ def test_inconsistent_top_level_failure_cannot_become_a_derived_pass() -> None:
         [inconsistent, inconsistent],
         required_repeats=2,
         seed=1729,
+        backend="memory",
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 
@@ -429,7 +890,11 @@ def test_imported_report_requires_exact_schema_and_expected_case_set(
     mutation(report)
 
     with pytest.raises(ValueError, match=match):
-        _deterministic_projection(report, expected_case_categories=TEST_CASES)
+        _deterministic_projection(
+            report,
+            expected_backend="memory",
+            expected_case_categories=TEST_CASES,
+        )
 
 
 def test_nonzero_runner_exit_is_failure_even_when_report_claims_pass(
@@ -452,6 +917,7 @@ def test_nonzero_runner_exit_is_failure_even_when_report_claims_pass(
         encoding="utf-8",
     )
     invoke = _subprocess_invoker(
+        backend="memory",
         workspace=tmp_path,
         validation_container_image=None,
         max_case_latency_ms=None,
@@ -463,9 +929,14 @@ def test_nonzero_runner_exit_is_failure_even_when_report_claims_pass(
     result = run_determinism(
         repeats=2,
         seed=1729,
+        backend="memory",
         run_root=tmp_path / "runs",
         output=tmp_path / "report.json",
         invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 
@@ -778,6 +1249,7 @@ def test_timeout_writes_atomic_redacted_iteration_and_aggregate_receipts(
         encoding="utf-8",
     )
     invoke = _subprocess_invoker(
+        backend="memory",
         workspace=tmp_path,
         validation_container_image=None,
         max_case_latency_ms=None,
@@ -790,9 +1262,14 @@ def test_timeout_writes_atomic_redacted_iteration_and_aggregate_receipts(
     report = run_determinism(
         repeats=2,
         seed=1729,
+        backend="memory",
         run_root=tmp_path / "runs",
         output=output,
         invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
         expected_case_categories=TEST_CASES,
     )
 

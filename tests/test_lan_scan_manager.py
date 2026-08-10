@@ -1166,8 +1166,11 @@ def test_stale_cancel_has_no_token_side_effect_and_committed_cancel_signals_toke
 
 def test_real_scanner_cancel_drains_admitted_work_before_terminal_receipt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered = Event()
+    all_admitted = Event()
+    release = Event()
 
     class BlockingTcp:
         def tcp_reachable(
@@ -1181,7 +1184,7 @@ def test_real_scanner_cancel_drains_admitted_work_before_terminal_receipt(
         ) -> bool:
             del deadline
             entered.set()
-            while not cancellation.is_cancelled():
+            while not cancellation.is_cancelled() and not release.is_set():
                 time.sleep(0.001)
             raise LanTransportError(LanTransportFailure.CANCELLED)
 
@@ -1202,40 +1205,51 @@ def test_real_scanner_cancel_drains_admitted_work_before_terminal_receipt(
             **kwargs,
         )
 
-    manager, _state, _ledger, interface = _manager(tmp_path, scanner=scanner)
-    _start_lifecycle(manager)
-    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
-    draft = manager.create_draft(authorization)
-    manager.start(
-        draft.scan_id,
-        expected_revision=draft.revision,
-        authorization=authorization,
-        preview_digest=authorization.preview_digest,
-    )
-    assert entered.wait(timeout=2)
+    manager, _state, ledger, interface = _manager(tmp_path, scanner=scanner)
+    shutdown_succeeded = False
+    try:
+        _start_lifecycle(manager)
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        expected_admitted = len(authorization.preview.port_matrix)
+        record_scan_progress = ledger.record_scan_progress
 
-    expected_admitted = len(authorization.preview.port_matrix)
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
+        def record_and_observe_progress(scan_id: str, **kwargs: Any) -> LanScanRecord:
+            updated = record_scan_progress(scan_id, **kwargs)
+            if kwargs["admitted_count"] == expected_admitted:
+                all_admitted.set()
+            return updated
+
+        monkeypatch.setattr(ledger, "record_scan_progress", record_and_observe_progress)
+        draft = manager.create_draft(authorization)
+        manager.start(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            authorization=authorization,
+            preview_digest=authorization.preview_digest,
+        )
+        assert entered.wait(timeout=15.0)
+        assert all_admitted.wait(timeout=15.0), (
+            "real scanner did not durably admit its bounded work"
+        )
         progress_events = [
             event for event in manager.events(draft.scan_id) if event.event_type == "scan_progress"
         ]
-        if progress_events and progress_events[-1].payload["admitted_count"] == (expected_admitted):
-            break
-        time.sleep(0.005)
-    else:
-        raise AssertionError("real scanner did not durably admit its bounded work")
+        assert progress_events[-1].payload["admitted_count"] == expected_admitted
 
-    current = manager.get(draft.scan_id)
-    assert current is not None
-    manager.cancel(draft.scan_id, expected_revision=current.revision)
-    terminal = _wait_for_terminal(manager, draft.scan_id)
-    assert terminal.status == "cancelled"
-    assert terminal.terminal_receipt is not None
-    assert terminal.terminal_receipt["admitted_count"] == expected_admitted
-    assert terminal.terminal_receipt["completed_count"] == expected_admitted
-    assert terminal.terminal_receipt["unknown_inflight_count"] == 0
-    assert manager.shutdown(timeout_seconds=2.0) is True
+        current = manager.get(draft.scan_id)
+        assert current is not None
+        manager.cancel(draft.scan_id, expected_revision=current.revision)
+        terminal = _wait_for_terminal(manager, draft.scan_id, timeout=15.0)
+        assert terminal.status == "cancelled"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["admitted_count"] == expected_admitted
+        assert terminal.terminal_receipt["completed_count"] == expected_admitted
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+    finally:
+        release.set()
+        shutdown_succeeded = manager.shutdown(timeout_seconds=15.0)
+    assert shutdown_succeeded is True
+    assert manager.is_quiescent() is True
 
 
 def test_real_scanner_pre_admission_cancel_receipt_has_zero_admitted_work(

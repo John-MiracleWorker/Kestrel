@@ -7,10 +7,12 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import sys
 from collections import Counter
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +25,7 @@ from scripts.bounded_process import run_bounded_process  # noqa: E402
 from scripts.golden_eval_contract import (  # noqa: E402
     GOLDEN_CASE_CATEGORIES,
     GOLDEN_REPORT_SCHEMA,
+    GoldenBackend,
     validate_golden_report,
 )
 
@@ -35,7 +38,40 @@ MAX_PYTHON_HASH_SEED = 4_294_967_295
 _VOLATILE_CASE_KEYS = frozenset({"latency_ms"})
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
-IterationRunner = Callable[[int, Path, int], dict[str, object]]
+
+@dataclass(frozen=True)
+class IterationInvocation:
+    """One imported golden report plus trusted parent-runner diagnostics."""
+
+    report: dict[str, object]
+    diagnostics: Mapping[str, object]
+
+
+IterationRunner = Callable[
+    [int, Path, int], dict[str, object] | IterationInvocation
+]
+_RUNNER_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "status",
+        "runner_exit_code",
+        "elapsed_seconds",
+        "deadline",
+        "cleanup",
+        "capture",
+        "stdout",
+        "stderr",
+    }
+)
+_RUNNER_FAILURE_STATUSES = frozenset(
+    {
+        "timed_out",
+        "cleanup_unverified",
+        "runner_nonzero",
+        "missing_report",
+        "invalid_json",
+        "runner_error",
+    }
+)
 
 
 class GoldenRunnerError(RuntimeError):
@@ -61,13 +97,49 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def _normalize_architecture(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"amd64", "x86_64", "x64"}:
+        return "X64"
+    if normalized in {"aarch64", "arm64"}:
+        return "ARM64"
+    raise ValueError(f"runner architecture is unsupported: {value!r}")
+
+
+def _normalize_runner_os(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized == "linux":
+        return "Linux"
+    if normalized in {"darwin", "macos"}:
+        return "macOS"
+    if normalized == "windows":
+        return "Windows"
+    raise ValueError(f"runner operating system is unsupported: {value!r}")
+
+
+def _validate_environment(
+    *,
+    runner_os: str,
+    runner_arch: str,
+    python_version: str,
+) -> tuple[str, str, str]:
+    normalized_os = _normalize_runner_os(runner_os)
+    normalized_architecture = _normalize_architecture(runner_arch)
+    normalized_python = python_version.strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[A-Za-z0-9.+-]*)?", normalized_python):
+        raise ValueError("runner Python version must be a concrete semantic version")
+    return normalized_os, normalized_architecture, normalized_python
+
+
 def _deterministic_projection(
     report: dict[str, object],
     *,
+    expected_backend: GoldenBackend,
     expected_case_categories: Mapping[str, str] = GOLDEN_CASE_CATEGORIES,
 ) -> dict[str, object]:
     validate_golden_report(
         report,
+        expected_backend=expected_backend,
         expected_case_categories=expected_case_categories,
     )
     raw_results = report["results"]
@@ -134,9 +206,13 @@ def build_determinism_report(
     *,
     required_repeats: int,
     seed: int,
+    backend: GoldenBackend,
+    source_commit: str,
+    runner_os: str,
+    runner_arch: str,
+    python_version: str,
     max_case_latency_ms: float | None = None,
     expected_case_categories: Mapping[str, str] = GOLDEN_CASE_CATEGORIES,
-    source_commit: str | None = None,
     case_timeout_seconds: float | None = None,
     iteration_timeout_seconds: float | None = None,
 ) -> dict[str, object]:
@@ -144,8 +220,18 @@ def build_determinism_report(
         raise ValueError("determinism evaluation requires at least two repeats")
     if max_case_latency_ms is not None and max_case_latency_ms <= 0:
         raise ValueError("determinism latency gate must be greater than zero")
+    if backend not in {"memory", "memvid"}:
+        raise ValueError("determinism backend must be 'memory' or 'memvid'")
+    if not isinstance(source_commit, str) or not _COMMIT_RE.fullmatch(source_commit):
+        raise ValueError("source commit must be a 40-character lowercase hexadecimal SHA")
+    normalized_os, normalized_architecture, normalized_python = _validate_environment(
+        runner_os=runner_os,
+        runner_arch=runner_arch,
+        python_version=python_version,
+    )
     derived_passes: list[bool] = []
     projections: list[dict[str, object]] = []
+    report_digests: list[str] = []
     for report in reports:
         configuration = report.get("configuration")
         if (
@@ -158,6 +244,7 @@ def build_determinism_report(
         derived_passes.append(
             validate_golden_report(
                 report,
+                expected_backend=backend,
                 expected_case_categories=expected_case_categories,
                 expected_seed=seed,
             )
@@ -165,8 +252,12 @@ def build_determinism_report(
         projections.append(
             _deterministic_projection(
                 report,
+                expected_backend=backend,
                 expected_case_categories=expected_case_categories,
             )
+        )
+        report_digests.append(
+            hashlib.sha256(_canonical_json(_redact_json(report)).encode()).hexdigest()
         )
     signatures = [_signature(projection) for projection in projections]
     signature_counts = Counter(signatures)
@@ -195,15 +286,23 @@ def build_determinism_report(
         dict[str, object],
         _redact_json(
             {
-                "schema": "kestrel.determinism_eval_report.v2",
+                "schema": "kestrel.determinism_eval_report.v3",
+                "subject": {"source_commit": source_commit},
                 "configuration": {
+                    "backend": backend,
+                    "provider": "mock",
+                    "model": "mock",
                     "seed": seed,
                     "required_repeats": required_repeats,
                     "comparison": "functional_outcomes_excluding_wall_clock_latency",
-                    "source_commit": source_commit,
                     "case_timeout_seconds": case_timeout_seconds,
                     "iteration_timeout_seconds": iteration_timeout_seconds,
                     "max_case_latency_ms": max_case_latency_ms,
+                },
+                "environment": {
+                    "os": normalized_os,
+                    "architecture": normalized_architecture,
+                    "python_version": normalized_python,
                 },
                 "summary": summary,
                 "differing_cases": _differing_cases(projections),
@@ -213,10 +312,17 @@ def build_determinism_report(
                         "repeat": index,
                         "passed": derived_passed,
                         "outcome_signature": signature,
+                        "golden_report_sha256": report_digest,
                         "failed_cases": _failed_case_names(report),
                     }
-                    for index, (report, signature, derived_passed) in enumerate(
-                        zip(reports, signatures, derived_passes, strict=True),
+                    for index, (report, signature, derived_passed, report_digest) in enumerate(
+                        zip(
+                            reports,
+                            signatures,
+                            derived_passes,
+                            report_digests,
+                            strict=True,
+                        ),
                         start=1,
                     )
                 ],
@@ -241,6 +347,7 @@ def _write_json(path: Path, payload: object) -> None:
 
 def _failure_report(
     *,
+    backend: GoldenBackend,
     seed: int,
     error: str,
     expected_case_categories: Mapping[str, str],
@@ -282,7 +389,7 @@ def _failure_report(
     return {
         "schema": GOLDEN_REPORT_SCHEMA,
         "configuration": {
-            "backend": "memory",
+            "backend": backend,
             "provider": "mock",
             "model": "mock",
             "seed": seed,
@@ -310,9 +417,15 @@ def _failure_report(
     }
 
 
-def _base_iteration_receipt(*, iteration: int, seed: int) -> dict[str, object]:
+def _base_iteration_receipt(
+    *,
+    backend: GoldenBackend,
+    iteration: int,
+    seed: int,
+) -> dict[str, object]:
     return {
         "schema": "kestrel.determinism_iteration_receipt.v1",
+        "backend": backend,
         "repeat": iteration,
         "seed": seed,
         "status": "runner_error",
@@ -340,11 +453,15 @@ def run_determinism(
     *,
     repeats: int,
     seed: int,
+    backend: GoldenBackend,
     run_root: Path,
     output: Path,
     invoke: IterationRunner,
+    source_commit: str,
+    runner_os: str,
+    runner_arch: str,
+    python_version: str,
     expected_case_categories: Mapping[str, str] = GOLDEN_CASE_CATEGORIES,
-    source_commit: str | None = None,
     max_case_latency_ms: float | None = None,
     case_timeout_seconds: float | None = None,
     iteration_timeout_seconds: float | None = None,
@@ -353,10 +470,17 @@ def run_determinism(
         raise ValueError("determinism evaluation requires at least two repeats")
     if not 0 <= seed <= MAX_PYTHON_HASH_SEED:
         raise ValueError(f"seed must be between 0 and {MAX_PYTHON_HASH_SEED}")
-    if source_commit is not None and not _COMMIT_RE.fullmatch(source_commit):
+    if backend not in {"memory", "memvid"}:
+        raise ValueError("determinism backend must be 'memory' or 'memvid'")
+    if not isinstance(source_commit, str) or not _COMMIT_RE.fullmatch(source_commit):
         raise ValueError("source commit must be a 40-character lowercase hexadecimal SHA")
     if max_case_latency_ms is not None and max_case_latency_ms <= 0:
         raise ValueError("determinism latency gate must be greater than zero")
+    normalized_os, normalized_architecture, normalized_python = _validate_environment(
+        runner_os=runner_os,
+        runner_arch=runner_arch,
+        python_version=python_version,
+    )
     run_root = run_root.expanduser().resolve(strict=False)
     if run_root.exists():
         raise ValueError(f"run root must not already exist: {run_root}")
@@ -367,14 +491,31 @@ def run_determinism(
         repeat_root = run_root / f"repeat-{iteration:02d}"
         repeat_root.mkdir()
         memory_root = repeat_root / "memory"
-        receipt = _base_iteration_receipt(iteration=iteration, seed=seed)
+        receipt = _base_iteration_receipt(
+            backend=backend,
+            iteration=iteration,
+            seed=seed,
+        )
         try:
             imported = invoke(iteration, memory_root, seed)
-            report = _redact_json(imported)
+            imported_report: object = imported
+            if isinstance(imported, IterationInvocation):
+                imported_report = imported.report
+                redacted_diagnostics = _redact_json(imported.diagnostics)
+                if isinstance(redacted_diagnostics, dict):
+                    receipt.update(
+                        {
+                            key: value
+                            for key, value in redacted_diagnostics.items()
+                            if key in _RUNNER_DIAGNOSTIC_FIELDS
+                        }
+                    )
+            report = _redact_json(imported_report)
             if not isinstance(report, dict):
                 raise ValueError("golden runner report is not a JSON object")
             derived_passed = validate_golden_report(
                 report,
+                expected_backend=backend,
                 expected_case_categories=expected_case_categories,
                 expected_seed=seed,
             )
@@ -386,9 +527,29 @@ def run_determinism(
                 }
             )
         except GoldenRunnerError as exc:
-            receipt.update(_redact_json(exc.receipt))
+            redacted_diagnostics = _redact_json(exc.receipt)
+            if isinstance(redacted_diagnostics, dict):
+                receipt.update(
+                    {
+                        key: value
+                        for key, value in redacted_diagnostics.items()
+                        if key in _RUNNER_DIAGNOSTIC_FIELDS
+                    }
+                )
+            if receipt.get("status") not in _RUNNER_FAILURE_STATUSES:
+                receipt["status"] = "runner_error"
+            receipt.update(
+                {
+                    "schema": "kestrel.determinism_iteration_receipt.v1",
+                    "backend": backend,
+                    "repeat": iteration,
+                    "seed": seed,
+                    "derived_passed": False,
+                }
+            )
             receipt["error"] = redact_secrets(f"{type(exc).__name__}: {exc}")
             report = _failure_report(
+                backend=backend,
                 seed=seed,
                 error=str(receipt["error"]),
                 expected_case_categories=expected_case_categories,
@@ -402,6 +563,7 @@ def run_determinism(
                 }
             )
             report = _failure_report(
+                backend=backend,
                 seed=seed,
                 error=str(receipt["error"]),
                 expected_case_categories=expected_case_categories,
@@ -413,9 +575,13 @@ def run_determinism(
             reports,
             required_repeats=repeats,
             seed=seed,
+            backend=backend,
+            source_commit=source_commit,
+            runner_os=normalized_os,
+            runner_arch=normalized_architecture,
+            python_version=normalized_python,
             max_case_latency_ms=max_case_latency_ms,
             expected_case_categories=expected_case_categories,
-            source_commit=source_commit,
             case_timeout_seconds=case_timeout_seconds,
             iteration_timeout_seconds=iteration_timeout_seconds,
         )
@@ -425,6 +591,7 @@ def run_determinism(
 
 def _subprocess_invoker(
     *,
+    backend: GoldenBackend,
     workspace: Path,
     validation_container_image: str | None,
     max_case_latency_ms: float | None,
@@ -439,7 +606,7 @@ def _subprocess_invoker(
             sys.executable,
             str(golden_runner),
             "--backend",
-            "memory",
+            backend,
             "--provider",
             "mock",
             "--model",
@@ -534,13 +701,17 @@ def _subprocess_invoker(
                 "golden runner report is not a JSON object",
                 receipt=receipt,
             )
-        return cast(dict[str, object], _redact_json(payload))
+        return IterationInvocation(
+            report=cast(dict[str, object], _redact_json(payload)),
+            diagnostics=receipt,
+        )
 
     return invoke
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=["memory", "memvid"], required=True)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
@@ -581,13 +752,18 @@ def main() -> int:
         parser.error("--case-timeout-seconds must be greater than 0")
     if args.iteration_timeout_seconds <= args.case_timeout_seconds:
         parser.error("--iteration-timeout-seconds must exceed --case-timeout-seconds")
+    if not isinstance(args.source_commit, str) or not _COMMIT_RE.fullmatch(args.source_commit):
+        parser.error("--source-commit must be a 40-character lowercase hexadecimal SHA")
+    backend = cast(GoldenBackend, args.backend)
     try:
         result = run_determinism(
             repeats=args.repeats,
             seed=args.seed,
+            backend=backend,
             run_root=args.run_root,
             output=args.output,
             invoke=_subprocess_invoker(
+                backend=backend,
                 workspace=args.workspace.resolve(strict=True),
                 validation_container_image=args.validation_container_image,
                 max_case_latency_ms=args.max_case_latency_ms,
@@ -595,6 +771,9 @@ def main() -> int:
                 iteration_timeout_seconds=args.iteration_timeout_seconds,
             ),
             source_commit=args.source_commit,
+            runner_os=platform.system(),
+            runner_arch=platform.machine(),
+            python_version=platform.python_version(),
             max_case_latency_ms=args.max_case_latency_ms,
             case_timeout_seconds=args.case_timeout_seconds,
             iteration_timeout_seconds=args.iteration_timeout_seconds,

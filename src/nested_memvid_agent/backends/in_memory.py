@@ -5,7 +5,7 @@ import math
 import os
 import re
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -194,6 +194,8 @@ class InMemoryBackend(MemoryBackend):
         super().__init__(path, layer, **kwargs)
         self.records: list[MemoryRecord] = []
         self._bm25 = _BM25Index()
+        self._identity_counts: Counter[str] = Counter()
+        self._identity_snapshots: list[frozenset[str]] = []
 
         self._enable_vec = bool(kwargs.get("enable_vec", False))
         self._embedding_model_name = str(kwargs.get("embedding_model", "all-MiniLM-L6-v2"))
@@ -293,10 +295,15 @@ class InMemoryBackend(MemoryBackend):
 
     def _rebuild_indices(self) -> None:
         self._bm25 = _BM25Index()
+        self._identity_counts = Counter()
+        self._identity_snapshots = []
         if self._vector_index is not None:
             self._vector_index = _VectorIndex()
             self._vector_cache = {}
         for record in self.records:
+            identities = _record_identity_values(record)
+            self._identity_snapshots.append(identities)
+            self._identity_counts.update(identities)
             text = self._text_for_record(record)
             tokens = _tokens(text)
             self._bm25.add(record.id, tokens)
@@ -305,18 +312,39 @@ class InMemoryBackend(MemoryBackend):
                 self._vector_index.add(record.id, vec)
                 self._vector_cache[record.id] = vec
 
+    def _remove_record_identities(self, identities: frozenset[str]) -> None:
+        for identity in identities:
+            remaining = self._identity_counts.get(identity, 0) - 1
+            if remaining > 0:
+                self._identity_counts[identity] = remaining
+            else:
+                self._identity_counts.pop(identity, None)
+
     def put(self, record: MemoryRecord) -> str:
         if record.layer != self.layer:
             raise ValueError(f"Cannot write {record.layer} record to {self.layer} backend")
         with self._state_lock:
             self._sync_indices()
             self.records.append(record)
+            identities = _record_identity_values(record)
+            self._identity_snapshots.append(identities)
+            self._identity_counts.update(identities)
             text = self._text_for_record(record)
             tokens = _tokens(text)
             self._bm25.add(record.id, tokens)
             self._maybe_index_vector(record)
             self._mark_mutation(indices_current=True)
         return record.id
+
+    @contextmanager
+    def identity_reservation(self) -> Iterator[None]:
+        with self._state_lock:
+            yield
+
+    def has_any_record_identity(self, record_ids: Collection[str]) -> bool:
+        with self._state_lock:
+            self._sync_indices()
+            return any(self._identity_counts.get(record_id, 0) > 0 for record_id in record_ids)
 
     def upsert(self, record: MemoryRecord) -> str:
         if record.layer != self.layer:
@@ -325,6 +353,7 @@ class InMemoryBackend(MemoryBackend):
             self._sync_indices()
             for index, existing in enumerate(self.records):
                 if existing.id == record.id:
+                    self._remove_record_identities(self._identity_snapshots[index])
                     old_text = self._text_for_record(existing)
                     new_text = self._text_for_record(record)
                     if old_text != new_text:
@@ -336,9 +365,15 @@ class InMemoryBackend(MemoryBackend):
                         self._maybe_index_vector(record)
                     else:
                         self.records[index] = record
+                    identities = _record_identity_values(record)
+                    self._identity_snapshots[index] = identities
+                    self._identity_counts.update(identities)
                     self._mark_mutation(indices_current=True)
                     return record.id
             self.records.append(record)
+            identities = _record_identity_values(record)
+            self._identity_snapshots.append(identities)
+            self._identity_counts.update(identities)
             text = self._text_for_record(record)
             tokens = _tokens(text)
             self._bm25.add(record.id, tokens)
@@ -544,6 +579,12 @@ def _snippet(text: str, query_tokens: set[str], window: int = 220) -> str:
 
 def _is_active(record: MemoryRecord) -> bool:
     return record.metadata.get("active", True) is not False
+
+
+def _record_identity_values(record: MemoryRecord) -> frozenset[str]:
+    frame_value = record.metadata.get("frame_id")
+    frame_id = "" if frame_value is None else str(frame_value)
+    return frozenset({record.id, frame_id} if frame_id else {record.id})
 
 
 def _snapshot_payload(records: Iterable[MemoryRecord]) -> list[dict[str, object]]:

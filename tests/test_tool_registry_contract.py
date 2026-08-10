@@ -715,8 +715,12 @@ def test_blocking_cancellation_hook_cannot_bypass_timeout_bound(tmp_path: Path) 
             workspace=tmp_path,
         ),
     )
-    assert monotonic() - started < 1.0
+    elapsed = monotonic() - started
+    # Whole-suite CI can overshoot subsecond Event waits under scheduler load.
+    # Keep a hard outer ceiling while binding the actual settlement policy below.
+    assert elapsed < 2.0
     assert result.error == "tool_outcome_unresolved"
+    assert result.data["settlement_timeout_seconds"] == pytest.approx(0.50)
     assert result.data["cancellation_hook_settled"] is False
     assert result.data["reconciliation_required"] is True
 

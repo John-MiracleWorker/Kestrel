@@ -1112,6 +1112,7 @@ dev = [
     { name = "mypy" },
     { name = "pygments" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
     { name = "uvicorn" },
 ]
@@ -1188,6 +1189,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "python-multipart", marker = "extra == 'runtime'", specifier = ">=0.0.31" },
     { name = "python-multipart", marker = "extra == 'server'", specifier = ">=0.0.31" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "setuptools", specifier = ">=83.0.0" },
     { name = "starlette", marker = "extra == 'runtime'", specifier = ">=1.3.1" },

@@ -45,6 +45,7 @@ def test_in_memory_backend_contract_round_trips_mutation_and_snapshot(tmp_path: 
     assert first_id == upsert_id == "backend-record"
     assert backend.get_record("backend-record").content.endswith("updated content.")
     assert backend.get_record("backend-frame").id == "backend-record"  # type: ignore[union-attr]
+    assert backend.has_any_record_identity(frozenset({"backend-frame"}))
     assert [record.id for record in backend.iter_records()] == ["backend-record"]
     assert backend.find("sentinel_backend_consistency_40de", k=3)
     assert backend.verify() is True
@@ -52,6 +53,7 @@ def test_in_memory_backend_contract_round_trips_mutation_and_snapshot(tmp_path: 
     backend.tombstone("backend-record", reason="superseded", superseded_by="backend-record-2")
     assert backend.find("sentinel_backend_consistency_40de", include_inactive=False) == []
     assert backend.find("sentinel_backend_consistency_40de", include_inactive=True)
+    assert backend.has_any_record_identity(frozenset({"backend-record", "backend-frame"}))
     assert list(backend.iter_records()) == []
     assert [record.id for record in backend.iter_records(include_inactive=True)] == ["backend-record"]
     backend.seal()
@@ -67,6 +69,7 @@ def test_in_memory_backend_contract_round_trips_mutation_and_snapshot(tmp_path: 
         assert inactive.metadata["active"] is False
         assert inactive.metadata["tombstone_reason"] == "superseded"
         assert reopened.get_record("backend-record", include_inactive=False) is None
+        assert reopened.has_any_record_identity(frozenset({"backend-record", "backend-frame"}))
     finally:
         reopened.close()
 
@@ -174,7 +177,7 @@ def test_same_path_backends_share_search_state_and_concurrent_seals(
     written = Barrier(2)
     sealing = Barrier(2)
     errors: list[BaseException] = []
-    observed: dict[str, tuple[bool, bool]] = {}
+    observed: dict[str, tuple[bool, bool, bool, bool]] = {}
 
     def worker(backend: InMemoryBackend, record_id: str, token: str) -> None:
         try:
@@ -188,12 +191,15 @@ def test_same_path_backends_share_search_state_and_concurrent_seals(
                     layer=MemoryLayer.SEMANTIC,
                     kind=MemoryKind.FACT,
                     confidence=0.9,
+                    metadata={"frame_id": f"frame-{record_id}"},
                 )
             )
             written.wait(timeout=5)
             observed[record_id] = (
                 bool(backend.find("aardvark", k=4)),
                 bool(backend.find("platypus", k=4)),
+                backend.has_any_record_identity(frozenset({"frame-fact-a"})),
+                backend.has_any_record_identity(frozenset({"frame-fact-b"})),
             )
             sealing.wait(timeout=5)
             backend.seal()
@@ -211,7 +217,10 @@ def test_same_path_backends_share_search_state_and_concurrent_seals(
 
     assert all(not thread.is_alive() for thread in threads)
     assert errors == []
-    assert observed == {"fact-a": (True, True), "fact-b": (True, True)}
+    assert observed == {
+        "fact-a": (True, True, True, True),
+        "fact-b": (True, True, True, True),
+    }
 
     InMemoryBackend._global_records.pop(str(path), None)
     reopened = InMemoryBackend(path=path, layer=MemoryLayer.SEMANTIC)

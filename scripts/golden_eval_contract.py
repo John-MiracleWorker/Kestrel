@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 GOLDEN_REPORT_SCHEMA = "kestrel.golden_eval_report.v2"
+GoldenBackend = Literal["memory", "memvid"]
 GOLDEN_CASE_CATEGORIES: Mapping[str, str] = MappingProxyType(
     {
         "remember_correction_across_sessions": "memory_precision_recall",
@@ -31,6 +32,15 @@ GOLDEN_CASE_CATEGORIES: Mapping[str, str] = MappingProxyType(
         "approval_requires_exact_call": "approval_correctness",
         "durable_plan_completion": "plan_completion_rate",
         "repo_regression_guard": "repo_regression",
+    }
+)
+GOLDEN_RETRIEVAL_MINIMA: Mapping[str, tuple[int, int]] = MappingProxyType(
+    {
+        "remember_correction_across_sessions": (1, 0),
+        "retrieve_prior_failure": (1, 1),
+        "use_procedural_recipe_after_repeats": (1, 0),
+        "compile_context_under_budget": (1, 1),
+        "summary_first_expand_raw_on_demand": (1, 1),
     }
 )
 
@@ -120,6 +130,7 @@ def _require_exact_fields(
 def validate_golden_report(
     report: dict[str, object],
     *,
+    expected_backend: GoldenBackend,
     expected_case_categories: Mapping[str, str] = GOLDEN_CASE_CATEGORIES,
     expected_seed: int | None = None,
 ) -> bool:
@@ -134,8 +145,10 @@ def validate_golden_report(
         _CONFIGURATION_FIELDS,
         label="golden report configuration",
     )
-    if configuration["backend"] != "memory":
-        raise ValueError("determinism golden report backend must be 'memory'")
+    if expected_backend not in {"memory", "memvid"}:
+        raise ValueError("expected golden report backend is invalid")
+    if configuration["backend"] != expected_backend:
+        raise ValueError("golden report backend mismatch")
     if configuration["provider"] != "mock" or configuration["model"] != "mock":
         raise ValueError("determinism golden report must use the mock provider and model")
     seed = configuration["seed"]
@@ -181,6 +194,16 @@ def validate_golden_report(
         for key in ("memory_hits", "context_chars", "tool_count"):
             if not isinstance(raw[key], int) or isinstance(raw[key], bool) or int(raw[key]) < 0:
                 raise ValueError(f"golden report {key} must be non-negative for {name!r}")
+        retrieval_minimum = GOLDEN_RETRIEVAL_MINIMA.get(name)
+        if raw["passed"] is True and retrieval_minimum is not None:
+            minimum_hits, minimum_context = retrieval_minimum
+            if (
+                int(raw["memory_hits"]) < minimum_hits
+                or int(raw["context_chars"]) < minimum_context
+            ):
+                raise ValueError(
+                    f"golden report retrieval evidence is incomplete for {name!r}"
+                )
         cost = raw["cost_estimate_usd"]
         if cost is not None and (not _is_number(cost) or float(cost) < 0):
             raise ValueError(f"golden report cost must be null or non-negative for {name!r}")

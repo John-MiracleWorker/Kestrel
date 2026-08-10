@@ -1837,22 +1837,44 @@ def test_unsupported_platform_birth_marker_fails_closed_without_proc(
     assert exc_info.value.code == "process_inspection_failed"
 
 
-def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None:
+def test_service_controller_real_process_lifecycle_smoke(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
     if os.name == "nt" or shutil.which("lsof") is None:
         pytest.skip("requires POSIX process inspection with lsof")
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
+    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    request.addfinalizer(reservation.close)
+    reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    reservation.bind(("127.0.0.1", 0))
+    port = reservation.getsockname()[1]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as competitor:
+        with pytest.raises(OSError):
+            competitor.bind(("127.0.0.1", port))
+
+    class ReservationAwareInspector(SystemProcessInspector):
+        def port_is_bindable(self, host: str, candidate_port: int) -> bool:
+            if (
+                reservation.fileno() >= 0
+                and host == "127.0.0.1"
+                and candidate_port == port
+            ):
+                return True
+            return super().port_is_bindable(host, candidate_port)
+
     paths = resolve_service_paths(_installation(tmp_path / "home"), port=port)
     paths.server_executable.write_text(
         "#!/usr/bin/env python3\n"
         "import signal, socket, sys\n"
+        "print('fixture: argv accepted', file=sys.stderr, flush=True)\n"
         "host = sys.argv[sys.argv.index('--host') + 1]\n"
         "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
         "listener = socket.socket()\n"
         "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)\n"
         "listener.bind((host, port))\n"
         "listener.listen()\n"
+        "print(f'fixture: listening on {host}:{port}', file=sys.stderr, flush=True)\n"
         "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
         "while True:\n"
         "    connection, _address = listener.accept()\n"
@@ -1860,33 +1882,44 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         encoding="utf-8",
     )
     paths.server_executable.chmod(0o755)
-    paths.supervisor_script.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -eu\n"
-        "umask 077\n"
-        "pid_file=$2; supervisor_file=$4; group_file=$6; log_file=$8\n"
-        "shift 8; shift\n"
-        "\"$@\" >>\"$log_file\" 2>&1 &\n"
-        "child=$!\n"
-        "while ! lsof -a -p \"$child\" -d cwd -Fn 2>/dev/null "
-        "| grep -q '^n'; do\n"
-        "  kill -0 \"$child\" 2>/dev/null || exit 1\n"
-        "  sleep 0.01\n"
-        "done\n"
-        "printf '%s\\n' \"$child\" >\"$pid_file\"\n"
-        "printf '%s\\n' \"$$\" >\"$supervisor_file\"\n"
-        "printf '%s\\n' \"$$\" >\"$group_file\"\n"
-        "wait \"$child\"\n",
-        encoding="utf-8",
+    shutil.copyfile(
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "installer-server-supervisor.sh",
+        paths.supervisor_script,
     )
     paths.supervisor_script.chmod(0o755)
 
     controller = ServiceController(
         paths,
         client=FakeClient(ServerProbe(True, True, False)),
+        inspector=ReservationAwareInspector(),
     )
+
+    def diagnostic_text(path: Path, *, encoding: str) -> str:
+        try:
+            return path.read_text(encoding=encoding, errors="replace")
+        except OSError as read_error:
+            return f"<unavailable: {type(read_error).__name__}: {read_error}>"
+
     try:
-        started = controller.start(poll_interval=0.05)
+        try:
+            started = controller.start(poll_interval=0.05)
+        except ServiceControlError as exc:
+            lifecycle_log = diagnostic_text(paths.log_path, encoding="utf-8")
+            metadata = {
+                "pid": diagnostic_text(paths.pid_path, encoding="ascii"),
+                "supervisor_pid": diagnostic_text(
+                    paths.supervisor_pid_path,
+                    encoding="ascii",
+                ),
+                "pgid": diagnostic_text(paths.pgid_path, encoding="ascii"),
+            }
+            raise AssertionError(
+                f"service fixture failed: {exc}; log={lifecycle_log!r}; "
+                f"metadata={metadata!r}"
+            ) from exc
+        reservation.close()
         assert started.state == ServiceState.RUNNING
         assert started.management == ServiceManagement.MANAGED
         assert paths.pid_path.exists()
@@ -1899,28 +1932,40 @@ def test_service_controller_real_process_lifecycle_smoke(tmp_path: Path) -> None
         assert not paths.pgid_path.exists()
         assert SystemProcessInspector().listeners(paths.host, paths.port) == ()
     finally:
+        reservation.close()
         try:
             controller.stop(grace_timeout=1, kill_timeout=1, poll_interval=0.05)
         except ServiceControlError:
             pass
-        if paths.pgid_path.exists():
+        try:
             pgid_text = paths.pgid_path.read_text(encoding="ascii").strip()
-            if pgid_text.isdigit():
-                try:
-                    group_leader = SystemProcessInspector().process(int(pgid_text))
-                except ServiceControlError:
-                    group_leader = None
-                if (
-                    group_leader is not None
-                    and group_leader.cwd == paths.home
-                    and str(paths.supervisor_script) in group_leader.command
-                ):
-                    os.killpg(int(pgid_text), signal.SIGKILL)
-                    deadline = time.monotonic() + 2
-                    while time.monotonic() < deadline and SystemProcessInspector().process(
-                        group_leader.pid
-                    ) is not None:
-                        time.sleep(0.05)
+        except OSError:
+            pgid_text = ""
+        if pgid_text.isdigit():
+            pgid = int(pgid_text)
+            try:
+                group_leader = SystemProcessInspector().process(pgid)
+            except ServiceControlError:
+                group_leader = None
+            if (
+                group_leader is not None
+                and group_leader.pgid == pgid
+                and service_control._server_identity_matches(
+                    group_leader,
+                    paths,
+                    managed=True,
+                )
+            ):
+                os.killpg(pgid, signal.SIGKILL)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        live_group_leader = SystemProcessInspector().process(group_leader.pid)
+                    except ServiceControlError:
+                        break
+                    if live_group_leader is None:
+                        break
+                    time.sleep(0.05)
 
 
 @pytest.mark.skipif(
