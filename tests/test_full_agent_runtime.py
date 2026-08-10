@@ -2673,6 +2673,40 @@ def test_client_status_wait_uses_public_run_timeout(
     assert _ASYNC_TEST_TIMEOUT_SECONDS < clock < _PUBLIC_RUN_TIMEOUT_SECONDS
 
 
+def test_client_status_wait_rejects_terminal_response_after_public_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 0.0
+    late_terminal = {"run_id": "run_late", "status": "completed"}
+
+    class LateTerminalRunClient:
+        def get(self, path: str) -> Any:
+            nonlocal clock
+            assert path == "/api/runs/run_late"
+            clock = _PUBLIC_RUN_TIMEOUT_SECONDS + 0.05
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: late_terminal,
+            )
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "monotonic", lambda: clock)
+
+    with pytest.raises(AssertionError) as caught:
+        _wait_for_client_status(LateTerminalRunClient(), "run_late", {"completed"})
+
+    assert caught.value.args == (
+        {
+            "run_id": "run_late",
+            "expected_statuses": ["completed"],
+            "phase": "api_run_completion",
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": 1,
+            "public_run": late_terminal,
+        },
+    )
+
+
 @pytest.mark.parametrize(
     ("pending", "expected_phase"),
     [
@@ -2723,7 +2757,7 @@ def test_client_status_wait_reports_last_public_run(
             "expected_statuses": ["completed", "failed"],
             "phase": expected_phase,
             "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
-            "poll_count": 2,
+            "poll_count": 1,
             "public_run": pending,
         },
     )
@@ -8129,31 +8163,31 @@ def _wait_for_client_status(client: Any, run_id: str, statuses: set[str]) -> dic
     deadline = monotonic() + _PUBLIC_RUN_TIMEOUT_SECONDS
     last_run: dict[str, object] | None = None
     poll_count = 0
-    while True:
+    while monotonic() < deadline:
         response = client.get(f"/api/runs/{run_id}")
         response.raise_for_status()
         last_run = dict(response.json())
         poll_count += 1
-        if str(last_run["status"]) in statuses:
-            return last_run
         remaining = deadline - monotonic()
         if remaining <= 0:
-            publication_pending = bool(last_run.get("publication_pending")) or (
-                last_run.get("stop_reason") == "publication_pending"
-            )
-            raise AssertionError(
-                {
-                    "run_id": run_id,
-                    "expected_statuses": sorted(statuses),
-                    "phase": (
-                        "api_publication" if publication_pending else "api_run_completion"
-                    ),
-                    "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
-                    "poll_count": poll_count,
-                    "public_run": last_run,
-                }
-            )
+            break
+        if str(last_run["status"]) in statuses:
+            return last_run
         sleep(min(0.05, remaining))
+    publication_pending = last_run is not None and (
+        bool(last_run.get("publication_pending"))
+        or last_run.get("stop_reason") == "publication_pending"
+    )
+    raise AssertionError(
+        {
+            "run_id": run_id,
+            "expected_statuses": sorted(statuses),
+            "phase": "api_publication" if publication_pending else "api_run_completion",
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": poll_count,
+            "public_run": last_run,
+        }
+    )
 
 
 def _wait_for_subagent(
