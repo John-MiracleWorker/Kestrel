@@ -320,6 +320,65 @@ def test_golden_determinism_matrix_runs_twenty_memory_and_memvid_repeats() -> No
     assert "run_determinism_evals.py" not in flock_runs
 
 
+def test_determinism_jobs_install_hash_locked_dependency_closures() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "determinism.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    expected_commands = {
+        "everyday-golden-determinism": [
+            "python -m pip install --require-hashes --only-binary=:all: "
+            "-r config/python-build-bootstrap.txt",
+            "uv export --frozen --no-dev --no-emit-local --extra dev --extra memvid "
+            '--format requirements.txt --output-file "${RUNNER_TEMP}/requirements-determinism.txt"',
+            "python -m pip install --require-hashes --only-binary=:all: "
+            '-r "${RUNNER_TEMP}/requirements-determinism.txt"',
+            "python -m pip install --no-build-isolation --no-deps -e '.[dev,memvid]'",
+            "python -m pip check",
+        ],
+        "flock-qualification-determinism": [
+            "python -m pip install --require-hashes --only-binary=:all: "
+            "-r config/python-build-bootstrap.txt",
+            "uv export --frozen --no-dev --no-emit-local --extra dev "
+            '--format requirements.txt --output-file "${RUNNER_TEMP}/requirements-flock-determinism.txt"',
+            "python -m pip install --require-hashes --only-binary=:all: "
+            '-r "${RUNNER_TEMP}/requirements-flock-determinism.txt"',
+            "python -m pip install --no-build-isolation --no-deps -e '.[dev]'",
+            "python -m pip check",
+        ],
+    }
+
+    for job_name, commands in expected_commands.items():
+        steps = workflow["jobs"][job_name]["steps"]
+        setup_uv = next(
+            step for step in steps if step.get("name") == "Install pinned uv"
+        )
+        assert setup_uv == {
+            "name": "Install pinned uv",
+            "uses": "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b",
+            "with": {"version": "0.11.16"},
+        }
+        install = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Install deterministic evaluation dependencies"
+        )
+        logical_commands: list[str] = []
+        continued = ""
+        for line in install.splitlines():
+            stripped = line.strip()
+            continued = f"{continued} {stripped}".strip()
+            if continued.endswith("\\"):
+                continued = continued[:-1].rstrip()
+                continue
+            logical_commands.append(continued)
+            continued = ""
+
+        assert not continued
+        assert logical_commands == commands
+
+
 def test_release_rehearsal_lane_is_repeatable_and_has_no_publication_authority() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release-rehearsal.yml").read_text(
         encoding="utf-8"
