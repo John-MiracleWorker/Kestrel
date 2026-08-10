@@ -168,6 +168,7 @@ jobs:
             -D "$determinism_receipt_dir"
           DETERMINISM_REPORT="${determinism_receipt_dir}/kestrel-determinism-report.json" \
             python - <<'PY'
+          import hashlib
           import json
           import os
           import re
@@ -244,16 +245,6 @@ jobs:
               is None
           ):
               raise SystemExit("determinism receipt environment is not release-qualified")
-          if (
-              summary.get("completed_repeats") != 20
-              or summary.get("required_repeats") != 20
-              or summary.get("all_runs_passed") is not True
-              or summary.get("unique_outcome_signatures") != 1
-              or summary.get("determinism_streak") != 20
-              or summary.get("observed_flake_count") != 0
-              or summary.get("observed_flake_rate") != 0.0
-          ):
-              raise SystemExit("determinism receipt does not prove a 20-run stable streak")
           digest_re = re.compile(r"^[0-9a-f]{64}$")
           if (
               report.get("passed") is not True
@@ -286,6 +277,42 @@ jobs:
               for run in runs
           ):
               raise SystemExit("determinism receipt golden report digest is invalid")
+          outcome_signatures = [run["outcome_signature"] for run in runs]
+          distinct_signatures = set(outcome_signatures)
+          first_signature = outcome_signatures[0]
+          derived_streak = 0
+          for signature in outcome_signatures:
+              if signature != first_signature:
+                  break
+              derived_streak += 1
+          modal_count = max(
+              outcome_signatures.count(signature) for signature in distinct_signatures
+          )
+          derived_flake_count = len(outcome_signatures) - modal_count
+          derived_summary = {
+              "completed_repeats": len(runs),
+              "required_repeats": configuration["required_repeats"],
+              "all_runs_passed": all(run["passed"] is True for run in runs),
+              "unique_outcome_signatures": len(distinct_signatures),
+              "determinism_streak": derived_streak,
+              "observed_flake_count": derived_flake_count,
+              "observed_flake_rate": round(derived_flake_count / len(runs), 6),
+          }
+          if len(distinct_signatures) != 1:
+              raise SystemExit("determinism receipt has multiple outcome signatures")
+          reference_projection = report["reference_projection"]
+          reference_signature = hashlib.sha256(
+              json.dumps(
+                  reference_projection,
+                  sort_keys=True,
+                  separators=(",", ":"),
+                  ensure_ascii=True,
+              ).encode()
+          ).hexdigest()
+          if outcome_signatures[0] != reference_signature:
+              raise SystemExit("determinism receipt reference projection digest does not match runs")
+          if summary != derived_summary:
+              raise SystemExit("determinism receipt derived summary does not match runs")
           print(f"verified exact-SHA determinism receipt from run {os.environ['DETERMINISM_RUN_ID']}")
           PY
 

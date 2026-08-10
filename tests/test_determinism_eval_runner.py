@@ -15,6 +15,7 @@ from nested_memvid_agent.security_boundary import REDACTED
 from scripts.bounded_process import run_bounded_process
 from scripts.golden_eval_contract import validate_golden_report
 from scripts.run_determinism_evals import (
+    GoldenRunnerError,
     _deterministic_projection,
     _excerpt,
     _subprocess_invoker,
@@ -335,6 +336,55 @@ def test_memvid_runner_failure_writes_a_backend_bound_failed_receipt(
         run["golden_report_sha256"]
         for run in report["runs"]
     )
+
+
+def test_runner_diagnostics_cannot_overwrite_iteration_receipt_identity(
+    tmp_path: Path,
+) -> None:
+    def forge(_iteration: int, _memory: Path, _seed: int) -> dict[str, object]:
+        raise GoldenRunnerError(
+            "forged runner failure",
+            receipt={
+                "schema": "attacker.receipt.v9",
+                "backend": "memory",
+                "repeat": 999,
+                "seed": 7,
+                "derived_passed": True,
+                "status": "runner_nonzero",
+                "runner_exit_code": 9,
+                "stderr": "useful runner diagnostic",
+            },
+        )
+
+    run_root = tmp_path / "runs"
+    report = run_determinism(
+        repeats=2,
+        seed=1729,
+        backend="memvid",
+        run_root=run_root,
+        output=tmp_path / "report.json",
+        invoke=forge,
+        source_commit=SOURCE_COMMIT,
+        runner_os=RUNNER_OS,
+        runner_arch=RUNNER_ARCH,
+        python_version=PYTHON_VERSION,
+        expected_case_categories=TEST_CASES,
+    )
+
+    assert report["passed"] is False
+    for expected_repeat, receipt_path in enumerate(
+        sorted(run_root.glob("repeat-*/iteration-receipt.json")),
+        start=1,
+    ):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["schema"] == "kestrel.determinism_iteration_receipt.v1"
+        assert receipt["backend"] == "memvid"
+        assert receipt["repeat"] == expected_repeat
+        assert receipt["seed"] == 1729
+        assert receipt["derived_passed"] is False
+        assert receipt["status"] == "runner_nonzero"
+        assert receipt["runner_exit_code"] == 9
+        assert receipt["stderr"] == "useful runner diagnostic"
 
 
 def test_cli_rejects_a_missing_source_commit_without_a_traceback(tmp_path: Path) -> None:

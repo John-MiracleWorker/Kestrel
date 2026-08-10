@@ -38,6 +38,28 @@ _VOLATILE_CASE_KEYS = frozenset({"latency_ms"})
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 IterationRunner = Callable[[int, Path, int], dict[str, object]]
+_RUNNER_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "status",
+        "runner_exit_code",
+        "elapsed_seconds",
+        "deadline",
+        "cleanup",
+        "capture",
+        "stdout",
+        "stderr",
+    }
+)
+_RUNNER_FAILURE_STATUSES = frozenset(
+    {
+        "timed_out",
+        "cleanup_unverified",
+        "runner_nonzero",
+        "missing_report",
+        "invalid_json",
+        "runner_error",
+    }
+)
 
 
 class GoldenRunnerError(RuntimeError):
@@ -481,7 +503,26 @@ def run_determinism(
                 }
             )
         except GoldenRunnerError as exc:
-            receipt.update(_redact_json(exc.receipt))
+            redacted_diagnostics = _redact_json(exc.receipt)
+            if isinstance(redacted_diagnostics, dict):
+                receipt.update(
+                    {
+                        key: value
+                        for key, value in redacted_diagnostics.items()
+                        if key in _RUNNER_DIAGNOSTIC_FIELDS
+                    }
+                )
+            if receipt.get("status") not in _RUNNER_FAILURE_STATUSES:
+                receipt["status"] = "runner_error"
+            receipt.update(
+                {
+                    "schema": "kestrel.determinism_iteration_receipt.v1",
+                    "backend": backend,
+                    "repeat": iteration,
+                    "seed": seed,
+                    "derived_passed": False,
+                }
+            )
             receipt["error"] = redact_secrets(f"{type(exc).__name__}: {exc}")
             report = _failure_report(
                 backend=backend,

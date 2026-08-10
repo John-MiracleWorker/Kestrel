@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -56,6 +57,15 @@ def _determinism_v3_receipt(
     golden_report_sha256: str = "b" * 64,
 ) -> dict[str, object]:
     commit = "a" * 40
+    reference_projection: dict[str, object] = {}
+    outcome_signature = hashlib.sha256(
+        json.dumps(
+            reference_projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+    ).hexdigest()
     return {
         "schema": "kestrel.determinism_eval_report.v3",
         "subject": {"source_commit": commit},
@@ -85,12 +95,12 @@ def _determinism_v3_receipt(
             "observed_flake_rate": 0.0,
         },
         "differing_cases": [],
-        "reference_projection": {},
+        "reference_projection": reference_projection,
         "runs": [
             {
                 "repeat": repeat,
                 "passed": True,
-                "outcome_signature": "c" * 64,
+                "outcome_signature": outcome_signature,
                 "golden_report_sha256": golden_report_sha256,
                 "failed_cases": [],
             }
@@ -109,7 +119,7 @@ def _run_determinism_receipt_gate(
     )
     gate = workflow.index("Require successful exact-SHA determinism receipt before build")
     receipt_validation = workflow.index("DETERMINISM_REPORT=", gate)
-    script_start = workflow.index("          import json", receipt_validation)
+    script_start = workflow.index("          import hashlib", receipt_validation)
     script_end = workflow.index("\n          PY", script_start)
     script = textwrap.dedent(workflow[script_start:script_end])
     report_path = tmp_path / "determinism-report.json"
@@ -253,7 +263,7 @@ def test_production_release_requires_exact_sha_reliability_receipts_before_build
     assert 'subject.get("source_commit") != expected_sha' in workflow
     assert 'configuration.get("backend") != "memory"' in workflow
     assert 'configuration.get("max_case_latency_ms") != 45000.0' in workflow
-    assert 'summary.get("completed_repeats") != 20' in workflow
+    assert "if summary != derived_summary" in workflow
 
 
 def test_release_gate_accepts_only_exact_sha_memory_v3_lane_receipt(
@@ -274,6 +284,41 @@ def test_release_gate_accepts_only_exact_sha_memory_v3_lane_receipt(
     assert "memory backend" in substituted.stderr
     assert malformed_digest.returncode != 0
     assert "golden report digest" in malformed_digest.stderr
+
+
+def test_release_gate_derives_one_distinct_outcome_signature(tmp_path: Path) -> None:
+    receipt = _determinism_v3_receipt()
+    runs = receipt["runs"]
+    assert isinstance(runs, list)
+    assert isinstance(runs[-1], dict)
+    runs[-1]["outcome_signature"] = "d" * 64
+
+    completed = _run_determinism_receipt_gate(tmp_path, receipt)
+
+    assert completed.returncode != 0
+    assert "multiple outcome signatures" in completed.stderr
+
+
+def test_release_gate_derives_reference_projection_signature(tmp_path: Path) -> None:
+    receipt = _determinism_v3_receipt()
+    receipt["reference_projection"] = {"substituted": True}
+
+    completed = _run_determinism_receipt_gate(tmp_path, receipt)
+
+    assert completed.returncode != 0
+    assert "reference projection digest" in completed.stderr
+
+
+def test_release_gate_rejects_forged_derived_summary(tmp_path: Path) -> None:
+    receipt = _determinism_v3_receipt()
+    summary = receipt["summary"]
+    assert isinstance(summary, dict)
+    summary["determinism_streak"] = 19
+
+    completed = _run_determinism_receipt_gate(tmp_path, receipt)
+
+    assert completed.returncode != 0
+    assert "derived summary" in completed.stderr
 
 
 def test_release_order_gate_accepts_only_a_rehearsal_completed_before_tag_workflow() -> None:
