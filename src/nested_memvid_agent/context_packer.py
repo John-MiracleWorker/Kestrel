@@ -380,8 +380,17 @@ def _should_expand_raw(
 
 def _needs_exact_evidence(objective: str, query: str) -> bool:
     text = f"{objective} {query}".lower()
-    markers = ("exact", "quote", "code", "diff", "stack trace", "error", "evidence", "line ")
-    return any(marker in text for marker in markers)
+    markers = (
+        r"\bexact\b",
+        r"\bquote\b",
+        r"\bcode\b",
+        r"\bdiff\b",
+        r"\bstack\s+trace\b",
+        r"\berror\b",
+        r"\bevidence\b",
+        r"\bline(?:s|-level)?\b",
+    )
+    return any(re.search(marker, text) for marker in markers)
 
 
 def _selection_reason(frame: MV2ContextFrame, expanded: bool) -> str:

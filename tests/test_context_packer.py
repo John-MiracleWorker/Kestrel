@@ -219,6 +219,33 @@ def test_packer_expands_raw_only_when_requested(tmp_path: Path) -> None:
     assert "Beta raw" in [item.frame.title for item in expanded.items]
 
 
+def test_packer_does_not_infer_exact_evidence_intent_from_identifier_fragments(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(tmp_path)
+    marker = "sentinel_exact_evidence_45aa"
+    _put(
+        memory,
+        "Identifier summary",
+        f"{marker} compact summary.",
+        MemoryLayer.EPISODIC,
+        frame_type="task_summary",
+    )
+    _put(
+        memory,
+        "Identifier raw",
+        f"{marker} raw details.",
+        MemoryLayer.EPISODIC,
+        frame_type="raw_chunk",
+    )
+
+    packed = ContextPacker(memory).pack(
+        ContextPackRequest(objective=marker, query=marker)
+    )
+
+    assert "Identifier raw" not in [item.frame.title for item in packed.items]
+
+
 def test_packer_expands_child_raw_frame_from_summary_link(tmp_path: Path) -> None:
     memory = _memory(tmp_path)
     _put(
