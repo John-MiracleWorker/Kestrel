@@ -13,7 +13,11 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _run_rehearsal_order_gate(*, rehearsal_updated_at: str) -> subprocess.CompletedProcess[str]:
+def _run_rehearsal_order_gate(
+    *,
+    rehearsal_updated_at: str,
+    rehearsal_overrides: dict[str, object] | None = None,
+) -> subprocess.CompletedProcess[str]:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     gate = workflow.index("Require successful exact-SHA release rehearsal before build")
     script_start = workflow.index("          from datetime import datetime", gate)
@@ -21,24 +25,20 @@ def _run_rehearsal_order_gate(*, rehearsal_updated_at: str) -> subprocess.Comple
     script = textwrap.dedent(workflow[script_start:script_end])
     commit = "a" * 40
     environment = os.environ.copy()
+    rehearsal = {
+        "head_sha": commit,
+        "head_branch": "main",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+        "updated_at": rehearsal_updated_at,
+    }
+    rehearsal.update(rehearsal_overrides or {})
     environment.update(
         {
             "RELEASE_COMMIT_SHA": commit,
             "RELEASE_RUN_JSON": json.dumps({"created_at": "2026-07-28T12:00:00Z"}),
-            "REHEARSAL_RUNS_JSON": json.dumps(
-                {
-                    "workflow_runs": [
-                        {
-                            "head_sha": commit,
-                            "head_branch": "main",
-                            "event": "push",
-                            "status": "completed",
-                            "conclusion": "success",
-                            "updated_at": rehearsal_updated_at,
-                        }
-                    ]
-                }
-            ),
+            "REHEARSAL_RUNS_JSON": json.dumps({"workflow_runs": [rehearsal]}),
         }
     )
     return subprocess.run(  # noqa: S603
@@ -207,7 +207,7 @@ def test_golden_determinism_matrix_runs_twenty_memory_and_memvid_repeats() -> No
     assert "run_determinism_evals.py" not in flock_runs
 
 
-def test_release_rehearsal_lane_has_no_production_publication_authority() -> None:
+def test_release_rehearsal_lane_is_repeatable_and_has_no_publication_authority() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release-rehearsal.yml").read_text(
         encoding="utf-8"
     )
@@ -215,9 +215,8 @@ def test_release_rehearsal_lane_has_no_production_publication_authority() -> Non
     assert "push:\n    branches: [main]" in workflow
     assert "permissions:\n  contents: read" in workflow
     assert "scripts/run_release_rehearsal.py" in workflow
-    assert "Require rehearsal before production tag creation" in workflow
-    assert 'refs/tags/v${VERSION}' in workflow
-    assert "production tag already exists; rehearsal must precede tag creation" in workflow
+    assert "git ls-remote --tags" not in workflow
+    assert "production tag already exists" not in workflow
     assert (
         "kestrel-rehearsal-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
         in workflow
@@ -328,3 +327,22 @@ def test_release_order_gate_accepts_only_a_rehearsal_completed_before_tag_workfl
     assert before.returncode == 0, before.stderr
     assert after.returncode != 0
     assert "completed before the release workflow was created" in after.stderr
+
+
+def test_release_order_gate_rejects_nonqualifying_rehearsal_metadata() -> None:
+    invalid_fields = (
+        ("head_sha", "b" * 40),
+        ("head_branch", "feature"),
+        ("event", "workflow_dispatch"),
+        ("status", "in_progress"),
+        ("conclusion", "failure"),
+        ("updated_at", "2026-07-28T12:00:00Z"),
+    )
+
+    for field, value in invalid_fields:
+        completed = _run_rehearsal_order_gate(
+            rehearsal_updated_at="2026-07-28T11:59:59Z",
+            rehearsal_overrides={field: value},
+        )
+
+        assert completed.returncode != 0, field
