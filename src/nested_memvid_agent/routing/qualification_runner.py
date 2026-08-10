@@ -63,6 +63,7 @@ from .qualification_records import (
     QualificationAttempt,
     QualificationAttemptDraft,
     QualificationCase,
+    QualificationRevisionConflict,
     QualificationRun,
     QualificationRunDraft,
 )
@@ -288,13 +289,21 @@ class QualificationRunner:
         run = self._require_run(run_id)
         if run.is_terminal:
             return self.get(run_id)
-        if run.status == "running":
+        while run.status == "running":
             try:
-                self._ledger.request_pause(run_id, expected_revision=run.revision)
-            except ValueError:
-                # Raced with terminalization; the final view is authoritative.
-                return self.get(run_id)
-        elif run.status not in ("pausing", "paused"):
+                run = self._ledger.request_pause(
+                    run_id,
+                    expected_revision=run.revision,
+                )
+            except QualificationRevisionConflict:
+                # A completion or monotonic cap update won this CAS. Reload:
+                # terminal completion is authoritative, while a still-running
+                # revision must receive the pause request rather than leak the
+                # internal conflict to the lifecycle caller.
+                run = self._require_run(run_id)
+                if run.is_terminal:
+                    return self.get(run_id)
+        if run.status not in ("pausing", "paused"):
             raise ValueError(
                 f"qualification run must be running to pause; current status is {run.status}"
             )
@@ -566,8 +575,9 @@ class QualificationRunner:
                     if inflight:
                         self._wait_for_any(inflight)
                         continue
-                    self._complete_run(run)
-                    return
+                    if self._complete_run(run):
+                        return
+                    continue
                 if len(inflight) >= max_inflight:
                     self._wait_for_any(inflight)
                     continue
@@ -719,10 +729,12 @@ class QualificationRunner:
 
     # -- terminalization -----------------------------------------------------------
 
-    def _complete_run(self, run: QualificationRun) -> None:
+    def _complete_run(self, run: QualificationRun) -> bool:
         fresh = self._require_run(run.run_id)
         if fresh.is_terminal:
-            return
+            return True
+        if fresh.status != "running":
+            return False
         actual_spend = self._conservative_spend(fresh)
         try:
             receipt = self._completion_receipt(fresh)
@@ -734,12 +746,18 @@ class QualificationRunner:
                 actual_spend=actual_spend,
                 receipt_payload=receipt,
             )
+        except QualificationRevisionConflict:
+            # A durable pause or cap reduction won the terminalization CAS.
+            # Reload in the drive loop so pausing can settle as paused and a
+            # still-running revision can rebuild its exact terminal receipt.
+            return False
         except Exception:  # noqa: BLE001 - never invent an unsigned qualifying receipt
             self._fail_run(
                 run.run_id,
                 terminal_reason=RECEIPT_FINALIZATION_FAILURE,
                 receipt={"qualifying": False, "reason": RECEIPT_FINALIZATION_FAILURE},
             )
+        return True
 
     def _completion_receipt(self, run: QualificationRun) -> Mapping[str, Any]:
         """Evaluate, replay twenty times, and build the terminal receipt.
