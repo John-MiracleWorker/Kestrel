@@ -6,6 +6,7 @@ import {
   lstat,
   mkdtemp,
   mkdir,
+  open,
   readFile,
   realpath,
   rename,
@@ -35,6 +36,29 @@ async function sha256File(path: string): Promise<string> {
 }
 
 const TINY_EXECUTABLE = "#!/bin/sh\nexit 0\n";
+
+async function withAsyncCleanup<T>(
+  operation: () => Promise<T>,
+  cleanup: () => Promise<void>,
+  combinedFailureMessage: string
+): Promise<T> {
+  let result: T;
+  try {
+    result = await operation();
+  } catch (operationError) {
+    try {
+      await cleanup();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [operationError, cleanupError],
+        combinedFailureMessage
+      );
+    }
+    throw operationError;
+  }
+  await cleanup();
+  return result;
+}
 
 describe("developer-runtime executable launch", () => {
   let root: string;
@@ -111,23 +135,35 @@ describe("developer-runtime executable launch", () => {
           }
         }
       );
-      await rename(executable, `${executable}.captured`);
-      await writeFile(executable, TINY_EXECUTABLE, { mode: 0o700 });  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
-      await chmod(executable, 0o700);
+      await withAsyncCleanup(
+        async () => {
+          await rename(executable, `${executable}.captured`);
+          const replacement = await open(executable, "wx", 0o700);
+          await withAsyncCleanup(
+            async () => {
+              await replacement.writeFile(TINY_EXECUTABLE);
+              await replacement.chmod(0o700);
+            },
+            () => replacement.close(),
+            "developer executable replacement and handle cleanup both failed"
+          );
 
-      expect(() =>
-        capability.spawn({
-          args: ["bootstrap"],
-          options: {
-            shell: false,
-            detached: false,
-            stdio: ["ignore", "pipe", "pipe"],
-            env: {}
-          }
-        })
-      ).toThrow("developer_executable_changed_before_spawn");
-      expect(spawnCalls).toBe(0);
-      await expect(capability.close()).resolves.toBeUndefined();
+          expect(() =>
+            capability.spawn({
+              args: ["bootstrap"],
+              options: {
+                shell: false,
+                detached: false,
+                stdio: ["ignore", "pipe", "pipe"],
+                env: {}
+              }
+            })
+          ).toThrow("developer_executable_changed_before_spawn");
+          expect(spawnCalls).toBe(0);
+        },
+        () => capability.close(),
+        "developer executable assertion and capability cleanup both failed"
+      );
     }
   );
 
