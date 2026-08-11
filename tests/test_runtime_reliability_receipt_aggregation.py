@@ -110,7 +110,7 @@ def _write_pytest_junit(repeat_root: Path) -> None:
 
 
 def _completed_process(*, native_windows_cleanup: bool = False) -> BoundedProcessResult:
-    stdout = "5 passed\n"
+    stdout = f"{len(RUNTIME_RELIABILITY_TESTS)} passed\n"
     return BoundedProcessResult(
         returncode=0,
         stdout=stdout,
