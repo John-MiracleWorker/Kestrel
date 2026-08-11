@@ -1459,6 +1459,11 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
     task6 = _task6()
     interface = _interface()
     probe_entered = Event()
+    probe_exited = Event()
+    release_probe = Event()
+    third_submit_attempted = Event()
+    allow_rejection = Event()
+    rejection_injected = Event()
     active_probes = 0
 
     class CancellingTcp:
@@ -1476,10 +1481,11 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
             active_probes += 1
             probe_entered.set()
             try:
-                while not cancellation.is_cancelled():
+                while not cancellation.is_cancelled() and not release_probe.is_set():
                     time.sleep(0.001)
             finally:
                 active_probes -= 1
+                probe_exited.set()
             raise LanTransportError(LanTransportFailure.CANCELLED)
 
     def scanner(scope: Any, limits: Any, **kwargs: Any) -> tuple[Any, ...]:
@@ -1503,14 +1509,25 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
         def __init__(self) -> None:
             super().__init__(max_workers=17, thread_name_prefix="task6-partial-reject")
             self.submit_calls = 0
+            self.submit_calls_lock = Lock()
+            self.controller_future: Any | None = None
 
         def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
-            self.submit_calls += 1
+            with self.submit_calls_lock:
+                self.submit_calls += 1
+                call_number = self.submit_calls
             # One submits the controller, two the first probe, and three
             # rejects the next probe after durable admission of the first.
-            if self.submit_calls == 3:
+            if call_number == 3:
+                third_submit_attempted.set()
+                if not allow_rejection.wait(timeout=15.0):
+                    raise RuntimeError("test did not authorize executor rejection")
+                rejection_injected.set()
                 raise RuntimeError("injected partial executor rejection")
-            return super().submit(fn, *args, **kwargs)
+            future = super().submit(fn, *args, **kwargs)
+            if call_number == 1:
+                self.controller_future = future
+            return future
 
     state = AgentStateStore(tmp_path / "state.db")
     utc = MutableUtcClock()
@@ -1525,29 +1542,89 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
         scan_id_factory=lambda: "lan_partial_executor_reject",
     )
     executor = RejectSecondProbeExecutor()
-    manager.start_lifecycle(executor)
-    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
-    draft = manager.create_draft(authorization)
-    manager.start(
-        draft.scan_id,
-        expected_revision=draft.revision,
-        authorization=authorization,
-        preview_digest=authorization.preview_digest,
-    )
+    shutdown_succeeded = False
+    primary_failure: BaseException | None = None
+    try:
+        manager.start_lifecycle(executor)
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft(authorization)
+        manager.start(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            authorization=authorization,
+            preview_digest=authorization.preview_digest,
+        )
 
-    assert probe_entered.wait(timeout=2.0)
-    terminal = _wait_for_terminal(manager, draft.scan_id)
-    receipt = terminal.terminal_receipt
-    assert terminal.status == "failed"
-    assert terminal.terminal_reason == "worker_error"
-    assert receipt is not None
-    assert receipt["admitted_count"] == 1
-    assert receipt["completed_count"] == 1
-    assert receipt["persisted_observation_count"] == 1
-    assert receipt["unknown_inflight_count"] == 0
-    assert active_probes == 0
-    assert executor.submit_calls == 3
-    assert manager.shutdown(timeout_seconds=1.0) is True
+        assert probe_entered.wait(timeout=15.0), "first admitted probe did not start"
+        assert third_submit_attempted.wait(timeout=15.0), (
+            f"third executor submission was not attempted: {executor.submit_calls=}"
+        )
+        allow_rejection.set()
+        assert rejection_injected.wait(timeout=15.0), (
+            f"third executor submission was not rejected: {executor.submit_calls=}"
+        )
+        controller_future = executor.controller_future
+        assert controller_future is not None, "controller future was not captured"
+        try:
+            controller_future.result(timeout=15.0)
+        except TimeoutError as exc:
+            current = manager.get(draft.scan_id)
+            raise AssertionError(
+                "controller did not finish after executor rejection: "
+                f"status={None if current is None else current.status!r}, "
+                f"{executor.submit_calls=}, probe_exited={probe_exited.is_set()}, "
+                f"active_probes={active_probes}"
+            ) from exc
+        terminal = manager.get(draft.scan_id)
+        assert terminal is not None and terminal.is_terminal, (
+            "controller completed without a durable terminal record: "
+            f"status={None if terminal is None else terminal.status!r}, "
+            f"{executor.submit_calls=}, probe_exited={probe_exited.is_set()}, "
+            f"active_probes={active_probes}"
+        )
+        receipt = terminal.terminal_receipt
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert receipt is not None
+        assert receipt["planned_count"] == 8
+        assert receipt["admitted_count"] == 1
+        assert receipt["completed_count"] == 1
+        assert receipt["observation_count"] == 1
+        assert receipt["persisted_observation_count"] == 1
+        assert receipt["evidence_complete"] is True
+        assert receipt["error_category_counts"] == {"cancelled": 1}
+        assert receipt["unknown_inflight_count"] == 0
+        events = manager.events(draft.scan_id)
+        progress = [item.payload for item in events if item.event_type == "scan_progress"]
+        assert [
+            (
+                item["planned_count"],
+                item["admitted_count"],
+                item["completed_count"],
+            )
+            for item in progress
+        ] == [(8, 0, 0), (8, 1, 0), (8, 1, 1)]
+        assert events[-1].event_type == "scan_failed"
+        assert probe_exited.is_set()
+        assert active_probes == 0
+        assert executor.submit_calls == 3
+    except BaseException as exc:
+        primary_failure = exc
+        raise
+    finally:
+        allow_rejection.set()
+        release_probe.set()
+        try:
+            shutdown_succeeded = manager.shutdown(timeout_seconds=15.0)
+        except BaseException as cleanup_error:
+            if primary_failure is None:
+                raise
+            primary_failure.add_note(f"manager shutdown also raised: {cleanup_error!r}")
+        else:
+            if primary_failure is not None and not shutdown_succeeded:
+                primary_failure.add_note("manager shutdown also returned False")
+    assert shutdown_succeeded is True
+    assert manager.is_quiescent() is True
 
 
 def test_manager_passes_one_executor_and_one_absolute_deadline_through_all_phases(
