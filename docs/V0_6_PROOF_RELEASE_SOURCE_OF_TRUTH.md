@@ -1,6 +1,6 @@
 # Kestrel v0.6 Proof Release — Source of Truth
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 This document is the canonical program contract for the Kestrel v0.6 proof
 release. It translates the owner-approved release prompt into durable,
@@ -152,15 +152,75 @@ Baseline follow-up receipt (`BASE-2026-08-10-B`):
   remaining hosted/cross-platform repeat requirements. REL/S1 remain
   `in_progress`.
 
+### Current S0/S1 reconciliation (2026-08-11)
+
+The audited baseline above remains historical and append-only. In particular,
+neither failed `BASE-2026-08-10-A` nor incomplete `BASE-2026-08-10-B` is
+rewritten as a pass.
+
+- S0 implementation from [PR #331](https://github.com/John-MiracleWorker/Kestrel/pull/331)
+  head `fc964b6a1fb6cd2cf6abc8b6156b775f4e8a9b39` merged as
+  `4bd4937a20d575d28803293b5c717120000957b4`; its automatic protected-main
+  [CI](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31360437434)
+  and [determinism](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31360437361)
+  runs completed successfully on attempt 1. A fresh local receipt on
+  protected-main qualification subject
+  `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` supplies the previously missing
+  full-test output, pinned-OCI 21-case golden report, conversational CLI output,
+  exact identity, and clean-checkout proof. Its owner-local receipt root,
+  command record, immutable S0-only manifest, and review disposition are
+  recorded in `MAIN-2026-08-11-S0`. That receipt qualifies S0 without changing
+  either baseline receipt's original result.
+- S1 implementation provenance spans backend-bound determinism
+  [PR #332](https://github.com/John-MiracleWorker/Kestrel/pull/332), Windows wait
+  stabilization [PR #333](https://github.com/John-MiracleWorker/Kestrel/pull/333),
+  cross-platform runtime qualification
+  [PR #334](https://github.com/John-MiracleWorker/Kestrel/pull/334), partial
+  executor-rejection synchronization
+  [PR #335](https://github.com/John-MiracleWorker/Kestrel/pull/335), and final
+  five-cell aggregation
+  [PR #337](https://github.com/John-MiracleWorker/Kestrel/pull/337). PR #337 head
+  `59ebcc6e90e2b120fddeceb6d0a2578213f4ef51` merged normally as
+  `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` with tree
+  `8395483245d48af48feeb3521f65f22785fe30ee`. Exact-main attempt-1 CI and
+  determinism passed, the five-cell aggregate artifact was independently
+  safety-checked and replayed against the same run/attempt/SHA, and exact-head
+  review found no major issue. The technical evidence qualifies REL-001 through
+  REL-003, subject to the process exception below.
+- Process exception: PRs #332 through #337 were merged by the repository owner
+  while this canonical record still marked S0 `in_progress`. That sequence
+  violated the dependency rule above. The later exact-main S0 receipt cannot
+  retroactively make those merges dependency-compliant. S1 therefore remains
+  `in_progress`, and S2 remains unavailable. After this reconciliation record
+  is merged, a distinct later owner-acceptance change may durably grant a
+  one-time exception and move S1 to `qualified`. That later change must preserve
+  the violation as history and does not waive dependency ordering for S2 or any
+  future slice. Issues #303 and #308 remain open until that later change
+  qualifies S1; any eventual closure must be scoped to REL-001 through REL-003
+  and must not imply REL-004/REL-005 or installed-artifact qualification.
+- The first exact-main S0 command used a non-native global `TMPDIR` and a pytest
+  base resolved under `/private/tmp`. Of the five preserved failures, one was a
+  harness-precondition failure and four exercised a real, separately triaged P3
+  `/tmp` versus `/private/tmp` launcher-path behavior. A native-temp focused
+  check passed 5/5 before the fresh full receipt passed. The invalid run is not
+  qualifying evidence; the focused pass does not erase the P3 installer/final-
+  release hardening finding, which does not block S0 or the REL-001–REL-003
+  technical evidence.
+
+These receipts do not satisfy REL-004, REL-005, any `RELEASE` requirement, S2
+or a later slice, installed-artifact qualification, owner promotion, stable-tag
+creation, publication, post-publication verification, or final v0.6 release
+qualification.
+
 ## Requirement register
 
 ### Reliability (`REL`)
 
 | ID | Requirement | Acceptance evidence | Status |
 | --- | --- | --- | --- |
-| REL-001 | Eliminate golden-eval nondeterminism rather than masking it with reruns/timeouts. | Regression reproduces the retrieval/settlement defect; fixed fixture sealing, seeds, clocks, IDs, ordering, and completion; exact-SHA memory and Memvid repeat receipts. | `in_progress` |
-| REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive Windows/macOS/Linux targeted iterations with no rerun; structured failure diagnostics. | `in_progress` |
-| REL-003 | Use monotonic elapsed-time logic and explicitly await asynchronous state transitions. | Static/test coverage for every changed timing path; no wall-clock equality or timing-point authority assertion. | `in_progress` |
+| REL-001 | Eliminate golden-eval nondeterminism rather than masking it with reruns/timeouts. | Regression reproduces the retrieval/settlement defect; fixed fixture sealing, seeds, clocks, IDs, ordering, and completion; exact-SHA memory and Memvid repeat receipts. | `qualified` |
+| REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive Windows/macOS/Linux targeted iterations with no rerun; structured failure diagnostics. | `qualified` |
+| REL-003 | Use monotonic elapsed-time logic and explicitly await asynchronous state transitions. | Static/test coverage for every changed timing path; no wall-clock equality or timing-point authority assertion. | `qualified` |
 | REL-004 | Rehearse the release lifecycle repeatedly. | One exact candidate produces 20 consecutive unique-namespace rehearsals, zero flaky failures, and an aggregate receipt digest. | `not_started` |
 | REL-005 | Prove fresh artifact install, launch, and first mission on supported platforms. | Windows/macOS/Linux, Python 3.11–3.13 exact-wheel matrix starts the installed entry point, awaits readiness, completes a mock mission, and verifies cleanup. | `not_started` |
 
@@ -215,7 +275,7 @@ Baseline follow-up receipt (`BASE-2026-08-10-B`):
 
 | Slice | Deliverable | Depends on | Status |
 | --- | --- | --- | --- |
-| S0 | Canonical source of truth and audited baseline | — | `in_progress` |
+| S0 | Canonical source of truth and audited baseline | — | `qualified` |
 | S1 | Reliability root-cause fixes and 20-repeat platform receipt | S0 | `in_progress` |
 | S2 | Exact-SHA candidate/promotion transaction | S1 | `not_started` |
 | S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `not_started` |
@@ -399,5 +459,10 @@ trust.
 | HOSTED-2026-08-09-REL | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | `merged` | `f78ef1b4a54d63b0e49787b80a67133ba2ae4268` | [Actions run 31283680648](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31283680648); exact commands remain encoded in `.github/workflows/release.yml` at this SHA | Candidate/artifact jobs ran; PyPI remained owner-gated. The expanded command list and artifact digests were not captured during the audit, so this historical receipt is explicitly incomplete and is not v0.6 evidence. |
 | BASE-2026-08-10-B | `9d8bc3d891859a0598350364f3f30e320814157b` | `unmerged` | — | Receipt root: `TASK1_RECEIPT_ROOT=/tmp/kestrel-v06-task1-review.oBrMFT`; focused RED/GREEN: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/test_tools.py::test_same_public_call_id_across_runs_keeps_process_tracking_isolated tests/test_tools.py::test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout`; full: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q`; golden: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 NEST_AGENT_VALIDATION_CONTAINER_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3' .venv/bin/python scripts/run_golden_evals.py --backend memory --provider mock --model mock --workspace . --memory-dir "$TASK1_RECEIPT_ROOT/golden-memory" --seed 1729 --output "$TASK1_RECEIPT_ROOT/golden-report.json" --case-timeout-seconds 120`; CLI: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m nested_memvid_agent.cli chat --backend memory --memory-dir "$TASK1_RECEIPT_ROOT/cli-receipt-memory" --provider mock --model mock --workspace . --log-dir "$TASK1_RECEIPT_ROOT/cli-receipt-logs" --state-path "$TASK1_RECEIPT_ROOT/cli-receipt-state/agent.db" --message 'Return a deterministic v0.6 CLI readiness acknowledgement.' --session-id v06_task1_cli_receipt > "$TASK1_RECEIPT_ROOT/cli-output.txt"` | Focused RED failed 2/2 at pre-repair subject `f78ef1b4a54d63b0e49787b80a67133ba2ae4268`; focused GREEN passed 2/2 at this `9d8bc3d` subject. Full pytest passed, but its output digest was not captured, so that local full-test receipt remains incomplete and non-qualifying. A fresh 2026-08-10 golden rerun passed 21/21 with report SHA-256 `a89cbf9e5c1c4cc1b45d0eaa6d6b76fc19c3b21604ca0280c6501c28ce0b3ea4`; the exact CLI command exited 0 with completed mock output SHA-256 `eaacc7efee11acef5f876681943a0260db2aa778bbdd2ec9e5195e71b1746b9e`. BASE-A remains failed; hosted/cross-platform repeat receipts are still missing, so REL/S1 remain `in_progress`. |
 | PR331-2026-08-10-DET | `96d265ef92b4a82ff8cbf815021af5035a1f195b` (synthetic PR merge) | `unmerged` | — | [Actions run 31356774284](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31356774284); determinism artifact SHA-256 `b65c4ea253c800c06e26f9ded7bd31d2f0b73b87d8b587b87260063d5af8d656`; workflow command is the exact HOSTED-DET command above | First-attempt Ubuntu/memory determinism and Flock qualification jobs passed for the PR merge candidate. This is review evidence only: it is not a protected-main SHA, Memvid proof, or cross-platform S1 qualification. |
+| MAIN-2026-08-11-S0-INVALID | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | Preserved output SHA-256 `112e85976f56173cf2b1dc6e71937585d3c3614eaef11052d06e33b21614f21b`; command globally set `TMPDIR=/tmp/kestrel-s0-exact-main.Zh6pp6/tmp` and `--basetemp /tmp/kestrel-s0-exact-main.Zh6pp6/pytest-basetemp`, which resolved under `/private/tmp`; native-temp correction output SHA-256 `4d2df7a96ce4a667da3ccf295f2d16c728a65ed0e861a3baa919f7bb469b02b5` | Non-qualifying receipt: one failure was a harness-precondition failure and four exercised the real, triaged P3 lexical `/tmp` versus `/private/tmp` launcher-path behavior. The focused native-temp correction passed 5/5 but does not erase that P3 finding. Neither this run nor the correction replaces the separately qualifying full-test receipt. |
+| MAIN-2026-08-11-S0 | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | [PR #331](https://github.com/John-MiracleWorker/Kestrel/pull/331) head `fc964b6a1fb6cd2cf6abc8b6156b775f4e8a9b39` merged by the repository owner as `4bd4937a20d575d28803293b5c717120000957b4`; [main CI 31360437434](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31360437434); [main determinism 31360437361](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31360437361); owner-local receipt root `/Users/tiuni/.codex/worktrees/kestrel-v06-reliability/.superpowers/sdd/V0_6_PROOF_RELEASE_SOURCE_OF_TRUTH/receipts/659c313ac164c4f62dbd38876f1caf0bc02ab0a2`; exact command record `COMMANDS.md` SHA-256 `6bd55537f723f8d37a1f87ff081095d196ee5dbba4ce6e4acf5454b092ba6d72`; fresh exact-main full pytest 5,298-test output SHA-256 `782070378d979a98b63a81ea96e2d8820b6a966cd31227a096965c1be80cfef8`; collection output SHA-256 `112141130834476fcac037bfbe94fff9bfacc3373154d81c5c6202ca24ecccc6`; pinned-OCI golden 21/21 report SHA-256 `712f5cc135517c7ae8f924b211e4e553f6d1cdd0232e2c08abc30a6cd4a5b3b4`; CLI completed output SHA-256 `d5109080017edbe9908699d15f1371b8ec47904da027d39f557aab0a78e108f5`; local summary SHA-256 `063893054c27f483ef72022d58563e0218108fbee5808dee817e279925b4298f`; immutable 35-entry `S0_SHA256SUMS` manifest SHA-256 `d6460a6743291494cc331b8e7dc515873eae6ca98d7956a2db53f90660d15658`; pinned uv 0.11.16, Python 3.13.12, OCI `python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3`; exact identity and clean checkout | S0 is qualified after independent receipt-integrity review and this record's owner-controlled merge. This fresh receipt supplies the output digest absent from BASE-B while preserving BASE-A/B exactly as failed/incomplete history. It qualifies only the canonical record/portable local baseline, not S1 or any release/artifact/promotion gate. The receipt is retained owner-locally; collaborators must not treat the path alone as remotely retrievable evidence. |
+| PR337-2026-08-11-S1 | `59ebcc6e90e2b120fddeceb6d0a2578213f4ef51` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | Root-cause provenance: [PR #332](https://github.com/John-MiracleWorker/Kestrel/pull/332), [PR #333](https://github.com/John-MiracleWorker/Kestrel/pull/333), [PR #334](https://github.com/John-MiracleWorker/Kestrel/pull/334), and [PR #335](https://github.com/John-MiracleWorker/Kestrel/pull/335); final qualification boundary [PR #337](https://github.com/John-MiracleWorker/Kestrel/pull/337); exact-head attempt-1 [push CI 31497683668](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31497683668), [PR CI 31497687124](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31497687124), and [determinism 31497687171](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31497687171); artifact `9104182385` ZIP SHA-256 `13ea1caa196b54fab82f4521b025d0a25ca8138f1925e43cb9a1998fc1bf29f4`; exact verifier replay; [hosted Codex review](https://github.com/John-MiracleWorker/Kestrel/pull/337#issuecomment-5254042760) reviewed `59ebcc6e90` with no major issue; original PR and exact-main ZIPs retained at the owner-local receipt root in `S1_ARTIFACT_SHA256SUMS` (manifest SHA-256 `a03546203dc4654e3de1dd4a8eeb914bc3380752482bd4ea82743f83b74e6415`) with preservation record `S1_ARTIFACTS.md` SHA-256 `04725be56412e150f0c85fa914e38d5547409d21cd90eb6396cc9f6ee261aeef` | Exact-head candidate evidence passed 5/5 cells, 100/100 repeats, 240 runtime and 840 golden executions, zero failures/flakes/cleanup failures, plus CI/security/review. This row is branch evidence and does not substitute for the protected-main row below. Hosted copies expire on 2026-08-25; the original ZIP bytes are retained owner-locally, not published. |
+| MAIN-2026-08-11-S1 | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | [CI 31508994971](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31508994971): attempt 1, 14/14 jobs, 156 executed steps successful and 35 expected conditional skips; [determinism 31508994974](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31508994974): attempt 1, 7/7 jobs; exact aggregate artifact `9108661459`, 248,519 bytes, ZIP SHA-256 `c274b4b41a4063bc8d7e0161484b485bebf398b5c4b6a7df89cfdb83f4624951`; safe 146-file archive audit; exact verifier replay; aggregate raw/canonical SHA-256 `39c9fbe60ee00ebe9f28352ac3f415a40cc2a658593fdfc4a789291c2326ec80` / `4c4d6b3387be4cd6f27b2e6a17aad2f5d9601181390d7f11678b79e217572b63`; exact-main CodeQL analysis `1602548479` fixed alert #126 with no new alert | REL-001, REL-002, and REL-003 technical evidence is qualified: 5/5 cells, 100/100 repeats (60 runtime/40 golden), 240 runtime and 840 golden executions, zero failures/flakes/cleanup failures, exact-main CI/security, independent artifact replay, and owner-local preservation of the original ZIP. S1 remains `in_progress` because its premature merges require the explicit owner reconciliation described above. This does not satisfy REL-004/005, S2+, installed-artifact, promotion, publication, or final release gates. |
+| MAIN-2026-08-11-REH | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | [Release rehearsal 31508995280](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31508995280), attempt 1; artifact `9108248907`, 955 bytes, ZIP SHA-256 `2e51ad05b33b8dda54a55bde6538461aa083298962a1d13d9d6466d576a826ac`; downloaded receipt JSON SHA-256 `e58f341b3497cefe2c8b4f34acf7909da9bdd555f71091ba2b63c4bd645dd421`; exact source/finalization SHA; wheel `264c92c1585bf4264484d7cb5b46ee9f0acbe573d7d0871e4e016c2d8f2a323d`; sdist `dfa0466570e6cda123a69e18e32406bb2d63e6b62b31117a12be07bda7fa0920` | One rehearsal passed with production targets blocked, exact replays `already_exact`, and conflicting mutation rejected. This rehearsal created no production tag, did not run the production release workflow, and created no GitHub release. It is not REL-004, S2/S3, promotion, publication, or release qualification. The current selector is post-tag and does not satisfy the required pre-tag transaction. Before S2 or RELEASE-001 can be qualified, and before any stable-tag creation, the selector must bind attempt 1, prove uniqueness, and download and verify the selected receipt. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
