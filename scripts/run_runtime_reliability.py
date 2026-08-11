@@ -25,10 +25,14 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from nested_memvid_agent.security_boundary import redact_secrets  # noqa: E402
 from scripts.bounded_process import BoundedProcessResult, run_bounded_process  # noqa: E402
+from scripts.runtime_reliability_contract import (  # noqa: E402
+    RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS as DEFAULT_ITERATION_TIMEOUT_SECONDS,
+)
+from scripts.runtime_reliability_contract import (  # noqa: E402
+    RUNTIME_RELIABILITY_REQUIRED_REPEATS as DEFAULT_REPEATS,
+)
 from scripts.runtime_reliability_contract import RUNTIME_RELIABILITY_TESTS  # noqa: E402
 
-DEFAULT_REPEATS = 20
-DEFAULT_ITERATION_TIMEOUT_SECONDS = 900.0
 PYTEST_JUNIT_FILENAME = "pytest-results.xml"
 _MAX_PYTEST_JUNIT_BYTES = 1024 * 1024
 
