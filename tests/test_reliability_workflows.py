@@ -12,6 +12,7 @@ import yaml
 
 from scripts.runtime_reliability_contract import (
     RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS,
+    RUNTIME_RELIABILITY_REQUIRED_REPEATS,
     RUNTIME_RELIABILITY_SCHEDULING_RESERVE_SECONDS,
     RUNTIME_RELIABILITY_TEST_SUCCESS_PATH_BUDGET_SECONDS,
     RUNTIME_RELIABILITY_TESTS,
@@ -484,13 +485,13 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
         if step.get("name") == "Run twenty fresh-process runtime reliability repetitions"
     )
     assert "scripts/run_runtime_reliability.py" in invocation
-    assert "--repeats 20" in invocation
     assert '--source-commit "${SOURCE_COMMIT}"' in invocation
     assert '--run-root "${RUNNER_TEMP}/kestrel-runtime-reliability-runs"' in invocation
     assert '--output "${RUNNER_TEMP}/kestrel-runtime-reliability-report.json"' in invocation
     assert '--workspace "."' in invocation
     tokens = invocation.split()
     repeats = int(tokens[tokens.index("--repeats") + 1])
+    assert repeats == RUNTIME_RELIABILITY_REQUIRED_REPEATS
     iteration_timeout = int(tokens[tokens.index("--iteration-timeout-seconds") + 1])
     assert iteration_timeout == RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS == 900.0
     assert tuple(RUNTIME_RELIABILITY_TEST_SUCCESS_PATH_BUDGET_SECONDS) == (
