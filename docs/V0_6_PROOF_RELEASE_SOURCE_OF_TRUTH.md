@@ -219,7 +219,7 @@ qualification.
 | ID | Requirement | Acceptance evidence | Status |
 | --- | --- | --- | --- |
 | REL-001 | Eliminate golden-eval nondeterminism rather than masking it with reruns/timeouts. | Regression reproduces the retrieval/settlement defect; fixed fixture sealing, seeds, clocks, IDs, ordering, and completion; exact-SHA memory and Memvid repeat receipts. | `qualified` |
-| REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive Windows/macOS/Linux targeted iterations with no rerun; structured failure diagnostics. | `qualified` |
+| REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive targeted iterations on Windows, macOS, and Linux with no rerun; structured failure diagnostics. | `qualified` |
 | REL-003 | Use monotonic elapsed-time logic and explicitly await asynchronous state transitions. | Static/test coverage for every changed timing path; no wall-clock equality or timing-point authority assertion. | `qualified` |
 | REL-004 | Rehearse the release lifecycle repeatedly. | One exact candidate produces 20 consecutive unique-namespace rehearsals, zero flaky failures, and an aggregate receipt digest. | `not_started` |
 | REL-005 | Prove fresh artifact install, launch, and first mission on supported platforms. | Windows/macOS/Linux, Python 3.11–3.13 exact-wheel matrix starts the installed entry point, awaits readiness, completes a mock mission, and verifies cleanup. | `not_started` |
