@@ -12,6 +12,9 @@ import yaml
 
 from scripts.runtime_reliability_contract import (
     RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS,
+    RUNTIME_RELIABILITY_SCHEDULING_RESERVE_SECONDS,
+    RUNTIME_RELIABILITY_TEST_SUCCESS_PATH_BUDGET_SECONDS,
+    RUNTIME_RELIABILITY_TESTS,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -410,7 +413,7 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
     runtime = workflow["jobs"]["runtime-reliability"]
 
     assert runtime["runs-on"] == "${{ matrix.os }}"
-    assert runtime["timeout-minutes"] == 120
+    assert runtime["timeout-minutes"] == 330
     assert runtime["defaults"] == {"run": {"shell": "bash"}}
     assert runtime["strategy"] == {
         "fail-fast": False,
@@ -489,7 +492,14 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
     tokens = invocation.split()
     repeats = int(tokens[tokens.index("--repeats") + 1])
     iteration_timeout = int(tokens[tokens.index("--iteration-timeout-seconds") + 1])
-    assert iteration_timeout == RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS == 300.0
+    assert iteration_timeout == RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS == 900.0
+    assert tuple(RUNTIME_RELIABILITY_TEST_SUCCESS_PATH_BUDGET_SECONDS) == (
+        RUNTIME_RELIABILITY_TESTS
+    )
+    assert iteration_timeout >= (
+        sum(RUNTIME_RELIABILITY_TEST_SUCCESS_PATH_BUDGET_SECONDS.values())
+        + RUNTIME_RELIABILITY_SCHEDULING_RESERVE_SECONDS
+    )
     assert repeats * iteration_timeout <= runtime["timeout-minutes"] * 60 - 600
     run_scripts = "\n".join(
         str(step["run"]) for step in runtime["steps"] if "run" in step
