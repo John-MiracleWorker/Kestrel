@@ -32,6 +32,9 @@ from scripts.run_runtime_reliability import (
 from scripts.run_runtime_reliability import (
     _excerpt as _runtime_excerpt,
 )
+from scripts.runtime_reliability_contract import (
+    RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS,
+)
 
 SOURCE_COMMIT = "a" * 40
 OTHER_COMMIT = "b" * 40
@@ -153,7 +156,7 @@ def _write_runtime_artifact(
         runner_os=runner_os,
         runner_arch=runner_arch,
         python_version=python_version,
-        iteration_timeout_seconds=150.0,
+        iteration_timeout_seconds=RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS,
     )
 
 
