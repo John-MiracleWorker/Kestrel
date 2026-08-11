@@ -798,20 +798,20 @@ def test_release_qualification_selector_does_not_use_run_updated_at_as_authority
 
 def test_release_qualification_selector_rejects_wrong_run_metadata() -> None:
     invalid_fields = (
-        ("id", "4242"),
-        ("head_sha", "b" * 40),
-        ("head_branch", "feature"),
-        ("event", "workflow_dispatch"),
-        ("run_attempt", True),
+        ("id", "4242", "attempt-1"),
+        ("head_sha", "b" * 40, "replacement runs are rejected"),
+        ("head_branch", "feature", "replacement runs are rejected"),
+        ("event", "workflow_dispatch", "replacement runs are rejected"),
+        ("run_attempt", True, "attempt-1"),
     )
 
-    for field, value in invalid_fields:
+    for field, value, expected in invalid_fields:
         completed = _run_qualification_selector(
             [_qualification_run(**{field: value})]
         )
 
         assert completed.returncode != 0, field
-        assert "exactly one" in completed.stderr, field
+        assert expected in completed.stderr, field
 
 
 def test_release_qualification_job_validator_accepts_exact_metadata() -> None:
