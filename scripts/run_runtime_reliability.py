@@ -543,6 +543,8 @@ def build_iteration_invoker(
         raise ValueError("Python executable must not be empty")
     _validate_iteration_timeout(iteration_timeout_seconds)
     environment = dict(os.environ if base_environment is None else base_environment)
+    environment.pop("PYTEST_ADDOPTS", None)
+    environment.pop("PYTEST_PLUGINS", None)
     environment["PYTHONHASHSEED"] = "0"
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 

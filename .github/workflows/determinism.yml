@@ -21,6 +21,9 @@ jobs:
     name: Runtime reliability (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -44,19 +47,19 @@ jobs:
       - name: Install runtime reliability dependencies
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
-          uv export --frozen --no-dev --no-emit-local --extra dev --format requirements.txt --output-file "${{ runner.temp }}/requirements-runtime-reliability.txt"
-          python -m pip install --require-hashes --only-binary=:all: -r "${{ runner.temp }}/requirements-runtime-reliability.txt"
+          uv export --frozen --no-dev --no-emit-local --extra dev --format requirements.txt --output-file "${RUNNER_TEMP}/requirements-runtime-reliability.txt"
+          python -m pip install --require-hashes --only-binary=:all: -r "${RUNNER_TEMP}/requirements-runtime-reliability.txt"
           python -m pip install --no-build-isolation --no-deps -e '.[dev]'
           python -m pip check
       - name: Run twenty fresh-process runtime reliability repetitions
         run: >-
           python scripts/run_runtime_reliability.py
           --repeats 20
-          --source-commit "${{ env.SOURCE_COMMIT }}"
-          --run-root "${{ runner.temp }}/kestrel-runtime-reliability-runs"
-          --output "${{ runner.temp }}/kestrel-runtime-reliability-report.json"
+          --source-commit "${SOURCE_COMMIT}"
+          --run-root "${RUNNER_TEMP}/kestrel-runtime-reliability-runs"
+          --output "${RUNNER_TEMP}/kestrel-runtime-reliability-report.json"
           --workspace "."
-          --iteration-timeout-seconds 900
+          --iteration-timeout-seconds 150
       - name: Upload runtime reliability receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -5,6 +5,7 @@ import hmac
 import json
 import queue
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
@@ -54,7 +55,8 @@ from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.builtin import build_default_tools
 
-_ASYNC_TEST_TIMEOUT_SECONDS = 15.0
+_ASYNC_EVENT_TIMEOUT_SECONDS = 15.0
+_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 _TERMINAL_RUN_EVENT_TYPES = {
     "run.admission_failed",
     "run.cancelled",
@@ -63,10 +65,77 @@ _TERMINAL_RUN_EVENT_TYPES = {
 }
 
 
+def _wait_for_terminal_run_event(
+    terminal_events: queue.Queue[Any],
+    *,
+    run_id: str,
+    timeout_seconds: float,
+    observed_events: list[dict[str, str]],
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Any:
+    deadline = monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise queue.Empty
+        event = terminal_events.get(timeout=remaining)
+        observed_events.append({"run_id": event.run_id, "type": event.type})
+        if event.run_id == run_id:
+            return event
+
+
 @pytest.fixture(autouse=True)
 def _authorized_telegram_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "12345")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "777,999")
+
+
+def test_terminal_event_wait_uses_one_absolute_deadline() -> None:
+    observed_timeouts: list[float] = []
+    events = iter(
+        [
+            SimpleNamespace(run_id="unrelated", type="run.completed"),
+            SimpleNamespace(run_id="target", type="run.completed"),
+        ]
+    )
+
+    class FakeQueue:
+        def get(self, *, timeout: float) -> Any:
+            observed_timeouts.append(timeout)
+            return next(events)
+
+    clock = iter([100.0, 101.0, 104.0])
+    observed_events: list[dict[str, str]] = []
+    event = _wait_for_terminal_run_event(
+        cast(queue.Queue[Any], FakeQueue()),
+        run_id="target",
+        timeout_seconds=15.0,
+        observed_events=observed_events,
+        monotonic=lambda: next(clock),
+    )
+
+    assert event.run_id == "target"
+    assert observed_timeouts == [14.0, 11.0]
+    assert observed_events == [
+        {"run_id": "unrelated", "type": "run.completed"},
+        {"run_id": "target", "type": "run.completed"},
+    ]
+
+
+def test_terminal_event_wait_fails_before_reading_after_deadline() -> None:
+    class NoReadQueue:
+        def get(self, *, timeout: float) -> Any:
+            pytest.fail(f"queue read started after deadline with timeout={timeout}")
+
+    clock = iter([100.0, 115.0])
+    with pytest.raises(queue.Empty):
+        _wait_for_terminal_run_event(
+            cast(queue.Queue[Any], NoReadQueue()),
+            run_id="target",
+            timeout_seconds=15.0,
+            observed_events=[],
+            monotonic=lambda: next(clock),
+        )
 
 
 def test_safe_channel_session_ids_preserve_legacy_continuity() -> None:
@@ -186,7 +255,7 @@ def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
     )
     request.addfinalizer(
         lambda: (
-            run_manager.shutdown(timeout_seconds=_ASYNC_TEST_TIMEOUT_SECONDS)
+            run_manager.shutdown(timeout_seconds=_ASYNC_SHUTDOWN_TIMEOUT_SECONDS)
             or pytest.fail("RunManager did not shut down within the test deadline")
         )
     )
@@ -265,11 +334,12 @@ def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
     )
     observed_terminal_events: list[dict[str, str]] = []
     try:
-        while True:
-            event = terminal_events.get(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
-            observed_terminal_events.append({"run_id": event.run_id, "type": event.type})
-            if event.run_id == primary.run_id:
-                break
+        _wait_for_terminal_run_event(
+            terminal_events,
+            run_id=primary.run_id,
+            timeout_seconds=_ASYNC_EVENT_TIMEOUT_SECONDS,
+            observed_events=observed_terminal_events,
+        )
     except queue.Empty:
         pytest.fail(
             "primary replay did not publish a terminal event: "

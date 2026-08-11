@@ -885,7 +885,12 @@ def test_iteration_invoker_uses_a_fresh_interpreter_and_basetemp_per_repeat(
         workspace=workspace,
         python_executable="/qualification/python",
         iteration_timeout_seconds=900.0,
-        base_environment={"PATH": "/qualification/bin", "PYTHONHASHSEED": "unexpected"},
+        base_environment={
+            "PATH": "/qualification/bin",
+            "PYTHONHASHSEED": "unexpected",
+            "PYTEST_ADDOPTS": "-p unexpected --maxfail=1",
+            "PYTEST_PLUGINS": "unexpected.plugin",
+        },
         bounded_runner=bounded_runner,
     )
 

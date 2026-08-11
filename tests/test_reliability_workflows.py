@@ -491,6 +491,7 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
 
     assert runtime["runs-on"] == "${{ matrix.os }}"
     assert runtime["timeout-minutes"] == 60
+    assert runtime["defaults"] == {"run": {"shell": "bash"}}
     assert runtime["strategy"] == {
         "fail-fast": False,
         "matrix": {
@@ -548,9 +549,9 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
         "python -m pip install --require-hashes --only-binary=:all: "
         "-r config/python-build-bootstrap.txt",
         "uv export --frozen --no-dev --no-emit-local --extra dev "
-        '--format requirements.txt --output-file "${{ runner.temp }}/requirements-runtime-reliability.txt"',
+        '--format requirements.txt --output-file "${RUNNER_TEMP}/requirements-runtime-reliability.txt"',
         "python -m pip install --require-hashes --only-binary=:all: "
-        '-r "${{ runner.temp }}/requirements-runtime-reliability.txt"',
+        '-r "${RUNNER_TEMP}/requirements-runtime-reliability.txt"',
         "python -m pip install --no-build-isolation --no-deps -e '.[dev]'",
         "python -m pip check",
     ]
@@ -561,9 +562,20 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
     )
     assert "scripts/run_runtime_reliability.py" in invocation
     assert "--repeats 20" in invocation
-    assert '--source-commit "${{ env.SOURCE_COMMIT }}"' in invocation
+    assert '--source-commit "${SOURCE_COMMIT}"' in invocation
+    assert '--run-root "${RUNNER_TEMP}/kestrel-runtime-reliability-runs"' in invocation
+    assert '--output "${RUNNER_TEMP}/kestrel-runtime-reliability-report.json"' in invocation
     assert '--workspace "."' in invocation
-    assert "--iteration-timeout-seconds 900" in invocation
+    assert "--iteration-timeout-seconds 150" in invocation
+    tokens = invocation.split()
+    repeats = int(tokens[tokens.index("--repeats") + 1])
+    iteration_timeout = int(tokens[tokens.index("--iteration-timeout-seconds") + 1])
+    assert repeats * iteration_timeout <= runtime["timeout-minutes"] * 60 - 600
+    run_scripts = "\n".join(
+        str(step["run"]) for step in runtime["steps"] if "run" in step
+    )
+    assert "${{ env.SOURCE_COMMIT }}" not in run_scripts
+    assert "${{ runner.temp }}" not in run_scripts
     upload = next(
         step
         for step in runtime["steps"]
