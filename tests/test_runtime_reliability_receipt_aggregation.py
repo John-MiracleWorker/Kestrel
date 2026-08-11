@@ -32,6 +32,9 @@ from scripts.run_runtime_reliability import (
 from scripts.run_runtime_reliability import (
     _excerpt as _runtime_excerpt,
 )
+from scripts.runtime_reliability_contract import (
+    RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS,
+)
 
 SOURCE_COMMIT = "a" * 40
 OTHER_COMMIT = "b" * 40
@@ -110,7 +113,7 @@ def _write_pytest_junit(repeat_root: Path) -> None:
 
 
 def _completed_process(*, native_windows_cleanup: bool = False) -> BoundedProcessResult:
-    stdout = "4 passed\n"
+    stdout = f"{len(RUNTIME_RELIABILITY_TESTS)} passed\n"
     return BoundedProcessResult(
         returncode=0,
         stdout=stdout,
@@ -153,7 +156,7 @@ def _write_runtime_artifact(
         runner_os=runner_os,
         runner_arch=runner_arch,
         python_version=python_version,
-        iteration_timeout_seconds=150.0,
+        iteration_timeout_seconds=RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS,
     )
 
 
@@ -401,7 +404,7 @@ def test_builds_and_independently_verifies_exact_five_cell_qualification(
         "completed_repeats": 100,
         "runtime_repeats": 60,
         "golden_repeats": 40,
-        "runtime_test_executions": 240,
+        "runtime_test_executions": 420,
         "golden_case_executions": 840,
         "failure_count": 0,
         "observed_flake_count": 0,

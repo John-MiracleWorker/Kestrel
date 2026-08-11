@@ -440,7 +440,7 @@ def _validate_runtime_test_evidence(value: object, *, label: str) -> None:
         or evidence["passed"] is not True
         or evidence["raw_source_retained"] is not False
     ):
-        raise ValueError(f"{label} does not prove exactly four passing runtime tests")
+        raise ValueError(f"{label} does not prove the declared passing runtime tests")
 
 
 def _validate_runtime_run(
@@ -1218,7 +1218,7 @@ def build_qualification(
         "completed_repeats": 100,
         "runtime_repeats": 60,
         "golden_repeats": 40,
-        "runtime_test_executions": 240,
+        "runtime_test_executions": 420,
         "golden_case_executions": 840,
         "failure_count": 0,
         "observed_flake_count": 0,

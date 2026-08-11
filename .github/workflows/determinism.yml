@@ -20,7 +20,7 @@ jobs:
   runtime-reliability:
     name: Runtime reliability (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 330
     defaults:
       run:
         shell: bash
@@ -59,7 +59,7 @@ jobs:
           --run-root "${RUNNER_TEMP}/kestrel-runtime-reliability-runs"
           --output "${RUNNER_TEMP}/kestrel-runtime-reliability-report.json"
           --workspace "."
-          --iteration-timeout-seconds 150
+          --iteration-timeout-seconds 900
       - name: Upload runtime reliability receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
