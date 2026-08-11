@@ -62,7 +62,7 @@ def _write_pytest_junit(
 def _completed_process(
     *,
     returncode: int = 0,
-    stdout: str = "4 passed\n",
+    stdout: str = "5 passed\n",
     cleanup_attempted: bool = False,
     cleanup_succeeded: bool = True,
 ) -> BoundedProcessResult:
@@ -169,9 +169,9 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
                 for nodeid in RUNTIME_RELIABILITY_TESTS
             ],
             "summary": {
-                "expected": 4,
-                "observed": 4,
-                "passed": 4,
+                "expected": len(RUNTIME_RELIABILITY_TESTS),
+                "observed": len(RUNTIME_RELIABILITY_TESTS),
+                "passed": len(RUNTIME_RELIABILITY_TESTS),
                 "failed": 0,
                 "errors": 0,
                 "skipped": 0,
@@ -179,7 +179,7 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
                 "unexpected": [],
                 "duplicates": [],
                 "declared": {
-                    "tests": 4,
+                    "tests": len(RUNTIME_RELIABILITY_TESTS),
                     "errors": 0,
                     "failures": 0,
                     "skipped": 0,
@@ -244,9 +244,13 @@ def test_runtime_reliability_fails_when_cleanup_is_unverified_without_attempt(
         (
             {nodeid: "skipped" for nodeid in RUNTIME_RELIABILITY_TESTS},
             0,
-            4,
+            len(RUNTIME_RELIABILITY_TESTS),
         ),
-        ({RUNTIME_RELIABILITY_TESTS[-1]: "skipped"}, 3, 1),
+        (
+            {RUNTIME_RELIABILITY_TESTS[-1]: "skipped"},
+            len(RUNTIME_RELIABILITY_TESTS) - 1,
+            1,
+        ),
     ],
     ids=["all-skipped", "partially-skipped"],
 )
@@ -480,7 +484,7 @@ def test_runtime_reliability_rejects_noncanonical_junit_structure(
         cases = raw[case_start:case_end]
         if variant == "declared-counts-mismatch":
             raw = raw.replace(
-                'errors="0" failures="0" skipped="0" tests="4"',
+                f'errors="0" failures="0" skipped="0" tests="{len(RUNTIME_RELIABILITY_TESTS)}"',
                 'errors="7" failures="6" skipped="5" tests="99"',
             )
         elif variant == "suite-level-error":
@@ -494,7 +498,7 @@ def test_runtime_reliability_rejects_noncanonical_junit_structure(
         elif variant == "testcases-nested-in-failure":
             raw = (
                 '<testsuites name="pytest tests"><testsuite name="pytest" '
-                'errors="0" failures="0" skipped="0" tests="4">'
+                f'errors="0" failures="0" skipped="0" tests="{len(RUNTIME_RELIABILITY_TESTS)}">'
                 f'<failure message="nested">{cases}</failure>'
                 "</testsuite></testsuites>"
             )
@@ -903,6 +907,7 @@ def test_iteration_invoker_uses_a_fresh_interpreter_and_basetemp_per_repeat(
         "tests/test_channels.py::test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay",
         "tests/test_channels.py::test_server_exposes_channel_ingest_route",
         "tests/test_full_agent_runtime.py::test_run_manager_heartbeat_renews_and_releases_its_run_lease",
+        "tests/test_full_agent_runtime.py::test_cancelling_queued_run_finishes_publication_fence_without_worker",
         "tests/test_full_agent_runtime.py::test_cross_manager_task_approval_waits_for_origin_lease_and_wakes_scheduler",
     )
     assert len(calls) == 2

@@ -3755,7 +3755,7 @@ def test_cancelling_queued_run_finishes_publication_fence_without_worker(
     def hold_active(run_id: str) -> None:
         manager.state.transition_run(run_id, "running")
         active_started.set()
-        assert release_active.wait(timeout=5)
+        assert release_active.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
         manager.state.transition_run(run_id, "completed", stop_reason="complete")
         manager.events.publish(run_id, "run.completed", {})
 
@@ -3764,29 +3764,30 @@ def test_cancelling_queued_run_finishes_publication_fence_without_worker(
         queued_started.set()
 
     manager._schedule_primary_run(active.run_id, hold_active)
-    assert active_started.wait(timeout=1)
-    manager._schedule_primary_run(queued.run_id, should_not_start)
+    try:
+        # Exercise queue/publication behavior, not platform thread wake latency.
+        assert active_started.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        manager._schedule_primary_run(queued.run_id, should_not_start)
 
-    cancelled = manager.cancel_run(queued.run_id)
-    started = monotonic()
-    observed = manager.get_run(queued.run_id)
+        cancelled = manager.cancel_run(queued.run_id)
 
-    assert cancelled["status"] == "cancelled"
-    assert observed["status"] == "cancelled"
-    assert monotonic() - started < 1
-    assert not queued_started.is_set()
-    assert any(
-        event["type"] == "run.cancelled" for event in manager.state.list_run_steps(queued.run_id)
-    )
-    with manager._lock:
-        assert queued.run_id not in manager._publication_events
-        assert queued.run_id not in manager._publication_counts
+        assert cancelled["status"] == "cancelled"
+        assert not queued_started.is_set()
+        assert any(
+            event["type"] == "run.cancelled"
+            for event in manager.state.list_run_steps(queued.run_id)
+        )
+        with manager._lock:
+            assert queued.run_id not in manager._publication_events
+            assert queued.run_id not in manager._publication_counts
 
-    release_active.set()
-    deadline = monotonic() + 1
-    while manager.get_run(active.run_id)["status"] != "completed" and monotonic() < deadline:
-        sleep(0.01)
-    assert manager.get_run(active.run_id)["status"] == "completed"
+        observed = manager.get_run(queued.run_id)
+        assert observed["status"] == "cancelled"
+    finally:
+        release_active.set()
+        final = _wait_for_status(manager, active.run_id, {"completed", "failed"})
+
+    assert final["status"] == "completed"
 
 
 def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:

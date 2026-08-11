@@ -110,7 +110,7 @@ def _write_pytest_junit(repeat_root: Path) -> None:
 
 
 def _completed_process(*, native_windows_cleanup: bool = False) -> BoundedProcessResult:
-    stdout = "4 passed\n"
+    stdout = "5 passed\n"
     return BoundedProcessResult(
         returncode=0,
         stdout=stdout,
@@ -401,7 +401,7 @@ def test_builds_and_independently_verifies_exact_five_cell_qualification(
         "completed_repeats": 100,
         "runtime_repeats": 60,
         "golden_repeats": 40,
-        "runtime_test_executions": 240,
+        "runtime_test_executions": 300,
         "golden_case_executions": 840,
         "failure_count": 0,
         "observed_flake_count": 0,

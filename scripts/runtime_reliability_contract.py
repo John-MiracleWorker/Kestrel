@@ -6,6 +6,7 @@ RUNTIME_RELIABILITY_TESTS = (
     "tests/test_channels.py::test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay",
     "tests/test_channels.py::test_server_exposes_channel_ingest_route",
     "tests/test_full_agent_runtime.py::test_run_manager_heartbeat_renews_and_releases_its_run_lease",
+    "tests/test_full_agent_runtime.py::test_cancelling_queued_run_finishes_publication_fence_without_worker",
     "tests/test_full_agent_runtime.py::test_cross_manager_task_approval_waits_for_origin_lease_and_wakes_scheduler",
 )
 
