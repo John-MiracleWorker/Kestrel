@@ -5898,8 +5898,8 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
             }
         )
 
-    def wait_for_terminal_event() -> tuple[str, list[dict[str, Any]]]:
-        deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
+    def wait_for_terminal_event(*, timeout_seconds: float) -> tuple[str, list[dict[str, Any]]]:
+        deadline = monotonic() + timeout_seconds
         observed: list[dict[str, Any]] = []
         while monotonic() < deadline:
             try:
@@ -5947,7 +5947,13 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
                 approved=True,
                 arguments=dict(approval["arguments"]),
             )
-        terminal_event, terminal_observed = wait_for_terminal_event()
+        # The final continuation performs a real git commit, closes the agent,
+        # reconciles the scheduler DAG, and publishes the terminal run event.
+        # Treat that as an end-to-end public run boundary rather than a single
+        # asynchronous wake-up.
+        terminal_event, terminal_observed = wait_for_terminal_event(
+            timeout_seconds=_PUBLIC_RUN_TIMEOUT_SECONDS
+        )
     finally:
         manager.events.unsubscribe(run.run_id, subscriber)
 
@@ -6860,7 +6866,7 @@ def test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization(
             context: ToolContext,
         ) -> ToolExecution:
             del context
-            assert renewal_started.wait(timeout=1)
+            assert renewal_started.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
             return ToolExecution(
                 call=ToolCall(name=self.spec.name, arguments=arguments),
                 success=True,
@@ -6907,7 +6913,7 @@ def test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization(
     def delayed_failed_renewal(*args: Any, **kwargs: Any) -> bool:
         del args, kwargs
         renewal_started.set()
-        assert release_renewal.wait(timeout=3)
+        assert release_renewal.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
         renewal_returned.set()
         return False
 
@@ -6927,33 +6933,54 @@ def test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization(
         memory=build_memory_system("memory", tmp_path / "execution-memory"),
         event_log=None,
     )
-    completed = Event()
+    heartbeat_threads: list[Thread] = []
+    original_thread = run_manager_module.Thread
+
+    def capture_heartbeat_thread(*args: Any, **kwargs: Any) -> Thread:
+        thread = original_thread(*args, **kwargs)
+        if str(kwargs.get("name", "")).startswith("kestrel-approval-heartbeat-"):
+            heartbeat_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(run_manager_module, "Thread", capture_heartbeat_thread)
     result: list[tuple[ToolCall, ToolExecution]] = []
+    execution_errors: list[BaseException] = []
 
     def execute() -> None:
-        result.append(
-            manager._execute_approved_tool(
-                agent,
-                approval,
-                {},
-                "session",
+        try:
+            result.append(
+                manager._execute_approved_tool(
+                    agent,
+                    approval,
+                    {},
+                    "session",
+                )
             )
-        )
-        completed.set()
+        except BaseException as exc:  # pragma: no cover - surfaced on the parent thread
+            execution_errors.append(exc)
 
     execution_thread = Thread(target=execute, daemon=True)
     execution_thread.start()
-    assert completed.wait(timeout=2)
-    assert result[0][1].success is True
-    assert manager.state.get_approval(str(approval["approval_id"]))["result"]["success"] is True
-    assert cancelled_runs == []
+    try:
+        execution_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        assert not execution_thread.is_alive()
+        assert execution_errors == []
+        assert result[0][1].success is True
+        assert manager.state.get_approval(str(approval["approval_id"]))["result"]["success"] is True
+        assert cancelled_runs == []
+    finally:
+        release_renewal.set()
+        execution_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        for heartbeat_thread in heartbeat_threads:
+            heartbeat_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
 
     # Let the storage call return a rejected renewal only after the durable
     # result exists.  The heartbeat must re-check stop and exit without a late
     # cancellation.
-    release_renewal.set()
-    assert renewal_returned.wait(timeout=1)
-    sleep(0.05)
+    assert not execution_thread.is_alive()
+    assert len(heartbeat_threads) == 1
+    assert renewal_returned.is_set()
+    assert not heartbeat_threads[0].is_alive()
     assert cancelled_runs == []
 
 

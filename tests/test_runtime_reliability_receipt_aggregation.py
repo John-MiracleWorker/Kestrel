@@ -401,7 +401,7 @@ def test_builds_and_independently_verifies_exact_five_cell_qualification(
         "completed_repeats": 100,
         "runtime_repeats": 60,
         "golden_repeats": 40,
-        "runtime_test_executions": 300,
+        "runtime_test_executions": 420,
         "golden_case_executions": 840,
         "failure_count": 0,
         "observed_flake_count": 0,
