@@ -17,6 +17,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runtime-reliability:
+    name: Runtime reliability (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11"]
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONHASHSEED: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+      - name: Install runtime reliability dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r config/python-build-bootstrap.txt
+          uv export --frozen --no-dev --no-emit-local --extra dev --format requirements.txt --output-file "${RUNNER_TEMP}/requirements-runtime-reliability.txt"
+          python -m pip install --require-hashes --only-binary=:all: -r "${RUNNER_TEMP}/requirements-runtime-reliability.txt"
+          python -m pip install --no-build-isolation --no-deps -e '.[dev]'
+          python -m pip check
+      - name: Run twenty fresh-process runtime reliability repetitions
+        run: >-
+          python scripts/run_runtime_reliability.py
+          --repeats 20
+          --source-commit "${SOURCE_COMMIT}"
+          --run-root "${RUNNER_TEMP}/kestrel-runtime-reliability-runs"
+          --output "${RUNNER_TEMP}/kestrel-runtime-reliability-report.json"
+          --workspace "."
+          --iteration-timeout-seconds 150
+      - name: Upload runtime reliability receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-runtime-reliability-${{ runner.os }}-${{ env.SOURCE_COMMIT }}
+          path: |
+            ${{ runner.temp }}/kestrel-runtime-reliability-report.json
+            ${{ runner.temp }}/kestrel-runtime-reliability-runs/repeat-*/iteration-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
   everyday-golden-determinism:
     runs-on: ubuntu-latest
     timeout-minutes: 90

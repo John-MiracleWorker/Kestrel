@@ -481,6 +481,123 @@ def test_determinism_jobs_install_hash_locked_dependency_closures() -> None:
         assert logical_commands == commands
 
 
+def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hosts() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "determinism.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    runtime = workflow["jobs"]["runtime-reliability"]
+
+    assert runtime["runs-on"] == "${{ matrix.os }}"
+    assert runtime["timeout-minutes"] == 60
+    assert runtime["defaults"] == {"run": {"shell": "bash"}}
+    assert runtime["strategy"] == {
+        "fail-fast": False,
+        "matrix": {
+            "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+            "python-version": ["3.11"],
+        },
+    }
+    checkout = next(
+        step
+        for step in runtime["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout["uses"] == (
+        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+    )
+    assert checkout["with"] == {
+        "persist-credentials": False,
+        "ref": "${{ env.SOURCE_COMMIT }}",
+    }
+    setup = next(
+        step
+        for step in runtime["steps"]
+        if str(step.get("uses", "")).startswith("actions/setup-python@")
+    )
+    assert setup["uses"] == (
+        "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+    )
+    assert setup["with"]["python-version"] == "${{ matrix.python-version }}"
+    setup_uv = next(
+        step for step in runtime["steps"] if step.get("name") == "Install pinned uv"
+    )
+    assert setup_uv == {
+        "name": "Install pinned uv",
+        "uses": "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b",
+        "with": {"version": "0.11.16"},
+    }
+    install = next(
+        step["run"]
+        for step in runtime["steps"]
+        if step.get("name") == "Install runtime reliability dependencies"
+    )
+    logical_commands: list[str] = []
+    continued = ""
+    for line in install.splitlines():
+        stripped = line.strip()
+        continued = f"{continued} {stripped}".strip()
+        if continued.endswith("\\"):
+            continued = continued[:-1].rstrip()
+            continue
+        logical_commands.append(continued)
+        continued = ""
+
+    assert not continued
+    assert logical_commands == [
+        "python -m pip install --require-hashes --only-binary=:all: "
+        "-r config/python-build-bootstrap.txt",
+        "uv export --frozen --no-dev --no-emit-local --extra dev "
+        '--format requirements.txt --output-file "${RUNNER_TEMP}/requirements-runtime-reliability.txt"',
+        "python -m pip install --require-hashes --only-binary=:all: "
+        '-r "${RUNNER_TEMP}/requirements-runtime-reliability.txt"',
+        "python -m pip install --no-build-isolation --no-deps -e '.[dev]'",
+        "python -m pip check",
+    ]
+    invocation = next(
+        step["run"]
+        for step in runtime["steps"]
+        if step.get("name") == "Run twenty fresh-process runtime reliability repetitions"
+    )
+    assert "scripts/run_runtime_reliability.py" in invocation
+    assert "--repeats 20" in invocation
+    assert '--source-commit "${SOURCE_COMMIT}"' in invocation
+    assert '--run-root "${RUNNER_TEMP}/kestrel-runtime-reliability-runs"' in invocation
+    assert '--output "${RUNNER_TEMP}/kestrel-runtime-reliability-report.json"' in invocation
+    assert '--workspace "."' in invocation
+    assert "--iteration-timeout-seconds 150" in invocation
+    tokens = invocation.split()
+    repeats = int(tokens[tokens.index("--repeats") + 1])
+    iteration_timeout = int(tokens[tokens.index("--iteration-timeout-seconds") + 1])
+    assert repeats * iteration_timeout <= runtime["timeout-minutes"] * 60 - 600
+    run_scripts = "\n".join(
+        str(step["run"]) for step in runtime["steps"] if "run" in step
+    )
+    assert "${{ env.SOURCE_COMMIT }}" not in run_scripts
+    assert "${{ runner.temp }}" not in run_scripts
+    upload = next(
+        step
+        for step in runtime["steps"]
+        if step.get("name") == "Upload runtime reliability receipts"
+    )
+    assert upload["if"] == "always()"
+    assert upload["uses"] == (
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    )
+    assert upload["with"]["name"] == (
+        "kestrel-runtime-reliability-${{ runner.os }}-${{ env.SOURCE_COMMIT }}"
+    )
+    assert upload["with"]["path"].splitlines() == [
+        "${{ runner.temp }}/kestrel-runtime-reliability-report.json",
+        "${{ runner.temp }}/kestrel-runtime-reliability-runs/repeat-*/iteration-receipt.json",
+    ]
+    assert "pytest-results.xml" not in upload["with"]["path"]
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["retention-days"] == 14
+    assert "github.sha" not in json.dumps(runtime, sort_keys=True)
+
+
 def test_release_rehearsal_lane_is_repeatable_and_has_no_publication_authority() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release-rehearsal.yml").read_text(
         encoding="utf-8"

@@ -5,6 +5,7 @@ import hmac
 import json
 import queue
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
@@ -54,11 +55,87 @@ from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import AgentStateStore
 from nested_memvid_agent.tools.builtin import build_default_tools
 
+_ASYNC_EVENT_TIMEOUT_SECONDS = 15.0
+_ASYNC_SHUTDOWN_TIMEOUT_SECONDS = 15.0
+_TERMINAL_RUN_EVENT_TYPES = {
+    "run.admission_failed",
+    "run.cancelled",
+    "run.completed",
+    "run.failed",
+}
+
+
+def _wait_for_terminal_run_event(
+    terminal_events: queue.Queue[Any],
+    *,
+    run_id: str,
+    timeout_seconds: float,
+    observed_events: list[dict[str, str]],
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Any:
+    deadline = monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise queue.Empty
+        event = terminal_events.get(timeout=remaining)
+        observed_events.append({"run_id": event.run_id, "type": event.type})
+        if event.run_id == run_id:
+            return event
+
 
 @pytest.fixture(autouse=True)
 def _authorized_telegram_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "12345")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "777,999")
+
+
+def test_terminal_event_wait_uses_one_absolute_deadline() -> None:
+    observed_timeouts: list[float] = []
+    events = iter(
+        [
+            SimpleNamespace(run_id="unrelated", type="run.completed"),
+            SimpleNamespace(run_id="target", type="run.completed"),
+        ]
+    )
+
+    class FakeQueue:
+        def get(self, *, timeout: float) -> Any:
+            observed_timeouts.append(timeout)
+            return next(events)
+
+    clock = iter([100.0, 101.0, 104.0])
+    observed_events: list[dict[str, str]] = []
+    event = _wait_for_terminal_run_event(
+        cast(queue.Queue[Any], FakeQueue()),
+        run_id="target",
+        timeout_seconds=15.0,
+        observed_events=observed_events,
+        monotonic=lambda: next(clock),
+    )
+
+    assert event.run_id == "target"
+    assert observed_timeouts == [14.0, 11.0]
+    assert observed_events == [
+        {"run_id": "unrelated", "type": "run.completed"},
+        {"run_id": "target", "type": "run.completed"},
+    ]
+
+
+def test_terminal_event_wait_fails_before_reading_after_deadline() -> None:
+    class NoReadQueue:
+        def get(self, *, timeout: float) -> Any:
+            pytest.fail(f"queue read started after deadline with timeout={timeout}")
+
+    clock = iter([100.0, 115.0])
+    with pytest.raises(queue.Empty):
+        _wait_for_terminal_run_event(
+            cast(queue.Queue[Any], NoReadQueue()),
+            run_id="target",
+            timeout_seconds=15.0,
+            observed_events=[],
+            monotonic=lambda: next(clock),
+        )
 
 
 def test_safe_channel_session_ids_preserve_legacy_continuity() -> None:
@@ -145,6 +222,7 @@ def test_telegram_channel_payload_runs_agent_and_records_provenance(tmp_path: Pa
 
 def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     class CapturingProvider(LLMProvider):
         def __init__(self) -> None:
@@ -174,6 +252,12 @@ def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
         events=RunEventBus(state),
         mcp=MCPManager(state),
         skills=SkillManager(config.skills_dir, state),
+    )
+    request.addfinalizer(
+        lambda: (
+            run_manager.shutdown(timeout_seconds=_ASYNC_SHUTDOWN_TIMEOUT_SECONDS)
+            or pytest.fail("RunManager did not shut down within the test deadline")
+        )
     )
     provider = CapturingProvider()
 
@@ -230,14 +314,51 @@ def test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay(
         "transcript_scope": "channel",
     }
 
+    terminal_events: queue.Queue[Any] = queue.Queue()
+    publish = run_manager.events.publish
+
+    def publish_and_signal_terminal(
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> Any:
+        event = publish(run_id, event_type, payload)
+        if event_type in _TERMINAL_RUN_EVENT_TYPES:
+            terminal_events.put(event)
+        return event
+
+    run_manager.events.publish = publish_and_signal_terminal  # type: ignore[method-assign]
     primary = run_manager.create_run(
         message="Continue provenance-e2e-71c4",
         session_id=persisted.session_id,
     )
-    deadline = time.monotonic() + 5
-    while run_manager.get_run(primary.run_id)["status"] not in {"completed", "failed"}:
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
+    observed_terminal_events: list[dict[str, str]] = []
+    try:
+        _wait_for_terminal_run_event(
+            terminal_events,
+            run_id=primary.run_id,
+            timeout_seconds=_ASYNC_EVENT_TIMEOUT_SECONDS,
+            observed_events=observed_terminal_events,
+        )
+    except queue.Empty:
+        pytest.fail(
+            "primary replay did not publish a terminal event: "
+            + json.dumps(
+                {
+                    "run": run_manager.get_run(primary.run_id),
+                    "observed_terminal_events": observed_terminal_events,
+                    "run_step_types": [
+                        step["type"] for step in state.list_run_steps(primary.run_id)
+                    ],
+                },
+                default=str,
+                sort_keys=True,
+            )
+        )
+    assert observed_terminal_events[-1] == {
+        "run_id": primary.run_id,
+        "type": "run.completed",
+    }
     assert run_manager.get_run(primary.run_id)["status"] == "completed"
     primary_task_titles = [
         task.title
@@ -983,6 +1104,7 @@ def test_server_exposes_channel_ingest_route(tmp_path: Path, started_test_client
     assert payload["session_id"] == durable_channel_session_id(
         channel="webhook", channel_id="webhook", conversation_id="thread"
     )
+    assert payload["stop_reason"] == "complete"
     assert payload["assistant_message"] == "Mock response: hello api channel"
     assert payload["delivery"]["dry_run"] is True
 
