@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -11,23 +12,68 @@ import pytest
 from scripts.bounded_process import BoundedProcessResult
 from scripts.run_runtime_reliability import (
     RUNTIME_RELIABILITY_TESTS,
+    _load_test_evidence,
+    _write_json,
     build_iteration_invoker,
     resolve_git_head,
     run_runtime_reliability,
 )
 
 SOURCE_COMMIT = "a" * 40
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def _completed_process(*, returncode: int = 0, stdout: str = "4 passed\n") -> BoundedProcessResult:
+def _write_pytest_junit(
+    repeat_root: Path,
+    *,
+    outcomes: dict[str, str] | None = None,
+    nodeids: tuple[str, ...] = RUNTIME_RELIABILITY_TESTS,
+) -> tuple[str, int]:
+    outcomes = {} if outcomes is None else outcomes
+    cases: list[str] = []
+    counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+    for nodeid in nodeids:
+        path, name = nodeid.split("::", maxsplit=1)
+        classname = path.removesuffix(".py").replace("/", ".")
+        outcome = outcomes.get(nodeid, "passed")
+        counts[outcome] += 1
+        child = {
+            "passed": "",
+            "failed": '<failure message="failed" />',
+            "error": '<error message="error" />',
+            "skipped": '<skipped message="skipped" />',
+        }[outcome]
+        cases.append(
+            f'<testcase classname="{classname}" name="{name}" time="0.01">'
+            f"{child}</testcase>"
+        )
+    raw = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites name="pytest tests"><testsuite name="pytest" '
+        f'errors="{counts["error"]}" failures="{counts["failed"]}" '
+        f'skipped="{counts["skipped"]}" tests="{len(nodeids)}">'
+        f'{"".join(cases)}</testsuite></testsuites>'
+    ).encode()
+    path = repeat_root / "pytest-results.xml"
+    path.write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def _completed_process(
+    *,
+    returncode: int = 0,
+    stdout: str = "4 passed\n",
+    cleanup_attempted: bool = False,
+    cleanup_succeeded: bool = True,
+) -> BoundedProcessResult:
     return BoundedProcessResult(
         returncode=returncode,
         stdout=stdout,
         stderr="",
         elapsed_seconds=1.25,
         timed_out=False,
-        cleanup_attempted=False,
-        cleanup_succeeded=True,
+        cleanup_attempted=cleanup_attempted,
+        cleanup_succeeded=cleanup_succeeded,
         termination_method=None,
         stdout_total_bytes=len(stdout.encode("utf-8")),
         stderr_total_bytes=0,
@@ -39,11 +85,13 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
 ) -> None:
     observed_roots: list[Path] = []
     identity_checks: list[Path] = []
+    evidence_sources: dict[int, tuple[str, int]] = {}
 
     def invoke(repeat: int, repeat_root: Path) -> BoundedProcessResult:
         assert repeat == len(observed_roots) + 1
         assert repeat_root.is_dir()
         observed_roots.append(repeat_root)
+        evidence_sources[repeat] = _write_pytest_junit(repeat_root)
         return _completed_process()
 
     def resolve_identity(workspace: Path) -> str:
@@ -106,6 +154,42 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
         assert run["repeat"] == repeat
         assert run["status"] == "completed"
         assert run["derived_passed"] is True
+        digest, size_bytes = evidence_sources[repeat]
+        assert run["test_evidence"] == {
+            "schema": "kestrel.pytest_evidence.v1",
+            "format": "junit_xml",
+            "source": {
+                "path": "pytest-results.xml",
+                "sha256": digest,
+                "size_bytes": size_bytes,
+            },
+            "expected_tests": list(RUNTIME_RELIABILITY_TESTS),
+            "observed": [
+                {"nodeid": nodeid, "outcome": "passed"}
+                for nodeid in RUNTIME_RELIABILITY_TESTS
+            ],
+            "summary": {
+                "expected": 4,
+                "observed": 4,
+                "passed": 4,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "missing": [],
+                "unexpected": [],
+                "duplicates": [],
+                "declared": {
+                    "tests": 4,
+                    "errors": 0,
+                    "failures": 0,
+                    "skipped": 0,
+                },
+                "declared_matches": True,
+            },
+            "status": "verified",
+            "passed": True,
+            "raw_source_retained": False,
+        }
         assert run["workspace_identity"] == {
             "before": expected_identity,
             "after": expected_identity,
@@ -116,7 +200,442 @@ def test_runtime_reliability_requires_twenty_fresh_passing_subprocess_receipts(
             )
         )
         assert receipt == run
+        assert not (tmp_path / "runs" / f"repeat-{repeat:02d}" / "pytest-results.xml").exists()
     assert json.loads(output.read_text(encoding="utf-8")) == report
+
+
+def test_runtime_reliability_fails_when_cleanup_is_unverified_without_attempt(
+    tmp_path: Path,
+) -> None:
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=lambda _repeat, _repeat_root: _completed_process(
+            cleanup_attempted=False,
+            cleanup_succeeded=False,
+        ),
+        source_commit=SOURCE_COMMIT,
+        workspace=tmp_path,
+        resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+        runner_os="Linux",
+        runner_arch="x86_64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    assert report["summary"]["passed"] is False
+    assert report["summary"]["completed_repeats"] == 1
+    assert report["summary"]["consecutive_passes"] == 0
+    assert report["summary"]["failure_count"] == 1
+    receipt = report["runs"][0]
+    assert receipt["status"] == "cleanup_unverified"
+    assert receipt["derived_passed"] is False
+    assert receipt["cleanup"] == {
+        "attempted": False,
+        "succeeded": False,
+        "method": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected_passed", "expected_skipped"),
+    [
+        (
+            {nodeid: "skipped" for nodeid in RUNTIME_RELIABILITY_TESTS},
+            0,
+            4,
+        ),
+        ({RUNTIME_RELIABILITY_TESTS[-1]: "skipped"}, 3, 1),
+    ],
+    ids=["all-skipped", "partially-skipped"],
+)
+def test_runtime_reliability_rejects_zero_exit_with_skipped_tests(
+    tmp_path: Path,
+    outcomes: dict[str, str],
+    expected_passed: int,
+    expected_skipped: int,
+) -> None:
+    def invoke(_repeat: int, repeat_root: Path) -> BoundedProcessResult:
+        _write_pytest_junit(repeat_root, outcomes=outcomes)
+        return _completed_process(stdout=f"{expected_passed} passed, {expected_skipped} skipped\n")
+
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        workspace=tmp_path,
+        resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+        runner_os="Linux",
+        runner_arch="x86_64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    assert report["summary"]["passed"] is False
+    assert report["summary"]["completed_repeats"] == 1
+    assert report["summary"]["consecutive_passes"] == 0
+    receipt = report["runs"][0]
+    assert receipt["status"] == "test_evidence_invalid"
+    assert receipt["derived_passed"] is False
+    evidence = receipt["test_evidence"]
+    assert evidence["status"] == "mismatch"
+    assert evidence["passed"] is False
+    assert evidence["summary"]["passed"] == expected_passed
+    assert evidence["summary"]["skipped"] == expected_skipped
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_status"),
+    [
+        (None, "missing"),
+        (b"<testsuites><broken>", "malformed"),
+        (
+            b'<!DOCTYPE testsuites [<!ENTITY injected "boom">]>'
+            b"<testsuites>&injected;</testsuites>",
+            "malformed",
+        ),
+        (
+            b'<testsuites name="pytest tests"><testsuite name="pytest" errors="0" '
+            b'failures="0" skipped="0" tests="'
+            + (b"9" * 5_000)
+            + b'"></testsuite></testsuites>',
+            "malformed",
+        ),
+    ],
+)
+def test_runtime_reliability_rejects_missing_or_malformed_test_evidence(
+    tmp_path: Path,
+    raw: bytes | None,
+    expected_status: str,
+) -> None:
+    def invoke(_repeat: int, repeat_root: Path) -> BoundedProcessResult:
+        if raw is not None:
+            (repeat_root / "pytest-results.xml").write_bytes(raw)
+        return _completed_process()
+
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        workspace=tmp_path,
+        resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+        runner_os="Linux",
+        runner_arch="x86_64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    receipt = report["runs"][0]
+    assert receipt["status"] == "test_evidence_invalid"
+    assert receipt["derived_passed"] is False
+    assert receipt["test_evidence"]["status"] == expected_status
+    assert receipt["test_evidence"]["passed"] is False
+    assert not (tmp_path / "runs" / "repeat-01" / "pytest-results.xml").exists()
+
+
+def test_runtime_reliability_discards_unredacted_junit_diagnostics(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-proj-runtime-junit-leak-123456789"
+
+    def invoke(_repeat: int, repeat_root: Path) -> BoundedProcessResult:
+        _write_pytest_junit(
+            repeat_root,
+            outcomes={RUNTIME_RELIABILITY_TESTS[0]: "failed"},
+        )
+        evidence_path = repeat_root / "pytest-results.xml"
+        raw = evidence_path.read_text(encoding="utf-8")
+        evidence_path.write_text(
+            raw.replace('message="failed"', f'message="{secret}"'),
+            encoding="utf-8",
+        )
+        return _completed_process(returncode=1, stdout=f"failure: {secret}\n")
+
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        workspace=tmp_path,
+        resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+        runner_os="Linux",
+        runner_arch="x86_64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    receipt = report["runs"][0]
+    assert receipt["status"] == "runner_nonzero"
+    assert receipt["test_evidence"]["summary"]["failed"] == 1
+    assert secret not in json.dumps(report)
+    assert not (tmp_path / "runs" / "repeat-01" / "pytest-results.xml").exists()
+
+
+def test_runtime_reliability_fails_closed_if_raw_evidence_cannot_be_discarded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repeat_root = tmp_path / "repeat-01"
+    repeat_root.mkdir()
+    _write_pytest_junit(repeat_root)
+    evidence_path = repeat_root / "pytest-results.xml"
+    unlink = Path.unlink
+
+    def fail_evidence_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == evidence_path:
+            raise OSError("simulated evidence cleanup failure")
+        unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_evidence_unlink)
+
+    evidence = _load_test_evidence(evidence_path)
+
+    assert evidence["status"] == "raw_cleanup_failed"
+    assert evidence["passed"] is False
+    assert "simulated evidence cleanup failure" in evidence["error"]
+
+
+@pytest.mark.parametrize(
+    ("nodeids", "expected_missing", "expected_unexpected", "expected_duplicates"),
+    [
+        (
+            (
+                *RUNTIME_RELIABILITY_TESTS[:-1],
+                "tests/test_channels.py::test_unexpected_runtime_case",
+            ),
+            [RUNTIME_RELIABILITY_TESTS[-1]],
+            ["tests.test_channels::test_unexpected_runtime_case"],
+            [],
+        ),
+        (
+            (*RUNTIME_RELIABILITY_TESTS[:-1], RUNTIME_RELIABILITY_TESTS[-2]),
+            [RUNTIME_RELIABILITY_TESTS[-1]],
+            [],
+            [RUNTIME_RELIABILITY_TESTS[-2]],
+        ),
+    ],
+    ids=["unexpected", "duplicate"],
+)
+def test_runtime_reliability_rejects_evidence_for_the_wrong_test_set(
+    tmp_path: Path,
+    nodeids: tuple[str, ...],
+    expected_missing: list[str],
+    expected_unexpected: list[str],
+    expected_duplicates: list[str],
+) -> None:
+    def invoke(_repeat: int, repeat_root: Path) -> BoundedProcessResult:
+        _write_pytest_junit(repeat_root, nodeids=nodeids)
+        return _completed_process()
+
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        workspace=tmp_path,
+        resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+        runner_os="Linux",
+        runner_arch="x86_64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    evidence = report["runs"][0]["test_evidence"]
+    assert report["runs"][0]["status"] == "test_evidence_invalid"
+    assert evidence["summary"]["missing"] == expected_missing
+    assert evidence["summary"]["unexpected"] == expected_unexpected
+    assert evidence["summary"]["duplicates"] == expected_duplicates
+    assert evidence["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "declared-counts-mismatch",
+        "suite-level-error",
+        "testcases-directly-under-root",
+        "testcases-nested-in-failure",
+        "outcome-nested-in-system-output",
+        "namespaced-outcome-nested-in-system-output",
+    ],
+)
+def test_runtime_reliability_rejects_noncanonical_junit_structure(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    def invoke(_repeat: int, repeat_root: Path) -> BoundedProcessResult:
+        _write_pytest_junit(repeat_root)
+        evidence_path = repeat_root / "pytest-results.xml"
+        raw = evidence_path.read_text(encoding="utf-8")
+        suite_start = raw.index('<testsuite name="pytest"')
+        case_start = raw.index(">", suite_start) + 1
+        case_end = raw.index("</testsuite>", case_start)
+        cases = raw[case_start:case_end]
+        if variant == "declared-counts-mismatch":
+            raw = raw.replace(
+                'errors="0" failures="0" skipped="0" tests="4"',
+                'errors="7" failures="6" skipped="5" tests="99"',
+            )
+        elif variant == "suite-level-error":
+            raw = raw.replace(
+                "</testsuite>",
+                '<error message="collection failed" /></testsuite>',
+                1,
+            )
+        elif variant == "testcases-directly-under-root":
+            raw = f'<testsuites name="pytest tests">{cases}</testsuites>'
+        elif variant == "testcases-nested-in-failure":
+            raw = (
+                '<testsuites name="pytest tests"><testsuite name="pytest" '
+                'errors="0" failures="0" skipped="0" tests="4">'
+                f'<failure message="nested">{cases}</failure>'
+                "</testsuite></testsuites>"
+            )
+        elif variant == "outcome-nested-in-system-output":
+            raw = raw.replace(
+                "</testcase>",
+                '<system-out><failure message="hidden" /></system-out></testcase>',
+                1,
+            )
+        elif variant == "namespaced-outcome-nested-in-system-output":
+            raw = raw.replace(
+                "</testcase>",
+                '<system-out><failure xmlns="urn:hidden" /></system-out></testcase>',
+                1,
+            )
+        else:  # pragma: no cover - the parametrization is exhaustive
+            raise AssertionError(f"unexpected variant: {variant}")
+        evidence_path.write_text(raw, encoding="utf-8")
+        return _completed_process()
+
+    report = run_runtime_reliability(
+        repeats=20,
+        run_root=tmp_path / "runs",
+        output=tmp_path / "report.json",
+        invoke=invoke,
+        source_commit=SOURCE_COMMIT,
+        workspace=tmp_path,
+        resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+        runner_os="Linux",
+        runner_arch="x86_64",
+        python_version="3.11.9",
+        iteration_timeout_seconds=900.0,
+    )
+
+    receipt = report["runs"][0]
+    assert report["summary"]["passed"] is False
+    assert report["summary"]["completed_repeats"] == 1
+    assert receipt["status"] == "test_evidence_invalid"
+    assert receipt["derived_passed"] is False
+    assert receipt["test_evidence"]["status"] in {"malformed", "mismatch"}
+    assert receipt["test_evidence"]["passed"] is False
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+def test_runtime_reliability_rejects_non_finite_iteration_deadlines(
+    tmp_path: Path,
+    timeout: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite and greater than zero"):
+        run_runtime_reliability(
+            repeats=20,
+            run_root=tmp_path / "runs",
+            output=tmp_path / "report.json",
+            invoke=lambda _repeat, _repeat_root: _completed_process(),
+            source_commit=SOURCE_COMMIT,
+            workspace=tmp_path,
+            resolve_workspace_head=lambda _workspace: SOURCE_COMMIT,
+            runner_os="Linux",
+            runner_arch="x86_64",
+            python_version="3.11.9",
+            iteration_timeout_seconds=timeout,
+        )
+    with pytest.raises(ValueError, match="finite and greater than zero"):
+        build_iteration_invoker(
+            workspace=tmp_path,
+            python_executable=sys.executable,
+            iteration_timeout_seconds=timeout,
+        )
+
+    assert not (tmp_path / "runs").exists()
+    assert not (tmp_path / "report.json").exists()
+
+
+@pytest.mark.parametrize("timeout", ["nan", "inf", "-inf"])
+def test_runtime_reliability_cli_rejects_non_finite_iteration_deadlines(
+    tmp_path: Path,
+    timeout: str,
+) -> None:
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/run_runtime_reliability.py",
+            "--source-commit",
+            SOURCE_COMMIT,
+            f"--iteration-timeout-seconds={timeout}",
+            "--run-root",
+            str(tmp_path / "runs"),
+            "--output",
+            str(tmp_path / "report.json"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "finite and greater than 0" in completed.stderr
+    assert "traceback" not in completed.stderr.lower()
+    assert not (tmp_path / "runs").exists()
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_runtime_reliability_default_receipt_root_is_git_ignored() -> None:
+    for receipt_path in (
+        "tmp-runtime-reliability/runs/repeat-01/iteration-receipt.json",
+        "tmp-runtime-reliability/report.json",
+    ):
+        completed = subprocess.run(  # noqa: S603
+            ["git", "check-ignore", "--quiet", receipt_path],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        assert completed.returncode == 0
+
+
+def test_runtime_reliability_writes_receipts_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replace_calls: list[tuple[Path, Path]] = []
+    replace = Path.replace
+
+    def replace_and_record(source: Path, target: Path) -> Path:
+        replace_calls.append((source, target))
+        return replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", replace_and_record)
+    output = tmp_path / "report.json"
+
+    _write_json(output, {"schema": "kestrel.runtime_reliability_report.v1"})
+
+    temporary = tmp_path / ".report.json.tmp"
+    assert replace_calls == [(temporary, output)]
+    assert not temporary.exists()
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "schema": "kestrel.runtime_reliability_report.v1"
+    }
 
 
 def test_runtime_reliability_stops_at_first_failure_with_redacted_diagnostics(
@@ -127,6 +646,7 @@ def test_runtime_reliability_stops_at_first_failure_with_redacted_diagnostics(
     def invoke(repeat: int, _repeat_root: Path) -> BoundedProcessResult:
         invoked.append(repeat)
         if repeat == 1:
+            _write_pytest_junit(_repeat_root)
             return _completed_process()
         return _completed_process(
             returncode=1,
@@ -390,6 +910,8 @@ def test_iteration_invoker_uses_a_fresh_interpreter_and_basetemp_per_repeat(
             *expected_targets,
             "--basetemp",
             str(repeat_root / "pytest-tmp"),
+            "--junitxml",
+            str(repeat_root / "pytest-results.xml"),
         )
         assert call["cwd"] == workspace
         assert call["timeout_seconds"] == 900.0

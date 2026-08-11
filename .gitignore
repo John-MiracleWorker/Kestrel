@@ -17,6 +17,7 @@ memory/
 logs/
 tmp-debug/
 tmp-golden/
+tmp-runtime-reliability/
 .coverage
 htmlcov/
 web/node_modules/

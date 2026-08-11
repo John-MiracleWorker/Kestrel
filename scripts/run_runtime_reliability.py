@@ -12,8 +12,12 @@ import re
 import subprocess  # nosec B404
 import sys
 from collections.abc import Callable, Mapping
+from math import isfinite
 from pathlib import Path
 from typing import cast
+
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -30,6 +34,8 @@ RUNTIME_RELIABILITY_TESTS = (
 )
 DEFAULT_REPEATS = 20
 DEFAULT_ITERATION_TIMEOUT_SECONDS = 900.0
+PYTEST_JUNIT_FILENAME = "pytest-results.xml"
+_MAX_PYTEST_JUNIT_BYTES = 1024 * 1024
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _PYTHON_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[A-Za-z0-9.+-]*)?$")
@@ -40,11 +46,285 @@ BoundedRunner = Callable[..., BoundedProcessResult]
 
 
 def _write_json(path: Path, value: object) -> None:
+    path = path.expanduser().resolve(strict=False)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
-        encoding="utf-8",
+    rendered = json.dumps(
+        value,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=True,
+        allow_nan=False,
     )
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(rendered + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _validate_iteration_timeout(value: float) -> None:
+    if not isfinite(value) or value <= 0:
+        raise ValueError("iteration timeout must be finite and greater than zero")
+
+
+def _expected_junit_cases() -> dict[tuple[str, str], str]:
+    expected: dict[tuple[str, str], str] = {}
+    for nodeid in RUNTIME_RELIABILITY_TESTS:
+        path, name = nodeid.split("::", maxsplit=1)
+        expected[(path.removesuffix(".py").replace("/", "."), name)] = nodeid
+    return expected
+
+
+def _empty_test_evidence(
+    *,
+    status: str,
+    source: dict[str, object],
+    error: str,
+) -> dict[str, object]:
+    return {
+        "schema": "kestrel.pytest_evidence.v1",
+        "format": "junit_xml",
+        "source": source,
+        "expected_tests": list(RUNTIME_RELIABILITY_TESTS),
+        "observed": [],
+        "summary": {
+            "expected": len(RUNTIME_RELIABILITY_TESTS),
+            "observed": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "missing": list(RUNTIME_RELIABILITY_TESTS),
+            "unexpected": [],
+            "duplicates": [],
+            "declared": None,
+            "declared_matches": False,
+        },
+        "status": status,
+        "passed": False,
+        "error": error,
+    }
+
+
+def _parse_test_evidence(path: Path) -> dict[str, object]:
+    source: dict[str, object] = {
+        "path": PYTEST_JUNIT_FILENAME,
+        "sha256": None,
+        "size_bytes": None,
+    }
+    try:
+        size_bytes = path.stat().st_size
+    except FileNotFoundError:
+        return _empty_test_evidence(
+            status="missing",
+            source=source,
+            error="pytest JUnit evidence is missing",
+        )
+    except OSError as exc:
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error=_excerpt(f"could not stat pytest JUnit evidence: {type(exc).__name__}: {exc}"),
+        )
+    source["size_bytes"] = size_bytes
+    if size_bytes > _MAX_PYTEST_JUNIT_BYTES:
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error=f"pytest JUnit evidence exceeds {_MAX_PYTEST_JUNIT_BYTES} bytes",
+        )
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error=_excerpt(f"could not read pytest JUnit evidence: {type(exc).__name__}: {exc}"),
+        )
+    source["size_bytes"] = len(raw)
+    if len(raw) > _MAX_PYTEST_JUNIT_BYTES:
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error=f"pytest JUnit evidence exceeds {_MAX_PYTEST_JUNIT_BYTES} bytes",
+        )
+    source["sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        root = ET.fromstring(raw)
+    except (ET.ParseError, DefusedXmlException):
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error="pytest JUnit evidence is not valid XML",
+        )
+    if root.tag != "testsuites" or root.attrib.get("name") != "pytest tests":
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error="pytest JUnit evidence must use the canonical pytest testsuites root",
+        )
+    root_children = list(root)
+    if len(root_children) != 1 or root_children[0].tag != "testsuite":
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error="pytest JUnit evidence must contain exactly one direct testsuite",
+        )
+    suite = root_children[0]
+    if suite.attrib.get("name") != "pytest":
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error="pytest JUnit evidence must contain the canonical pytest suite",
+        )
+    suite_children = list(suite)
+    testcases = [child for child in suite_children if child.tag == "testcase"]
+    if len(testcases) != len(suite_children) or len(list(root.iter("testcase"))) != len(
+        testcases
+    ):
+        return _empty_test_evidence(
+            status="malformed",
+            source=source,
+            error="pytest JUnit evidence contains invalid testcase nesting or suite outcomes",
+        )
+    declared: dict[str, int] = {}
+    maximum_count = len(RUNTIME_RELIABILITY_TESTS)
+    for attribute in ("tests", "errors", "failures", "skipped"):
+        raw_count = suite.attrib.get(attribute)
+        if (
+            raw_count is None
+            or re.fullmatch(r"\d+", raw_count) is None
+            or len(raw_count) > len(str(maximum_count))
+        ):
+            return _empty_test_evidence(
+                status="malformed",
+                source=source,
+                error=f"pytest JUnit evidence has an invalid {attribute} count",
+            )
+        parsed_count = int(raw_count)
+        if parsed_count > maximum_count:
+            return _empty_test_evidence(
+                status="malformed",
+                source=source,
+                error=f"pytest JUnit evidence has an invalid {attribute} count",
+            )
+        declared[attribute] = parsed_count
+
+    expected = _expected_junit_cases()
+    expected_nodeids = set(expected.values())
+    observed: list[dict[str, str]] = []
+    observed_expected: list[str] = []
+    unexpected: list[str] = []
+    outcome_counts = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+    for testcase in testcases:
+        classname = testcase.attrib.get("classname", "")
+        name = testcase.attrib.get("name", "")
+        nodeid = expected.get((classname, name))
+        if nodeid is None:
+            nodeid = _excerpt(f"{classname}::{name}", limit=512)
+            unexpected.append(nodeid)
+        else:
+            observed_expected.append(nodeid)
+        allowed_children = {"error", "failure", "skipped", "system-out", "system-err"}
+        if any(
+            child.tag not in allowed_children or len(child) != 0 for child in testcase
+        ) or any(
+            len(list(testcase.iter(outcome))) != len(testcase.findall(outcome))
+            for outcome in ("error", "failure", "skipped")
+        ):
+            return _empty_test_evidence(
+                status="malformed",
+                source=source,
+                error="pytest JUnit evidence contains invalid testcase outcome nesting",
+            )
+        outcome_elements = {
+            "errors": testcase.findall("error"),
+            "failed": testcase.findall("failure"),
+            "skipped": testcase.findall("skipped"),
+        }
+        outcome_total = sum(len(elements) for elements in outcome_elements.values())
+        if outcome_total == 0:
+            outcome = "passed"
+        elif outcome_total == 1:
+            outcome = next(
+                candidate for candidate, elements in outcome_elements.items() if elements
+            )
+        else:
+            outcome = "errors"
+        outcome_counts[outcome] += 1
+        observed.append({"nodeid": nodeid, "outcome": outcome})
+
+    seen_counts = {nodeid: observed_expected.count(nodeid) for nodeid in expected_nodeids}
+    missing = [nodeid for nodeid in RUNTIME_RELIABILITY_TESTS if seen_counts[nodeid] == 0]
+    duplicates = [nodeid for nodeid in RUNTIME_RELIABILITY_TESTS if seen_counts[nodeid] > 1]
+    unexpected = sorted(set(unexpected))
+    declared_matches = declared == {
+        "tests": len(observed),
+        "errors": outcome_counts["errors"],
+        "failures": outcome_counts["failed"],
+        "skipped": outcome_counts["skipped"],
+    }
+    verified = (
+        len(observed) == len(RUNTIME_RELIABILITY_TESTS)
+        and outcome_counts["passed"] == len(RUNTIME_RELIABILITY_TESTS)
+        and not missing
+        and not unexpected
+        and not duplicates
+        and declared_matches
+    )
+    return {
+        "schema": "kestrel.pytest_evidence.v1",
+        "format": "junit_xml",
+        "source": source,
+        "expected_tests": list(RUNTIME_RELIABILITY_TESTS),
+        "observed": observed,
+        "summary": {
+            "expected": len(RUNTIME_RELIABILITY_TESTS),
+            "observed": len(observed),
+            **outcome_counts,
+            "missing": missing,
+            "unexpected": unexpected,
+            "duplicates": duplicates,
+            "declared": declared,
+            "declared_matches": declared_matches,
+        },
+        "status": "verified" if verified else "mismatch",
+        "passed": verified,
+    }
+
+
+def _load_test_evidence(path: Path) -> dict[str, object]:
+    evidence = _empty_test_evidence(
+        status="malformed",
+        source={
+            "path": PYTEST_JUNIT_FILENAME,
+            "sha256": None,
+            "size_bytes": None,
+        },
+        error="pytest JUnit evidence parsing failed unexpectedly",
+    )
+    cleanup_error: OSError | None = None
+    try:
+        try:
+            evidence = _parse_test_evidence(path)
+        except Exception as exc:  # noqa: BLE001 - evidence parsing must fail closed
+            evidence["error"] = _excerpt(
+                f"pytest JUnit evidence parsing failed: {type(exc).__name__}: {exc}"
+            )
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            cleanup_error = exc
+    if cleanup_error is not None:
+        evidence["status"] = "raw_cleanup_failed"
+        evidence["passed"] = False
+        evidence["raw_source_retained"] = True
+        evidence["error"] = _excerpt(
+            "could not discard raw pytest JUnit evidence: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        return evidence
+    evidence["raw_source_retained"] = False
+    return evidence
 
 
 def _excerpt(value: str, *, limit: int = 4_000) -> str:
@@ -93,8 +373,7 @@ def _validate_preflight(
         )
     if not _COMMIT_RE.fullmatch(source_commit):
         raise ValueError("source commit must be a lowercase 40-character hexadecimal SHA")
-    if iteration_timeout_seconds <= 0:
-        raise ValueError("iteration timeout must be greater than zero")
+    _validate_iteration_timeout(iteration_timeout_seconds)
     if not workspace.is_dir():
         raise ValueError(f"workspace is not a directory: {workspace}")
 
@@ -153,7 +432,7 @@ def _workspace_identity(
 def _status(result: BoundedProcessResult) -> str:
     if result.timed_out:
         return "timed_out"
-    if result.cleanup_attempted and not result.cleanup_succeeded:
+    if not result.cleanup_succeeded:
         return "cleanup_unverified"
     if result.returncode != 0:
         return "runner_nonzero"
@@ -165,9 +444,12 @@ def _iteration_receipt(
     repeat: int,
     source_commit: str,
     result: BoundedProcessResult,
+    test_evidence: dict[str, object],
     workspace_identity: dict[str, object],
 ) -> dict[str, object]:
     status = _status(result)
+    if status == "completed" and test_evidence.get("passed") is not True:
+        status = "test_evidence_invalid"
     if not all(
         identity.get("passed") is True
         for identity in workspace_identity.values()
@@ -204,6 +486,7 @@ def _iteration_receipt(
         },
         "stdout": stdout,
         "stderr": stderr,
+        "test_evidence": test_evidence,
         "workspace_identity": workspace_identity,
     }
     return cast(dict[str, object], redact_secrets(receipt))
@@ -214,6 +497,7 @@ def _iteration_error_receipt(
     repeat: int,
     source_commit: str,
     error: Exception,
+    test_evidence: dict[str, object],
     workspace_identity: dict[str, object],
 ) -> dict[str, object]:
     empty_sha256 = hashlib.sha256(b"").hexdigest()
@@ -238,6 +522,7 @@ def _iteration_error_receipt(
         },
         "stdout": "",
         "stderr": "",
+        "test_evidence": test_evidence,
         "workspace_identity": workspace_identity,
         "error": _excerpt(f"{type(error).__name__}: {error}"),
     }
@@ -256,8 +541,7 @@ def build_iteration_invoker(
 
     if not python_executable:
         raise ValueError("Python executable must not be empty")
-    if iteration_timeout_seconds <= 0:
-        raise ValueError("iteration timeout must be greater than zero")
+    _validate_iteration_timeout(iteration_timeout_seconds)
     environment = dict(os.environ if base_environment is None else base_environment)
     environment["PYTHONHASHSEED"] = "0"
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
@@ -271,6 +555,8 @@ def build_iteration_invoker(
             *RUNTIME_RELIABILITY_TESTS,
             "--basetemp",
             str(repeat_root / "pytest-tmp"),
+            "--junitxml",
+            str(repeat_root / PYTEST_JUNIT_FILENAME),
         )
         return bounded_runner(
             command,
@@ -295,6 +581,7 @@ def _first_failure(receipt: dict[str, object]) -> dict[str, object]:
             "capture",
             "stdout",
             "stderr",
+            "test_evidence",
             "workspace_identity",
         )
     }
@@ -349,6 +636,7 @@ def run_runtime_reliability(
                 repeat=repeat,
                 source_commit=source_commit,
                 error=ValueError("workspace integrity check failed before repeat"),
+                test_evidence=_load_test_evidence(repeat_root / PYTEST_JUNIT_FILENAME),
                 workspace_identity=workspace_identity,
             )
             receipt["status"] = "workspace_integrity_failed"
@@ -358,6 +646,7 @@ def run_runtime_reliability(
             break
         try:
             result = invoke(repeat, repeat_root)
+            test_evidence = _load_test_evidence(repeat_root / PYTEST_JUNIT_FILENAME)
             after_identity = _workspace_identity(
                 workspace=workspace,
                 source_commit=source_commit,
@@ -368,9 +657,11 @@ def run_runtime_reliability(
                 repeat=repeat,
                 source_commit=source_commit,
                 result=result,
+                test_evidence=test_evidence,
                 workspace_identity=workspace_identity,
             )
         except Exception as exc:  # noqa: BLE001 - preserve a fail-closed receipt
+            test_evidence = _load_test_evidence(repeat_root / PYTEST_JUNIT_FILENAME)
             after_identity = _workspace_identity(
                 workspace=workspace,
                 source_commit=source_commit,
@@ -381,6 +672,7 @@ def run_runtime_reliability(
                 repeat=repeat,
                 source_commit=source_commit,
                 error=exc,
+                test_evidence=test_evidence,
                 workspace_identity=workspace_identity,
             )
         _write_json(repeat_root / "iteration-receipt.json", receipt)
@@ -503,8 +795,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.repeats < DEFAULT_REPEATS:
         parser.error(f"--repeats must be at least {DEFAULT_REPEATS}")
-    if args.iteration_timeout_seconds <= 0:
-        parser.error("--iteration-timeout-seconds must be greater than 0")
+    if not isfinite(args.iteration_timeout_seconds) or args.iteration_timeout_seconds <= 0:
+        parser.error("--iteration-timeout-seconds must be finite and greater than 0")
     if not isinstance(args.source_commit, str) or not _COMMIT_RE.fullmatch(args.source_commit):
         parser.error("--source-commit must be a 40-character lowercase hexadecimal SHA")
 
