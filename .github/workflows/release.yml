@@ -122,332 +122,198 @@ jobs:
           print(f"verified successful rehearsal {successful[0].get('html_url', '')}")
           PY
 
-      - name: Require successful exact-SHA determinism receipt before build
+      - name: Require successful exact-SHA runtime reliability qualification before build
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          determinism_runs="$(gh api --method GET \
+          release_run="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")"
+          export RELEASE_RUN_JSON="$release_run"
+          qualification_runs="$(gh api --method GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/determinism.yml/runs" \
             -f head_sha="$RELEASE_COMMIT_SHA" \
             -f branch=main \
             -f event=push \
-            -f status=completed \
             -f per_page=100)"
-          DETERMINISM_RUN_ID="$(
-            DETERMINISM_RUNS_JSON="$determinism_runs" python - <<'PY'
+          QUALIFICATION_RUN_ID="$(
+            QUALIFICATION_RUNS_JSON="$qualification_runs" \
+              python - <<'PY'
           import json
           import os
 
           expected_sha = os.environ["RELEASE_COMMIT_SHA"]
-          runs = json.loads(os.environ["DETERMINISM_RUNS_JSON"]).get("workflow_runs", [])
-          successful = [
+          response = json.loads(os.environ["QUALIFICATION_RUNS_JSON"])
+          runs = response.get("workflow_runs", [])
+          total_count = response.get("total_count")
+          if (
+              not isinstance(runs, list)
+              or type(total_count) is not int
+              or total_count != len(runs)
+              or total_count > 100
+          ):
+              raise SystemExit(
+                  "qualification workflow response is malformed or requires pagination"
+              )
+          exact_matches = [
               run
               for run in runs
-              if run.get("head_sha") == expected_sha
+              if isinstance(run, dict)
+              and run.get("head_sha") == expected_sha
               and run.get("head_branch") == "main"
               and run.get("event") == "push"
-              and run.get("status") == "completed"
-              and run.get("conclusion") == "success"
           ]
-          if not successful:
+          if len(exact_matches) != 1:
               raise SystemExit(
-                  f"release commit {expected_sha} has no successful exact-SHA "
-                  "determinism push run on main"
+                  f"release commit {expected_sha} must have exactly one exact-SHA "
+                  "determinism push run on main; replacement runs are rejected"
               )
-          run_id = successful[0].get("id")
-          if not isinstance(run_id, int):
-              raise SystemExit("successful determinism workflow has no numeric run id")
+          selected = exact_matches[0]
+          if (
+              type(selected.get("id")) is not int
+              or selected["id"] <= 0
+              or type(selected.get("run_attempt")) is not int
+              or selected["run_attempt"] != 1
+          ):
+              raise SystemExit(
+                  f"release commit {expected_sha} must have exactly one attempt-1 "
+                  "exact-SHA determinism push run on main"
+              )
+          run_id = selected["id"]
           print(run_id)
           PY
           )"
-          export DETERMINISM_RUN_ID
-          determinism_receipt_dir="${RUNNER_TEMP}/determinism-receipt-${GITHUB_RUN_ID}"
-          mkdir "$determinism_receipt_dir"
-          gh run download "$DETERMINISM_RUN_ID" \
-            -n "kestrel-determinism-memory-${RELEASE_COMMIT_SHA}" \
-            -D "$determinism_receipt_dir"
-          DETERMINISM_ARTIFACT_DIR="$determinism_receipt_dir" \
-            DETERMINISM_REPORT="${determinism_receipt_dir}/kestrel-determinism-report.json" \
-            python - <<'PY'
-          import hashlib
+          export QUALIFICATION_RUN_ID
+
+          qualification_jobs="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${QUALIFICATION_RUN_ID}/jobs" \
+            -f filter=all \
+            -f per_page=100)"
+          QUALIFICATION_JOBS_JSON="$qualification_jobs" python - <<'PY'
+          from datetime import datetime
           import json
           import os
-          import re
-          from pathlib import Path
 
-          from scripts.golden_eval_contract import validate_golden_report
-
-          expected_sha = os.environ["RELEASE_COMMIT_SHA"]
-          artifact_dir = Path(os.environ["DETERMINISM_ARTIFACT_DIR"])
-          report_path = Path(os.environ["DETERMINISM_REPORT"])
-          report = json.loads(report_path.read_text(encoding="utf-8"))
-          if not isinstance(report, dict):
-              raise SystemExit("determinism receipt is not a JSON object")
-          if set(report) != {
-              "schema",
-              "subject",
-              "configuration",
-              "environment",
-              "summary",
-              "differing_cases",
-              "reference_projection",
-              "runs",
-              "passed",
-          }:
-              raise SystemExit("determinism receipt fields are not accepted")
-          if report.get("schema") != "kestrel.determinism_eval_report.v3":
-              raise SystemExit("determinism receipt schema is not accepted")
-          subject = report.get("subject")
-          configuration = report.get("configuration")
-          environment = report.get("environment")
-          summary = report.get("summary")
-          runs = report.get("runs")
-          if (
-              not isinstance(subject, dict)
-              or set(subject) != {"source_commit"}
-              or not isinstance(configuration, dict)
-              or not isinstance(environment, dict)
-              or not isinstance(summary, dict)
-          ):
-              raise SystemExit("determinism receipt metadata is incomplete")
-          if subject.get("source_commit") != expected_sha:
-              raise SystemExit("determinism receipt is not bound to the release commit")
-          if set(configuration) != {
-              "backend",
-              "provider",
-              "model",
-              "seed",
-              "required_repeats",
-              "comparison",
-              "case_timeout_seconds",
-              "iteration_timeout_seconds",
-              "max_case_latency_ms",
-          }:
-              raise SystemExit("determinism receipt configuration fields are not accepted")
-          if (
-              configuration.get("backend") != "memory"
-              or configuration.get("provider") != "mock"
-              or configuration.get("model") != "mock"
-          ):
-              raise SystemExit("determinism receipt is not the memory backend mock lane")
-          if (
-              configuration.get("seed") != 1729
-              or configuration.get("required_repeats") != 20
-              or configuration.get("comparison")
-              != "functional_outcomes_excluding_wall_clock_latency"
-              or configuration.get("case_timeout_seconds") != 60.0
-              or configuration.get("iteration_timeout_seconds") != 1500.0
-              or configuration.get("max_case_latency_ms") != 45000.0
-          ):
-              raise SystemExit("determinism receipt configuration is not release-qualified")
-          if (
-              set(environment) != {"os", "architecture", "python_version"}
-              or environment.get("os") != "Linux"
-              or environment.get("architecture") != "X64"
-              or not isinstance(environment.get("python_version"), str)
-              or re.fullmatch(r"3\.11\.\d+(?:[A-Za-z0-9.+-]*)?", environment["python_version"])
-              is None
-          ):
-              raise SystemExit("determinism receipt environment is not release-qualified")
-          digest_re = re.compile(r"^[0-9a-f]{64}$")
-          if (
-              report.get("passed") is not True
-              or report.get("differing_cases") != []
-              or not isinstance(report.get("reference_projection"), dict)
-              or not isinstance(runs, list)
-              or len(runs) != 20
-              or any(
-                  not isinstance(run, dict)
-                  or set(run)
-                  != {
-                      "repeat",
-                      "passed",
-                      "outcome_signature",
-                      "golden_report_sha256",
-                      "failed_cases",
-                  }
-                  or run.get("repeat") != repeat
-                  or run.get("passed") is not True
-                  or run.get("failed_cases") != []
-                  or not isinstance(run.get("outcome_signature"), str)
-                  or digest_re.fullmatch(run["outcome_signature"]) is None
-                  for repeat, run in enumerate(runs, start=1)
-              )
-          ):
-              raise SystemExit("determinism receipt run records are incomplete or failing")
-          if any(
-              not isinstance(run.get("golden_report_sha256"), str)
-              or digest_re.fullmatch(run["golden_report_sha256"]) is None
-              for run in runs
-          ):
-              raise SystemExit("determinism receipt golden report digest is invalid")
-          golden_report_paths = sorted(artifact_dir.rglob("golden-report.json"))
-          if len(golden_report_paths) != len(runs):
-              raise SystemExit(
-                  "determinism golden report artifact count does not match runs"
-              )
-          expected_golden_report_paths = {
-              repeat: artifact_dir
-              / "kestrel-determinism-runs"
-              / f"repeat-{repeat:02d}"
-              / "golden-report.json"
-              for repeat in range(1, len(runs) + 1)
-          }
-          if set(golden_report_paths) != set(expected_golden_report_paths.values()):
-              raise SystemExit("determinism golden report artifact layout is not accepted")
-          recomputed_pass_states = []
-          recomputed_projections = []
-          recomputed_signatures = []
-          for run in runs:
-              repeat = run["repeat"]
-              golden_report_path = expected_golden_report_paths[repeat]
+          def timestamp(value):
+              if not isinstance(value, str):
+                  raise SystemExit("qualification ordering evidence has no timestamp")
               try:
-                  golden_report = json.loads(
-                      golden_report_path.read_text(encoding="utf-8")
-                  )
-              except (OSError, json.JSONDecodeError) as exc:
-                  raise SystemExit(
-                      f"determinism golden report {repeat} is unreadable: {exc}"
-                  ) from exc
-              if not isinstance(golden_report, dict):
-                  raise SystemExit(
-                      f"determinism golden report {repeat} is not a JSON object"
-                  )
-              # The golden runner writes the already-redacted payload. Recreate the
-              # producer's canonical JSON serialization before hashing that payload.
-              canonical_golden_report = json.dumps(
-                  golden_report,
-                  sort_keys=True,
-                  separators=(",", ":"),
-                  ensure_ascii=True,
-              )
-              recomputed_digest = hashlib.sha256(
-                  canonical_golden_report.encode()
-              ).hexdigest()
-              if recomputed_digest != run["golden_report_sha256"]:
-                  raise SystemExit(
-                      "determinism golden report digest does not match "
-                      f"repeat {repeat}"
-                  )
-              golden_configuration = golden_report.get("configuration")
-              if (
-                  not isinstance(golden_configuration, dict)
-                  or golden_configuration.get("max_case_latency_ms")
-                  != configuration["max_case_latency_ms"]
-              ):
-                  raise SystemExit(
-                      "determinism golden report latency gate does not match "
-                      f"repeat {repeat}"
-                  )
-              try:
-                  recomputed_passed = validate_golden_report(
-                      golden_report,
-                      expected_backend="memory",
-                      expected_seed=configuration["seed"],
-                  )
+                  parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
               except ValueError as exc:
                   raise SystemExit(
-                      "determinism golden report contract is invalid for "
-                      f"repeat {repeat}: {exc}"
+                      "qualification ordering evidence has an invalid timestamp"
                   ) from exc
-              if recomputed_passed is not True:
+              if parsed.tzinfo is None:
                   raise SystemExit(
-                      "determinism golden report acceptance failed for "
-                      f"repeat {repeat}"
+                      "qualification ordering evidence has no timezone"
                   )
-              raw_results = golden_report["results"]
-              assert isinstance(raw_results, list)
-              recomputed_failed_cases = sorted(
-                  str(item["name"])
-                  for item in raw_results
-                  if isinstance(item, dict) and item.get("passed") is not True
-              )
-              if run["failed_cases"] != recomputed_failed_cases:
-                  raise SystemExit(
-                      "determinism golden report failed cases do not match "
-                      f"repeat {repeat}"
-                  )
-              cases = []
-              for raw_result in raw_results:
-                  assert isinstance(raw_result, dict)
-                  cases.append(
-                      {
-                          "name": str(raw_result["name"]),
-                          "category": str(raw_result["category"]),
-                          "outcome": {
-                              str(key): value
-                              for key, value in raw_result.items()
-                              if key not in {"name", "category", "latency_ms"}
-                          },
-                      }
-                  )
-              cases.sort(key=lambda item: (item["name"], item["category"]))
-              recomputed_projection = {
-                  "schema": golden_report["schema"],
-                  "configuration": {
-                      key: golden_configuration.get(key)
-                      for key in ("backend", "provider", "model", "seed")
-                  },
-                  "cases": cases,
-              }
-              recomputed_signature = hashlib.sha256(
-                  json.dumps(
-                      recomputed_projection,
-                      sort_keys=True,
-                      separators=(",", ":"),
-                      ensure_ascii=True,
-                  ).encode()
-              ).hexdigest()
-              if run["outcome_signature"] != recomputed_signature:
-                  raise SystemExit(
-                      "determinism golden report projection does not match "
-                      f"repeat {repeat}"
-                  )
-              recomputed_pass_states.append(recomputed_passed)
-              recomputed_projections.append(recomputed_projection)
-              recomputed_signatures.append(recomputed_signature)
-          outcome_signatures = recomputed_signatures
-          distinct_signatures = set(outcome_signatures)
-          first_signature = outcome_signatures[0]
-          derived_streak = 0
-          for signature in outcome_signatures:
-              if signature != first_signature:
-                  break
-              derived_streak += 1
-          modal_count = max(
-              outcome_signatures.count(signature) for signature in distinct_signatures
-          )
-          derived_flake_count = len(outcome_signatures) - modal_count
-          derived_summary = {
-              "completed_repeats": len(runs),
-              "required_repeats": configuration["required_repeats"],
-              "all_runs_passed": all(recomputed_pass_states),
-              "unique_outcome_signatures": len(distinct_signatures),
-              "determinism_streak": derived_streak,
-              "observed_flake_count": derived_flake_count,
-              "observed_flake_rate": round(derived_flake_count / len(runs), 6),
-          }
-          if len(distinct_signatures) != 1:
-              raise SystemExit("determinism receipt has multiple outcome signatures")
-          reference_projection = report["reference_projection"]
-          if reference_projection != recomputed_projections[0]:
+              return parsed
+
+          run_id = int(os.environ["QUALIFICATION_RUN_ID"])
+          release_run = json.loads(os.environ["RELEASE_RUN_JSON"])
+          if not isinstance(release_run, dict):
+              raise SystemExit("release workflow metadata is malformed")
+          release_created_at = timestamp(release_run.get("created_at"))
+          response = json.loads(os.environ["QUALIFICATION_JOBS_JSON"])
+          jobs = response.get("jobs", [])
+          total_count = response.get("total_count")
+          if (
+              not isinstance(jobs, list)
+              or type(total_count) is not int
+              or total_count != len(jobs)
+              or total_count > 100
+          ):
               raise SystemExit(
-                  "determinism receipt reference projection does not match reports"
+                  "qualification job metadata is malformed or requires pagination"
               )
-          reference_signature = hashlib.sha256(
-              json.dumps(
-                  reference_projection,
-                  sort_keys=True,
-                  separators=(",", ":"),
-                  ensure_ascii=True,
-              ).encode()
-          ).hexdigest()
-          if outcome_signatures[0] != reference_signature:
-              raise SystemExit("determinism receipt reference projection digest does not match runs")
-          if summary != derived_summary:
-              raise SystemExit("determinism receipt derived summary does not match runs")
-          print(f"verified exact-SHA determinism receipt from run {os.environ['DETERMINISM_RUN_ID']}")
+          expected_name = "Exact-SHA five-cell runtime reliability qualification"
+          matches = [
+              job
+              for job in jobs
+              if isinstance(job, dict) and job.get("name") == expected_name
+          ]
+          if len(matches) != 1:
+              raise SystemExit(
+                  "qualification workflow must expose exactly one aggregate job"
+              )
+          job = matches[0]
+          if (
+              type(job.get("id")) is not int
+              or job["id"] <= 0
+              or type(job.get("run_id")) is not int
+              or job["run_id"] != run_id
+              or type(job.get("run_attempt")) is not int
+              or job["run_attempt"] != 1
+              or job.get("head_sha") != os.environ["RELEASE_COMMIT_SHA"]
+              or job.get("status") != "completed"
+              or job.get("conclusion") != "success"
+              or timestamp(job.get("completed_at")) >= release_created_at
+          ):
+              raise SystemExit(
+                  "qualification aggregate job metadata is stale, failed, or mismatched"
+              )
           PY
+
+          qualification_artifacts="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${QUALIFICATION_RUN_ID}/artifacts" \
+            -f per_page=100)"
+          QUALIFICATION_ARTIFACTS_JSON="$qualification_artifacts" python - <<'PY'
+          import json
+          import os
+
+          run_id = int(os.environ["QUALIFICATION_RUN_ID"])
+          expected_name = (
+              "kestrel-runtime-reliability-qualification-"
+              + os.environ["RELEASE_COMMIT_SHA"]
+          )
+          response = json.loads(os.environ["QUALIFICATION_ARTIFACTS_JSON"])
+          artifacts = response.get("artifacts", [])
+          total_count = response.get("total_count")
+          if (
+              not isinstance(artifacts, list)
+              or type(total_count) is not int
+              or total_count != len(artifacts)
+              or total_count > 100
+          ):
+              raise SystemExit(
+                  "qualification artifact metadata is malformed or requires pagination"
+              )
+          matches = [
+              artifact
+              for artifact in artifacts
+              if isinstance(artifact, dict)
+              and artifact.get("name") == expected_name
+          ]
+          if len(matches) != 1:
+              raise SystemExit(
+                  "qualification workflow must expose exactly one exact-name aggregate artifact"
+              )
+          artifact = matches[0]
+          workflow_run = artifact.get("workflow_run")
+          if (
+              type(artifact.get("id")) is not int
+              or artifact["id"] <= 0
+              or artifact.get("expired") is not False
+              or not isinstance(workflow_run, dict)
+              or type(workflow_run.get("id")) is not int
+              or workflow_run["id"] != run_id
+              or workflow_run.get("head_sha") != os.environ["RELEASE_COMMIT_SHA"]
+          ):
+              raise SystemExit(
+                  "qualification aggregate artifact metadata is stale or mismatched"
+              )
+          PY
+
+          qualification_root="${RUNNER_TEMP}/runtime-reliability-qualification-${GITHUB_RUN_ID}"
+          mkdir "$qualification_root"
+          gh run download "$QUALIFICATION_RUN_ID" \
+            -n "kestrel-runtime-reliability-qualification-${RELEASE_COMMIT_SHA}" \
+            -D "$qualification_root"
+          python scripts/aggregate_runtime_reliability_receipts.py verify \
+            --artifact-root "$qualification_root" \
+            --source-commit "$RELEASE_COMMIT_SHA" \
+            --workflow-run-id "$QUALIFICATION_RUN_ID" \
+            --workflow-run-attempt 1 \
+            --report "$qualification_root/kestrel-runtime-reliability-qualification.json"
 
       - name: Install pinned uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0

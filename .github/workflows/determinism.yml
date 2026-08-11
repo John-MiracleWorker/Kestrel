@@ -136,6 +136,60 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  runtime-reliability-qualification:
+    name: Exact-SHA five-cell runtime reliability qualification
+    needs:
+      - runtime-reliability
+      - everyday-golden-determinism
+    if: github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_COMMIT }}
+      - name: Download Linux runtime reliability evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-runtime-reliability-Linux-${{ env.SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/kestrel-runtime-reliability-qualification/kestrel-runtime-reliability-Linux-${{ env.SOURCE_COMMIT }}
+      - name: Download macOS runtime reliability evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-runtime-reliability-macOS-${{ env.SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/kestrel-runtime-reliability-qualification/kestrel-runtime-reliability-macOS-${{ env.SOURCE_COMMIT }}
+      - name: Download Windows runtime reliability evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-runtime-reliability-Windows-${{ env.SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/kestrel-runtime-reliability-qualification/kestrel-runtime-reliability-Windows-${{ env.SOURCE_COMMIT }}
+      - name: Download memory determinism evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-determinism-memory-${{ env.SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/kestrel-runtime-reliability-qualification/kestrel-determinism-memory-${{ env.SOURCE_COMMIT }}
+      - name: Download Memvid determinism evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-determinism-memvid-${{ env.SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/kestrel-runtime-reliability-qualification/kestrel-determinism-memvid-${{ env.SOURCE_COMMIT }}
+      - name: Build the five-cell runtime reliability qualification
+        run: >-
+          python scripts/aggregate_runtime_reliability_receipts.py build
+          --artifact-root "${RUNNER_TEMP}/kestrel-runtime-reliability-qualification"
+          --source-commit "${SOURCE_COMMIT}"
+          --workflow-run-id "${GITHUB_RUN_ID}"
+          --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --output "${RUNNER_TEMP}/kestrel-runtime-reliability-qualification/kestrel-runtime-reliability-qualification.json"
+      - name: Upload the five-cell runtime reliability qualification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-runtime-reliability-qualification-${{ env.SOURCE_COMMIT }}
+          path: ${{ runner.temp }}/kestrel-runtime-reliability-qualification
+          if-no-files-found: error
+          retention-days: 14
+
   flock-qualification-determinism:
     runs-on: ubuntu-latest
     timeout-minutes: 90
