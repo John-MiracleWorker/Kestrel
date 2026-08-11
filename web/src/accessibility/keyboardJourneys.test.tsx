@@ -67,6 +67,23 @@ describe("Setup Center keyboard journey", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("restores stage heading focus without animation-frame delivery", async () => {
+    const requestAnimationFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation(() => 1);
+    const api = fakeSetupApi(setupSnapshot());
+    render(<SetupCenter api={api} />);
+
+    await screen.findByRole("heading", { name: "Add a project" });
+    fireEvent.click(screen.getByRole("button", { name: "Do this later" }));
+
+    expect(
+      screen.getByRole("heading", { name: "Review safety defaults" }),
+    ).toHaveFocus();
+    expect(requestAnimationFrame).not.toHaveBeenCalled();
   });
 
   it("walks Core → Project → Safety → First mission with heading focus restoration", async () => {
