@@ -1032,11 +1032,13 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
     submitted: list[str] = []
     submitted_event = Event()
     release = Event()
+    release_observed = Event()
 
     def scanner(*_args: Any, **_kwargs: Any) -> tuple[()]:
         submitted.append("scan")
         submitted_event.set()
-        release.wait(timeout=3)
+        release.wait()
+        release_observed.set()
         return ()
 
     managers = [
@@ -1058,29 +1060,63 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
         manager.create_draft(authorization)
         for manager, authorization in zip(managers, authorizations, strict=True)
     ]
-    outcomes: list[str] = []
+    outcomes: dict[int, str] = {}
+    winning_futures: dict[int, Any] = {}
+    worker_failures: dict[int, BaseException] = {}
+    outcomes_lock = Lock()
 
     def start(index: int) -> None:
-        barrier.wait()
         try:
-            managers[index].start(
-                drafts[index].scan_id,
-                expected_revision=drafts[index].revision,
-                authorization=authorizations[index],
-                preview_digest=authorizations[index].preview_digest,
-            )
-        except task6.LanScanAdmissionConflict:
-            outcomes.append("lost")
-        else:
-            outcomes.append("won")
+            barrier.wait()
+            try:
+                managers[index].start(
+                    drafts[index].scan_id,
+                    expected_revision=drafts[index].revision,
+                    authorization=authorizations[index],
+                    preview_digest=authorizations[index].preview_digest,
+                )
+            except task6.LanScanAdmissionConflict:
+                with outcomes_lock:
+                    outcomes[index] = "lost"
+                return
+            with managers[index]._lock:  # noqa: SLF001 - exact worker teardown proof
+                handle = managers[index]._active_scans[drafts[index].scan_id]  # noqa: SLF001
+                future = handle.future
+            if future is None:
+                raise AssertionError("winning LAN controller has no submitted future")
+            with outcomes_lock:
+                outcomes[index] = "won"
+                winning_futures[index] = future
+        except BaseException as exc:  # noqa: BLE001 - surface exact thread failure
+            with outcomes_lock:
+                worker_failures[index] = exc
 
     threads = [Thread(target=start, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=3)
+    primary_failure: BaseException | None = None
+    reported_worker_failures: set[int] = set()
     try:
-        assert sorted(outcomes) == ["lost", "won"]
+        for thread in threads:
+            thread.start()
+        start_deadline = time.monotonic() + 15.0
+        for thread in threads:
+            thread.join(timeout=max(0.0, start_deadline - time.monotonic()))
+        with outcomes_lock:
+            worker_failure_items = tuple(sorted(worker_failures.items()))
+        if worker_failure_items:
+            failed_index, failure = worker_failure_items[0]
+            reported_worker_failures.update(index for index, _ in worker_failure_items)
+            failure.add_note(f"raised by LAN start worker {failed_index}")
+            for additional_index, additional_failure in worker_failure_items[1:]:
+                failure.add_note(
+                    "additional LAN start worker "
+                    f"{additional_index} failure: {additional_failure!r}"
+                )
+            raise failure
+        assert all(not thread.is_alive() for thread in threads)
+        assert sorted(outcomes.values()) == ["lost", "won"]
+        assert sorted(winning_futures) == [
+            index for index, outcome in sorted(outcomes.items()) if outcome == "won"
+        ]
         assert submitted_event.wait(timeout=2.0)
         assert submitted == ["scan"]
         scans = ledger_a.list_scans(owner_principal=FIXED_OWNER)
@@ -1097,10 +1133,89 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
         assert ledger_a.list_events(losers[0].scan_id) == []
         assert ledger_a.list_observations(winners[0].scan_id) == []
         assert ledger_a.list_observations(losers[0].scan_id) == []
+    except BaseException as exc:
+        primary_failure = exc
+        raise
     finally:
         release.set()
-        for manager in managers:
-            assert manager.shutdown(timeout_seconds=2.0) is True
+        # Future completion is the lifecycle boundary. The longer deadline is only
+        # a guard for loaded Windows/SQLite cleanup; elapsed time is not the proof.
+        cleanup_deadline = time.monotonic() + 15.0
+        cleanup_failures: list[str] = []
+        barrier.abort()
+        for index, thread in enumerate(threads):
+            if thread.is_alive():
+                thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+            if thread.is_alive():
+                cleanup_failures.append(f"start thread {index} did not stop")
+        with outcomes_lock:
+            winner_items = tuple(sorted(winning_futures.items()))
+            late_worker_failure_items = tuple(
+                (index, failure)
+                for index, failure in sorted(worker_failures.items())
+                if index not in reported_worker_failures
+            )
+        cleanup_failures.extend(
+            f"start worker {index} failed: {failure!r}"
+            for index, failure in late_worker_failure_items
+        )
+        if winner_items and not release_observed.wait(
+            timeout=max(0.0, cleanup_deadline - time.monotonic())
+        ):
+            cleanup_failures.append("winning scanner did not observe release")
+        for index, future in winner_items:
+            try:
+                future.result(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+                terminal = managers[index].get(drafts[index].scan_id)
+                if terminal is None:
+                    raise AssertionError("winning LAN scan has no durable record")
+                if terminal.status != "completed":
+                    raise AssertionError(
+                        f"winning LAN scan has terminal status {terminal.status!r}"
+                    )
+                if terminal.terminal_reason != "scan_complete":
+                    raise AssertionError(
+                        "winning LAN scan has terminal reason "
+                        f"{terminal.terminal_reason!r}"
+                    )
+                event_types = [
+                    event.event_type
+                    for event in managers[index].events(drafts[index].scan_id)
+                ]
+                if event_types != ["scan_started", "scan_completed"]:
+                    raise AssertionError(
+                        f"winning LAN scan has durable events {event_types!r}"
+                    )
+            except BaseException as exc:  # noqa: BLE001 - preserve exact cleanup evidence
+                cleanup_failures.append(f"winner {index} future: {exc!r}")
+        shutdown_results: list[tuple[int, bool]] = []
+        for index, manager in enumerate(managers):
+            try:
+                shutdown_results.append(
+                    (
+                        index,
+                        manager.shutdown(
+                            timeout_seconds=max(0.0, cleanup_deadline - time.monotonic())
+                        ),
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - preserve exact cleanup evidence
+                cleanup_failures.append(f"manager {index} shutdown: {exc!r}")
+        if not cleanup_failures:
+            for index, manager in enumerate(managers):
+                try:
+                    if not manager.is_quiescent():
+                        cleanup_failures.append(f"manager {index} is not quiescent")
+                except BaseException as exc:  # noqa: BLE001 - preserve exact cleanup evidence
+                    cleanup_failures.append(f"manager {index} quiescence: {exc!r}")
+        if cleanup_failures or shutdown_results != [(0, True), (1, True)]:
+            detail = (
+                f"LAN cleanup failed: {cleanup_failures=}, "
+                f"{shutdown_results=}"
+            )
+            if primary_failure is None:
+                raise AssertionError(detail)
+            primary_failure.add_note(detail)
 
 
 def test_stale_cancel_has_no_token_side_effect_and_committed_cancel_signals_token(

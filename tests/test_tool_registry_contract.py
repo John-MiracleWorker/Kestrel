@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
@@ -21,21 +22,51 @@ from nested_memvid_agent.tools.registry import RetryingRegistry, RuntimeToolFenc
 class ContractSlowTool(AgentTool):
     spec = ToolSpec(
         name="contract.slow",
-        description="Sleeps longer than the configured timeout.",
+        description="Blocks until cancellation releases it.",
         parameters={"type": "object", "properties": {}},
     )
 
     def __init__(self) -> None:
         self.cancelled_call_ids: list[str] = []
+        self.started = Event()
+        self.release = Event()
+        self.finished = Event()
 
     def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
-        sleep(0.2)
-        return ToolExecution(
-            call=ToolCall(name=self.spec.name, arguments=arguments), success=True, content="late"
-        )
+        del context
+        self.started.set()
+        try:
+            self.release.wait()
+            return ToolExecution(
+                call=ToolCall(name=self.spec.name, arguments=arguments),
+                success=True,
+                content="late",
+            )
+        finally:
+            self.finished.set()
 
     def cancel(self, call_id: str) -> None:
         self.cancelled_call_ids.append(call_id)
+        self.release.set()
+
+
+def _release_and_await_tool_body(
+    release: Event,
+    terminal: Event,
+    *,
+    label: str,
+) -> bool:
+    """Release a gated tool body and prove it stopped without hiding a primary failure."""
+
+    release.set()
+    if terminal.wait(timeout=15.0):
+        return True
+    detail = f"{label} tool body did not terminate after release"
+    active_error = sys.exception()
+    if active_error is None:
+        raise AssertionError(detail)
+    active_error.add_note(detail)
+    return False
 
 
 def test_agent_tool_has_noop_cancel_contract() -> None:
@@ -282,23 +313,36 @@ def test_registry_defense_in_depth_rejects_nonfinite_timeout(tmp_path: Path) -> 
     assert result.data["retryable"] is False
 
 
-def test_tool_registry_calls_cancel_on_timeout(tmp_path: Path) -> None:
+def test_tool_registry_calls_cancel_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = ToolRegistry()
     tool = ContractSlowTool()
     registry.register(tool)
+    # Select the resolved-late branch explicitly. Other tests bind the real
+    # 0.50-second settlement ceiling and unresolved/quarantine contract.
+    monkeypatch.setattr(registry_module, "_CANCELLATION_SETTLEMENT_SECONDS", 5.0)
 
-    result = registry.execute(
-        ToolCall(name="contract.slow", arguments={}, id="slow-call"),
-        ToolContext(
-            memory=memory, config=AgentConfig(tool_timeout_seconds=0.01), workspace=tmp_path
-        ),
-    )
+    try:
+        result = registry.execute(
+            ToolCall(name="contract.slow", arguments={}, id="slow-call"),
+            ToolContext(
+                memory=memory,
+                config=AgentConfig(tool_timeout_seconds=0.05),
+                workspace=tmp_path,
+            ),
+        )
+    finally:
+        _release_and_await_tool_body(tool.release, tool.finished, label="contract-slow")
 
+    assert tool.started.is_set()
+    assert tool.finished.is_set()
     assert result.success is True
     assert result.error is None
     assert result.data["tool_deadline_exceeded"] is True
-    assert result.data["tool_timeout_seconds"] == 0.01
+    assert result.data["tool_timeout_seconds"] == 0.05
     assert tool.cancelled_call_ids == ["slow-call"]
 
 

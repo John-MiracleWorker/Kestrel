@@ -25,13 +25,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from nested_memvid_agent.security_boundary import redact_secrets  # noqa: E402
 from scripts.bounded_process import BoundedProcessResult, run_bounded_process  # noqa: E402
+from scripts.runtime_reliability_contract import RUNTIME_RELIABILITY_TESTS  # noqa: E402
 
-RUNTIME_RELIABILITY_TESTS = (
-    "tests/test_channels.py::test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay",
-    "tests/test_channels.py::test_server_exposes_channel_ingest_route",
-    "tests/test_full_agent_runtime.py::test_run_manager_heartbeat_renews_and_releases_its_run_lease",
-    "tests/test_full_agent_runtime.py::test_cross_manager_task_approval_waits_for_origin_lease_and_wakes_scheduler",
-)
 DEFAULT_REPEATS = 20
 DEFAULT_ITERATION_TIMEOUT_SECONDS = 900.0
 PYTEST_JUNIT_FILENAME = "pytest-results.xml"

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -8,9 +7,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
 import yaml
-
-from scripts.golden_eval_contract import GOLDEN_CASE_CATEGORIES
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -53,241 +51,157 @@ def _run_rehearsal_order_gate(
     )
 
 
-def _determinism_v3_receipt(
-    *,
-    backend: str = "memory",
-    golden_report_sha256: str | None = None,
-) -> dict[str, object]:
-    commit = "a" * 40
-    golden_reports = _golden_reports()
-    reference_projection = _golden_projection(golden_reports[0])
-    outcome_signature = hashlib.sha256(
-        json.dumps(
-            reference_projection,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode()
-    ).hexdigest()
-    return {
-        "schema": "kestrel.determinism_eval_report.v3",
-        "subject": {"source_commit": commit},
-        "configuration": {
-            "backend": backend,
-            "provider": "mock",
-            "model": "mock",
-            "seed": 1729,
-            "required_repeats": 20,
-            "comparison": "functional_outcomes_excluding_wall_clock_latency",
-            "case_timeout_seconds": 60.0,
-            "iteration_timeout_seconds": 1500.0,
-            "max_case_latency_ms": 45000.0,
-        },
-        "environment": {
-            "os": "Linux",
-            "architecture": "X64",
-            "python_version": "3.11.13",
-        },
-        "summary": {
-            "completed_repeats": 20,
-            "required_repeats": 20,
-            "all_runs_passed": True,
-            "unique_outcome_signatures": 1,
-            "determinism_streak": 20,
-            "observed_flake_count": 0,
-            "observed_flake_rate": 0.0,
-        },
-        "differing_cases": [],
-        "reference_projection": reference_projection,
-        "runs": [
-            {
-                "repeat": repeat,
-                "passed": True,
-                "outcome_signature": outcome_signature,
-                "golden_report_sha256": (
-                    golden_report_sha256
-                    if golden_report_sha256 is not None
-                    else _golden_report_sha256(golden_reports[repeat - 1])
-                ),
-                "failed_cases": [],
-            }
-            for repeat in range(1, 21)
-        ],
-        "passed": True,
+def _qualification_run(**overrides: object) -> dict[str, object]:
+    run: dict[str, object] = {
+        "id": 4242,
+        "head_sha": "a" * 40,
+        "head_branch": "main",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+        "run_attempt": 1,
+        "updated_at": "2026-07-28T11:59:59Z",
     }
+    run.update(overrides)
+    return run
 
 
-def _golden_reports(
+def _run_qualification_selector(
+    runs: list[dict[str, object]],
     *,
-    failed: bool = False,
-    tool_count: int = 1,
-) -> list[dict[str, object]]:
-    reports: list[dict[str, object]] = []
-    failed_name = next(iter(GOLDEN_CASE_CATEGORIES)) if failed else None
-    for repeat in range(1, 21):
-        results: list[dict[str, object]] = []
-        for index, (name, category) in enumerate(GOLDEN_CASE_CATEGORIES.items()):
-            passed = name != failed_name
-            results.append(
-                {
-                    "name": name,
-                    "category": category,
-                    "passed": passed,
-                    "score": 1.0 if passed else 0.0,
-                    "latency_ms": repeat + index / 100,
-                    "memory_hits": 1,
-                    "context_chars": 3,
-                    "tool_count": tool_count,
-                    "cost_estimate_usd": None,
-                    "executed_tools": ["repo.map"],
-                }
-            )
-        latency_ms_max = max(float(item["latency_ms"]) for item in results)
-        functional_passed = all(item["passed"] is True for item in results)
-        latency_acceptance = {
-            "measurement_status": "measured",
-            "gate_configured": True,
-            "required": True,
-            "threshold_max_case_latency_ms": 45000.0,
-            "latency_ms_max": latency_ms_max,
-            "passed": True,
-        }
-        cost_acceptance = {
-            "measurement_status": "unmeasured",
-            "gate_configured": False,
-            "required": False,
-            "measured_case_count": 0,
-            "unmeasured_case_count": len(results),
-            "cost_estimate_usd_total": None,
-            "passed": None,
-            "residual": "fixture",
-        }
-        reports.append(
-            {
-                "schema": "kestrel.golden_eval_report.v2",
-                "configuration": {
-                    "backend": "memory",
-                    "provider": "mock",
-                    "model": "mock",
-                    "seed": 1729,
-                    "max_case_latency_ms": 45000.0,
-                },
-                "results": results,
-                "summary": {
-                    "pass_count": sum(item["passed"] is True for item in results),
-                    "fail_count": sum(item["passed"] is not True for item in results),
-                    "latency_ms_max": latency_ms_max,
-                    "context_chars_max": 3,
-                    "tool_count_total": len(results) * tool_count,
-                    "cost_estimate_usd_total": None,
-                    "categories": {},
-                    "acceptance": {
-                        "latency": dict(latency_acceptance),
-                        "cost": dict(cost_acceptance),
-                    },
-                    "promotion_precision": None,
-                    "false_promotion_count": 0,
-                },
-                "acceptance": {
-                    "functional": {
-                        "required": True,
-                        "passed": functional_passed,
-                    },
-                    "latency": dict(latency_acceptance),
-                    "cost": dict(cost_acceptance),
-                },
-                "passed": functional_passed,
-            }
-        )
-    return reports
-
-
-def _golden_projection(report: dict[str, object]) -> dict[str, object]:
-    raw_results = report["results"]
-    assert isinstance(raw_results, list)
-    cases = []
-    for raw_result in raw_results:
-        assert isinstance(raw_result, dict)
-        cases.append(
-            {
-                "name": raw_result["name"],
-                "category": raw_result["category"],
-                "outcome": {
-                    key: value
-                    for key, value in raw_result.items()
-                    if key not in {"name", "category", "latency_ms"}
-                },
-            }
-        )
-    cases.sort(key=lambda item: (str(item["name"]), str(item["category"])))
-    configuration = report["configuration"]
-    assert isinstance(configuration, dict)
-    return {
-        "schema": report["schema"],
-        "configuration": {
-            key: configuration.get(key)
-            for key in ("backend", "provider", "model", "seed")
-        },
-        "cases": cases,
-    }
-
-
-def _golden_report_sha256(report: dict[str, object]) -> str:
-    canonical = json.dumps(
-        report,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    )
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def _run_determinism_receipt_gate(
-    tmp_path: Path,
-    receipt: dict[str, object],
-    *,
-    golden_reports: list[dict[str, object]] | None = None,
-    omitted_repeats: frozenset[int] = frozenset(),
-    extra_reports: dict[int, dict[str, object]] | None = None,
+    release_created_at: str = "2026-07-28T12:00:00Z",
+    total_count: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
-    gate = workflow.index("Require successful exact-SHA determinism receipt before build")
-    receipt_validation = workflow.index("DETERMINISM_REPORT=", gate)
-    script_start = workflow.index("          import hashlib", receipt_validation)
+    gate = workflow.index(
+        "Require successful exact-SHA runtime reliability qualification before build"
+    )
+    assignment = workflow.index("QUALIFICATION_RUN_ID=\"$(", gate)
+    heredoc = workflow.index("python - <<'PY'", assignment)
+    script_start = workflow.index("\n", heredoc) + 1
     script_end = workflow.index("\n          PY", script_start)
     script = textwrap.dedent(workflow[script_start:script_end])
-    gate_root = tmp_path / f"gate-{len(tuple(tmp_path.iterdir()))}"
-    artifact_root = gate_root / "artifact"
-    run_root = artifact_root / "kestrel-determinism-runs"
-    artifact_root.mkdir(parents=True)
-    report_path = artifact_root / "kestrel-determinism-report.json"
-    report_path.write_text(json.dumps(receipt), encoding="utf-8")
-    reports = golden_reports if golden_reports is not None else _golden_reports()
-    for repeat, golden_report in enumerate(reports, start=1):
-        if repeat in omitted_repeats:
-            continue
-        repeat_root = run_root / f"repeat-{repeat:02d}"
-        repeat_root.mkdir(parents=True)
-        (repeat_root / "golden-report.json").write_text(
-            json.dumps(golden_report),
-            encoding="utf-8",
-        )
-    for repeat, golden_report in (extra_reports or {}).items():
-        repeat_root = run_root / f"repeat-{repeat:02d}"
-        repeat_root.mkdir(parents=True, exist_ok=True)
-        (repeat_root / "golden-report.json").write_text(
-            json.dumps(golden_report),
-            encoding="utf-8",
-        )
     environment = os.environ.copy()
     environment.update(
         {
             "RELEASE_COMMIT_SHA": "a" * 40,
-            "DETERMINISM_RUN_ID": "4242",
-            "DETERMINISM_ARTIFACT_DIR": str(artifact_root),
-            "DETERMINISM_REPORT": str(report_path),
+            "RELEASE_RUN_JSON": json.dumps({"created_at": release_created_at}),
+            "QUALIFICATION_RUNS_JSON": json.dumps(
+                {
+                    "total_count": len(runs) if total_count is None else total_count,
+                    "workflow_runs": runs,
+                }
+            ),
+        }
+    )
+    return subprocess.run(  # noqa: S603
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+def _qualification_job(**overrides: object) -> dict[str, object]:
+    job: dict[str, object] = {
+        "id": 5252,
+        "name": "Exact-SHA five-cell runtime reliability qualification",
+        "run_id": 4242,
+        "run_attempt": 1,
+        "head_sha": "a" * 40,
+        "status": "completed",
+        "conclusion": "success",
+        "completed_at": "2026-07-28T11:59:59Z",
+    }
+    job.update(overrides)
+    return job
+
+
+def _run_qualification_job_validator(
+    jobs: list[dict[str, object]],
+    *,
+    qualification_run_id: int = 4242,
+    total_count: object | None = None,
+    release_created_at: str = "2026-07-28T12:00:00Z",
+) -> subprocess.CompletedProcess[str]:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    assignment = workflow.index(
+        'QUALIFICATION_JOBS_JSON="$qualification_jobs" python - <<\'PY\''
+    )
+    heredoc = workflow.index("python - <<'PY'", assignment)
+    script_start = workflow.index("\n", heredoc) + 1
+    script_end = workflow.index("\n          PY", script_start)
+    script = textwrap.dedent(workflow[script_start:script_end])
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "QUALIFICATION_RUN_ID": str(qualification_run_id),
+            "RELEASE_COMMIT_SHA": "a" * 40,
+            "RELEASE_RUN_JSON": json.dumps({"created_at": release_created_at}),
+            "QUALIFICATION_JOBS_JSON": json.dumps(
+                {
+                    "total_count": len(jobs) if total_count is None else total_count,
+                    "jobs": jobs,
+                }
+            ),
+        }
+    )
+    return subprocess.run(  # noqa: S603
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+def _qualification_artifact(**overrides: object) -> dict[str, object]:
+    artifact: dict[str, object] = {
+        "id": 6262,
+        "name": "kestrel-runtime-reliability-qualification-" + "a" * 40,
+        "expired": False,
+        "workflow_run": {"id": 4242, "head_sha": "a" * 40},
+    }
+    artifact.update(overrides)
+    return artifact
+
+
+def _run_qualification_artifact_validator(
+    artifacts: list[dict[str, object]],
+    *,
+    qualification_run_id: int = 4242,
+    total_count: object | None = None,
+) -> subprocess.CompletedProcess[str]:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    assignment = workflow.index(
+        'QUALIFICATION_ARTIFACTS_JSON="$qualification_artifacts" python - <<\'PY\''
+    )
+    heredoc = workflow.index("python - <<'PY'", assignment)
+    script_start = workflow.index("\n", heredoc) + 1
+    script_end = workflow.index("\n          PY", script_start)
+    script = textwrap.dedent(workflow[script_start:script_end])
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "QUALIFICATION_RUN_ID": str(qualification_run_id),
+            "RELEASE_COMMIT_SHA": "a" * 40,
+            "QUALIFICATION_ARTIFACTS_JSON": json.dumps(
+                {
+                    "total_count": (
+                        len(artifacts) if total_count is None else total_count
+                    ),
+                    "artifacts": artifacts,
+                }
+            ),
         }
     )
     return subprocess.run(  # noqa: S603
@@ -331,6 +245,7 @@ def test_determinism_lane_binds_pr_evidence_to_the_exact_head_commit() -> None:
     )
     for job_name in (
         "everyday-golden-determinism",
+        "runtime-reliability-qualification",
         "flock-qualification-determinism",
     ):
         checkout = next(
@@ -339,6 +254,7 @@ def test_determinism_lane_binds_pr_evidence_to_the_exact_head_commit() -> None:
             if str(step.get("uses", "")).startswith("actions/checkout@")
         )
         assert checkout["with"]["ref"] == "${{ env.SOURCE_COMMIT }}"
+        assert checkout["with"]["persist-credentials"] is False
 
     golden = workflow["jobs"]["everyday-golden-determinism"]
     golden_invocation = next(
@@ -598,6 +514,108 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
     assert "github.sha" not in json.dumps(runtime, sort_keys=True)
 
 
+def test_determinism_lane_builds_one_attempt_one_self_contained_five_cell_qualification() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "determinism.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    qualification = workflow["jobs"]["runtime-reliability-qualification"]
+
+    assert qualification["needs"] == [
+        "runtime-reliability",
+        "everyday-golden-determinism",
+    ]
+    assert qualification["if"] == "github.run_attempt == 1"
+    assert "flock" not in json.dumps(qualification, sort_keys=True).lower()
+
+    pinned_download = (
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+    )
+    downloads = [
+        step
+        for step in qualification["steps"]
+        if step.get("uses") == pinned_download
+    ]
+    assert [step["with"] for step in downloads] == [
+        {
+            "name": "kestrel-runtime-reliability-Linux-${{ env.SOURCE_COMMIT }}",
+            "path": (
+                "${{ runner.temp }}/kestrel-runtime-reliability-qualification/"
+                "kestrel-runtime-reliability-Linux-${{ env.SOURCE_COMMIT }}"
+            ),
+        },
+        {
+            "name": "kestrel-runtime-reliability-macOS-${{ env.SOURCE_COMMIT }}",
+            "path": (
+                "${{ runner.temp }}/kestrel-runtime-reliability-qualification/"
+                "kestrel-runtime-reliability-macOS-${{ env.SOURCE_COMMIT }}"
+            ),
+        },
+        {
+            "name": "kestrel-runtime-reliability-Windows-${{ env.SOURCE_COMMIT }}",
+            "path": (
+                "${{ runner.temp }}/kestrel-runtime-reliability-qualification/"
+                "kestrel-runtime-reliability-Windows-${{ env.SOURCE_COMMIT }}"
+            ),
+        },
+        {
+            "name": "kestrel-determinism-memory-${{ env.SOURCE_COMMIT }}",
+            "path": (
+                "${{ runner.temp }}/kestrel-runtime-reliability-qualification/"
+                "kestrel-determinism-memory-${{ env.SOURCE_COMMIT }}"
+            ),
+        },
+        {
+            "name": "kestrel-determinism-memvid-${{ env.SOURCE_COMMIT }}",
+            "path": (
+                "${{ runner.temp }}/kestrel-runtime-reliability-qualification/"
+                "kestrel-determinism-memvid-${{ env.SOURCE_COMMIT }}"
+            ),
+        },
+    ]
+    assert len(
+        [
+            step
+            for step in qualification["steps"]
+            if str(step.get("uses", "")).startswith("actions/download-artifact@")
+        ]
+    ) == 5
+
+    build = next(
+        step["run"]
+        for step in qualification["steps"]
+        if step.get("name") == "Build the five-cell runtime reliability qualification"
+    )
+    assert "scripts/aggregate_runtime_reliability_receipts.py build" in build
+    assert '--source-commit "${SOURCE_COMMIT}"' in build
+    assert '--workflow-run-id "${GITHUB_RUN_ID}"' in build
+    assert '--workflow-run-attempt "${GITHUB_RUN_ATTEMPT}"' in build
+    assert (
+        '--artifact-root "${RUNNER_TEMP}/kestrel-runtime-reliability-qualification"'
+        in build
+    )
+
+    upload = next(
+        step
+        for step in qualification["steps"]
+        if step.get("name") == "Upload the five-cell runtime reliability qualification"
+    )
+    assert upload["uses"] == (
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    )
+    assert upload.get("if") != "always()"
+    assert upload["with"] == {
+        "name": (
+            "kestrel-runtime-reliability-qualification-"
+            "${{ env.SOURCE_COMMIT }}"
+        ),
+        "path": "${{ runner.temp }}/kestrel-runtime-reliability-qualification",
+        "if-no-files-found": "error",
+        "retention-days": 14,
+    }
+
+
 def test_release_rehearsal_lane_is_repeatable_and_has_no_publication_authority() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release-rehearsal.yml").read_text(
         encoding="utf-8"
@@ -640,211 +658,340 @@ def test_testing_guide_determinism_command_binds_backend_and_source_subject() ->
 
 
 def test_production_release_requires_exact_sha_reliability_receipts_before_build() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow_path = ROOT / ".github" / "workflows" / "release.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
 
-    rehearsal_gate = workflow.index("Require successful exact-SHA release rehearsal before build")
-    determinism_gate = workflow.index(
-        "Require successful exact-SHA determinism receipt before build"
+    rehearsal_gate = workflow_text.index(
+        "Require successful exact-SHA release rehearsal before build"
     )
-    build = workflow.index("Build Python release artifacts")
+    qualification_gate = workflow_text.index(
+        "Require successful exact-SHA runtime reliability qualification before build"
+    )
+    build = workflow_text.index("Build Python release artifacts")
     assert rehearsal_gate < build
-    assert determinism_gate < build
-    assert 'actions/workflows/release-rehearsal.yml/runs"' in workflow
-    assert 'actions/workflows/determinism.yml/runs"' in workflow
-    assert '-f head_sha="$RELEASE_COMMIT_SHA"' in workflow
-    assert "-f branch=main" in workflow
-    assert "-f event=push" in workflow
-    assert 'run.get("head_sha") == expected_sha' in workflow
-    assert 'run.get("conclusion") == "success"' in workflow
-    assert 'actions/runs/${GITHUB_RUN_ID}' in workflow
-    assert 'release_run.get("created_at")' in workflow
-    assert 'run.get("updated_at")' in workflow
-    assert '"release rehearsal push run on main that completed before the "' in workflow
-    assert '"release workflow was created"' in workflow
-    assert 'gh run download "$DETERMINISM_RUN_ID"' in workflow
-    assert "kestrel-determinism-memory-${RELEASE_COMMIT_SHA}" in workflow
-    assert 'report.get("schema") != "kestrel.determinism_eval_report.v3"' in workflow
-    assert 'subject.get("source_commit") != expected_sha' in workflow
-    assert 'configuration.get("backend") != "memory"' in workflow
-    assert 'configuration.get("max_case_latency_ms") != 45000.0' in workflow
-    assert "validate_golden_report(" in workflow
-    assert "recomputed_projection" in workflow
-    assert "if summary != derived_summary" in workflow
+    assert qualification_gate < build
+    assert workflow["permissions"] == {"actions": "read", "contents": "read"}
 
-
-def test_release_gate_accepts_only_exact_sha_memory_v3_lane_receipt(
-    tmp_path: Path,
-) -> None:
-    accepted = _run_determinism_receipt_gate(tmp_path, _determinism_v3_receipt())
-    substituted = _run_determinism_receipt_gate(
-        tmp_path,
-        _determinism_v3_receipt(backend="memvid"),
+    gate_text = workflow_text[qualification_gate:build]
+    assert 'actions/workflows/determinism.yml/runs"' in gate_text
+    assert '-f head_sha="$RELEASE_COMMIT_SHA"' in gate_text
+    assert "-f branch=main" in gate_text
+    assert "-f event=push" in gate_text
+    assert "-f status=completed" not in gate_text
+    assert 'actions/runs/${GITHUB_RUN_ID}' in gate_text
+    assert 'export RELEASE_RUN_JSON="$release_run"' in gate_text
+    assert 'run.get("head_sha") == expected_sha' in gate_text
+    assert 'run.get("head_branch") == "main"' in gate_text
+    assert 'run.get("event") == "push"' in gate_text
+    assert 'selected.get("status")' not in gate_text
+    assert 'run.get("conclusion") == "success"' not in gate_text
+    assert 'type(selected.get("run_attempt")) is not int' in gate_text
+    assert 'selected["run_attempt"] != 1' in gate_text
+    assert 'selected.get("updated_at")' not in gate_text
+    assert 'actions/runs/${QUALIFICATION_RUN_ID}/jobs' in gate_text
+    assert 'job.get("name")' in gate_text
+    assert '"Exact-SHA five-cell runtime reliability qualification"' in gate_text
+    assert 'job.get("conclusion") != "success"' in gate_text
+    assert 'job.get("completed_at")' in gate_text
+    assert 'gh run download "$QUALIFICATION_RUN_ID"' in gate_text
+    assert (
+        '"kestrel-runtime-reliability-qualification-${RELEASE_COMMIT_SHA}"'
+        in gate_text
     )
-    malformed_digest = _run_determinism_receipt_gate(
-        tmp_path,
-        _determinism_v3_receipt(golden_report_sha256="not-a-digest"),
+    assert gate_text.count("gh run download") == 1
+    assert "kestrel-determinism-memory-${RELEASE_COMMIT_SHA}" not in gate_text
+    assert "kestrel-determinism-memvid-${RELEASE_COMMIT_SHA}" not in gate_text
+    assert "kestrel-flock-qualification" not in gate_text
+    assert "scripts/aggregate_runtime_reliability_receipts.py verify" in gate_text
+    assert '--source-commit "$RELEASE_COMMIT_SHA"' in gate_text
+    assert '--workflow-run-id "$QUALIFICATION_RUN_ID"' in gate_text
+    assert "--workflow-run-attempt 1" in gate_text
+    assert "kestrel-runtime-reliability-qualification.json" in gate_text
+
+
+def test_release_qualification_selector_accepts_one_attempt_one_pre_release_run() -> None:
+    completed = _run_qualification_selector([_qualification_run()])
+    enclosing_workflow_failed = _run_qualification_selector(
+        [_qualification_run(conclusion="failure")]
+    )
+    enclosing_workflow_still_running = _run_qualification_selector(
+        [
+            _qualification_run(
+                status="in_progress",
+                updated_at="not-qualification-authority",
+            )
+        ]
     )
 
-    assert accepted.returncode == 0, accepted.stderr
-    assert substituted.returncode != 0
-    assert "memory backend" in substituted.stderr
-    assert malformed_digest.returncode != 0
-    assert "golden report digest" in malformed_digest.stderr
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "4242"
+    assert enclosing_workflow_failed.returncode == 0, enclosing_workflow_failed.stderr
+    assert enclosing_workflow_failed.stdout.strip() == "4242"
+    assert enclosing_workflow_still_running.returncode == 0, (
+        enclosing_workflow_still_running.stderr
+    )
+    assert enclosing_workflow_still_running.stdout.strip() == "4242"
 
 
-def test_release_gate_accepts_distinct_golden_digests_for_one_functional_signature(
-    tmp_path: Path,
+def test_release_qualification_selector_rejects_rerun_and_ambiguous_evidence() -> None:
+    rerun = _run_qualification_selector([_qualification_run(run_attempt=2)])
+    ambiguous = _run_qualification_selector(
+        [_qualification_run(), _qualification_run(id=4343)]
+    )
+    replacement = _run_qualification_selector(
+        [
+            _qualification_run(id=4141, conclusion="failure"),
+            _qualification_run(id=4242),
+        ]
+    )
+
+    assert rerun.returncode != 0
+    assert "exactly one" in rerun.stderr
+    assert ambiguous.returncode != 0
+    assert "exactly one" in ambiguous.stderr
+    assert replacement.returncode != 0
+    assert "exactly one" in replacement.stderr
+
+
+@pytest.mark.parametrize(
+    "malformed_id",
+    ["4343", True, 4242.0, None, 0, -1],
+    ids=["string", "boolean", "float", "null", "zero", "negative"],
+)
+def test_release_qualification_selector_rejects_malformed_id_replacement(
+    malformed_id: object,
 ) -> None:
-    receipt = _determinism_v3_receipt()
-    runs = receipt["runs"]
-    assert isinstance(runs, list)
-    digests = {
-        run["golden_report_sha256"]
-        for run in runs
-        if isinstance(run, dict)
-    }
+    completed = _run_qualification_selector(
+        [_qualification_run(), _qualification_run(id=malformed_id)]
+    )
 
-    completed = _run_determinism_receipt_gate(tmp_path, receipt)
+    assert completed.returncode != 0
+    assert "replacement runs are rejected" in completed.stderr
 
-    assert len(digests) == 20
+
+def test_release_qualification_selector_rejects_paginated_ambiguity() -> None:
+    completed = _run_qualification_selector(
+        [_qualification_run()],
+        total_count=101,
+    )
+
+    assert completed.returncode != 0
+    assert "pagination" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "updated_at",
+    ["2026-07-28T12:00:00Z", "2026-07-28T12:00:01Z", "malformed", None],
+    ids=["equal", "after", "malformed", "null"],
+)
+def test_release_qualification_selector_does_not_use_run_updated_at_as_authority(
+    updated_at: object,
+) -> None:
+    completed = _run_qualification_selector(
+        [_qualification_run(updated_at=updated_at)]
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "4242"
+
+
+def test_release_qualification_selector_rejects_wrong_run_metadata() -> None:
+    invalid_fields = (
+        ("id", "4242", "attempt-1"),
+        ("head_sha", "b" * 40, "replacement runs are rejected"),
+        ("head_branch", "feature", "replacement runs are rejected"),
+        ("event", "workflow_dispatch", "replacement runs are rejected"),
+        ("run_attempt", True, "attempt-1"),
+    )
+
+    for field, value, expected in invalid_fields:
+        completed = _run_qualification_selector(
+            [_qualification_run(**{field: value})]
+        )
+
+        assert completed.returncode != 0, field
+        assert expected in completed.stderr, field
+
+
+def test_release_qualification_job_validator_accepts_exact_metadata() -> None:
+    completed = _run_qualification_job_validator([_qualification_job()])
+
     assert completed.returncode == 0, completed.stderr
 
 
-def test_release_gate_recomputes_each_uploaded_golden_report_digest(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "completed_at",
+    [
+        "2026-07-28T12:00:00Z",
+        "2026-07-28T12:00:01Z",
+        "malformed",
+        None,
+        True,
+    ],
+    ids=["equal", "after", "malformed", "null", "boolean"],
+)
+def test_release_qualification_job_validator_rejects_non_pre_release_completion(
+    completed_at: object,
 ) -> None:
-    receipt = _determinism_v3_receipt()
-    substituted_reports = _golden_reports()
-    substituted_reports[-1] = {
-        **substituted_reports[-1],
-        "substituted": True,
-    }
-
-    completed = _run_determinism_receipt_gate(
-        tmp_path,
-        receipt,
-        golden_reports=substituted_reports,
+    completed = _run_qualification_job_validator(
+        [_qualification_job(completed_at=completed_at)]
     )
 
     assert completed.returncode != 0
-    assert "golden report digest does not match repeat 20" in completed.stderr
 
 
-def test_release_gate_derives_pass_state_from_each_uploaded_golden_report(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("job", "qualification_run_id"),
+    [
+        (_qualification_job(run_attempt=True), 4242),
+        (_qualification_job(run_attempt=1.0), 4242),
+        (_qualification_job(run_id=True), 1),
+        (_qualification_job(run_id=4242.0), 4242),
+        (_qualification_job(head_sha="b" * 40), 4242),
+        (_qualification_job(status="in_progress"), 4242),
+        (_qualification_job(conclusion="failure"), 4242),
+    ],
+    ids=[
+        "boolean-attempt",
+        "float-attempt",
+        "boolean-run-id",
+        "float-run-id",
+        "wrong-sha",
+        "incomplete-status",
+        "failed-conclusion",
+    ],
+)
+def test_release_qualification_job_validator_rejects_mismatched_metadata(
+    job: dict[str, object], qualification_run_id: int
 ) -> None:
-    receipt = _determinism_v3_receipt()
-    failing_reports = _golden_reports(failed=True)
-    runs = receipt["runs"]
-    assert isinstance(runs, list)
-    for run, golden_report in zip(runs, failing_reports, strict=True):
-        assert isinstance(run, dict)
-        run["golden_report_sha256"] = _golden_report_sha256(golden_report)
-
-    completed = _run_determinism_receipt_gate(
-        tmp_path,
-        receipt,
-        golden_reports=failing_reports,
+    completed = _run_qualification_job_validator(
+        [job], qualification_run_id=qualification_run_id
     )
 
     assert completed.returncode != 0
-    assert "golden report acceptance failed for repeat 1" in completed.stderr
+    assert "stale, failed, or mismatched" in completed.stderr
 
 
-def test_release_gate_validates_each_uploaded_golden_report_contract(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "total_count",
+    [True, 1.0, 2],
+    ids=["boolean", "float", "mismatch"],
+)
+def test_release_qualification_job_validator_rejects_invalid_total_count(
+    total_count: object,
 ) -> None:
-    receipt = _determinism_v3_receipt()
-    malformed_reports = _golden_reports()
-    malformed_reports[0] = {**malformed_reports[0], "untrusted": True}
-    runs = receipt["runs"]
-    assert isinstance(runs, list)
-    assert isinstance(runs[0], dict)
-    runs[0]["golden_report_sha256"] = _golden_report_sha256(malformed_reports[0])
-
-    completed = _run_determinism_receipt_gate(
-        tmp_path,
-        receipt,
-        golden_reports=malformed_reports,
+    completed = _run_qualification_job_validator(
+        [_qualification_job()], total_count=total_count
     )
 
     assert completed.returncode != 0
-    assert "golden report contract is invalid for repeat 1" in completed.stderr
+    assert "malformed or requires pagination" in completed.stderr
 
 
-def test_release_gate_derives_projection_from_each_uploaded_golden_report(
-    tmp_path: Path,
-) -> None:
-    receipt = _determinism_v3_receipt()
-    substituted_reports = _golden_reports(tool_count=2)
-    runs = receipt["runs"]
-    assert isinstance(runs, list)
-    for run, golden_report in zip(runs, substituted_reports, strict=True):
-        assert isinstance(run, dict)
-        run["golden_report_sha256"] = _golden_report_sha256(golden_report)
+def test_release_qualification_job_validator_rejects_paginated_metadata() -> None:
+    jobs = [_qualification_job()]
+    jobs.extend({"name": f"unrelated-job-{index}"} for index in range(100))
 
-    completed = _run_determinism_receipt_gate(
-        tmp_path,
-        receipt,
-        golden_reports=substituted_reports,
-    )
+    completed = _run_qualification_job_validator(jobs, total_count=len(jobs))
 
     assert completed.returncode != 0
-    assert "golden report projection does not match repeat 1" in completed.stderr
+    assert "malformed or requires pagination" in completed.stderr
 
 
-def test_release_gate_rejects_missing_or_extra_golden_reports(tmp_path: Path) -> None:
-    receipt = _determinism_v3_receipt()
-    missing = _run_determinism_receipt_gate(
-        tmp_path,
-        receipt,
-        omitted_repeats=frozenset({20}),
+def test_release_qualification_job_validator_requires_one_exact_name() -> None:
+    missing = _run_qualification_job_validator(
+        [_qualification_job(name="unrelated job")]
     )
-    extra = _run_determinism_receipt_gate(
-        tmp_path,
-        receipt,
-        extra_reports={21: {"extra": True}},
+    duplicate = _run_qualification_job_validator(
+        [_qualification_job(), _qualification_job(id=5353)]
     )
 
     assert missing.returncode != 0
-    assert "golden report artifact count" in missing.stderr
-    assert extra.returncode != 0
-    assert "golden report artifact count" in extra.stderr
+    assert "exactly one aggregate job" in missing.stderr
+    assert duplicate.returncode != 0
+    assert "exactly one aggregate job" in duplicate.stderr
 
 
-def test_release_gate_derives_one_distinct_outcome_signature(tmp_path: Path) -> None:
-    receipt = _determinism_v3_receipt()
-    runs = receipt["runs"]
-    assert isinstance(runs, list)
-    assert isinstance(runs[-1], dict)
-    runs[-1]["outcome_signature"] = "d" * 64
+def test_release_qualification_artifact_validator_accepts_exact_metadata() -> None:
+    completed = _run_qualification_artifact_validator([_qualification_artifact()])
 
-    completed = _run_determinism_receipt_gate(tmp_path, receipt)
-
-    assert completed.returncode != 0
-    assert "golden report projection does not match repeat 20" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
 
 
-def test_release_gate_derives_reference_projection_signature(tmp_path: Path) -> None:
-    receipt = _determinism_v3_receipt()
-    receipt["reference_projection"] = {"substituted": True}
-
-    completed = _run_determinism_receipt_gate(tmp_path, receipt)
-
-    assert completed.returncode != 0
-    assert "reference projection does not match reports" in completed.stderr
-
-
-def test_release_gate_rejects_forged_derived_summary(tmp_path: Path) -> None:
-    receipt = _determinism_v3_receipt()
-    summary = receipt["summary"]
-    assert isinstance(summary, dict)
-    summary["determinism_streak"] = 19
-
-    completed = _run_determinism_receipt_gate(tmp_path, receipt)
+@pytest.mark.parametrize(
+    "total_count",
+    [True, 1.0, 2],
+    ids=["boolean", "float", "mismatch"],
+)
+def test_release_qualification_artifact_validator_rejects_invalid_total_count(
+    total_count: object,
+) -> None:
+    completed = _run_qualification_artifact_validator(
+        [_qualification_artifact()], total_count=total_count
+    )
 
     assert completed.returncode != 0
-    assert "derived summary" in completed.stderr
+    assert "malformed or requires pagination" in completed.stderr
+
+
+def test_release_qualification_artifact_validator_rejects_paginated_metadata() -> None:
+    artifacts = [_qualification_artifact()]
+    artifacts.extend(
+        {"name": f"unrelated-artifact-{index}"} for index in range(100)
+    )
+
+    completed = _run_qualification_artifact_validator(
+        artifacts, total_count=len(artifacts)
+    )
+
+    assert completed.returncode != 0
+    assert "malformed or requires pagination" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("workflow_run", "qualification_run_id"),
+    [
+        ({"id": True, "head_sha": "a" * 40}, 1),
+        ({"id": 4242.0, "head_sha": "a" * 40}, 4242),
+        ({"id": 4343, "head_sha": "a" * 40}, 4242),
+        ({"id": 4242, "head_sha": "b" * 40}, 4242),
+    ],
+    ids=["boolean-run-id", "float-run-id", "wrong-run-id", "wrong-sha"],
+)
+def test_release_qualification_artifact_validator_rejects_mismatched_workflow_run(
+    workflow_run: dict[str, object], qualification_run_id: int
+) -> None:
+    completed = _run_qualification_artifact_validator(
+        [_qualification_artifact(workflow_run=workflow_run)],
+        qualification_run_id=qualification_run_id,
+    )
+
+    assert completed.returncode != 0
+    assert "stale or mismatched" in completed.stderr
+
+
+def test_release_qualification_artifact_validator_rejects_expired_artifact() -> None:
+    completed = _run_qualification_artifact_validator(
+        [_qualification_artifact(expired=True)]
+    )
+
+    assert completed.returncode != 0
+    assert "stale or mismatched" in completed.stderr
+
+
+def test_release_qualification_artifact_validator_requires_one_exact_name() -> None:
+    missing = _run_qualification_artifact_validator(
+        [_qualification_artifact(name="unrelated-artifact")]
+    )
+    duplicate = _run_qualification_artifact_validator(
+        [_qualification_artifact(), _qualification_artifact(id=6363)]
+    )
+
+    assert missing.returncode != 0
+    assert "exactly one exact-name aggregate artifact" in missing.stderr
+    assert duplicate.returncode != 0
+    assert "exactly one exact-name aggregate artifact" in duplicate.stderr
 
 
 def test_release_order_gate_accepts_only_a_rehearsal_completed_before_tag_workflow() -> None:
