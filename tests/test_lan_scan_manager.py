@@ -1062,21 +1062,23 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
     ]
     outcomes: dict[int, str] = {}
     winning_futures: dict[int, Any] = {}
+    worker_failures: dict[int, BaseException] = {}
     outcomes_lock = Lock()
 
     def start(index: int) -> None:
-        barrier.wait()
         try:
-            managers[index].start(
-                drafts[index].scan_id,
-                expected_revision=drafts[index].revision,
-                authorization=authorizations[index],
-                preview_digest=authorizations[index].preview_digest,
-            )
-        except task6.LanScanAdmissionConflict:
-            with outcomes_lock:
-                outcomes[index] = "lost"
-        else:
+            barrier.wait()
+            try:
+                managers[index].start(
+                    drafts[index].scan_id,
+                    expected_revision=drafts[index].revision,
+                    authorization=authorizations[index],
+                    preview_digest=authorizations[index].preview_digest,
+                )
+            except task6.LanScanAdmissionConflict:
+                with outcomes_lock:
+                    outcomes[index] = "lost"
+                return
             with managers[index]._lock:  # noqa: SLF001 - exact worker teardown proof
                 handle = managers[index]._active_scans[drafts[index].scan_id]  # noqa: SLF001
                 future = handle.future
@@ -1085,14 +1087,31 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
             with outcomes_lock:
                 outcomes[index] = "won"
                 winning_futures[index] = future
+        except BaseException as exc:  # noqa: BLE001 - surface exact thread failure
+            with outcomes_lock:
+                worker_failures[index] = exc
 
     threads = [Thread(target=start, args=(index,)) for index in range(2)]
     primary_failure: BaseException | None = None
+    reported_worker_failures: set[int] = set()
     try:
         for thread in threads:
             thread.start()
+        start_deadline = time.monotonic() + 15.0
         for thread in threads:
-            thread.join(timeout=3)
+            thread.join(timeout=max(0.0, start_deadline - time.monotonic()))
+        with outcomes_lock:
+            worker_failure_items = tuple(sorted(worker_failures.items()))
+        if worker_failure_items:
+            failed_index, failure = worker_failure_items[0]
+            reported_worker_failures.update(index for index, _ in worker_failure_items)
+            failure.add_note(f"raised by LAN start worker {failed_index}")
+            for additional_index, additional_failure in worker_failure_items[1:]:
+                failure.add_note(
+                    "additional LAN start worker "
+                    f"{additional_index} failure: {additional_failure!r}"
+                )
+            raise failure
         assert all(not thread.is_alive() for thread in threads)
         assert sorted(outcomes.values()) == ["lost", "won"]
         assert sorted(winning_futures) == [
@@ -1131,6 +1150,15 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
                 cleanup_failures.append(f"start thread {index} did not stop")
         with outcomes_lock:
             winner_items = tuple(sorted(winning_futures.items()))
+            late_worker_failure_items = tuple(
+                (index, failure)
+                for index, failure in sorted(worker_failures.items())
+                if index not in reported_worker_failures
+            )
+        cleanup_failures.extend(
+            f"start worker {index} failed: {failure!r}"
+            for index, failure in late_worker_failure_items
+        )
         if winner_items and not release_observed.wait(
             timeout=max(0.0, cleanup_deadline - time.monotonic())
         ):

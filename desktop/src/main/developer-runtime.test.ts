@@ -34,6 +34,8 @@ async function sha256File(path: string): Promise<string> {
     .digest("hex");
 }
 
+const TINY_EXECUTABLE = "#!/bin/sh\nexit 0\n";
+
 describe("developer-runtime executable launch", () => {
   let root: string;
 
@@ -92,7 +94,7 @@ describe("developer-runtime executable launch", () => {
     "detects a pathname replacement immediately before spawn without launching it",
     async () => {
       const executable = join(root, "sidecar");
-      await copyFile(process.execPath, executable);
+      await writeFile(executable, TINY_EXECUTABLE, { mode: 0o700 });
       await chmod(executable, 0o700);
       const metadata = await lstat(executable);
       let spawnCalls = 0;
@@ -110,7 +112,7 @@ describe("developer-runtime executable launch", () => {
         }
       );
       await rename(executable, `${executable}.captured`);
-      await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
+      await writeFile(executable, TINY_EXECUTABLE, { mode: 0o700 });  // codeql[js/file-system-race] — test fixture: O_NOFOLLOW + fstat identity check
       await chmod(executable, 0o700);
 
       expect(() =>
@@ -174,7 +176,7 @@ describe("developer-runtime executable launch", () => {
     async () => {
       const executable = join(root, "sidecar");
       const link = join(root, "sidecar-link");
-      await copyFile(process.execPath, executable);
+      await writeFile(executable, TINY_EXECUTABLE, { mode: 0o700 });
       await chmod(executable, 0o700);
       await symlink(executable, link);
       const metadata = await lstat(executable);
@@ -678,7 +680,7 @@ describe("immutable packaged runtime selection", () => {
         await chmod(userData, 0o700);
         const profileRoot = join(userData, "profiles", "default");
         const executable = join(userData, "sidecar");
-        await copyFile(process.execPath, executable);
+        await writeFile(executable, TINY_EXECUTABLE, { mode: 0o700 });
         await chmod(executable, 0o700);
         const metadata = await lstat(executable);
         const resource = {
