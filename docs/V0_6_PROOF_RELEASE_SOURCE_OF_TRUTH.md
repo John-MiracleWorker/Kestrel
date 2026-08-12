@@ -1,6 +1,6 @@
 # Kestrel v0.6 Proof Release — Source of Truth
 
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 This document is the canonical program contract for the Kestrel v0.6 proof
 release. It translates the owner-approved release prompt into durable,
@@ -170,9 +170,9 @@ rewritten as a pass.
   exact identity, and clean-checkout proof. Its owner-local receipt root,
   command record, immutable S0-only manifest, and review disposition are
   recorded in `MAIN-2026-08-11-S0`. That receipt completes the technical S0
-  evidence without changing either baseline receipt's original result. S0
-  remains `in_progress` until PR #338 merges and a later append-only receipt
-  binds its then-known merge SHA.
+  evidence without changing either baseline receipt's original result. At
+  this receipt's 2026-08-11 boundary, S0 remained `in_progress` until PR #338
+  merged and a later append-only receipt bound its then-unknown merge SHA.
 - S1 implementation provenance spans backend-bound determinism
   [PR #332](https://github.com/John-MiracleWorker/Kestrel/pull/332), Windows wait
   stabilization [PR #333](https://github.com/John-MiracleWorker/Kestrel/pull/333),
@@ -212,10 +212,11 @@ rewritten as a pass.
   `qualified`. The later exact-main S0 receipt cannot retroactively make those
   merges dependency-compliant. PR #338 is this reconciliation record, is not
   part of that exception set, and its merge does not grant the distinct owner
-  exception. Its merge also does not itself qualify S0: a later append-only
-  receipt must bind PR #338's merged SHA before a follow-up may move S0 to
-  `qualified`. S0 and S1 therefore remain `in_progress`, and S2 remains
-  unavailable. After S0 qualifies, a distinct later owner-acceptance change
+  exception. At this 2026-08-11 reconciliation boundary, its future merge
+  also could not itself qualify S0: a later append-only receipt still had to
+  bind PR #338's merged SHA before a follow-up could move S0 to `qualified`.
+  S0 and S1 therefore remained `in_progress`, and S2 remained unavailable.
+  After S0 qualifies, a distinct later owner-acceptance change
   may durably grant a one-time exception and move S1 to `qualified`; no such
   exception has been granted. That later change must preserve the violation as
   history and does not waive dependency ordering for S2 or any future slice.
@@ -230,6 +231,28 @@ rewritten as a pass.
   qualifying evidence; the focused pass does not erase the P3 installer/final-
   release hardening finding, which does not block S0 or the REL-001–REL-003
   technical evidence.
+
+### S0 qualification follow-up (2026-08-12)
+
+PR #338 reviewed head `d73f5c54be0739787612bfa03df50f7942cd598e`,
+tree `8f8e09bf4c4226df67255df79d8004f1b5d75cc1`, merged normally as signed
+protected-main commit `eb7f26628e40e3a840dccb7ebfb9dd67e0bb7ac9` with
+the same tree and ordered parents
+`94556eaa98ec153729d0d063346c8e64ba2575e1` and
+`d73f5c54be0739787612bfa03df50f7942cd598e`. The append-only
+`MAIN-2026-08-12-S0-QUAL` receipt below binds that exact merge to the already
+accepted `MAIN-2026-08-11-S0` technical receipt. Exact-head CI, determinism,
+review, and exact-main attempt-1 CI and determinism all passed without rerun or
+cancellation. This closes only the remaining canonical-record gate and moves
+S0 to `qualified`.
+
+REL-001 through REL-003 and S1 remain `in_progress`; the distinct S1 owner
+exception has not been granted. S2 remains unavailable and `not_started`, and
+issues #303 and #308 remain open. This follow-up does not satisfy REL-004,
+REL-005, S2 or any later slice, installed-artifact qualification, owner
+promotion, stable-tag creation, publication, post-publication verification, or
+final v0.6 release qualification. The successful single protected-main
+rehearsal is ancillary and is not REL-004.
 
 These receipts do not satisfy REL-004, REL-005, any `RELEASE` requirement, S2
 or a later slice, installed-artifact qualification, owner promotion, stable-tag
@@ -299,7 +322,7 @@ qualification.
 
 | Slice | Deliverable | Depends on | Status |
 | --- | --- | --- | --- |
-| S0 | Canonical source of truth and audited baseline | — | `in_progress` |
+| S0 | Canonical source of truth and audited baseline | — | `qualified` |
 | S1 | Reliability root-cause fixes and 20-repeat platform receipt | S0 | `in_progress` |
 | S2 | Exact-SHA candidate/promotion transaction | S1 | `not_started` |
 | S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `not_started` |
@@ -492,5 +515,6 @@ trust.
 | PR339-2026-08-11-CI-FAIL | `8b72ae875d1c44339cd5aa9babf785c79bae04ca` | `failed receipt; PR #339 merged later` | `94556eaa98ec153729d0d063346c8e64ba2575e1` | Attempt-1 [push CI 31525914516](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31525914516), Windows `93894066757`; [PR CI 31525917233](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31525917233), Windows `93894076076`; successful [determinism 31525917155](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31525917155) | Push failed `test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipts` after its fixed 15-second terminal wait; PR CI independently failed `test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization` at its fixed two-second completion wait. Both Docker jobs were skipped. This exact `8b72ae8` receipt remained failed and non-qualifying; PR #339 merged later as `94556eaa` only after later repairs produced qualified head `9023a7c`. The attempt was not rerun, and the later merge does not rewrite it as a pass. |
 | PR339-2026-08-11-S1 | `9023a7c04cd7ccaa87fa49deef0fbbf14261473b` | `merged` | `94556eaa98ec153729d0d063346c8e64ba2575e1` | Exact tree `854d534160f76adaa1e4039dcd291f154f4cb5e6`; attempt-1 [push CI 31542384239](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31542384239) 14/14, [PR CI 31542387278](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31542387278) 14/14, and [determinism 31542387290](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31542387290) 7/7; aggregate artifact `9121666980`, API digest `f89e5118ce6979de81dd8404825546ef2b19c57ad04cfe29a8663432930da098`, JSON SHA-256 `44ddaa20d8a9e9a05a7e9164ebd52eb6393bb00d36da50e2f7a31111d9423ff9`; clean local 20-by-7 report SHA-256 `7df5cbe83414b170910d519871f0c2099c808607db34d61e0a4b81fcb76edbd2`; [hosted Codex review](https://github.com/John-MiracleWorker/Kestrel/pull/339#issuecomment-5259594915) and current-head CodeRabbit status | Five of five cells, 100/100 repeats, 420 runtime and 840 golden executions, ordinary Windows and downstream Docker all passed with zero failures, flakes, cleanup failures, deadline overruns, or receipt diagnostics. This qualifies the branch candidate only; it grants no owner exception and does not satisfy S2, installed-artifact, repeated rehearsal, publication, promotion, or release qualification. |
 | MAIN-2026-08-11-S1-REQUAL | `94556eaa98ec153729d0d063346c8e64ba2575e1` | `merged` | `94556eaa98ec153729d0d063346c8e64ba2575e1` | Exact tree `854d534160f76adaa1e4039dcd291f154f4cb5e6`; attempt-1 [CI 31545460395](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31545460395) 14/14, Windows `93956853439`, Docker `93962276821`; [determinism 31545460478](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31545460478) 7/7, aggregate artifact `9122565218`, API digest `04c7342fe9bb7166ffb48ea279e01ba3b09093aaae07b0b3297b988bb9e751dc`, JSON SHA-256 `b4a91cddd150f492be3a2fdf6346a51091ad604cbff94579318bde9aca3c41a8`; complete 5,298-test/local-qualification receipt SHA-256 `49291fb4ba6695d6c6eff49dfafb1385092704f07e2e27a4d2424ad9b8b93a1a`; local 20-by-7 report SHA-256 `45b2d18a6f361914b6b3dc16b53d1bd1512915d93b96e4e3b4857b8469cbf292`; ancillary [release rehearsal 31545460452](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31545460452), artifact `9122289710`, report SHA-256 `c4289de984cbefa21f48e9c8bfedb7b14300039a3fdb5d28cf279bdd643e2631` | Protected-main technical requalification passed: five of five cells, 100/100 repeats, 420 runtime and 840 golden executions, zero failures, flakes, cleanup failures, deadline overruns, or diagnostics; Windows and strict Docker passed. REL-001 through REL-003 remain `in_progress`: S0 is `in_progress` pending the later PR #338 merged-SHA receipt, and after S0 qualifies the distinct S1 process exception will still be ungranted. S1 remains `in_progress`; S2 remains unavailable and `not_started`; #303/#308 remain open. One disposable rehearsal is ancillary and does not satisfy REL-004, S2, promotion, publication, or release qualification. |
+| MAIN-2026-08-12-S0-QUAL | `eb7f26628e40e3a840dccb7ebfb9dd67e0bb7ac9` | `merged` | `eb7f26628e40e3a840dccb7ebfb9dd67e0bb7ac9` | Prior technical receipt `MAIN-2026-08-11-S0`; [PR #338](https://github.com/John-MiracleWorker/Kestrel/pull/338) reviewed head `d73f5c54be0739787612bfa03df50f7942cd598e`, tree `8f8e09bf4c4226df67255df79d8004f1b5d75cc1`, and validly signed merge with ordered parents `94556eaa98ec153729d0d063346c8e64ba2575e1` / `d73f5c54be0739787612bfa03df50f7942cd598e`; one-file patch SHA-256 `7f8c79d40f05120047d60e9dd334c5a1c485f6d4429a5b13f475f80d351e992f`; exact-head attempt-1 [push CI 31557390723](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31557390723) 14/14, [PR CI 31557393069](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31557393069) 14/14, and [determinism 31557393068](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31557393068) 7/7; CodeRabbit SUCCESS; hosted Codex comment `5261496325` reviewed exact `d73f5c54be` with no major issue; 5/5 review threads resolved; exact-main attempt-1 [CI 31560773372](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31560773372) 14/14, Windows `94002397462`, Docker `94008639366`; [determinism 31560773367](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31560773367) 7/7, aggregate artifact `9127839468`, API digest `22ecaa60a25015cefce7c95033a693f72775f4818ce85fa574c7ff86599dab8c`, JSON SHA-256 `6f486d29b639c98f93da8ca40cee0730d39ad712933f0709789808d22bd2edf3` | The appended merged-SHA binding closes only the remaining S0 canonical-record gap and, together with `MAIN-2026-08-11-S0`, qualifies S0. It does not rewrite failed/incomplete history, qualify REL-001 through REL-003 or S1, grant the distinct owner exception, close #303/#308, make S2 available, or satisfy REL-004/REL-005, release qualification, promotion, publication, or post-publication verification. PR #338's owner merge is merge evidence, not the S1 exception. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
