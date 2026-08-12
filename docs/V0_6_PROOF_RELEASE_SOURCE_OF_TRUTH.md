@@ -259,6 +259,40 @@ or a later slice, installed-artifact qualification, owner promotion, stable-tag
 creation, publication, post-publication verification, or final v0.6 release
 qualification.
 
+### S1 one-time owner-acceptance exception (2026-08-12)
+
+On 2026-08-12 the repository owner, Trent Iuni, explicitly selected **Grant the
+narrow S1 exception** in response to this exact question:
+
+> May I create the one-time S1 owner-acceptance record that preserves that
+> historical dependency-order violation and waives no S2+, release, promotion,
+> or publication gate?
+
+This durably records the owner's one-time acceptance of the S1 process
+exception anticipated by the 2026-08-11 reconciliation above. The exception:
+
+- Is narrow and nonprecedential. It applies only to accepting the already
+  complete REL-001/REL-002/REL-003 technical evidence for S1 (receipts
+  `MAIN-2026-08-11-S1`, `MAIN-2026-08-11-S1-REQUAL`, and `PR339-2026-08-11-S1`).
+- Preserves as history that PRs #332 through #337 and PR #339 were merged
+  before a merged canonical record had qualified S0. Those merges remain a
+  dependency-order violation and are never rewritten as dependency-compliant.
+- Grants no waiver, authority, or evidence for REL-004, REL-005, S2 through
+  S12, installed artifacts, stable-tag creation, promotion, publication,
+  post-publication verification, issue closure beyond the scoped reliability
+  issues (#303/#308, scoped to REL-001 through REL-003 when closure later
+  occurs), or any future dependency-order violation.
+
+This change does not qualify S1 on this unmerged branch. REL-001 through
+REL-003 and S1 remain `in_progress` until this owner-acceptance change itself
+is normally merged to protected main and a later append-only receipt binds the
+exact protected-main merge SHA. Only then may S1 move to `qualified`, and only
+then may issues #303/#308 be closed, scoped to REL-001 through REL-003. S2
+remains `not_started` and unavailable for acceptance, merge, or qualification;
+any S2 preparation is limited to an isolated stacked branch and grants no
+authority. The existing S0 qualification and every failed or incomplete
+receipt above remain unchanged.
+
 ## Requirement register
 
 ### Reliability (`REL`)
