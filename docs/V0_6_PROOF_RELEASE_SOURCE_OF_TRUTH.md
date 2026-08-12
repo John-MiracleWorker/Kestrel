@@ -179,25 +179,44 @@ rewritten as a pass.
   executor-rejection synchronization
   [PR #335](https://github.com/John-MiracleWorker/Kestrel/pull/335), and final
   five-cell aggregation
-  [PR #337](https://github.com/John-MiracleWorker/Kestrel/pull/337). PR #337 head
+  [PR #337](https://github.com/John-MiracleWorker/Kestrel/pull/337), followed by
+  the scheduler-sensitive Windows reliability repair
+  [PR #339](https://github.com/John-MiracleWorker/Kestrel/pull/339). PR #337 head
   `59ebcc6e90e2b120fddeceb6d0a2578213f4ef51` merged normally as
   `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` with tree
   `8395483245d48af48feeb3521f65f22785fe30ee`. Exact-main attempt-1 CI and
   determinism passed, the five-cell aggregate artifact was independently
   safety-checked and replayed against the same run/attempt/SHA, and exact-head
-  review found no major issue. The technical evidence qualifies REL-001 through
-  REL-003, subject to the process exception below.
-- Process exception: PRs #332 through #337 were merged by the repository owner
-  while this canonical record still marked S0 `in_progress`. That sequence
-  violated the dependency rule above. The later exact-main S0 receipt cannot
-  retroactively make those merges dependency-compliant. S1 therefore remains
-  `in_progress`, and S2 remains unavailable. After this reconciliation record
-  is merged, a distinct later owner-acceptance change may durably grant a
-  one-time exception and move S1 to `qualified`. That later change must preserve
-  the violation as history and does not waive dependency ordering for S2 or any
-  future slice. Issues #303 and #308 remain open until that later change
-  qualifies S1; any eventual closure must be scoped to REL-001 through REL-003
-  and must not imply REL-004/REL-005 or installed-artifact qualification.
+  review found no major issue.
+- Later qualification preserved two additional failed candidate heads rather
+  than rewriting them as passes. PR #338 head
+  `b5d914813f4308efc73acd0d35319a7d23e03747`
+  exposed a one-second Windows scheduler wait and unhandled worker warning.
+  PR #339 intermediate head
+  `8b72ae875d1c44339cd5aa9babf785c79bae04ca` then exposed independent
+  15-second terminal-event and two-second execution-completion wait failures
+  even though its targeted determinism receipt passed. The final seven-test
+  contract uses a 900-second per-iteration deadline. PR #339 final head
+  `9023a7c04cd7ccaa87fa49deef0fbbf14261473b`, tree
+  `854d534160f76adaa1e4039dcd291f154f4cb5e6`, passed exact-head qualification
+  and merged normally as `94556eaa98ec153729d0d063346c8e64ba2575e1`.
+  Fresh protected-main CI, determinism, release rehearsal, the complete local
+  5,298-test suite, and a local 20-by-7 receipt then passed at that merge SHA.
+  The technical evidence qualifies REL-001 through REL-003, subject to the
+  process exception below.
+- Process exception: PRs #332 through #337 and PR #339 were merged by the
+  repository owner before the merged canonical record established S0 as
+  `qualified`. The later exact-main S0 receipt cannot retroactively make those
+  merges dependency-compliant. PR #338 is this reconciliation record, is not
+  part of that exception set, and its merge does not grant the distinct owner
+  exception. S1 therefore remains `in_progress`, and S2 remains unavailable.
+  A distinct later owner-acceptance change may durably grant a one-time
+  exception and move S1 to `qualified`; no such exception has been granted.
+  That later change must preserve the violation as history and does not waive
+  dependency ordering for S2 or any future slice. Issues #303 and #308 remain
+  open until that later change qualifies S1; any eventual closure must be
+  scoped to REL-001 through REL-003 and must not imply REL-004/REL-005 or
+  installed-artifact qualification.
 - The first exact-main S0 command used a non-native global `TMPDIR` and a pytest
   base resolved under `/private/tmp`. Of the five preserved failures, one was a
   harness-precondition failure and four exercised a real, separately triaged P3
@@ -464,5 +483,9 @@ trust.
 | PR337-2026-08-11-S1 | `59ebcc6e90e2b120fddeceb6d0a2578213f4ef51` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | Root-cause provenance: [PR #332](https://github.com/John-MiracleWorker/Kestrel/pull/332), [PR #333](https://github.com/John-MiracleWorker/Kestrel/pull/333), [PR #334](https://github.com/John-MiracleWorker/Kestrel/pull/334), and [PR #335](https://github.com/John-MiracleWorker/Kestrel/pull/335); final qualification boundary [PR #337](https://github.com/John-MiracleWorker/Kestrel/pull/337); exact-head attempt-1 [push CI 31497683668](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31497683668), [PR CI 31497687124](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31497687124), and [determinism 31497687171](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31497687171); artifact `9104182385` ZIP SHA-256 `13ea1caa196b54fab82f4521b025d0a25ca8138f1925e43cb9a1998fc1bf29f4`; exact verifier replay; [hosted Codex review](https://github.com/John-MiracleWorker/Kestrel/pull/337#issuecomment-5254042760) reviewed `59ebcc6e90` with no major issue; original PR and exact-main ZIPs retained at the owner-local receipt root in `S1_ARTIFACT_SHA256SUMS` (manifest SHA-256 `a03546203dc4654e3de1dd4a8eeb914bc3380752482bd4ea82743f83b74e6415`) with preservation record `S1_ARTIFACTS.md` SHA-256 `04725be56412e150f0c85fa914e38d5547409d21cd90eb6396cc9f6ee261aeef` | Exact-head candidate evidence passed 5/5 cells, 100/100 repeats, 240 runtime and 840 golden executions, zero failures/flakes/cleanup failures, plus CI/security/review. This row is branch evidence and does not substitute for the protected-main row below. Hosted copies expire on 2026-08-25; the original ZIP bytes are retained owner-locally, not published. |
 | MAIN-2026-08-11-S1 | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | [CI 31508994971](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31508994971): attempt 1, 14/14 jobs, 156 executed steps successful and 35 expected conditional skips; [determinism 31508994974](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31508994974): attempt 1, 7/7 jobs; exact aggregate artifact `9108661459`, 248,519 bytes, ZIP SHA-256 `c274b4b41a4063bc8d7e0161484b485bebf398b5c4b6a7df89cfdb83f4624951`; safe 146-file archive audit; exact verifier replay; aggregate raw/canonical SHA-256 `39c9fbe60ee00ebe9f28352ac3f415a40cc2a658593fdfc4a789291c2326ec80` / `4c4d6b3387be4cd6f27b2e6a17aad2f5d9601181390d7f11678b79e217572b63`; exact-main CodeQL analysis `1602548479` fixed alert #126 with no new alert | REL-001, REL-002, and REL-003 technical evidence is qualified: 5/5 cells, 100/100 repeats (60 runtime/40 golden), 240 runtime and 840 golden executions, zero failures/flakes/cleanup failures, exact-main CI/security, independent artifact replay, and owner-local preservation of the original ZIP. S1 remains `in_progress` because its premature merges require the explicit owner reconciliation described above. This does not satisfy REL-004/005, S2+, installed-artifact, promotion, publication, or final release gates. |
 | MAIN-2026-08-11-REH | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | `merged` | `659c313ac164c4f62dbd38876f1caf0bc02ab0a2` | [Release rehearsal 31508995280](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31508995280), attempt 1; artifact `9108248907`, 955 bytes, ZIP SHA-256 `2e51ad05b33b8dda54a55bde6538461aa083298962a1d13d9d6466d576a826ac`; downloaded receipt JSON SHA-256 `e58f341b3497cefe2c8b4f34acf7909da9bdd555f71091ba2b63c4bd645dd421`; exact source/finalization SHA; wheel `264c92c1585bf4264484d7cb5b46ee9f0acbe573d7d0871e4e016c2d8f2a323d`; sdist `dfa0466570e6cda123a69e18e32406bb2d63e6b62b31117a12be07bda7fa0920` | One rehearsal passed with production targets blocked, exact replays `already_exact`, and conflicting mutation rejected. This rehearsal created no production tag, did not run the production release workflow, and created no GitHub release. It is not REL-004, S2/S3, promotion, publication, or release qualification. The current selector is post-tag and does not satisfy the required pre-tag transaction. Before S2 or RELEASE-001 can be qualified, and before any stable-tag creation, the selector must bind attempt 1, prove uniqueness, and download and verify the selected receipt. |
+| PR338-2026-08-11-CI-FAIL | `b5d914813f4308efc73acd0d35319a7d23e03747` | `unmerged at receipt time; superseded on PR #338` | — | Attempt-1 [push CI 31517030595](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31517030595), Windows job `93864630113`; concurrent [PR CI 31517057727](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31517057727) and [determinism 31517057680](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31517057680) | Push Windows failed `test_cancelling_queued_run_finishes_publication_fence_without_worker` at `active_started.wait(timeout=1)` and emitted an unhandled worker warning; downstream Docker was skipped. The concurrent PR CI and determinism copies passed, proving a real scheduler-sensitive REL-002 flake. The attempt was neither rerun nor cancelled, and later green runs do not erase it. |
+| PR339-2026-08-11-CI-FAIL | `8b72ae875d1c44339cd5aa9babf785c79bae04ca` | `merged` | `94556eaa98ec153729d0d063346c8e64ba2575e1` | Attempt-1 [push CI 31525914516](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31525914516), Windows `93894066757`; [PR CI 31525917233](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31525917233), Windows `93894076076`; successful [determinism 31525917155](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31525917155) | Push failed `test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipts` after its fixed 15-second terminal wait; PR CI independently failed `test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization` at its fixed two-second completion wait. Both Docker jobs were skipped. The targeted receipt was insufficient; this exact head was rejected without rerun and superseded by later repairs. |
+| PR339-2026-08-11-S1 | `9023a7c04cd7ccaa87fa49deef0fbbf14261473b` | `merged` | `94556eaa98ec153729d0d063346c8e64ba2575e1` | Exact tree `854d534160f76adaa1e4039dcd291f154f4cb5e6`; attempt-1 [push CI 31542384239](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31542384239) 14/14, [PR CI 31542387278](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31542387278) 14/14, and [determinism 31542387290](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31542387290) 7/7; aggregate artifact `9121666980`, API digest `f89e5118ce6979de81dd8404825546ef2b19c57ad04cfe29a8663432930da098`, JSON SHA-256 `44ddaa20d8a9e9a05a7e9164ebd52eb6393bb00d36da50e2f7a31111d9423ff9`; clean local 20-by-7 report SHA-256 `7df5cbe83414b170910d519871f0c2099c808607db34d61e0a4b81fcb76edbd2`; [hosted Codex review](https://github.com/John-MiracleWorker/Kestrel/pull/339#issuecomment-5259594915) and current-head CodeRabbit status | Five of five cells, 100/100 repeats, 420 runtime and 840 golden executions, ordinary Windows and downstream Docker all passed with zero failures, flakes, cleanup failures, deadline overruns, or receipt diagnostics. This qualifies the branch candidate only; it grants no owner exception and does not satisfy S2, installed-artifact, repeated rehearsal, publication, promotion, or release qualification. |
+| MAIN-2026-08-11-S1-REQUAL | `94556eaa98ec153729d0d063346c8e64ba2575e1` | `merged` | `94556eaa98ec153729d0d063346c8e64ba2575e1` | Exact tree `854d534160f76adaa1e4039dcd291f154f4cb5e6`; attempt-1 [CI 31545460395](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31545460395) 14/14, Windows `93956853439`, Docker `93962276821`; [determinism 31545460478](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31545460478) 7/7, aggregate artifact `9122565218`, API digest `04c7342fe9bb7166ffb48ea279e01ba3b09093aaae07b0b3297b988bb9e751dc`, JSON SHA-256 `b4a91cddd150f492be3a2fdf6346a51091ad604cbff94579318bde9aca3c41a8`; complete 5,298-test/local-qualification receipt SHA-256 `49291fb4ba6695d6c6eff49dfafb1385092704f07e2e27a4d2424ad9b8b93a1a`; local 20-by-7 report SHA-256 `45b2d18a6f361914b6b3dc16b53d1bd1512915d93b96e4e3b4857b8469cbf292`; ancillary [release rehearsal 31545460452](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31545460452), artifact `9122289710`, report SHA-256 `c4289de984cbefa21f48e9c8bfedb7b14300039a3fdb5d28cf279bdd643e2631` | Protected-main technical requalification passed: five of five cells, 100/100 repeats, 420 runtime and 840 golden executions, zero failures, flakes, cleanup failures, deadline overruns, or diagnostics; Windows and strict Docker passed. REL-001 through REL-003 remain technically qualified. S1 remains `in_progress` solely for the ungranted distinct process exception; S2 remains unavailable and `not_started`; #303/#308 remain open. One disposable rehearsal is ancillary and does not satisfy REL-004, S2, promotion, publication, or release qualification. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
