@@ -16,6 +16,7 @@ from agent_benchmark import run_agent_benchmark
 from error_recovery_benchmark import run_error_recovery_benchmark
 from learning_benchmark import run_learning_benchmark
 from memory_benchmark import run_memory_benchmark
+from memory_benchmark_transcript import run_memory_transcript_benchmark
 
 _MEMORY_QUALITY_FLOOR_VERSION = "kestrel.aggregate-memory-quality-floor.v1"
 _MEMORY_QUALITY_FLOOR_V1 = {
@@ -87,6 +88,24 @@ def main() -> int:
             "checks": memory_floor_checks,
             "passed": all(memory_floor_checks.values()),
         }
+
+        print("Running memory transcript benchmark...", file=sys.stderr)
+        memory_transcript = run_memory_transcript_benchmark(k=args.memory_k)
+        report["memory_transcript"] = memory_transcript
+        assertions["memory_transcript_comparative_gate_passed"] = bool(
+            memory_transcript.get("acceptance", {}).get("passed")
+        )
+        stressed_overall = memory_transcript["recency_stress_corpus"]["overall"]
+        assertions["memory_transcript_recall_not_below_flat_baselines"] = (
+            stressed_overall["kestrel"]["recall_at_k"]
+            >= stressed_overall["tfidf"]["recall_at_k"]
+            and stressed_overall["kestrel"]["recall_at_k"]
+            >= stressed_overall["transcript"]["recall_at_k"]
+        )
+        assertions["memory_transcript_mrr_not_below_flat_baselines"] = (
+            stressed_overall["kestrel"]["mrr"] >= stressed_overall["tfidf"]["mrr"]
+            and stressed_overall["kestrel"]["mrr"] >= stressed_overall["transcript"]["mrr"]
+        )
 
     if run_everything or args.agent_only:
         print("Running agent benchmark...", file=sys.stderr)
