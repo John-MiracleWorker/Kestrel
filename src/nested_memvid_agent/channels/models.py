@@ -129,6 +129,7 @@ class ChannelProcessResult:
             "channel_id": self.inbound.channel_id,
             "conversation_id": self.inbound.conversation_id,
             "session_id": self.turn.session_id,
+            "run_id": self.turn.run_id or None,
             "user_message": self.turn.user_message,
             "assistant_message": self.turn.assistant_message,
             "stop_reason": self.turn.stop_reason,
