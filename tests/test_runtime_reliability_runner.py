@@ -907,6 +907,7 @@ def test_iteration_invoker_uses_a_fresh_interpreter_and_basetemp_per_repeat(
         "tests/test_channels.py::test_run_manager_channel_turn_is_durable_and_isolated_from_primary_replay",
         "tests/test_channels.py::test_server_exposes_channel_ingest_route",
         "tests/test_channels.py::test_public_channel_webhook_allows_explicit_unsigned_channel",
+        "tests/test_lan_scan_manager.py::test_manual_confirm_requires_exact_consent_and_cached_authority_without_writes[nonzero-cas]",
         "tests/test_full_agent_runtime.py::test_run_manager_heartbeat_renews_and_releases_its_run_lease",
         "tests/test_full_agent_runtime.py::test_cancelling_queued_run_finishes_publication_fence_without_worker",
         "tests/test_full_agent_runtime.py::test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization",

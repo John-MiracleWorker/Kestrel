@@ -345,6 +345,41 @@ REL-001 through REL-003 and S1 remain `in_progress`; S2 remains `not_started`,
 and issues #303/#308 remain open until the repaired exact-head and later
 protected-main receipts pass without rerun.
 
+### S1 repaired candidate and LAN test scheduling gap (2026-08-13)
+
+The first [PR #342](https://github.com/John-MiracleWorker/Kestrel/pull/342)
+candidate, `cf5ab301180340fc5a8ae323aa5d29928e0eee45`, implemented the public
+channel correlation repair and passed its attempt-1 five-cell determinism run
+[31683321383](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683321383).
+Independent replay of aggregate artifact `9174792983` proved 5/5 cells,
+100/100 repeats, 480 runtime test executions, 840 golden-case executions, and
+zero failures, flakes, or cleanup failures. The broader attempt-1 push CI run
+[31683286186](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683286186)
+nevertheless exposed another Windows scheduling dependency in
+`test_manual_confirm_requires_exact_consent_and_cached_authority_without_writes[nonzero-cas]`:
+
+- Windows job
+  [94393448052](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683286186/job/94393448052)
+  failed after `_wait_for_terminal` exhausted a fixed three-second polling
+  window. The injected manual scanner itself is immediate and deterministic.
+- The concurrent PR Windows copy completed the same full-test step and the
+  separately repeated runtime cells remained green. That contrast does not
+  erase the failed push receipt; it demonstrates that the assertion depended
+  on incidental thread-pool scheduling.
+- The test is about exact consent, compare-and-swap rejection, cached address
+  authority, and absence of rejected writes. It does not need a live scheduler
+  race. Its worker submission is therefore changed to a controlled executor:
+  rejected calls must enqueue nothing, the one accepted call must enqueue
+  exactly one controller, and the test explicitly releases and joins that
+  controller before inspecting the durable terminal record.
+
+The exact failed parameter now joins the runtime reliability contract. The
+qualified contract consequently rises from eight tests/480 executions to nine
+tests/540 executions across Linux, macOS, and Windows. REL-001 through REL-003
+and S1 remain `in_progress`; S2 remains `not_started`; no rerun of the failed
+receipt may substitute for a fresh repaired candidate and later protected-main
+evidence.
+
 ## Requirement register
 
 ### Reliability (`REL`)
@@ -605,5 +640,6 @@ trust.
 | OWNER-2026-08-12-S1-EXC | `15768229811db675de169ecfa1a619dc70e4124c` (unmerged branch candidate; docs-only) | `unmerged` | — | Immutable source ID `OWNER-DECISION-2026-08-12-S1-EXC-V1`, canonical-record SHA-256 `fe9e3bc2bdcf93f76632d63fb55198884503446169b51c45ea5fe4124d753c60`; owner decision by repository owner Trent Iuni on 2026-08-12 explicitly selecting **Grant the narrow S1 exception** in response to the exact question recorded in the section "S1 one-time owner-acceptance exception (2026-08-12)" of this document; one-time owner-acceptance record added on branch `agent/v06-s1-owner-exception-draft` based on protected-main SHA `f60a65f156437c968be78a83d0a9db29a4d8389a` | One-time, narrow, nonprecedential exception accepting only the already complete REL-001/REL-002/REL-003 technical evidence for S1. It preserves the PR #332–#337/#339 dependency-order violation as history and grants no waiver, authority, or evidence for REL-004/REL-005, S2–S12, installed artifacts, stable-tag creation, promotion, publication, post-publication verification, issue closure beyond the scoped reliability issues, or future dependency-order violations. S1 and REL-001 through REL-003 remain `in_progress` and S2 remains `not_started` and unavailable until this change is normally merged to protected main and a later append-only receipt binds the exact merge SHA; no merge SHA, workflow URL, or review receipt exists yet and none is invented here. |
 | PR341-2026-08-12-CI-FAIL | `c4201981cb0fa474a29ed32117a254cbfd6457b2` | `merged after a no-code rerun` | `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` | PR CI [31582333551](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31582333551) attempt 1; failed Windows job [94068071202](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31582333551/job/94068071202); the same run's no-code attempt 2 later passed | Windows observed the truthful accepted/still-working channel response while the test asserted the eventual mock response. This is a preserved failed receipt and a missing durable-correlation regression, not an execution failure. The rerun and later merge do not rewrite it as a pass. |
 | MAIN-2026-08-12-S1-COVERAGE-GAP | `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` | `merged` | `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` | Owner-exception [PR #341](https://github.com/John-MiracleWorker/Kestrel/pull/341); exact-main attempt-1 [CI 31588036325](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31588036325), [determinism 31588036297](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31588036297), and ancillary [release rehearsal 31588036357](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31588036357) | The narrow owner decision is merged and exact-main checks passed, but the seven-test runtime contract omitted the public webhook failure exposed by PR #341. This receipt is explicitly insufficient to qualify REL-001/002/003 or S1. The repair requires an additive public `run_id`, deterministic accepted-to-terminal API correlation, an eight-test/480-execution contract, fresh exact-head evidence, and later exact-main evidence without rerun. |
+| PR342-2026-08-13-LAN-CI-FAIL | `cf5ab301180340fc5a8ae323aa5d29928e0eee45` | `unmerged; superseded on PR #342` | — | Attempt-1 [push CI 31683286186](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683286186), failed Windows job [94393448052](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683286186/job/94393448052); concurrent attempt-1 [PR CI 31683321361](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683321361) 14/14; successful attempt-1 [determinism 31683321383](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683321383), aggregate artifact `9174792983`, API digest `671de541a63542fdb548dd3e7923f3e517b5832323801508b2b84ec9b22c2c2c`, aggregate JSON SHA-256 `749006e320fbe0443c1a194af1c4da87bb8976e4ef2ce2c7e1be771404954e37` | The five-cell eight-test contract passed 100/100 repeats with 480 runtime and 840 golden executions and zero failures/flakes/cleanup failures, but it omitted the LAN test that then failed the broad Windows suite at a fixed three-second terminal poll. The concurrent PR Windows copy passed the same full-test step, confirming scheduler sensitivity. This receipt remains failed and cannot qualify S1; the repair uses an explicitly controlled executor and expands the repeated contract to nine tests/540 executions. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.

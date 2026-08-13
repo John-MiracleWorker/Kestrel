@@ -10,7 +10,7 @@ import time
 import urllib.request
 from collections import Counter
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
@@ -227,6 +227,43 @@ def _start_lifecycle(manager: Any) -> ThreadPoolExecutor:
     executor = ThreadPoolExecutor(max_workers=17, thread_name_prefix="task6-test-lan")
     manager.start_lifecycle(executor)
     return executor
+
+
+class ControlledExecutor:
+    """Run submitted controller work only when the test explicitly releases it."""
+
+    def __init__(self) -> None:
+        self._pending: list[
+            tuple[Future[Any], Any, tuple[Any, ...], dict[str, Any]]
+        ] = []
+        self.shutdown_calls: list[tuple[bool, bool]] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def submit(self, function: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+        future: Future[Any] = Future()
+        self._pending.append((future, function, args, kwargs))
+        return future
+
+    def run_next(self) -> Future[Any]:
+        if not self._pending:
+            raise AssertionError("controlled executor has no pending work")
+        future, function, args, kwargs = self._pending.pop(0)
+        if future.set_running_or_notify_cancel():
+            try:
+                result = function(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        self.shutdown_calls.append((wait, cancel_futures))
+        if self._pending:
+            raise AssertionError("controlled executor shut down with pending work")
 
 
 def test_construction_is_inert_and_recovery_runs_only_after_lifecycle_start(
@@ -4128,7 +4165,8 @@ def test_manual_confirm_requires_exact_consent_and_cached_authority_without_writ
         manual_scanner=_manual_probe_result,
         scan_id="lan_" + "2" * 32,
     )
-    _start_lifecycle(manager)
+    executor = ControlledExecutor()
+    manager.start_lifecycle(executor)
     try:
         authorization = manager.manual_preview(
             interface.interface_id,
@@ -4152,6 +4190,7 @@ def test_manual_confirm_requires_exact_consent_and_cached_authority_without_writ
 
         assert resolver_calls == ["model-box.local"]
         assert manager.list() == []
+        assert executor.pending_count == 0
         started = manager.confirm_manual(
             authorization.preview_digest,
             "192.168.90.2",
@@ -4159,11 +4198,16 @@ def test_manual_confirm_requires_exact_consent_and_cached_authority_without_writ
             confirmed=True,
             privacy_acknowledged=True,
         )
-        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+        assert executor.pending_count == 1
+        executor.run_next().result()
+        terminal = manager.get(started.scan_id)
+        assert terminal is not None
+        assert terminal.status == "completed"
         assert resolver_calls == ["model-box.local"]
         assert [item.scan_id for item in manager.list()] == [started.scan_id]
     finally:
         assert manager.shutdown(timeout_seconds=1.0) is True
+    assert executor.shutdown_calls == [(True, False)]
 
 
 def test_manual_confirm_never_reresolves_and_consumes_authority_only_after_commit(
