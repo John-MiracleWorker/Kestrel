@@ -787,10 +787,28 @@ def test_public_channel_webhook_rejects_unsigned_payloads_by_default(tmp_path: P
 
 def test_public_channel_webhook_allows_explicit_unsigned_channel(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     started_test_client: Any,
 ) -> None:
     from fastapi.testclient import TestClient
 
+    worker_started = Event()
+    release_worker = Event()
+    original_run_agent_turn = RunManager._run_agent_turn
+
+    def run_agent_turn_after_release(
+        manager: RunManager,
+        run_id: str,
+        config: AgentConfig,
+        message: str,
+        session_id: str,
+    ) -> None:
+        worker_started.set()
+        if not release_worker.wait(timeout=_ASYNC_EVENT_TIMEOUT_SECONDS):
+            raise RuntimeError("test worker barrier release was not signaled")
+        original_run_agent_turn(manager, run_id, config, message, session_id)
+
+    monkeypatch.setattr(RunManager, "_run_agent_turn", run_agent_turn_after_release)
     channels = [
         {
             "id": "webhook",
@@ -799,16 +817,49 @@ def test_public_channel_webhook_allows_explicit_unsigned_channel(
         }
     ]
     (tmp_path / "channels.json").write_text(json.dumps({"channels": channels}), encoding="utf-8")
-    client = started_test_client(TestClient(create_app(_config(tmp_path))))
+    config = replace(_config(tmp_path), channel_send_timeout_seconds=0.1)
+    client = started_test_client(TestClient(create_app(config)))
 
-    response = client.post(
-        "/api/channels/webhook/webhook",
-        content=b'{"conversation_id":"thread","text":"unsigned allowed"}',
-        headers={"content-type": "application/json"},
-    )
+    try:
+        response = client.post(
+            "/api/channels/webhook/webhook",
+            content=b'{"conversation_id":"thread","text":"unsigned allowed"}',
+            headers={"content-type": "application/json"},
+        )
 
-    assert response.status_code == 200
-    assert response.json()["assistant_message"] == "Mock response: unsigned allowed"
+        assert response.status_code == 200
+        initial = response.json()
+        assert initial["assistant_message"] == "Kestrel accepted the request and is still working."
+        run_id = initial["run_id"]
+        assert isinstance(run_id, str) and run_id.startswith("run_")
+        assert worker_started.wait(timeout=_ASYNC_EVENT_TIMEOUT_SECONDS)
+    finally:
+        release_worker.set()
+
+    deadline = time.monotonic() + _ASYNC_EVENT_TIMEOUT_SECONDS
+    observed_statuses: list[str] = []
+    last_run: dict[str, Any] = {}
+    while True:
+        run_response = client.get(f"/api/runs/{run_id}")
+        assert run_response.status_code == 200
+        last_run = run_response.json()
+        status = str(last_run.get("status") or "missing")
+        observed_statuses.append(status)
+        if status in {"completed", "failed", "cancelled"}:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(
+                f"run {run_id} did not reach a terminal state "
+                f"(observed_statuses={observed_statuses!r})"
+            )
+        time.sleep(min(0.05, remaining))
+
+    assert last_run["status"] == "completed", {
+        "observed_statuses": observed_statuses,
+        "run": last_run,
+    }
+    assert last_run["assistant_message"] == "Mock response: unsigned allowed"
 
 
 def test_signed_telegram_webhook_is_the_only_public_api_ingress(
