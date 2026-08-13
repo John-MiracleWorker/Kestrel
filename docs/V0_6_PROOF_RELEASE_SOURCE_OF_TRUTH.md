@@ -380,15 +380,55 @@ and S1 remain `in_progress`; S2 remains `not_started`; no rerun of the failed
 receipt may substitute for a fresh repaired candidate and later protected-main
 evidence.
 
+### S1 qualification closure (2026-08-13)
+
+[PR #342](https://github.com/John-MiracleWorker/Kestrel/pull/342) repaired both
+remaining coverage gaps and merged normally as signed protected-main commit
+`dbe9313c8671e2ba7507f73cc434569a59ebf785`, tree
+`e7cf79be8d95b5b307827ba694e00a7dda63c90b`, with ordered parents
+`deeb7138c755af7427e3ee11f6244bb1cf2dbf94` and
+`894b31ce1d3b6353a4257948bbcd3e9912ceda2f`. The exact repaired PR head passed
+attempt-1 push CI, PR CI, and five-cell determinism; the aggregate was
+independently replayed, and current-head review found no major issue or
+unresolved thread. The append-only failed receipts above remain failures and
+were not rerun or rewritten.
+
+The later exact protected-main receipt `MAIN-2026-08-13-S1-QUAL` below passed
+on first attempts at the merge SHA. Its independently replayed 146-file
+aggregate proved 5/5 cells and 100/100 repetitions: 20 each for Linux, macOS,
+Windows, memory, and real Memvid; 540 runtime-test executions; 840 golden-case
+executions; and zero failures, observed flakes, cleanup failures, missing
+cells, duplicate cells, stale cells, or mismatched cells. The ordinary
+protected-main CI passed all 14 jobs, including the complete Windows suite,
+the separate LAN adversarial suite, Docker privilege/license controls, and the
+container vulnerability policy. A fresh local full suite from a clean detached
+worktree at the same merge SHA also passed all 5,298 collected tests. The exact
+command, subject identity, pre/post status, collection, output, and exit status
+are retained under owner-local receipt root
+`/Users/tiuni/.codex/evidence/kestrel-v06-s1-channel-reliability/dbe9313c8671e2ba7507f73cc434569a59ebf785/local-full-suite-2026-08-13`;
+`RECEIPT.json` SHA-256 is
+`08f27d84a5d16726f698b6c632ea50e8ec127959d97efa8422071c1e988164d8`,
+and the immutable file-manifest SHA-256 is
+`ab35957d79a30fd5823e2ebd5dc58fe40495089ce39a9f3ddf449c8cfdb6453a`.
+
+Together with S0 qualification and the narrow one-time owner decision already
+merged by PR #341, these exact-head and protected-main receipts satisfy
+REL-001, REL-002, REL-003, and S1. Those four statuses therefore move to
+`qualified`, and S2 becomes available to begin under its separately approved
+plan. This closure grants no evidence or authority for REL-004, REL-005, S2 or
+later slices, installed-artifact qualification, release promotion,
+publication, or final v0.6 qualification. The one exact-main release rehearsal
+is recorded as ancillary only and does not satisfy repeated-rehearsal REL-004.
+
 ## Requirement register
 
 ### Reliability (`REL`)
 
 | ID | Requirement | Acceptance evidence | Status |
 | --- | --- | --- | --- |
-| REL-001 | Eliminate golden-eval nondeterminism rather than masking it with reruns/timeouts. | Regression reproduces the retrieval/settlement defect; fixed fixture sealing, seeds, clocks, IDs, ordering, and completion; exact-SHA memory and Memvid repeat receipts. | `in_progress` |
-| REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive targeted iterations on Windows, macOS, and Linux with no rerun; structured failure diagnostics. | `in_progress` |
-| REL-003 | Use monotonic elapsed-time logic and explicitly await asynchronous state transitions. | Static/test coverage for every changed timing path; no wall-clock equality or timing-point authority assertion. | `in_progress` |
+| REL-001 | Eliminate golden-eval nondeterminism rather than masking it with reruns/timeouts. | Regression reproduces the retrieval/settlement defect; fixed fixture sealing, seeds, clocks, IDs, ordering, and completion; exact-SHA memory and Memvid repeat receipts. | `qualified` |
+| REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive targeted iterations on Windows, macOS, and Linux with no rerun; structured failure diagnostics. | `qualified` |
+| REL-003 | Use monotonic elapsed-time logic and explicitly await asynchronous state transitions. | Static/test coverage for every changed timing path; no wall-clock equality or timing-point authority assertion. | `qualified` |
 | REL-004 | Rehearse the release lifecycle repeatedly. | One exact candidate produces 20 consecutive unique-namespace rehearsals, zero flaky failures, and an aggregate receipt digest. | `not_started` |
 | REL-005 | Prove fresh artifact install, launch, and first mission on supported platforms. | Windows/macOS/Linux, Python 3.11–3.13 exact-wheel matrix starts the installed entry point, awaits readiness, completes a mock mission, and verifies cleanup. | `not_started` |
 
@@ -444,7 +484,7 @@ evidence.
 | Slice | Deliverable | Depends on | Status |
 | --- | --- | --- | --- |
 | S0 | Canonical source of truth and audited baseline | — | `qualified` |
-| S1 | Reliability root-cause fixes and 20-repeat platform receipt | S0 | `in_progress` |
+| S1 | Reliability root-cause fixes and 20-repeat platform receipt | S0 | `qualified` |
 | S2 | Exact-SHA candidate/promotion transaction | S1 | `not_started` |
 | S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `not_started` |
 | S4 | Live reviewer separation and truthful routing modes | S3 | `not_started` |
@@ -641,5 +681,7 @@ trust.
 | PR341-2026-08-12-CI-FAIL | `c4201981cb0fa474a29ed32117a254cbfd6457b2` | `merged after a no-code rerun` | `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` | PR CI [31582333551](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31582333551) attempt 1; failed Windows job [94068071202](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31582333551/job/94068071202); the same run's no-code attempt 2 later passed | Windows observed the truthful accepted/still-working channel response while the test asserted the eventual mock response. This is a preserved failed receipt and a missing durable-correlation regression, not an execution failure. The rerun and later merge do not rewrite it as a pass. |
 | MAIN-2026-08-12-S1-COVERAGE-GAP | `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` | `merged` | `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` | Owner-exception [PR #341](https://github.com/John-MiracleWorker/Kestrel/pull/341); exact-main attempt-1 [CI 31588036325](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31588036325), [determinism 31588036297](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31588036297), and ancillary [release rehearsal 31588036357](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31588036357) | The narrow owner decision is merged and exact-main checks passed, but the seven-test runtime contract omitted the public webhook failure exposed by PR #341. This receipt is explicitly insufficient to qualify REL-001/002/003 or S1. The repair requires an additive public `run_id`, deterministic accepted-to-terminal API correlation, an eight-test/480-execution contract, fresh exact-head evidence, and later exact-main evidence without rerun. |
 | PR342-2026-08-13-LAN-CI-FAIL | `cf5ab301180340fc5a8ae323aa5d29928e0eee45` | `unmerged; superseded on PR #342` | — | Attempt-1 [push CI 31683286186](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683286186), failed Windows job [94393448052](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683286186/job/94393448052); concurrent attempt-1 [PR CI 31683321361](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683321361) 14/14; successful attempt-1 [determinism 31683321383](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31683321383), aggregate artifact `9174792983`, API digest `671de541a63542fdb548dd3e7923f3e517b5832323801508b2b84ec9b22c2c2c`, aggregate JSON SHA-256 `749006e320fbe0443c1a194af1c4da87bb8976e4ef2ce2c7e1be771404954e37` | The five-cell eight-test contract passed 100/100 repeats with 480 runtime and 840 golden executions and zero failures/flakes/cleanup failures, but it omitted the LAN test that then failed the broad Windows suite at a fixed three-second terminal poll. The concurrent PR Windows copy passed the same full-test step, confirming scheduler sensitivity. This receipt remains failed and cannot qualify S1; the repair uses an explicitly controlled executor and expands the repeated contract to nine tests/540 executions. |
+| PR342-2026-08-13-S1 | `894b31ce1d3b6353a4257948bbcd3e9912ceda2f` | `merged` | `dbe9313c8671e2ba7507f73cc434569a59ebf785` | Exact tree `e7cf79be8d95b5b307827ba694e00a7dda63c90b`; attempt-1 [push CI 31687437405](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31687437405) 14/14, [PR CI 31687440512](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31687440512) 14/14, and [determinism 31687440395](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31687440395) 7/7; aggregate artifact `9176317110`, API digest `9577de368e35a1480c8599612d25bb3b7718d199eaa47f947e8a63c55e2c1edf`, aggregate JSON SHA-256 `56efe738552d2dda94c7613a11a814c1f86db3d4f636d1d492545b01d89e71a5`; clean local 20-by-9 report SHA-256 `09610a24c64191858469835b544c0eaf1b58097e8361d998b39d9093f9ab9360`; [hosted Codex review](https://github.com/John-MiracleWorker/Kestrel/pull/342#issuecomment-5278658094) reviewed `894b31ce1d` with no major issue; zero unresolved review threads | Five of five cells, 100/100 repeats, 540 runtime and 840 golden executions, ordinary Windows, downstream Docker, and full local tests passed with zero failures, flakes, cleanup failures, or deadline overruns. This is exact-head candidate evidence; protected-main binding is recorded separately below. |
+| MAIN-2026-08-13-S1-QUAL | `dbe9313c8671e2ba7507f73cc434569a59ebf785` | `merged` | `dbe9313c8671e2ba7507f73cc434569a59ebf785` | Signed [PR #342](https://github.com/John-MiracleWorker/Kestrel/pull/342) merge, tree `e7cf79be8d95b5b307827ba694e00a7dda63c90b`, parents `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` / `894b31ce1d3b6353a4257948bbcd3e9912ceda2f`; exact-main attempt-1 [CI 31690911759](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31690911759) 14/14, Windows `94417759252`, Docker `94426161166`; [determinism 31690911872](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31690911872) 7/7, aggregate artifact `9177709996`, API digest `c2fa169d0b69020b0243f277ca6fded03f762f61699f8372da87f0bc66ce0beb`, aggregate JSON SHA-256 `aa705501806927d73fa25d94ac702240e9a6319bfd0b4f73f42e0cbdfdeecb3f`; safe 146-file download and exact verifier replay; fresh clean detached-worktree command `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /Users/tiuni/.codex/worktrees/kestrel-v06-s1-channel-reliability/.venv/bin/python -m pytest -q` exited 0 with 5,298 tests, output SHA-256 `94094d68e15e8c90632114b1057c272051fca3bae62d8ac94b1a329832e0cc6a`, collection-output SHA-256 `10395c2052657482089ccfef26418bc73e0a183ad26b5266911347c50c6c6874`, command-record SHA-256 `49e40d97ce3f7144f7de354d70ddf072f60efc2185e02cc2cbee0409076350dd`, structured-receipt SHA-256 `08f27d84a5d16726f698b6c632ea50e8ec127959d97efa8422071c1e988164d8`, and owner-local receipt root `/Users/tiuni/.codex/evidence/kestrel-v06-s1-channel-reliability/dbe9313c8671e2ba7507f73cc434569a59ebf785/local-full-suite-2026-08-13`; ancillary attempt-1 [release rehearsal 31690911883](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31690911883), artifact `9177349607`, API digest `b56c9ae721cac7ff05842e810eb5846d9861945659ec847758a61f9c056cc480`, report SHA-256 `d5564d46a8907299e0b2943ebadb26cd5db6b905320b8c096e797c4b4d122da2` | Protected-main closure passed 5/5 cells, 100/100 repeats, 540 runtime and 840 golden executions, zero failures/flakes/cleanup failures/diagnostics, plus ordinary Windows, LAN adversarial, Docker security controls, and local full regression. The owner-local path is not remotely retrievable; its recorded digests integrity-bind the retained receipt. Together with qualified S0 and the merged narrow owner exception, this qualifies only REL-001, REL-002, REL-003, and S1. The one rehearsal is ancillary: REL-004/REL-005, S2+, installed artifacts, promotion, publication, and final release qualification remain unsatisfied. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
