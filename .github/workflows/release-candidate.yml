@@ -1,0 +1,2019 @@
+name: Release Candidate
+run-name: Kestrel candidate ${{ inputs.version }} @ ${{ inputs.source_sha }} tx ${{ inputs.transaction_nonce }} bind ${{ inputs.dispatch_binding }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable X.Y.Z version encoded by the candidate
+        required: true
+        type: string
+      source_sha:
+        description: Exact full protected-main commit SHA to qualify
+        required: true
+        type: string
+      transaction_nonce:
+        description: Controller-issued lowercase transaction nonce
+        required: true
+        type: string
+      dispatch_binding:
+        description: Controller-issued digest binding the complete dispatch
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-candidate-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CANDIDATE_REPOSITORY_ID: ${{ github.repository_id }}
+  CANDIDATE_SOURCE_SHA: ${{ inputs.source_sha }}
+  CANDIDATE_VERSION: ${{ inputs.version }}
+  RELEASE_COMMIT_SHA: ${{ inputs.source_sha }}
+  RELEASE_TAG: v${{ inputs.version }}
+  RELEASE_VERSION: ${{ inputs.version }}
+
+jobs:
+  candidate-identity:
+    name: Bind the controller dispatch and exact protected-main candidate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CANDIDATE_TRANSACTION_NONCE: ${{ inputs.transaction_nonce }}
+      CANDIDATE_DISPATCH_BINDING: ${{ inputs.dispatch_binding }}
+      CANDIDATE_GITHUB_REF: ${{ github.ref }}
+      CANDIDATE_GITHUB_REF_NAME: ${{ github.ref_name }}
+      CANDIDATE_GITHUB_SHA: ${{ github.sha }}
+      CANDIDATE_REPOSITORY: ${{ github.repository }}
+      CANDIDATE_WORKFLOW: ${{ github.workflow }}
+      CANDIDATE_WORKFLOW_REF: ${{ github.workflow_ref }}
+      CANDIDATE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      CANDIDATE_ACTOR: ${{ github.actor }}
+      CANDIDATE_ACTOR_ID: ${{ github.actor_id }}
+      CANDIDATE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Preflight the literal candidate dispatch envelope
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import re
+
+          source_sha = os.environ["CANDIDATE_SOURCE_SHA"]
+          version = os.environ["CANDIDATE_VERSION"]
+          nonce = os.environ["CANDIDATE_TRANSACTION_NONCE"]
+          binding = os.environ["CANDIDATE_DISPATCH_BINDING"]
+          if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+              raise SystemExit("candidate source SHA is not a full lowercase Git SHA")
+          if re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version) is None:
+              raise SystemExit("candidate version is not canonical X.Y.Z")
+          if re.fullmatch(r"[0-9a-f]{64}", nonce) is None:  # ^[0-9a-f]{64}$
+              raise SystemExit("candidate transaction nonce is invalid")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", binding) is None:  # ^sha256:[0-9a-f]{64}$
+              raise SystemExit("candidate dispatch binding is invalid")
+          if (
+              os.environ["CANDIDATE_REPOSITORY"] != "John-MiracleWorker/Kestrel"
+              or os.environ["CANDIDATE_GITHUB_REF"] != "refs/heads/main"
+              or os.environ["CANDIDATE_GITHUB_REF_NAME"] != "main"
+              or os.environ["CANDIDATE_GITHUB_SHA"] != source_sha
+              or os.environ["CANDIDATE_WORKFLOW_SHA"] != source_sha
+          ):
+              raise SystemExit("candidate dispatch is not bound to the selected protected-main tip")
+          expected_workflow_ref = (
+              f"{os.environ['CANDIDATE_REPOSITORY']}/"
+              ".github/workflows/release-candidate.yml@refs/heads/main"
+          )
+          if os.environ["CANDIDATE_WORKFLOW_REF"] != expected_workflow_ref:
+              raise SystemExit("candidate workflow ref is not protected main")
+          actor = os.environ["CANDIDATE_ACTOR"]
+          if (
+              actor != "John-MiracleWorker"
+              or os.environ["CANDIDATE_TRIGGERING_ACTOR"] != actor
+          ):
+              raise SystemExit("candidate dispatch was not initiated by the repository owner")
+          for name in ("CANDIDATE_REPOSITORY_ID", "GITHUB_RUN_ID", "CANDIDATE_ACTOR_ID"):
+              try:
+                  value = int(os.environ[name])
+              except ValueError as exc:
+                  raise SystemExit(f"{name} is not an integer") from exc
+              if value <= 0:
+                  raise SystemExit(f"{name} is not positive")
+          if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
+              raise SystemExit("candidate dispatch run attempt must be one")
+          PY
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.CANDIDATE_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create the canonical candidate dispatch identity
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import re
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          from scripts import release_control_receipt as receipts
+
+          source_sha = os.environ["CANDIDATE_SOURCE_SHA"]
+          version = os.environ["CANDIDATE_VERSION"]
+          nonce = os.environ["CANDIDATE_TRANSACTION_NONCE"]
+          binding = os.environ["CANDIDATE_DISPATCH_BINDING"]
+          if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+              raise SystemExit("candidate source SHA is not a full lowercase Git SHA")
+          if re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version) is None:
+              raise SystemExit("candidate version is not canonical X.Y.Z")
+          if re.fullmatch(r"[0-9a-f]{64}", nonce) is None:  # ^[0-9a-f]{64}$
+              raise SystemExit("candidate transaction nonce is invalid")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", binding) is None:  # ^sha256:[0-9a-f]{64}$
+              raise SystemExit("candidate dispatch binding is invalid")
+          if (
+              os.environ["CANDIDATE_GITHUB_REF"] != "refs/heads/main"
+              or os.environ["CANDIDATE_GITHUB_REF_NAME"] != "main"
+              or os.environ["CANDIDATE_GITHUB_SHA"] != source_sha
+              or os.environ["CANDIDATE_WORKFLOW_SHA"] != source_sha
+          ):
+              raise SystemExit("candidate dispatch is not bound to the selected main tip")
+          expected_workflow_ref = (
+              f"{os.environ['CANDIDATE_REPOSITORY']}/"
+              ".github/workflows/release-candidate.yml@refs/heads/main"
+          )
+          if os.environ["CANDIDATE_WORKFLOW_REF"] != expected_workflow_ref:
+              raise SystemExit("candidate workflow ref is not protected main")
+          actor = os.environ["CANDIDATE_ACTOR"]
+          if (
+              actor != "John-MiracleWorker"
+              or os.environ["CANDIDATE_TRIGGERING_ACTOR"] != actor
+          ):
+              raise SystemExit("candidate dispatch actor is not the repository owner")
+
+          inputs_without_binding = {
+              "source_sha": source_sha,
+              "transaction_nonce": nonce,
+              "version": version,
+          }
+          expected_binding = receipts.dispatch_binding(
+              short_ref="main", inputs_without_binding=inputs_without_binding
+          )
+          if binding != expected_binding:
+              raise SystemExit("candidate dispatch binding does not match complete event inputs")
+          complete_inputs = {**inputs_without_binding, "dispatch_binding": binding}
+          context = {
+              "schema": "kestrel.candidate_github_context_allowlist.v1",
+              "event_inputs": complete_inputs,
+              "repository": os.environ["CANDIDATE_REPOSITORY"],
+              "repository_id": int(os.environ["CANDIDATE_REPOSITORY_ID"]),
+              "workflow": os.environ["CANDIDATE_WORKFLOW"],
+              "workflow_ref": os.environ["CANDIDATE_WORKFLOW_REF"],
+              "workflow_sha": os.environ["CANDIDATE_WORKFLOW_SHA"],
+              "event_name": "workflow_dispatch",
+              "ref": os.environ["CANDIDATE_GITHUB_REF"],
+              "ref_name": os.environ["CANDIDATE_GITHUB_REF_NAME"],
+              "sha": source_sha,
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "actor": os.environ["CANDIDATE_ACTOR"],
+              "actor_id": int(os.environ["CANDIDATE_ACTOR_ID"]),
+              "triggering_actor": os.environ["CANDIDATE_TRIGGERING_ACTOR"],
+          }
+          if context["run_attempt"] != 1:
+              raise SystemExit("candidate dispatch run attempt must be one")
+          identity = {
+              "schema": "kestrel.dispatch_identity.v1",
+              "transaction_nonce": nonce,
+              "dispatch_binding": binding,
+              "dispatch_inputs_digest": receipts._sha256(  # noqa: SLF001
+                  receipts.canonical_json_bytes(complete_inputs)
+              ),
+              "repository": context["repository"],
+              "repository_id": context["repository_id"],
+              "workflow": context["workflow"],
+              "workflow_ref": context["workflow_ref"],
+              "workflow_sha": context["workflow_sha"],
+              "event_name": context["event_name"],
+              "ref": context["ref"],
+              "sha": context["sha"],
+              "run_id": context["run_id"],
+              "run_attempt": 1,
+              "actor": context["actor"],
+              "actor_id": context["actor_id"],
+              "triggering_actor": context["triggering_actor"],
+              "observed_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "evidence": {
+                  "source_bundle_digest": receipts.source_bundle_digest(
+                      {"github-context-allowlist": receipts.canonical_json_bytes(context)}
+                  ),
+                  "canonicalization_vector_digest": receipts.canonicalization_vector_digest(),
+              },
+              "provenance": {
+                  "producer": "scripts/release_control_receipt.py",
+                  "provider": "github.com",
+                  "method": "github-context-allowlist",
+              },
+              "confidence": 1,
+              "validation_status": "validated",
+          }
+          receipts._validate_schema(  # noqa: SLF001
+              "kestrel.dispatch_identity.v1", identity, label="candidate dispatch identity"
+          )
+          output = Path("candidate-identity/kestrel-dispatch-identity.json")
+          output.parent.mkdir(parents=True, exist_ok=False)
+          output.write_bytes(receipts.canonical_json_bytes(identity))
+          PY
+      - name: Upload immutable candidate dispatch identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-dispatch-identity-${{ github.run_id }}-1
+          path: candidate-identity/kestrel-dispatch-identity.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Prove the exact protected-main source and select attempt-one prerequisites
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          repository_json="$(gh api "repos/${GITHUB_REPOSITORY}")"
+          test "$(jq -er '.id' <<<"$repository_json")" = "$CANDIDATE_REPOSITORY_ID"
+          test "$(jq -er '.owner.id' <<<"$repository_json")" = "$CANDIDATE_ACTOR_ID"
+          test "$(jq -er '.owner.login' <<<"$repository_json")" = "$CANDIDATE_ACTOR"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.protected')" = true
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SOURCE_SHA"
+          test "$(git rev-parse origin/main)" = "$CANDIDATE_SOURCE_SHA"
+          source_tree="$(git rev-parse "$CANDIDATE_SOURCE_SHA^{tree}")"
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$project_version" = "$CANDIDATE_VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/v${CANDIDATE_VERSION}" >/dev/null 2>&1; then
+            echo "candidate stable tag already exists" >&2
+            exit 1
+          fi
+          remote_tags="$(git ls-remote --tags origin)"
+          SOURCE_SHA="$CANDIDATE_SOURCE_SHA" REMOTE_TAGS="$remote_tags" python - <<'PY'
+          import os
+          import re
+
+          if any(
+              re.fullmatch(r"refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(?:\^\{\})?", ref)
+              and sha == os.environ["SOURCE_SHA"]
+              for line in os.environ["REMOTE_TAGS"].splitlines()
+              for sha, ref in [line.split()]
+          ):
+              raise SystemExit("candidate source already has a stable tag")
+          PY
+
+          mkdir -p candidate-prerequisites/raw candidate-prerequisites/qualification/receipts
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > candidate-prerequisites/raw/candidate-run.json
+          for specification in \
+            'protected-main-ci:ci.yml' \
+            'release-rehearsal:release-rehearsal.yml' \
+            'runtime-reliability-qualification:determinism.yml'; do
+            name="${specification%%:*}"
+            path="${specification#*:}"
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${path}/runs?head_sha=${CANDIDATE_SOURCE_SHA}&branch=main&event=push&per_page=100" \
+              > "candidate-prerequisites/raw/${name}-runs.json"
+          done
+          SOURCE_TREE="$source_tree" python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          root = Path("candidate-prerequisites/raw")
+          candidate = json.loads((root / "candidate-run.json").read_text(encoding="utf-8"))
+          candidate_created = datetime.fromisoformat(candidate["created_at"].replace("Z", "+00:00"))
+          if candidate_created.tzinfo is None or candidate_created.utcoffset() != UTC.utcoffset(candidate_created):
+              raise SystemExit("candidate workflow creation time is invalid")
+          paths = {
+              "protected-main-ci": ".github/workflows/ci.yml",
+              "release-rehearsal": ".github/workflows/release-rehearsal.yml",
+              "runtime-reliability-qualification": ".github/workflows/determinism.yml",
+          }
+          selected = {}
+          for name, workflow_path in paths.items():
+              pages = json.loads((root / f"{name}-runs.json").read_text(encoding="utf-8"))
+              candidates = []
+              for page in pages:
+                  for run in page.get("workflow_runs", []):
+                      updated = datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+                      run_attempt = run.get("run_attempt")
+                      if (
+                          type(run_attempt) is int
+                          and run_attempt == 1
+                          and run.get("head_sha") == os.environ["CANDIDATE_SOURCE_SHA"]
+                          and run.get("head_branch") == "main"
+                          and run.get("event") == "push"
+                          and run.get("status") == "completed"
+                          and run.get("conclusion") == "success"
+                          and str(run.get("path", "")).split("@", 1)[0] == workflow_path
+                          and updated < candidate_created
+                      ):
+                          candidates.append(run)
+              if not candidates:
+                  raise SystemExit(f"no exact successful attempt-one prerequisite: {name}")
+              candidates.sort(key=lambda run: (run["updated_at"], run["id"]))
+              selected[name] = candidates[-1]
+          output = {
+              "schema": "kestrel.candidate_prerequisite_selection.v1",
+              "source_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+              "source_tree": os.environ["SOURCE_TREE"],
+              "candidate_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "candidate_run_attempt": 1,
+              "runs": {name: run["id"] for name, run in sorted(selected.items())},
+          }
+          Path("candidate-prerequisites/selection.json").write_text(
+              json.dumps(output, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+          )
+          PY
+          for name in protected-main-ci release-rehearsal runtime-reliability-qualification; do
+            run_id="$(jq -er --arg name "$name" '.runs[$name]' candidate-prerequisites/selection.json)"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
+              > "candidate-prerequisites/raw/${name}-run.json"
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/1/jobs?per_page=100" \
+              > "candidate-prerequisites/raw/${name}-jobs.json"
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+              > "candidate-prerequisites/raw/${name}-artifacts.json"
+          done
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          from scripts import release_candidate_manifest as manifests
+
+          root = Path("candidate-prerequisites/raw")
+          output = Path("candidate-prerequisites/qualification/receipts")
+          paths = {
+              "protected-main-ci": ".github/workflows/ci.yml",
+              "release-rehearsal": ".github/workflows/release-rehearsal.yml",
+              "runtime-reliability-qualification": ".github/workflows/determinism.yml",
+          }
+          schemas = {
+              "protected-main-ci": "kestrel.check.protected-main-ci.v1",
+              "release-rehearsal": "kestrel.check.release-rehearsal.v1",
+              "runtime-reliability-qualification": "kestrel.check.runtime-reliability-qualification.v1",
+          }
+          selection = json.loads(
+              Path("candidate-prerequisites/selection.json").read_text(encoding="utf-8")
+          )
+          candidate = json.loads((root / "candidate-run.json").read_text(encoding="utf-8"))
+          selected_run_ids = selection.get("runs") if type(selection) is dict else None
+          if type(selected_run_ids) is not dict or set(selected_run_ids) != set(paths):
+              raise SystemExit("prerequisite run selection is not exact")
+          candidate_created = datetime.fromisoformat(
+              candidate["created_at"].replace("Z", "+00:00")
+          )
+          if (
+              candidate.get("id") != int(os.environ["GITHUB_RUN_ID"])
+              or candidate.get("run_attempt") != 1
+              or candidate_created.tzinfo is None
+              or candidate_created.utcoffset() != UTC.utcoffset(candidate_created)
+          ):
+              raise SystemExit("candidate run observation is not exact")
+
+          def digest(path: Path) -> str:
+              return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+          for name, workflow_path in paths.items():
+              run_path = root / f"{name}-run.json"
+              jobs_path = root / f"{name}-jobs.json"
+              artifacts_path = root / f"{name}-artifacts.json"
+              run = json.loads(run_path.read_text(encoding="utf-8"))
+              job_pages = json.loads(jobs_path.read_text(encoding="utf-8"))
+              artifact_pages = json.loads(artifacts_path.read_text(encoding="utf-8"))
+              run_attempt = run.get("run_attempt")
+              repository = run.get("repository") or {}
+              updated = datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+              if (
+                  run.get("id") != selected_run_ids[name]
+                  or type(run.get("workflow_id")) is not int
+                  or run["workflow_id"] <= 0
+                  or type(run_attempt) is not int
+                  or run_attempt != 1
+                  or run.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+                  or run.get("head_branch") != "main"
+                  or run.get("event") != "push"
+                  or run.get("status") != "completed"
+                  or run.get("conclusion") != "success"
+                  or str(run.get("path", "")).split("@", 1)[0] != workflow_path
+                  or repository.get("id") != int(os.environ["CANDIDATE_REPOSITORY_ID"])
+                  or repository.get("full_name") != os.environ["GITHUB_REPOSITORY"]
+                  or updated.tzinfo is None
+                  or updated.utcoffset() != UTC.utcoffset(updated)
+                  or updated >= candidate_created
+              ):
+                  raise SystemExit(f"prerequisite run identity is not exact: {name}")
+              jobs = [job for page in job_pages for job in page.get("jobs", [])]
+              normalized_jobs = []
+              for job in jobs:
+                  if (
+                      type(job.get("id")) is not int
+                      or job["id"] <= 0
+                      or not isinstance(job.get("name"), str)
+                      or not job["name"]
+                      or job.get("run_id") != run["id"]
+                      or job.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+                      or job.get("status") != "completed"
+                      or job.get("conclusion") not in {"success", "skipped"}
+                  ):
+                      raise SystemExit(f"prerequisite job is not exact and complete: {name}")
+                  normalized_jobs.append({
+                      "job_id": job["id"],
+                      "name": job["name"],
+                      "run_id": run["id"],
+                      "run_attempt": 1,
+                      "head_sha": job["head_sha"],
+                      "status": job["status"],
+                      "conclusion": job["conclusion"],
+                  })
+              normalized_jobs.sort(key=lambda item: (item["name"], item["job_id"]))
+              if not normalized_jobs or not any(job["conclusion"] == "success" for job in normalized_jobs):
+                  raise SystemExit(f"prerequisite job inventory has no success: {name}")
+              artifacts = [
+                  artifact
+                  for page in artifact_pages
+                  for artifact in page.get("artifacts", [])
+              ]
+              normalized_artifacts = []
+              artifact_ids: set[int] = set()
+              artifact_names: set[str] = set()
+              for artifact in artifacts:
+                  api_digest = artifact.get("digest")
+                  workflow_run = artifact.get("workflow_run") or {}
+                  artifact_id = artifact.get("id")
+                  artifact_name = artifact.get("name")
+                  size = artifact.get("size_in_bytes")
+                  if (
+                      type(artifact_id) is not int
+                      or artifact_id <= 0
+                      or artifact_id in artifact_ids
+                      or not isinstance(artifact_name, str)
+                      or not artifact_name
+                      or artifact_name in artifact_names
+                      or type(size) is not int
+                      or isinstance(size, bool)
+                      or size <= 0
+                      or re.fullmatch(r"sha256:[0-9a-f]{64}", str(api_digest)) is None
+                      or artifact.get("expired") is not False
+                      or workflow_run.get("id") != run["id"]
+                      or workflow_run.get("repository_id")
+                      != int(os.environ["CANDIDATE_REPOSITORY_ID"])
+                      or workflow_run.get("head_branch") != "main"
+                      or workflow_run.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+                  ):
+                      raise SystemExit(f"prerequisite artifact is not exact: {name}")
+                  artifact_ids.add(artifact_id)
+                  artifact_names.add(artifact_name)
+                  normalized_artifacts.append({
+                      "artifact_id": artifact_id,
+                      "name": artifact_name,
+                      "api_digest": api_digest,
+                      "size_bytes": size,
+                      "expired": False,
+                      "run_id": run["id"],
+                      "run_attempt": 1,
+                      "source_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                  })
+              normalized_artifacts.sort(key=lambda item: (item["name"], item["artifact_id"]))
+              if name != "protected-main-ci" and not normalized_artifacts:
+                  raise SystemExit(f"prerequisite artifact inventory is empty: {name}")
+              receipt = {
+                  "schema": schemas[name],
+                  "name": name,
+                  "status": "success",
+                  "subject_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                  "run_id": run["id"],
+                  "run_attempt": 1,
+                  "workflow": {
+                      "repository": os.environ["GITHUB_REPOSITORY"],
+                      "repository_id": int(os.environ["CANDIDATE_REPOSITORY_ID"]),
+                      "workflow_id": run["workflow_id"],
+                      "workflow_path": workflow_path,
+                      "workflow_ref": "refs/heads/main",
+                      "workflow_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                      "run_id": run["id"],
+                      "run_attempt": 1,
+                      "event": "push",
+                      "head_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                      "status": "completed",
+                      "conclusion": "success",
+                  },
+                  "jobs": normalized_jobs,
+                  "artifacts": normalized_artifacts,
+                  "evidence": {
+                      "workflow_observation_digest": digest(run_path),
+                      "jobs_observation_digest": digest(jobs_path),
+                      "artifacts_observation_digest": digest(artifacts_path),
+                      "job_count": len(normalized_jobs),
+                      "artifact_count": len(normalized_artifacts),
+                      "complete": True,
+                      "canonicalization_vector_digest": manifests.CANONICALIZATION_VECTOR_DIGEST,
+                  },
+                  "provenance": {
+                      "producer": ".github/workflows/release-candidate.yml",
+                      "provider": "github.com",
+                      "method": "actions-check-observation",
+                  },
+                  "confidence": 1,
+                  "validation_status": "validated",
+              }
+              (output / f"{name}.json").write_bytes(manifests.canonical_json_bytes(receipt))
+          PY
+      - name: Upload immutable prerequisite receipt selection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-candidate-prerequisites-${{ env.CANDIDATE_SOURCE_SHA }}
+          path: candidate-prerequisites/qualification/receipts/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  build-release-candidate:
+    name: Build and validate the exact release candidate
+    needs: candidate-identity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      RELEASE_EXTRAS: "memvid,openai,anthropic,gemini,server,mcp,keyring"
+      GITLEAKS_IMAGE: "zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Create the exact candidate source archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/kestrel-candidate-source"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SOURCE_SHA"
+          git archive --format=tar "$CANDIDATE_SOURCE_SHA" \
+            > "$RUNNER_TEMP/kestrel-candidate-source/source.tar"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/kestrel-candidate-source-verification.tar"
+          cmp "$RUNNER_TEMP/kestrel-candidate-source/source.tar" \
+            "$RUNNER_TEMP/kestrel-candidate-source-verification.tar"
+      - name: Upload the exact candidate source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-candidate-source-${{ env.CANDIDATE_SOURCE_SHA }}
+          path: ${{ runner.temp }}/kestrel-candidate-source/source.tar
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+      - name: Verify tag matches package version
+        run: |
+          VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$RELEASE_TAG" = "v$VERSION"
+          test "$RELEASE_VERSION" = "$VERSION"
+          python scripts/check_project_metadata.py --release-tag "$RELEASE_TAG"
+          uv lock --check
+      - name: Install hash-locked build bootstrap and Python dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: \
+            -r config/release-build-bootstrap.txt
+          uv export --frozen --no-dev --no-emit-local \
+            --group release \
+            --extra dev \
+            --extra memvid \
+            --extra mcp \
+            --extra keyring \
+            --format requirements.txt \
+            --output-file "${RUNNER_TEMP}/requirements-validation.txt"
+          python -m pip install --require-hashes --only-binary=:all: \
+            -r "${RUNNER_TEMP}/requirements-validation.txt"
+          python -m pip install --no-build-isolation --no-deps \
+            -e '.[dev,memvid,mcp,keyring]'
+      - name: Validate Python package
+        run: |
+          python -m compileall -q src tests scripts
+          ruff check scripts src tests
+          mypy src
+          pytest -q
+          VALIDATION_IMAGE='python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3'
+          docker pull "$VALIDATION_IMAGE"
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE="$VALIDATION_IMAGE" \
+            python scripts/run_golden_evals.py --backend memory --provider mock \
+              --max-case-latency-ms 45000
+          NEST_AGENT_VALIDATION_CONTAINER_IMAGE="$VALIDATION_IMAGE" \
+            python scripts/run_golden_evals.py --backend memvid --provider mock \
+              --memory-dir "${RUNNER_TEMP}/kestrel-memvid-golden" \
+              --max-case-latency-ms 45000
+          ruff check benchmarks/real_agent_learning_benchmark.py tests/test_real_agent_learning_benchmark.py
+          MYPYPATH=src mypy --strict benchmarks/real_agent_learning_benchmark.py
+          python benchmarks/real_agent_learning_benchmark.py --output "${RUNNER_TEMP}/agent-learning-gate.json"
+      - name: Validate security, shell, recovery, and live local integrations
+        env:
+          RUN_EXTENSION_SANDBOX_INTEGRATION: "1"
+          KESTREL_EXTENSION_TEST_IMAGE: "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
+        run: |
+          shellcheck install.sh scripts/*.sh
+          bandit -q -r src -lll -iii
+          python -m pip_audit
+          candidate_source="${RUNNER_TEMP}/kestrel-secret-scan-${RELEASE_COMMIT_SHA}"
+          install -d -m 0700 "$candidate_source"
+          git archive --format=tar "$RELEASE_COMMIT_SHA" | tar -xf - -C "$candidate_source"
+          docker pull "$GITLEAKS_IMAGE"
+          docker run --rm -v "$candidate_source:/repo:ro" -w /repo "$GITLEAKS_IMAGE" \
+            dir --redact=100 --no-banner .
+          docker pull "$KESTREL_EXTENSION_TEST_IMAGE"
+          RUN_MEMVID_INTEGRATION=1 RUN_MCP_INTEGRATION=1 pytest -q \
+            tests/integration/test_memvid_backend_integration.py \
+            tests/integration/test_memvid_memory_system.py \
+            tests/integration/test_memvid_context_frames.py \
+            tests/integration/test_mcp_stdio_integration.py \
+            tests/integration/test_extension_container_integration.py
+          pytest -q tests/test_chaos_recovery.py tests/test_memory_backup.py tests/test_run_backpressure.py
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Validate and build web workbench
+        working-directory: web
+        run: |
+          npm ci
+          npm run licenses:check
+          npm audit --audit-level=high
+          npm test
+          npm run build
+      - name: Stage web workbench in Python package
+        run: python scripts/stage_web_release.py
+
+      - name: Build Python release artifacts
+        run: python -m build --no-isolation --outdir dist
+      - name: Validate release artifact metadata
+        run: python -m twine check --strict dist/*
+      - name: Enable ARM64 container emulation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - name: Configure Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build, execute, and scan release containers
+        env:
+          TRIVY_IMAGE: "aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f"
+        run: |
+          source_url="https://github.com/${GITHUB_REPOSITORY}"
+          raw_oci_root="${RUNNER_TEMP}/kestrel-raw-oci"
+          mkdir -p "$raw_oci_root"
+          for architecture in amd64 arm64; do
+            docker buildx build \
+              --platform "linux/${architecture}" \
+              --provenance=false \
+              --sbom=false \
+              --output type=docker \
+              --output "type=oci,dest=${raw_oci_root}/${architecture}.tar" \
+              --label "org.opencontainers.image.revision=${RELEASE_COMMIT_SHA}" \
+              --label "org.opencontainers.image.source=${source_url}" \
+              --label "org.opencontainers.image.version=${RELEASE_TAG}" \
+              -t "kestrel-agent:release-${architecture}" \
+              .
+          done
+          for image in kestrel-agent:release-amd64 kestrel-agent:release-arm64; do
+            architecture="${image##*-}"
+            docker run --rm --entrypoint /bin/sh "$image" -c \
+              'set -eu;
+              test "$(id -u)" = 999;
+              test -f /app/LICENSE;
+              test -f /app/web/dist/THIRD_PARTY_NOTICES.txt;
+              test ! -u /usr/bin/mount;
+              test ! -u /usr/bin/umount;
+              test ! -u /usr/bin/su'
+            docker run --rm --entrypoint /bin/sh "$image" -c \
+              'set -eu;
+              mkdir -p /data/doctor-memory;
+              exec nest-agent doctor \
+              --backend memvid \
+              --memory-dir /data/doctor-memory \
+              --provider mock \
+              --model mock'
+            probe_name="kestrel-release-readonly-${architecture}"
+            probe_token="kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+            cleanup_probe() {
+              docker rm -f "$probe_name" >/dev/null 2>&1 || true
+            }
+            trap cleanup_probe EXIT
+            docker run -d \
+              --name "$probe_name" \
+              --platform "linux/${architecture}" \
+              --user 999:999 \
+              --read-only \
+              --tmpfs /data:rw,nosuid,nodev,size=1073741824,uid=999,gid=999,mode=0700 \
+              --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 256 \
+              --memory 1g \
+              --cpus 2 \
+              -e NEST_AGENT_API_TOKEN="$probe_token" \
+              -e NEST_AGENT_PROVIDER=mock \
+              -e NEST_AGENT_MODEL=mock \
+              -p 127.0.0.1::8765 \
+              "$image"
+            probe_port="$(docker port "$probe_name" 8765/tcp | awk -F: 'END {print $NF}')"
+            test -n "$probe_port"
+            probe_ready=0
+            for _ in {1..120}; do
+              if curl -fsS \
+                -H "Authorization: Bearer $probe_token" \
+                "http://127.0.0.1:${probe_port}/api/health/ready" \
+                >"${RUNNER_TEMP}/kestrel-readonly-${architecture}-ready.json"; then
+                probe_ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$probe_ready" -ne 1 ]; then
+              docker logs "$probe_name" >&2
+              exit 1
+            fi
+            # The arm64 probe runs under QEMU emulation (roughly 20x slower than
+            # native), so the p95/throughput budgets are per-architecture: 30s p95
+            # and 0.1 runs/s native, 120s p95 and 0.01 runs/s emulated (the soak
+            # measures throughput against wall-clock load time, which emulation
+            # inflates). Functional assertions (completion, accounting, contract)
+            # stay identical for both.
+            if [ "${architecture}" = "amd64" ]; then
+              soak_max_p95=30
+              soak_min_throughput=0.1
+            else
+              soak_max_p95=120
+              soak_min_throughput=0.01
+            fi
+            NEST_AGENT_API_TOKEN="$probe_token" python scripts/run-soak.py \
+              --base-url "http://127.0.0.1:${probe_port}" \
+              --runs 4 \
+              --concurrency 2 \
+              --timeout 90 \
+              --response-contract mock-echo \
+              --max-p95 "$soak_max_p95" \
+              --min-throughput "$soak_min_throughput"
+            cleanup_probe
+            trap - EXIT
+          done
+          docker pull "$TRIVY_IMAGE"
+          docker run --rm \
+            -v "$PWD:/repo:ro" \
+            -w /repo \
+            "$TRIVY_IMAGE" config \
+            --skip-version-check \
+            --skip-check-update \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignore-policy config/trivy-dockerfile-ignore.rego \
+            Dockerfile
+          for architecture in amd64 arm64; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP:/reports" \
+              "$TRIVY_IMAGE" image \
+              --skip-version-check \
+              --scanners vuln \
+              --pkg-types os,library \
+              --format json \
+              --output "/reports/kestrel-release-container-trivy-${architecture}.json" \
+              "kestrel-agent:release-${architecture}"
+            python scripts/check_container_vulnerabilities.py \
+              "$RUNNER_TEMP/kestrel-release-container-trivy-${architecture}.json" \
+              --exceptions config/container_vulnerability_exceptions.json
+          done
+          for architecture in amd64 arm64; do
+            image="kestrel-agent:release-${architecture}"
+            test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$architecture"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$RELEASE_COMMIT_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image")" = "$source_url"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")" = "$RELEASE_TAG"
+          done
+          container_artifacts="$RUNNER_TEMP/kestrel-container-artifacts"
+          RAW_OCI_ROOT="$raw_oci_root" CONTAINER_ARTIFACTS="$container_artifacts" python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          repository = "ghcr.io/john-miracleworker/kestrel"
+          media_index = "application/vnd.oci.image.index.v1+json"
+          media_manifest = "application/vnd.oci.image.manifest.v1+json"
+          raw_root = Path(os.environ["RAW_OCI_ROOT"])
+          output_root = Path(os.environ["CONTAINER_ARTIFACTS"])
+          if output_root.exists():
+              raise SystemExit("OCI candidate output already exists")
+          layout_root = output_root / "oci-layout"
+          blob_root = layout_root / "blobs" / "sha256"
+          blob_root.mkdir(parents=True)
+
+          def canonical(value: object) -> bytes:
+              return json.dumps(
+                  value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+              ).encode("utf-8")
+
+          def digest(raw: bytes) -> str:
+              return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+          def file_digest(path: Path) -> str:
+              value = hashlib.sha256()
+              with path.open("rb") as handle:
+                  while chunk := handle.read(1024 * 1024):
+                      value.update(chunk)
+              return "sha256:" + value.hexdigest()
+
+          def digest_hex(value: object, label: str) -> str:
+              text = str(value)
+              if re.fullmatch(r"sha256:[0-9a-f]{64}", text) is None:
+                  raise SystemExit(f"{label} is not a lowercase SHA-256 digest")
+              return text.removeprefix("sha256:")
+
+          def safe_extract(archive_path: Path, destination: Path) -> None:
+              destination.mkdir()
+              seen: set[str] = set()
+              total = 0
+              with tarfile.open(archive_path, mode="r:") as archive:
+                  if archive.pax_headers:
+                      raise SystemExit("raw OCI archive has global pax headers")
+                  for member in archive:
+                      name = member.name.rstrip("/")
+                      path = PurePosixPath(name)
+                      if (
+                          not name
+                          or path.is_absolute()
+                          or any(part in {"", ".", ".."} for part in path.parts)
+                          or "\\" in name
+                          or name in seen
+                          or member.pax_headers
+                      ):
+                          raise SystemExit("raw OCI archive has an unsafe member")
+                      seen.add(name)
+                      target = destination.joinpath(*path.parts)
+                      if member.isdir():
+                          target.mkdir(parents=True, exist_ok=True)
+                          continue
+                      if not member.isfile() or member.size > 2_147_483_648:
+                          raise SystemExit("raw OCI archive has a link or oversized member")
+                      total += member.size
+                      if total > 4_294_967_296:
+                          raise SystemExit("raw OCI archive is too large")
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      source = archive.extractfile(member)
+                      if source is None:
+                          raise SystemExit("raw OCI archive member cannot be read")
+                      with source, target.open("xb") as handle:
+                          shutil.copyfileobj(source, handle, length=1024 * 1024)
+                      if target.stat().st_size != member.size:
+                          raise SystemExit("raw OCI archive member size changed")
+
+          def json_object(path: Path, label: str) -> dict[str, object]:
+              value = json.loads(path.read_bytes())
+              if type(value) is not dict:
+                  raise SystemExit(f"{label} is not an object")
+              return value
+
+          combined_records: list[dict[str, object]] = []
+          platform_records: list[dict[str, object]] = []
+          platform_files: dict[str, dict[str, bytes | Path]] = {}
+          archive_paths = {
+              "amd64": "containers/kestrel-linux-amd64.tar",
+              "arm64": "containers/kestrel-linux-arm64.tar",
+          }
+          for architecture in ("amd64", "arm64"):
+              extracted = raw_root / f"extracted-{architecture}"
+              safe_extract(raw_root / f"{architecture}.tar", extracted)
+              index = json_object(extracted / "index.json", "raw OCI index")
+              records = index.get("manifests")
+              if type(records) is not list:
+                  raise SystemExit("raw OCI index manifests are invalid")
+              matching = [
+                  item
+                  for item in records
+                  if type(item) is dict
+                  and type(item.get("platform")) is dict
+                  and item["platform"].get("os") == "linux"
+                  and item["platform"].get("architecture") == architecture
+                  and item.get("mediaType") == media_manifest
+              ]
+              if len(matching) != 1:
+                  raise SystemExit("raw OCI platform manifest is absent or ambiguous")
+              raw_manifest_digest = str(matching[0].get("digest"))
+              raw_manifest_path = (
+                  extracted
+                  / "blobs"
+                  / "sha256"
+                  / digest_hex(raw_manifest_digest, "raw OCI manifest digest")
+              )
+              if (
+                  file_digest(raw_manifest_path) != raw_manifest_digest
+                  or raw_manifest_path.stat().st_size != matching[0].get("size")
+              ):
+                  raise SystemExit("raw OCI manifest identity mismatch")
+              raw_manifest = json_object(raw_manifest_path, "raw OCI manifest")
+              if set(raw_manifest) != {"schemaVersion", "mediaType", "config", "layers"}:
+                  raise SystemExit("raw OCI manifest fields are not exact")
+              raw_config = raw_manifest.get("config")
+              layers = raw_manifest.get("layers")
+              if type(raw_config) is not dict or type(layers) is not list or not layers:
+                  raise SystemExit("raw OCI manifest graph is incomplete")
+              raw_config_digest = str(raw_config.get("digest"))
+              raw_config_path = (
+                  extracted
+                  / "blobs"
+                  / "sha256"
+                  / digest_hex(raw_config_digest, "raw OCI config digest")
+              )
+              if (
+                  file_digest(raw_config_path) != raw_config_digest
+                  or raw_config_path.stat().st_size != raw_config.get("size")
+              ):
+                  raise SystemExit("raw OCI config identity mismatch")
+              config_value = json_object(raw_config_path, "raw OCI config")
+              if config_value.get("os") != "linux" or config_value.get("architecture") != architecture:
+                  raise SystemExit("raw OCI config platform mismatch")
+              config_raw = canonical(config_value)
+              config_digest = digest(config_raw)
+              (blob_root / config_digest.removeprefix("sha256:")).write_bytes(config_raw)
+              normalized_layers = []
+              archive_files: dict[str, bytes | Path] = {}
+              for layer in layers:
+                  if type(layer) is not dict or set(layer) != {"mediaType", "digest", "size"}:
+                      raise SystemExit("raw OCI layer descriptor fields are not exact")
+                  layer_digest = str(layer["digest"])
+                  layer_path = extracted / "blobs" / "sha256" / digest_hex(
+                      layer_digest, "raw OCI layer digest"
+                  )
+                  if not layer_path.is_file() or layer_path.is_symlink():
+                      raise SystemExit("raw OCI layer blob is not regular")
+                  if file_digest(layer_path) != layer_digest or layer_path.stat().st_size != layer["size"]:
+                      raise SystemExit("raw OCI layer identity mismatch")
+                  destination = blob_root / layer_digest.removeprefix("sha256:")
+                  if destination.exists():
+                      if file_digest(destination) != layer_digest:
+                          raise SystemExit("shared OCI layer digest collision")
+                  else:
+                      shutil.copyfile(layer_path, destination)
+                  normalized_layers.append(layer)
+                  archive_files[f"blobs/sha256/{layer_digest.removeprefix('sha256:')}"] = destination
+              manifest = {
+                  "schemaVersion": 2,
+                  "mediaType": media_manifest,
+                  "config": {
+                      "mediaType": raw_config["mediaType"],
+                      "digest": config_digest,
+                      "size": len(config_raw),
+                  },
+                  "layers": normalized_layers,
+              }
+              manifest_raw = canonical(manifest)
+              manifest_digest = digest(manifest_raw)
+              (blob_root / manifest_digest.removeprefix("sha256:")).write_bytes(manifest_raw)
+              record = {
+                  "mediaType": media_manifest,
+                  "digest": manifest_digest,
+                  "size": len(manifest_raw),
+                  "platform": {"architecture": architecture, "os": "linux"},
+              }
+              combined_records.append(record)
+              marker_raw = canonical({"imageLayoutVersion": "1.0.0"})
+              platform_index_raw = canonical(
+                  {"schemaVersion": 2, "mediaType": media_index, "manifests": [record]}
+              )
+              archive_files.update({
+                  "oci-layout": marker_raw,
+                  "index.json": platform_index_raw,
+                  f"blobs/sha256/{manifest_digest.removeprefix('sha256:')}": manifest_raw,
+                  f"blobs/sha256/{config_digest.removeprefix('sha256:')}": config_raw,
+              })
+              platform_files[architecture] = archive_files
+              platform_records.append({
+                  "os": "linux",
+                  "architecture": architecture,
+                  "manifest_digest": manifest_digest,
+                  "manifest_ref": f"{repository}@{manifest_digest}",
+                  "config_digest": config_digest,
+                  "archive_path": archive_paths[architecture],
+                  "archive_sha256": None,
+              })
+
+          marker_raw = canonical({"imageLayoutVersion": "1.0.0"})
+          (layout_root / "oci-layout").write_bytes(marker_raw)
+          index_raw = canonical(
+              {"schemaVersion": 2, "mediaType": media_index, "manifests": combined_records}
+          )
+          (layout_root / "index.json").write_bytes(index_raw)
+          for index, architecture in enumerate(("amd64", "arm64")):
+              archive_path = output_root / f"kestrel-linux-{architecture}.tar"
+              with tarfile.open(archive_path, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+                  for name, value in sorted(platform_files[architecture].items()):
+                      info = tarfile.TarInfo(name)
+                      info.mode = 0o644
+                      info.uid = 0
+                      info.gid = 0
+                      info.mtime = 0
+                      info.uname = ""
+                      info.gname = ""
+                      if isinstance(value, Path):
+                          info.size = value.stat().st_size
+                          with value.open("rb") as handle:
+                              archive.addfile(info, handle)
+                      else:
+                          info.size = len(value)
+                          archive.addfile(info, io.BytesIO(value))
+              platform_records[index]["archive_sha256"] = file_digest(archive_path)
+          index_digest = digest(index_raw)
+          descriptor = {
+              "schema": "kestrel.oci_descriptor.v1",
+              "repository": repository,
+              "source_sha": os.environ["RELEASE_COMMIT_SHA"],
+              "index_digest": index_digest,
+              "index_ref": f"{repository}@{index_digest}",
+              "index_manifest_path": "containers/oci-layout/index.json",
+              "platforms": platform_records,
+          }
+          descriptor_relative = Path("containers/oci-descriptor.json")
+          (output_root / descriptor_relative.name).write_bytes(canonical(descriptor))
+          release_record = {
+              "schema": "kestrel.oci_image_digests.v1",
+              "repository": repository,
+              "source_sha": os.environ["RELEASE_COMMIT_SHA"],
+              "index_digest": index_digest,
+              "index_ref": f"{repository}@{index_digest}",
+              "platforms": [
+                  {
+                      "os": item["os"],
+                      "architecture": item["architecture"],
+                      "manifest_digest": item["manifest_digest"],
+                      "manifest_ref": item["manifest_ref"],
+                  }
+                  for item in platform_records
+              ],
+          }
+          release_record_relative = Path("release/oci-image-digests.json")
+          Path("dist", release_record_relative.name).write_bytes(canonical(release_record))
+          PY
+      - name: Upload exact scanned release containers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-containers-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/kestrel-container-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Verify packaged licenses and web workbench
+        run: |
+          python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit(f"unexpected release artifacts: wheels={wheels}, sdists={sdists}")
+          wheel_notice = "nested_memvid_agent/web_dist/THIRD_PARTY_NOTICES.txt"
+          with zipfile.ZipFile(wheels[0]) as archive:
+              wheel_names = set(archive.namelist())
+              if wheel_notice not in wheel_names:
+                  raise SystemExit(f"wheel is missing {wheel_notice}")
+              if not any(name.endswith(".dist-info/licenses/LICENSE") for name in wheel_names):
+                  raise SystemExit("wheel is missing Kestrel's LICENSE")
+              if not any(
+                  name.endswith(".dist-info/licenses/web/public/THIRD_PARTY_NOTICES.txt")
+                  for name in wheel_names
+              ):
+                  raise SystemExit("wheel metadata is missing third-party notices")
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              sdist_names = set(archive.getnames())
+              if any("/tests/" in name for name in sdist_names):
+                  raise SystemExit("sdist contains a partial test bundle")
+              if not any(name.endswith(f"/src/{wheel_notice}") for name in sdist_names):
+                  raise SystemExit(f"sdist is missing src/{wheel_notice}")
+              if not any(name.endswith("/web/public/THIRD_PARTY_NOTICES.txt") for name in sdist_names):
+                  raise SystemExit("sdist is missing source third-party notices")
+          PY
+      - name: Stage version-pinned installer
+        run: |
+          cp install.sh dist/install.sh
+          cp install.ps1 dist/install.ps1
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("dist/install.sh")
+          powershell_path = Path("dist/install.ps1")
+          text = path.read_text(encoding="utf-8")
+          tag = os.environ["RELEASE_TAG"]
+          release_sha = os.environ["RELEASE_COMMIT_SHA"]
+          version = tag.removeprefix("v")
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected exactly one wheel, found: {wheels}")
+          release_base = (
+              f"https://github.com/John-MiracleWorker/Kestrel/releases/download/{tag}"
+          )
+          expected_extras = f'DEFAULT_EXTRAS="{os.environ["RELEASE_EXTRAS"]}"'
+          if expected_extras not in text:
+              raise SystemExit("installer default extras do not match the release environment")
+          replacements = {
+              'KESTREL_REF="${KESTREL_REF:-main}"':
+                  'KESTREL_REF="${KESTREL_REF:-' + tag + '}"',
+              'DEFAULT_REQUIREMENTS_URL=""':
+                  f'DEFAULT_REQUIREMENTS_URL="{release_base}/requirements-release.txt"',
+              'DEFAULT_WHEEL_URL=""':
+                  f'DEFAULT_WHEEL_URL="{release_base}/{wheels[0].name}"',
+              'DEFAULT_CHECKSUMS_URL=""':
+                  f'DEFAULT_CHECKSUMS_URL="{release_base}/SHA256SUMS"',
+              'DEFAULT_RELEASE_SHA=""':
+                  f'DEFAULT_RELEASE_SHA="{release_sha}"',
+              'DEFAULT_RELEASE_VERSION=""':
+                  f'DEFAULT_RELEASE_VERSION="{version}"',
+              "https://raw.githubusercontent.com/John-MiracleWorker/Kestrel/main/install.sh":
+                  f"{release_base}/install.sh",
+              "Defaults to main.": f"Defaults to {tag}.",
+          }
+          for marker, pinned in replacements.items():
+              if marker not in text:
+                  raise SystemExit(f"installer release marker not found: {marker}")
+              text = text.replace(marker, pinned, 1)
+          path.write_text(text, encoding="utf-8")
+          powershell_text = powershell_path.read_text(encoding="utf-8")
+          powershell_version = f'[string] $Version = "{version}"'
+          if powershell_text.count(powershell_version) != 1:
+              raise SystemExit(
+                  "PowerShell bootstrap version does not match the release: "
+                  f"{powershell_version}"
+              )
+          PY
+      - name: Validate staged release installer plan
+        run: |
+          installer_help="$(bash dist/install.sh --help)"
+          grep -Fq "https://github.com/John-MiracleWorker/Kestrel/releases/download/$RELEASE_TAG/install.sh | bash" <<< "$installer_help"
+          installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-plan" bash dist/install.sh)"
+          grep -Fq "ref: $RELEASE_TAG" <<< "$installer_plan"
+          grep -Fq "immutable release commit: $RELEASE_COMMIT_SHA" <<< "$installer_plan"
+          grep -Fq "verify checkout HEAD equals immutable release commit $RELEASE_COMMIT_SHA" <<< "$installer_plan"
+          grep -Fq "verify SHA256SUMS" <<< "$installer_plan"
+          grep -Fq "pip install --require-hashes" <<< "$installer_plan"
+          grep -Fq "pip install --no-deps" <<< "$installer_plan"
+          stdin_installer_plan="$(KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-stdin-plan" bash < dist/install.sh)"
+          grep -Fq "ref: $RELEASE_TAG" <<< "$stdin_installer_plan"
+          grep -Fq "verify SHA256SUMS" <<< "$stdin_installer_plan"
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-ref-override" \
+            KESTREL_REF=main bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_REF override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-repo-override" \
+            KESTREL_REPO=https://example.invalid/fork.git bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_REPO override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-requirements-override" \
+            KESTREL_REQUIREMENTS_URL=https://example.invalid/replacement-requirements.txt \
+            bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_REQUIREMENTS_URL override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-wheel-override" \
+            KESTREL_WHEEL_URL=https://example.invalid/replacement.whl bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_WHEEL_URL override" >&2
+            exit 1
+          fi
+          if KESTREL_DRY_RUN=1 KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-checksums-override" \
+            KESTREL_CHECKSUMS_URL=https://example.invalid/replacement-SHA256SUMS \
+            bash dist/install.sh; then
+            echo "staged release installer accepted KESTREL_CHECKSUMS_URL override" >&2
+            exit 1
+          fi
+      - name: Export locked default release dependencies
+        run: |
+          extra_args=()
+          IFS=',' read -ra extras <<< "$RELEASE_EXTRAS"
+          for extra in "${extras[@]}"; do
+            extra_args+=(--extra "$extra")
+          done
+          uv export --frozen --no-dev --no-emit-local \
+            "${extra_args[@]}" \
+            --format requirements.txt \
+            --output-file dist/requirements-release.txt
+      - name: Smoke-test built wheel
+        run: |
+          python -m venv /tmp/kestrel-release-smoke
+          wheels=(dist/*.whl)
+          /tmp/kestrel-release-smoke/bin/python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            -r dist/requirements-release.txt
+          /tmp/kestrel-release-smoke/bin/python -m pip install \
+            --no-deps \
+            "${wheels[0]}[${RELEASE_EXTRAS}]"
+          /tmp/kestrel-release-smoke/bin/python -m pip check
+          /tmp/kestrel-release-smoke/bin/python -c 'import importlib.metadata, keyring, os; actual=importlib.metadata.version("nested-memvid-agent"); expected=os.environ["RELEASE_VERSION"]; assert actual == expected, (actual, expected); assert callable(keyring.get_keyring)'
+          /tmp/kestrel-release-smoke/bin/nest-agent doctor --backend memvid --memory-dir "$RUNNER_TEMP/kestrel-release-memory" --provider mock --model mock
+          /tmp/kestrel-release-smoke/bin/nest-agent chat --backend memvid --memory-dir "$RUNNER_TEMP/kestrel-release-chat" --provider mock --model mock --message "release wheel smoke"
+          NEST_AGENT_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          export NEST_AGENT_API_TOKEN
+          export NEST_AGENT_REQUIRE_API_AUTH=1
+          export NEST_AGENT_API_RATE_LIMIT_REQUESTS=100000
+          export NEST_AGENT_API_RATE_LIMIT_WINDOW_SECONDS=60
+          export NEST_AGENT_MAX_CONCURRENT_RUNS=1
+          export NEST_AGENT_MAX_QUEUED_RUNS=4
+          (
+            cd /tmp
+            /tmp/kestrel-release-smoke/bin/nest-agent server \
+              --backend memory \
+              --memory-dir "$RUNNER_TEMP/kestrel-release-server/memory" \
+              --state-path "$RUNNER_TEMP/kestrel-release-server/state/agent.sqlite3" \
+              --log-dir "$RUNNER_TEMP/kestrel-release-server/logs" \
+              --secret-store-path "$RUNNER_TEMP/kestrel-release-server/secrets/store.json" \
+              --provider mock \
+              --model mock \
+              --host 127.0.0.1 \
+              --port 8878
+          ) >/tmp/kestrel-release-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in {1..30}; do
+            if curl -fsS http://127.0.0.1:8878/ >/tmp/kestrel-release-index.html; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8878/ | grep -q '<div id="root"></div>'
+          unauthenticated_code="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8878/api/health/ready)"
+          test "$unauthenticated_code" = 401
+          curl -fsS \
+            -H "Authorization: Bearer $NEST_AGENT_API_TOKEN" \
+            http://127.0.0.1:8878/api/health/ready >/tmp/kestrel-release-readiness.json
+          python scripts/run-soak.py \
+            --base-url http://127.0.0.1:8878 \
+            --runs 30 \
+            --concurrency 4 \
+            --timeout 60 \
+            --response-contract mock-echo \
+            --max-p95 10 \
+            --min-throughput 0.75
+          python scripts/run-soak.py \
+            --base-url http://127.0.0.1:8878 \
+            --runs 40 \
+            --concurrency 40 \
+            --timeout 60 \
+            --response-contract mock-echo \
+            --require-overload \
+            --min-completed 4 \
+            --max-overload-ratio 0.90 \
+            --max-p95 10 \
+            --min-throughput 0.5
+          kill "$server_pid"
+          trap - EXIT
+      - name: Smoke-test built source distribution
+        run: |
+          python -m venv /tmp/kestrel-release-sdist-smoke
+          sdists=(dist/*.tar.gz)
+          test "${#sdists[@]}" -eq 1
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            -r config/release-build-bootstrap.txt
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            -r dist/requirements-release.txt
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip install \
+            --no-build-isolation \
+            --no-deps \
+            "${sdists[0]}[${RELEASE_EXTRAS}]"
+          /tmp/kestrel-release-sdist-smoke/bin/python -m pip check
+          /tmp/kestrel-release-sdist-smoke/bin/python -c \
+            'import keyring; assert callable(keyring.get_keyring)'
+          /tmp/kestrel-release-sdist-smoke/bin/nest-agent doctor \
+            --backend memvid \
+            --memory-dir "$RUNNER_TEMP/kestrel-release-sdist-memory" \
+            --provider mock \
+            --model mock
+          /tmp/kestrel-release-sdist-smoke/bin/nest-agent chat \
+            --backend memvid \
+            --memory-dir "$RUNNER_TEMP/kestrel-release-sdist-chat" \
+            --provider mock \
+            --model mock \
+            --message "release sdist smoke"
+          /tmp/kestrel-release-sdist-smoke/bin/python - <<'PY'
+          import importlib.metadata
+          import os
+          from importlib.resources import files
+
+          expected = os.environ["RELEASE_VERSION"]
+          actual = importlib.metadata.version("nested-memvid-agent")
+          assert actual == expected, (actual, expected)
+          web = files("nested_memvid_agent").joinpath("web_dist")
+          assert web.joinpath("index.html").is_file()
+          assert web.joinpath("THIRD_PARTY_NOTICES.txt").is_file()
+          PY
+      - name: Audit shipped dependencies and generate release SBOM
+        run: |
+          RELEASE_SITE_PACKAGES="$(/tmp/kestrel-release-smoke/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          python -m pip_audit --path "$RELEASE_SITE_PACKAGES"
+          cyclonedx-py environment /tmp/kestrel-release-smoke/bin/python \
+            --output-reproducible \
+            --output-format JSON \
+            --output-file dist/sbom.cdx.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("dist/sbom.cdx.json").read_text(encoding="utf-8"))
+          names = {
+              str(component.get("name", "")).casefold().replace("_", "-")
+              for component in payload.get("components", [])
+          }
+          required = {
+              "nested-memvid-agent",
+              "memvid-sdk",
+              "openai",
+              "anthropic",
+              "google-genai",
+              "keyring",
+              "fastapi",
+              "mcp",
+          }
+          missing = sorted(required - names)
+          development_only = sorted({"pytest", "ruff", "mypy"} & names)
+          if missing or development_only:
+              raise SystemExit(
+                  f"release SBOM mismatch: missing={missing}, development_only={development_only}"
+              )
+          PY
+      - name: Generate artifact checksums
+        run: |
+          (
+            cd dist
+            shopt -s nullglob
+            wheels=(*.whl)
+            sdists=(*.tar.gz)
+            test "${#wheels[@]}" -eq 1
+            test "${#sdists[@]}" -eq 1
+            sha256sum install.sh install.ps1 requirements-release.txt "${wheels[@]}" "${sdists[@]}" sbom.cdx.json oci-image-digests.json > SHA256SUMS
+          )
+      - name: Verify complete release payload
+        run: python scripts/verify_release_payload.py dist --expected-version "$RELEASE_TAG"
+      - name: Upload validated release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-release-${{ inputs.source_sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  cross-platform-exact-wheel:
+    name: Exact wheel on ${{ matrix.os }} ${{ matrix.machine }} / Python ${{ matrix.python }}
+    needs: build-release-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+            machine: x86_64
+          - os: ubuntu-latest
+            python: "3.12"
+            machine: x86_64
+          - os: ubuntu-latest
+            python: "3.13"
+            machine: x86_64
+          - os: macos-latest
+            python: "3.11"
+            machine: arm64
+          - os: macos-latest
+            python: "3.12"
+            machine: arm64
+          - os: macos-latest
+            python: "3.13"
+            machine: arm64
+          - os: windows-latest
+            python: "3.11"
+            machine: AMD64
+          - os: windows-latest
+            python: "3.12"
+            machine: AMD64
+          - os: windows-latest
+            python: "3.13"
+            machine: AMD64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      actions: read
+      contents: read
+    env:
+      PYTHONNOUSERSITE: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Verify runner architecture matches the matrix label
+        run: >-
+          python -c "import platform;
+          actual=platform.machine().casefold();
+          expected='${{ matrix.machine }}'.casefold();
+          assert actual == expected, (actual, expected)"
+      - name: Download the single validated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-release-${{ inputs.source_sha }}
+          path: dist
+      - name: Verify and install exact wheel payload
+        shell: bash
+        run: >-
+          python -m scripts.verify_exact_wheel_install dist
+          --expected-version "$RELEASE_VERSION"
+          --source-root .
+      - name: Validate the shipped PowerShell Windows diagnostic
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $reportText = powershell -NoProfile -ExecutionPolicy Bypass -File dist/install.ps1 -Action Doctor -Json
+          if ($LASTEXITCODE -ne 0) {
+            throw "PowerShell diagnostic exited $LASTEXITCODE"
+          }
+          $report = $reportText | ConvertFrom-Json
+          if ($report.schema -ne "kestrel.windows_bootstrap_report.v1") {
+            throw "PowerShell diagnostic returned the wrong schema"
+          }
+          if ($report.mutation_performed -ne $false -or $report.passed -ne $true) {
+            throw "PowerShell diagnostic did not prove a non-mutating supported path"
+          }
+      - name: Record the successful exact-wheel matrix cell
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_PYTHON: ${{ matrix.python }}
+          MATRIX_MACHINE: ${{ matrix.machine }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          record = {
+              "schema": "kestrel.exact_wheel_cell.v1",
+              "source_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "os": os.environ["MATRIX_OS"],
+              "python": os.environ["MATRIX_PYTHON"],
+              "machine": os.environ["MATRIX_MACHINE"],
+              "status": "success",
+          }
+          path = Path("exact-wheel-cell.json")
+          path.write_text(
+              json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+          )
+          PY
+      - name: Upload immutable exact-wheel matrix cell
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-exact-wheel-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.machine }}-${{ env.CANDIDATE_SOURCE_SHA }}
+          path: exact-wheel-cell.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  finalize-candidate:
+    name: Seal the exact validated candidate manifest
+    needs: cross-platform-exact-wheel
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-id: ${{ steps.candidate-upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.candidate-upload.outputs.artifact-digest }}
+      artifact-url: ${{ steps.candidate-upload.outputs.artifact-url }}
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CROSS_PLATFORM_RESULT: ${{ needs.cross-platform-exact-wheel.result }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Download the exact candidate source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-candidate-source-${{ env.CANDIDATE_SOURCE_SHA }}
+          path: ${{ runner.temp }}/kestrel-release-candidate-bundle
+      - name: Download exact validated release bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-release-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/kestrel-release-candidate-bundle/release
+      - name: Download exact scanned container bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-containers-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/kestrel-release-candidate-bundle/containers
+      - name: Download exact attempt-one prerequisite receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kestrel-candidate-prerequisites-${{ env.CANDIDATE_SOURCE_SHA }}
+          path: ${{ runner.temp }}/kestrel-release-candidate-bundle/qualification/receipts
+      - name: Build and independently verify the immutable candidate bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_BUNDLE_ROOT: ${{ runner.temp }}/kestrel-release-candidate-bundle
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$CROSS_PLATFORM_RESULT" = success
+          test "$(git rev-parse "$CANDIDATE_SOURCE_SHA^{commit}")" = "$CANDIDATE_SOURCE_SHA"
+          source_tree="$(git rev-parse "$CANDIDATE_SOURCE_SHA^{tree}")"
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "$CANDIDATE_SOURCE_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq '.protected')" = true
+          if git ls-remote --exit-code --tags origin "refs/tags/v$CANDIDATE_VERSION" >/dev/null 2>&1; then
+            echo "candidate source acquired a stable tag before finalization" >&2
+            exit 1
+          fi
+          remote_tags="$(git ls-remote --tags origin)"
+          SOURCE_SHA="$CANDIDATE_SOURCE_SHA" REMOTE_TAGS="$remote_tags" python - <<'PY'
+          import os
+          import re
+
+          if any(
+              re.fullmatch(r"refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(?:\^\{\})?", ref)
+              and sha == os.environ["SOURCE_SHA"]
+              for line in os.environ["REMOTE_TAGS"].splitlines()
+              for sha, ref in [line.split()]
+          ):
+              raise SystemExit("candidate source acquired a stable tag before finalization")
+          PY
+          expected_source_archive="$RUNNER_TEMP/kestrel-expected-source.tar"
+          git archive --format=tar "$CANDIDATE_SOURCE_SHA" > "$expected_source_archive"
+          cmp "$CANDIDATE_BUNDLE_ROOT/source.tar" "$expected_source_archive"
+          observation_root="$RUNNER_TEMP/kestrel-candidate-final-observations"
+          mkdir -p "$observation_root"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"             > "$observation_root/run.json"
+          gh api --paginate --slurp             "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100"             > "$observation_root/jobs.json"
+          gh api --paginate --slurp             "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"             > "$observation_root/artifacts.json"
+          SOURCE_TREE="$source_tree" OBSERVATION_ROOT="$observation_root" python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          from scripts import release_candidate_manifest as manifests
+
+          bundle = Path(os.environ["CANDIDATE_BUNDLE_ROOT"])
+          observation_root = Path(os.environ["OBSERVATION_ROOT"])
+          run_path = observation_root / "run.json"
+          jobs_path = observation_root / "jobs.json"
+          artifacts_path = observation_root / "artifacts.json"
+          run = json.loads(run_path.read_text(encoding="utf-8"))
+          jobs_pages = json.loads(jobs_path.read_text(encoding="utf-8"))
+          artifact_pages = json.loads(artifacts_path.read_text(encoding="utf-8"))
+          if (
+              run.get("id") != int(os.environ["GITHUB_RUN_ID"])
+              or run.get("run_attempt") != 1
+              or run.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+              or run.get("head_branch") != "main"
+              or run.get("event") != "workflow_dispatch"
+              or run.get("status") != "in_progress"
+              or run.get("conclusion") is not None
+              or str(run.get("path", "")).split("@", 1)[0]
+              != ".github/workflows/release-candidate.yml"
+          ):
+              raise SystemExit("candidate workflow observation is not the active exact run")
+
+          raw_jobs = [job for page in jobs_pages for job in page.get("jobs", [])]
+          build_jobs = [
+              job
+              for job in raw_jobs
+              if job.get("name") == "Build and validate the exact release candidate"
+          ]
+          wheel_jobs = [
+              job for job in raw_jobs if str(job.get("name", "")).startswith("Exact wheel on ")
+          ]
+          expected_wheel_names = {
+              f"Exact wheel on {runner} {machine} / Python {version}"
+              for runner, machine in (
+                  ("ubuntu-latest", "x86_64"),
+                  ("macos-latest", "arm64"),
+                  ("windows-latest", "AMD64"),
+              )
+              for version in ("3.11", "3.12", "3.13")
+          }
+          if len(build_jobs) != 1 or {job.get("name") for job in wheel_jobs} != expected_wheel_names:
+              raise SystemExit("candidate completed-job inventory is not exact")
+
+          def normalized_jobs(values: list[dict[str, object]]) -> list[dict[str, object]]:
+              result = []
+              for job in values:
+                  if (
+                      job.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+                      or job.get("status") != "completed"
+                      or job.get("conclusion") != "success"
+                  ):
+                      raise SystemExit("candidate check job is not successfully complete")
+                  result.append(
+                      {
+                          "job_id": job["id"],
+                          "name": job["name"],
+                          "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                          "run_attempt": 1,
+                          "head_sha": job["head_sha"],
+                          "status": "completed",
+                          "conclusion": "success",
+                      }
+                  )
+              result.sort(key=lambda item: (item["name"], item["job_id"]))
+              return result
+
+          raw_artifacts = [
+              artifact
+              for page in artifact_pages
+              for artifact in page.get("artifacts", [])
+          ]
+          expected_matrix_artifacts = {
+              f"kestrel-exact-wheel-{runner}-{version}-{machine}-{os.environ['CANDIDATE_SOURCE_SHA']}"
+              for runner, machine in (
+                  ("ubuntu-latest", "x86_64"),
+                  ("macos-latest", "arm64"),
+                  ("windows-latest", "AMD64"),
+              )
+              for version in ("3.11", "3.12", "3.13")
+          }
+          release_name = f"kestrel-release-{os.environ['CANDIDATE_SOURCE_SHA']}"
+          containers_name = f"kestrel-containers-{os.environ['CANDIDATE_SOURCE_SHA']}"
+          by_name: dict[str, dict[str, object]] = {}
+          for artifact in raw_artifacts:
+              name = artifact.get("name")
+              if type(name) is str and (
+                  name in {release_name, containers_name} or name in expected_matrix_artifacts
+              ):
+                  if name in by_name:
+                      raise SystemExit("candidate evidence artifact name is duplicated")
+                  by_name[name] = artifact
+          if set(by_name) != {release_name, containers_name, *expected_matrix_artifacts}:
+              raise SystemExit("candidate evidence artifact inventory is incomplete")
+
+          def normalized_artifacts(names: set[str]) -> list[dict[str, object]]:
+              result = []
+              for name in names:
+                  artifact = by_name[name]
+                  api_digest = artifact.get("digest")
+                  workflow_run = artifact.get("workflow_run") or {}
+                  size = artifact.get("size_in_bytes")
+                  if (
+                      re.fullmatch(r"sha256:[0-9a-f]{64}", str(api_digest)) is None
+                      or artifact.get("expired") is not False
+                      or type(size) is not int
+                      or isinstance(size, bool)
+                      or size <= 0
+                      or workflow_run.get("id") != int(os.environ["GITHUB_RUN_ID"])
+                      or workflow_run.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+                  ):
+                      raise SystemExit("candidate evidence artifact identity mismatch")
+                  result.append(
+                      {
+                          "artifact_id": artifact["id"],
+                          "name": name,
+                          "api_digest": api_digest,
+                          "size_bytes": size,
+                          "expired": False,
+                          "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                          "run_attempt": 1,
+                          "source_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                      }
+                  )
+              result.sort(key=lambda item: (item["name"], item["artifact_id"]))
+              return result
+
+          artifacts = manifests._artifact_inventory(bundle)  # noqa: SLF001
+          artifact_set_digest = manifests.artifact_set_digest(artifacts)
+
+          def raw_digest(path: Path) -> str:
+              return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+          receipt_root = bundle / "qualification" / "receipts"
+          receipt_root.mkdir(parents=True, exist_ok=True)
+          candidate_checks = {
+              "nine-row-exact-wheel": (
+                  normalized_jobs(wheel_jobs),
+                  normalized_artifacts(expected_matrix_artifacts),
+              ),
+              "oci-layout": (
+                  normalized_jobs(build_jobs),
+                  normalized_artifacts({containers_name}),
+              ),
+              "release-payload": (
+                  normalized_jobs(build_jobs),
+                  normalized_artifacts({release_name}),
+              ),
+          }
+          candidate_schemas = {
+              "nine-row-exact-wheel": "kestrel.check.nine-row-exact-wheel.v1",
+              "oci-layout": "kestrel.check.oci-layout.v1",
+              "release-payload": "kestrel.check.release-payload.v1",
+          }
+          for name, (jobs, evidence_artifacts) in candidate_checks.items():
+              receipt = {
+                  "schema": candidate_schemas[name],
+                  "name": name,
+                  "status": "success",
+                  "subject_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                  "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                  "run_attempt": 1,
+                  "workflow": {
+                      "repository": os.environ["GITHUB_REPOSITORY"],
+                      "repository_id": int(os.environ["CANDIDATE_REPOSITORY_ID"]),
+                      "workflow_id": run["workflow_id"],
+                      "workflow_path": ".github/workflows/release-candidate.yml",
+                      "workflow_ref": "refs/heads/main",
+                      "workflow_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                      "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                      "run_attempt": 1,
+                      "event": "workflow_dispatch",
+                      "head_sha": os.environ["CANDIDATE_SOURCE_SHA"],
+                      "status": "in_progress",
+                      "conclusion": None,
+                  },
+                  "jobs": jobs,
+                  "artifacts": evidence_artifacts,
+                  "artifact_set_digest": artifact_set_digest,
+                  "evidence": {
+                      "workflow_observation_digest": raw_digest(run_path),
+                      "jobs_observation_digest": raw_digest(jobs_path),
+                      "artifacts_observation_digest": raw_digest(artifacts_path),
+                      "job_count": len(jobs),
+                      "artifact_count": len(evidence_artifacts),
+                      "complete": True,
+                      "canonicalization_vector_digest": manifests.CANONICALIZATION_VECTOR_DIGEST,
+                  },
+                  "provenance": {
+                      "producer": ".github/workflows/release-candidate.yml",
+                      "provider": "github.com",
+                      "method": "actions-check-observation",
+                  },
+                  "confidence": 1,
+                  "validation_status": "validated",
+              }
+              (receipt_root / f"{name}.json").write_bytes(
+                  manifests.canonical_json_bytes(receipt)
+              )
+
+          checks = []
+          for name in manifests.CHECK_NAMES:
+              receipt_path = receipt_root / f"{name}.json"
+              raw = receipt_path.read_bytes()
+              receipt = json.loads(raw)
+              checks.append(
+                  {
+                      "name": name,
+                      "status": receipt["status"],
+                      "subject_sha": receipt["subject_sha"],
+                      "run_id": receipt["run_id"],
+                      "run_attempt": receipt["run_attempt"],
+                      "receipt_path": f"qualification/receipts/{name}.json",
+                      "receipt_sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                  }
+              )
+          checks_path = observation_root / "checks.json"
+          checks_path.write_bytes(manifests.canonical_json_bytes(checks))
+
+          descriptor = json.loads(
+              (bundle / "containers" / "oci-descriptor.json").read_text(encoding="utf-8")
+          )
+          subjects = [
+              {
+                  "kind": "file",
+                  "name": item["path"],
+                  "digest": item["sha256"],
+              }
+              for item in artifacts
+              if item["path"].startswith("release/")
+          ]
+          subjects.append(
+              {
+                  "kind": "oci_index",
+                  "name": "ghcr.io/john-miracleworker/kestrel",
+                  "digest": descriptor["index_digest"],
+              }
+          )
+          subjects.sort(key=lambda item: (item["kind"], item["name"]))
+          (bundle / "attestations.json").write_bytes(
+              manifests.canonical_json_bytes(subjects)
+          )
+          PY
+          workflow_id="$(jq -er '.workflow_id' "$observation_root/run.json")"
+          python -m scripts.release_candidate_manifest create \
+            --source-root . \
+            --bundle-root "$CANDIDATE_BUNDLE_ROOT" \
+            --version "$CANDIDATE_VERSION" \
+            --source-sha "$CANDIDATE_SOURCE_SHA" \
+            --source-tree "$source_tree" \
+            --source-archive "$CANDIDATE_BUNDLE_ROOT/source.tar" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$CANDIDATE_REPOSITORY_ID" \
+            --workflow-id "$workflow_id" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --workflow-ref refs/heads/main \
+            --workflow-sha "$CANDIDATE_SOURCE_SHA" \
+            --checks "$observation_root/checks.json" \
+            --attestation-subjects "$CANDIDATE_BUNDLE_ROOT/attestations.json" \
+            --output "$CANDIDATE_BUNDLE_ROOT/candidate-manifest.json"
+          candidate_manifest_digest="$(
+            python -m scripts.release_candidate_manifest digest \
+              "$CANDIDATE_BUNDLE_ROOT/candidate-manifest.json"
+          )"
+          python -m scripts.release_candidate_manifest verify \
+            "$CANDIDATE_BUNDLE_ROOT/candidate-manifest.json" \
+            --bundle-root "$CANDIDATE_BUNDLE_ROOT" \
+            --source-root . \
+            --expected-digest "$candidate_manifest_digest"
+          python -m scripts.release_candidate_manifest verify \
+            "$CANDIDATE_BUNDLE_ROOT/candidate-manifest.json" \
+            --bundle-root "$CANDIDATE_BUNDLE_ROOT" \
+            --source-root . \
+            --expected-digest "$candidate_manifest_digest"
+      - name: Upload sealed candidate transaction
+        id: candidate-upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-release-candidate-${{ inputs.version }}-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/kestrel-release-candidate-bundle/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Verify the unique sealed candidate artifact identity
+        env:
+          CANDIDATE_ARTIFACT_ID: ${{ steps.candidate-upload.outputs.artifact-id }}
+          CANDIDATE_ARTIFACT_DIGEST: ${{ steps.candidate-upload.outputs.artifact-digest }}
+          CANDIDATE_ARTIFACT_URL: ${{ steps.candidate-upload.outputs.artifact-url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_observation="$RUNNER_TEMP/kestrel-sealed-candidate-artifact.json"
+          artifact_pages="$RUNNER_TEMP/kestrel-sealed-candidate-artifacts.json"
+          run_observation="$RUNNER_TEMP/kestrel-sealed-candidate-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT_ID" \
+            > "$artifact_observation"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            > "$artifact_pages"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            > "$run_observation"
+          CANDIDATE_ARTIFACT_OBSERVATION="$artifact_observation" \
+            CANDIDATE_ARTIFACT_PAGES="$artifact_pages" \
+            CANDIDATE_RUN_OBSERVATION="$run_observation" \
+            python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import re
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          artifact_id_text = os.environ["CANDIDATE_ARTIFACT_ID"]
+          if re.fullmatch(r"[1-9][0-9]*", artifact_id_text) is None:
+              raise SystemExit("candidate upload did not return a positive artifact ID")
+          artifact_id = int(artifact_id_text)
+          upload_digest = os.environ["CANDIDATE_ARTIFACT_DIGEST"]
+          if re.fullmatch(r"[0-9a-f]{64}", upload_digest) is None:
+              raise SystemExit("candidate upload did not return a canonical artifact digest")
+          expected_api_digest = f"sha256:{upload_digest}"
+          expected_name = (
+              f"kestrel-release-candidate-{os.environ['CANDIDATE_VERSION']}-"
+              f"{os.environ['CANDIDATE_SOURCE_SHA']}"
+          )
+          expected_url = (
+              f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+              f"{os.environ['GITHUB_RUN_ID']}/artifacts/{artifact_id}"
+          )
+          if os.environ["CANDIDATE_ARTIFACT_URL"] != expected_url:
+              raise SystemExit("candidate upload artifact URL is not exact")
+
+          artifact = json.loads(
+              Path(os.environ["CANDIDATE_ARTIFACT_OBSERVATION"]).read_text(
+                  encoding="utf-8"
+              )
+          )
+          pages = json.loads(
+              Path(os.environ["CANDIDATE_ARTIFACT_PAGES"]).read_text(encoding="utf-8")
+          )
+          run = json.loads(
+              Path(os.environ["CANDIDATE_RUN_OBSERVATION"]).read_text(encoding="utf-8")
+          )
+          if type(artifact) is not dict or type(pages) is not list or type(run) is not dict:
+              raise SystemExit("candidate upload API observations have invalid shapes")
+          matches = [
+              item
+              for page in pages
+              if type(page) is dict
+              for item in page.get("artifacts", [])
+              if type(item) is dict and item.get("name") == expected_name
+          ]
+          if len(matches) != 1:
+              raise SystemExit("sealed candidate artifact name is absent or ambiguous")
+          listed = matches[0]
+          workflow_run = artifact.get("workflow_run") or {}
+          size = artifact.get("size_in_bytes")
+          try:
+              created = datetime.strptime(
+                  artifact.get("created_at"), "%Y-%m-%dT%H:%M:%SZ"
+              ).replace(tzinfo=UTC)
+              expires = datetime.strptime(
+                  artifact.get("expires_at"), "%Y-%m-%dT%H:%M:%SZ"
+              ).replace(tzinfo=UTC)
+          except (TypeError, ValueError) as exc:
+              raise SystemExit("sealed candidate artifact timestamps are invalid") from exc
+          observed_retention = int((expires - created).total_seconds())
+          configured_retention = 30 * 86400
+          if observed_retention not in {configured_retention, configured_retention - 1}:
+              raise SystemExit("sealed candidate artifact retention is not exactly 30 days")
+          if (
+              artifact.get("id") != int(os.environ["CANDIDATE_ARTIFACT_ID"])
+              or artifact.get("name") != expected_name
+              or artifact.get("digest") != expected_api_digest
+              or artifact.get("expired") is not False
+              or type(size) is not int
+              or isinstance(size, bool)
+              or size <= 0
+              or workflow_run.get("id") != int(os.environ["GITHUB_RUN_ID"])
+              or workflow_run.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+          ):
+              raise SystemExit("sealed candidate artifact identity does not match the upload")
+          identity_fields = (
+              "id",
+              "name",
+              "size_in_bytes",
+              "digest",
+              "expired",
+              "created_at",
+              "expires_at",
+              "archive_download_url",
+          )
+          if any(listed.get(field) != artifact.get(field) for field in identity_fields):
+              raise SystemExit("candidate artifact list and direct observations disagree")
+          listed_workflow_run = listed.get("workflow_run") or {}
+          if (
+              listed_workflow_run.get("id") != workflow_run.get("id")
+              or listed_workflow_run.get("head_sha") != workflow_run.get("head_sha")
+          ):
+              raise SystemExit("candidate artifact workflow observations disagree")
+          repository = run.get("repository") or {}
+          if (
+              run.get("id") != int(os.environ["GITHUB_RUN_ID"])
+              or run.get("run_attempt") != 1
+              or run.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]
+              or run.get("head_branch") != "main"
+              or run.get("event") != "workflow_dispatch"
+              or str(run.get("path", "")).split("@", 1)[0]
+              != ".github/workflows/release-candidate.yml"
+              or repository.get("id") != int(os.environ["CANDIDATE_REPOSITORY_ID"])
+              or repository.get("full_name") != os.environ["GITHUB_REPOSITORY"]
+          ):
+              raise SystemExit("sealed candidate run identity is not exact")
+          PY

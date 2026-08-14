@@ -13,6 +13,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 import scripts.verify_exact_wheel_install as exact_wheel_install
 from scripts.release_publication_guard import (
@@ -27,6 +28,108 @@ from scripts.release_publication_guard import (
 from scripts.verify_release_payload import verify_release_payload
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_release_candidate_workflow_is_read_only_and_expression_safe() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-candidate.yml"
+    workflow = workflow_path.read_text(encoding="utf-8")
+
+    assert "^[0-9a-f]{64}$" in workflow
+    assert "^sha256:[0-9a-f]{64}$" in workflow
+    assert "kestrel-dispatch-identity-${{ github.run_id }}-1" in workflow
+    identity_block = workflow.split(
+        "Create the canonical candidate dispatch identity", 1
+    )[1].split("Upload immutable candidate dispatch identity", 1)[0]
+    assert '"producer": "scripts/release_control_receipt.py"' in identity_block
+    assert 'git archive --format=tar "$CANDIDATE_SOURCE_SHA"' in workflow
+    assert "candidate-manifest.json" in workflow
+    assert workflow.count("release_candidate_manifest verify") == 2
+    assert "retention-days: 30" in workflow
+    assert (
+        "name: kestrel-release-candidate-${{ inputs.version }}-${{ inputs.source_sha }}"
+        in workflow
+    )
+    assert "persist-credentials: false" in workflow
+    assert 'actor != "John-MiracleWorker"' in workflow
+    assert "'.owner.id'" in workflow
+    assert "'.owner.login'" in workflow
+
+    for action in (
+        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+        "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    ):
+        assert action in workflow
+    assert not re.search(r"uses:\s+[^\s#]+@v[0-9]+", workflow)
+
+    for receipt in (
+        "kestrel.check.protected-main-ci.v1",
+        "kestrel.check.release-rehearsal.v1",
+        "kestrel.check.runtime-reliability-qualification.v1",
+        "kestrel.check.release-payload.v1",
+        "kestrel.check.nine-row-exact-wheel.v1",
+        "kestrel.check.oci-layout.v1",
+    ):
+        assert receipt in workflow
+    assert "run_attempt == 1" in workflow
+    assert "qualification/receipts" in workflow
+    for exact_observation_join in (
+        'run.get("id") != selected_run_ids[name]',
+        'run.get("head_sha") != os.environ["CANDIDATE_SOURCE_SHA"]',
+        'run.get("head_branch") != "main"',
+        'str(run.get("path", "")).split("@", 1)[0] != workflow_path',
+        'repository.get("id") != int(os.environ["CANDIDATE_REPOSITORY_ID"])',
+        'job.get("run_id") != run["id"]',
+        '/attempts/1/jobs?per_page=100',
+        'workflow_run.get("repository_id")',
+    ):
+        assert exact_observation_join in workflow
+
+    forbidden = (
+        "git tag ",
+        "git push ",
+        "gh release create",
+        "gh release upload",
+        "twine upload",
+        "gh attestation",
+        "docker push",
+        "id-token: write",
+        "packages: write",
+        "contents: write",
+    )
+    for fragment in forbidden:
+        assert fragment not in workflow
+
+    parsed_workflow = yaml.safe_load(workflow)
+    run_blocks = [
+        step["run"]
+        for job in parsed_workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if isinstance(step.get("run"), str)
+    ]
+    assert run_blocks
+    assert all("${{ inputs." not in block for block in run_blocks)
+
+
+def test_release_candidate_workflow_keeps_the_exact_nine_row_wheel_matrix() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    matrix = workflow.split("  cross-platform-exact-wheel:", 1)[1].split(
+        "  finalize-candidate:", 1
+    )[0]
+    assert matrix.count("- os: ubuntu-latest") == 3
+    assert matrix.count("- os: macos-latest") == 3
+    assert matrix.count("- os: windows-latest") == 3
+    for version in ("3.11", "3.12", "3.13"):
+        assert matrix.count(f'python: "{version}"') == 3
+    assert matrix.count("machine: x86_64") == 3
+    assert matrix.count("machine: arm64") == 3
+    assert matrix.count("machine: AMD64") == 3
+    assert "python -m scripts.verify_exact_wheel_install" in matrix
+    assert "python -m build" not in matrix
 
 
 def test_exact_wheel_verifier_supports_direct_and_module_entrypoints() -> None:

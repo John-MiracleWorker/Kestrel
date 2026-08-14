@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import io
+import os
 import re
 import subprocess
 import sys
+import tarfile
 import tomllib
 from pathlib import Path
+
+import pytest
 
 from nested_memvid_agent.config import AgentConfig
 from scripts.check_project_metadata import PUBLISHED_RELEASE, _release_mode_errors
@@ -13,6 +18,278 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_TEST_IMAGE = (
     "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
 )
+POSIX_WORKFLOW_LINTER_BOOTSTRAP = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="workflow-linter bootstrap intentionally supports only Darwin and Linux",
+)
+
+
+def test_release_candidate_builds_exact_payload_and_digest_only_oci_layout_once() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow.count("Build Python release artifacts") == 1
+    assert workflow.count("python -m build --no-isolation") == 1
+    assert "containers/oci-layout/index.json" in workflow
+    assert "containers/oci-descriptor.json" in workflow
+    assert "containers/kestrel-linux-amd64.tar" in workflow
+    assert "containers/kestrel-linux-arm64.tar" in workflow
+    assert "ghcr.io/john-miracleworker/kestrel@${" not in workflow
+    assert '"index_ref": f"{repository}@{index_digest}"' in workflow
+    assert '"manifest_ref": f"{repository}@{manifest_digest}"' in workflow
+    assert '"schema": "kestrel.oci_descriptor.v1"' in workflow
+    assert "kestrel.oci_candidate_descriptor.v1" not in workflow
+    assert '"release/oci-image-digests.json"' in workflow
+    assert "attestations.json" in workflow
+    assert '"kind": "oci_index"' in workflow
+    assert '"kind": "file"' in workflow
+
+
+def test_workflow_linter_bootstrap_is_version_and_archive_digest_pinned() -> None:
+    bootstrap = (ROOT / "scripts" / "bootstrap_workflow_linters.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "actionlint 1.7.7" in bootstrap
+    assert "ShellCheck - shell script analysis tool" in bootstrap
+    assert "version: 0.11.0" in bootstrap
+    assert "Darwin:arm64" in bootstrap
+    assert "Linux:x86_64" in bootstrap
+    for url in (
+        "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_darwin_arm64.tar.gz",
+        "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz",
+        "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.xz",
+        "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz",
+    ):
+        assert url in bootstrap
+    for digest in (
+        "2693315b9093aeacb4ebd91a993fea54fc215057bf0da2659056b4bc033873db",
+        "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757",
+        "56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0a79",
+        "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198",
+    ):
+        assert digest in bootstrap
+    assert "shasum -a 256" in bootstrap
+    assert "tar -tf" in bootstrap
+    assert "tar -tJf" in bootstrap
+    assert "../" in bootstrap
+    assert "destination must be absent or empty" in bootstrap
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _write_linter_archives(root: Path, *, unsafe_member: str | None = None) -> tuple[Path, Path]:
+    actionlint_archive = root / "actionlint.tar.gz"
+    shellcheck_archive = root / "shellcheck.tar.xz"
+
+    with tarfile.open(actionlint_archive, "w:gz") as archive:
+        payload = b"#!/bin/sh\nprintf '1.7.7\\n'\n"
+        member = tarfile.TarInfo("actionlint")
+        member.mode = 0o755
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+        if unsafe_member == "duplicate":
+            duplicate = tarfile.TarInfo("actionlint")
+            duplicate.mode = 0o755
+            duplicate.size = len(payload)
+            archive.addfile(duplicate, io.BytesIO(payload))
+        elif unsafe_member == "traversal":
+            traversal = tarfile.TarInfo("../escape")
+            traversal.size = 1
+            archive.addfile(traversal, io.BytesIO(b"x"))
+        elif unsafe_member == "link":
+            link = tarfile.TarInfo("actionlint-link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "actionlint"
+            archive.addfile(link)
+
+    with tarfile.open(shellcheck_archive, "w:xz") as archive:
+        payload = (
+            b"#!/bin/sh\n"
+            b"printf '%s\\n' 'ShellCheck - shell script analysis tool' 'version: 0.11.0'\n"
+        )
+        member = tarfile.TarInfo("shellcheck-v0.11.0/shellcheck")
+        member.mode = 0o755
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+
+    return actionlint_archive, shellcheck_archive
+
+
+def _bootstrap_fixture_environment(
+    fake_bin: Path,
+    *,
+    actionlint_archive: Path,
+    shellcheck_archive: Path,
+    checksum_exit: int = 0,
+    system: str = "Darwin",
+    machine: str = "arm64",
+) -> dict[str, str]:
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "uname",
+        f"#!/bin/sh\ncase \"$1\" in -s) printf '%s\\n' {system} ;; -m) printf '%s\\n' {machine} ;; esac\n",
+    )
+    _write_executable(
+        fake_bin / "curl",
+        """#!/bin/sh
+output=
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) shift; output=$1 ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+case "$url" in
+  *actionlint*) cp "$BOOTSTRAP_ACTIONLINT_ARCHIVE" "$output" ;;
+  *shellcheck*) cp "$BOOTSTRAP_SHELLCHECK_ARCHIVE" "$output" ;;
+  *) exit 64 ;;
+esac
+""",
+    )
+    _write_executable(
+        fake_bin / "shasum",
+        f"#!/bin/sh\ncat >/dev/null\nexit {checksum_exit}\n",
+    )
+    return {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BOOTSTRAP_ACTIONLINT_ARCHIVE": str(actionlint_archive),
+        "BOOTSTRAP_SHELLCHECK_ARCHIVE": str(shellcheck_archive),
+    }
+
+
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_installs_only_verified_executables(tmp_path: Path) -> None:
+    actionlint_archive, shellcheck_archive = _write_linter_archives(tmp_path)
+    environment = _bootstrap_fixture_environment(
+        tmp_path / "bin",
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+    )
+    destination = tmp_path / "linters"
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(destination)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert sorted(path.name for path in destination.iterdir()) == ["actionlint", "shellcheck"]
+    assert all(path.stat().st_mode & 0o111 for path in destination.iterdir())
+
+
+@pytest.mark.parametrize("unsafe_member", ["duplicate", "traversal", "link"])
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_rejects_unsafe_archives(
+    tmp_path: Path, unsafe_member: str
+) -> None:
+    actionlint_archive, shellcheck_archive = _write_linter_archives(
+        tmp_path, unsafe_member=unsafe_member
+    )
+    environment = _bootstrap_fixture_environment(
+        tmp_path / "bin",
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+    )
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(tmp_path / "linters")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "unsafe or duplicate member" in completed.stderr or "link or special member" in completed.stderr
+
+
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_checks_digest_before_archive_inspection(
+    tmp_path: Path,
+) -> None:
+    actionlint_archive = tmp_path / "not-actionlint.tar.gz"
+    shellcheck_archive = tmp_path / "not-shellcheck.tar.xz"
+    actionlint_archive.write_bytes(b"not an archive")
+    shellcheck_archive.write_bytes(b"not an archive")
+    fake_bin = tmp_path / "bin"
+    environment = _bootstrap_fixture_environment(
+        fake_bin,
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+        checksum_exit=1,
+    )
+    tar_marker = tmp_path / "tar-invoked"
+    _write_executable(
+        fake_bin / "tar",
+        "#!/bin/sh\n: >\"$BOOTSTRAP_TAR_MARKER\"\nexit 99\n",
+    )
+    environment["BOOTSTRAP_TAR_MARKER"] = str(tar_marker)
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(tmp_path / "linters")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert not tar_marker.exists()
+
+
+@pytest.mark.parametrize("destination_kind", ["nonempty", "symlink"])
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_rejects_unsafe_destination(
+    tmp_path: Path, destination_kind: str
+) -> None:
+    destination = tmp_path / "linters"
+    if destination_kind == "nonempty":
+        destination.mkdir()
+        (destination / "unexpected").write_text("occupied", encoding="utf-8")
+    else:
+        target = tmp_path / "target"
+        target.mkdir()
+        destination.symlink_to(target, target_is_directory=True)
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(destination)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "destination must be absent or empty" in completed.stderr
+
+
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_rejects_unsupported_platform(tmp_path: Path) -> None:
+    actionlint_archive, shellcheck_archive = _write_linter_archives(tmp_path)
+    environment = _bootstrap_fixture_environment(
+        tmp_path / "bin",
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+        system="Plan9",
+        machine="riscv64",
+    )
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(tmp_path / "linters")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "unsupported workflow-linter bootstrap platform: Plan9:riscv64" in completed.stderr
 
 
 def test_package_metadata_identifies_kestrel_release() -> None:

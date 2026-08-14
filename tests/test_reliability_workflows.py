@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -10,6 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from scripts.release_control_receipt import dispatch_binding
 from scripts.runtime_reliability_contract import (
     RUNTIME_RELIABILITY_ITERATION_TIMEOUT_SECONDS,
     RUNTIME_RELIABILITY_REQUIRED_REPEATS,
@@ -19,6 +21,326 @@ from scripts.runtime_reliability_contract import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _github_workflow_trigger(workflow: dict[object, object]) -> object:
+    """Return GitHub's ``on`` key despite PyYAML's YAML 1.1 bool resolver."""
+
+    return workflow.get("on", workflow.get(True))
+
+
+def test_release_candidate_workflow_has_exact_dispatch_graph_and_permissions() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-candidate.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+
+    assert workflow["run-name"] == (
+        "Kestrel candidate ${{ inputs.version }} @ ${{ inputs.source_sha }} "
+        "tx ${{ inputs.transaction_nonce }} bind ${{ inputs.dispatch_binding }}"
+    )
+    assert workflow["permissions"] == {}
+    assert workflow["env"]["CANDIDATE_REPOSITORY_ID"] == "${{ github.repository_id }}"
+    trigger = _github_workflow_trigger(workflow)
+    assert isinstance(trigger, dict)
+    assert set(trigger) == {"workflow_dispatch"}
+    inputs = trigger["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {
+        "version",
+        "source_sha",
+        "transaction_nonce",
+        "dispatch_binding",
+    }
+    for contract in inputs.values():
+        assert contract["required"] is True
+        assert contract["type"] == "string"
+        assert "default" not in contract
+
+    jobs = workflow["jobs"]
+    assert list(jobs) == [
+        "candidate-identity",
+        "build-release-candidate",
+        "cross-platform-exact-wheel",
+        "finalize-candidate",
+    ]
+    assert "needs" not in jobs["candidate-identity"]
+    assert jobs["build-release-candidate"]["needs"] == "candidate-identity"
+    assert jobs["cross-platform-exact-wheel"]["needs"] == "build-release-candidate"
+    assert jobs["finalize-candidate"]["needs"] == "cross-platform-exact-wheel"
+    assert {
+        name: job["permissions"] for name, job in jobs.items()
+    } == {
+        "candidate-identity": {"actions": "read", "contents": "read"},
+        "build-release-candidate": {"contents": "read"},
+        "cross-platform-exact-wheel": {"actions": "read", "contents": "read"},
+        "finalize-candidate": {"actions": "read", "contents": "read"},
+    }
+    assert all("environment" not in job for job in jobs.values())
+
+
+def test_release_candidate_preflights_before_checkout_and_verifies_final_upload() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-candidate.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+
+    identity_steps = jobs["candidate-identity"]["steps"]
+    preflight_index = next(
+        index
+        for index, step in enumerate(identity_steps)
+        if step.get("name") == "Preflight the literal candidate dispatch envelope"
+    )
+    checkout_index = next(
+        index
+        for index, step in enumerate(identity_steps)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert preflight_index < checkout_index
+    assert "from scripts" not in identity_steps[preflight_index]["run"]
+
+    final_steps = jobs["finalize-candidate"]["steps"]
+    upload_index = next(
+        index for index, step in enumerate(final_steps) if step.get("id") == "candidate-upload"
+    )
+    verification = final_steps[upload_index + 1]
+    assert verification["name"] == "Verify the unique sealed candidate artifact identity"
+    assert verification["env"] == {
+        "CANDIDATE_ARTIFACT_ID": "${{ steps.candidate-upload.outputs.artifact-id }}",
+        "CANDIDATE_ARTIFACT_DIGEST": "${{ steps.candidate-upload.outputs.artifact-digest }}",
+        "CANDIDATE_ARTIFACT_URL": "${{ steps.candidate-upload.outputs.artifact-url }}",
+        "GH_TOKEN": "${{ github.token }}",
+    }
+    assert 'if len(matches) != 1:' in verification["run"]
+    assert 'artifact.get("id") != int(os.environ["CANDIDATE_ARTIFACT_ID"])' in verification[
+        "run"
+    ]
+    assert 're.fullmatch(r"[0-9a-f]{64}", upload_digest)' in verification["run"]
+    assert 'expected_api_digest = f"sha256:{upload_digest}"' in verification["run"]
+    assert 'artifact.get("digest") != expected_api_digest' in verification["run"]
+    assert "observed_retention not in {configured_retention, configured_retention - 1}" in verification[
+        "run"
+    ]
+    assert 'run.get("run_attempt") != 1' in verification["run"]
+
+
+def test_release_candidate_final_upload_verifier_executes_and_checks_retention(
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["finalize-candidate"]["steps"]
+    verification = next(
+        step
+        for step in steps
+        if step.get("name") == "Verify the unique sealed candidate artifact identity"
+    )
+    source = verification["run"].split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+    source_sha = "a" * 40
+    upload_digest = "c" * 64
+    artifact_id = 404
+    run_id = 707
+    repository = "John-MiracleWorker/Kestrel"
+    version = "0.6.0"
+    artifact_name = f"kestrel-release-candidate-{version}-{source_sha}"
+    artifact = {
+        "id": artifact_id,
+        "name": artifact_name,
+        "size_in_bytes": 4096,
+        "digest": f"sha256:{upload_digest}",
+        "expired": False,
+        "created_at": "2026-08-13T20:00:00Z",
+        "expires_at": "2026-09-12T20:00:00Z",
+        "archive_download_url": "https://api.github.test/artifacts/404/zip",
+        "workflow_run": {"id": run_id, "head_sha": source_sha},
+    }
+    run = {
+        "id": run_id,
+        "run_attempt": 1,
+        "head_sha": source_sha,
+        "head_branch": "main",
+        "event": "workflow_dispatch",
+        "path": ".github/workflows/release-candidate.yml@refs/heads/main",
+        "repository": {"id": 303, "full_name": repository},
+    }
+    artifact_path = tmp_path / "artifact.json"
+    pages_path = tmp_path / "artifact-pages.json"
+    run_path = tmp_path / "run.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    pages_path.write_text(json.dumps([{"artifacts": [artifact]}]), encoding="utf-8")
+    run_path.write_text(json.dumps(run), encoding="utf-8")
+    environment = {
+        **os.environ,
+        "CANDIDATE_ARTIFACT_ID": str(artifact_id),
+        "CANDIDATE_ARTIFACT_DIGEST": upload_digest,
+        "CANDIDATE_ARTIFACT_URL": (
+            f"https://github.com/{repository}/actions/runs/{run_id}/artifacts/{artifact_id}"
+        ),
+        "CANDIDATE_VERSION": version,
+        "CANDIDATE_SOURCE_SHA": source_sha,
+        "CANDIDATE_REPOSITORY_ID": "303",
+        "GITHUB_REPOSITORY": repository,
+        "GITHUB_RUN_ID": str(run_id),
+        "CANDIDATE_ARTIFACT_OBSERVATION": str(artifact_path),
+        "CANDIDATE_ARTIFACT_PAGES": str(pages_path),
+        "CANDIDATE_RUN_OBSERVATION": str(run_path),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    artifact["expires_at"] = "2026-09-11T20:00:00Z"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    rejected = subprocess.run(
+        [sys.executable, "-c", source],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "retention is not exactly 30 days" in rejected.stderr
+
+
+def test_release_candidate_matrix_uses_explicit_cross_platform_shells() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["cross-platform-exact-wheel"]["steps"]
+    by_name = {step.get("name"): step for step in steps if step.get("name")}
+
+    exact_wheel = by_name["Verify and install exact wheel payload"]
+    assert exact_wheel["shell"] == "bash"
+    assert '--expected-version "$RELEASE_VERSION"' in exact_wheel["run"]
+    matrix_record = by_name["Record the successful exact-wheel matrix cell"]
+    assert matrix_record["shell"] == "bash"
+    assert "python - <<'PY'" in matrix_record["run"]
+
+
+def test_release_candidate_embedded_python_is_syntax_valid() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-candidate.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    compiled_blocks: list[str] = []
+
+    for job_name, job in workflow["jobs"].items():
+        for step_index, step in enumerate(job.get("steps", [])):
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            lines = run.splitlines()
+            line_index = 0
+            while line_index < len(lines):
+                if "python - <<'PY'" not in lines[line_index]:
+                    line_index += 1
+                    continue
+                try:
+                    terminator_index = lines.index("PY", line_index + 1)
+                except ValueError:
+                    pytest.fail(
+                        f"{job_name} step {step_index} has an unterminated Python heredoc"
+                    )
+                label = f"{job_name}:step-{step_index}:heredoc-{len(compiled_blocks) + 1}"
+                source = "\n".join(lines[line_index + 1 : terminator_index]) + "\n"
+                compile(source, label, "exec")
+                compiled_blocks.append(label)
+                line_index = terminator_index + 1
+
+    assert len(compiled_blocks) == workflow_text.count("python - <<'PY'")
+    assert compiled_blocks
+
+
+def test_release_candidate_identity_steps_execute_against_the_closed_schema(
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["candidate-identity"]["steps"]
+    by_name = {step.get("name"): step for step in steps if step.get("name")}
+    source_sha = "a" * 40
+    nonce = "b" * 64
+    version = "0.6.0"
+    binding = dispatch_binding(
+        short_ref="main",
+        inputs_without_binding={
+            "source_sha": source_sha,
+            "transaction_nonce": nonce,
+            "version": version,
+        },
+    )
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(ROOT),
+        "CANDIDATE_SOURCE_SHA": source_sha,
+        "CANDIDATE_VERSION": version,
+        "CANDIDATE_TRANSACTION_NONCE": nonce,
+        "CANDIDATE_DISPATCH_BINDING": binding,
+        "CANDIDATE_GITHUB_REF": "refs/heads/main",
+        "CANDIDATE_GITHUB_REF_NAME": "main",
+        "CANDIDATE_GITHUB_SHA": source_sha,
+        "CANDIDATE_REPOSITORY": "John-MiracleWorker/Kestrel",
+        "CANDIDATE_REPOSITORY_ID": "303",
+        "CANDIDATE_WORKFLOW": "Release Candidate",
+        "CANDIDATE_WORKFLOW_REF": (
+            "John-MiracleWorker/Kestrel/.github/workflows/"
+            "release-candidate.yml@refs/heads/main"
+        ),
+        "CANDIDATE_WORKFLOW_SHA": source_sha,
+        "CANDIDATE_ACTOR": "John-MiracleWorker",
+        "CANDIDATE_ACTOR_ID": "606",
+        "CANDIDATE_TRIGGERING_ACTOR": "John-MiracleWorker",
+        "GITHUB_RUN_ID": "707",
+        "GITHUB_RUN_ATTEMPT": "1",
+    }
+
+    for name in (
+        "Preflight the literal candidate dispatch envelope",
+        "Create the canonical candidate dispatch identity",
+    ):
+        run = by_name[name]["run"]
+        source = run.split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        completed = subprocess.run(
+            [sys.executable, "-c", source],
+            cwd=tmp_path,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    identity = json.loads(
+        (tmp_path / "candidate-identity" / "kestrel-dispatch-identity.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert identity["schema"] == "kestrel.dispatch_identity.v1"
+    assert identity["dispatch_binding"] == binding
+    assert identity["sha"] == source_sha
+    assert identity["provenance"]["producer"] == "scripts/release_control_receipt.py"
+
+    schema = json.loads(
+        (ROOT / "schemas" / "kestrel.dispatch_identity.v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    actor_pattern = schema["properties"]["actor"]["pattern"]
+    triggering_actor_pattern = schema["properties"]["triggering_actor"]["pattern"]
+    for pattern in (actor_pattern, triggering_actor_pattern):
+        assert re.fullmatch(pattern, "John-MiracleWorker")
+        assert re.fullmatch(pattern, "kestrel-release-dispatcher[bot]")
+        assert re.fullmatch(pattern, "other-user") is None
 
 
 def _run_rehearsal_order_gate(
