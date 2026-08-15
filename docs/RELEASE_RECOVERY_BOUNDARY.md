@@ -61,11 +61,18 @@ stdlib/runtime tree, interpreter, dependency and wheel locks, private-loader dep
 resolution, capsule assets, and static execution closure. It scrubs the inherited environment and
 executes every authority command in the OS sandbox with the network namespace unshared.
 
-The bootstrap freshly creates the virtual environment from the hash-locked capsule wheelhouse,
-uses `--no-index`, and runs `pip check`. This slice does not yet record and re-hash the resulting
-installed `site-packages` tree before every later launcher invocation. Closing that integrity gap
-is a required dependent controller/runtime-hardening gate before S2 qualification; the wheel lock
-alone must not be described as later byte-for-byte installed-environment verification.
+The capsule-construction protocol requires its controller to build a reference virtual
+environment at the exact target path before capsule creation, with bytecode generation disabled,
+and bind a schema-validated `site-packages` tree identity into the immutable execution closure.
+The production smoke exercises that protocol primitive; the production controller named above
+is still a separate integration gate. Bootstrap freshly creates that same virtual environment
+from the hash-locked capsule wheelhouse, uses `--no-index`, runs `pip check`, requires an exact
+match to the controller-bound tree, and freezes the installed files read-only. Every later
+launcher invocation re-hashes the complete bound `site-packages` tree before authority code can
+run. Workflow and nested launcher wrappers enter on `-I -S -B` stdlib paths only; the launcher
+removes any capsule/environment paths before its own stdlib imports, verifies the manifest and
+tree with its pre-import gate, and only then authorizes capsule and `site-packages` imports. A
+wheel lock by itself is not treated as installed-environment verification.
 
 Inside that sandbox, the offline plane may:
 
@@ -197,7 +204,7 @@ The schema-validated, self-digesting `kestrel.recovery_capsule_smoke.v1` report 
 - A source, schema, workflow, Python, GitHub CLI, receipt, or dependency mismatch stops recovery.
 - Capsule execution remains network denied; the host plane never imports capsule code directly.
 - `/etc/ld.so.preload`, an unexpected inherited environment key, an ambient loader dependency, or
-  a changed Python stdlib/runtime byte stops recovery.
+  a changed Python stdlib/runtime or installed `site-packages` byte stops recovery.
 - Offline verification, candidate materialization, and host binding all use the same nested,
   network-unshared execution boundary.
 - Role evidence is append-only across artifact handoffs; a later role creates a new binding rather

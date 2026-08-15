@@ -79,6 +79,9 @@
         "requirements_sha256": {
           "$ref": "#/$defs/digest"
         },
+        "environment_manifest_sha256": {
+          "$ref": "#/$defs/nullable_digest"
+        },
         "runtime_manifest_sha256": {
           "$ref": "#/$defs/nullable_digest"
         },
@@ -95,6 +98,7 @@
       "required": [
         "requirements_path",
         "requirements_sha256",
+        "environment_manifest_sha256",
         "runtime_manifest_sha256",
         "python_runtime_manifest_sha256",
         "python_runtime_archive_sha256",

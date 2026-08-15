@@ -2644,11 +2644,27 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
             "runtime_total_size_bytes": 1,
         }
     )
+    environment_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_environment.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": "3.11.14",
+            "python_abi": "cp311",
+            "environment_root": "/recovery-runtime/environment",
+            "site_packages_path": (
+                "/recovery-runtime/environment/lib/python3.11/site-packages"
+            ),
+            "site_packages_tree_sha256": "sha256:" + "6" * 64,
+            "site_packages_file_count": 1,
+            "site_packages_total_size_bytes": 1,
+        }
+    )
     closure_assets: dict[str, bytes] = {
         ".github/workflows/release.yml": b"name: Release\n",
         ".gitleaksignore": b"fixture\n",
         "evidence/normalized-source.json": b"{}",
         "recovery/bin/bwrap": sandbox,
+        "recovery/environment-manifest.json": environment_manifest,
         "recovery/requirements.txt": b"# no third-party recovery dependencies\n",
         "recovery/python-runtime-manifest.json": python_runtime_manifest,
         "recovery/python-runtime.tar.gz": python_runtime_archive,
@@ -2713,6 +2729,7 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
             "dependency_lock": {
                 "requirements_path": "recovery/requirements.txt",
                 "requirements_sha256": _sha256(closure_assets["recovery/requirements.txt"]),
+                "environment_manifest_sha256": _sha256(environment_manifest),
                 "runtime_manifest_sha256": _sha256(runtime_manifest),
                 "python_runtime_manifest_sha256": _sha256(python_runtime_manifest),
                 "python_runtime_archive_sha256": _sha256(python_runtime_archive),

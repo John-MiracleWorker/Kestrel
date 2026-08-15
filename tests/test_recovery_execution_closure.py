@@ -170,6 +170,7 @@ def _closure(tmp_path: Path) -> tuple[Path, bytes, Path]:
         "dependency_lock": {
             "requirements_path": "recovery/requirements.txt",
             "requirements_sha256": _sha(requirements),
+            "environment_manifest_sha256": None,
             "runtime_manifest_sha256": None,
             "python_runtime_manifest_sha256": None,
             "python_runtime_archive_sha256": None,
@@ -412,7 +413,7 @@ def test_isolated_python_probe_includes_hash_locked_environment_dependencies() -
     assert sysconfig.get_paths()["purelib"] in observed
 
 
-def test_isolated_runpy_bootstrap_can_import_capsule_launcher_dependencies() -> None:
+def test_isolated_runpy_bootstrap_cannot_bypass_preimport_environment_gate() -> None:
     observed, _runtime = launcher.inspect_isolated_python(Path(sys.executable))
     purelib = sysconfig.get_paths()["purelib"]
     effective = launcher.effective_recovery_sys_path(
@@ -441,7 +442,56 @@ def test_isolated_runpy_bootstrap_can_import_capsule_launcher_dependencies() -> 
         timeout=10,
     )
 
+    assert completed.returncode != 0
+    assert "recovery launcher invocation is incomplete" in completed.stderr
+
+
+def test_isolated_bootstrap_does_not_authorize_paths_before_launcher_preflight(
+    tmp_path: Path,
+) -> None:
+    launcher_path = tmp_path / "capsule" / "scripts" / "recovery_launcher.py"
+    launcher_path.parent.mkdir(parents=True)
+    observed_path = tmp_path / "observed-sys-path.json"
+    poison = tmp_path / "unverified-site-packages"
+    poison.mkdir()
+    unverified_paths = [
+        str(poison),
+        *[
+            entry
+            for entry in sys.path
+            if entry
+            and Path(entry).is_absolute()
+            and entry != str(ROOT)
+            and "site-packages" not in Path(entry).parts
+        ],
+    ]
+    launcher_path.write_text(
+        "import json,sys\n"
+        "open(sys.argv[1], 'w').write(json.dumps(sys.path, separators=(',', ':')))\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            launcher.ISOLATED_PYTHON_BOOTSTRAP,
+            json.dumps(unverified_paths, separators=(",", ":")),
+            str(launcher_path),
+            str(observed_path),
+        ],
+        capture_output=True,
+        check=False,
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"},
+        text=True,
+        timeout=10,
+    )
+
     assert completed.returncode == 0, completed.stderr
+    assert str(poison) not in json.loads(observed_path.read_bytes())
 
 
 def test_isolated_runpy_bootstrap_rejects_an_ambient_secret() -> None:
@@ -490,6 +540,331 @@ def test_python_runtime_tree_identity_detects_stdlib_drift(tmp_path: Path) -> No
     drifted = launcher._python_runtime_tree_identity(runtime)  # noqa: SLF001
 
     assert original != drifted
+
+
+def test_installed_environment_identity_is_shared_and_detects_drift(tmp_path: Path) -> None:
+    environment = tmp_path / "environment"
+    package = environment / "lib" / "python3.11" / "site-packages" / "trusted.py"
+    _write(package, b"VALUE = 'trusted'\n")
+
+    staged = launcher._installed_environment_tree_identity(environment)  # noqa: SLF001
+    bootstrapped = bootstrap._installed_environment_tree_identity(environment)  # noqa: SLF001
+    assert bootstrapped == staged
+
+    package.write_bytes(b"VALUE = 'drifted'\n")
+
+    assert launcher._installed_environment_tree_identity(environment) != staged  # noqa: SLF001
+    assert bootstrap._installed_environment_tree_identity(environment) != staged  # noqa: SLF001
+
+
+def test_bootstrap_recovery_freezes_only_a_controller_bound_installed_environment(
+    tmp_path: Path,
+) -> None:
+    environment = tmp_path / "environment"
+    package = environment / "lib" / "python3.11" / "site-packages" / "trusted.py"
+    _write(package, b"VALUE = 'trusted'\n")
+    count, total, digest = bootstrap._installed_environment_tree_identity(environment)  # noqa: SLF001
+    manifest = {
+        "site_packages_file_count": count,
+        "site_packages_total_size_bytes": total,
+        "site_packages_tree_sha256": digest,
+    }
+
+    bootstrap._verify_installed_environment(  # noqa: SLF001
+        environment_root=environment,
+        manifest=manifest,
+    )
+
+    assert stat.S_IMODE(package.stat().st_mode) == 0o444
+    assert stat.S_IMODE(package.parent.stat().st_mode) == 0o555
+    package.chmod(0o644)
+    package.write_bytes(b"VALUE = 'drifted'\n")
+    with pytest.raises(ValueError, match="installed environment tree identity"):
+        bootstrap._verify_installed_environment(  # noqa: SLF001
+            environment_root=environment,
+            manifest=manifest,
+        )
+
+
+def test_launcher_rehashes_the_bound_installed_environment_before_every_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule = tmp_path / "capsule"
+    recovery = capsule / "recovery"
+    recovery.mkdir(parents=True)
+    runtime_root = tmp_path / "recovery-runtime"
+    base_python = runtime_root / "base" / "bin" / "python3.11"
+    _write(base_python, b"trusted base python\n")
+    (runtime_root / "base" / "lib").mkdir()
+    environment_python = runtime_root / "environment" / "bin" / "python"
+    _write(environment_python, b"trusted environment python\n")
+    package = (
+        runtime_root
+        / "environment"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+        / "trusted.py"
+    )
+    _write(package, b"VALUE = 'trusted'\n")
+    count, total, environment_digest = launcher._installed_environment_tree_identity(  # noqa: SLF001
+        runtime_root / "environment"
+    )
+    environment_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_environment.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": "3.11.14",
+            "python_abi": "cp311",
+            "environment_root": str(runtime_root / "environment"),
+            "site_packages_path": str(
+                runtime_root
+                / "environment"
+                / "lib"
+                / "python3.11"
+                / "site-packages"
+            ),
+            "site_packages_tree_sha256": environment_digest,
+            "site_packages_file_count": count,
+            "site_packages_total_size_bytes": total,
+        }
+    )
+    _write(recovery / "environment-manifest.json", environment_manifest)
+    base_identity = launcher._python_runtime_tree_identity(runtime_root / "base")  # noqa: SLF001
+    python_manifest = _canonical(
+        {
+            "runtime_file_count": base_identity[0],
+            "runtime_total_size_bytes": base_identity[1],
+            "runtime_tree_sha256": base_identity[2],
+            "python_executable_sha256": _sha(base_python.read_bytes()),
+        }
+    )
+    _write(recovery / "python-runtime-manifest.json", python_manifest)
+    closure_value = {
+        "dependency_lock": {
+            "environment_manifest_sha256": _sha(environment_manifest),
+            "python_runtime_manifest_sha256": _sha(python_manifest),
+            "python_runtime_archive_sha256": "sha256:" + "1" * 64,
+        },
+        "python_runtime": {
+            "implementation": "CPython",
+            "version": "3.11.14",
+            "abi": "cp311",
+        },
+        "io_roots": [
+            {"path": str(runtime_root / "base" / "lib"), "access": "read"}
+        ],
+    }
+    monkeypatch.setattr(launcher, "_closure", lambda _raw: closure_value)
+    monkeypatch.setattr(launcher, "_verify_dependency_lock", lambda *_args: None)
+    monkeypatch.setattr(
+        launcher,
+        "resolve_external_executable",
+        lambda **_kwargs: environment_python.resolve(strict=True),
+    )
+    monkeypatch.setattr(launcher.receipts, "_validate_schema", lambda *_args, **_kwargs: None)
+
+    assert launcher._verify_extracted_python_runtime(  # noqa: SLF001
+        closure=b"fixture",
+        capsule_root=capsule,
+    ) == (runtime_root / "base" / "lib").resolve(strict=True)
+
+    package.write_bytes(b"VALUE = 'drifted'\n")
+    with pytest.raises(ValueError, match="installed environment tree identity"):
+        launcher._verify_extracted_python_runtime(  # noqa: SLF001
+            closure=b"fixture",
+            capsule_root=capsule,
+        )
+
+
+def test_launcher_rejects_environment_drift_before_importing_any_capsule_path(
+    tmp_path: Path,
+) -> None:
+    capsule = tmp_path / "capsule"
+    scripts = capsule / "scripts"
+    recovery = capsule / "recovery"
+    scripts.mkdir(parents=True)
+    recovery.mkdir()
+    (scripts / "recovery_launcher.py").write_bytes(
+        (ROOT / "scripts" / "recovery_launcher.py").read_bytes()
+    )
+    (scripts / "release_control_receipt.py").write_bytes(
+        (ROOT / "scripts" / "release_control_receipt.py").read_bytes()
+    )
+    environment = tmp_path / "recovery-runtime" / "environment"
+    site_packages = environment / "lib" / "python3.11" / "site-packages"
+    site_packages.mkdir(parents=True)
+    platform_sentinel = tmp_path / "platform-imported"
+    jsonschema_sentinel = tmp_path / "jsonschema-imported"
+    platform_module = site_packages / "platform.py"
+    jsonschema_module = site_packages / "jsonschema.py"
+    platform_module.write_text("# controller-bound platform fixture\n", encoding="utf-8")
+    jsonschema_module.write_text("# controller-bound jsonschema fixture\n", encoding="utf-8")
+    count, total, tree_digest = bootstrap._installed_environment_tree_identity(  # noqa: SLF001
+        environment
+    )
+    environment_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_environment.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": "3.11.14",
+            "python_abi": "cp311",
+            "environment_root": str(environment),
+            "site_packages_path": str(site_packages),
+            "site_packages_tree_sha256": tree_digest,
+            "site_packages_file_count": count,
+            "site_packages_total_size_bytes": total,
+        }
+    )
+    (recovery / "environment-manifest.json").write_bytes(environment_manifest)
+    closure = capsule / "recovery-execution-closure.json"
+    closure.write_bytes(
+        _canonical(
+            {
+                "dependency_lock": {
+                    "environment_manifest_sha256": _sha(environment_manifest),
+                },
+                "data_resources": [
+                    {
+                        "path": "recovery/environment-manifest.json",
+                        "sha256": _sha(environment_manifest),
+                    }
+                ],
+                "external_executables": [
+                    {
+                        "name": "python",
+                        "path": str(environment / "bin" / "python"),
+                    }
+                ],
+                "python_runtime": {
+                    "implementation": "CPython",
+                    "version": "3.11.14",
+                    "abi": "cp311",
+                },
+            }
+        )
+    )
+    platform_module.write_text(
+        f"open({str(platform_sentinel)!r}, 'w').write('executed')\n",
+        encoding="utf-8",
+    )
+    jsonschema_module.write_text(
+        f"open({str(jsonschema_sentinel)!r}, 'w').write('executed')\n",
+        encoding="utf-8",
+    )
+    executable_path = [
+        str(capsule),
+        str(site_packages),
+        *[
+            entry
+            for entry in sys.path
+            if entry
+            and Path(entry).is_absolute()
+            and entry not in {str(ROOT), str(capsule), str(site_packages)}
+            and "site-packages" not in Path(entry).parts
+        ],
+    ]
+    outer_bootstrap = (
+        "import json,runpy,sys;"
+        "sys.path[:]=json.loads(sys.argv.pop(1));"
+        "target=sys.argv.pop(1);"
+        "runpy.run_path(target,run_name='__main__')"
+    )
+
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            outer_bootstrap,
+            json.dumps(executable_path, separators=(",", ":")),
+            str(scripts / "recovery_launcher.py"),
+            "verify",
+            str(closure),
+            "--capsule-root",
+            str(capsule),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert "recovery installed environment tree identity mismatch" in completed.stderr
+    assert not platform_sentinel.exists()
+    assert not jsonschema_sentinel.exists()
+
+
+def test_preimport_gate_rejects_schema_invalid_identity_before_authorizing_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule = tmp_path / "capsule"
+    launcher_path = capsule / "scripts" / "recovery_launcher.py"
+    environment = tmp_path / "recovery-runtime" / "environment"
+    site_packages = environment / "lib" / "python3.11" / "site-packages"
+    _write(launcher_path, b"fixture launcher\n")
+    _write(site_packages / "trusted.py", b"x")
+    count, total, tree_digest = bootstrap._installed_environment_tree_identity(  # noqa: SLF001
+        environment
+    )
+    assert count == total == 1
+    manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_environment.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": "3.11.14",
+            "python_abi": "cp311",
+            "environment_root": str(environment),
+            "site_packages_path": str(site_packages),
+            "site_packages_tree_sha256": tree_digest,
+            "site_packages_file_count": True,
+            "site_packages_total_size_bytes": total,
+        }
+    )
+    _write(capsule / "recovery" / "environment-manifest.json", manifest)
+    closure = capsule / "recovery-execution-closure.json"
+    _write(
+        closure,
+        _canonical(
+            {
+                "dependency_lock": {"environment_manifest_sha256": _sha(manifest)},
+                "data_resources": [
+                    {
+                        "path": "recovery/environment-manifest.json",
+                        "sha256": _sha(manifest),
+                    }
+                ],
+                "external_executables": [
+                    {
+                        "name": "python",
+                        "path": str(environment / "bin" / "python"),
+                    }
+                ],
+                "python_runtime": {
+                    "implementation": "CPython",
+                    "version": "3.11.14",
+                    "abi": "cp311",
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(launcher, "__file__", str(launcher_path))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(launcher_path), "verify", str(closure), "--capsule-root", str(capsule)],
+    )
+    original_path = list(sys.path)
+
+    with pytest.raises(ValueError, match="manifest identity"):
+        launcher._authorize_preimport_environment()  # noqa: SLF001
+
+    assert sys.path == original_path
 
 
 def test_launcher_does_not_self_certify_declared_sys_path(tmp_path: Path) -> None:
@@ -1260,11 +1635,33 @@ def _bootstrap_archive(
     )
     _write(source / "recovery" / "python-runtime-manifest.json", python_runtime_manifest)
     _write(source / "recovery" / "python-runtime.tar.gz", python_runtime_archive)
+    environment_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_environment.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": (
+                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            ),
+            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "environment_root": str(venv_python.parent.parent),
+            "site_packages_path": str(
+                venv_python.parent.parent / "lib" / "python3.11" / "site-packages"
+            ),
+            "site_packages_tree_sha256": "sha256:" + "6" * 64,
+            "site_packages_file_count": 1,
+            "site_packages_total_size_bytes": 1,
+        }
+    )
+    _write(source / "recovery" / "environment-manifest.json", environment_manifest)
     sandbox = source / "recovery" / "bin" / "bwrap"
     sandbox_raw = b"trusted bubblewrap fixture\n"
     if include_sandbox:
         _write(sandbox, sandbox_raw)
     data_resources = [
+        {
+            "path": "recovery/environment-manifest.json",
+            "sha256": _sha(environment_manifest),
+        },
         {
             "path": "recovery/runtime-manifest.json",
             "sha256": _sha(runtime_manifest),
@@ -1337,6 +1734,7 @@ def _bootstrap_archive(
         "dependency_lock": {
             "requirements_path": "recovery/requirements.txt",
             "requirements_sha256": _sha(requirements),
+            "environment_manifest_sha256": _sha(environment_manifest),
             "runtime_manifest_sha256": _sha(runtime_manifest),
             "python_runtime_manifest_sha256": _sha(python_runtime_manifest),
             "python_runtime_archive_sha256": _sha(python_runtime_archive),
@@ -1435,6 +1833,11 @@ def _trust_fixture_bootstrap_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
             *arguments,
         ],
     )
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_installed_environment",
+        lambda **_kwargs: None,
+    )
 
 
 def test_bootstrap_recovery_builds_hash_locked_offline_environment(
@@ -1444,6 +1847,17 @@ def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     archive, destination = _bootstrap_archive(tmp_path)
     _trust_current_bootstrap_python(monkeypatch)
     _trust_fixture_bootstrap_sandbox(monkeypatch)
+    verified_environment: dict[str, object] = {}
+
+    def verify_environment(*, environment_root: Path, manifest: dict[str, object]) -> None:
+        verified_environment["root"] = environment_root
+        verified_environment["manifest"] = manifest
+
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_installed_environment",
+        verify_environment,
+    )
     monkeypatch.setattr(
         bootstrap,
         "_verify_with_bootstrapped_environment",
@@ -1459,6 +1873,10 @@ def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     venv_python = destination.parent / "recovery-runtime" / "environment" / "bin" / "python"
     assert venv_python.is_file()
     assert not venv_python.is_symlink()
+    assert verified_environment["root"] == venv_python.parent.parent
+    manifest = verified_environment["manifest"]
+    assert isinstance(manifest, dict)
+    assert manifest["schema"] == "kestrel.recovery_environment.v1"
     assert verification["validation_status"] == "validated"
 
 

@@ -6037,6 +6037,7 @@ _RECOVERY_CAPSULE_SCHEMA_ASSETS = frozenset(
             "kestrel.pypi_upload_authority_prerequisite.v3.schema.json",
             "kestrel.recovery_capsule_smoke.v1.schema.json",
             "kestrel.recovery_dependency_staging.v1.schema.json",
+            "kestrel.recovery_environment.v1.schema.json",
             "kestrel.recovery_execution_closure.v1.schema.json",
             "kestrel.recovery_host_actuator_binding.v1.schema.json",
             "kestrel.recovery_python_runtime.v1.schema.json",
@@ -6071,6 +6072,7 @@ def _capsule_asset_name_is_allowed(name: str) -> bool:
         | _RECOVERY_CAPSULE_SCHEMA_ASSETS
         | {
             _RECOVERY_SANDBOX_ASSET,
+            "recovery/environment-manifest.json",
             "recovery/requirements.txt",
             "recovery/python-runtime-manifest.json",
             "recovery/python-runtime.tar.gz",
@@ -6439,6 +6441,7 @@ def _validate_capsule_execution_asset_closure(
         | _RECOVERY_CAPSULE_SCHEMA_ASSETS
         | {
             _RECOVERY_SANDBOX_ASSET,
+            "recovery/environment-manifest.json",
             "recovery/requirements.txt",
             "recovery/python-runtime-manifest.json",
             "recovery/python-runtime.tar.gz",
@@ -6486,6 +6489,27 @@ def _validate_capsule_execution_asset_closure(
         "recovery/requirements.txt"
     ):
         raise ReleaseControlError("recovery capsule dependency requirements digest mismatch")
+    environment_manifest_raw = asset_bytes.get("recovery/environment-manifest.json")
+    if (
+        environment_manifest_raw is None
+        or dependency_lock.get("environment_manifest_sha256")
+        != _sha256(environment_manifest_raw)
+        or member_digests.get("recovery/environment-manifest.json")
+        != _sha256(environment_manifest_raw)
+    ):
+        raise ReleaseControlError("recovery capsule environment manifest binding mismatch")
+    environment_manifest = _object(
+        strict_canonical_json(
+            environment_manifest_raw,
+            label="recovery capsule environment manifest",
+        ),
+        label="recovery capsule environment manifest",
+    )
+    _validate_schema(
+        "kestrel.recovery_environment.v1",
+        environment_manifest,
+        label="recovery capsule environment manifest",
+    )
     runtime_manifest_raw = asset_bytes.get("recovery/runtime-manifest.json")
     if (
         runtime_manifest_raw is None
@@ -6565,9 +6589,21 @@ def _validate_capsule_execution_asset_closure(
     python_path = PurePosixPath(
         _validate_string(python_items[0].get("path"), label="capsule Python path")
     )
+    environment_root = PurePosixPath(
+        _validate_string(
+            environment_manifest.get("environment_root"),
+            label="capsule environment root",
+        )
+    )
+    python_runtime = _object(closure.get("python_runtime"), label="capsule Python runtime")
     if (
         not python_path.is_absolute()
         or python_path.parts[-4:] != ("recovery-runtime", "environment", "bin", "python")
+        or environment_root != python_path.parent.parent
+        or environment_manifest.get("site_packages_path")
+        != str(environment_root / "lib" / "python3.11" / "site-packages")
+        or environment_manifest.get("python_version") != python_runtime.get("version")
+        or environment_manifest.get("python_abi") != python_runtime.get("abi")
         or python_items[0].get("sha256")
         != python_manifest.get("python_executable_sha256")
     ):
@@ -7274,6 +7310,24 @@ def _capsule_collect_recovery_dependencies(
     lock = _object(closure.get("dependency_lock"), label="capsule dependency lock")
     if lock.get("requirements_path") != "recovery/requirements.txt":
         raise ReleaseControlError("recovery capsule dependency requirements path mismatch")
+    environment_raw = assets.get("recovery/environment-manifest.json")
+    if (
+        environment_raw is None
+        or lock.get("environment_manifest_sha256") != _sha256(environment_raw)
+    ):
+        raise ReleaseControlError("recovery capsule environment manifest binding mismatch")
+    environment_manifest = _object(
+        strict_canonical_json(
+            environment_raw,
+            label="recovery capsule environment manifest",
+        ),
+        label="recovery capsule environment manifest",
+    )
+    _validate_schema(
+        "kestrel.recovery_environment.v1",
+        environment_manifest,
+        label="recovery capsule environment manifest",
+    )
     _capsule_add_asset(
         assets,
         name=_RECOVERY_SANDBOX_ASSET,
@@ -7730,6 +7784,11 @@ def _command_create_recovery_capsule(
         "recovery-authority.json.sig": recovery_signature,
         "recovery-repository-observation.json": recovery_repository_raw,
         "recovery-execution-closure.json": execution_closure,
+        "recovery/environment-manifest.json": _read_regular(
+            Path(args.environment_manifest),
+            label="capsule recovery environment manifest",
+            max_bytes=MAX_SOURCE_BODY_BYTES,
+        ),
     }
     _capsule_collect_tree(assets, root=Path(args.normalized_evidence_root), prefix="evidence")
     _capsule_collect_tree(assets, root=Path(args.schema_root), prefix="schemas")
@@ -8551,6 +8610,7 @@ def _parser() -> argparse.ArgumentParser:
         "recovery-authority-signature",
         "recovery-repository-observation",
         "execution-closure",
+        "environment-manifest",
         "output-root",
     ):
         create_capsule.add_argument(f"--{argument}", required=True)

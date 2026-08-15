@@ -509,6 +509,7 @@ def _collect_runtime_files(
             "pip",
             "--isolated",
             "install",
+            "--no-compile",
             "--no-index",
             "--find-links",
             str(wheelhouse),

@@ -626,6 +626,21 @@ def test_production_smoke_builds_a_schema_valid_complete_execution_closure(
     destination.mkdir()
     candidate_archive = tmp_path / "candidate-archive.tar"
     candidate_archive.write_bytes(b"fixture candidate archive")
+    environment_root = destination.parent / "recovery-runtime" / "environment"
+    environment_manifest_path = tmp_path / "environment-manifest.json"
+    environment_manifest = {
+        "schema": "kestrel.recovery_environment.v1",
+        "platform": "ubuntu-24.04-x86_64",
+        "python_version": "3.11.14",
+        "python_abi": "cp311",
+        "environment_root": str(environment_root),
+        "site_packages_path": str(
+            environment_root / "lib" / "python3.11" / "site-packages"
+        ),
+        "site_packages_tree_sha256": "sha256:" + "6" * 64,
+        "site_packages_file_count": 2,
+        "site_packages_total_size_bytes": 3,
+    }
     python_digest = "sha256:" + "3" * 64
     runtime = {"implementation": "CPython", "version": "3.11.14", "abi": "cp311"}
     monkeypatch.setattr(
@@ -636,6 +651,7 @@ def test_production_smoke_builds_a_schema_valid_complete_execution_closure(
             runtime,
             python_digest,
             destination.parent / "recovery-runtime" / "base" / "lib",
+            environment_manifest,
         ),
     )
     monkeypatch.setattr(
@@ -662,6 +678,7 @@ def test_production_smoke_builds_a_schema_valid_complete_execution_closure(
         dependency_root=dependency_root,
         destination=destination,
         candidate_archive=candidate_archive,
+        environment_manifest_output=environment_manifest_path,
     )
     raw = receipts.canonical_json_bytes(closure)
 
@@ -698,6 +715,19 @@ def test_production_smoke_builds_a_schema_valid_complete_execution_closure(
     assert closure["dependency_lock"]["python_runtime_archive_sha256"] == (
         "sha256:" + _sha256(python_runtime_archive)
     )
+    environment_manifest_raw = receipts.canonical_json_bytes(environment_manifest)
+    assert environment_manifest_path.read_bytes() == environment_manifest_raw
+    assert closure["dependency_lock"]["environment_manifest_sha256"] == (
+        "sha256:" + _sha256(environment_manifest_raw)
+    )
+    assert next(
+        item
+        for item in closure["data_resources"]
+        if item["path"] == "recovery/environment-manifest.json"
+    ) == {
+        "path": "recovery/environment-manifest.json",
+        "sha256": "sha256:" + _sha256(environment_manifest_raw),
+    }
     assert {item["path"]: item["access"] for item in closure["io_roots"]}[
         str(source_root)
     ] == "read"
@@ -773,6 +803,8 @@ def test_production_smoke_invokes_a_nested_verification_through_the_launcher(
     command = observed["command"]
     assert isinstance(command, list)
     assert command[0] == str(python)
+    assert command[1:5] == ["-I", "-S", "-B", "-c"]
+    assert "sys.path" not in command[5]
     assert "launch" in command
     assert "--executable" in command
     assert command.count(str(launcher)) == 2

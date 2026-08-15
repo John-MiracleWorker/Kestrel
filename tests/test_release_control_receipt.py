@@ -4838,6 +4838,26 @@ def _fixture_recovery_python_runtime() -> tuple[bytes, bytes]:
     return manifest, archive
 
 
+def _fixture_recovery_environment(
+    environment_root: str = "/recovery-runtime/environment",
+) -> bytes:
+    return _canonical(
+        {
+            "schema": "kestrel.recovery_environment.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": "3.11.14",
+            "python_abi": "cp311",
+            "environment_root": environment_root,
+            "site_packages_path": (
+                f"{environment_root}/lib/python3.11/site-packages"
+            ),
+            "site_packages_tree_sha256": "sha256:" + "6" * 64,
+            "site_packages_file_count": 1,
+            "site_packages_total_size_bytes": 1,
+        }
+    )
+
+
 def _complete_recovery_capsule_assets(
     transaction_raw: bytes,
     tmp_path: Path,
@@ -4873,11 +4893,13 @@ def _complete_recovery_capsule_assets(
     python_runtime_manifest, python_runtime_archive = (
         _fixture_recovery_python_runtime()
     )
+    environment_manifest = _fixture_recovery_environment()
     closure_assets: dict[str, bytes] = {
         **workflows,
         ".gitleaksignore": b"fixture\n",
         "evidence/normalized-source.json": b"{}",
         "recovery/bin/bwrap": sandbox,
+        "recovery/environment-manifest.json": environment_manifest,
         "recovery/requirements.txt": b"# no third-party recovery dependencies\n",
         "recovery/python-runtime-manifest.json": python_runtime_manifest,
         "recovery/python-runtime.tar.gz": python_runtime_archive,
@@ -4944,6 +4966,7 @@ def _complete_recovery_capsule_assets(
             "dependency_lock": {
                 "requirements_path": "recovery/requirements.txt",
                 "requirements_sha256": _sha256(closure_assets["recovery/requirements.txt"]),
+                "environment_manifest_sha256": _sha256(environment_manifest),
                 "runtime_manifest_sha256": _sha256(runtime_manifest),
                 "python_runtime_manifest_sha256": _sha256(python_runtime_manifest),
                 "python_runtime_archive_sha256": _sha256(python_runtime_archive),
@@ -5111,6 +5134,9 @@ def test_recovery_capsule_command_accepts_only_an_explicit_programmatic_clock(
         "recovery-execution-closure.json": assets[
             "recovery-execution-closure.json"
         ],
+        "recovery-environment-manifest.json": assets[
+            "recovery/environment-manifest.json"
+        ],
     }
     for name, raw in input_assets.items():
         (inputs / name).write_bytes(raw)
@@ -5161,6 +5187,8 @@ def test_recovery_capsule_command_accepts_only_an_explicit_programmatic_clock(
             str(inputs / "recovery-repository-observation.json"),
             "--execution-closure",
             str(inputs / "recovery-execution-closure.json"),
+            "--environment-manifest",
+            str(inputs / "recovery-environment-manifest.json"),
             "--output-root",
             str(output),
         ],
@@ -5341,6 +5369,7 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
     python_runtime_manifest, python_runtime_archive = (
         _fixture_recovery_python_runtime()
     )
+    environment_manifest = _fixture_recovery_environment()
     source = tmp_path / "source"
     (source / "recovery" / "wheelhouse").mkdir(parents=True)
     (source / "recovery" / "bin").mkdir()
@@ -5397,7 +5426,9 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
     receipt["receipt_digest"] = _sha256(_canonical(receipt))
     receipt_raw = _canonical(receipt)
     (source / "recovery" / "dependency-staging-receipt.json").write_bytes(receipt_raw)
-    assets: dict[str, bytes] = {}
+    assets: dict[str, bytes] = {
+        "recovery/environment-manifest.json": environment_manifest
+    }
     monkeypatch.setattr(subject, "_RECOVERY_BWRAP_BINARY_DIGEST", _sha256(sandbox))
 
     subject._capsule_collect_recovery_dependencies(  # noqa: SLF001
@@ -5408,6 +5439,7 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
             "dependency_lock": {
                 "requirements_path": "recovery/requirements.txt",
                 "requirements_sha256": _sha256(requirements),
+                "environment_manifest_sha256": _sha256(environment_manifest),
                 "runtime_manifest_sha256": _sha256(runtime_manifest),
                 "python_runtime_manifest_sha256": _sha256(python_runtime_manifest),
                 "python_runtime_archive_sha256": _sha256(python_runtime_archive),
@@ -5420,6 +5452,7 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
     assert assets == {
         "recovery/bin/bwrap": sandbox,
         "recovery/dependency-staging-receipt.json": receipt_raw,
+        "recovery/environment-manifest.json": environment_manifest,
         "recovery/requirements.txt": requirements,
         "recovery/python-runtime-manifest.json": python_runtime_manifest,
         "recovery/python-runtime.tar.gz": python_runtime_archive,
@@ -5473,6 +5506,7 @@ def test_recovery_capsule_rejects_dependency_staging_receipt_source_drift(
     python_runtime_manifest, python_runtime_archive = (
         _fixture_recovery_python_runtime()
     )
+    environment_manifest = _fixture_recovery_environment()
     root = tmp_path / "dependencies" / "recovery"
     (root / "bin").mkdir(parents=True)
     (root / "wheelhouse").mkdir()
@@ -5519,13 +5553,14 @@ def test_recovery_capsule_rejects_dependency_staging_receipt_source_drift(
 
     with pytest.raises(ValueError, match="input binding"):
         subject._capsule_collect_recovery_dependencies(  # noqa: SLF001
-            {},
+            {"recovery/environment-manifest.json": environment_manifest},
             dependency_root=root.parent,
             expected_source_sha="a" * 40,
             closure={
                 "dependency_lock": {
                     "requirements_path": "recovery/requirements.txt",
                     "requirements_sha256": _sha256(requirements),
+                    "environment_manifest_sha256": _sha256(environment_manifest),
                     "runtime_manifest_sha256": _sha256(runtime_manifest),
                     "python_runtime_manifest_sha256": _sha256(
                         python_runtime_manifest

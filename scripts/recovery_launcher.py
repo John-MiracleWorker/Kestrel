@@ -3,19 +3,9 @@
 
 from __future__ import annotations
 
-import argparse
-import ast
-import hashlib
-import json
-import os
-import platform
-import subprocess  # nosec B404
+# ruff: noqa: E402, I001  # Security gate separates builtin and authorized imports.
+
 import sys
-import tarfile
-from collections.abc import Mapping, Sequence
-from pathlib import Path, PurePosixPath
-from typing import cast
-from urllib.parse import SplitResult, urlsplit
 
 if __name__ == "__main__" and not (
     sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode
@@ -23,22 +13,369 @@ if __name__ == "__main__" and not (
     sys.stderr.write("recovery launcher requires Python -I -S -B isolation\n")
     raise SystemExit(2)
 
+# Production wrappers intentionally enter through stdlib-only paths. Defensively
+# strip any inherited capsule/environment entry before importing even stdlib
+# modules: an installed package must not shadow one of those imports before its
+# controller-bound identity has been checked.
+_PREIMPORT_LAUNCHER_PATH = __file__.replace("\\", "/")
+_PREIMPORT_LAUNCHER_SUFFIX = "/scripts/recovery_launcher.py"
+_PREIMPORT_CAPSULE_ROOT = (
+    _PREIMPORT_LAUNCHER_PATH[: -len(_PREIMPORT_LAUNCHER_SUFFIX)]
+    if _PREIMPORT_LAUNCHER_PATH.endswith(_PREIMPORT_LAUNCHER_SUFFIX)
+    else ""
+)
+_PREIMPORT_ENVIRONMENT_ROOT = (
+    _PREIMPORT_CAPSULE_ROOT.rsplit("/", 1)[0] + "/recovery-runtime/environment"
+    if "/" in _PREIMPORT_CAPSULE_ROOT
+    else ""
+)
+if __name__ == "__main__":
+    if not _PREIMPORT_CAPSULE_ROOT or not _PREIMPORT_ENVIRONMENT_ROOT:
+        sys.stderr.write("recovery launcher path is not an absolute capsule member\n")
+        raise SystemExit(2)
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if isinstance(entry, str)
+        and entry
+        and not (
+            entry.replace("\\", "/").rstrip("/") == _PREIMPORT_CAPSULE_ROOT
+            or entry.replace("\\", "/").rstrip("/").startswith(
+                _PREIMPORT_CAPSULE_ROOT + "/"
+            )
+            or entry.replace("\\", "/").rstrip("/") == _PREIMPORT_ENVIRONMENT_ROOT
+            or entry.replace("\\", "/").rstrip("/").startswith(
+                _PREIMPORT_ENVIRONMENT_ROOT + "/"
+            )
+        )
+    ]
+_PREIMPORT_STDLIB_SYS_PATH = tuple(sys.path)
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import platform
+import subprocess  # nosec B404
+import tarfile
+from collections.abc import Mapping, Sequence
+from pathlib import Path, PurePosixPath
+from typing import cast
+from urllib.parse import SplitResult, urlsplit
+
+MAX_CLOSURE_BYTES = 16 * 1024 * 1024
+MAX_INSTALLED_ENVIRONMENT_MEMBERS = 32768
+MAX_INSTALLED_ENVIRONMENT_FILE_BYTES = 512 * 1024 * 1024
+MAX_INSTALLED_ENVIRONMENT_TOTAL_BYTES = 1024 * 1024 * 1024
+
+
+class _RecoveryLauncherPreImportError(ValueError):
+    """Reject an unsafe installed environment before dependency imports."""
+
+
+def _preimport_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise _RecoveryLauncherPreImportError(
+            "recovery pre-import member could not be read"
+        ) from exc
+    return "sha256:" + digest.hexdigest()
+
+
+def _preimport_regular(path: Path, *, label: str, maximum: int) -> bytes:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise _RecoveryLauncherPreImportError(f"{label} is missing") from exc
+    if path.is_symlink() or not path.is_file() or size < 0 or size > maximum:
+        raise _RecoveryLauncherPreImportError(f"{label} is not a bounded regular file")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise _RecoveryLauncherPreImportError(f"{label} could not be read") from exc
+    if len(raw) != size:
+        raise _RecoveryLauncherPreImportError(f"{label} changed while being read")
+    return raw
+
+
+def _preimport_object(raw: bytes, *, label: str) -> dict[str, object]:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise _RecoveryLauncherPreImportError(f"{label} contains duplicate fields")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (_RecoveryLauncherPreImportError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if isinstance(exc, _RecoveryLauncherPreImportError):
+            raise
+        raise _RecoveryLauncherPreImportError(f"{label} is not valid JSON") from exc
+    if type(value) is not dict:
+        raise _RecoveryLauncherPreImportError(f"{label} is not an object")
+    return cast(dict[str, object], value)
+
+
+def _preimport_installed_environment_tree_identity(
+    environment_root: Path,
+) -> tuple[int, int, str]:
+    """Hash site-packages without importing from the not-yet-authorized path."""
+
+    site_packages = environment_root / "lib" / "python3.11" / "site-packages"
+    for root in (
+        environment_root,
+        environment_root / "lib",
+        environment_root / "lib" / "python3.11",
+        site_packages,
+    ):
+        if root.is_symlink() or not root.is_dir():
+            raise _RecoveryLauncherPreImportError(
+                "recovery installed environment site-packages root is unsafe"
+            )
+    records: list[dict[str, object]] = []
+    total = 0
+    try:
+        members = sorted(
+            site_packages.rglob("*"),
+            key=lambda item: item.relative_to(site_packages).as_posix(),
+        )
+    except OSError as exc:
+        raise _RecoveryLauncherPreImportError(
+            "recovery installed environment could not be enumerated"
+        ) from exc
+    for path in members:
+        if path.is_symlink():
+            raise _RecoveryLauncherPreImportError(
+                "recovery installed environment contains a link"
+            )
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise _RecoveryLauncherPreImportError(
+                "recovery installed environment contains a special file"
+            )
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise _RecoveryLauncherPreImportError(
+                "recovery installed environment changed while being read"
+            ) from exc
+        total += size
+        if size < 0 or size > MAX_INSTALLED_ENVIRONMENT_FILE_BYTES:
+            raise _RecoveryLauncherPreImportError(
+                "recovery installed environment file is too large"
+            )
+        if (
+            total > MAX_INSTALLED_ENVIRONMENT_TOTAL_BYTES
+            or len(records) >= MAX_INSTALLED_ENVIRONMENT_MEMBERS
+        ):
+            raise _RecoveryLauncherPreImportError(
+                "recovery installed environment is too large"
+            )
+        mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
+        records.append(
+            {
+                "mode": f"{mode:04o}",
+                "path": path.relative_to(site_packages).as_posix(),
+                "sha256": _preimport_digest(path),
+                "size_bytes": size,
+            }
+        )
+    if not records:
+        raise _RecoveryLauncherPreImportError("recovery installed environment is empty")
+    canonical = json.dumps(
+        records, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    return len(records), total, "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _authorize_preimport_environment() -> None:
+    """Authenticate site-packages before authorizing it as an import path."""
+
+    if len(sys.argv) < 3 or sys.argv[1] not in {
+        "verify",
+        "materialize-candidate",
+        "bind-host-actuator",
+        "launch",
+    }:
+        raise _RecoveryLauncherPreImportError("recovery launcher invocation is incomplete")
+    closure_argument = Path(sys.argv[2])
+    try:
+        root_index = next(
+            index
+            for index, argument in enumerate(sys.argv[3:], start=3)
+            if argument == "--capsule-root"
+        )
+        root_argument = Path(sys.argv[root_index + 1])
+    except (StopIteration, IndexError) as exc:
+        raise _RecoveryLauncherPreImportError(
+            "recovery launcher capsule root is missing"
+        ) from exc
+    launcher_path = Path(__file__)
+    try:
+        capsule_root = root_argument.resolve(strict=True)
+        expected_capsule_root = launcher_path.resolve(strict=True).parents[1]
+        closure_path = closure_argument.resolve(strict=True)
+    except OSError as exc:
+        raise _RecoveryLauncherPreImportError(
+            "recovery launcher pre-import paths are missing"
+        ) from exc
+    if (
+        launcher_path.is_symlink()
+        or root_argument.is_symlink()
+        or not capsule_root.is_dir()
+        or capsule_root != expected_capsule_root
+        or closure_argument.is_symlink()
+        or closure_path != capsule_root / "recovery-execution-closure.json"
+    ):
+        raise _RecoveryLauncherPreImportError(
+            "recovery launcher pre-import paths are not exact"
+        )
+    closure = _preimport_object(
+        _preimport_regular(
+            closure_path,
+            label="recovery execution closure",
+            maximum=MAX_CLOSURE_BYTES,
+        ),
+        label="recovery execution closure",
+    )
+    lock = closure.get("dependency_lock")
+    resources = closure.get("data_resources")
+    runtime = closure.get("python_runtime")
+    executables = closure.get("external_executables")
+    if (
+        type(lock) is not dict
+        or type(resources) is not list
+        or type(runtime) is not dict
+        or type(executables) is not list
+    ):
+        raise _RecoveryLauncherPreImportError(
+            "recovery execution closure pre-import binding is invalid"
+        )
+    environment_manifest_path = capsule_root / "recovery" / "environment-manifest.json"
+    environment_manifest_raw = _preimport_regular(
+        environment_manifest_path,
+        label="recovery installed environment manifest",
+        maximum=MAX_CLOSURE_BYTES,
+    )
+    environment_manifest_digest = "sha256:" + hashlib.sha256(
+        environment_manifest_raw
+    ).hexdigest()
+    matching_resources = [
+        item
+        for item in resources
+        if type(item) is dict
+        and item.get("path") == "recovery/environment-manifest.json"
+    ]
+    if (
+        lock.get("environment_manifest_sha256") != environment_manifest_digest
+        or len(matching_resources) != 1
+        or matching_resources[0].get("sha256") != environment_manifest_digest
+    ):
+        raise _RecoveryLauncherPreImportError(
+            "recovery installed environment manifest binding mismatch"
+        )
+    manifest = _preimport_object(
+        environment_manifest_raw,
+        label="recovery installed environment manifest",
+    )
+    expected_fields = {
+        "schema",
+        "platform",
+        "python_version",
+        "python_abi",
+        "environment_root",
+        "site_packages_path",
+        "site_packages_tree_sha256",
+        "site_packages_file_count",
+        "site_packages_total_size_bytes",
+    }
+    environment_root = capsule_root.parent / "recovery-runtime" / "environment"
+    site_packages = environment_root / "lib" / "python3.11" / "site-packages"
+    python_items = [
+        item
+        for item in executables
+        if type(item) is dict and item.get("name") == "python"
+    ]
+    if (
+        set(manifest) != expected_fields
+        or runtime
+        != {
+            "implementation": "CPython",
+            "version": "3.11.14",
+            "abi": "cp311",
+        }
+        or manifest.get("schema") != "kestrel.recovery_environment.v1"
+        or manifest.get("platform") != "ubuntu-24.04-x86_64"
+        or manifest.get("python_version") != runtime.get("version")
+        or manifest.get("python_abi") != runtime.get("abi")
+        or manifest.get("environment_root") != str(environment_root)
+        or manifest.get("site_packages_path") != str(site_packages)
+        or len(python_items) != 1
+        or python_items[0].get("path") != str(environment_root / "bin" / "python")
+        or type(manifest.get("site_packages_file_count")) is not int
+        or cast(int, manifest["site_packages_file_count"]) <= 0
+        or type(manifest.get("site_packages_total_size_bytes")) is not int
+        or cast(int, manifest["site_packages_total_size_bytes"]) <= 0
+        or not isinstance(manifest.get("site_packages_tree_sha256"), str)
+        or len(cast(str, manifest["site_packages_tree_sha256"])) != 71
+        or not cast(str, manifest["site_packages_tree_sha256"]).startswith("sha256:")
+        or any(
+            character not in "0123456789abcdef"
+            for character in cast(str, manifest["site_packages_tree_sha256"])[7:]
+        )
+    ):
+        raise _RecoveryLauncherPreImportError(
+            "recovery installed environment manifest identity mismatch"
+        )
+    expected_identity = (
+        manifest.get("site_packages_file_count"),
+        manifest.get("site_packages_total_size_bytes"),
+        manifest.get("site_packages_tree_sha256"),
+    )
+    if _preimport_installed_environment_tree_identity(environment_root) != expected_identity:
+        raise _RecoveryLauncherPreImportError(
+            "recovery installed environment tree identity mismatch"
+        )
+    authorized_path: list[str] = []
+    for entry in (str(capsule_root), *_PREIMPORT_STDLIB_SYS_PATH, str(site_packages)):
+        if not isinstance(entry, str) or not entry or not Path(entry).is_absolute():
+            raise _RecoveryLauncherPreImportError(
+                "recovery pre-import sys.path contains an ambient entry"
+            )
+        if entry not in authorized_path:
+            authorized_path.append(entry)
+    sys.path[:] = authorized_path
+
+
+if __name__ == "__main__":
+    _authorize_preimport_environment()
+
 from scripts import release_control_receipt as receipts
 
 CLOSURE_SCHEMA = "kestrel.recovery_execution_closure.v1"
-MAX_CLOSURE_BYTES = 16 * 1024 * 1024
 MAX_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 8192
 MAX_ARCHIVE_MEMBER_BYTES = 2_147_483_648
 MAX_ARCHIVE_TOTAL_BYTES = 2_147_483_648
 ISOLATED_PYTHON_BOOTSTRAP = (
     "import json,os,runpy,sys;"
-    "allowed={'LANG','LC_ALL','LD_LIBRARY_PATH','PATH','PYTHONNOUSERSITE',"
+    "allowed={'LANG','LC_ALL','LD_LIBRARY_PATH','PATH','PYTHONDONTWRITEBYTECODE',"
+    "'PYTHONNOUSERSITE',"
     "'PYTHONSAFEPATH','__CF_USER_TEXT_ENCODING'};"
     "unexpected=set(os.environ)-allowed;"
     "len(unexpected)==0 or (_ for _ in ()).throw(RuntimeError('ambient recovery environment'));"
-    "sys.path[:]=json.loads(sys.argv.pop(1));"
+    "declared_path=json.loads(sys.argv.pop(1));"
     "target=sys.argv.pop(1);"
+    "target_is_launcher=target.replace('\\\\','/').endswith('/scripts/recovery_launcher.py');"
+    "sys.path[:]=sys.path if target_is_launcher else declared_path;"
     "runpy.run_path(target,run_name='__main__')"
 )
 TRUSTED_RECOVERY_PYTHON_IDENTITIES: Mapping[
@@ -326,6 +663,11 @@ def _verify_dependency_lock(closure: receipts.JSONObject, capsule_root: Path) ->
             raise receipts.ReleaseControlError("recovery runtime manifest digest mismatch")
     for field, relative, label in (
         (
+            "environment_manifest_sha256",
+            PurePosixPath("recovery/environment-manifest.json"),
+            "recovery installed environment manifest",
+        ),
+        (
             "python_runtime_manifest_sha256",
             PurePosixPath("recovery/python-runtime-manifest.json"),
             "recovery Python runtime manifest",
@@ -392,6 +734,15 @@ def _python_runtime_tree_identity(root: Path) -> tuple[int, int, str]:
     return len(records), total, digest
 
 
+def _installed_environment_tree_identity(environment_root: Path) -> tuple[int, int, str]:
+    """Re-authenticate the installed site-packages tree before every launch."""
+
+    try:
+        return _preimport_installed_environment_tree_identity(environment_root)
+    except _RecoveryLauncherPreImportError as exc:
+        raise receipts.ReleaseControlError(str(exc)) from exc
+
+
 def _verify_extracted_python_runtime(
     *, closure: bytes, capsule_root: Path
 ) -> Path | None:
@@ -439,6 +790,46 @@ def _verify_extracted_python_runtime(
         != manifest.get("python_executable_sha256")
     ):
         raise receipts.ReleaseControlError("recovery Python runtime tree identity mismatch")
+    environment_manifest_path = _regular_member(
+        capsule_root,
+        PurePosixPath("recovery/environment-manifest.json"),
+        label="recovery installed environment manifest",
+    )
+    environment_manifest = receipts._object(  # noqa: SLF001
+        receipts.strict_canonical_json(
+            environment_manifest_path.read_bytes(),
+            label="recovery installed environment manifest",
+        ),
+        label="recovery installed environment manifest",
+    )
+    receipts._validate_schema(  # noqa: SLF001
+        "kestrel.recovery_environment.v1",
+        environment_manifest,
+        label="recovery installed environment manifest",
+    )
+    environment_root = runtime_root / "environment"
+    runtime = receipts._object(  # noqa: SLF001
+        value.get("python_runtime"), label="recovery Python runtime"
+    )
+    installed_identity = _installed_environment_tree_identity(environment_root)
+    if (
+        lock.get("environment_manifest_sha256")
+        != _member_digest(environment_manifest_path)
+        or environment_manifest.get("environment_root") != str(environment_root)
+        or environment_manifest.get("site_packages_path")
+        != str(environment_root / "lib" / "python3.11" / "site-packages")
+        or environment_manifest.get("python_version") != runtime.get("version")
+        or environment_manifest.get("python_abi") != runtime.get("abi")
+        or installed_identity
+        != (
+            environment_manifest.get("site_packages_file_count"),
+            environment_manifest.get("site_packages_total_size_bytes"),
+            environment_manifest.get("site_packages_tree_sha256"),
+        )
+    ):
+        raise receipts.ReleaseControlError(
+            "recovery installed environment tree identity mismatch"
+        )
     library_root = (base_root / "lib").resolve(strict=True)
     _authorize_io_path(value, path=library_root)
     return library_root
@@ -778,6 +1169,7 @@ def build_isolated_environment(*, closure: bytes) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": os.pathsep.join(directories),
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONSAFEPATH": "1",
     }

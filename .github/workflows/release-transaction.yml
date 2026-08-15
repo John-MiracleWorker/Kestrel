@@ -914,7 +914,7 @@ jobs:
           }
           test -f "$capsule_root/candidate-archive.tar"
           capsule_private_loader -I -S -B -c \
-            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
             launch "$capsule_root/recovery-execution-closure.json" \
@@ -931,7 +931,7 @@ jobs:
           host_binding="$GITHUB_WORKSPACE/transaction-identity/recovery/host-actuator-binding.json"
           test ! -e "$host_binding"
           capsule_private_loader -I -S -B -c \
-            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
             launch "$capsule_root/recovery-execution-closure.json" \
@@ -1763,7 +1763,7 @@ jobs:
           (
             cd transaction/capsule-download
             capsule_private_loader -I -S -B -c \
-              'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+              'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
               --capsule-root "$capsule_root" \
@@ -1790,7 +1790,7 @@ jobs:
           host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/prepare/host-actuator-binding.json"
           test ! -e "$host_binding"
           capsule_private_loader -I -S -B -c \
-            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
             launch "$capsule_root/recovery-execution-closure.json" \
@@ -3029,7 +3029,7 @@ jobs:
           (
             cd transaction/capsule-download
             capsule_private_loader -I -S -B -c \
-              'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+              'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
               --capsule-root "$capsule_root" \
@@ -3055,7 +3055,7 @@ jobs:
           host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/commit/host-actuator-binding.json"
           test ! -e "$host_binding"
           capsule_private_loader -I -S -B -c \
-            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
             launch "$capsule_root/recovery-execution-closure.json" \
@@ -5426,7 +5426,7 @@ jobs:
           (
             cd transaction/capsule-download
             capsule_private_loader -I -S -B -c \
-              'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+              'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
               --capsule-root "$capsule_root" \
@@ -5452,7 +5452,7 @@ jobs:
           host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/verify/host-actuator-binding.json"
           test ! -e "$host_binding"
           capsule_private_loader -I -S -B -c \
-            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
             launch "$capsule_root/recovery-execution-closure.json" \
@@ -6198,7 +6198,7 @@ jobs:
           (
             cd transaction/capsule-download
             capsule_private_loader -I -S -B -c \
-              'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+              'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
               --capsule-root "$capsule_root" \
@@ -6224,7 +6224,7 @@ jobs:
           host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/pypi/host-actuator-binding.json"
           test ! -e "$host_binding"
           capsule_private_loader -I -S -B -c \
-            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
             launch "$capsule_root/recovery-execution-closure.json" \
@@ -7368,7 +7368,7 @@ jobs:
           host_binding="$GITHUB_WORKSPACE/reconciliation/host-actuator/host-actuator-binding.json"
           test ! -e "$host_binding"
           capsule_private_loader -I -S -B -c \
-            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
             launch "$capsule_root/recovery-execution-closure.json" \

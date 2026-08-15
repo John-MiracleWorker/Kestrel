@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.recovery_environment.v1.schema.json",
+  "title": "kestrel.recovery_environment.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "required": [
+    "schema",
+    "platform",
+    "python_version",
+    "python_abi",
+    "environment_root",
+    "site_packages_path",
+    "site_packages_tree_sha256",
+    "site_packages_file_count",
+    "site_packages_total_size_bytes"
+  ],
+  "properties": {
+    "schema": {"const": "kestrel.recovery_environment.v1"},
+    "platform": {"const": "ubuntu-24.04-x86_64"},
+    "python_version": {"const": "3.11.14"},
+    "python_abi": {"const": "cp311"},
+    "environment_root": {
+      "type": "string",
+      "pattern": "^/[^\\x00]+$",
+      "maxLength": 4096
+    },
+    "site_packages_path": {
+      "type": "string",
+      "pattern": "^/[^\\x00]+/lib/python3\\.11/site-packages$",
+      "maxLength": 4096
+    },
+    "site_packages_tree_sha256": {"$ref": "#/$defs/digest"},
+    "site_packages_file_count": {"$ref": "#/$defs/positive_integer"},
+    "site_packages_total_size_bytes": {"$ref": "#/$defs/positive_integer"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "positive_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    }
+  }
+}

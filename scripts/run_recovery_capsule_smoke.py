@@ -141,7 +141,7 @@ def _owner_key_observation(source_root: Path, *, public_key: str) -> bytes:
 
 def _probe_final_python(
     *, destination: Path, dependency_root: Path
-) -> tuple[list[str], dict[str, str], str, Path]:
+) -> tuple[list[str], dict[str, str], str, Path, dict[str, Any]]:
     runtime_root = destination.parent / "recovery-runtime"
     base_root = runtime_root / "base"
     environment_root = runtime_root / "environment"
@@ -192,6 +192,7 @@ def _probe_final_python(
                     "pip",
                     "--isolated",
                     "install",
+                    "--no-compile",
                     "--no-index",
                     "--find-links",
                     str(wheelhouse),
@@ -200,6 +201,15 @@ def _probe_final_python(
                     "-r",
                     str(requirements),
                 ),
+                additional_library_roots=(base_root / "lib",),
+            ),
+            environment=bootstrap_recovery._bootstrap_environment(),  # noqa: SLF001
+        )
+        bootstrap_recovery._run_bootstrap_command(  # noqa: SLF001
+            bootstrap_recovery._private_loader_command(  # noqa: SLF001
+                capsule_root=probe_capsule,
+                executable=venv_python,
+                arguments=("-I", "-B", "-m", "pip", "--isolated", "check"),
                 additional_library_roots=(base_root / "lib",),
             ),
             environment=bootstrap_recovery._bootstrap_environment(),  # noqa: SLF001
@@ -242,7 +252,34 @@ def _probe_final_python(
             capsule_root=destination,
             interpreter_sys_path=raw_path,
         )
-        return effective_path, runtime, _path_sha256(venv_python), base_root / "lib"
+        count, total, tree_digest = recovery_launcher._installed_environment_tree_identity(  # noqa: SLF001
+            environment_root
+        )
+        environment_manifest = {
+            "schema": "kestrel.recovery_environment.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": runtime["version"],
+            "python_abi": runtime["abi"],
+            "environment_root": str(environment_root),
+            "site_packages_path": str(
+                environment_root / "lib" / "python3.11" / "site-packages"
+            ),
+            "site_packages_tree_sha256": tree_digest,
+            "site_packages_file_count": count,
+            "site_packages_total_size_bytes": total,
+        }
+        receipts._validate_schema(  # noqa: SLF001
+            "kestrel.recovery_environment.v1",
+            environment_manifest,
+            label="recovery installed environment manifest",
+        )
+        return (
+            effective_path,
+            runtime,
+            _path_sha256(venv_python),
+            base_root / "lib",
+            environment_manifest,
+        )
     finally:
         shutil.rmtree(runtime_root)
 
@@ -253,6 +290,7 @@ def _execution_closure(
     dependency_root: Path,
     destination: Path,
     candidate_archive: Path,
+    environment_manifest_output: Path,
 ) -> dict[str, Any]:
     member_bytes: dict[str, bytes] = {}
     for name in sorted(receipts._RECOVERY_CAPSULE_SOURCE_ASSETS):  # noqa: SLF001
@@ -313,10 +351,20 @@ def _execution_closure(
 
     requirements = dependency_root / "recovery" / "requirements.txt"
     wheelhouse_manifest = dependency_root / "recovery" / "wheelhouse-manifest.json"
-    sys_path, runtime, python_digest, base_library_root = _probe_final_python(
+    (
+        sys_path,
+        runtime,
+        python_digest,
+        base_library_root,
+        environment_manifest,
+    ) = _probe_final_python(
         destination=destination,
         dependency_root=dependency_root,
     )
+    environment_manifest_raw = receipts.canonical_json_bytes(environment_manifest)
+    _write(environment_manifest_output, environment_manifest_raw)
+    member_bytes["recovery/environment-manifest.json"] = environment_manifest_raw
+    data_names = sorted(set(member_bytes) - set(python_names) - set(shell_names))
     python_identity = (
         python_digest,
         f"Python {runtime['version']}",
@@ -405,6 +453,7 @@ def _execution_closure(
         "dependency_lock": {
             "requirements_path": "recovery/requirements.txt",
             "requirements_sha256": _path_sha256(requirements),
+            "environment_manifest_sha256": _sha256(environment_manifest_raw),
             "wheelhouse_manifest_sha256": _path_sha256(wheelhouse_manifest),
             "runtime_manifest_sha256": _path_sha256(
                 dependency_root / "recovery" / "runtime-manifest.json"
@@ -448,10 +497,8 @@ def _run_network_denied_capsule_command(
     if any(path.is_symlink() or not path.is_file() for path in (python, launcher, closure)):
         raise ValueError("recovery smoke launch closure is incomplete")
     closure_raw = closure.read_bytes()
-    closure_value = json.loads(closure_raw)
     outer_bootstrap = (
-        "import json,runpy,sys;"
-        "sys.path[:]=json.loads(sys.argv.pop(1));"
+        "import runpy,sys;"
         "target=sys.argv.pop(1);"
         "runpy.run_path(target,run_name='__main__')"
     )
@@ -461,7 +508,6 @@ def _run_network_denied_capsule_command(
         "-B",
         "-c",
         outer_bootstrap,
-        json.dumps(closure_value["sys_path"], separators=(",", ":")),
         str(launcher),
         "launch",
         str(closure),
@@ -652,6 +698,7 @@ def run_smoke(
         dependency_root=dependency_root,
         destination=destination,
         candidate_archive=candidate_archive,
+        environment_manifest_output=work_root / "environment-manifest.json",
     )
     closure_raw = receipts.canonical_json_bytes(closure)
     _write(work_root / "recovery-execution-closure.json", closure_raw)
@@ -692,6 +739,8 @@ def run_smoke(
             str(work_root / "recovery-repository-observation.json"),
             "--execution-closure",
             str(work_root / "recovery-execution-closure.json"),
+            "--environment-manifest",
+            str(work_root / "environment-manifest.json"),
             "--output-root",
             str(capsule_root),
         ],

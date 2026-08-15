@@ -70,6 +70,7 @@ CORE_SCHEMAS = (
     "kestrel.pypi_upload_authority_prerequisite.v3.schema.json",
     "kestrel.recovery_capsule_smoke.v1.schema.json",
     "kestrel.recovery_dependency_staging.v1.schema.json",
+    "kestrel.recovery_environment.v1.schema.json",
     "kestrel.recovery_execution_closure.v1.schema.json",
     "kestrel.recovery_host_actuator_binding.v1.schema.json",
     "kestrel.recovery_repository_authority.v1.schema.json",

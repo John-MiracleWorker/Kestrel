@@ -29,6 +29,9 @@ MAX_BOOTSTRAP_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_PYTHON_RUNTIME_MEMBERS = 32768
 MAX_PYTHON_RUNTIME_FILE_BYTES = 512 * 1024 * 1024
 MAX_PYTHON_RUNTIME_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_INSTALLED_ENVIRONMENT_MEMBERS = 32768
+MAX_INSTALLED_ENVIRONMENT_FILE_BYTES = 512 * 1024 * 1024
+MAX_INSTALLED_ENVIRONMENT_TOTAL_BYTES = 1024 * 1024 * 1024
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 RECOVERY_PYTHON_PACKAGE_URL = (
     "https://github.com/actions/python-versions/releases/download/"
@@ -184,6 +187,7 @@ def _bootstrap_environment() -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": "",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONSAFEPATH": "1",
     }
@@ -254,6 +258,60 @@ def _python_runtime_tree_identity(root: Path) -> tuple[int, int, str]:
         )
     if not records:
         raise RecoveryBootstrapError("recovery Python runtime tree is empty")
+    canonical = json.dumps(
+        records, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    return len(records), total, "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _installed_environment_tree_identity(environment_root: Path) -> tuple[int, int, str]:
+    """Hash the exact installed site-packages tree without following links."""
+
+    site_packages = environment_root / "lib" / "python3.11" / "site-packages"
+    for root in (
+        environment_root,
+        environment_root / "lib",
+        environment_root / "lib" / "python3.11",
+        site_packages,
+    ):
+        if root.is_symlink() or not root.is_dir():
+            raise RecoveryBootstrapError(
+                "recovery installed environment site-packages root is unsafe"
+            )
+    records: list[dict[str, object]] = []
+    total = 0
+    for path in sorted(
+        site_packages.rglob("*"),
+        key=lambda item: item.relative_to(site_packages).as_posix(),
+    ):
+        if path.is_symlink():
+            raise RecoveryBootstrapError("recovery installed environment contains a link")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise RecoveryBootstrapError(
+                "recovery installed environment contains a special file"
+            )
+        size, digest = _path_digest(
+            path, maximum=MAX_INSTALLED_ENVIRONMENT_FILE_BYTES
+        )
+        total += size
+        if (
+            total > MAX_INSTALLED_ENVIRONMENT_TOTAL_BYTES
+            or len(records) >= MAX_INSTALLED_ENVIRONMENT_MEMBERS
+        ):
+            raise RecoveryBootstrapError("recovery installed environment is too large")
+        mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
+        records.append(
+            {
+                "mode": f"{mode:04o}",
+                "path": path.relative_to(site_packages).as_posix(),
+                "sha256": digest,
+                "size_bytes": size,
+            }
+        )
+    if not records:
+        raise RecoveryBootstrapError("recovery installed environment is empty")
     canonical = json.dumps(
         records, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode()
@@ -459,7 +517,16 @@ def _trusted_capsule_inputs(
 
 def _bootstrap_dependency_inputs(
     *, capsule_root: Path, closure: dict[str, object]
-) -> tuple[Path, Path, Path, Path, Path, Path, dict[str, object]]:
+) -> tuple[
+    Path,
+    Path,
+    Path,
+    Path,
+    Path,
+    Path,
+    dict[str, object],
+    dict[str, object],
+]:
     runtime = closure.get("python_runtime")
     if type(runtime) is not dict or runtime != {
         "implementation": "CPython",
@@ -515,12 +582,18 @@ def _bootstrap_dependency_inputs(
     if type(lock) is not dict or lock.get("requirements_path") != "recovery/requirements.txt":
         raise RecoveryBootstrapError("recovery dependency lock is invalid")
     requirements = capsule_root / "recovery" / "requirements.txt"
+    environment_manifest_path = capsule_root / "recovery" / "environment-manifest.json"
     wheelhouse_manifest = capsule_root / "recovery" / "wheelhouse-manifest.json"
     runtime_manifest = capsule_root / "recovery" / "runtime-manifest.json"
     python_runtime_manifest = capsule_root / "recovery" / "python-runtime-manifest.json"
     python_runtime_archive = capsule_root / "recovery" / "python-runtime.tar.gz"
     for path, field, label in (
         (requirements, "requirements_sha256", "requirements lock"),
+        (
+            environment_manifest_path,
+            "environment_manifest_sha256",
+            "installed environment manifest",
+        ),
         (wheelhouse_manifest, "wheelhouse_manifest_sha256", "wheelhouse manifest"),
         (runtime_manifest, "runtime_manifest_sha256", "runtime manifest"),
         (
@@ -544,6 +617,46 @@ def _bootstrap_dependency_inputs(
             _checked_digest(expected_digest, label=f"recovery {label} digest")
         ):
             raise RecoveryBootstrapError(f"recovery {label} digest mismatch")
+    environment_manifest = _json_without_duplicates(
+        environment_manifest_path.read_bytes(),
+        label="recovery installed environment manifest",
+    )
+    if set(environment_manifest) != {
+        "schema",
+        "platform",
+        "python_version",
+        "python_abi",
+        "environment_root",
+        "site_packages_path",
+        "site_packages_tree_sha256",
+        "site_packages_file_count",
+        "site_packages_total_size_bytes",
+    }:
+        raise RecoveryBootstrapError("recovery installed environment manifest fields mismatch")
+    if (
+        environment_manifest.get("schema") != "kestrel.recovery_environment.v1"
+        or environment_manifest.get("platform") != "ubuntu-24.04-x86_64"
+        or environment_manifest.get("python_version") != runtime.get("version")
+        or environment_manifest.get("python_abi") != runtime.get("abi")
+        or environment_manifest.get("environment_root") != str(environment_root)
+        or environment_manifest.get("site_packages_path")
+        != str(environment_root / "lib" / "python3.11" / "site-packages")
+        or any(
+            type(environment_manifest.get(field)) is not int
+            or isinstance(environment_manifest.get(field), bool)
+            or cast(int, environment_manifest[field]) <= 0
+            for field in (
+                "site_packages_file_count",
+                "site_packages_total_size_bytes",
+            )
+        )
+        or type(environment_manifest.get("site_packages_tree_sha256")) is not str
+    ):
+        raise RecoveryBootstrapError("recovery installed environment manifest identity mismatch")
+    _checked_digest(
+        cast(str, environment_manifest["site_packages_tree_sha256"]),
+        label="recovery installed environment tree digest",
+    )
     python_manifest = _json_without_duplicates(
         python_runtime_manifest.read_bytes(), label="recovery Python runtime manifest"
     )
@@ -656,7 +769,38 @@ def _bootstrap_dependency_inputs(
         wheelhouse,
         requirements,
         python_manifest,
+        environment_manifest,
     )
+
+
+def _verify_installed_environment(
+    *, environment_root: Path, manifest: dict[str, object]
+) -> None:
+    """Match and freeze the controller-bound installed site-packages tree."""
+
+    identity = _installed_environment_tree_identity(environment_root)
+    expected = (
+        manifest.get("site_packages_file_count"),
+        manifest.get("site_packages_total_size_bytes"),
+        manifest.get("site_packages_tree_sha256"),
+    )
+    if identity != expected:
+        raise RecoveryBootstrapError("recovery installed environment tree identity mismatch")
+    site_packages = environment_root / "lib" / "python3.11" / "site-packages"
+    for path in sorted(
+        site_packages.rglob("*"),
+        key=lambda item: (len(item.relative_to(site_packages).parts), item.as_posix()),
+        reverse=True,
+    ):
+        if path.is_file() and not path.is_symlink():
+            path.chmod(0o555 if path.stat().st_mode & 0o111 else 0o444)
+        elif path.is_dir() and not path.is_symlink():
+            path.chmod(0o555)
+        else:
+            raise RecoveryBootstrapError("recovery installed environment changed while freezing")
+    site_packages.chmod(0o555)
+    if _installed_environment_tree_identity(environment_root) != identity:
+        raise RecoveryBootstrapError("recovery installed environment changed while freezing")
 
 
 def _prepare_trusted_runtime_files(
@@ -993,6 +1137,7 @@ def bootstrap_recovery_environment(
         wheelhouse,
         requirements,
         python_manifest,
+        environment_manifest,
     ) = _bootstrap_dependency_inputs(capsule_root=capsule_root, closure=closure)
     _prepare_trusted_os_sandbox(capsule_root=capsule_root, closure=closure)
     _prepare_trusted_runtime_files(capsule_root=capsule_root, closure=closure)
@@ -1039,6 +1184,7 @@ def bootstrap_recovery_environment(
                 "pip",
                 "--isolated",
                 "install",
+                "--no-compile",
                 "--no-index",
                 "--find-links",
                 str(wheelhouse),
@@ -1059,6 +1205,10 @@ def bootstrap_recovery_environment(
             additional_library_roots=(base_root / "lib",),
         ),
         environment=_bootstrap_environment(),
+    )
+    _verify_installed_environment(
+        environment_root=environment_root,
+        manifest=environment_manifest,
     )
     return _verify_with_bootstrapped_environment(
         venv_python=venv_python,

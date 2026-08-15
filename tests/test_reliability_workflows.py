@@ -999,8 +999,13 @@ def test_capsule_verification_never_reintroduces_the_checkout_with_pythonpath() 
     )
     assert "sys.path.insert(0,root)" not in workflow_text
     assert (
+        'sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"]'
+        not in workflow_text
+    )
+    assert (
         workflow_text.count(
-            'sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"]'
+            'import runpy,sys;sys.argv.pop(1);target=sys.argv.pop(1);'
+            'runpy.run_path(target,run_name="__main__")'
         )
         == 11
     )
