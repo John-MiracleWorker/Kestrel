@@ -11,6 +11,7 @@ import os
 import platform
 import subprocess
 import sys
+import tarfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -27,15 +28,40 @@ from scripts import release_control_receipt as receipts
 CLOSURE_SCHEMA = "kestrel.recovery_execution_closure.v1"
 MAX_CLOSURE_BYTES = 16 * 1024 * 1024
 MAX_MEMBER_BYTES = 128 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 8192
+MAX_ARCHIVE_MEMBER_BYTES = 2_147_483_648
+MAX_ARCHIVE_TOTAL_BYTES = 2_147_483_648
 ISOLATED_PYTHON_BOOTSTRAP = (
     "import json,runpy,sys;"
     "sys.path[:]=json.loads(sys.argv.pop(1));"
     "target=sys.argv.pop(1);"
     "runpy.run_path(target,run_name='__main__')"
 )
-SANDBOX_POLICY_ENV = "KESTREL_RECOVERY_SANDBOX_POLICY"
-SANDBOX_PROTOCOL = "kestrel-recovery-sandbox-v1"
-TRUSTED_OS_SANDBOX_IDENTITIES: Mapping[tuple[str, str], frozenset[tuple[str, str]]] = {}
+TRUSTED_RECOVERY_PYTHON_IDENTITIES: Mapping[
+    tuple[str, str], frozenset[tuple[str, str, str, str, str]]
+] = {
+    ("linux", "x86_64"): frozenset(
+        {
+            (
+                "sha256:dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8",
+                "Python 3.11.14",
+                "CPython",
+                "3.11.14",
+                "cp311",
+            )
+        }
+    )
+}
+TRUSTED_OS_SANDBOX_IDENTITIES: Mapping[tuple[str, str], frozenset[tuple[str, str]]] = {
+    ("linux", "x86_64"): frozenset(
+        {
+            (
+                "sha256:52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712",
+                "bubblewrap 0.9.0",
+            )
+        }
+    )
+}
 
 
 def _closure(raw: bytes) -> receipts.JSONObject:
@@ -335,6 +361,55 @@ def resolve_trusted_os_sandbox(*, closure: bytes) -> Path:
     return resolve_external_executable(closure=closure, name="sandbox")
 
 
+def resolve_trusted_recovery_python(*, closure: bytes) -> Path:
+    """Resolve only the independently pinned recovery interpreter identity."""
+
+    value = _closure(closure)
+    matches = [
+        receipts._object(item, label="recovery Python executable")  # noqa: SLF001
+        for item in receipts._array(  # noqa: SLF001
+            value.get("external_executables"), label="recovery external executables"
+        )
+        if receipts._object(  # noqa: SLF001
+            item, label="recovery external executable"
+        ).get("name")
+        == "python"
+    ]
+    if len(matches) != 1:
+        raise receipts.ReleaseControlError(
+            "Kestrel-trusted recovery Python is absent"
+        )
+    python_item = matches[0]
+    runtime = receipts._object(  # noqa: SLF001
+        value.get("python_runtime"), label="recovery Python runtime"
+    )
+    identity = (
+        receipts._digest(  # noqa: SLF001
+            python_item.get("sha256"), label="recovery Python executable digest"
+        ),
+        receipts._validate_string(  # noqa: SLF001
+            python_item.get("version"), label="recovery Python executable version"
+        ),
+        receipts._validate_string(  # noqa: SLF001
+            runtime.get("implementation"), label="recovery Python implementation"
+        ),
+        receipts._validate_string(  # noqa: SLF001
+            runtime.get("version"), label="recovery Python runtime version"
+        ),
+        receipts._validate_string(  # noqa: SLF001
+            runtime.get("abi"), label="recovery Python ABI"
+        ),
+    )
+    platform_identities = TRUSTED_RECOVERY_PYTHON_IDENTITIES.get(
+        (sys.platform, platform.machine()), frozenset()
+    )
+    if identity not in platform_identities:
+        raise receipts.ReleaseControlError(
+            "recovery Python is not a Kestrel-trusted platform identity"
+        )
+    return resolve_external_executable(closure=closure, name="python")
+
+
 def resolve_dynamic_import(
     *, closure: bytes, capsule_root: Path, importer: str, module: str
 ) -> Path:
@@ -505,8 +580,218 @@ def authorize_launch_arguments(*, closure: bytes, arguments: Sequence[str]) -> t
     return tuple(checked)
 
 
+def build_os_sandbox_arguments(
+    *,
+    closure: bytes,
+    sandbox: Path,
+    command: Sequence[str],
+    declared_endpoints: Sequence[str],
+) -> list[str]:
+    """Build the fixed bubblewrap profile for one offline recovery command."""
+
+    value = _closure(closure)
+    if not command:
+        raise receipts.ReleaseControlError("recovery sandbox command is empty")
+    if declared_endpoints:
+        raise receipts.ReleaseControlError(
+            "recovery network sandbox has no endpoint-filtering authority"
+        )
+    checked_command = [
+        receipts._validate_string(item, label="recovery sandbox command")  # noqa: SLF001
+        for item in command
+    ]
+    target = Path(checked_command[0])
+    external_paths = {
+        Path(
+            receipts._validate_string(  # noqa: SLF001
+                receipts._object(  # noqa: SLF001
+                    item, label="recovery external executable"
+                ).get("path"),
+                label="recovery external executable path",
+            )
+        ).resolve(strict=True)
+        for item in receipts._array(  # noqa: SLF001
+            value.get("external_executables"), label="recovery external executables"
+        )
+    }
+    resolved_target = target.resolve(strict=True)
+    roots = _validated_io_roots(value)
+    if not any(resolved_target == root or root in resolved_target.parents for root, _ in roots):
+        if resolved_target not in external_paths:
+            raise receipts.ReleaseControlError(
+                "recovery sandbox target is outside the execution closure"
+            )
+    resolved_sandbox = sandbox.resolve(strict=True)
+    if resolved_sandbox not in external_paths:
+        raise receipts.ReleaseControlError(
+            "recovery sandbox executable is outside the execution closure"
+        )
+
+    arguments = [
+        str(resolved_sandbox),
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+        "--unshare-net",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+    ]
+    for root, access in roots:
+        operation = "--bind" if access == "read_write" else "--ro-bind"
+        arguments.extend((operation, str(root), str(root)))
+    for executable in sorted(external_paths, key=str):
+        if any(executable == root or root in executable.parents for root, _ in roots):
+            continue
+        arguments.extend(("--ro-bind", str(executable), str(executable)))
+    environment = build_isolated_environment(closure=closure)
+    arguments.append("--clearenv")
+    for name, setting in sorted(environment.items()):
+        arguments.extend(("--setenv", name, setting))
+    capsule_root = Path(
+        receipts._validate_string(  # noqa: SLF001
+            receipts._array(value.get("sys_path"), label="recovery sys.path")[0],  # noqa: SLF001
+            label="recovery capsule sys.path",
+        )
+    ).resolve(strict=True)
+    arguments.extend(("--chdir", str(capsule_root), "--", *checked_command))
+    return arguments
+
+
+def materialize_candidate_from_capsule(
+    *,
+    closure: bytes,
+    capsule_root: Path,
+    destination: Path,
+) -> None:
+    """Extract only the candidate archive whose bytes are frozen in the closure."""
+
+    value = _closure(closure)
+    resources = _member_table(value, field="data_resources", capsule_root=capsule_root)
+    archive_entry = resources.get("candidate-archive.tar")
+    if archive_entry is None:
+        raise receipts.ReleaseControlError(
+            "recovery capsule candidate archive is absent from the closure"
+        )
+    archive, expected_digest = archive_entry
+    expected_archive = capsule_root.resolve(strict=True) / "candidate-archive.tar"
+    if archive.resolve(strict=True) != expected_archive or _member_digest(archive) != expected_digest:
+        raise receipts.ReleaseControlError(
+            "recovery capsule candidate archive identity mismatch"
+        )
+    if destination.exists() or destination.is_symlink():
+        raise receipts.ReleaseControlError(
+            "recovery candidate materialization destination must be absent"
+        )
+    if not destination.parent.is_dir() or destination.parent.is_symlink():
+        raise receipts.ReleaseControlError(
+            "recovery candidate materialization parent is invalid"
+        )
+    _authorize_io_path(value, path=destination.parent.resolve(strict=True), require_write=True)
+    _extract_deterministic_archive(archive=archive, destination=destination)
+
+
+def _extract_deterministic_archive(*, archive: Path, destination: Path) -> None:
+    """Extract authenticated regular members without importing a checkout helper."""
+
+    if not archive.is_file() or archive.is_symlink():
+        raise receipts.ReleaseControlError("recovery candidate archive is not regular")
+    if destination.exists() or destination.is_symlink():
+        raise receipts.ReleaseControlError(
+            "recovery candidate destination must be absent"
+        )
+    if not destination.parent.is_dir() or destination.parent.is_symlink():
+        raise receipts.ReleaseControlError(
+            "recovery candidate destination parent is invalid"
+        )
+    destination.mkdir(mode=0o700)
+    seen: set[str] = set()
+    total = 0
+    with tarfile.open(archive, mode="r:") as source:
+        members = source.getmembers()
+        if not members or len(members) > MAX_ARCHIVE_MEMBERS:
+            raise receipts.ReleaseControlError(
+                "recovery candidate archive member cardinality is invalid"
+            )
+        for member in members:
+            relative = _relative_member(
+                member.name, label="recovery candidate archive member"
+            )
+            normalized = relative.as_posix()
+            if normalized in seen:
+                raise receipts.ReleaseControlError(
+                    "recovery candidate archive has a duplicate member"
+                )
+            seen.add(normalized)
+            if member.pax_headers or member.sparse is not None:
+                raise receipts.ReleaseControlError(
+                    "recovery candidate archive metadata is not deterministic"
+                )
+            if member.uid != 0 or member.gid != 0 or member.mtime != 0:
+                raise receipts.ReleaseControlError(
+                    "recovery candidate archive ownership or time is not deterministic"
+                )
+            target = destination.joinpath(*relative.parts)
+            if member.isdir():
+                if member.mode != 0o755:
+                    raise receipts.ReleaseControlError(
+                        "recovery candidate archive directory mode is invalid"
+                    )
+                target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                target.chmod(0o755)
+                continue
+            if not member.isreg() or member.mode != 0o644:
+                raise receipts.ReleaseControlError(
+                    "recovery candidate archive has a link, special file, or invalid mode"
+                )
+            if member.size < 0 or member.size > MAX_ARCHIVE_MEMBER_BYTES:
+                raise receipts.ReleaseControlError(
+                    "recovery candidate archive member size is invalid"
+                )
+            total += member.size
+            if total > MAX_ARCHIVE_TOTAL_BYTES:
+                raise receipts.ReleaseControlError(
+                    "recovery candidate archive exceeds the total size limit"
+                )
+            target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            extracted = source.extractfile(member)
+            if extracted is None:
+                raise receipts.ReleaseControlError(
+                    "recovery candidate archive member body is absent"
+                )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(target, flags, 0o644)
+            written = 0
+            try:
+                with os.fdopen(descriptor, "wb", closefd=True) as output:
+                    while chunk := extracted.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > member.size:
+                            raise receipts.ReleaseControlError(
+                                "recovery candidate archive member exceeded its size"
+                            )
+                        output.write(chunk)
+                    if written != member.size:
+                        raise receipts.ReleaseControlError(
+                            "recovery candidate archive member ended early"
+                        )
+                    output.flush()
+                    os.fsync(output.fileno())
+            finally:
+                extracted.close()
+            target.chmod(0o644)
+
+
 def inspect_isolated_python(executable: Path) -> tuple[list[str], dict[str, str]]:
-    """Read sys.path and runtime identity from the exact isolated target interpreter."""
+    """Read the exact isolated target runtime and its hash-locked dependency path."""
 
     probe = (
         "import json,platform,sys;"
@@ -516,7 +801,7 @@ def inspect_isolated_python(executable: Path) -> tuple[list[str], dict[str, str]
         "'sys_path':sys.path},sort_keys=True,separators=(',',':')))"
     )
     completed = subprocess.run(  # noqa: S603  # nosec B603
-        [str(executable), "-I", "-S", "-c", probe],
+        [str(executable), "-I", "-B", "-c", probe],
         capture_output=True,
         check=False,
         env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"},
@@ -548,19 +833,66 @@ def inspect_isolated_python(executable: Path) -> tuple[list[str], dict[str, str]
     return paths, runtime
 
 
+def effective_recovery_sys_path(
+    *, capsule_root: Path, interpreter_sys_path: Sequence[str]
+) -> list[str]:
+    """Compose the exact executable path from the capsule and a real isolated probe."""
+
+    try:
+        resolved_capsule = capsule_root.resolve(strict=True)
+    except OSError as exc:
+        raise receipts.ReleaseControlError("recovery capsule sys.path root is missing") from exc
+    if not resolved_capsule.is_dir() or capsule_root.is_symlink():
+        raise receipts.ReleaseControlError("recovery capsule sys.path root is invalid")
+    effective = [str(resolved_capsule)]
+    observed: set[str] = set()
+    for raw_entry in interpreter_sys_path:
+        entry = receipts._validate_string(  # noqa: SLF001
+            raw_entry, label="isolated recovery Python sys.path"
+        )
+        path = Path(entry)
+        if not path.is_absolute():
+            raise receipts.ReleaseControlError(
+                "isolated recovery Python sys.path contains a relative entry"
+            )
+        if entry in observed:
+            raise receipts.ReleaseControlError(
+                "isolated recovery Python sys.path is duplicated"
+            )
+        observed.add(entry)
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            # The effective launch path is replaced explicitly. A conventional
+            # nonexistent pythonXY.zip probe entry therefore grants no authority.
+            continue
+        if (
+            path.is_symlink()
+            or str(resolved) != entry
+            or (not resolved.is_dir() and not resolved.is_file())
+        ):
+            raise receipts.ReleaseControlError(
+                "isolated recovery Python sys.path entry is not exact"
+            )
+        if entry in effective:
+            raise receipts.ReleaseControlError(
+                "isolated recovery Python sys.path duplicates the capsule"
+            )
+        effective.append(entry)
+    return effective
+
+
 def _validate_active_sys_path(*, expected: Sequence[str], active: Sequence[str]) -> None:
     if not active or len(active) != len(set(active)):
         raise receipts.ReleaseControlError("active recovery sys.path is empty or duplicated")
-    positions: list[int] = []
     for entry in active:
-        if not Path(entry).is_absolute() or entry not in expected:
+        if not Path(entry).is_absolute():
             raise receipts.ReleaseControlError(
                 "active sys.path contains ambient paths outside the recovery closure"
             )
-        positions.append(expected.index(entry))
-    if positions != sorted(positions):
+    if list(active) != list(expected):
         raise receipts.ReleaseControlError(
-            "active recovery sys.path order differs from the closure"
+            "active recovery sys.path is not the complete ordered closure"
         )
 
 
@@ -659,19 +991,31 @@ def verify_execution_closure(
         path = resolve_external_executable(closure=closure, name=name)
         version = versions.get(str(path))
         if version is None:
-            result = subprocess.run(
-                [str(path), "--version"],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=build_isolated_environment(closure=closure),
-                timeout=10,
-            )
-            if result.returncode != 0:
-                raise receipts.ReleaseControlError(
-                    "recovery external executable version check failed"
+            if name == "python":
+                version = f"Python {actual_runtime['version']}"
+            elif name == "sandbox":
+                if resolve_trusted_os_sandbox(closure=closure) != path:
+                    raise receipts.ReleaseControlError(
+                        "recovery sandbox identity changed during closure verification"
+                    )
+                result = subprocess.run(
+                    [str(path), "--version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=build_isolated_environment(closure=closure),
+                    timeout=10,
                 )
-            version = (result.stdout or result.stderr).splitlines()[0]
+                if result.returncode != 0:
+                    raise receipts.ReleaseControlError(
+                        "recovery external executable version check failed"
+                    )
+                version = (result.stdout or result.stderr).splitlines()[0]
+            else:
+                # The digest and closure membership authorize this tool, but its
+                # first execution must occur inside the OS sandbox. A caller may
+                # supply an independently captured version without executing it.
+                continue
         if version != item.get("version"):
             raise receipts.ReleaseControlError("recovery external executable version mismatch")
     _verify_dependency_lock(value, capsule_root)
@@ -684,6 +1028,10 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify")
     verify.add_argument("closure")
     verify.add_argument("--capsule-root", required=True)
+    materialize = commands.add_parser("materialize-candidate")
+    materialize.add_argument("closure")
+    materialize.add_argument("--capsule-root", required=True)
+    materialize.add_argument("--destination", required=True)
     launch = commands.add_parser("launch")
     launch.add_argument("closure")
     launch.add_argument("--capsule-root", required=True)
@@ -700,13 +1048,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         closure_path, label="recovery execution closure", max_bytes=MAX_CLOSURE_BYTES
     )
     value = _closure(closure)
+    if args.command == "materialize-candidate":
+        materialize_candidate_from_capsule(
+            closure=closure,
+            capsule_root=Path(args.capsule_root),
+            destination=Path(args.destination),
+        )
+        return 0
     try:
-        python_executable = resolve_external_executable(closure=closure, name="python")
+        python_executable = resolve_trusted_recovery_python(closure=closure)
     except receipts.ReleaseControlError as exc:
         raise receipts.ReleaseControlError(
             "recovery Python interpreter is absent from the exact closure"
         ) from exc
-    active_sys_path, active_runtime = inspect_isolated_python(python_executable)
+    interpreter_sys_path, active_runtime = inspect_isolated_python(python_executable)
+    active_sys_path = effective_recovery_sys_path(
+        capsule_root=Path(args.capsule_root),
+        interpreter_sys_path=interpreter_sys_path,
+    )
     verify_execution_closure(
         closure=closure,
         capsule_root=Path(args.capsule_root),
@@ -759,32 +1118,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     sandbox = resolve_trusted_os_sandbox(closure=closure)
     if sandbox == executable:
         raise receipts.ReleaseControlError("recovery sandbox and target must be distinct")
-    policy: receipts.JSONObject = {
-        "schema": "kestrel.recovery_sandbox_policy.v1",
-        "protocol": SANDBOX_PROTOCOL,
-        "capsule_root": str(Path(args.capsule_root).resolve(strict=True)),
-        "target": {
-            "name": executable_name,
-            "path": str(executable),
-            "arguments": cast(list[receipts.JSONValue], arguments[1:]),
-        },
-        "io_roots": value["io_roots"],
-        "network_policy": {
-            "default_deny": True,
-            "allowed_endpoints": cast(list[receipts.JSONValue], declared_endpoints),
-        },
-    }
     environment = build_isolated_environment(closure=closure)
-    environment[SANDBOX_POLICY_ENV] = receipts.canonical_json_bytes(policy).decode("ascii")
-    sandbox_arguments = [
-        str(sandbox),
-        "--protocol",
-        SANDBOX_PROTOCOL,
-        "--policy-env",
-        SANDBOX_POLICY_ENV,
-        "--",
-        *arguments,
-    ]
+    sandbox_arguments = build_os_sandbox_arguments(
+        closure=closure,
+        sandbox=sandbox,
+        command=arguments,
+        declared_endpoints=declared_endpoints,
+    )
     os.execve(str(sandbox), sandbox_arguments, environment)
     return 1  # pragma: no cover
 

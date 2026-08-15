@@ -5,7 +5,6 @@ import os
 import re
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -74,6 +73,1068 @@ def test_release_candidate_workflow_has_exact_dispatch_graph_and_permissions() -
         "finalize-candidate": {"actions": "read", "contents": "read"},
     }
     assert all("environment" not in job for job in jobs.values())
+
+
+def test_release_promotion_workflow_has_exact_dispatch_contract() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+
+    assert workflow["run-name"] == (
+        "Kestrel release tx ${{ inputs.transaction_nonce }} "
+        "bind ${{ inputs.dispatch_binding }}"
+    )
+    assert workflow["permissions"] == {}
+    assert workflow["concurrency"] == {
+        "group": "kestrel-release-promotion",
+        "cancel-in-progress": False,
+    }
+    trigger = _github_workflow_trigger(workflow)
+    assert isinstance(trigger, dict)
+    assert set(trigger) == {"workflow_dispatch"}
+    inputs = trigger["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {
+        "candidate_run_id",
+        "candidate_manifest_digest",
+        "mode",
+        "transaction_nonce",
+        "dispatch_binding",
+    }
+    for contract in inputs.values():
+        assert contract["required"] is True
+        assert contract["type"] == "string"
+        assert "default" not in contract
+
+    assert list(workflow["jobs"]) == ["release-transaction"]
+    transaction = workflow["jobs"]["release-transaction"]
+    assert transaction == {
+        "uses": "./.github/workflows/release-transaction.yml",
+        "permissions": {
+            "actions": "read",
+            "attestations": "write",
+            "contents": "write",
+            "id-token": "write",
+            "packages": "write",
+        },
+        "secrets": {
+            "RELEASE_GUARD_TOKEN": "${{ secrets.RELEASE_GUARD_TOKEN }}",
+            "RELEASE_RECOVERY_READER_TOKEN": (
+                "${{ secrets.RELEASE_RECOVERY_READER_TOKEN }}"
+            ),
+        },
+        "with": {
+            "candidate_run_id": "${{ inputs.candidate_run_id }}",
+            "candidate_manifest_digest": "${{ inputs.candidate_manifest_digest }}",
+            "mode": "${{ inputs.mode }}",
+            "transaction_nonce": "${{ inputs.transaction_nonce }}",
+            "dispatch_binding": "${{ inputs.dispatch_binding }}",
+        },
+    }
+    assert "secrets: inherit" not in workflow_path.read_text(encoding="utf-8")
+
+
+def test_release_transaction_has_exact_seven_job_graph_and_permissions() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-transaction.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+
+    assert workflow["permissions"] == {}
+    trigger = _github_workflow_trigger(workflow)
+    assert isinstance(trigger, dict)
+    assert set(trigger) == {"workflow_call"}
+    workflow_call = trigger["workflow_call"]
+    assert workflow_call["secrets"] == {
+        "RELEASE_GUARD_TOKEN": {"required": True},
+        "RELEASE_RECOVERY_READER_TOKEN": {"required": True},
+    }
+    inputs = workflow_call["inputs"]
+    assert set(inputs) == {
+        "candidate_run_id",
+        "candidate_manifest_digest",
+        "mode",
+        "transaction_nonce",
+        "dispatch_binding",
+    }
+    for contract in inputs.values():
+        assert contract["required"] is True
+        assert contract["type"] == "string"
+        assert "default" not in contract
+
+    jobs = workflow["jobs"]
+    assert list(jobs) == [
+        "identity-admission",
+        "authorize-release",
+        "prepare-github-ghcr",
+        "commit-github-release",
+        "verify-github-ghcr",
+        "publish-pypi",
+        "reconcile-final",
+    ]
+    assert all(job["runs-on"] == "ubuntu-24.04" for job in jobs.values())
+    assert "needs" not in jobs["identity-admission"]
+    assert jobs["authorize-release"]["needs"] == "identity-admission"
+    assert jobs["prepare-github-ghcr"]["needs"] == "authorize-release"
+    assert jobs["commit-github-release"]["needs"] == "prepare-github-ghcr"
+    assert jobs["verify-github-ghcr"]["needs"] == "commit-github-release"
+    assert jobs["publish-pypi"]["needs"] == "verify-github-ghcr"
+    assert jobs["reconcile-final"]["needs"] == [
+        "identity-admission",
+        "authorize-release",
+        "prepare-github-ghcr",
+        "commit-github-release",
+        "verify-github-ghcr",
+        "publish-pypi",
+    ]
+    assert jobs["reconcile-final"]["if"] == "${{ always() }}"
+    assert {
+        name: job.get("environment") for name, job in jobs.items()
+    } == {
+        "identity-admission": None,
+        "authorize-release": {"name": "release"},
+        "prepare-github-ghcr": {"name": "release-prepare"},
+        "commit-github-release": {"name": "release-commit"},
+        "verify-github-ghcr": None,
+        "publish-pypi": {"name": "pypi"},
+        "reconcile-final": None,
+    }
+    assert {name: job["permissions"] for name, job in jobs.items()} == {
+        "identity-admission": {"actions": "read", "contents": "read"},
+        "authorize-release": {
+            "actions": "read",
+            "attestations": "read",
+            "contents": "read",
+            "packages": "read",
+        },
+        "prepare-github-ghcr": {
+            "actions": "read",
+            "contents": "write",
+            "packages": "write",
+        },
+        "commit-github-release": {
+            "actions": "read",
+            "attestations": "write",
+            "contents": "write",
+            "id-token": "write",
+            "packages": "read",
+        },
+        "verify-github-ghcr": {
+            "actions": "read",
+            "attestations": "read",
+            "contents": "read",
+            "packages": "read",
+        },
+        "publish-pypi": {
+            "actions": "read",
+            "contents": "read",
+            "id-token": "write",
+        },
+        "reconcile-final": {
+            "actions": "read",
+            "attestations": "read",
+            "contents": "read",
+            "packages": "read",
+        },
+    }
+
+
+def test_release_transaction_uses_only_frozen_github_authority_phases() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    scripts_by_job = {
+        name: "\n".join(str(step.get("run", "")) for step in job["steps"])
+        for name, job in workflow["jobs"].items()
+    }
+    all_scripts = "\n".join(scripts_by_job.values())
+
+    assert "--expected-phase" not in all_scripts
+    assert "--expected-github-authority-phase" not in all_scripts
+    for forbidden_stem in (
+        "github-authorization-authority",
+        "github-preparation-authority",
+        "github-verification-authority",
+        "github-pypi-boundary-authority",
+        "github-final-authority",
+    ):
+        assert forbidden_stem not in all_scripts
+
+    authorize = scripts_by_job["authorize-release"]
+    assert "authority-evidence/github-admission-authority.json" in authorize
+    assert "authority-evidence/github-admission-authority-verification.json" in authorize
+    assert "--github-admission-authority-verification" in authorize
+
+    commit = scripts_by_job["commit-github-release"]
+    assert "github-commit-authority.json" in commit
+    assert "github-commit-authority-verification.json" in commit
+
+
+def test_release_mutations_have_last_moment_current_authority_gates() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(encoding="utf-8")
+    )
+
+    expected_predecessors = {
+        "prepare-github-ghcr": {
+            "Execute only the authorized preparation plan": (
+                "Revalidate preparation authority immediately before mutation",
+            ),
+        },
+        "commit-github-release": {
+            "Atomically create the marker and publish the exact draft": (
+                "Revalidate commit authority immediately before marker publication",
+            ),
+            "Create only the missing OCI repository custom attestation": (
+                "Revalidate commit authority immediately before OCI attestation",
+            ),
+        },
+        "publish-pypi": {
+            "Publish only the missing exact PyPI distributions": (
+                "Revalidate PyPI and GitHub authority immediately before publication",
+            ),
+        },
+    }
+    for job_name, guarded_steps in expected_predecessors.items():
+        steps = workflow["jobs"][job_name]["steps"]
+        names = [step["name"] for step in steps]
+        for mutation, predecessors in guarded_steps.items():
+            mutation_index = names.index(mutation)
+            assert tuple(names[mutation_index - len(predecessors) : mutation_index]) == predecessors
+
+    prepare_gate = next(
+        step
+        for step in workflow["jobs"]["prepare-github-ghcr"]["steps"]
+        if step["name"] == "Revalidate preparation authority immediately before mutation"
+    )["run"]
+    for required in (
+        "validate_server_authorization",
+        "_verified_authority_from_record",
+        "_require_current_authority",
+        "_require_authorization_admission_authority",
+    ):
+        assert required in prepare_gate
+
+    for gate_name in (
+        "Revalidate commit authority immediately before marker publication",
+        "Revalidate commit authority immediately before OCI attestation",
+    ):
+        gate = next(
+            step
+            for step in workflow["jobs"]["commit-github-release"]["steps"]
+            if step["name"] == gate_name
+        )
+        assert "verify-github-boundary-binding" in gate["run"]
+
+    pypi_gate = next(
+        step
+        for step in workflow["jobs"]["publish-pypi"]["steps"]
+        if step["name"]
+        == "Revalidate PyPI and GitHub authority immediately before publication"
+    )
+    assert "_require_pypi_authority_binding" in pypi_gate["run"]
+    assert "_require_current_authority" in pypi_gate["run"]
+
+
+def test_commit_reobserves_exact_annotated_tag_before_release_publication() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    execute = next(
+        step["run"]
+        for step in workflow["jobs"]["commit-github-release"]["steps"]
+        if step.get("name") == "Atomically create the marker and publish the exact draft"
+    )
+
+    create_ref = execute.index("/git/refs")
+    reread_ref = execute.index("/git/ref/tags/", create_ref)
+    classify = execute.index("_classify_commit_tag_observation", reread_ref)
+    publish = execute.index('"PATCH"', classify)
+    assert create_ref < reread_ref < classify < publish
+
+
+def test_pypi_public_state_is_reobserved_immediately_before_publisher() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["publish-pypi"]["steps"]
+    names = [step.get("name") for step in steps]
+    gate_name = "Revalidate PyPI and GitHub authority immediately before publication"
+    publish_name = "Publish only the missing exact PyPI distributions"
+    publish_index = names.index(publish_name)
+    assert names[publish_index - 1] == gate_name
+    gate = steps[publish_index - 1]["run"]
+    assert "fresh-project.json" in gate
+    assert "planned_state" in gate and "fresh_state" in gate
+    assert "PyPI state changed after publication planning" in gate
+    assert "staged PyPI distribution changed after planning" in gate
+
+
+def test_final_reconciliation_is_durable_when_live_observation_fails() -> None:
+    workflow_text = (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+        encoding="utf-8"
+    )
+    workflow = yaml.safe_load(workflow_text)
+    steps = workflow["jobs"]["reconcile-final"]["steps"]
+    by_name = {step["name"]: step for step in steps}
+
+    observation = by_name[
+        "Observe the active lock, ingress, and every available release surface"
+    ]
+    assert observation["continue-on-error"] is True
+    assert observation["if"] == "${{ always() }}"
+    assert by_name["Reconcile the transaction without inventing authority"]["if"] == (
+        "${{ always() }}"
+    )
+    assert "final Release listing requires another page" not in workflow_text
+    assert "_boundary_paginated_source" in observation["run"]
+
+
+def test_final_reconciliation_refreshes_authority_before_a_bounded_observation() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["reconcile-final"]["steps"]
+    names = [step["name"] for step in steps]
+    fetch_name = "Download the fresh terminal final authority boundary"
+    boundary_name = "Capture the final live prerequisite boundary"
+    binding_name = "Verify the exact terminal final transaction binding"
+    observation_name = (
+        "Observe the active lock, ingress, and every available release surface"
+    )
+    reconcile_name = "Reconcile the transaction without inventing authority"
+
+    assert names.index(fetch_name) < names.index(boundary_name)
+    assert names.index(boundary_name) < names.index(binding_name)
+    assert names.index(binding_name) < names.index(observation_name)
+    assert names.index(observation_name) < names.index(reconcile_name)
+
+    by_name = {step["name"]: step for step in steps}
+    assert "observe-final-surfaces" not in by_name[fetch_name]["if"]
+    capture = by_name[boundary_name]
+    assert "begin_final_reconciliation_freshness_budget" in capture["run"]
+    observation = by_name[observation_name]
+    assert (
+        "remaining_final_reconciliation_observation_seconds" in observation["run"]
+    )
+    assert "if ! test -e reconciliation/final-freshness-budget.json" in observation[
+        "run"
+    ]
+    assert "begin_final_reconciliation_freshness_budget" in observation["run"]
+    assert "timeout --signal=TERM --kill-after=5s" in observation["run"]
+    assert '"${observation_budget}s"' in observation["run"]
+    assert "kestrel-final-observation" in observation["run"]
+    reconcile = by_name[reconcile_name]
+    assert "require_final_reconciliation_freshness_budget" in reconcile["run"]
+    assert "final_freshness_budget_exhausted" in reconcile["run"]
+
+
+def test_release_signature_verification_steps_receive_the_qualified_guard_token() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(encoding="utf-8")
+    )
+    signature_consumers = (
+        "verify-runtime-credential",
+        "verify-github-authority",
+        "verify-github-boundary-binding",
+        "verify-pypi-authority",
+        "_verified_authority_from_record",
+        "record-pypi",
+        'reconcile "${arguments[@]}"',
+    )
+
+    for job in workflow["jobs"].values():
+        for step in job["steps"]:
+            script = str(step.get("run", ""))
+            if any(command in script for command in signature_consumers):
+                assert step.get("env", {}).get("GH_TOKEN") in {
+                    "${{ github.token }}",
+                    "${{ secrets.RELEASE_GUARD_TOKEN }}",
+                }, step["name"]
+
+
+def test_every_inline_github_release_asset_reader_uses_the_bounded_redirect_client() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(encoding="utf-8")
+    )
+    identity_steps = {
+        step["name"]: str(step.get("run", ""))
+        for step in workflow["jobs"]["identity-admission"]["steps"]
+    }
+
+    for step_name in (
+        "Verify recovery-reader credential scope",
+        "Poll and verify owner-signed dispatch admission",
+    ):
+        script = identity_steps[step_name]
+        assert "DirectGitHubReadAPI" in script
+        assert "asset_api(" in script
+
+    admission_script = identity_steps["Poll and verify owner-signed dispatch admission"]
+    assert '"Authorization": f"Bearer {token}"' not in admission_script.split(
+        "for asset in assets:", maxsplit=1
+    )[1]
+
+
+def test_every_ghcr_digest_reader_uses_the_credential_stripping_client() -> None:
+    workflow_text = (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow_text.count("fetch_ghcr_pull_token(") == 8
+    assert workflow_text.count("DirectOCIReadAPI(") == 9
+    assert workflow_text.count("registry_api.read_digest(") == 8
+    assert workflow_text.count("registry_reader.read_digest(") == 2
+    assert re.search(r"https://ghcr\.io/v2/[^\n]*\{kind\}", workflow_text) is None
+
+
+def test_ghcr_publisher_uses_the_pinned_nonredirecting_write_client() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    preparation = next(
+        step
+        for step in workflow["jobs"]["prepare-github-ghcr"]["steps"]
+        if step.get("name") == "Execute only the authorized preparation plan"
+    )["run"]
+
+    assert "fetch_ghcr_push_token(" in preparation
+    assert "DirectOCIWriteAPI(" in preparation
+    assert "registry_writer.upload_blob(" in preparation
+    assert "registry_writer.put_manifest(" in preparation
+    assert "urllib.request" not in preparation
+    assert "token_url" not in preparation
+
+
+def test_preparation_recovery_mutates_only_missing_exact_objects() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    preparation = next(
+        step["run"]
+        for step in workflow["jobs"]["prepare-github-ghcr"]["steps"]
+        if step.get("name") == "Execute only the authorized preparation plan"
+    )
+
+    digest_check = preparation.index("for operation, request in requests.items()")
+    first_mutation = preparation.index('if release_operation["action"] == "create"')
+    assert digest_check < first_mutation
+    assert "_missing_product_release_assets" in preparation
+    assert "_missing_ghcr_object_digests" in preparation
+    assert 'created_release_id = created_state["release_id"]' in preparation
+    assert "_resolve_product_release_asset_upload_target" in preparation
+    assert '"api",\n                          "api",' not in preparation
+    assert "uploaded Release asset is not exact by Release ID" in preparation
+    assert "digest not in missing_oci_digests" in preparation
+    assert "uploaded GHCR blob is not observable by digest" in preparation
+    assert "uploaded GHCR manifest is not observable by digest" in preparation
+
+
+def test_attestation_plan_uses_missing_subjects_and_stable_fresh_predicate_identity() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    materialize = next(
+        step["run"]
+        for step in workflow["jobs"]["commit-github-release"]["steps"]
+        if step.get("name")
+        == "Materialize the canonical predicate from fresh published surfaces"
+    )
+
+    assert "existing_identities" in materialize
+    assert "missing_subjects" in materialize
+    assert "_promotion_attestation_request_identity" in materialize
+    assert 'item for item in missing_subjects if item["kind"] == kind' in materialize
+    assert "available_by_digest_at" not in materialize.split(
+        "_promotion_attestation_request_identity", 1
+    )[1]
+
+
+def test_file_attestations_use_eight_guarded_singleton_subjects() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["commit-github-release"]["steps"]
+    names = [step["name"] for step in steps]
+    singleton_steps = [
+        step
+        for step in steps
+        if step["name"].startswith("Create missing file subject ")
+    ]
+
+    assert len(singleton_steps) == 8
+    for index, attestation in enumerate(singleton_steps):
+        assert attestation["id"] == f"attest-file-{index}"
+        assert attestation["if"] == (
+            f"${{{{ steps.commit-plan.outputs.file_{index}_action == 'create' }}}}"
+        )
+        assert attestation["with"] == {
+            "subject-name": f"${{{{ steps.commit-plan.outputs.file_{index}_name }}}}",
+            "subject-digest": f"${{{{ steps.commit-plan.outputs.file_{index}_digest }}}}",
+            "predicate-type": "https://kestrel.dev/attestations/release-promotion/v1",
+            "predicate-path": "transaction/stages/release-promotion-predicate.json",
+        }
+        position = names.index(attestation["name"])
+        gate = steps[position - 1]
+        assert gate["name"] == f"Revalidate commit authority for file subject {index}"
+        assert gate["if"] == attestation["if"]
+        assert "verify-github-boundary-binding" in gate["run"]
+
+    commit_plan = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Observe exact commit surfaces and create the commit plan"
+    )
+    assert "len(file_subjects) != 8" in commit_plan
+    assert "subject-checksums" not in (
+        ROOT / ".github" / "workflows" / "release-transaction.yml"
+    ).read_text(encoding="utf-8")
+
+
+def test_every_ghcr_observation_requires_complete_package_and_tag_visibility() -> None:
+    workflow_text = (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow_text.count('"package_present": package_present') == 8
+    assert workflow_text.count('"tag_inventory_complete": (') == 8
+    assert workflow_text.count("_ghcr_package_is_present(") >= workflow_text.count(
+        '"package_present": package_present'
+    )
+
+
+def test_preparation_states_await_fresh_ghcr_read_model_convergence() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["prepare-github-ghcr"]["steps"]
+
+    for step_name, settled_assignment in (
+        (
+            "Observe and plan draft Release and digest-only GHCR preparation",
+            "ghcr = transaction.wait_for_ghcr_digest_convergence",
+        ),
+        (
+            "Record preparation outcome from fresh post-state",
+            "post_ghcr = transaction.wait_for_ghcr_digest_convergence",
+        ),
+    ):
+        source = next(step["run"] for step in steps if step.get("name") == step_name)
+        poll = source.split("def observe_ghcr():", 1)[1].split(
+            settled_assignment, 1
+        )[0]
+        assert "run_gh_json(" in poll
+        assert "subprocess.run(" in source
+        assert (
+            "users/John-MiracleWorker/packages?package_type=container&per_page=100"
+            in poll
+        )
+        assert (
+            "users/John-MiracleWorker/packages/container/kestrel/versions?per_page=100"
+            in poll
+        )
+        assert "registry_api.read_digest(" in poll
+        assert "time.sleep(" not in source
+        assert "time.monotonic(" not in source
+
+
+def test_release_transaction_wires_role_specific_transaction_stages() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-transaction.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    jobs = workflow["jobs"]
+
+    assert "Fail closed until" not in workflow_text
+    required_commands = {
+        "identity-admission": (
+            "create-dispatch-identity",
+            "verify-runtime-credential",
+            "verify_dispatch_admission",
+            "release_candidate_manifest verify",
+        ),
+        "authorize-release": (
+            "verify-runtime-credential",
+            "verify-github-authority",
+            "inspect-prerequisites",
+            "release_promotion_transaction authorize",
+        ),
+        "prepare-github-ghcr": (
+            "verify-recovery-capsule",
+            "inspect-prerequisites",
+            "plan-preparation",
+            "record-preparation",
+        ),
+        "commit-github-release": (
+            "verify-recovery-capsule",
+            "verify-github-authority",
+            "inspect-prerequisites",
+            "plan-commit",
+            "record-commit",
+        ),
+        "verify-github-ghcr": (
+            "verify-recovery-capsule",
+            "verify-github-ghcr",
+        ),
+        "publish-pypi": (
+            "verify-pypi-authority",
+            "pypi-attestations verify pypi --offline",
+            "record-pypi",
+        ),
+        "reconcile-final": ("release_promotion_transaction reconcile",),
+    }
+    for job_name, commands in required_commands.items():
+        job_text = "\n".join(str(step.get("run", "")) for step in jobs[job_name]["steps"])
+        for command in commands:
+            assert command in job_text, f"{job_name} does not invoke {command}"
+
+    authorize_text = json.dumps(jobs["authorize-release"], sort_keys=True)
+    assert "release-authorization.json" in authorize_text
+    assert "release-execution-authorization.json" in authorize_text
+    assert "authorization.json" not in authorize_text.replace(
+        "release-authorization.json", ""
+    ).replace("release-execution-authorization.json", "")
+
+    for job in jobs.values():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if isinstance(run, str):
+                assert "${{ inputs." not in run
+                assert "${{ github.event.inputs" not in run
+
+
+def test_release_transaction_uses_mode_specific_authorization_artifact_names() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    expected_name = "${{ env.PROMOTION_AUTHORIZATION_ARTIFACT_NAME }}"
+    assert workflow["env"]["PROMOTION_AUTHORIZATION_ARTIFACT_NAME"] == (
+        "${{ inputs.mode == 'initiate' && "
+        "format('kestrel-release-transaction-authorization-{0}-1', github.run_id) || "
+        "format('kestrel-release-execution-authorization-{0}-1', github.run_id) }}"
+    )
+
+    upload = next(
+        step
+        for step in workflow["jobs"]["authorize-release"]["steps"]
+        if step.get("name") == "Upload role-specific authorization"
+    )
+    restore = next(
+        step
+        for step in workflow["jobs"]["prepare-github-ghcr"]["steps"]
+        if step.get("name") == "Restore role-specific authorization"
+    )
+    assert upload["with"]["name"] == expected_name
+    assert restore["with"]["name"] == expected_name
+
+    workflow_text = (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "kestrel-release-authorization-${{ github.run_id }}-1" not in workflow_text
+
+
+def test_release_transaction_recaptures_prerequisites_at_every_live_boundary() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    jobs = workflow["jobs"]
+    expected = {
+        "authorize-release": "authorization-boundary",
+        "prepare-github-ghcr": "preparation-boundary",
+        "commit-github-release": "commit-boundary",
+        "verify-github-ghcr": "verification-boundary",
+        "publish-pypi": "pypi-boundary",
+    }
+    external_observations = (
+        "repository-observation.json",
+        "repository-collaborators-observation.json",
+        "repository-invitations-observation.json",
+        "deploy-keys-observation.json",
+        "actions-workflow-permissions-observation.json",
+        "owner-signing-keys-observation.json",
+        "main-branch-observation.json",
+        "immutable-releases-observation.json",
+        "rulesets-observation.json",
+        "tag-ruleset-detail-observation.json",
+        "ingress-ruleset-detail-observation.json",
+        "workflow-observation.json",
+        "default-branch-workflow-contents.json",
+        "candidate-workflow-contents.json",
+        "recovery-repository-observation.json",
+        "recovery-immutable-releases-observation.json",
+        "environment-release-observation.json",
+        "environment-release-prepare-observation.json",
+        "environment-release-commit-observation.json",
+        "environment-pypi-observation.json",
+        "environment-release-policies-observation.json",
+        "environment-release-prepare-policies-observation.json",
+        "environment-release-commit-policies-observation.json",
+        "environment-pypi-policies-observation.json",
+    )
+
+    for job_name, boundary in expected.items():
+        steps = jobs[job_name]["steps"]
+        capture_index, capture = next(
+            (index, step)
+            for index, step in enumerate(steps)
+            if "capture-prerequisite-boundary" in str(step.get("run", ""))
+        )
+        capture_run = capture["run"]
+        assert f"transaction/{boundary}" in capture_run
+        assert capture["env"] == {
+            "GH_TOKEN": "${{ secrets.RELEASE_GUARD_TOKEN }}",
+            "RELEASE_RECOVERY_READER_TOKEN_BYTES": (
+                "${{ secrets.RELEASE_RECOVERY_READER_TOKEN }}"
+            ),
+        }
+        inspect_index, inspect = next(
+            (index, step)
+            for index, step in enumerate(steps)
+            if "inspect-prerequisites" in str(step.get("run", ""))
+        )
+        assert capture_index < inspect_index
+        inspect_run = inspect["run"]
+        for filename in external_observations:
+            assert f"transaction/{boundary}/{filename}" in inspect_run
+
+
+def test_recovery_reader_captures_authenticated_paginated_owner_keys() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    step = next(
+        step
+        for step in workflow["jobs"]["identity-admission"]["steps"]
+        if step.get("name") == "Verify recovery-reader credential scope"
+    )
+    run = step["run"]
+
+    assert '"pages": keys_pages' in run
+    assert '"request_url": keys_request_url' in run
+    assert '"response_headers": keys_headers' in run
+    assert "authenticated=False" not in run
+    assert "--identity-observation" in run
+    assert "transaction-identity/recovery-reader/identity-probe.json" in run
+
+
+def test_release_transaction_rebootstraps_capsules_after_artifact_transport() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    jobs = workflow["jobs"]
+
+    for producer in (
+        "prepare-github-ghcr",
+        "commit-github-release",
+        "verify-github-ghcr",
+    ):
+        upload = next(
+            step
+            for step in jobs[producer]["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+            and "transaction" in str(step.get("with", {}).get("path", ""))
+        )
+        assert "!transaction/capsule/**" in upload["with"]["path"]
+
+    for consumer, step_name in (
+        ("commit-github-release", "Reverify the immutable recovery capsule before commit"),
+        (
+            "verify-github-ghcr",
+            "Reverify the immutable recovery capsule before surface verification",
+        ),
+        ("publish-pypi", "Reverify the immutable recovery capsule before PyPI admission"),
+    ):
+        step = next(step for step in jobs[consumer]["steps"] if step.get("name") == step_name)
+        run = step["run"]
+        bootstrap = run.index("transaction/capsule-download/recovery-bootstrap.py")
+        executable_check = run.index('capsule_python="$capsule_root/venv/bin/python"')
+        assert "test ! -e transaction/capsule" in run[:bootstrap]
+        assert bootstrap < executable_check
+
+
+def test_recovery_capsule_locator_comes_from_the_committed_publication_receipt() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    prepare = workflow["jobs"]["prepare-github-ghcr"]["steps"]
+    download = next(
+        step
+        for step in prepare
+        if step.get("name") == "Download signed capsule verification and immutable capsule"
+    )["run"]
+    bootstrap = next(
+        step
+        for step in prepare
+        if step.get("name") == "Bootstrap and verify the immutable recovery capsule"
+    )["run"]
+
+    for run in (download, bootstrap):
+        assert "recovery-${PROMOTION_RUN_ID}-1" not in run
+        assert 'publication["tag"]' in run
+    assert "recovery-capsule-publication.json" in download
+    assert "recovery-capsule-publication.json" in bootstrap
+
+
+def test_recovery_candidate_and_original_authorization_are_capsule_only() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    identity = workflow["jobs"]["identity-admission"]["steps"]
+    initiate_only = {
+        "Select exact release candidate",
+        "Download exact release candidate",
+    }
+    for step in identity:
+        if step.get("name") in initiate_only:
+            assert step.get("if") == "${{ inputs.mode == 'initiate' }}"
+
+    recovery = next(
+        step
+        for step in identity
+        if step.get("name")
+        == "Restore committed release candidate from the immutable capsule"
+    )
+    assert recovery.get("if") == "${{ inputs.mode == 'recover_committed' }}"
+    run = recovery["run"]
+    for required in (
+        "recovery-capsule-verification.json",
+        "release-authorization.json",
+        "candidate-archive.tar",
+        "transaction-identity/recovery-capsule-download/recovery-bootstrap.py",
+        "scripts/recovery_launcher.py",
+        "materialize-candidate",
+        "PROMOTION_CANDIDATE_MANIFEST_DIGEST",
+        "PROMOTION_REF_NAME",
+    ):
+        assert required in run
+    assert "actions/download-artifact" not in run
+    assert "recovery-${PROMOTION_RUN_ID}-1" not in run
+    assert "--destination transaction/capsule" in run
+    assert 'capsule_root="$GITHUB_WORKSPACE/transaction/capsule"' in run
+    assert "--destination transaction-identity/recovery-capsule" not in run
+
+    verify = next(
+        step
+        for step in identity
+        if step.get("name") == "Verify exact release candidate"
+    )["run"]
+    assert 'mode = os.environ["PROMOTION_MODE"]' in verify
+    assert (
+        'if mode == "initiate":\n'
+        '    run = json.loads(Path("transaction-identity/candidate-run.json").read_bytes())'
+    ) in verify
+    assert 'elif mode == "recover_committed":' in verify
+
+    authorize = next(
+        step
+        for step in workflow["jobs"]["authorize-release"]["steps"]
+        if step.get("name") == "Create role-specific server authorization"
+    )["run"]
+    assert "transaction-identity/recovery/release-authorization.json" in authorize
+    assert "cmp --silent" in authorize
+
+
+def test_capsule_verification_never_reintroduces_the_checkout_with_pythonpath() -> None:
+    workflow_text = (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "PYTHONPATH=" not in workflow_text
+    assert workflow_text.count("transaction/capsule/scripts/release_control_receipt.py") == 4
+    assert workflow_text.count("runpy.run_path(target,run_name=\"__main__\")") >= 5
+    assert workflow_text.count('"$capsule_root/scripts/recovery_launcher.py" \\') == 5
+    assert '"$capsule_root" "$capsule_receipts" verify-' not in workflow_text
+    assert workflow_text.count("--executable python") >= 4
+    assert (
+        workflow_text.count(
+            'release verify-asset "$recovery_tag" \\\n'
+            '              "transaction/capsule-download/$capsule_asset"'
+        )
+        == 4
+    )
+    assert "sys.path.insert(0,root)" not in workflow_text
+    assert (
+        workflow_text.count(
+            'sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"]'
+        )
+        == 5
+    )
+
+
+def test_transaction_jobs_pin_the_exact_recovery_python_patch() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    setup_steps = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        if str(step.get("uses", "")).startswith("actions/setup-python@")
+    ]
+    assert len(setup_steps) == 7
+    assert all(step["with"] == {"python-version": "3.11.14"} for step in setup_steps)
+
+
+def test_transaction_jobs_verify_the_pinned_python_before_first_use() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-transaction.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    expected_digest = (
+        "dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8"
+    )
+
+    assert "/usr/bin/python3" not in workflow_text
+    for job_name, job in workflow["jobs"].items():
+        setup_index = next(
+            index
+            for index, step in enumerate(job["steps"])
+            if str(step.get("uses", "")).startswith("actions/setup-python@")
+        )
+        verification = job["steps"][setup_index + 1]
+        assert verification["name"] == "Verify the pinned recovery Python identity"
+        assert expected_digest in verification["run"], job_name
+        assert "python --version" in verification["run"]
+
+
+def test_recovery_bootstrap_executes_only_the_immutable_release_asset() -> None:
+    workflow_text = (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "-B scripts/bootstrap_recovery.py" not in workflow_text
+    assert workflow_text.count("--pattern recovery-bootstrap.py") == 1
+    assert workflow_text.count("transaction/capsule-download/recovery-bootstrap.py") == 4
+    invocations = re.findall(
+        r"^\s+(transaction(?:-identity)?/[^\s]*recovery-bootstrap\.py) \\$",
+        workflow_text,
+        flags=re.MULTILINE,
+    )
+    assert invocations == [
+        "transaction-identity/recovery-capsule-download/recovery-bootstrap.py",
+        *(["transaction/capsule-download/recovery-bootstrap.py"] * 4),
+    ]
+    assert (
+        "transaction-identity/recovery-capsule-download/recovery-bootstrap.py"
+        in workflow_text
+    )
+
+
+def test_release_transaction_bootstraps_pinned_tools_and_actions() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-transaction.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+
+    for job_name, job in workflow["jobs"].items():
+        uses = [step["uses"] for step in job.get("steps", []) if "uses" in step]
+        for action in uses:
+            assert re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}", action), (
+                job_name,
+                action,
+            )
+        for step in job.get("steps", []):
+            if str(step.get("uses", "")).startswith("actions/checkout@"):
+                assert step["with"]["persist-credentials"] is False
+                assert step["with"]["ref"] == "${{ github.sha }}"
+
+    for job_name in (
+        "identity-admission",
+        "authorize-release",
+        "prepare-github-ghcr",
+        "commit-github-release",
+        "verify-github-ghcr",
+        "reconcile-final",
+    ):
+        steps = workflow["jobs"][job_name]["steps"]
+        bootstrap_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Bootstrap pinned GitHub CLI"
+        )
+        authoritative_indexes = [
+            index
+            for index, step in enumerate(steps)
+            if any(
+                token in str(step.get("name", ""))
+                for token in ("Release", "asset", "attestation", "surface", "capsule")
+            )
+            and "Bootstrap" not in str(step.get("name", ""))
+        ]
+        assert all(bootstrap_index < index for index in authoritative_indexes)
+
+    assert "scripts/bootstrap_workflow_tools.sh" in workflow_text
+    assert "scripts/bootstrap_uv.py" in workflow_text
+    assert "astral-sh/setup-uv@" not in workflow_text
+    assert "actions/attest-build-provenance@" not in workflow_text
+    assert "push-to-registry" not in workflow_text
+    assert "skip-existing" not in workflow_text
+    assert "--clobber" not in workflow_text
+    assert re.search(r"(?m)(^|[;&|]\s*)gh\s", workflow_text) is None
+
+
+def test_release_transaction_preserves_failure_evidence_and_reconciles_always() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    jobs = workflow["jobs"]
+
+    for job_name, outcome_name in (
+        ("prepare-github-ghcr", "release-preparation-outcome.json"),
+        ("commit-github-release", "release-commit-outcome.json"),
+        ("publish-pypi", "release-pypi-outcome.json"),
+    ):
+        steps = jobs[job_name]["steps"]
+        record = next(step for step in steps if outcome_name in str(step.get("run", "")))
+        assert record["if"] == "${{ always() }}"
+        upload = next(
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+            and outcome_name in str(step.get("with", {}).get("path", ""))
+        )
+        assert upload["if"] == "${{ always() }}"
+        propagate = steps[-1]
+        assert propagate["name"] == "Propagate the preserved stage result"
+        assert propagate["if"] == "${{ always() }}"
+
+    reconcile = jobs["reconcile-final"]
+    reconcile_text = "\n".join(str(step.get("run", "")) for step in reconcile["steps"])
+    assert reconcile["if"] == "${{ always() }}"
+    assert '"lock_release_permitted":false' in reconcile_text
+    assert "release-reconciliation.json" in reconcile_text
+    assert any(
+        step.get("if") == "${{ always() }}"
+        and str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        for step in reconcile["steps"]
+    )
 
 
 def test_release_candidate_preflights_before_checkout_and_verifies_final_upload() -> None:
@@ -258,6 +1319,171 @@ def test_release_candidate_embedded_python_is_syntax_valid() -> None:
     assert compiled_blocks
 
 
+def test_release_transaction_embedded_python_is_syntax_valid() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "release-transaction.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    compiled_blocks: list[str] = []
+
+    for job_name, job in workflow["jobs"].items():
+        for step_index, step in enumerate(job.get("steps", [])):
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            lines = run.splitlines()
+            line_index = 0
+            while line_index < len(lines):
+                if "<<'PY'" not in lines[line_index]:
+                    line_index += 1
+                    continue
+                try:
+                    terminator_index = lines.index("PY", line_index + 1)
+                except ValueError:
+                    pytest.fail(
+                        f"{job_name} step {step_index} has an unterminated Python heredoc"
+                    )
+                label = (
+                    f"{job_name}:step-{step_index}:"
+                    f"heredoc-{len(compiled_blocks) + 1}"
+                )
+                source = "\n".join(lines[line_index + 1 : terminator_index]) + "\n"
+                compile(source, label, "exec")
+                compiled_blocks.append(label)
+                line_index = terminator_index + 1
+
+    assert len(compiled_blocks) == workflow_text.count("<<'PY'")
+    assert compiled_blocks
+
+
+def test_release_transaction_candidate_admission_uses_real_rest_and_v1_manifest_shapes(
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["identity-admission"]["steps"]
+    by_name = {step.get("name"): step for step in steps if step.get("name")}
+
+    select = by_name["Select exact release candidate"]["run"]
+    assert '".github/workflows/release-candidate.yml@main"' in select
+
+    verify = by_name["Verify exact release candidate"]["run"]
+    assert 'manifest["candidate_run"]' in verify
+    assert 'manifest["workflow"]' not in verify
+    assert '".github/workflows/release-candidate.yml@main"' in verify
+
+    source_sha = "a" * 40
+    manifest = {
+        "candidate_run": {
+            "workflow_id": 606,
+            "workflow_ref": "refs/heads/main",
+            "workflow_sha": source_sha,
+            "run_id": 1000,
+            "run_attempt": 1,
+        },
+        "source": {"commit_sha": source_sha},
+        "tag": "v0.6.0",
+    }
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    identity = tmp_path / "transaction-identity"
+    identity.mkdir()
+    (candidate / "candidate-manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    select_source = select.split('$KESTREL_PYTHON" - <<\'PY\'\n', 1)[1].rsplit(
+        "\nPY", 1
+    )[0]
+    github_output = tmp_path / "github-output"
+    selected = subprocess.run(
+        [sys.executable, "-c", select_source],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "RUN_JSON": json.dumps(
+                {
+                    "id": 1000,
+                    "workflow_id": 606,
+                    "run_attempt": 1,
+                    "event": "workflow_dispatch",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_branch": "main",
+                    "head_sha": source_sha,
+                    "path": ".github/workflows/release-candidate.yml@main",
+                    "repository": {"full_name": "John-MiracleWorker/Kestrel"},
+                }
+            ),
+            "ARTIFACTS_JSON": json.dumps(
+                [
+                    {
+                        "artifacts": [
+                            {
+                                "name": f"kestrel-release-candidate-0.6.0-{source_sha}",
+                                "expired": False,
+                                "workflow_run": {"id": 1000},
+                            }
+                        ]
+                    }
+                ]
+            ),
+            "PROMOTION_CANDIDATE_RUN_ID": "1000",
+            "PROMOTION_REPOSITORY": "John-MiracleWorker/Kestrel",
+            "GITHUB_OUTPUT": str(github_output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert "artifact_name=kestrel-release-candidate-0.6.0-" in github_output.read_text(
+        encoding="utf-8"
+    )
+    source = verify.split("$KESTREL_PYTHON\" - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PROMOTION_CANDIDATE_RUN_ID": "1000",
+            "PROMOTION_MODE": "initiate",
+            "PROMOTION_SHA": source_sha,
+            "PROMOTION_REF_NAME": "main",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_release_transaction_downloads_commit_authority_before_commit_planning() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["commit-github-release"]["steps"]
+    names = [step.get("name") for step in steps]
+    plan_index = names.index("Observe exact commit surfaces and create the commit plan")
+    for prerequisite in (
+        "Download exact owner-signed commit authority",
+        "Verify both injected credentials at the commit boundary",
+        "Verify owner-signed GitHub commit authority",
+        "Require exact cumulative commit approvals",
+    ):
+        assert names.index(prerequisite) < plan_index
+
+
+def test_release_transaction_never_interpolates_secrets_into_run_bodies() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(encoding="utf-8")
+    )
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if isinstance(run, str):
+                assert "secrets." not in run
+
+
 def test_release_candidate_identity_steps_execute_against_the_closed_schema(
     tmp_path: Path,
 ) -> None:
@@ -343,200 +1569,66 @@ def test_release_candidate_identity_steps_execute_against_the_closed_schema(
         assert re.fullmatch(pattern, "other-user") is None
 
 
-def _run_rehearsal_order_gate(
-    *,
-    rehearsal_updated_at: str,
-    rehearsal_overrides: dict[str, object] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    gate = workflow.index("Require successful exact-SHA release rehearsal before build")
-    script_start = workflow.index("          from datetime import datetime", gate)
-    script_end = workflow.index("\n          PY", script_start)
-    script = textwrap.dedent(workflow[script_start:script_end])
-    commit = "a" * 40
-    environment = os.environ.copy()
-    rehearsal = {
-        "head_sha": commit,
-        "head_branch": "main",
-        "event": "push",
-        "status": "completed",
-        "conclusion": "success",
-        "updated_at": rehearsal_updated_at,
-    }
-    rehearsal.update(rehearsal_overrides or {})
-    environment.update(
-        {
-            "RELEASE_COMMIT_SHA": commit,
-            "RELEASE_RUN_JSON": json.dumps({"created_at": "2026-07-28T12:00:00Z"}),
-            "REHEARSAL_RUNS_JSON": json.dumps({"workflow_runs": [rehearsal]}),
-        }
-    )
-    return subprocess.run(  # noqa: S603
-        [sys.executable, "-c", script],
-        cwd=ROOT,
-        env=environment,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
+_PREREQUISITE_WORKFLOWS = {
+    "protected-main-ci": ".github/workflows/ci.yml",
+    "release-rehearsal": ".github/workflows/release-rehearsal.yml",
+    "runtime-reliability-qualification": ".github/workflows/determinism.yml",
+}
 
 
-def _qualification_run(**overrides: object) -> dict[str, object]:
+def _candidate_prerequisite_run(
+    name: str, *, run_id: int, updated_at: str, **overrides: object
+) -> dict[str, object]:
     run: dict[str, object] = {
-        "id": 4242,
+        "id": run_id,
         "head_sha": "a" * 40,
         "head_branch": "main",
         "event": "push",
         "status": "completed",
         "conclusion": "success",
         "run_attempt": 1,
-        "updated_at": "2026-07-28T11:59:59Z",
+        "updated_at": updated_at,
+        "path": _PREREQUISITE_WORKFLOWS[name],
     }
     run.update(overrides)
     return run
 
 
-def _run_qualification_selector(
-    runs: list[dict[str, object]],
-    *,
-    release_created_at: str = "2026-07-28T12:00:00Z",
-    total_count: int | None = None,
+def _run_candidate_prerequisite_selector(
+    tmp_path: Path,
+    runs: dict[str, list[dict[str, object]]],
 ) -> subprocess.CompletedProcess[str]:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
-        encoding="utf-8"
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+            encoding="utf-8"
+        )
     )
-    gate = workflow.index(
-        "Require successful exact-SHA runtime reliability qualification before build"
+    step = next(
+        step
+        for step in workflow["jobs"]["candidate-identity"]["steps"]
+        if step.get("name")
+        == "Prove the exact protected-main source and select attempt-one prerequisites"
     )
-    assignment = workflow.index("QUALIFICATION_RUN_ID=\"$(", gate)
-    heredoc = workflow.index("python - <<'PY'", assignment)
-    script_start = workflow.index("\n", heredoc) + 1
-    script_end = workflow.index("\n          PY", script_start)
-    script = textwrap.dedent(workflow[script_start:script_end])
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "RELEASE_COMMIT_SHA": "a" * 40,
-            "RELEASE_RUN_JSON": json.dumps({"created_at": release_created_at}),
-            "QUALIFICATION_RUNS_JSON": json.dumps(
-                {
-                    "total_count": len(runs) if total_count is None else total_count,
-                    "workflow_runs": runs,
-                }
-            ),
-        }
+    marker = 'SOURCE_TREE="$source_tree" python - <<\'PY\'\n'
+    source = step["run"].split(marker, 1)[1].split("\nPY\n", 1)[0]
+    raw = tmp_path / "candidate-prerequisites" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "candidate-run.json").write_text(
+        json.dumps({"created_at": "2026-07-28T12:00:00Z"}), encoding="utf-8"
     )
-    return subprocess.run(  # noqa: S603
-        [sys.executable, "-c", script],
-        cwd=ROOT,
-        env=environment,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-
-
-def _qualification_job(**overrides: object) -> dict[str, object]:
-    job: dict[str, object] = {
-        "id": 5252,
-        "name": "Exact-SHA five-cell runtime reliability qualification",
-        "run_id": 4242,
-        "run_attempt": 1,
-        "head_sha": "a" * 40,
-        "status": "completed",
-        "conclusion": "success",
-        "completed_at": "2026-07-28T11:59:59Z",
+    for name, values in runs.items():
+        (raw / f"{name}-runs.json").write_text(
+            json.dumps([{"workflow_runs": values}]), encoding="utf-8"
+        )
+    environment = {
+        **os.environ,
+        "CANDIDATE_SOURCE_SHA": "a" * 40,
+        "GITHUB_RUN_ID": "707",
+        "SOURCE_TREE": "b" * 40,
     }
-    job.update(overrides)
-    return job
-
-
-def _run_qualification_job_validator(
-    jobs: list[dict[str, object]],
-    *,
-    qualification_run_id: int = 4242,
-    total_count: object | None = None,
-    release_created_at: str = "2026-07-28T12:00:00Z",
-) -> subprocess.CompletedProcess[str]:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
-        encoding="utf-8"
-    )
-    assignment = workflow.index(
-        'QUALIFICATION_JOBS_JSON="$qualification_jobs" python - <<\'PY\''
-    )
-    heredoc = workflow.index("python - <<'PY'", assignment)
-    script_start = workflow.index("\n", heredoc) + 1
-    script_end = workflow.index("\n          PY", script_start)
-    script = textwrap.dedent(workflow[script_start:script_end])
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "QUALIFICATION_RUN_ID": str(qualification_run_id),
-            "RELEASE_COMMIT_SHA": "a" * 40,
-            "RELEASE_RUN_JSON": json.dumps({"created_at": release_created_at}),
-            "QUALIFICATION_JOBS_JSON": json.dumps(
-                {
-                    "total_count": len(jobs) if total_count is None else total_count,
-                    "jobs": jobs,
-                }
-            ),
-        }
-    )
     return subprocess.run(  # noqa: S603
-        [sys.executable, "-c", script],
-        cwd=ROOT,
-        env=environment,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-
-
-def _qualification_artifact(**overrides: object) -> dict[str, object]:
-    artifact: dict[str, object] = {
-        "id": 6262,
-        "name": "kestrel-runtime-reliability-qualification-" + "a" * 40,
-        "expired": False,
-        "workflow_run": {"id": 4242, "head_sha": "a" * 40},
-    }
-    artifact.update(overrides)
-    return artifact
-
-
-def _run_qualification_artifact_validator(
-    artifacts: list[dict[str, object]],
-    *,
-    qualification_run_id: int = 4242,
-    total_count: object | None = None,
-) -> subprocess.CompletedProcess[str]:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
-        encoding="utf-8"
-    )
-    assignment = workflow.index(
-        'QUALIFICATION_ARTIFACTS_JSON="$qualification_artifacts" python - <<\'PY\''
-    )
-    heredoc = workflow.index("python - <<'PY'", assignment)
-    script_start = workflow.index("\n", heredoc) + 1
-    script_end = workflow.index("\n          PY", script_start)
-    script = textwrap.dedent(workflow[script_start:script_end])
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "QUALIFICATION_RUN_ID": str(qualification_run_id),
-            "RELEASE_COMMIT_SHA": "a" * 40,
-            "QUALIFICATION_ARTIFACTS_JSON": json.dumps(
-                {
-                    "total_count": (
-                        len(artifacts) if total_count is None else total_count
-                    ),
-                    "artifacts": artifacts,
-                }
-            ),
-        }
-    )
-    return subprocess.run(  # noqa: S603
-        [sys.executable, "-c", script],
-        cwd=ROOT,
+        [sys.executable, "-c", source],
+        cwd=tmp_path,
         env=environment,
         capture_output=True,
         check=False,
@@ -994,366 +2086,122 @@ def test_testing_guide_determinism_command_binds_backend_and_source_subject() ->
     assert '--source-commit "$SOURCE_COMMIT"' in command
 
 
-def test_production_release_requires_exact_sha_reliability_receipts_before_build() -> None:
-    workflow_path = ROOT / ".github" / "workflows" / "release.yml"
-    workflow_text = workflow_path.read_text(encoding="utf-8")
-    workflow = yaml.safe_load(workflow_text)
-
-    rehearsal_gate = workflow_text.index(
-        "Require successful exact-SHA release rehearsal before build"
-    )
-    qualification_gate = workflow_text.index(
-        "Require successful exact-SHA runtime reliability qualification before build"
-    )
-    build = workflow_text.index("Build Python release artifacts")
-    assert rehearsal_gate < build
-    assert qualification_gate < build
-    assert workflow["permissions"] == {"actions": "read", "contents": "read"}
-
-    gate_text = workflow_text[qualification_gate:build]
-    assert 'actions/workflows/determinism.yml/runs"' in gate_text
-    assert '-f head_sha="$RELEASE_COMMIT_SHA"' in gate_text
-    assert "-f branch=main" in gate_text
-    assert "-f event=push" in gate_text
-    assert "-f status=completed" not in gate_text
-    assert 'actions/runs/${GITHUB_RUN_ID}' in gate_text
-    assert 'export RELEASE_RUN_JSON="$release_run"' in gate_text
-    assert 'run.get("head_sha") == expected_sha' in gate_text
-    assert 'run.get("head_branch") == "main"' in gate_text
-    assert 'run.get("event") == "push"' in gate_text
-    assert 'selected.get("status")' not in gate_text
-    assert 'run.get("conclusion") == "success"' not in gate_text
-    assert 'type(selected.get("run_attempt")) is not int' in gate_text
-    assert 'selected["run_attempt"] != 1' in gate_text
-    assert 'selected.get("updated_at")' not in gate_text
-    assert 'actions/runs/${QUALIFICATION_RUN_ID}/jobs' in gate_text
-    assert 'job.get("name")' in gate_text
-    assert '"Exact-SHA five-cell runtime reliability qualification"' in gate_text
-    assert 'job.get("conclusion") != "success"' in gate_text
-    assert 'job.get("completed_at")' in gate_text
-    assert 'gh run download "$QUALIFICATION_RUN_ID"' in gate_text
-    assert (
-        '"kestrel-runtime-reliability-qualification-${RELEASE_COMMIT_SHA}"'
-        in gate_text
-    )
-    assert gate_text.count("gh run download") == 1
-    assert "kestrel-determinism-memory-${RELEASE_COMMIT_SHA}" not in gate_text
-    assert "kestrel-determinism-memvid-${RELEASE_COMMIT_SHA}" not in gate_text
-    assert "kestrel-flock-qualification" not in gate_text
-    assert "scripts/aggregate_runtime_reliability_receipts.py verify" in gate_text
-    assert '--source-commit "$RELEASE_COMMIT_SHA"' in gate_text
-    assert '--workflow-run-id "$QUALIFICATION_RUN_ID"' in gate_text
-    assert "--workflow-run-attempt 1" in gate_text
-    assert "kestrel-runtime-reliability-qualification.json" in gate_text
-
-
-def test_release_qualification_selector_accepts_one_attempt_one_pre_release_run() -> None:
-    completed = _run_qualification_selector([_qualification_run()])
-    enclosing_workflow_failed = _run_qualification_selector(
-        [_qualification_run(conclusion="failure")]
-    )
-    enclosing_workflow_still_running = _run_qualification_selector(
-        [
-            _qualification_run(
-                status="in_progress",
-                updated_at="not-qualification-authority",
-            )
-        ]
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "4242"
-    assert enclosing_workflow_failed.returncode == 0, enclosing_workflow_failed.stderr
-    assert enclosing_workflow_failed.stdout.strip() == "4242"
-    assert enclosing_workflow_still_running.returncode == 0, (
-        enclosing_workflow_still_running.stderr
-    )
-    assert enclosing_workflow_still_running.stdout.strip() == "4242"
-
-
-def test_release_qualification_selector_rejects_rerun_and_ambiguous_evidence() -> None:
-    rerun = _run_qualification_selector([_qualification_run(run_attempt=2)])
-    ambiguous = _run_qualification_selector(
-        [_qualification_run(), _qualification_run(id=4343)]
-    )
-    replacement = _run_qualification_selector(
-        [
-            _qualification_run(id=4141, conclusion="failure"),
-            _qualification_run(id=4242),
-        ]
-    )
-
-    assert rerun.returncode != 0
-    assert "exactly one" in rerun.stderr
-    assert ambiguous.returncode != 0
-    assert "exactly one" in ambiguous.stderr
-    assert replacement.returncode != 0
-    assert "exactly one" in replacement.stderr
-
-
-@pytest.mark.parametrize(
-    "malformed_id",
-    ["4343", True, 4242.0, None, 0, -1],
-    ids=["string", "boolean", "float", "null", "zero", "negative"],
-)
-def test_release_qualification_selector_rejects_malformed_id_replacement(
-    malformed_id: object,
-) -> None:
-    completed = _run_qualification_selector(
-        [_qualification_run(), _qualification_run(id=malformed_id)]
-    )
-
-    assert completed.returncode != 0
-    assert "replacement runs are rejected" in completed.stderr
-
-
-def test_release_qualification_selector_rejects_paginated_ambiguity() -> None:
-    completed = _run_qualification_selector(
-        [_qualification_run()],
-        total_count=101,
-    )
-
-    assert completed.returncode != 0
-    assert "pagination" in completed.stderr
-
-
-@pytest.mark.parametrize(
-    "updated_at",
-    ["2026-07-28T12:00:00Z", "2026-07-28T12:00:01Z", "malformed", None],
-    ids=["equal", "after", "malformed", "null"],
-)
-def test_release_qualification_selector_does_not_use_run_updated_at_as_authority(
-    updated_at: object,
-) -> None:
-    completed = _run_qualification_selector(
-        [_qualification_run(updated_at=updated_at)]
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "4242"
-
-
-def test_release_qualification_selector_rejects_wrong_run_metadata() -> None:
-    invalid_fields = (
-        ("id", "4242", "attempt-1"),
-        ("head_sha", "b" * 40, "replacement runs are rejected"),
-        ("head_branch", "feature", "replacement runs are rejected"),
-        ("event", "workflow_dispatch", "replacement runs are rejected"),
-        ("run_attempt", True, "attempt-1"),
-    )
-
-    for field, value, expected in invalid_fields:
-        completed = _run_qualification_selector(
-            [_qualification_run(**{field: value})]
+def test_release_candidate_requires_exact_sha_prerequisite_receipts_before_build() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+            encoding="utf-8"
         )
+    )
+    jobs = workflow["jobs"]
+    identity = jobs["candidate-identity"]
+    assert jobs["build-release-candidate"]["needs"] == "candidate-identity"
+    gate = next(
+        step
+        for step in identity["steps"]
+        if step.get("name")
+        == "Prove the exact protected-main source and select attempt-one prerequisites"
+    )["run"]
 
-        assert completed.returncode != 0, field
-        assert expected in completed.stderr, field
+    for name, path in _PREREQUISITE_WORKFLOWS.items():
+        assert f"'{name}:{Path(path).name}'" in gate
+        assert f'"{name}": "{path}"' in gate
+        assert f'"{name}": "kestrel.check.{name}.v1"' in gate
+    assert "gh api --paginate --slurp" in gate
+    assert "type(run_attempt) is int" in gate
+    assert 'run.get("head_sha") == os.environ["CANDIDATE_SOURCE_SHA"]' in gate
+    assert 'run.get("head_branch") == "main"' in gate
+    assert 'run.get("event") == "push"' in gate
+    assert 'run.get("status") == "completed"' in gate
+    assert 'run.get("conclusion") == "success"' in gate
+    assert "updated < candidate_created" in gate
+    assert 'artifact.get("expired") is not False' in gate
+    assert 're.fullmatch(r"sha256:[0-9a-f]{64}", str(api_digest))' in gate
+    assert 'job.get("conclusion") not in {"success", "skipped"}' in gate
+    assert "candidate-prerequisites/qualification/receipts" in gate
+
+    finalize = "\n".join(
+        str(step.get("run", "")) for step in jobs["finalize-candidate"]["steps"]
+    )
+    assert "python -m scripts.release_candidate_manifest create" in finalize
+    assert "python -m scripts.release_candidate_manifest verify" in finalize
 
 
-def test_release_qualification_job_validator_accepts_exact_metadata() -> None:
-    completed = _run_qualification_job_validator([_qualification_job()])
+def test_release_candidate_prerequisite_selector_chooses_latest_exact_runs(
+    tmp_path: Path,
+) -> None:
+    runs = {
+        name: [
+            _candidate_prerequisite_run(
+                name, run_id=index, updated_at="2026-07-28T11:00:00Z"
+            ),
+            _candidate_prerequisite_run(
+                name, run_id=index + 100, updated_at="2026-07-28T11:59:59Z"
+            ),
+        ]
+        for index, name in enumerate(_PREREQUISITE_WORKFLOWS, start=10)
+    }
+
+    completed = _run_candidate_prerequisite_selector(tmp_path, runs)
 
     assert completed.returncode == 0, completed.stderr
+    selection = json.loads(
+        (tmp_path / "candidate-prerequisites" / "selection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert selection == {
+        "schema": "kestrel.candidate_prerequisite_selection.v1",
+        "source_sha": "a" * 40,
+        "source_tree": "b" * 40,
+        "candidate_run_id": 707,
+        "candidate_run_attempt": 1,
+        "runs": {
+            name: index + 100
+            for index, name in enumerate(_PREREQUISITE_WORKFLOWS, start=10)
+        },
+    }
 
 
 @pytest.mark.parametrize(
-    "completed_at",
+    ("field", "value"),
     [
-        "2026-07-28T12:00:00Z",
-        "2026-07-28T12:00:01Z",
-        "malformed",
-        None,
-        True,
-    ],
-    ids=["equal", "after", "malformed", "null", "boolean"],
-)
-def test_release_qualification_job_validator_rejects_non_pre_release_completion(
-    completed_at: object,
-) -> None:
-    completed = _run_qualification_job_validator(
-        [_qualification_job(completed_at=completed_at)]
-    )
-
-    assert completed.returncode != 0
-
-
-@pytest.mark.parametrize(
-    ("job", "qualification_run_id"),
-    [
-        (_qualification_job(run_attempt=True), 4242),
-        (_qualification_job(run_attempt=1.0), 4242),
-        (_qualification_job(run_id=True), 1),
-        (_qualification_job(run_id=4242.0), 4242),
-        (_qualification_job(head_sha="b" * 40), 4242),
-        (_qualification_job(status="in_progress"), 4242),
-        (_qualification_job(conclusion="failure"), 4242),
-    ],
-    ids=[
-        "boolean-attempt",
-        "float-attempt",
-        "boolean-run-id",
-        "float-run-id",
-        "wrong-sha",
-        "incomplete-status",
-        "failed-conclusion",
-    ],
-)
-def test_release_qualification_job_validator_rejects_mismatched_metadata(
-    job: dict[str, object], qualification_run_id: int
-) -> None:
-    completed = _run_qualification_job_validator(
-        [job], qualification_run_id=qualification_run_id
-    )
-
-    assert completed.returncode != 0
-    assert "stale, failed, or mismatched" in completed.stderr
-
-
-@pytest.mark.parametrize(
-    "total_count",
-    [True, 1.0, 2],
-    ids=["boolean", "float", "mismatch"],
-)
-def test_release_qualification_job_validator_rejects_invalid_total_count(
-    total_count: object,
-) -> None:
-    completed = _run_qualification_job_validator(
-        [_qualification_job()], total_count=total_count
-    )
-
-    assert completed.returncode != 0
-    assert "malformed or requires pagination" in completed.stderr
-
-
-def test_release_qualification_job_validator_rejects_paginated_metadata() -> None:
-    jobs = [_qualification_job()]
-    jobs.extend({"name": f"unrelated-job-{index}"} for index in range(100))
-
-    completed = _run_qualification_job_validator(jobs, total_count=len(jobs))
-
-    assert completed.returncode != 0
-    assert "malformed or requires pagination" in completed.stderr
-
-
-def test_release_qualification_job_validator_requires_one_exact_name() -> None:
-    missing = _run_qualification_job_validator(
-        [_qualification_job(name="unrelated job")]
-    )
-    duplicate = _run_qualification_job_validator(
-        [_qualification_job(), _qualification_job(id=5353)]
-    )
-
-    assert missing.returncode != 0
-    assert "exactly one aggregate job" in missing.stderr
-    assert duplicate.returncode != 0
-    assert "exactly one aggregate job" in duplicate.stderr
-
-
-def test_release_qualification_artifact_validator_accepts_exact_metadata() -> None:
-    completed = _run_qualification_artifact_validator([_qualification_artifact()])
-
-    assert completed.returncode == 0, completed.stderr
-
-
-@pytest.mark.parametrize(
-    "total_count",
-    [True, 1.0, 2],
-    ids=["boolean", "float", "mismatch"],
-)
-def test_release_qualification_artifact_validator_rejects_invalid_total_count(
-    total_count: object,
-) -> None:
-    completed = _run_qualification_artifact_validator(
-        [_qualification_artifact()], total_count=total_count
-    )
-
-    assert completed.returncode != 0
-    assert "malformed or requires pagination" in completed.stderr
-
-
-def test_release_qualification_artifact_validator_rejects_paginated_metadata() -> None:
-    artifacts = [_qualification_artifact()]
-    artifacts.extend(
-        {"name": f"unrelated-artifact-{index}"} for index in range(100)
-    )
-
-    completed = _run_qualification_artifact_validator(
-        artifacts, total_count=len(artifacts)
-    )
-
-    assert completed.returncode != 0
-    assert "malformed or requires pagination" in completed.stderr
-
-
-@pytest.mark.parametrize(
-    ("workflow_run", "qualification_run_id"),
-    [
-        ({"id": True, "head_sha": "a" * 40}, 1),
-        ({"id": 4242.0, "head_sha": "a" * 40}, 4242),
-        ({"id": 4343, "head_sha": "a" * 40}, 4242),
-        ({"id": 4242, "head_sha": "b" * 40}, 4242),
-    ],
-    ids=["boolean-run-id", "float-run-id", "wrong-run-id", "wrong-sha"],
-)
-def test_release_qualification_artifact_validator_rejects_mismatched_workflow_run(
-    workflow_run: dict[str, object], qualification_run_id: int
-) -> None:
-    completed = _run_qualification_artifact_validator(
-        [_qualification_artifact(workflow_run=workflow_run)],
-        qualification_run_id=qualification_run_id,
-    )
-
-    assert completed.returncode != 0
-    assert "stale or mismatched" in completed.stderr
-
-
-def test_release_qualification_artifact_validator_rejects_expired_artifact() -> None:
-    completed = _run_qualification_artifact_validator(
-        [_qualification_artifact(expired=True)]
-    )
-
-    assert completed.returncode != 0
-    assert "stale or mismatched" in completed.stderr
-
-
-def test_release_qualification_artifact_validator_requires_one_exact_name() -> None:
-    missing = _run_qualification_artifact_validator(
-        [_qualification_artifact(name="unrelated-artifact")]
-    )
-    duplicate = _run_qualification_artifact_validator(
-        [_qualification_artifact(), _qualification_artifact(id=6363)]
-    )
-
-    assert missing.returncode != 0
-    assert "exactly one exact-name aggregate artifact" in missing.stderr
-    assert duplicate.returncode != 0
-    assert "exactly one exact-name aggregate artifact" in duplicate.stderr
-
-
-def test_release_order_gate_accepts_only_a_rehearsal_completed_before_tag_workflow() -> None:
-    before = _run_rehearsal_order_gate(rehearsal_updated_at="2026-07-28T11:59:59Z")
-    after = _run_rehearsal_order_gate(rehearsal_updated_at="2026-07-28T12:00:01Z")
-
-    assert before.returncode == 0, before.stderr
-    assert after.returncode != 0
-    assert "completed before the release workflow was created" in after.stderr
-
-
-def test_release_order_gate_rejects_nonqualifying_rehearsal_metadata() -> None:
-    invalid_fields = (
         ("head_sha", "b" * 40),
         ("head_branch", "feature"),
         ("event", "workflow_dispatch"),
         ("status", "in_progress"),
         ("conclusion", "failure"),
+        ("run_attempt", 2),
+        ("run_attempt", True),
+        ("path", ".github/workflows/other.yml"),
         ("updated_at", "2026-07-28T12:00:00Z"),
-    )
-
-    for field, value in invalid_fields:
-        completed = _run_rehearsal_order_gate(
-            rehearsal_updated_at="2026-07-28T11:59:59Z",
-            rehearsal_overrides={field: value},
+        ("updated_at", "2026-07-28T12:00:01Z"),
+    ],
+)
+def test_release_candidate_prerequisite_selector_rejects_nonqualifying_runs(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    runs: dict[str, list[dict[str, object]]] = {}
+    for index, name in enumerate(_PREREQUISITE_WORKFLOWS, start=10):
+        updated_at = (
+            value
+            if name == "release-rehearsal" and field == "updated_at"
+            else "2026-07-28T11:59:59Z"
         )
+        assert isinstance(updated_at, str)
+        overrides = (
+            {field: value}
+            if name == "release-rehearsal" and field != "updated_at"
+            else {}
+        )
+        runs[name] = [
+            _candidate_prerequisite_run(
+                name, run_id=index, updated_at=updated_at, **overrides
+            )
+        ]
 
-        assert completed.returncode != 0, field
+    completed = _run_candidate_prerequisite_selector(tmp_path, runs)
+
+    assert completed.returncode != 0
+    assert "no exact successful attempt-one prerequisite: release-rehearsal" in (
+        completed.stderr
+    )

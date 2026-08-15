@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import http.client
 import importlib.metadata
 import io
@@ -30,8 +31,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Protocol, cast
-from urllib.parse import quote, urlsplit
+from typing import BinaryIO, Protocol, cast
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
@@ -43,6 +44,22 @@ from scripts import release_control_receipt as receipts  # noqa: E402
 MAX_TRANSPORT_RESPONSE_BYTES = 1024 * 1024
 MAX_DISPATCH_TOKEN_BYTES = 4096
 DISPATCH_STATE_ROOT = Path.home() / ".kestrel" / "release-control" / "dispatches"
+FINAL_RECONCILIATION_FRESHNESS_BUDGET_SECONDS = 90
+FINAL_RECONCILIATION_OBSERVATION_RESERVE_SECONDS = 15
+_FINAL_RECONCILIATION_FRESHNESS_SCHEMA = (
+    "kestrel.final_reconciliation_freshness_budget.v1"
+)
+_RELEASE_PROMOTION_PREDICATE_TYPE = (
+    "https://kestrel.dev/attestations/release-promotion/v1"
+)
+_RELEASE_PROMOTION_PREDICATE_SCHEMA = "kestrel.release_promotion_predicate.v1"
+_RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
+_RELEASE_CANDIDATE_WORKFLOW_PATH = ".github/workflows/release-candidate.yml"
+_RELEASE_REPOSITORY = "John-MiracleWorker/Kestrel"
+_RELEASE_OWNER = "John-MiracleWorker"
+_RELEASE_OWNER_ID = 58918509
+GHCR_CONVERGENCE_TIMEOUT_SECONDS = 90.0
+GHCR_CONVERGENCE_POLL_INTERVAL_SECONDS = 2.0
 _WORKFLOW_TOOL_ARCHIVE_DIGESTS = {
     (
         "linux",
@@ -53,6 +70,142 @@ _WORKFLOW_TOOL_ARCHIVE_DIGESTS = {
         "arm64",
     ): "sha256:a58b8fd77b417a38f47a0b54d1370c59b0fcdb324ccc9ca002b0998f7c4c999e",
 }
+
+
+def begin_final_reconciliation_freshness_budget(
+    marker: Path, *, _clock: Callable[[], int] = time.monotonic_ns
+) -> None:
+    """Persist the runner-local monotonic origin for final source freshness."""
+
+    started = _clock()
+    if type(started) is not int or started < 0:
+        raise receipts.ReleaseControlError(
+            "final reconciliation monotonic clock is invalid"
+        )
+    value = {
+        "schema": _FINAL_RECONCILIATION_FRESHNESS_SCHEMA,
+        "started_monotonic_ns": started,
+        "budget_seconds": FINAL_RECONCILIATION_FRESHNESS_BUDGET_SECONDS,
+        "observation_reserve_seconds": (
+            FINAL_RECONCILIATION_OBSERVATION_RESERVE_SECONDS
+        ),
+    }
+    if not receipts.write_once(marker, receipts.canonical_json_bytes(value)):
+        raise receipts.ReleaseControlError(
+            "final reconciliation freshness budget was already started"
+        )
+
+
+def _final_reconciliation_freshness_remaining_seconds(
+    marker: Path,
+    *,
+    reserve_seconds: int,
+    _clock: Callable[[], int],
+) -> int:
+    raw = receipts._read_regular(  # noqa: SLF001
+        marker,
+        label="final reconciliation freshness budget",
+        max_bytes=1024,
+    )
+    value = receipts.strict_canonical_json(
+        raw, label="final reconciliation freshness budget"
+    )
+    if type(value) is not dict or set(value) != {
+        "schema",
+        "started_monotonic_ns",
+        "budget_seconds",
+        "observation_reserve_seconds",
+    }:
+        raise receipts.ReleaseControlError(
+            "final reconciliation freshness budget fields mismatch"
+        )
+    if (
+        value.get("schema") != _FINAL_RECONCILIATION_FRESHNESS_SCHEMA
+        or value.get("budget_seconds")
+        != FINAL_RECONCILIATION_FRESHNESS_BUDGET_SECONDS
+        or value.get("observation_reserve_seconds")
+        != FINAL_RECONCILIATION_OBSERVATION_RESERVE_SECONDS
+    ):
+        raise receipts.ReleaseControlError(
+            "final reconciliation freshness budget policy mismatch"
+        )
+    started = value.get("started_monotonic_ns")
+    now = _clock()
+    if (
+        type(started) is not int
+        or started < 0
+        or type(now) is not int
+        or now < started
+        or type(reserve_seconds) is not int
+        or not 0 <= reserve_seconds < FINAL_RECONCILIATION_FRESHNESS_BUDGET_SECONDS
+    ):
+        raise receipts.ReleaseControlError(
+            "final reconciliation monotonic freshness state is invalid"
+        )
+    remaining_ns = (
+        (FINAL_RECONCILIATION_FRESHNESS_BUDGET_SECONDS - reserve_seconds)
+        * 1_000_000_000
+        - (now - started)
+    )
+    remaining_seconds = remaining_ns // 1_000_000_000
+    if remaining_seconds <= 0:
+        raise receipts.ReleaseControlError(
+            "final reconciliation freshness budget is exhausted"
+        )
+    return remaining_seconds
+
+
+def remaining_final_reconciliation_observation_seconds(
+    marker: Path, *, _clock: Callable[[], int] = time.monotonic_ns
+) -> int:
+    """Return a whole-second scan budget while preserving reconcile headroom."""
+
+    return _final_reconciliation_freshness_remaining_seconds(
+        marker,
+        reserve_seconds=FINAL_RECONCILIATION_OBSERVATION_RESERVE_SECONDS,
+        _clock=_clock,
+    )
+
+
+def require_final_reconciliation_freshness_budget(
+    marker: Path, *, _clock: Callable[[], int] = time.monotonic_ns
+) -> None:
+    """Fail closed unless the shared final reconciliation budget remains live."""
+
+    _final_reconciliation_freshness_remaining_seconds(
+        marker,
+        reserve_seconds=0,
+        _clock=_clock,
+    )
+
+
+def _sha256_stream(
+    handle: BinaryIO, *, max_bytes: int, chunk_bytes: int = 1024 * 1024
+) -> tuple[str, int]:
+    """Hash a remote body without buffering it beyond a fixed chunk."""
+
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes < 0
+        or isinstance(chunk_bytes, bool)
+        or not isinstance(chunk_bytes, int)
+        or chunk_bytes <= 0
+    ):
+        raise receipts.ReleaseControlError("stream digest bounds are invalid")
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = handle.read(min(chunk_bytes, max_bytes - size + 1))
+        if type(chunk) is not bytes:
+            raise receipts.ReleaseControlError("stream digest reader returned non-bytes")
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > max_bytes:
+            raise receipts.ReleaseControlError("stream exceeds its digest boundary")
+        digest.update(chunk)
+    return "sha256:" + digest.hexdigest(), size
 
 
 def _workflow_tools_archive_digest(*, system: str | None = None, machine: str | None = None) -> str:
@@ -782,6 +935,1337 @@ class PinnedGitHubTransport:
                 connection.close()
 
 
+@dataclass(frozen=True)
+class GitHubReadExchange:
+    """One bounded, non-redirecting GitHub REST read."""
+
+    http_status: int
+    response_headers: tuple[tuple[str, str], ...]
+    response_body: bytes
+
+
+class GitHubReadAPI(Protocol):
+    """Minimal injectable read boundary used by prerequisite recapture."""
+
+    def __call__(self, request_target: str, *, accept: str) -> GitHubReadExchange: ...
+
+
+def _github_read_path_allowed(path: str) -> bool:
+    repository_roots = (
+        "/repos/John-MiracleWorker/Kestrel",
+        "/repos/John-MiracleWorker/Kestrel-Release-Recovery",
+    )
+    return (
+        path == "/user"
+        or path == "/users/John-MiracleWorker/ssh_signing_keys"
+        or any(path == root or path.startswith(root + "/") for root in repository_roots)
+    )
+
+
+class DirectGitHubReadAPI:
+    """Read GitHub directly without a proxy, retry, or credential replay."""
+
+    _ALLOWED_ACCEPTS = frozenset(
+        {
+            "application/octet-stream",
+            "application/vnd.github+json",
+            "application/vnd.github.raw+json",
+        }
+    )
+
+    def __init__(
+        self,
+        *,
+        token: bytes,
+        timeout_seconds: float = 30.0,
+        connection_factory: ConnectionFactory = _default_connection,
+    ) -> None:
+        if (
+            type(token) is not bytes
+            or not token
+            or len(token) > MAX_DISPATCH_TOKEN_BYTES
+            or any(byte < 0x21 or byte > 0x7E for byte in token)
+        ):
+            raise receipts.ReleaseControlError("GitHub read credential bytes are invalid")
+        if type(timeout_seconds) is not float or not 0.0 < timeout_seconds <= 60.0:
+            raise receipts.ReleaseControlError("GitHub read timeout is invalid")
+        self._token = token.decode("ascii")
+        self._timeout_seconds = timeout_seconds
+        self._connection_factory = connection_factory
+
+    @staticmethod
+    def _validate_request_target(request_target: str) -> str:
+        if (
+            type(request_target) is not str
+            or not request_target.startswith("GET /")
+            or len(request_target) > 8192
+            or any(character in request_target for character in "\r\n\0")
+        ):
+            raise receipts.ReleaseControlError("GitHub read target is invalid")
+        target = request_target.removeprefix("GET ")
+        try:
+            parsed = urlsplit(target)
+        except ValueError as exc:
+            raise receipts.ReleaseControlError("GitHub read target is invalid") from exc
+        if (
+            parsed.scheme
+            or parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not _github_read_path_allowed(parsed.path)
+        ):
+            raise receipts.ReleaseControlError("GitHub read target leaves the pinned origin")
+        return target
+
+    @staticmethod
+    def _validate_asset_redirect(location: str) -> tuple[str, str]:
+        if (
+            type(location) is not str
+            or not location
+            or len(location) > 8192
+            or any(character in location for character in "\r\n\0")
+        ):
+            raise receipts.ReleaseControlError("GitHub asset redirect is invalid")
+        try:
+            parsed = urlsplit(location)
+            port = parsed.port
+        except ValueError as exc:
+            raise receipts.ReleaseControlError("GitHub asset redirect is invalid") from exc
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "release-assets.githubusercontent.com"
+            or port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not parsed.path.startswith("/github-production-release-asset/")
+            or not parsed.query
+        ):
+            raise receipts.ReleaseControlError(
+                "GitHub asset redirect leaves the pinned release asset origin"
+            )
+        return parsed.hostname, f"{parsed.path}?{parsed.query}"
+
+    def _follow_asset_redirect(self, location: str) -> GitHubReadExchange:
+        host, target = self._validate_asset_redirect(location)
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        connection = self._connection_factory(host, context, self._timeout_seconds)
+        try:
+            connection.connect()
+            connection.putrequest(
+                "GET",
+                target,
+                skip_host=False,
+                skip_accept_encoding=True,
+            )
+            for name, value in sorted(
+                {
+                    "Accept": _BOUNDARY_ASSET_ACCEPT,
+                    "User-Agent": "kestrel-release-transaction/1",
+                }.items()
+            ):
+                connection.putheader(name, value)
+            connection.endheaders()
+            response = connection.getresponse()
+            body = response.read(receipts.MAX_SOURCE_BODY_BYTES + 1)
+            if len(body) > receipts.MAX_SOURCE_BODY_BYTES:
+                raise receipts.ReleaseControlError(
+                    "GitHub asset redirect response exceeds its limit"
+                )
+            if response.status != 200:
+                raise receipts.ReleaseControlError(
+                    "GitHub asset redirect did not terminate successfully"
+                )
+            return GitHubReadExchange(
+                http_status=200,
+                response_headers=(),
+                response_body=body,
+            )
+        except receipts.ReleaseControlError:
+            raise
+        except Exception as exc:
+            raise receipts.ReleaseControlError("GitHub asset redirect failed") from exc
+        finally:
+            with suppress(Exception):
+                connection.close()
+
+    def __call__(self, request_target: str, *, accept: str) -> GitHubReadExchange:
+        target = self._validate_request_target(request_target)
+        if accept not in self._ALLOWED_ACCEPTS:
+            raise receipts.ReleaseControlError("GitHub read media type is invalid")
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        connection = self._connection_factory(
+            "api.github.com", context, self._timeout_seconds
+        )
+        try:
+            connection.connect()
+            connection.putrequest(
+                "GET",
+                target,
+                skip_host=False,
+                skip_accept_encoding=True,
+            )
+            headers = {
+                "Accept": accept,
+                "Authorization": f"Bearer {self._token}",
+                "User-Agent": "kestrel-release-transaction/1",
+                "X-GitHub-Api-Version": receipts.DISPATCH_API_VERSION,
+            }
+            for name, value in sorted(headers.items()):
+                connection.putheader(name, value)
+            connection.endheaders()
+            response = connection.getresponse()
+            body = response.read(receipts.MAX_SOURCE_BODY_BYTES + 1)
+            if len(body) > receipts.MAX_SOURCE_BODY_BYTES:
+                raise receipts.ReleaseControlError("GitHub read response exceeds its limit")
+            if type(response.status) is not int:
+                raise receipts.ReleaseControlError("GitHub read status is invalid")
+            response_headers = tuple(
+                (name.lower(), value)
+                for name, value in response.getheaders()
+                if name.lower() in {"link", "location"}
+            )
+            for header_name in ("link", "location"):
+                if sum(name == header_name for name, _value in response_headers) > 1:
+                    raise receipts.ReleaseControlError(
+                        f"GitHub read has duplicate {header_name.title()} headers"
+                    )
+            exchange = GitHubReadExchange(
+                http_status=response.status,
+                response_headers=response_headers,
+                response_body=body,
+            )
+        except receipts.ReleaseControlError:
+            raise
+        except Exception as exc:
+            raise receipts.ReleaseControlError("GitHub read failed") from exc
+        finally:
+            with suppress(Exception):
+                connection.close()
+        if exchange.http_status != 302:
+            return exchange
+        if accept != _BOUNDARY_ASSET_ACCEPT or "/releases/assets/" not in target:
+            raise receipts.ReleaseControlError("GitHub read redirect is forbidden")
+        locations = [
+            value for name, value in exchange.response_headers if name == "location"
+        ]
+        if len(locations) != 1:
+            raise receipts.ReleaseControlError("GitHub asset redirect lacks one Location")
+        return self._follow_asset_redirect(locations[0])
+
+
+_OCI_REPOSITORY = "john-miracleworker/kestrel"
+_OCI_ACCEPT = (
+    "application/vnd.oci.image.index.v1+json, "
+    "application/vnd.oci.image.manifest.v1+json"
+)
+_OCI_REDIRECT_HOST = "pkg-containers.githubusercontent.com"
+_OCI_MAX_TOKEN_RESPONSE_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class OCIReadObservation:
+    """One content-verified digest read from the fixed Kestrel GHCR repository."""
+
+    http_status: int
+    observed_digest: str | None
+    size_bytes: int
+
+
+def _fetch_ghcr_token(
+    credential: bytes,
+    *,
+    actions: str,
+    principal: str,
+    timeout_seconds: float = 30.0,
+    connection_factory: ConnectionFactory = _default_connection,
+) -> str:
+    """Obtain one fixed-scope token without proxy or redirect behavior."""
+
+    if actions not in {"pull", "pull,push"}:
+        raise receipts.ReleaseControlError("GHCR token actions are invalid")
+    token_label = "pull" if actions == "pull" else "push"
+    if (
+        type(principal) is not str
+        or re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", principal) is None
+        or len(principal) > 100
+    ):
+        raise receipts.ReleaseControlError(
+            f"GHCR {token_label} principal is invalid"
+        )
+    if (
+        type(credential) is not bytes
+        or len(credential) < 20
+        or len(credential) > MAX_DISPATCH_TOKEN_BYTES
+        or any(byte < 0x21 or byte > 0x7E for byte in credential)
+    ):
+        raise receipts.ReleaseControlError(
+            f"GHCR {token_label} credential bytes are invalid"
+        )
+    if type(timeout_seconds) is not float or not 0.0 < timeout_seconds <= 60.0:
+        raise receipts.ReleaseControlError("GHCR token timeout is invalid")
+    context = ssl.create_default_context()
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    connection = connection_factory("ghcr.io", context, timeout_seconds)
+    target = (
+        f"/token?service=ghcr.io&scope=repository:{_OCI_REPOSITORY}:{actions}"
+    )
+    basic = base64.b64encode(principal.encode("ascii") + b":" + credential).decode(
+        "ascii"
+    )
+    try:
+        connection.connect()
+        connection.putrequest(
+            "GET",
+            target,
+            skip_host=False,
+            skip_accept_encoding=True,
+        )
+        for name, header_value in sorted(
+            {
+                "Accept": "application/json",
+                "Authorization": f"Basic {basic}",
+                "User-Agent": "kestrel-release-transaction/1",
+            }.items()
+        ):
+            connection.putheader(name, header_value)
+        connection.endheaders()
+        response = connection.getresponse()
+        raw = response.read(_OCI_MAX_TOKEN_RESPONSE_BYTES + 1)
+        if response.status != 200 or len(raw) > _OCI_MAX_TOKEN_RESPONSE_BYTES:
+            raise receipts.ReleaseControlError(
+                f"GHCR {token_label} token response is invalid"
+            )
+        token_response = receipts._object(  # noqa: SLF001
+            receipts.parse_external_json_bytes(
+                raw, label=f"GHCR {token_label} token response"
+            ),
+            label=f"GHCR {token_label} token response",
+        )
+        token = receipts._validate_string(  # noqa: SLF001
+            token_response.get("token"), label=f"GHCR {token_label} token"
+        )
+        try:
+            encoded = token.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise receipts.ReleaseControlError(
+                f"GHCR {token_label} token is invalid"
+            ) from exc
+        if len(encoded) > MAX_DISPATCH_TOKEN_BYTES or any(
+            byte < 0x21 or byte > 0x7E for byte in encoded
+        ):
+            raise receipts.ReleaseControlError(
+                f"GHCR {token_label} token is invalid"
+            )
+        return token
+    except receipts.ReleaseControlError:
+        raise
+    except Exception as exc:
+        raise receipts.ReleaseControlError(
+            f"GHCR {token_label} token request failed"
+        ) from exc
+    finally:
+        with suppress(Exception):
+            connection.close()
+
+
+def fetch_ghcr_pull_token(
+    credential: bytes,
+    *,
+    timeout_seconds: float = 30.0,
+    connection_factory: ConnectionFactory = _default_connection,
+) -> str:
+    """Obtain the fixed pull token without proxying, redirecting, or replaying auth."""
+
+    return _fetch_ghcr_token(
+        credential,
+        actions="pull",
+        principal=receipts.SIGNING_PRINCIPAL,
+        timeout_seconds=timeout_seconds,
+        connection_factory=connection_factory,
+    )
+
+
+def fetch_ghcr_push_token(
+    credential: bytes,
+    *,
+    principal: str,
+    timeout_seconds: float = 30.0,
+    connection_factory: ConnectionFactory = _default_connection,
+) -> str:
+    """Obtain the fixed pull/push token without redirecting owner credentials."""
+
+    return _fetch_ghcr_token(
+        credential,
+        actions="pull,push",
+        principal=principal,
+        timeout_seconds=timeout_seconds,
+        connection_factory=connection_factory,
+    )
+
+
+class DirectOCIReadAPI:
+    """Read exact Kestrel GHCR digests with one credential-free blob redirect."""
+
+    def __init__(
+        self,
+        *,
+        token: bytes,
+        timeout_seconds: float = 30.0,
+        connection_factory: ConnectionFactory = _default_connection,
+    ) -> None:
+        if (
+            type(token) is not bytes
+            or not token
+            or len(token) > MAX_DISPATCH_TOKEN_BYTES
+            or any(byte < 0x21 or byte > 0x7E for byte in token)
+        ):
+            raise receipts.ReleaseControlError("GHCR pull token bytes are invalid")
+        if type(timeout_seconds) is not float or not 0.0 < timeout_seconds <= 60.0:
+            raise receipts.ReleaseControlError("GHCR read timeout is invalid")
+        self._token = token.decode("ascii")
+        self._timeout_seconds = timeout_seconds
+        self._connection_factory = connection_factory
+
+    @staticmethod
+    def _redirect_target(location: str, *, digest: str) -> tuple[str, str]:
+        if (
+            type(location) is not str
+            or not location
+            or len(location) > 8192
+            or any(character in location for character in "\r\n\0")
+        ):
+            raise receipts.ReleaseControlError("GHCR blob redirect is invalid")
+        try:
+            parsed = urlsplit(location)
+            port = parsed.port
+        except ValueError as exc:
+            raise receipts.ReleaseControlError("GHCR blob redirect is invalid") from exc
+        decoded_path = unquote(parsed.path)
+        try:
+            query = parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+        except ValueError as exc:
+            raise receipts.ReleaseControlError("GHCR blob redirect query is invalid") from exc
+        def query_value(name: str) -> str | None:
+            values = query.get(name)
+            return values[0] if values is not None and len(values) == 1 else None
+
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != _OCI_REDIRECT_HOST
+            or port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or re.fullmatch(
+                rf"/ghcrblobs[0-9]{{2}}/blobs/{re.escape(digest)}",
+                decoded_path,
+            )
+            is None
+            or any(len(values) != 1 for values in query.values())
+            or not query_value("se")
+            or not query_value("sig")
+            or query_value("sp") != "r"
+            or query_value("spr") != "https"
+            or query_value("sr") != "b"
+            or not query_value("sv")
+        ):
+            raise receipts.ReleaseControlError(
+                "GHCR blob redirect leaves the pinned storage origin"
+            )
+        return _OCI_REDIRECT_HOST, f"{parsed.path}?{parsed.query}"
+
+    @staticmethod
+    def _response_headers(response: HTTPResponseLike) -> tuple[tuple[str, str], ...]:
+        headers = tuple(
+            (name.lower(), value)
+            for name, value in response.getheaders()
+            if name.lower() in {"docker-content-digest", "location"}
+        )
+        for header_name in ("docker-content-digest", "location"):
+            if sum(name == header_name for name, _value in headers) > 1:
+                raise receipts.ReleaseControlError(
+                    f"GHCR read has duplicate {header_name} headers"
+                )
+        return headers
+
+    def _verified_response(
+        self,
+        *,
+        connection: HTTPSConnectionLike,
+        digest: str,
+        max_bytes: int,
+        allow_redirect: bool,
+    ) -> OCIReadObservation | str:
+        response = connection.getresponse()
+        if type(response.status) is not int:
+            raise receipts.ReleaseControlError("GHCR read status is invalid")
+        headers = self._response_headers(response)
+        content_digests = [
+            value for name, value in headers if name == "docker-content-digest"
+        ]
+        if content_digests and content_digests != [digest]:
+            raise receipts.ReleaseControlError("GHCR response digest header conflicts")
+        if response.status in {302, 307}:
+            if not allow_redirect:
+                raise receipts.ReleaseControlError("GHCR redirect is forbidden")
+            locations = [value for name, value in headers if name == "location"]
+            if len(locations) != 1:
+                raise receipts.ReleaseControlError("GHCR blob redirect is incomplete")
+            return locations[0]
+        if response.status == 404:
+            return OCIReadObservation(http_status=404, observed_digest=None, size_bytes=0)
+        if response.status != 200:
+            raise receipts.ReleaseControlError("GHCR digest read failed")
+        observed_digest, size = _sha256_stream(
+            cast(BinaryIO, response), max_bytes=max_bytes
+        )
+        if observed_digest != digest:
+            raise receipts.ReleaseControlError("GHCR returned conflicting digest bytes")
+        return OCIReadObservation(
+            http_status=200,
+            observed_digest=observed_digest,
+            size_bytes=size,
+        )
+
+    def read_digest(
+        self,
+        *,
+        kind: str,
+        digest: str,
+        max_bytes: int,
+    ) -> OCIReadObservation:
+        checked_digest = receipts._digest(digest, label="GHCR requested digest")  # noqa: SLF001
+        if kind not in {"blobs", "manifests"}:
+            raise receipts.ReleaseControlError("GHCR digest kind is invalid")
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 0 < max_bytes <= 2_147_483_648
+        ):
+            raise receipts.ReleaseControlError("GHCR digest read boundary is invalid")
+        target = f"/v2/{_OCI_REPOSITORY}/{kind}/{checked_digest}"
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        connection = self._connection_factory(
+            "ghcr.io", context, self._timeout_seconds
+        )
+        try:
+            connection.connect()
+            connection.putrequest(
+                "GET",
+                target,
+                skip_host=False,
+                skip_accept_encoding=True,
+            )
+            for name, value in sorted(
+                {
+                    "Accept": _OCI_ACCEPT,
+                    "Authorization": f"Bearer {self._token}",
+                    "User-Agent": "kestrel-release-transaction/1",
+                }.items()
+            ):
+                connection.putheader(name, value)
+            connection.endheaders()
+            result = self._verified_response(
+                connection=connection,
+                digest=checked_digest,
+                max_bytes=max_bytes,
+                allow_redirect=kind == "blobs",
+            )
+        except receipts.ReleaseControlError:
+            raise
+        except Exception as exc:
+            raise receipts.ReleaseControlError("GHCR digest read failed") from exc
+        finally:
+            with suppress(Exception):
+                connection.close()
+        if isinstance(result, OCIReadObservation):
+            return result
+
+        host, redirect_target = self._redirect_target(result, digest=checked_digest)
+        redirect_connection = self._connection_factory(
+            host, context, self._timeout_seconds
+        )
+        try:
+            redirect_connection.connect()
+            redirect_connection.putrequest(
+                "GET",
+                redirect_target,
+                skip_host=False,
+                skip_accept_encoding=True,
+            )
+            for name, value in sorted(
+                {
+                    "Accept": "application/octet-stream",
+                    "User-Agent": "kestrel-release-transaction/1",
+                }.items()
+            ):
+                redirect_connection.putheader(name, value)
+            redirect_connection.endheaders()
+            redirected = self._verified_response(
+                connection=redirect_connection,
+                digest=checked_digest,
+                max_bytes=max_bytes,
+                allow_redirect=False,
+            )
+            if not isinstance(redirected, OCIReadObservation):
+                raise receipts.ReleaseControlError("GHCR redirect did not terminate")
+            return redirected
+        except receipts.ReleaseControlError:
+            raise
+        except Exception as exc:
+            raise receipts.ReleaseControlError("GHCR blob redirect failed") from exc
+        finally:
+            with suppress(Exception):
+                redirect_connection.close()
+
+
+class DirectOCIWriteAPI:
+    """Publish exact Kestrel OCI objects only to the pinned GHCR origin."""
+
+    def __init__(
+        self,
+        *,
+        token: bytes,
+        timeout_seconds: float = 30.0,
+        connection_factory: ConnectionFactory = _default_connection,
+    ) -> None:
+        if (
+            type(token) is not bytes
+            or not token
+            or len(token) > MAX_DISPATCH_TOKEN_BYTES
+            or any(byte < 0x21 or byte > 0x7E for byte in token)
+        ):
+            raise receipts.ReleaseControlError("GHCR push token bytes are invalid")
+        if type(timeout_seconds) is not float or not 0.0 < timeout_seconds <= 120.0:
+            raise receipts.ReleaseControlError("GHCR write timeout is invalid")
+        self._token = token.decode("ascii")
+        self._timeout_seconds = timeout_seconds
+        self._connection_factory = connection_factory
+
+    @staticmethod
+    def _response_headers(
+        response: HTTPResponseLike,
+    ) -> tuple[tuple[str, str], ...]:
+        headers = tuple(
+            (name.lower(), value)
+            for name, value in response.getheaders()
+            if name.lower() in {"docker-content-digest", "location"}
+        )
+        for header_name in ("docker-content-digest", "location"):
+            if sum(name == header_name for name, _value in headers) > 1:
+                raise receipts.ReleaseControlError(
+                    f"GHCR write has duplicate {header_name} headers"
+                )
+        return headers
+
+    def _exchange(
+        self,
+        *,
+        method: str,
+        target: str,
+        content: bytes,
+        media_type: str | None,
+    ) -> tuple[int, tuple[tuple[str, str], ...]]:
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        connection = self._connection_factory(
+            "ghcr.io", context, self._timeout_seconds
+        )
+        try:
+            connection.connect()
+            connection.putrequest(
+                method,
+                target,
+                skip_host=False,
+                skip_accept_encoding=True,
+            )
+            headers = {
+                "Accept": _OCI_ACCEPT,
+                "Authorization": f"Bearer {self._token}",
+                "Content-Length": str(len(content)),
+                "User-Agent": "kestrel-release-transaction/1",
+            }
+            if media_type is not None:
+                headers["Content-Type"] = media_type
+            for name, value in sorted(headers.items()):
+                connection.putheader(name, value)
+            connection.endheaders()
+            if content:
+                connection.send(content)
+            response = connection.getresponse()
+            raw = response.read(MAX_TRANSPORT_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_TRANSPORT_RESPONSE_BYTES or type(response.status) is not int:
+                raise receipts.ReleaseControlError("GHCR write response is invalid")
+            return response.status, self._response_headers(response)
+        except receipts.ReleaseControlError:
+            raise
+        except Exception as exc:
+            raise receipts.ReleaseControlError("GHCR write request failed") from exc
+        finally:
+            with suppress(Exception):
+                connection.close()
+
+    @staticmethod
+    def _upload_target(location: str, *, digest: str) -> str:
+        checked_digest = receipts._digest(  # noqa: SLF001
+            digest, label="GHCR blob upload digest"
+        )
+        if (
+            type(location) is not str
+            or not location
+            or len(location) > 8192
+            or any(character in location for character in "\r\n\0")
+        ):
+            raise receipts.ReleaseControlError("GHCR blob upload location is invalid")
+        try:
+            parsed = urlsplit(location)
+            port = parsed.port
+            query = parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+        except ValueError as exc:
+            raise receipts.ReleaseControlError(
+                "GHCR blob upload location is invalid"
+            ) from exc
+        absolute = bool(parsed.scheme or parsed.netloc)
+        origin_valid = (
+            parsed.scheme == "https"
+            and parsed.hostname == "ghcr.io"
+            and port in {None, 443}
+            and parsed.username is None
+            and parsed.password is None
+        ) if absolute else parsed.scheme == "" and parsed.netloc == ""
+        if (
+            not origin_valid
+            or parsed.fragment
+            or unquote(parsed.path) != parsed.path
+            or re.fullmatch(
+                r"/v2/john-miracleworker/kestrel/blobs/uploads/"
+                r"[A-Za-z0-9._~-]{1,512}",
+                parsed.path,
+            )
+            is None
+            or set(query) - {"_state"}
+            or any(len(values) != 1 or not values[0] for values in query.values())
+        ):
+            raise receipts.ReleaseControlError(
+                "GHCR blob upload leaves the pinned registry origin"
+            )
+        separator = "&" if parsed.query else "?"
+        return (
+            f"{parsed.path}"
+            f"{('?' + parsed.query) if parsed.query else ''}"
+            f"{separator}digest={quote(checked_digest, safe='')}"
+        )
+
+    @staticmethod
+    def _require_committed_digest(
+        *,
+        status: int,
+        headers: tuple[tuple[str, str], ...],
+        digest: str,
+        label: str,
+    ) -> None:
+        observed = [
+            value for name, value in headers if name == "docker-content-digest"
+        ]
+        if status != 201 or observed != [digest]:
+            raise receipts.ReleaseControlError(f"{label} did not commit the exact digest")
+
+    def upload_blob(self, *, digest: str, content: bytes) -> None:
+        checked_digest = receipts._digest(digest, label="GHCR blob digest")  # noqa: SLF001
+        if (
+            type(content) is not bytes
+            or not content
+            or len(content) > 2_147_483_648
+            or receipts._sha256(content) != checked_digest  # noqa: SLF001
+        ):
+            raise receipts.ReleaseControlError("GHCR blob content digest mismatch")
+        status, headers = self._exchange(
+            method="POST",
+            target=f"/v2/{_OCI_REPOSITORY}/blobs/uploads/",
+            content=b"",
+            media_type=None,
+        )
+        locations = [value for name, value in headers if name == "location"]
+        if status != 202 or len(locations) != 1:
+            raise receipts.ReleaseControlError("GHCR blob upload start is invalid")
+        target = self._upload_target(locations[0], digest=checked_digest)
+        commit_status, commit_headers = self._exchange(
+            method="PUT",
+            target=target,
+            content=content,
+            media_type="application/octet-stream",
+        )
+        self._require_committed_digest(
+            status=commit_status,
+            headers=commit_headers,
+            digest=checked_digest,
+            label="GHCR blob upload",
+        )
+
+    def put_manifest(self, *, digest: str, media_type: str, content: bytes) -> None:
+        checked_digest = receipts._digest(  # noqa: SLF001
+            digest, label="GHCR manifest digest"
+        )
+        if media_type not in {
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.oci.image.manifest.v1+json",
+        }:
+            raise receipts.ReleaseControlError("GHCR manifest media type is invalid")
+        if (
+            type(content) is not bytes
+            or not content
+            or len(content) > receipts.MAX_SOURCE_BODY_BYTES
+            or receipts._sha256(content) != checked_digest  # noqa: SLF001
+        ):
+            raise receipts.ReleaseControlError("GHCR manifest content digest mismatch")
+        status, headers = self._exchange(
+            method="PUT",
+            target=f"/v2/{_OCI_REPOSITORY}/manifests/{checked_digest}",
+            content=content,
+            media_type=media_type,
+        )
+        self._require_committed_digest(
+            status=status,
+            headers=headers,
+            digest=checked_digest,
+            label="GHCR manifest publication",
+        )
+
+
+_BOUNDARY_JSON_ACCEPT = "application/vnd.github+json"
+_BOUNDARY_RAW_ACCEPT = "application/vnd.github.raw+json"
+_BOUNDARY_ASSET_ACCEPT = "application/octet-stream"
+_BOUNDARY_REPOSITORY = "John-MiracleWorker/Kestrel"
+_BOUNDARY_RECOVERY_REPOSITORY = "John-MiracleWorker/Kestrel-Release-Recovery"
+_BOUNDARY_ENVIRONMENTS = ("release", "release-prepare", "release-commit", "pypi")
+_BOUNDARY_CREDENTIAL_ASSETS = (
+    "recovery-reader-endpoint-probes.json",
+    "recovery-reader-identity-probe.json",
+    "recovery-reader-scope-authority.json",
+    "recovery-reader-scope-authority.json.sig",
+    "release-guard-endpoint-probes.json",
+    "release-guard-identity-probe.json",
+    "release-guard-scope-authority.json",
+    "release-guard-scope-authority.json.sig",
+)
+_BOUNDARY_AUTHORITY_RELEASES: dict[
+    str, tuple[str, str | None, tuple[str, ...]]
+] = {
+    "authorize": (
+        "release-authorization-authority",
+        None,
+        (*_BOUNDARY_CREDENTIAL_ASSETS, "approval-history-observation.json"),
+    ),
+    "prepare": (
+        "release-preparation-authority",
+        None,
+        (*_BOUNDARY_CREDENTIAL_ASSETS, "approval-history-observation.json"),
+    ),
+    "commit": (
+        "release-commit-authority",
+        "github-commit-authority",
+        (*_BOUNDARY_CREDENTIAL_ASSETS, "approval-history-observation.json"),
+    ),
+    "verify": (
+        "release-verification-authority",
+        None,
+        _BOUNDARY_CREDENTIAL_ASSETS,
+    ),
+    "pypi": (
+        "release-pypi-authority",
+        None,
+        (
+            *_BOUNDARY_CREDENTIAL_ASSETS,
+            "approval-history-observation.json",
+            "pypi-authority.json",
+            "pypi-authority.json.sig",
+        ),
+    ),
+    "final": (
+        "release-final-authority",
+        None,
+        _BOUNDARY_CREDENTIAL_ASSETS,
+    ),
+}
+
+
+def _boundary_identity(api: GitHubReadAPI, *, label: str) -> bytes:
+    exchange = api("GET /user", accept=_BOUNDARY_JSON_ACCEPT)
+    if exchange.http_status != 200:
+        raise receipts.ReleaseControlError(f"{label} identity observation failed")
+    value = receipts._object(  # noqa: SLF001
+        receipts.parse_external_json_bytes(
+            exchange.response_body, label=f"{label} identity observation"
+        ),
+        label=f"{label} identity observation",
+    )
+    if (
+        value.get("login") != receipts.SIGNING_PRINCIPAL
+        or value.get("id") != 58918509
+        or value.get("type") != "User"
+    ):
+        raise receipts.ReleaseControlError(f"{label} identity is not the repository owner")
+    return receipts.canonical_json_bytes({"login": receipts.SIGNING_PRINCIPAL})
+
+
+def fetch_github_boundary_authority(
+    *,
+    boundary: str,
+    run_id: int,
+    output_dir: Path,
+    api: GitHubReadAPI,
+    timeout_seconds: float = 600.0,
+    poll_interval_seconds: float = 5.0,
+    _monotonic: Callable[[], float] = time.monotonic,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> tuple[str, ...]:
+    """Poll one phase tag and download its exact immutable signed authority set."""
+
+    configuration = _BOUNDARY_AUTHORITY_RELEASES.get(boundary)
+    if configuration is None:
+        raise receipts.ReleaseControlError("GitHub boundary authority phase is invalid")
+    checked_run_id = receipts._safe_integer(  # noqa: SLF001
+        run_id, label="GitHub boundary authority run ID", positive=True
+    )
+    if (
+        type(timeout_seconds) is not float
+        or not 0.0 < timeout_seconds <= 1800.0
+        or type(poll_interval_seconds) is not float
+        or not 0.0 < poll_interval_seconds <= 30.0
+    ):
+        raise receipts.ReleaseControlError("GitHub boundary authority polling policy is invalid")
+    if output_dir.exists() or output_dir.is_symlink():
+        raise receipts.ReleaseControlError("GitHub boundary authority output must be absent")
+
+    tag_prefix, authority_stem, extra_assets = configuration
+    tag = f"{tag_prefix}-{checked_run_id}-1"
+    release_body = (
+        f"Kestrel {boundary} authority for promotion run {checked_run_id}"
+    )
+    expected_names = {
+        "owner-signing-keys-observation.json",
+        *extra_assets,
+    }
+    if authority_stem is not None:
+        expected_names.update(
+            {f"{authority_stem}.json", f"{authority_stem}.json.sig"}
+        )
+    release_target = (
+        f"GET /repos/{_BOUNDARY_RECOVERY_REPOSITORY}/releases/tags/{quote(tag, safe='')}"
+    )
+    _boundary_identity(api, label="boundary authority recovery reader")
+    started = _monotonic()
+    while True:
+        exchange = api(release_target, accept=_BOUNDARY_JSON_ACCEPT)
+        if exchange.http_status == 200:
+            break
+        if exchange.http_status != 404:
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority Release observation failed"
+            )
+        elapsed = _monotonic() - started
+        if elapsed < 0.0 or elapsed >= timeout_seconds:
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority Release was not provisioned in time"
+            )
+        _sleep(min(poll_interval_seconds, timeout_seconds - elapsed))
+
+    release = receipts._object(  # noqa: SLF001
+        receipts.parse_external_json_bytes(
+            exchange.response_body, label="GitHub boundary authority Release"
+        ),
+        label="GitHub boundary authority Release",
+    )
+    raw_assets = receipts._array(  # noqa: SLF001
+        release.get("assets"), label="GitHub boundary authority Release assets"
+    )
+    assets: dict[str, tuple[int, int]] = {}
+    for raw_asset in raw_assets:
+        asset = receipts._object(raw_asset, label="GitHub boundary authority asset")  # noqa: SLF001
+        name = receipts._validate_string(  # noqa: SLF001
+            asset.get("name"), label="GitHub boundary authority asset name"
+        )
+        if name in assets:
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority asset inventory is duplicated"
+            )
+        assets[name] = (
+            receipts._safe_integer(  # noqa: SLF001
+                asset.get("id"), label="GitHub boundary authority asset ID", positive=True
+            ),
+            receipts._safe_integer(  # noqa: SLF001
+                asset.get("size"), label="GitHub boundary authority asset size", positive=True
+            ),
+        )
+    if (
+        release.get("tag_name") != tag
+        or release.get("name") != tag
+        or release.get("body") != release_body
+        or release.get("draft") is not False
+        or release.get("prerelease") is not False
+        or release.get("immutable") is not True
+        or set(assets) != expected_names
+        or len(raw_assets) != len(expected_names)
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release is not exact and immutable"
+        )
+
+    downloaded: dict[str, bytes] = {}
+    for name in sorted(assets):
+        asset_id, size = assets[name]
+        asset_exchange = api(
+            f"GET /repos/{_BOUNDARY_RECOVERY_REPOSITORY}/releases/assets/{asset_id}",
+            accept=_BOUNDARY_ASSET_ACCEPT,
+        )
+        if asset_exchange.http_status != 200 or len(asset_exchange.response_body) != size:
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority asset download mismatch"
+            )
+        downloaded[name] = asset_exchange.response_body
+
+    output_dir.mkdir(mode=0o700, parents=False)
+    for name, raw in downloaded.items():
+        if not receipts.write_once(output_dir / name, raw):
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority output already exists"
+            )
+    return tuple(sorted(downloaded))
+
+
+def _boundary_next_request(
+    headers: tuple[tuple[str, str], ...], *, label: str
+) -> tuple[str | None, str | None]:
+    header_pairs: list[receipts.JSONValue] = [
+        cast(receipts.JSONValue, [name, value]) for name, value in headers
+    ]
+    next_url = receipts._pagination_next_link(  # noqa: SLF001
+        header_pairs, label=f"{label} response"
+    )
+    if next_url is None:
+        return None, None
+    try:
+        parsed = urlsplit(next_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise receipts.ReleaseControlError(f"{label} next page is invalid") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "api.github.com"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not _github_read_path_allowed(parsed.path)
+        or not parsed.query
+        or parsed.fragment
+    ):
+        raise receipts.ReleaseControlError(f"{label} next page leaves the pinned origin")
+    return next_url, f"GET {parsed.path}?{parsed.query}"
+
+
+def _boundary_paginated_source(
+    api: GitHubReadAPI,
+    *,
+    request_target: str,
+    locator: str,
+    label: str,
+    wrap_object: bool = False,
+    collection_key: str | None = None,
+) -> tuple[bytes, list[receipts.JSONValue]]:
+    pages: list[receipts.JSONValue] = []
+    items: list[receipts.JSONValue] = []
+    current_target = request_target
+    evidence_url = locator
+    seen_targets: set[str] = set()
+    for number in range(1, receipts.MAX_SOURCE_ENVELOPES + 1):
+        if current_target in seen_targets:
+            raise receipts.ReleaseControlError(f"{label} pagination looped")
+        seen_targets.add(current_target)
+        exchange = api(current_target, accept=_BOUNDARY_JSON_ACCEPT)
+        if exchange.http_status != 200:
+            raise receipts.ReleaseControlError(f"{label} observation failed")
+        parsed = receipts.parse_external_json_bytes(
+            exchange.response_body, label=f"{label} response"
+        )
+        body_items: list[receipts.JSONValue]
+        if collection_key is not None:
+            response_object = receipts._object(  # noqa: SLF001
+                parsed, label=f"{label} response"
+            )
+            body_items = list(
+                receipts._array(  # noqa: SLF001
+                    response_object.get(collection_key),
+                    label=f"{label} {collection_key}",
+                )
+            )
+        elif wrap_object:
+            body_items = [
+                cast(receipts.JSONValue, receipts._object(parsed, label=f"{label} response"))  # noqa: SLF001
+            ]
+        else:
+            body_items = list(receipts._array(parsed, label=f"{label} response"))  # noqa: SLF001
+        items.extend(body_items)
+        response_headers: list[receipts.JSONValue] = [
+            cast(receipts.JSONValue, [name, value])
+            for name, value in exchange.response_headers
+        ]
+        pages.append(
+            {
+                "number": number,
+                "request_url": evidence_url,
+                "response_headers": response_headers,
+                "body": body_items,
+            }
+        )
+        next_url, next_target = _boundary_next_request(
+            exchange.response_headers, label=label
+        )
+        if next_url is None or next_target is None:
+            break
+        evidence_url = next_url
+        current_target = next_target
+    else:
+        raise receipts.ReleaseControlError(f"{label} page cardinality exceeds its limit")
+    return receipts.canonical_external_json_bytes({"pages": pages}), items
+
+
+def capture_prerequisite_boundary(
+    *,
+    registry: Mapping[str, object],
+    repository: str,
+    recovery_repository: str,
+    candidate_ref: str,
+    promotion_run_id: int,
+    output_dir: Path,
+    guard_api: GitHubReadAPI,
+    recovery_api: GitHubReadAPI,
+    _clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> tuple[str, ...]:
+    """Capture every mutable prerequisite after the job approval boundary."""
+
+    if repository != _BOUNDARY_REPOSITORY or recovery_repository != _BOUNDARY_RECOVERY_REPOSITORY:
+        raise receipts.ReleaseControlError("prerequisite boundary repository identity mismatch")
+    candidate_sha = receipts._git_sha(candidate_ref, label="prerequisite candidate ref")  # noqa: SLF001
+    checked_run_id = receipts._safe_integer(  # noqa: SLF001
+        promotion_run_id, label="prerequisite promotion run ID", positive=True
+    )
+    if output_dir.exists() or output_dir.is_symlink():
+        raise receipts.ReleaseControlError("prerequisite boundary output must be absent")
+    output_dir.mkdir(mode=0o700, parents=False)
+    guard_identity = _boundary_identity(guard_api, label="release guard")
+    recovery_identity = _boundary_identity(recovery_api, label="recovery reader")
+    entries = {
+        cast(str, entry["name"]): entry
+        for entry in receipts._validate_registry(registry)  # noqa: SLF001
+        if entry.get("receipt_schema") == receipts.SOURCE_OBSERVATION_SCHEMA
+        and entry.get("phase") == "release-control"
+        and entry.get("mode") is None
+    }
+    written: list[str] = []
+
+    def store(name: str, raw: bytes, *, recovery: bool = False) -> None:
+        entry = entries.get(name)
+        if entry is None:
+            raise receipts.ReleaseControlError("prerequisite source is absent from the registry")
+        envelope = receipts.capture_source(
+            registry=registry,
+            receipt_schema=receipts.SOURCE_OBSERVATION_SCHEMA,
+            phase="release-control",
+            mode=None,
+            name=name,
+            raw_input=raw,
+            identity_observation=recovery_identity if recovery else guard_identity,
+            _clock=_clock,
+        )
+        path = output_dir / f"{name}.json"
+        if not receipts.write_once(path, receipts.canonical_json_bytes(envelope)):
+            raise receipts.ReleaseControlError("prerequisite boundary output already exists")
+        written.append(path.name)
+
+    def singleton(
+        name: str,
+        request_target: str,
+        *,
+        api: GitHubReadAPI = guard_api,
+        accept: str = _BOUNDARY_JSON_ACCEPT,
+        recovery: bool = False,
+    ) -> receipts.JSONValue | bytes:
+        exchange = api(request_target, accept=accept)
+        if exchange.http_status != 200:
+            raise receipts.ReleaseControlError(f"{name} observation failed")
+        raw = exchange.response_body
+        value: receipts.JSONValue | bytes
+        if accept == _BOUNDARY_JSON_ACCEPT:
+            value = receipts.parse_external_json_bytes(raw, label=name)
+        else:
+            if not raw:
+                raise receipts.ReleaseControlError(f"{name} observation is empty")
+            value = raw
+        store(name, raw, recovery=recovery)
+        return value
+
+    def paginated(
+        name: str,
+        request_target: str,
+        *,
+        wrap_object: bool = False,
+        collection_key: str | None = None,
+    ) -> list[receipts.JSONValue]:
+        entry = entries.get(name)
+        if entry is None:
+            raise receipts.ReleaseControlError("prerequisite source is absent from the registry")
+        raw, items = _boundary_paginated_source(
+            guard_api,
+            request_target=request_target,
+            locator=cast(str, entry["locator"]),
+            label=name,
+            wrap_object=wrap_object,
+            collection_key=collection_key,
+        )
+        store(name, raw)
+        return items
+
+    singleton("repository-observation", f"GET /repos/{repository}")
+    paginated(
+        "repository-collaborators-observation",
+        f"GET /repos/{repository}/collaborators?affiliation=all&permission=push&per_page=100",
+    )
+    paginated(
+        "repository-invitations-observation",
+        f"GET /repos/{repository}/invitations?per_page=100",
+    )
+    paginated("deploy-keys-observation", f"GET /repos/{repository}/keys?per_page=100")
+    singleton(
+        "actions-workflow-permissions-observation",
+        f"GET /repos/{repository}/actions/permissions/workflow",
+    )
+    paginated(
+        "active-runs-observation",
+        f"GET /repos/{repository}/actions/runs?per_page=100",
+        collection_key="workflow_runs",
+    )
+    paginated(
+        "owner-signing-keys-observation",
+        "GET /users/John-MiracleWorker/ssh_signing_keys?per_page=100",
+    )
+    singleton("main-branch-observation", f"GET /repos/{repository}/branches/main")
+    singleton(
+        "promotion-run-observation",
+        f"GET /repos/{repository}/actions/runs/{checked_run_id}",
+    )
+    singleton(
+        "immutable-releases-observation",
+        f"GET /repos/{repository}/immutable-releases",
+    )
+    rulesets = paginated(
+        "rulesets-observation", f"GET /repos/{repository}/rulesets?per_page=100"
+    )
+    for source_name, ruleset_name in (
+        ("tag-ruleset-detail-observation", "kestrel-release-tags"),
+        ("ingress-ruleset-detail-observation", "kestrel-release-transaction-main-lock"),
+    ):
+        matching = [
+            receipts._object(item, label=f"{source_name} inventory item")  # noqa: SLF001
+            for item in rulesets
+            if type(item) is dict
+            and item.get("name") == ruleset_name
+            and item.get("enforcement") == "active"
+        ]
+        if len(matching) != 1:
+            raise receipts.ReleaseControlError(f"{source_name} inventory is not a singleton")
+        ruleset_id = receipts._safe_integer(  # noqa: SLF001
+            matching[0].get("id"), label=f"{source_name} ID", positive=True
+        )
+        singleton(source_name, f"GET /repos/{repository}/rulesets/{ruleset_id}")
+    singleton(
+        "workflow-observation",
+        f"GET /repos/{repository}/actions/workflows/release.yml",
+    )
+    singleton(
+        "default-branch-workflow-contents",
+        f"GET /repos/{repository}/contents/.github/workflows/release.yml?ref=main",
+        accept=_BOUNDARY_RAW_ACCEPT,
+    )
+    singleton(
+        "candidate-workflow-contents",
+        f"GET /repos/{repository}/contents/.github/workflows/release.yml?ref={candidate_sha}",
+        accept=_BOUNDARY_RAW_ACCEPT,
+    )
+    singleton(
+        "recovery-repository-observation",
+        f"GET /repos/{recovery_repository}",
+        api=recovery_api,
+        recovery=True,
+    )
+    singleton(
+        "recovery-immutable-releases-observation",
+        f"GET /repos/{recovery_repository}/immutable-releases",
+        api=recovery_api,
+        recovery=True,
+    )
+    for environment in _BOUNDARY_ENVIRONMENTS:
+        singleton(
+            f"environment-{environment}-observation",
+            f"GET /repos/{repository}/environments/{environment}",
+        )
+        paginated(
+            f"environment-{environment}-policies-observation",
+            (
+                f"GET /repos/{repository}/environments/{environment}/"
+                "deployment-branch-policies?per_page=100"
+            ),
+            wrap_object=True,
+        )
+    expected = {
+        *(name + ".json" for name in (
+            "actions-workflow-permissions-observation",
+            "active-runs-observation",
+            "candidate-workflow-contents",
+            "default-branch-workflow-contents",
+            "deploy-keys-observation",
+            "immutable-releases-observation",
+            "ingress-ruleset-detail-observation",
+            "main-branch-observation",
+            "owner-signing-keys-observation",
+            "promotion-run-observation",
+            "recovery-immutable-releases-observation",
+            "recovery-repository-observation",
+            "repository-collaborators-observation",
+            "repository-invitations-observation",
+            "repository-observation",
+            "rulesets-observation",
+            "tag-ruleset-detail-observation",
+            "workflow-observation",
+        )),
+        *(f"environment-{environment}-observation.json" for environment in _BOUNDARY_ENVIRONMENTS),
+        *(
+            f"environment-{environment}-policies-observation.json"
+            for environment in _BOUNDARY_ENVIRONMENTS
+        ),
+    }
+    if set(written) != expected or len(written) != len(expected):
+        raise receipts.ReleaseControlError("prerequisite boundary source inventory mismatch")
+    return tuple(sorted(written))
+
+
 def _load_canonical_object(path: Path, *, label: str) -> receipts.JSONObject:
     raw = receipts._read_regular(  # noqa: SLF001
         path, label=label, max_bytes=receipts.MAX_SOURCE_BODY_BYTES
@@ -878,7 +2362,11 @@ def prepare_dispatch_from_observations(
     receipts._dispatch_workflow(workflow)  # noqa: SLF001
     if (
         not default_branch_workflow_contents
-        or default_branch_workflow_contents != candidate_workflow_contents
+        or not candidate_workflow_contents
+        or (
+            mode == "initiate"
+            and default_branch_workflow_contents != candidate_workflow_contents
+        )
     ):
         raise receipts.ReleaseControlError(
             "dispatch ingress workflow bytes differ between default and candidate"
@@ -2610,6 +4098,7 @@ def _verified_authority_from_record(
     verification_schema: str,
     authority_schema: str,
     label: str,
+    require_current: bool = True,
     _clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> receipts.JSONObject:
     checked = receipts._copy_json_object(verification, label=label)  # noqa: SLF001
@@ -2683,23 +4172,27 @@ def _verified_authority_from_record(
         checked.get("signing_key_fingerprint"),
         label=f"{label} signing key fingerprint",
     )
+    if type(require_current) is not bool:
+        raise receipts.ReleaseControlError(f"{label} freshness policy is invalid")
     now = _clock()
     if now.tzinfo is None or now.utcoffset() != timedelta(0):
         raise receipts.ReleaseControlError(f"{label} clock must be aware UTC")
     now = now.astimezone(UTC).replace(microsecond=0)
+    verified_at = receipts.parse_timestamp(
+        checked.get("verified_at"), label=f"{label} verification time"
+    )
+    if verified_at > now:
+        raise receipts.ReleaseControlError(f"{label} verification time is in the future")
     receipts.verify_owner_detached_signature(
         receipt=receipt,
         signature=signature,
         owner_signing_keys_observation=owner_keys,
         principal=receipts.SIGNING_PRINCIPAL,
         namespace=receipts.SIGNING_NAMESPACE,
-        _clock=lambda: now,
+        _clock=(lambda: now if require_current else verified_at),
     )
     if receipts.signature_public_key_fingerprint(signature) != signing_fingerprint:
         raise receipts.ReleaseControlError(f"{label} signing key fingerprint mismatch")
-    verified_at = receipts.parse_timestamp(
-        checked.get("verified_at"), label=f"{label} verification time"
-    )
     observed_at = receipts.parse_timestamp(
         authority.get("observed_at"), label=f"{label} authority observed_at"
     )
@@ -2710,7 +4203,7 @@ def _verified_authority_from_record(
         raise receipts.ReleaseControlError(
             f"{label} verification occurred outside authority lifetime"
         )
-    if now < observed_at or now >= expires_at:
+    if require_current and (now < observed_at or now >= expires_at):
         raise receipts.ReleaseControlError(f"{label} authority is not currently fresh")
     return authority
 
@@ -2756,6 +4249,32 @@ def _require_github_authority_binding(
         or bindings.get("commit_marker_digest") != commit_marker_digest
     ):
         raise receipts.ReleaseControlError("GitHub authority transaction binding mismatch")
+
+
+def _require_authorization_admission_authority(
+    authority: Mapping[str, object],
+    *,
+    candidate: Mapping[str, object],
+    transaction_authorization_digest: str | None,
+    recovery_capsule_digest: str | None,
+    commit_marker_digest: str | None,
+) -> None:
+    """Bind server authorization to the frozen admission authority contract."""
+
+    try:
+        _require_github_authority_binding(
+            authority,
+            candidate=candidate,
+            phase="admission",
+            transaction_authorization_digest=transaction_authorization_digest,
+            execution_authorization_digest=None,
+            recovery_capsule_digest=recovery_capsule_digest,
+            commit_marker_digest=commit_marker_digest,
+        )
+    except receipts.ReleaseControlError as exc:
+        raise receipts.ReleaseControlError(
+            f"authorization admission authority binding mismatch: {exc}"
+        ) from exc
 
 
 def _require_cumulative_owner_approvals(
@@ -3067,6 +4586,46 @@ def build_release_stage_record(
     return record
 
 
+def release_stage_operation_request_digest(
+    *,
+    candidate: Mapping[str, object],
+    operation: str,
+    request: Mapping[str, object],
+    transaction_authorization_digest: str,
+    recovery_capsule_digest: str,
+) -> str:
+    """Digest one exact operation request with its durable transaction bindings."""
+
+    checked_operation = receipts._validate_string(  # noqa: SLF001
+        operation, label="release stage operation"
+    )
+    request_raw = receipts.canonical_external_json_bytes(dict(request))
+    checked_request = receipts._object(  # noqa: SLF001
+        receipts.parse_external_json_bytes(
+            request_raw, label=f"release stage {checked_operation} request"
+        ),
+        label=f"release stage {checked_operation} request",
+    )
+    wrapper = {
+        "candidate": receipts._copy_json_object(  # noqa: SLF001
+            candidate, label="release stage operation candidate"
+        ),
+        "operation": checked_operation,
+        "canonical_request_sha256": receipts._sha256(  # noqa: SLF001
+            receipts.canonical_external_json_bytes(checked_request)
+        ),
+        "transaction_authorization_digest": receipts._digest(  # noqa: SLF001
+            transaction_authorization_digest,
+            label="release stage operation transaction authorization",
+        ),
+        "recovery_capsule_digest": receipts._digest(  # noqa: SLF001
+            recovery_capsule_digest,
+            label="release stage operation recovery capsule",
+        ),
+    }
+    return receipts._sha256(receipts.canonical_json_bytes(wrapper))  # noqa: SLF001
+
+
 def build_release_stage_plan(
     *,
     stage: int,
@@ -3149,19 +4708,16 @@ def build_release_stage_plan(
     operations: list[receipts.JSONValue] = []
     for item in state_operations:
         operation = cast(str, item["operation"])
-        request = {
-            "candidate": checked_candidate,
-            "operation": operation,
-            "request": checked_requests.get(operation, {}),
-            "transaction_authorization_digest": transaction_digest,
-            "recovery_capsule_digest": capsule_digest,
-        }
         operations.append(
             {
                 "operation": operation,
                 "action": ("create" if item.get("state") == "missing" else "no_op"),
-                "request_digest": receipts._sha256(  # noqa: SLF001
-                    receipts.canonical_json_bytes(request)
+                "request_digest": release_stage_operation_request_digest(
+                    candidate=checked_candidate,
+                    operation=operation,
+                    request=checked_requests.get(operation, {}),
+                    transaction_authorization_digest=transaction_digest,
+                    recovery_capsule_digest=capsule_digest,
                 ),
             }
         )
@@ -3787,6 +5343,454 @@ def publish_dispatch_terminal_release(
         "asset_names": cast(list[receipts.JSONValue], sorted(expected_assets)),
         "record_digest": record_digest,
         "signature_digest": receipts._sha256(signature),  # noqa: SLF001
+        "validation_status": "validated",
+    }
+
+
+def _inspect_boundary_authority_releases(
+    *,
+    listing: TerminalReleaseListing,
+    tag_name: str,
+    release_name: str,
+    release_body: str,
+    expected_assets: Mapping[str, tuple[bytes, str]],
+) -> TerminalRelease | None:
+    if listing.complete is not True:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release listing is incomplete"
+        )
+    release_ids = [release.release_id for release in listing.releases]
+    if (
+        any(type(release_id) is not int or release_id <= 0 for release_id in release_ids)
+        or len(release_ids) != len(set(release_ids))
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release IDs are invalid or duplicated"
+        )
+    matches = [release for release in listing.releases if release.tag_name == tag_name]
+    if len(matches) > 1:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release tag is ambiguous"
+        )
+    if not matches:
+        return None
+    release = matches[0]
+    if (
+        release.name != release_name
+        or release.body != release_body
+        or release.prerelease is not False
+        or not release.html_url
+        or release.draft is release.immutable
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release identity or state conflicts"
+        )
+    names = [asset.name for asset in release.assets]
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release assets are unsorted or duplicated"
+        )
+    if not set(names).issubset(expected_assets):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release contains an unexpected asset"
+        )
+    asset_ids = [asset.asset_id for asset in release.assets]
+    if (
+        any(type(asset_id) is not int or asset_id <= 0 for asset_id in asset_ids)
+        or len(asset_ids) != len(set(asset_ids))
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release asset IDs are invalid or duplicated"
+        )
+    for asset in release.assets:
+        content, media_type = expected_assets[asset.name]
+        if (
+            asset.size_bytes != len(content)
+            or asset.digest != receipts._sha256(content)  # noqa: SLF001
+            or asset.media_type != media_type
+        ):
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority Release asset identity conflicts"
+            )
+    if release.immutable and set(names) != set(expected_assets):
+        raise receipts.ReleaseControlError(
+            "immutable GitHub boundary authority asset set is incomplete"
+        )
+    return release
+
+
+def publish_github_boundary_authority(
+    *,
+    boundary: str,
+    run_id: int,
+    candidate_manifest_digest: str,
+    environment_id: int,
+    asset_root: Path,
+    journal_path: Path,
+    credential_tokens: Mapping[str, bytes],
+    api: TerminalReleaseAPI,
+    recovery_reader_api: GitHubReadAPI,
+    _clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> receipts.JSONObject:
+    """Validate and crash-resume one exact immutable phase-authority Release."""
+
+    configuration = _BOUNDARY_AUTHORITY_RELEASES.get(boundary)
+    if configuration is None:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority publication phase is invalid"
+        )
+    checked_run_id = receipts._safe_integer(  # noqa: SLF001
+        run_id, label="GitHub boundary authority publication run ID", positive=True
+    )
+    checked_candidate_digest = receipts._digest(  # noqa: SLF001
+        candidate_manifest_digest,
+        label="GitHub boundary authority publication candidate digest",
+    )
+    checked_environment_id = receipts._safe_integer(  # noqa: SLF001
+        environment_id,
+        label="GitHub boundary authority publication environment ID",
+        positive=True,
+    )
+    if not asset_root.is_dir() or asset_root.is_symlink():
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority asset root is invalid"
+        )
+    tag_prefix, authority_stem, extra_assets = configuration
+    expected_names = {
+        "owner-signing-keys-observation.json",
+        *extra_assets,
+    }
+    if authority_stem is not None:
+        expected_names.update(
+            {f"{authority_stem}.json", f"{authority_stem}.json.sig"}
+        )
+    entries = tuple(asset_root.iterdir())
+    if (
+        {entry.name for entry in entries} != expected_names
+        or len(entries) != len(expected_names)
+        or any(not entry.is_file() or entry.is_symlink() for entry in entries)
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority asset inventory is not exact"
+        )
+    assets: dict[str, tuple[bytes, str]] = {}
+    for name in sorted(expected_names):
+        raw = receipts._read_regular(  # noqa: SLF001
+            asset_root / name,
+            label=f"GitHub boundary authority asset {name}",
+            max_bytes=receipts.MAX_SOURCE_ENVELOPE_BYTES,
+        )
+        media_type = (
+            "application/octet-stream" if name.endswith(".sig") else "application/json"
+        )
+        if media_type == "application/json":
+            receipts.strict_canonical_json(
+                raw, label=f"GitHub boundary authority asset {name}"
+            )
+        assets[name] = (raw, media_type)
+
+    owner_keys = assets["owner-signing-keys-observation.json"][0]
+    verification_digests: dict[str, receipts.JSONValue] = {}
+    if authority_stem is not None:
+        if boundary != "commit":
+            raise receipts.ReleaseControlError(
+                "only the commit boundary may carry GitHub release authority v3"
+            )
+        authority_name = f"{authority_stem}.json"
+        github_verification = receipts.verify_github_authority(
+            receipt=assets[authority_name][0],
+            signature=assets[f"{authority_name}.sig"][0],
+            owner_signing_keys_observation=owner_keys,
+            expected_run_id=checked_run_id,
+            expected_candidate_digest=checked_candidate_digest,
+            expected_environment_id=checked_environment_id,
+            _clock=_clock,
+        )
+        verified_authority = receipts._object(  # noqa: SLF001
+            github_verification.get("authority"),
+            label="GitHub boundary verified authority",
+        )
+        if (
+            github_verification.get("validation_status") != "validated"
+            or verified_authority.get("phase") != "commit"
+        ):
+            raise receipts.ReleaseControlError(
+                "GitHub commit boundary authority verification is not validated"
+            )
+        verification_digests["github_authority"] = receipts._sha256(  # noqa: SLF001
+            receipts.canonical_json_bytes(github_verification)
+        )
+    if set(credential_tokens) != {"recovery-reader", "release-guard"}:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority runtime credential set is not exact"
+        )
+    for credential in ("recovery-reader", "release-guard"):
+        token = credential_tokens[credential]
+        verification = receipts.verify_runtime_credential(
+            scope_authority=assets[f"{credential}-scope-authority.json"][0],
+            scope_authority_signature=assets[
+                f"{credential}-scope-authority.json.sig"
+            ][0],
+            owner_signing_keys_observation=owner_keys,
+            identity_probe=assets[f"{credential}-identity-probe.json"][0],
+            endpoint_probe_observations=assets[
+                f"{credential}-endpoint-probes.json"
+            ][0],
+            token_bytes=token,
+            _clock=_clock,
+        )
+        if verification.get("validation_status") != "validated":
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority runtime credential is not validated"
+            )
+        verification_digests[credential.replace("-", "_")] = receipts._sha256(  # noqa: SLF001
+            receipts.canonical_json_bytes(verification)
+        )
+    if boundary == "pypi":
+        pypi_verification = receipts.verify_pypi_authority(
+            receipt=assets["pypi-authority.json"][0],
+            signature=assets["pypi-authority.json.sig"][0],
+            owner_signing_keys_observation=owner_keys,
+            expected_run_id=checked_run_id,
+            expected_candidate_digest=checked_candidate_digest,
+            expected_environment_id=checked_environment_id,
+            _clock=_clock,
+        )
+        if pypi_verification.get("validation_status") != "validated":
+            raise receipts.ReleaseControlError(
+                "PyPI boundary authority verification is not validated"
+            )
+        verification_digests["pypi_authority"] = receipts._sha256(  # noqa: SLF001
+            receipts.canonical_json_bytes(pypi_verification)
+        )
+
+    _boundary_identity(
+        recovery_reader_api,
+        label="boundary authority publication recovery reader",
+    )
+
+    tag_name = f"{tag_prefix}-{checked_run_id}-1"
+    release_name = tag_name
+    release_body = f"Kestrel {boundary} authority for promotion run {checked_run_id}"
+    repository_preflight = recovery_reader_api(
+        f"GET /repos/{_BOUNDARY_RECOVERY_REPOSITORY}",
+        accept=_BOUNDARY_JSON_ACCEPT,
+    )
+    if repository_preflight.http_status != 200:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority recovery-reader repository access preflight failed"
+        )
+    recovery_repository = receipts._object(  # noqa: SLF001
+        receipts.parse_external_json_bytes(
+            repository_preflight.response_body,
+            label="recovery-reader repository preflight",
+        ),
+        label="recovery-reader repository preflight",
+    )
+    repository_owner = receipts._object(  # noqa: SLF001
+        recovery_repository.get("owner"),
+        label="recovery-reader repository preflight owner",
+    )
+    if (
+        recovery_repository.get("full_name") != _BOUNDARY_RECOVERY_REPOSITORY
+        or recovery_repository.get("private") is not True
+        or recovery_repository.get("visibility") != "private"
+        or recovery_repository.get("archived") is not False
+        or recovery_repository.get("disabled") is not False
+        or repository_owner.get("login") != receipts.SIGNING_PRINCIPAL
+        or repository_owner.get("id") != 58918509
+        or repository_owner.get("type") != "User"
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority recovery repository identity conflicts"
+        )
+    receipts._safe_integer(  # noqa: SLF001
+        recovery_repository.get("id"),
+        label="recovery-reader repository preflight ID",
+        positive=True,
+    )
+    reader_preflight = recovery_reader_api(
+        "GET /repos/"
+        f"{_BOUNDARY_RECOVERY_REPOSITORY}/releases/tags/{quote(tag_name, safe='')}",
+        accept=_BOUNDARY_JSON_ACCEPT,
+    )
+    if reader_preflight.http_status not in {200, 404}:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority recovery-reader Release access preflight failed"
+        )
+    if reader_preflight.http_status == 200:
+        preexisting = receipts._object(  # noqa: SLF001
+            receipts.parse_external_json_bytes(
+                reader_preflight.response_body,
+                label="preexisting GitHub boundary authority Release",
+            ),
+            label="preexisting GitHub boundary authority Release",
+        )
+        if preexisting.get("tag_name") != tag_name:
+            raise receipts.ReleaseControlError(
+                "preexisting GitHub boundary authority Release tag conflicts"
+            )
+    journal: receipts.JSONObject = {
+        "schema": "kestrel.github_boundary_authority_publication_journal.v1",
+        "repository": _BOUNDARY_RECOVERY_REPOSITORY,
+        "boundary": boundary,
+        "run_id": checked_run_id,
+        "candidate_manifest_digest": checked_candidate_digest,
+        "environment_id": checked_environment_id,
+        "tag_name": tag_name,
+        "name": release_name,
+        "body": release_body,
+        "assets": [
+            {
+                "name": name,
+                "sha256": receipts._sha256(content),  # noqa: SLF001
+                "size_bytes": len(content),
+                "media_type": media_type,
+            }
+            for name, (content, media_type) in sorted(assets.items())
+        ],
+        "verification_digests": verification_digests,
+        "validation_status": "validated",
+    }
+    journal_raw = receipts.canonical_json_bytes(journal)
+    if journal_path.exists() or journal_path.is_symlink():
+        if (
+            _load_canonical_object(
+                journal_path, label="GitHub boundary authority publication journal"
+            )
+            != journal
+        ):
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority publication journal conflicts"
+            )
+    elif not receipts.write_once(journal_path, journal_raw):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority publication journal creation raced"
+        )
+
+    def observe() -> TerminalRelease | None:
+        return _inspect_boundary_authority_releases(
+            listing=api.list_releases(_BOUNDARY_RECOVERY_REPOSITORY),
+            tag_name=tag_name,
+            release_name=release_name,
+            release_body=release_body,
+            expected_assets=assets,
+        )
+
+    release = observe()
+    if release is None:
+        created_release_id = api.create_draft(
+            _BOUNDARY_RECOVERY_REPOSITORY,
+            tag_name=tag_name,
+            name=release_name,
+            body=release_body,
+        )
+        release = observe()
+        if release is None or not release.draft or release.release_id != created_release_id:
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority draft creation was not observed exactly"
+            )
+    for asset_name, (content, media_type) in sorted(assets.items()):
+        release = observe()
+        if release is None:
+            raise receipts.ReleaseControlError(
+                "GitHub boundary authority Release disappeared during publication"
+            )
+        if asset_name not in {asset.name for asset in release.assets}:
+            if not release.draft:
+                raise receipts.ReleaseControlError(
+                    "published GitHub boundary authority is missing an asset"
+                )
+            api.upload_asset(
+                _BOUNDARY_RECOVERY_REPOSITORY,
+                release_id=release.release_id,
+                name=asset_name,
+                media_type=media_type,
+                content=content,
+            )
+            release = observe()
+            if release is None or asset_name not in {
+                asset.name for asset in release.assets
+            }:
+                raise receipts.ReleaseControlError(
+                    "GitHub boundary authority asset upload was not observed exactly"
+                )
+    release = observe()
+    if release is None:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release disappeared before publication"
+        )
+    if release.draft:
+        api.publish_immutable(
+            _BOUNDARY_RECOVERY_REPOSITORY,
+            release_id=release.release_id,
+        )
+        release = observe()
+    if (
+        release is None
+        or release.draft
+        or not release.immutable
+        or {asset.name for asset in release.assets} != set(assets)
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority Release is not exact and immutable"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix="kestrel-boundary-authority-verification-"
+    ) as temporary_root:
+        downloaded_root = Path(temporary_root) / "authority"
+        downloaded_names = fetch_github_boundary_authority(
+            boundary=boundary,
+            run_id=checked_run_id,
+            output_dir=downloaded_root,
+            api=recovery_reader_api,
+            timeout_seconds=30.0,
+            poll_interval_seconds=1.0,
+        )
+        if set(downloaded_names) != set(assets):
+            raise receipts.ReleaseControlError(
+                "independent GitHub boundary authority asset inventory changed"
+            )
+        independently_downloaded = {
+            name: receipts._read_regular(  # noqa: SLF001
+                downloaded_root / name,
+                label=f"independently downloaded boundary authority asset {name}",
+                max_bytes=receipts.MAX_SOURCE_ENVELOPE_BYTES,
+            )
+            for name in downloaded_names
+        }
+    if any(
+        independently_downloaded[name] != assets[name][0] for name in sorted(assets)
+    ):
+        raise receipts.ReleaseControlError(
+            "independent GitHub boundary authority asset bytes changed"
+        )
+    independent_bundle_digest = receipts.source_bundle_digest(
+        independently_downloaded
+    )
+    return {
+        "schema": "kestrel.github_boundary_authority_publication.v1",
+        "repository": _BOUNDARY_RECOVERY_REPOSITORY,
+        "boundary": boundary,
+        "run_id": checked_run_id,
+        "candidate_manifest_digest": checked_candidate_digest,
+        "environment_id": checked_environment_id,
+        "release_id": release.release_id,
+        "tag_name": release.tag_name,
+        "html_url": release.html_url,
+        "immutable": True,
+        "asset_names": cast(list[receipts.JSONValue], sorted(assets)),
+        "evidence": {
+            "journal_digest": receipts._sha256(journal_raw),  # noqa: SLF001
+            "independent_reader_bundle_digest": independent_bundle_digest,
+            "verification_digests": verification_digests,
+        },
+        "provenance": {
+            "producer": "scripts/release_promotion_transaction.py",
+            "provider": "github.com",
+            "method": "owner-controller-boundary-authority-publication",
+        },
+        "confidence": 1,
         "validation_status": "validated",
     }
 
@@ -5037,6 +7041,7 @@ def _validate_recovery_capsule_verification_claim(
     )
 
     expected_asset_names = [
+        "recovery-bootstrap.py",
         "recovery-capsule-manifest.json",
         "recovery-capsule.tar",
     ]
@@ -5593,14 +7598,14 @@ def _command_authorize(args: argparse.Namespace) -> int:
         admission_source,
         verification_schema="kestrel.github_release_authority_verification.v1",
         authority_schema=receipts.GITHUB_AUTHORITY_SCHEMA,
-        label="authorization admission authority verification",
+        label="authorization boundary authority verification",
     )
     _require_current_authority(
-        github_admission_authority, label="authorization admission authority"
+        github_admission_authority, label="authorization boundary authority"
     )
     if admission_source.get("signing_key_fingerprint") != owner_key_fingerprint:
         raise receipts.ReleaseControlError(
-            "authorization admission signing key is not the current owner key"
+            "authorization boundary signing key is not the current owner key"
         )
     _require_operational_environment_policy_join(
         github_authority=github_admission_authority,
@@ -5741,24 +7746,22 @@ def _command_authorize(args: argparse.Namespace) -> int:
         )
         marker_digest = receipts._sha256(marker_raw)  # noqa: SLF001
         source_records["recovery-capsule-verification"] = capsule_source_raw
-    _require_github_authority_binding(
+    _require_authorization_admission_authority(
         github_admission_authority,
         candidate=candidate,
-        phase="admission",
         transaction_authorization_digest=(
             None if transaction_raw is None else receipts._sha256(transaction_raw)  # noqa: SLF001
         ),
-        execution_authorization_digest=None,
         recovery_capsule_digest=capsule_digest,
         commit_marker_digest=marker_digest,
     )
     authority_run = receipts._object(  # noqa: SLF001
         github_admission_authority.get("promotion_run"),
-        label="authorization verified admission run",
+        label="authorization verified boundary run",
     )
     authority_environment = receipts._object(  # noqa: SLF001
         github_admission_authority.get("environment"),
-        label="authorization verified admission environment",
+        label="authorization verified boundary environment",
     )
     if (
         github_admission_authority.get("mode") != args.mode
@@ -5767,11 +7770,15 @@ def _command_authorize(args: argparse.Namespace) -> int:
         or authority_environment.get("name") != environment.get("name")
     ):
         raise receipts.ReleaseControlError(
-            "authorization admission authority current-run binding mismatch"
+            "authorization boundary authority current-run binding mismatch"
         )
     source_records["approval-history"] = approval_raw
     source_records["admission-authority"] = admission_raw
     source_records["dispatch-reconciliation"] = reconciliation_raw
+    _require_current_authority(
+        github_admission_authority,
+        label="authorization boundary authority immediately before authorization",
+    )
     authority = build_server_authorization(
         candidate=candidate,
         promotion_run=promotion_run,
@@ -5973,6 +7980,329 @@ def _require_operational_environment_policy_join(
         raise receipts.ReleaseControlError(
             "operational environment policy authority cardinality mismatch"
         )
+
+
+def _require_operational_github_authority_join(
+    *,
+    github_authority: Mapping[str, object],
+    github_verification: Mapping[str, object],
+    live_owner_signing_fingerprint: str,
+    live_owner_keys_observation: bytes,
+    tag_ruleset: Mapping[str, object],
+    ingress_ruleset: Mapping[str, object],
+    workflow: Mapping[str, object],
+    default_workflow: bytes,
+    candidate_workflow: bytes,
+    main_sha: str,
+    immutable_releases: bool,
+    transaction_mode: str,
+    _clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> None:
+    """Join fresh REST/key evidence to the bounded zero-App owner authority."""
+
+    authority = receipts.validate_github_authority(github_authority)
+    _require_current_authority(authority, label="GitHub prerequisite authority", _clock=_clock)
+    verification_fingerprint = receipts._digest(  # noqa: SLF001
+        github_verification.get("signing_key_fingerprint"),
+        label="GitHub authority verification signing key fingerprint",
+    )
+    live_fingerprint = receipts._digest(  # noqa: SLF001
+        live_owner_signing_fingerprint,
+        label="live owner signing key fingerprint",
+    )
+    if verification_fingerprint != live_fingerprint:
+        raise receipts.ReleaseControlError(
+            "live owner signing key does not match the signed GitHub authority"
+        )
+    if authority.get("mode") != transaction_mode or authority.get("installed_apps") != []:
+        raise receipts.ReleaseControlError(
+            "GitHub prerequisite authority mode or installed App state mismatch"
+        )
+
+    snapshots = [
+        receipts._object(item, label="GitHub authority source snapshot")  # noqa: SLF001
+        for item in receipts._array(  # noqa: SLF001
+            authority.get("source_snapshots"), label="GitHub authority sources"
+        )
+    ]
+    installed_snapshots = [
+        item for item in snapshots if item.get("name") == "installed-apps-owner"
+    ]
+    if (
+        len(installed_snapshots) != 1
+        or installed_snapshots[0].get("authenticated_as") != receipts.SIGNING_PRINCIPAL
+        or installed_snapshots[0].get("freshness_class") != "current"
+        or installed_snapshots[0].get("complete") is not True
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub authority lacks one complete current owner App snapshot"
+        )
+    owner_keys_envelope = receipts._object(  # noqa: SLF001
+        receipts.strict_canonical_json(
+            live_owner_keys_observation,
+            label="live owner signing keys observation",
+        ),
+        label="live owner signing keys observation",
+    )
+    live_captured_at = receipts.parse_timestamp(
+        owner_keys_envelope.get("captured_at"),
+        label="live owner signing keys captured_at",
+    )
+    observed_at = receipts.parse_timestamp(
+        authority.get("observed_at"), label="GitHub authority observed_at"
+    )
+    expires_at = receipts.parse_timestamp(
+        authority.get("expires_at"), label="GitHub authority expires_at"
+    )
+    if live_captured_at < observed_at or live_captured_at >= expires_at:
+        raise receipts.ReleaseControlError(
+            "live owner signing keys were captured outside GitHub authority lifetime"
+        )
+
+    receipts._validate_ruleset(  # noqa: SLF001
+        tag_ruleset,
+        label="live GitHub tag ruleset",
+        expected_name="kestrel-release-tags",
+        expected_target="tag",
+        expected_include="refs/tags/v*",
+    )
+    receipts._validate_ruleset(  # noqa: SLF001
+        ingress_ruleset,
+        label="live GitHub ingress ruleset",
+        expected_name="kestrel-release-transaction-main-lock",
+        expected_target="branch",
+        expected_include="refs/heads/main",
+    )
+    authority_tag = receipts._object(  # noqa: SLF001
+        authority.get("tag_ruleset"), label="GitHub authority tag ruleset"
+    )
+    authority_ingress = receipts._object(  # noqa: SLF001
+        authority.get("ingress_ruleset"), label="GitHub authority ingress ruleset"
+    )
+    ingress = receipts._object(  # noqa: SLF001
+        authority.get("workflow_ingress"), label="GitHub authority workflow ingress"
+    )
+    candidate_digest = receipts._sha256(candidate_workflow)  # noqa: SLF001
+    if (
+        tag_ruleset.get("id") != authority_tag.get("id")
+        or ingress_ruleset.get("id") != authority_ingress.get("id")
+        or workflow.get("id") != ingress.get("workflow_id")
+        or workflow.get("path") != ingress.get("path")
+        or workflow.get("state") != "active"
+        or ingress.get("state") != "active"
+        or candidate_digest != ingress.get("candidate_blob_sha256")
+        or immutable_releases is not True
+    ):
+        raise receipts.ReleaseControlError(
+            "fresh GitHub boundary does not match the signed owner authority"
+        )
+    candidate = receipts._object(  # noqa: SLF001
+        authority.get("candidate"), label="GitHub authority candidate"
+    )
+    if transaction_mode == "initiate" and (
+        receipts._sha256(default_workflow) != candidate_digest  # noqa: SLF001
+        or receipts._git_sha(main_sha, label="live main SHA")  # noqa: SLF001
+        != candidate.get("source_sha")
+    ):
+        raise receipts.ReleaseControlError(
+            "initiate GitHub boundary differs from the signed candidate"
+        )
+
+
+def _workflow_boundary_byte_policy(
+    *,
+    default_workflow: bytes,
+    candidate_workflow: bytes,
+    expected_workflow: bytes,
+    transaction_mode: str,
+) -> bool:
+    if transaction_mode not in {"initiate", "recover_committed"}:
+        raise receipts.ReleaseControlError("prerequisite transaction mode is invalid")
+    if not candidate_workflow or candidate_workflow != expected_workflow:
+        return False
+    return transaction_mode == "recover_committed" or default_workflow == candidate_workflow
+
+
+def _command_capture_prerequisite_boundary(args: argparse.Namespace) -> int:
+    registry = receipts._object(  # noqa: SLF001
+        receipts._load_canonical_file(  # noqa: SLF001
+            Path(args.registry),
+            label="prerequisite source registry",
+            max_bytes=4 * 1024 * 1024,
+        ),
+        label="prerequisite source registry",
+    )
+
+    def credential(name: str, *, label: str) -> bytes:
+        value = os.environ.get(name)
+        if value is None:
+            raise receipts.ReleaseControlError(f"{label} credential is unavailable")
+        try:
+            return value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise receipts.ReleaseControlError(f"{label} credential is invalid") from exc
+
+    capture_prerequisite_boundary(
+        registry=registry,
+        repository=args.repository,
+        recovery_repository=args.recovery_repository,
+        candidate_ref=args.candidate_ref,
+        promotion_run_id=args.run_id,
+        output_dir=Path(args.output_dir),
+        guard_api=DirectGitHubReadAPI(
+            token=credential("GH_TOKEN", label="release guard")
+        ),
+        recovery_api=DirectGitHubReadAPI(
+            token=credential(
+                "RELEASE_RECOVERY_READER_TOKEN_BYTES", label="recovery reader"
+            )
+        ),
+    )
+    return 0
+
+
+def _command_fetch_github_boundary_authority(args: argparse.Namespace) -> int:
+    token = os.environ.get("RELEASE_RECOVERY_READER_TOKEN_BYTES")
+    if token is None:
+        raise receipts.ReleaseControlError("recovery reader credential is unavailable")
+    try:
+        token_bytes = token.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise receipts.ReleaseControlError("recovery reader credential is invalid") from exc
+    fetch_github_boundary_authority(
+        boundary=args.boundary,
+        run_id=args.run_id,
+        output_dir=Path(args.output_dir),
+        api=DirectGitHubReadAPI(token=token_bytes),
+    )
+    return 0
+
+
+def _command_publish_github_boundary_authority(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    journal = Path(args.journal)
+    if output == journal:
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority output and journal must be distinct"
+        )
+    _require_new_outputs((output,))
+    tokens: dict[str, bytes] = {}
+    for credential, environment_name in (
+        ("recovery-reader", "RELEASE_RECOVERY_READER_TOKEN_BYTES"),
+        ("release-guard", "RELEASE_GUARD_TOKEN_BYTES"),
+    ):
+        token = os.environ.get(environment_name)
+        if token is None:
+            raise receipts.ReleaseControlError(
+                f"{credential} publication credential is unavailable"
+            )
+        try:
+            tokens[credential] = token.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise receipts.ReleaseControlError(
+                f"{credential} publication credential is invalid"
+            ) from exc
+    publication = publish_github_boundary_authority(
+        boundary=args.boundary,
+        run_id=args.run_id,
+        candidate_manifest_digest=args.candidate_manifest_digest,
+        environment_id=args.environment_id,
+        asset_root=Path(args.asset_root),
+        journal_path=journal,
+        credential_tokens=tokens,
+        api=_terminal_release_api_from_environment(),
+        recovery_reader_api=DirectGitHubReadAPI(token=tokens["recovery-reader"]),
+    )
+    if not receipts.write_once(output, receipts.canonical_json_bytes(publication)):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary authority publication output creation raced"
+        )
+    return 0
+
+
+def _command_verify_github_boundary_binding(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    _require_new_outputs((output,))
+    candidate, transaction, execution, capsule, _sources = _stage_candidate_and_authority(
+        manifest_path=Path(args.manifest),
+        bundle_root=None,
+        transaction_authorization_path=Path(args.transaction_authorization),
+        execution_authorization_path=(
+            None
+            if args.execution_authorization is None
+            else Path(args.execution_authorization)
+        ),
+        recovery_capsule_verification_path=Path(args.recovery_capsule_verification),
+    )
+    verification_raw = receipts._read_regular(  # noqa: SLF001
+        Path(args.authority_verification),
+        label="GitHub boundary authority verification",
+        max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+    )
+    verification = _canonical_object(
+        verification_raw, label="GitHub boundary authority verification"
+    )
+    authority = _verified_authority_from_record(
+        verification,
+        verification_schema="kestrel.github_release_authority_verification.v1",
+        authority_schema=receipts.GITHUB_AUTHORITY_SCHEMA,
+        label="GitHub boundary authority verification",
+    )
+
+    post_commit = args.phase in {"verify", "pypi", "final"}
+    if post_commit != (args.commit_outcome is not None):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary commit outcome requirement mismatch"
+        )
+    commit_marker_digest: str | None = None
+    if args.commit_outcome is not None:
+        commit_raw = receipts._read_regular(  # noqa: SLF001
+            Path(args.commit_outcome),
+            label="GitHub boundary commit outcome",
+            max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+        )
+        commit = _canonical_object(commit_raw, label="GitHub boundary commit outcome")
+        validate_release_stage_record(commit)
+        if commit.get("schema") != "kestrel.release_commit_outcome.v2":
+            raise receipts.ReleaseControlError(
+                "GitHub boundary commit outcome schema mismatch"
+            )
+        _require_completed_stage_binding(
+            commit,
+            candidate=candidate,
+            transaction_authorization_digest=transaction,
+            execution_authorization_digest=execution,
+            recovery_capsule_digest=capsule,
+            label="GitHub boundary commit outcome",
+        )
+        commit_marker_digest = receipts._sha256(commit_raw)  # noqa: SLF001
+
+    _require_github_authority_binding(
+        authority,
+        candidate=candidate,
+        phase=args.phase,
+        transaction_authorization_digest=transaction,
+        execution_authorization_digest=execution,
+        recovery_capsule_digest=capsule,
+        commit_marker_digest=commit_marker_digest,
+    )
+    record: receipts.JSONObject = {
+        "schema": "kestrel.github_boundary_binding_verification.v1",
+        "phase": args.phase,
+        "candidate_manifest_digest": candidate["candidate_manifest_digest"],
+        "authority_receipt_digest": verification["receipt_digest"],
+        "transaction_authorization_digest": transaction,
+        "execution_authorization_digest": execution,
+        "recovery_capsule_manifest_digest": capsule,
+        "commit_marker_digest": commit_marker_digest,
+        "verified_at": verification["verified_at"],
+        "validation_status": "validated",
+    }
+    if not receipts.write_once(output, receipts.canonical_json_bytes(record)):
+        raise receipts.ReleaseControlError(
+            "GitHub boundary binding output path must be empty"
+        )
+    return 0
 
 
 def _command_inspect_prerequisites(args: argparse.Namespace) -> int:
@@ -6215,13 +8545,24 @@ def _command_inspect_prerequisites(args: argparse.Namespace) -> int:
         )
         sources["default-branch-workflow-contents"] = default_source
         sources["candidate-workflow-contents"] = candidate_source
+        workflow_source_bytes = receipts._read_regular(  # noqa: SLF001
+            Path(args.workflow_source_root) / ".github/workflows/release.yml",
+            label="prerequisite pinned workflow source",
+            max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+        )
+        sources["workflow-source"] = workflow_source_bytes
         ingress_active = (
             ingress_detail.get("name") == "kestrel-release-transaction-main-lock"
             and ingress_detail.get("target") == "branch"
             and ingress_detail.get("enforcement") == "active"
             and ingress_detail.get("bypass_actors") == []
         )
-        workflow_equal = bool(default_bytes) and default_bytes == candidate_bytes
+        workflow_equal = _workflow_boundary_byte_policy(
+            default_workflow=default_bytes,
+            candidate_workflow=candidate_bytes,
+            expected_workflow=workflow_source_bytes,
+            transaction_mode=args.transaction_mode,
+        )
         ingress_observation: receipts.JSONObject = {
             "ruleset_id": receipts._safe_integer(  # noqa: SLF001
                 ingress_detail.get("id"),
@@ -6360,8 +8701,11 @@ def _command_inspect_prerequisites(args: argparse.Namespace) -> int:
         args.pypi_authority_verification,
     )
     if args.mode == "hosted-smoke":
-        if any(value is not None for value in verification_paths) or (
+        if (
+            any(value is not None for value in verification_paths)
+            or (
             args.recovery_immutable_releases_observation is not None
+            )
         ):
             raise receipts.ReleaseControlError(
                 "hosted-smoke prerequisites cannot mix operational authority inputs"
@@ -6380,8 +8724,9 @@ def _command_inspect_prerequisites(args: argparse.Namespace) -> int:
         }
         status = "validated_for_hosted_smoke"
     else:
-        if any(value is None for value in verification_paths) or (
-            args.recovery_immutable_releases_observation is None
+        if (
+            any(value is None for value in verification_paths)
+            or args.recovery_immutable_releases_observation is None
         ):
             raise receipts.ReleaseControlError(
                 "operational prerequisites require every signed authority"
@@ -6416,6 +8761,7 @@ def _command_inspect_prerequisites(args: argparse.Namespace) -> int:
                 verification_schema=("kestrel.recovery_repository_authority_verification.v1"),
                 authority_schema=receipts.RECOVERY_AUTHORITY_SCHEMA,
                 label="recovery authority verification",
+                require_current=False,
             )
         )
         github_authority = receipts.validate_github_authority(
@@ -6432,6 +8778,7 @@ def _command_inspect_prerequisites(args: argparse.Namespace) -> int:
                 verification_schema=("kestrel.pypi_upload_authority_verification.v1"),
                 authority_schema=receipts.PYPI_AUTHORITY_SCHEMA,
                 label="PyPI authority verification",
+                require_current=False,
             )
         )
         if (
@@ -6451,6 +8798,24 @@ def _command_inspect_prerequisites(args: argparse.Namespace) -> int:
             raise receipts.ReleaseControlError(
                 "operational prerequisite authority identities disagree"
             )
+        if not all(value is not None for value in optional_ingress):
+            raise receipts.ReleaseControlError(
+                "operational prerequisites require the complete live ingress boundary"
+            )
+        _require_operational_github_authority_join(
+            github_authority=github_authority,
+            github_verification=github_verification,
+            live_owner_signing_fingerprint=fingerprint,
+            live_owner_keys_observation=sources["owner-signing-keys-observation"],
+            tag_ruleset=tag_detail,
+            ingress_ruleset=ingress_detail,
+            workflow=workflow,
+            default_workflow=default_bytes,
+            candidate_workflow=candidate_bytes,
+            main_sha=cast(str, main_branch["sha"]),
+            immutable_releases=immutable_enabled,
+            transaction_mode=args.transaction_mode,
+        )
         _require_operational_environment_policy_join(
             github_authority=github_authority,
             environments={cast(str, item["name"]): item for item in environments},
@@ -6633,7 +8998,16 @@ def verify_recovery_capsule(
         raise receipts.ReleaseControlError("recovery capsule immutable Release identity mismatch")
 
     archive = receipts.deterministic_recovery_capsule_archive(capsule_root)
+    bootstrap = receipts._read_regular(  # noqa: SLF001
+        capsule_root / "scripts" / "bootstrap_recovery.py",
+        label="recovery bootstrap release asset",
+        max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+    )
     expected_assets = {
+        "recovery-bootstrap.py": (
+            len(bootstrap),
+            receipts._sha256(bootstrap),  # noqa: SLF001
+        ),
         "recovery-capsule-manifest.json": (
             len(capsule_manifest),
             manifest_digest,
@@ -7094,7 +9468,7 @@ def _candidate_product_release_contract(
         **persisted,
         "draft": True,
         "generate_release_notes": False,
-        "make_latest": False,
+        "make_latest": "false",
     }
     return {
         "create_request": create_request,
@@ -7103,20 +9477,81 @@ def _candidate_product_release_contract(
     }
 
 
+def _product_release_publish_patch() -> receipts.JSONObject:
+    """Return the exact GitHub REST body for immutable Release publication."""
+
+    return {"draft": False, "make_latest": "false"}
+
+
+def _complete_product_release_pages(value: object) -> list[list[receipts.JSONValue]]:
+    """Normalize one exhaustive raw or source-wrapped Release pagination."""
+
+    if type(value) is dict:
+        wrapper = receipts._object(  # noqa: SLF001
+            value, label="complete product Release pagination wrapper"
+        )
+        receipts._require_exact_fields(  # noqa: SLF001
+            wrapper,
+            frozenset({"pages"}),
+            label="complete product Release pagination wrapper",
+        )
+        wrapped_pages = receipts._array(  # noqa: SLF001
+            wrapper.get("pages"), label="complete product Release wrapped pages"
+        )
+        raw_pages: list[receipts.JSONValue] = []
+        for index, raw_page in enumerate(wrapped_pages, start=1):
+            page = receipts._object(  # noqa: SLF001
+                raw_page, label="complete product Release wrapped page"
+            )
+            receipts._require_exact_fields(  # noqa: SLF001
+                page,
+                frozenset({"number", "request_url", "response_headers", "body"}),
+                label="complete product Release wrapped page",
+            )
+            if page.get("number") != index:
+                raise receipts.ReleaseControlError(
+                    "complete product Release wrapped pages are not consecutive"
+                )
+            receipts._validate_string(  # noqa: SLF001
+                page.get("request_url"),
+                label="complete product Release wrapped page request URL",
+            )
+            receipts._array(  # noqa: SLF001
+                page.get("response_headers"),
+                label="complete product Release wrapped page response headers",
+            )
+            raw_pages.append(
+                cast(
+                    receipts.JSONValue,
+                    receipts._array(  # noqa: SLF001
+                        page.get("body"),
+                        label="complete product Release wrapped page body",
+                    ),
+                )
+            )
+    else:
+        raw_pages = receipts._array(  # noqa: SLF001
+            value, label="complete product Release pagination"
+        )
+    if not raw_pages:
+        raise receipts.ReleaseControlError("complete product Release pagination is empty")
+    return [
+        receipts._array(  # noqa: SLF001
+            raw_page, label="complete product Release pagination page"
+        )
+        for raw_page in raw_pages
+    ]
+
+
 def _classify_product_release_listing(
     value: object, *, contract: Mapping[str, object]
 ) -> receipts.JSONObject:
     """Classify one exhaustive paginated GitHub Release listing."""
 
-    pages = receipts._array(value, label="complete product Release pagination")  # noqa: SLF001
-    if not pages:
-        raise receipts.ReleaseControlError("complete product Release pagination is empty")
+    pages = _complete_product_release_pages(value)
     releases: list[receipts.JSONObject] = []
     release_ids: set[int] = set()
-    for raw_page in pages:
-        page = receipts._array(  # noqa: SLF001
-            raw_page, label="complete product Release pagination page"
-        )
+    for page in pages:
         for raw_release in page:
             release = receipts._object(raw_release, label="product Release")  # noqa: SLF001
             release_id = receipts._safe_integer(  # noqa: SLF001
@@ -7175,8 +9610,10 @@ def _classify_product_release_listing(
         if name not in expected_assets:
             raise receipts.ReleaseControlError("product Release contains an unexpected asset")
         expected = expected_assets[name]
-        if asset.get("size") != expected.get("size_bytes") or asset.get("digest") != expected.get(
-            "sha256"
+        if (
+            asset.get("size") != expected.get("size_bytes")
+            or asset.get("digest") != expected.get("sha256")
+            or asset.get("content_type") != expected.get("media_type")
         ):
             raise receipts.ReleaseControlError(
                 "product Release asset identity conflicts with candidate bytes"
@@ -7184,6 +9621,10 @@ def _classify_product_release_listing(
         asset_ids.add(asset_id)
         observed_assets[name] = asset
     asset_state = "existing_exact" if set(observed_assets) == set(expected_assets) else "missing"
+    if release_state == "immutable_exact" and asset_state != "existing_exact":
+        raise receipts.ReleaseControlError(
+            "immutable product Release asset inventory is incomplete"
+        )
     return {
         "release": release_state,
         "assets": asset_state,
@@ -7193,17 +9634,234 @@ def _classify_product_release_listing(
     }
 
 
-def _classify_ghcr_digest_observation(value: object, *, expected_digests: Sequence[str]) -> str:
-    """Derive GHCR state from exact digest-query status and tag observations."""
+def _missing_product_release_assets(
+    value: object, *, contract: Mapping[str, object]
+) -> list[receipts.JSONObject]:
+    """Return only candidate Release assets absent from one validated listing."""
+
+    state = _classify_product_release_listing(value, contract=contract)
+    present_names: set[str] = set()
+    release_id = state["release_id"]
+    if isinstance(release_id, int):
+        matching = [
+            receipts._object(raw_release, label="product Release")  # noqa: SLF001
+            for page in _complete_product_release_pages(value)
+            for raw_release in page
+            if receipts._object(  # noqa: SLF001
+                raw_release, label="product Release"
+            ).get("id")
+            == release_id
+        ]
+        if len(matching) != 1:
+            raise receipts.ReleaseControlError(
+                "product Release ID is not uniquely observable"
+            )
+        present_names = {
+            receipts._validate_string(  # noqa: SLF001
+                asset.get("name"), label="product Release asset name"
+            )
+            for raw_asset in receipts._array(  # noqa: SLF001
+                matching[0].get("assets"), label="product Release assets"
+            )
+            for asset in [receipts._object(raw_asset, label="product Release asset")]  # noqa: SLF001
+        }
+    return [
+        asset
+        for raw_asset in receipts._array(  # noqa: SLF001
+            contract.get("assets"), label="product Release asset contract"
+        )
+        for asset in [receipts._object(raw_asset, label="product Release asset contract")]  # noqa: SLF001
+        if asset.get("name") not in present_names
+    ]
+
+
+def _product_release_asset_upload_request(
+    *,
+    contract: Mapping[str, object],
+    release_state: Mapping[str, object],
+    missing_assets: Sequence[Mapping[str, object]],
+    create_operation_request_digest: str,
+) -> receipts.JSONObject:
+    """Bind uploads to an exact existing ID or the authorized create response."""
+
+    checked_state = receipts._copy_json_object(  # noqa: SLF001
+        release_state, label="product Release upload pre-state"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        checked_state,
+        frozenset({"release", "assets", "release_id"}),
+        label="product Release upload pre-state",
+    )
+    create_request = receipts._object(  # noqa: SLF001
+        contract.get("create_request"), label="product Release upload create request"
+    )
+    tag_name = receipts._validate_string(  # noqa: SLF001
+        create_request.get("tag_name"), label="product Release upload tag"
+    )
+    create_digest = receipts._digest(  # noqa: SLF001
+        create_operation_request_digest,
+        label="product Release create operation request digest",
+    )
+    release_id = checked_state.get("release_id")
+    if release_id is None:
+        if checked_state.get("release") != "missing":
+            raise receipts.ReleaseControlError(
+                "missing product Release upload ID conflicts with its pre-state"
+            )
+        locator: receipts.JSONObject = {
+            "strategy": "created_response_and_exact_relist",
+            "tag_name": tag_name,
+            "release_id": None,
+            "create_operation_request_digest": create_digest,
+        }
+    else:
+        checked_release_id = receipts._safe_integer(  # noqa: SLF001
+            release_id, label="product Release upload preobserved ID", positive=True
+        )
+        if checked_state.get("release") not in {"draft_exact", "immutable_exact"}:
+            raise receipts.ReleaseControlError(
+                "preobserved product Release upload ID conflicts with its pre-state"
+            )
+        locator = {
+            "strategy": "preobserved_exact_release_id",
+            "tag_name": tag_name,
+            "release_id": checked_release_id,
+            "create_operation_request_digest": None,
+        }
+    assets = [
+        receipts._copy_json_object(item, label="product Release upload asset")  # noqa: SLF001
+        for item in missing_assets
+    ]
+    expected_assets = {
+        receipts._validate_string(  # noqa: SLF001
+            item.get("name"), label="product Release upload contract asset name"
+        ): item
+        for raw_item in receipts._array(  # noqa: SLF001
+            contract.get("assets"), label="product Release upload contract assets"
+        )
+        for item in [
+            receipts._object(raw_item, label="product Release upload contract asset")  # noqa: SLF001
+        ]
+    }
+    names: list[str] = []
+    for asset in assets:
+        name = receipts._validate_string(  # noqa: SLF001
+            asset.get("name"), label="product Release upload asset name"
+        )
+        if expected_assets.get(name) != asset:
+            raise receipts.ReleaseControlError(
+                "product Release upload asset conflicts with its candidate contract"
+            )
+        names.append(name)
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise receipts.ReleaseControlError(
+            "product Release upload asset request is unsorted or duplicated"
+        )
+    return {
+        "release_locator": locator,
+        "assets": cast(list[receipts.JSONValue], assets),
+    }
+
+
+def _resolve_product_release_asset_upload_target(
+    request: Mapping[str, object],
+    *,
+    release_state: Mapping[str, object],
+    created_release_id: int | None,
+    create_operation_request_digest: str,
+) -> int:
+    """Resolve the sole Release ID permitted by a planned upload locator."""
+
+    checked_request = receipts._copy_json_object(  # noqa: SLF001
+        request, label="product Release upload request"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        checked_request,
+        frozenset({"release_locator", "assets"}),
+        label="product Release upload request",
+    )
+    locator = receipts._object(  # noqa: SLF001
+        checked_request.get("release_locator"), label="product Release upload locator"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        locator,
+        frozenset(
+            {
+                "strategy",
+                "tag_name",
+                "release_id",
+                "create_operation_request_digest",
+            }
+        ),
+        label="product Release upload locator",
+    )
+    receipts._validate_string(  # noqa: SLF001
+        locator.get("tag_name"), label="product Release upload locator tag"
+    )
+    checked_state = receipts._copy_json_object(  # noqa: SLF001
+        release_state, label="product Release upload resolved state"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        checked_state,
+        frozenset({"release", "assets", "release_id"}),
+        label="product Release upload resolved state",
+    )
+    resolved_release_id = receipts._safe_integer(  # noqa: SLF001
+        checked_state.get("release_id"),
+        label="product Release upload resolved ID",
+        positive=True,
+    )
+    strategy = locator.get("strategy")
+    if strategy == "created_response_and_exact_relist":
+        if (
+            locator.get("release_id") is not None
+            or locator.get("create_operation_request_digest")
+            != receipts._digest(  # noqa: SLF001
+                create_operation_request_digest,
+                label="product Release create operation request digest",
+            )
+            or type(created_release_id) is not int
+            or created_release_id <= 0
+            or created_release_id != resolved_release_id
+        ):
+            raise receipts.ReleaseControlError(
+                "created product Release upload ID is not authorized by its plan"
+            )
+    elif strategy == "preobserved_exact_release_id":
+        if (
+            receipts._safe_integer(  # noqa: SLF001
+                locator.get("release_id"),
+                label="preobserved product Release upload ID",
+                positive=True,
+            )
+            != resolved_release_id
+            or locator.get("create_operation_request_digest") is not None
+            or created_release_id is not None
+        ):
+            raise receipts.ReleaseControlError(
+                "preobserved product Release upload ID changed before mutation"
+            )
+    else:
+        raise receipts.ReleaseControlError(
+            "product Release upload locator strategy is invalid"
+        )
+    return resolved_release_id
+
+
+def _ghcr_digest_observation_state(value: object, *, expected_digests: Sequence[str]) -> str:
+    """Derive exact, missing, or transiently split GHCR observation state."""
 
     observation = receipts._object(value, label="GHCR digest observation")  # noqa: SLF001
     receipts._require_exact_fields(  # noqa: SLF001
         observation,
-        frozenset({"repository", "objects"}),
+        frozenset({"repository", "package_present", "objects"}),
         label="GHCR digest observation",
     )
     if observation.get("repository") != candidates.OCI_REPOSITORY:
         raise receipts.ReleaseControlError("GHCR repository identity mismatch")
+    package_present = observation.get("package_present")
+    if type(package_present) is not bool:
+        raise receipts.ReleaseControlError("GHCR package presence is not boolean")
     expected = sorted(
         receipts._digest(item, label="expected GHCR object digest")  # noqa: SLF001
         for item in expected_digests
@@ -7218,10 +9876,19 @@ def _classify_ghcr_digest_observation(value: object, *, expected_digests: Sequen
     ]
     observed_digests: list[str] = []
     statuses: list[int] = []
+    tag_inventories_complete: list[bool] = []
     for item in objects:
         receipts._require_exact_fields(  # noqa: SLF001
             item,
-            frozenset({"digest", "http_status", "tags"}),
+            frozenset(
+                {
+                    "digest",
+                    "http_status",
+                    "tags",
+                    "tag_inventory_complete",
+                    "observed_at",
+                }
+            ),
             label="GHCR digest query",
         )
         digest = receipts._digest(item.get("digest"), label="GHCR object digest")  # noqa: SLF001
@@ -7229,17 +9896,800 @@ def _classify_ghcr_digest_observation(value: object, *, expected_digests: Sequen
         if isinstance(status, bool) or status not in {200, 404}:
             raise receipts.ReleaseControlError("GHCR object query status is neither 200 nor 404")
         tags = receipts._array(item.get("tags"), label="GHCR object tags")  # noqa: SLF001
+        tag_inventory_complete = item.get("tag_inventory_complete")
+        if type(tag_inventory_complete) is not bool:
+            raise receipts.ReleaseControlError(
+                "GHCR object tag inventory completeness is not boolean"
+            )
+        receipts.parse_timestamp(item.get("observed_at"), label="GHCR object observation time")
         if tags:
             raise receipts.ReleaseControlError(
                 "digest-addressed GHCR object unexpectedly has a tag"
             )
         observed_digests.append(digest)
         statuses.append(status)
+        tag_inventories_complete.append(tag_inventory_complete)
     if observed_digests != expected:
         raise receipts.ReleaseControlError(
             "GHCR digest query inventory is incomplete, duplicated, or unsorted"
         )
+    if any(status == 200 for status in statuses) and (
+        package_present is False or not all(tag_inventories_complete)
+    ):
+        # GHCR's registry and GitHub's package APIs are separate read models.
+        # A first publication can become readable by digest before the package
+        # or version inventory exists. This state is never accepted as final,
+        # but it is the one state for which a bounded convergence poll is safe.
+        return "converging"
+    if not all(tag_inventories_complete):
+        raise receipts.ReleaseControlError("GHCR object tag inventory is incomplete")
     return "existing_exact" if all(status == 200 for status in statuses) else "missing"
+
+
+def _classify_ghcr_digest_observation(value: object, *, expected_digests: Sequence[str]) -> str:
+    """Derive only a settled exact or missing GHCR state."""
+
+    state = _ghcr_digest_observation_state(value, expected_digests=expected_digests)
+    if state == "converging":
+        raise receipts.ReleaseControlError(
+            "GHCR package and digest observations have not converged"
+        )
+    return state
+
+
+def wait_for_ghcr_digest_convergence(
+    *,
+    observe: Callable[[], object],
+    expected_digests: Sequence[str],
+    timeout_seconds: float = GHCR_CONVERGENCE_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = GHCR_CONVERGENCE_POLL_INTERVAL_SECONDS,
+    _monotonic: Callable[[], float] = time.monotonic,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> receipts.JSONObject:
+    """Await agreement between GHCR registry and package read models."""
+
+    if (
+        not callable(observe)
+        or type(timeout_seconds) is not float
+        or not 0.0 < timeout_seconds <= 300.0
+        or type(poll_interval_seconds) is not float
+        or not 0.0 < poll_interval_seconds <= 30.0
+        or poll_interval_seconds > timeout_seconds
+    ):
+        raise receipts.ReleaseControlError("GHCR convergence polling policy is invalid")
+    expected = tuple(expected_digests)
+    started = _monotonic()
+    if type(started) is not float or not math.isfinite(started) or started < 0.0:
+        raise receipts.ReleaseControlError("GHCR convergence monotonic clock is invalid")
+
+    def remaining_seconds() -> float:
+        now = _monotonic()
+        if type(now) is not float or not math.isfinite(now) or now < started:
+            raise receipts.ReleaseControlError("GHCR convergence monotonic clock is invalid")
+        remaining = timeout_seconds - (now - started)
+        if remaining <= 0.0:
+            raise receipts.ReleaseControlError(
+                "GHCR package and digest convergence deadline expired"
+            )
+        return remaining
+
+    first_observation = True
+    while True:
+        if not first_observation:
+            remaining_seconds()
+        first_observation = False
+        observed = observe()
+        state = _ghcr_digest_observation_state(observed, expected_digests=expected)
+        remaining = remaining_seconds()
+        if state != "converging":
+            return receipts._copy_json_object(  # noqa: SLF001
+                receipts._object(observed, label="settled GHCR digest observation"),  # noqa: SLF001
+                label="settled GHCR digest observation",
+            )
+        _sleep(min(poll_interval_seconds, remaining))
+
+
+def _missing_ghcr_object_digests(
+    value: object, *, expected_digests: Sequence[str]
+) -> list[str]:
+    """Return only exact candidate OCI digests observed as absent."""
+
+    _classify_ghcr_digest_observation(value, expected_digests=expected_digests)
+    observation = receipts._object(value, label="GHCR digest observation")  # noqa: SLF001
+    return sorted(
+        receipts._digest(item.get("digest"), label="missing GHCR object digest")  # noqa: SLF001
+        for raw_item in receipts._array(  # noqa: SLF001
+            observation.get("objects"), label="GHCR digest queries"
+        )
+        for item in [receipts._object(raw_item, label="GHCR digest query")]  # noqa: SLF001
+        if item.get("http_status") == 404
+    )
+
+
+def _release_promotion_published_surfaces(
+    *,
+    release_listing: object,
+    release_contract: Mapping[str, object],
+    ghcr_observation: object,
+    expected_oci_digests: Sequence[str],
+    allow_exact_draft: bool = False,
+) -> receipts.JSONObject:
+    """Normalize the exact immutable Release and point-in-time GHCR state."""
+
+    release_state = _classify_product_release_listing(
+        release_listing, contract=release_contract
+    )
+    accepted_release_states = {"immutable_exact"}
+    if allow_exact_draft is True:
+        accepted_release_states.add("draft_exact")
+    elif allow_exact_draft is not False:
+        raise receipts.ReleaseControlError(
+            "release-promotion draft planning policy is invalid"
+        )
+    if (
+        release_state.get("release") not in accepted_release_states
+        or release_state.get("assets") != "existing_exact"
+    ):
+        raise receipts.ReleaseControlError(
+            "release-promotion predicate requires an exact immutable product Release"
+        )
+    if (
+        _classify_ghcr_digest_observation(
+            ghcr_observation, expected_digests=expected_oci_digests
+        )
+        != "existing_exact"
+    ):
+        raise receipts.ReleaseControlError(
+            "release-promotion predicate requires every exact GHCR digest"
+        )
+    persisted = receipts._object(  # noqa: SLF001
+        release_contract.get("persisted"),
+        label="release-promotion persisted Release contract",
+    )
+    release_assets: list[receipts.JSONValue] = []
+    for raw_asset in receipts._array(  # noqa: SLF001
+        release_contract.get("assets"),
+        label="release-promotion Release assets",
+    ):
+        asset = receipts._object(  # noqa: SLF001
+            raw_asset, label="release-promotion Release asset"
+        )
+        release_assets.append(
+            {
+                "name": receipts._validate_string(  # noqa: SLF001
+                    asset.get("name"), label="release-promotion Release asset name"
+                ),
+                "size_bytes": receipts._safe_integer(  # noqa: SLF001
+                    asset.get("size_bytes"),
+                    label="release-promotion Release asset size",
+                    positive=True,
+                ),
+                "sha256": receipts._digest(  # noqa: SLF001
+                    asset.get("sha256"),
+                    label="release-promotion Release asset digest",
+                ),
+                "media_type": receipts._validate_string(  # noqa: SLF001
+                    asset.get("media_type"),
+                    label="release-promotion Release asset media type",
+                ),
+            }
+        )
+    release_assets.sort(key=lambda item: cast(str, cast(dict[str, object], item)["name"]))
+
+    ghcr = receipts._object(ghcr_observation, label="release-promotion GHCR state")  # noqa: SLF001
+    ghcr_objects: list[receipts.JSONValue] = []
+    for raw_object in receipts._array(  # noqa: SLF001
+        ghcr.get("objects"), label="release-promotion GHCR objects"
+    ):
+        item = receipts._object(raw_object, label="release-promotion GHCR object")  # noqa: SLF001
+        ghcr_objects.append(
+            {
+                "digest": receipts._digest(  # noqa: SLF001
+                    item.get("digest"), label="release-promotion GHCR digest"
+                ),
+                "available_by_digest": True,
+                "available_by_digest_at": item.get("observed_at"),
+                "tags": [],
+            }
+        )
+    ghcr_objects.sort(key=lambda item: cast(str, cast(dict[str, object], item)["digest"]))
+    return {
+        "github_release": {
+            "repository": _RELEASE_REPOSITORY,
+            "release_id": receipts._safe_integer(  # noqa: SLF001
+                release_state.get("release_id"),
+                label="release-promotion Release ID",
+                positive=True,
+            ),
+            "tag_name": persisted.get("tag_name"),
+            "target_commitish": persisted.get("target_commitish"),
+            "immutable": True,
+            "assets": release_assets,
+        },
+        "ghcr": {
+            "repository": ghcr.get("repository"),
+            "objects": ghcr_objects,
+        },
+    }
+
+
+def _release_promotion_published_surface_identity(
+    value: object,
+) -> receipts.JSONObject:
+    """Validate published-surface evidence and project its stable identity."""
+
+    surfaces = receipts._object(value, label="release-promotion published surfaces")  # noqa: SLF001
+    receipts._require_exact_fields(  # noqa: SLF001
+        surfaces,
+        frozenset({"github_release", "ghcr"}),
+        label="release-promotion published surfaces",
+    )
+    release = receipts._object(  # noqa: SLF001
+        surfaces.get("github_release"), label="release-promotion GitHub Release"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        release,
+        frozenset(
+            {
+                "repository",
+                "release_id",
+                "tag_name",
+                "target_commitish",
+                "immutable",
+                "assets",
+            }
+        ),
+        label="release-promotion GitHub Release",
+    )
+    if release.get("repository") != _RELEASE_REPOSITORY or release.get("immutable") is not True:
+        raise receipts.ReleaseControlError(
+            "release-promotion GitHub Release identity mismatch"
+        )
+    stable_assets: list[receipts.JSONValue] = []
+    asset_names: set[str] = set()
+    for raw_asset in receipts._array(  # noqa: SLF001
+        release.get("assets"), label="release-promotion GitHub Release assets"
+    ):
+        asset = receipts._object(  # noqa: SLF001
+            raw_asset, label="release-promotion GitHub Release asset"
+        )
+        receipts._require_exact_fields(  # noqa: SLF001
+            asset,
+            frozenset({"name", "size_bytes", "sha256", "media_type"}),
+            label="release-promotion GitHub Release asset",
+        )
+        name = receipts._validate_string(  # noqa: SLF001
+            asset.get("name"), label="release-promotion GitHub Release asset name"
+        )
+        if name in asset_names:
+            raise receipts.ReleaseControlError(
+                "release-promotion GitHub Release asset is duplicated"
+            )
+        asset_names.add(name)
+        stable_assets.append(
+            {
+                "name": name,
+                "size_bytes": receipts._safe_integer(  # noqa: SLF001
+                    asset.get("size_bytes"),
+                    label="release-promotion GitHub Release asset size",
+                    positive=True,
+                ),
+                "sha256": receipts._digest(  # noqa: SLF001
+                    asset.get("sha256"),
+                    label="release-promotion GitHub Release asset digest",
+                ),
+                "media_type": receipts._validate_string(  # noqa: SLF001
+                    asset.get("media_type"),
+                    label="release-promotion GitHub Release asset media type",
+                ),
+            }
+        )
+    if not stable_assets:
+        raise receipts.ReleaseControlError(
+            "release-promotion GitHub Release asset inventory is empty"
+        )
+
+    ghcr = receipts._object(surfaces.get("ghcr"), label="release-promotion GHCR")  # noqa: SLF001
+    receipts._require_exact_fields(  # noqa: SLF001
+        ghcr,
+        frozenset({"repository", "objects"}),
+        label="release-promotion GHCR",
+    )
+    if ghcr.get("repository") != candidates.OCI_REPOSITORY:
+        raise receipts.ReleaseControlError("release-promotion GHCR repository mismatch")
+    stable_objects: list[receipts.JSONValue] = []
+    object_digests: set[str] = set()
+    for raw_object in receipts._array(  # noqa: SLF001
+        ghcr.get("objects"), label="release-promotion GHCR objects"
+    ):
+        item = receipts._object(raw_object, label="release-promotion GHCR object")  # noqa: SLF001
+        receipts._require_exact_fields(  # noqa: SLF001
+            item,
+            frozenset(
+                {"digest", "available_by_digest", "available_by_digest_at", "tags"}
+            ),
+            label="release-promotion GHCR object",
+        )
+        digest = receipts._digest(  # noqa: SLF001
+            item.get("digest"), label="release-promotion GHCR object digest"
+        )
+        if digest in object_digests:
+            raise receipts.ReleaseControlError(
+                "release-promotion GHCR object is duplicated"
+            )
+        object_digests.add(digest)
+        if item.get("available_by_digest") is not True or item.get("tags") != []:
+            raise receipts.ReleaseControlError(
+                "release-promotion GHCR object availability mismatch"
+            )
+        receipts.parse_timestamp(
+            item.get("available_by_digest_at"),
+            label="release-promotion GHCR availability time",
+        )
+        stable_objects.append(
+            {"digest": digest, "available_by_digest": True, "tags": []}
+        )
+    if not stable_objects:
+        raise receipts.ReleaseControlError(
+            "release-promotion GHCR object inventory is empty"
+        )
+    return {
+        "github_release": {
+            "repository": _RELEASE_REPOSITORY,
+            "release_id": receipts._safe_integer(  # noqa: SLF001
+                release.get("release_id"),
+                label="release-promotion GitHub Release ID",
+                positive=True,
+            ),
+            "tag_name": receipts._validate_string(  # noqa: SLF001
+                release.get("tag_name"), label="release-promotion GitHub Release tag"
+            ),
+            "target_commitish": receipts._git_sha(  # noqa: SLF001
+                release.get("target_commitish"),
+                label="release-promotion GitHub Release commit",
+            ),
+            "immutable": True,
+            "assets": stable_assets,
+        },
+        "ghcr": {
+            "repository": candidates.OCI_REPOSITORY,
+            "objects": stable_objects,
+        },
+    }
+
+
+def _release_promotion_predicate_context(
+    *,
+    manifest: Mapping[str, object],
+    transaction_authorization_digest: str,
+    release_listing: object,
+    release_contract: Mapping[str, object],
+    ghcr_observation: object,
+    expected_oci_digests: Sequence[str],
+    allow_exact_draft: bool = False,
+) -> receipts.JSONObject:
+    """Build the run-independent portion of the custom promotion predicate."""
+
+    manifest_raw = receipts.canonical_json_bytes(manifest)
+    candidate, repository_id = receipts._candidate_from_manifest(manifest_raw)  # noqa: SLF001
+    candidate_run = receipts._copy_json_object(  # noqa: SLF001
+        receipts._object(  # noqa: SLF001
+            manifest.get("candidate_run"),
+            label="release-promotion candidate run",
+        ),
+        label="release-promotion candidate run",
+    )
+    checks = [
+        cast(
+            receipts.JSONValue,
+            receipts._copy_json_object(  # noqa: SLF001
+                receipts._object(item, label="release-promotion candidate check"),  # noqa: SLF001
+                label="release-promotion candidate check",
+            ),
+        )
+        for item in receipts._array(  # noqa: SLF001
+            manifest.get("checks"), label="release-promotion candidate checks"
+        )
+    ]
+    if len(checks) != 6:
+        raise receipts.ReleaseControlError(
+            "release-promotion predicate requires the six candidate checks"
+        )
+    return {
+        "schema": _RELEASE_PROMOTION_PREDICATE_SCHEMA,
+        "candidate": candidate,
+        "candidate_build_evidence": {
+            "repository_id": repository_id,
+            "workflow_path": _RELEASE_CANDIDATE_WORKFLOW_PATH,
+            "candidate_run": candidate_run,
+            "checks": checks,
+        },
+        "transaction_authorization_digest": receipts._digest(  # noqa: SLF001
+            transaction_authorization_digest,
+            label="release-promotion transaction authorization digest",
+        ),
+        "published_surfaces": _release_promotion_published_surfaces(
+            release_listing=release_listing,
+            release_contract=release_contract,
+            ghcr_observation=ghcr_observation,
+            expected_oci_digests=expected_oci_digests,
+            allow_exact_draft=allow_exact_draft,
+        ),
+    }
+
+
+def build_release_promotion_predicate(
+    *,
+    context: Mapping[str, object],
+    execution_authorization_digest: str | None,
+    promotion_run: Mapping[str, object],
+) -> receipts.JSONObject:
+    """Add the selected mode-aware authority to a canonical predicate context."""
+
+    checked = receipts._copy_json_object(  # noqa: SLF001
+        context, label="release-promotion predicate context"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        checked,
+        frozenset(
+            {
+                "schema",
+                "candidate",
+                "candidate_build_evidence",
+                "transaction_authorization_digest",
+                "published_surfaces",
+            }
+        ),
+        label="release-promotion predicate context",
+    )
+    if checked.get("schema") != _RELEASE_PROMOTION_PREDICATE_SCHEMA:
+        raise receipts.ReleaseControlError(
+            "release-promotion predicate context schema mismatch"
+        )
+    predicate: receipts.JSONObject = {
+        "schema": checked["schema"],
+        "candidate": checked["candidate"],
+        "candidate_build_evidence": checked["candidate_build_evidence"],
+        "transaction_authorization_digest": checked[
+            "transaction_authorization_digest"
+        ],
+        "execution_authorization_digest": (
+            None
+            if execution_authorization_digest is None
+            else receipts._digest(  # noqa: SLF001
+                execution_authorization_digest,
+                label="release-promotion execution authorization digest",
+            )
+        ),
+        "promotion_run": receipts._copy_json_object(  # noqa: SLF001
+            promotion_run, label="release-promotion run"
+        ),
+        "published_surfaces": checked["published_surfaces"],
+    }
+    receipts._require_exact_fields(  # noqa: SLF001
+        predicate,
+        frozenset(
+            {
+                "schema",
+                "candidate",
+                "candidate_build_evidence",
+                "transaction_authorization_digest",
+                "execution_authorization_digest",
+                "promotion_run",
+                "published_surfaces",
+            }
+        ),
+        label="release-promotion predicate",
+    )
+    receipts.canonical_json_bytes(predicate)
+    return predicate
+
+
+def _promotion_attestation_request_identity(
+    *, predicate: Mapping[str, object], subjects: Sequence[object]
+) -> receipts.JSONObject:
+    """Bind an attestation mutation while permitting fresh observation times."""
+
+    checked_predicate = receipts._copy_json_object(  # noqa: SLF001
+        predicate, label="release-promotion attestation predicate"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        checked_predicate,
+        frozenset(
+            {
+                "schema",
+                "candidate",
+                "candidate_build_evidence",
+                "transaction_authorization_digest",
+                "execution_authorization_digest",
+                "promotion_run",
+                "published_surfaces",
+            }
+        ),
+        label="release-promotion attestation predicate",
+    )
+    checked_predicate["published_surfaces"] = (
+        _release_promotion_published_surface_identity(
+            checked_predicate.get("published_surfaces")
+        )
+    )
+    checked_subjects = [
+        receipts._copy_json_object(  # noqa: SLF001
+            receipts._object(item, label="release-promotion attestation subject"),  # noqa: SLF001
+            label="release-promotion attestation subject",
+        )
+        for item in subjects
+    ]
+    return {
+        "predicate_type": _RELEASE_PROMOTION_PREDICATE_TYPE,
+        "predicate_identity": checked_predicate,
+        "subjects": cast(list[receipts.JSONValue], checked_subjects),
+    }
+
+
+def _ghcr_tags_by_digest_from_package_versions(value: object) -> dict[str, list[str]]:
+    """Normalize the complete pinned-CLI GHCR package-version tag inventory."""
+
+    pages = receipts._array(value, label="GHCR package version pages")  # noqa: SLF001
+    if not pages or len(pages) > 100:
+        raise receipts.ReleaseControlError("GHCR package version pagination is invalid")
+    result: dict[str, list[str]] = {}
+    version_ids: set[int] = set()
+    seen_tags: set[str] = set()
+    version_count = 0
+    for page_value in pages:
+        page = receipts._array(  # noqa: SLF001
+            page_value, label="GHCR package version page"
+        )
+        if len(page) > 100:
+            raise receipts.ReleaseControlError("GHCR package version page exceeds 100 records")
+        version_count += len(page)
+        if version_count > 10_000:
+            raise receipts.ReleaseControlError("GHCR package version inventory is too large")
+        for raw_version in page:
+            version = receipts._object(  # noqa: SLF001
+                raw_version, label="GHCR package version"
+            )
+            version_id = receipts._safe_integer(  # noqa: SLF001
+                version.get("id"), label="GHCR package version ID", positive=True
+            )
+            digest = receipts._digest(  # noqa: SLF001
+                version.get("name"), label="GHCR package version digest"
+            )
+            if version_id in version_ids or digest in result:
+                raise receipts.ReleaseControlError(
+                    "GHCR package version identity is duplicated"
+                )
+            metadata = receipts._object(  # noqa: SLF001
+                version.get("metadata"), label="GHCR package version metadata"
+            )
+            if metadata.get("package_type") != "container":
+                raise receipts.ReleaseControlError(
+                    "GHCR package version has the wrong package type"
+                )
+            container = receipts._object(  # noqa: SLF001
+                metadata.get("container"), label="GHCR package version container metadata"
+            )
+            tags: list[str] = []
+            for raw_tag in receipts._array(  # noqa: SLF001
+                container.get("tags"), label="GHCR package version tags"
+            ):
+                tag = receipts._validate_string(  # noqa: SLF001
+                    raw_tag, label="GHCR package version tag", max_bytes=128
+                )
+                if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}", tag) is None:
+                    raise receipts.ReleaseControlError(
+                        "GHCR package version tag is not an OCI tag"
+                    )
+                if tag in seen_tags:
+                    raise receipts.ReleaseControlError(
+                        "GHCR package version tag is duplicated"
+                    )
+                seen_tags.add(tag)
+                tags.append(tag)
+            version_ids.add(version_id)
+            result[digest] = sorted(tags, key=lambda item: item.encode("utf-8"))
+    return dict(sorted(result.items()))
+
+
+def _ghcr_package_is_present(value: object) -> bool:
+    """Derive first-publication package presence from the complete user inventory."""
+
+    pages = receipts._array(value, label="GHCR user package pages")  # noqa: SLF001
+    if not pages or len(pages) > 100:
+        raise receipts.ReleaseControlError("GHCR user package pagination is invalid")
+    package_ids: set[int] = set()
+    package_names: set[str] = set()
+    total = 0
+    for raw_page in pages:
+        page = receipts._array(raw_page, label="GHCR user package page")  # noqa: SLF001
+        if len(page) > 100:
+            raise receipts.ReleaseControlError("GHCR user package page exceeds 100 records")
+        total += len(page)
+        if total > 10_000:
+            raise receipts.ReleaseControlError("GHCR user package inventory is too large")
+        for raw_package in page:
+            package = receipts._object(raw_package, label="GHCR user package")  # noqa: SLF001
+            package_id = receipts._safe_integer(  # noqa: SLF001
+                package.get("id"), label="GHCR user package ID", positive=True
+            )
+            name = receipts._validate_string(  # noqa: SLF001
+                package.get("name"), label="GHCR user package name"
+            )
+            if package.get("package_type") != "container":
+                raise receipts.ReleaseControlError(
+                    "GHCR user package inventory contains the wrong package type"
+                )
+            owner = receipts._object(  # noqa: SLF001
+                package.get("owner"), label="GHCR user package owner"
+            )
+            if (
+                owner.get("login") != "John-MiracleWorker"
+                or owner.get("id") != 58918509
+            ):
+                raise receipts.ReleaseControlError("GHCR user package owner conflicts")
+            if package_id in package_ids or name in package_names:
+                raise receipts.ReleaseControlError(
+                    "GHCR user package identity is duplicated"
+                )
+            package_ids.add(package_id)
+            package_names.add(name)
+    return "kestrel" in package_names
+
+
+def _repository_attestation_inventory_count(
+    value: object, *, expected_repository_id: int
+) -> int:
+    """Validate one complete predicate-filtered REST attestation inventory."""
+
+    repository_id = receipts._safe_integer(  # noqa: SLF001
+        expected_repository_id,
+        label="attestation inventory repository ID",
+        positive=True,
+    )
+    pages = receipts._array(  # noqa: SLF001
+        value, label="repository attestation inventory pages"
+    )
+    if not pages or len(pages) > 100:
+        raise receipts.ReleaseControlError(
+            "repository attestation inventory pagination is invalid"
+        )
+    bundle_urls: set[str] = set()
+    total = 0
+    for raw_page in pages:
+        page = receipts._object(  # noqa: SLF001
+            raw_page, label="repository attestation inventory page"
+        )
+        receipts._require_exact_fields(  # noqa: SLF001
+            page,
+            frozenset({"attestations"}),
+            label="repository attestation inventory page",
+        )
+        attestations = receipts._array(  # noqa: SLF001
+            page.get("attestations"), label="repository attestation inventory"
+        )
+        if len(attestations) > 100:
+            raise receipts.ReleaseControlError(
+                "repository attestation inventory page exceeds 100 records"
+            )
+        total += len(attestations)
+        if total > 10_000:
+            raise receipts.ReleaseControlError(
+                "repository attestation inventory is too large"
+            )
+        for raw_attestation in attestations:
+            attestation = receipts._object(  # noqa: SLF001
+                raw_attestation, label="repository attestation inventory item"
+            )
+            receipts._require_exact_fields(  # noqa: SLF001
+                attestation,
+                frozenset({"repository_id", "bundle_url", "initiator"}),
+                label="repository attestation inventory item",
+            )
+            if attestation.get("repository_id") != repository_id:
+                raise receipts.ReleaseControlError(
+                    "repository attestation inventory repository conflicts"
+                )
+            bundle_url = receipts._validate_string(  # noqa: SLF001
+                attestation.get("bundle_url"),
+                label="repository attestation inventory bundle URL",
+            )
+            parsed = urlsplit(bundle_url)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+            ):
+                raise receipts.ReleaseControlError(
+                    "repository attestation inventory bundle URL is invalid"
+                )
+            receipts._validate_string(  # noqa: SLF001
+                attestation.get("initiator"),
+                label="repository attestation inventory initiator",
+            )
+            if bundle_url in bundle_urls:
+                raise receipts.ReleaseControlError(
+                    "repository attestation inventory is duplicated"
+                )
+            bundle_urls.add(bundle_url)
+    return total
+
+
+def _observe_promotion_attestation_subject(
+    *,
+    subject: Mapping[str, object],
+    target: str,
+    pinned_gh: Path,
+    repository: str,
+    expected_repository_id: int,
+    common_arguments: Sequence[str],
+    token: str,
+    label: str,
+) -> receipts.JSONObject:
+    """Prove REST absence before treating CLI verification failure as missing."""
+
+    checked = receipts._copy_json_object(  # noqa: SLF001
+        subject, label=f"{label} subject"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        checked,
+        frozenset({"kind", "name", "digest"}),
+        label=f"{label} subject",
+    )
+    if repository != _RELEASE_REPOSITORY:
+        raise receipts.ReleaseControlError(f"{label} repository mismatch")
+    digest = receipts._digest(checked.get("digest"), label=f"{label} digest")  # noqa: SLF001
+    target_text = receipts._validate_string(target, label=f"{label} target")  # noqa: SLF001
+    token_text = receipts._validate_string(token, label=f"{label} token")  # noqa: SLF001
+    arguments = [
+        receipts._validate_string(item, label=f"{label} common argument")  # noqa: SLF001
+        for item in common_arguments
+    ]
+    endpoint = (
+        f"repos/{repository}/attestations/{quote(digest, safe='')}"
+        f"?predicate_type={quote(_RELEASE_PROMOTION_PREDICATE_TYPE, safe='')}"
+        "&per_page=100"
+    )
+    environment = {
+        "GH_TOKEN": token_text,
+        "GH_PROMPT_DISABLED": "1",
+        "NO_COLOR": "1",
+    }
+    inventory_result = subprocess.run(  # noqa: S603
+        [str(pinned_gh), "api", "--paginate", "--slurp", endpoint],
+        capture_output=True,
+        check=False,
+        env=environment,
+        timeout=120,
+    )
+    if inventory_result.returncode != 0:
+        raise receipts.ReleaseControlError(f"{label} inventory query failed")
+    inventory = receipts.parse_external_json_bytes(
+        inventory_result.stdout, label=f"{label} inventory"
+    )
+    inventory_count = _repository_attestation_inventory_count(
+        inventory, expected_repository_id=expected_repository_id
+    )
+    if inventory_count == 0:
+        return {**checked, "inventory": inventory, "verification": None}
+
+    verification_result = subprocess.run(  # noqa: S603
+        [str(pinned_gh), "attestation", "verify", target_text, *arguments],
+        capture_output=True,
+        check=False,
+        env=environment,
+        timeout=120,
+    )
+    if verification_result.returncode != 0:
+        raise receipts.ReleaseControlError(f"{label} verification failed")
+    verification = receipts.parse_external_json_bytes(
+        verification_result.stdout, label=f"{label} verification"
+    )
+    if verification in ({}, []):
+        raise receipts.ReleaseControlError(f"{label} verification output is empty")
+    return {**checked, "inventory": inventory, "verification": verification}
 
 
 def _expected_oci_object_digests(bundle_root: Path) -> tuple[str, ...]:
@@ -7372,7 +10822,11 @@ def _classify_commit_tag_observation(
 
 
 def _classify_promotion_attestation_observation(
-    value: object, *, manifest: Mapping[str, object]
+    value: object,
+    *,
+    manifest: Mapping[str, object],
+    expected_context: Mapping[str, object],
+    recovery_capsule_digest: str,
 ) -> dict[str, str]:
     """Derive attestation state from subject-bound GitHub CLI verification JSON."""
 
@@ -7398,13 +10852,47 @@ def _classify_promotion_attestation_observation(
     expected_identities = [
         (item.get("kind"), item.get("name"), item.get("digest")) for item in expected_subjects
     ]
+    expected_by_kind: dict[str, dict[str, str]] = {"file": {}, "oci_index": {}}
+    for item in expected_subjects:
+        expected_kind = receipts._validate_string(  # noqa: SLF001
+            item.get("kind"), label="candidate attestation subject kind"
+        )
+        expected_name = receipts._validate_string(  # noqa: SLF001
+            item.get("name"), label="candidate attestation subject name"
+        )
+        expected_digest = receipts._digest(  # noqa: SLF001
+            item.get("digest"), label="candidate attestation subject digest"
+        )
+        if expected_kind not in expected_by_kind or expected_name in expected_by_kind[expected_kind]:
+            raise receipts.ReleaseControlError(
+                "candidate attestation subject inventory is invalid"
+            )
+        expected_by_kind[expected_kind][expected_name] = expected_digest
     observed_identities: list[tuple[object, object, object]] = []
     states = {"file": "existing_exact", "oci_index": "existing_exact"}
     seen_kinds: set[str] = set()
+    build_evidence = receipts._object(  # noqa: SLF001
+        expected_context.get("candidate_build_evidence"),
+        label="promotion attestation candidate build evidence",
+    )
+    repository_id = receipts._safe_integer(  # noqa: SLF001
+        build_evidence.get("repository_id"),
+        label="promotion attestation repository ID",
+        positive=True,
+    )
     for item in observed_subjects:
         receipts._require_exact_fields(  # noqa: SLF001
             item,
-            frozenset({"kind", "name", "digest", "verification"}),
+            frozenset(
+                {
+                    "kind",
+                    "name",
+                    "digest",
+                    "inventory",
+                    "verification",
+                    "authority_verification",
+                }
+            ),
             label="promotion attestation subject",
         )
         kind = receipts._validate_string(  # noqa: SLF001
@@ -7414,10 +10902,30 @@ def _classify_promotion_attestation_observation(
             raise receipts.ReleaseControlError("promotion attestation subject kind is invalid")
         seen_kinds.add(kind)
         observed_identities.append((item.get("kind"), item.get("name"), item.get("digest")))
+        inventory_count = _repository_attestation_inventory_count(
+            item.get("inventory"), expected_repository_id=repository_id
+        )
         verification = item.get("verification")
+        authority_verification = item.get("authority_verification")
         if verification is None:
+            if inventory_count != 0:
+                raise receipts.ReleaseControlError(
+                    "nonempty attestation inventory lacks successful verification"
+                )
+            if authority_verification is not None:
+                raise receipts.ReleaseControlError(
+                    "missing promotion attestation has authority evidence"
+                )
             states[kind] = "missing"
             continue
+        if inventory_count == 0:
+            raise receipts.ReleaseControlError(
+                "attestation verification conflicts with an empty inventory"
+            )
+        if authority_verification is None:
+            raise receipts.ReleaseControlError(
+                "promotion attestation lacks independent authority evidence"
+            )
         name = receipts._validate_string(  # noqa: SLF001
             item.get("name"), label="promotion attestation subject name"
         )
@@ -7428,6 +10936,13 @@ def _classify_promotion_attestation_observation(
             receipts.canonical_external_json_bytes(verification),
             expected_name=name,
             expected_digest=digest,
+            expected_context=expected_context,
+            recovery_capsule_digest=recovery_capsule_digest,
+            authority_verification=receipts._object(  # noqa: SLF001
+                authority_verification,
+                label="promotion attestation authority verification",
+            ),
+            allowed_subjects=expected_by_kind[kind],
         )
     if observed_identities != expected_identities or seen_kinds != set(states):
         raise receipts.ReleaseControlError(
@@ -7550,6 +11065,25 @@ def _classify_pypi_project_observation(
         "missing": cast(list[receipts.JSONValue], missing),
         "last_serial": serial,
     }
+
+
+def _pypi_publication_outcome(
+    *,
+    pre_missing: Sequence[str],
+    post_missing: Sequence[str],
+    publisher_outcome: str,
+) -> str:
+    """Attribute public PyPI state without turning a failed publish into success."""
+
+    if publisher_outcome not in {"success", "failure", "skipped"}:
+        raise receipts.ReleaseControlError("PyPI publisher outcome is invalid")
+    if not pre_missing:
+        return "existing_exact" if not post_missing else "unknown"
+    if publisher_outcome == "failure":
+        return "unknown"
+    if publisher_outcome == "success":
+        return "created" if not post_missing else "unknown"
+    return "unknown" if not post_missing else "not_attempted"
 
 
 def _verify_pypi_integrity_provenance(
@@ -7828,7 +11362,7 @@ def _validate_pypi_provenance_evidence(
     ):
         receipts._require_exact_fields(  # noqa: SLF001
             integrity_item,
-            frozenset({"filename", "provenance"}),
+            frozenset({"filename", "provenance_response_base64"}),
             label="PyPI Integrity file",
         )
         receipts._require_exact_fields(  # noqa: SLF001
@@ -7880,8 +11414,14 @@ def _validate_pypi_provenance_evidence(
             or receipts._sha256(distribution_raw) != expected_digest  # noqa: SLF001
         ):
             raise receipts.ReleaseControlError("PyPI candidate distribution bytes mismatch")
-        provenance = integrity_item.get("provenance")
-        provenance_raw = receipts.canonical_external_json_bytes(provenance)
+        provenance_raw = _decode_observation_bytes(
+            integrity_item.get("provenance_response_base64"),
+            label=f"PyPI Integrity raw provenance for {filename}",
+        )
+        provenance = receipts.parse_external_json_bytes(
+            provenance_raw,
+            label=f"PyPI Integrity raw provenance for {filename}",
+        )
         if (
             verification_item.get("filename") != filename
             or verification_item.get("distribution_sha256") != expected_digest
@@ -8113,6 +11653,7 @@ def _validate_final_lock_sources(
     workflow: object,
     default_branch_workflow: bytes,
     expected_workflow: bytes,
+    transaction_mode: str,
 ) -> None:
     """Validate the final lock directly from fresh registered source bodies."""
 
@@ -8129,12 +11670,18 @@ def _validate_final_lock_sources(
     receipts._safe_integer(  # noqa: SLF001
         checked_workflow.get("id"), label="final release ingress workflow ID", positive=True
     )
+    if transaction_mode not in {"initiate", "recover_committed"}:
+        raise receipts.ReleaseControlError("final release transaction mode is invalid")
     if (
         checked_workflow.get("path") != ".github/workflows/release.yml"
         or checked_workflow.get("state") != "active"
         or checked_workflow.get("default_branch") != "main"
         or not default_branch_workflow
-        or default_branch_workflow != expected_workflow
+        or not expected_workflow
+        or (
+            transaction_mode == "initiate"
+            and default_branch_workflow != expected_workflow
+        )
     ):
         raise receipts.ReleaseControlError("final release lock or ingress byte source mismatch")
 
@@ -8163,19 +11710,21 @@ def _command_plan_preparation(args: argparse.Namespace) -> int:
         Path(args.release_list_observation),
         label="preparation complete product Release listing",
     )
+    release_listing = receipts.parse_external_json_bytes(
+        release_raw, label="preparation complete product Release listing"
+    )
     release_state = _classify_product_release_listing(
-        receipts.parse_external_json_bytes(
-            release_raw, label="preparation complete product Release listing"
-        ),
-        contract=release_contract,
+        release_listing, contract=release_contract
     )
     ghcr_raw = _read_observation_or_record(
         Path(args.ghcr_observation), label="preparation GHCR observation"
     )
     expected_oci_digests = _expected_oci_object_digests(Path(args.bundle_root))
+    ghcr_observation = receipts.parse_external_json_bytes(
+        ghcr_raw, label="preparation GHCR observation"
+    )
     ghcr_state = _classify_ghcr_digest_observation(
-        receipts.parse_external_json_bytes(ghcr_raw, label="preparation GHCR observation"),
-        expected_digests=expected_oci_digests,
+        ghcr_observation, expected_digests=expected_oci_digests
     )
     state: receipts.JSONObject = {
         "schema": "kestrel.release_stage_state.v1",
@@ -8197,14 +11746,28 @@ def _command_plan_preparation(args: argparse.Namespace) -> int:
         release_contract.get("create_request"),
         label="preparation product Release create request",
     )
-    asset_request: receipts.JSONObject = {
-        "tag_name": create_request["tag_name"],
-        "release_id": release_state["release_id"],
-        "assets": release_contract["assets"],
-    }
+    missing_assets = _missing_product_release_assets(
+        release_listing, contract=release_contract
+    )
+    create_operation_request_digest = release_stage_operation_request_digest(
+        candidate=candidate,
+        operation="create_github_release_draft",
+        request=create_request,
+        transaction_authorization_digest=transaction,
+        recovery_capsule_digest=capsule,
+    )
+    asset_request = _product_release_asset_upload_request(
+        contract=release_contract,
+        release_state=release_state,
+        missing_assets=missing_assets,
+        create_operation_request_digest=create_operation_request_digest,
+    )
+    missing_oci_digests = _missing_ghcr_object_digests(
+        ghcr_observation, expected_digests=expected_oci_digests
+    )
     ghcr_request: receipts.JSONObject = {
         "repository": candidates.OCI_REPOSITORY,
-        "digests": list(expected_oci_digests),
+        "digests": cast(list[receipts.JSONValue], missing_oci_digests),
     }
     plan = build_release_stage_plan(
         stage=1,
@@ -8314,11 +11877,11 @@ def _command_plan_commit(args: argparse.Namespace) -> int:
         Path(args.release_list_observation),
         label="commit complete product Release listing",
     )
+    release_listing = receipts.parse_external_json_bytes(
+        release_raw, label="commit complete product Release listing"
+    )
     release_state = _classify_product_release_listing(
-        receipts.parse_external_json_bytes(
-            release_raw, label="commit complete product Release listing"
-        ),
-        contract=release_contract,
+        release_listing, contract=release_contract
     )
     if release_state["release"] == "missing" or release_state["assets"] != "existing_exact":
         raise receipts.ReleaseControlError(
@@ -8328,21 +11891,35 @@ def _command_plan_commit(args: argparse.Namespace) -> int:
         Path(args.ghcr_observation), label="commit GHCR observation"
     )
     expected_oci_digests = _expected_oci_object_digests(Path(args.bundle_root))
+    ghcr_observation = receipts.parse_external_json_bytes(
+        ghcr_raw, label="commit GHCR observation"
+    )
     ghcr_state = _classify_ghcr_digest_observation(
-        receipts.parse_external_json_bytes(ghcr_raw, label="commit GHCR observation"),
-        expected_digests=expected_oci_digests,
+        ghcr_observation, expected_digests=expected_oci_digests
     )
     if ghcr_state != "existing_exact":
         raise receipts.ReleaseControlError("commit requires every candidate OCI object by digest")
+    predicate_context = _release_promotion_predicate_context(
+        manifest=manifest,
+        transaction_authorization_digest=transaction,
+        release_listing=release_listing,
+        release_contract=release_contract,
+        ghcr_observation=ghcr_observation,
+        expected_oci_digests=expected_oci_digests,
+        allow_exact_draft=True,
+    )
     attestations_raw = _read_observation_or_record(
         Path(args.attestation_observations),
         label="commit promotion attestation observations",
     )
+    attestation_observation = receipts.parse_external_json_bytes(
+        attestations_raw, label="commit promotion attestation observations"
+    )
     attestation_state = _classify_promotion_attestation_observation(
-        receipts.parse_external_json_bytes(
-            attestations_raw, label="commit promotion attestation observations"
-        ),
+        attestation_observation,
         manifest=manifest,
+        expected_context=predicate_context,
+        recovery_capsule_digest=capsule,
     )
     if tag_state == "missing" and (
         release_state["release"] == "immutable_exact"
@@ -8379,17 +11956,51 @@ def _command_plan_commit(args: argparse.Namespace) -> int:
         ],
         "complete": True,
     }
+    selected_authorization = _canonical_object(
+        sources[
+            "execution-authorization"
+            if execution is not None
+            else "transaction-authorization"
+        ],
+        label="commit selected server authorization",
+    )
+    predicate = build_release_promotion_predicate(
+        context=predicate_context,
+        execution_authorization_digest=execution,
+        promotion_run=receipts._object(  # noqa: SLF001
+            selected_authorization.get("promotion_run"),
+            label="commit selected promotion run",
+        ),
+    )
     subject_requests: dict[str, receipts.JSONObject] = {
-        "file": {"predicate_type": _RELEASE_PROMOTION_PREDICATE_TYPE, "subjects": []},
-        "oci_index": {
-            "predicate_type": _RELEASE_PROMOTION_PREDICATE_TYPE,
-            "subjects": [],
-        },
+        kind: _promotion_attestation_request_identity(
+            predicate=predicate, subjects=[]
+        )
+        for kind in ("file", "oci_index")
+    }
+    observed_attestations = receipts._object(  # noqa: SLF001
+        attestation_observation, label="commit promotion attestation observations"
+    )
+    existing_subjects = {
+        (item.get("kind"), item.get("name"), item.get("digest"))
+        for raw_item in receipts._array(  # noqa: SLF001
+            observed_attestations.get("subjects"),
+            label="commit promotion attestation subjects",
+        )
+        for item in [
+            receipts._object(  # noqa: SLF001
+                raw_item, label="commit promotion attestation subject"
+            )
+        ]
+        if item.get("verification") is not None
     }
     for raw_subject in receipts._array(  # noqa: SLF001
         manifest.get("attestation_subjects"), label="commit attestation subjects"
     ):
         subject = receipts._object(raw_subject, label="commit attestation subject")  # noqa: SLF001
+        identity = (subject.get("kind"), subject.get("name"), subject.get("digest"))
+        if identity in existing_subjects:
+            continue
         kind = cast(str, subject["kind"])
         cast(list[receipts.JSONValue], subject_requests[kind]["subjects"]).append(subject)
     create_tag_request: receipts.JSONObject = {
@@ -8406,7 +12017,7 @@ def _command_plan_commit(args: argparse.Namespace) -> int:
     publish_request: receipts.JSONObject = {
         "release_id": release_state["release_id"],
         "tag_name": candidate["tag"],
-        "patch": {"draft": False, "make_latest": False},
+        "patch": _product_release_publish_patch(),
     }
     plan = build_release_stage_plan(
         stage=2,
@@ -8619,9 +12230,6 @@ def _command_record_commit(args: argparse.Namespace) -> int:
     return _command_record_mutation_stage(args, stage=2)
 
 
-_RELEASE_PROMOTION_PREDICATE_TYPE = "https://kestrel.dev/attestations/release-promotion/v1"
-
-
 def _require_nonempty_gh_json(raw: bytes, *, label: str) -> receipts.JSONValue:
     if not raw:
         raise receipts.ReleaseControlError(f"{label} produced no verification output")
@@ -8631,7 +12239,33 @@ def _require_nonempty_gh_json(raw: bytes, *, label: str) -> receipts.JSONValue:
     return value
 
 
-def _verify_attestation_output(raw: bytes, *, expected_name: str, expected_digest: str) -> None:
+def _parse_external_attestation_timestamp(value: object) -> datetime:
+    checked = receipts._validate_string(  # noqa: SLF001
+        value, label="GitHub attestation verified timestamp"
+    )
+    try:
+        parsed = datetime.fromisoformat(checked.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise receipts.ReleaseControlError(
+            "GitHub attestation verified timestamp is not RFC 3339"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.microsecond != 0:
+        raise receipts.ReleaseControlError(
+            "GitHub attestation verified timestamp is not aware whole-second time"
+        )
+    return parsed.astimezone(UTC)
+
+
+def _verified_promotion_attestation_claim(
+    raw: bytes,
+    *,
+    expected_name: str,
+    expected_digest: str,
+    expected_context: Mapping[str, object],
+    allowed_subjects: Mapping[str, str] | None = None,
+) -> receipts.JSONObject:
+    """Parse the signed statement and non-workflow-controlled certificate identity."""
+
     value = _require_nonempty_gh_json(raw, label="GitHub attestation verification")
     entries = receipts._array(value, label="GitHub attestation verification")  # noqa: SLF001
     if len(entries) != 1:
@@ -8645,23 +12279,520 @@ def _verify_attestation_output(raw: bytes, *, expected_name: str, expected_diges
     statement = receipts._object(  # noqa: SLF001
         result.get("statement"), label="GitHub attestation statement"
     )
-    if statement.get("predicateType") != _RELEASE_PROMOTION_PREDICATE_TYPE:
+    receipts._require_exact_fields(  # noqa: SLF001
+        statement,
+        frozenset({"_type", "predicateType", "subject", "predicate"}),
+        label="GitHub attestation statement",
+    )
+    if (
+        statement.get("_type") != "https://in-toto.io/Statement/v1"
+        or statement.get("predicateType") != _RELEASE_PROMOTION_PREDICATE_TYPE
+    ):
         raise receipts.ReleaseControlError("GitHub attestation predicate type mismatch")
     subjects = receipts._array(  # noqa: SLF001
         statement.get("subject"), label="GitHub attestation subjects"
     )
-    if len(subjects) != 1:
-        raise receipts.ReleaseControlError("GitHub attestation subject is not a singleton")
-    subject = receipts._object(subjects[0], label="GitHub attestation subject")  # noqa: SLF001
-    digest = receipts._object(  # noqa: SLF001
-        subject.get("digest"), label="GitHub attestation subject digest"
+    observed: dict[str, str] = {}
+    for raw_subject in subjects:
+        subject = receipts._object(  # noqa: SLF001
+            raw_subject, label="GitHub attestation subject"
+        )
+        receipts._require_exact_fields(  # noqa: SLF001
+            subject,
+            frozenset({"name", "digest"}),
+            label="GitHub attestation subject",
+        )
+        digest = receipts._object(  # noqa: SLF001
+            subject.get("digest"), label="GitHub attestation subject digest"
+        )
+        name = receipts._validate_string(  # noqa: SLF001
+            subject.get("name"), label="GitHub attestation subject name"
+        )
+        if set(digest) != {"sha256"}:
+            raise receipts.ReleaseControlError(
+                "GitHub attestation subject identity mismatch"
+            )
+        digest_value = receipts._digest(  # noqa: SLF001
+            f"sha256:{digest.get('sha256')}",
+            label="GitHub attestation subject digest",
+        )
+        if name in observed:
+            raise receipts.ReleaseControlError(
+                "GitHub attestation subject identity is duplicated"
+            )
+        observed[name] = digest_value
+    expected_singleton = {expected_name: expected_digest}
+    if allowed_subjects is None:
+        permitted = observed == expected_singleton
+    else:
+        allowed = {
+            receipts._validate_string(  # noqa: SLF001
+                name, label="allowed attestation subject name"
+            ): receipts._digest(  # noqa: SLF001
+                digest, label="allowed attestation subject digest"
+            )
+            for name, digest in allowed_subjects.items()
+        }
+        if allowed.get(expected_name) != expected_digest:
+            raise receipts.ReleaseControlError(
+                "GitHub attestation allowed subject identity mismatch"
+            )
+        permitted = (
+            bool(observed)
+            and observed.get(expected_name) == expected_digest
+            and all(allowed.get(name) == digest for name, digest in observed.items())
+        )
+    if not permitted:
+        raise receipts.ReleaseControlError(
+            "GitHub attestation subject identity mismatch"
+        )
+
+    context = receipts._copy_json_object(  # noqa: SLF001
+        expected_context, label="expected release-promotion predicate context"
     )
-    expected_hex = expected_digest.removeprefix("sha256:")
-    if set(digest) != {"sha256"} or (subject.get("name"), digest.get("sha256")) != (
-        expected_name,
-        expected_hex,
+    receipts._require_exact_fields(  # noqa: SLF001
+        context,
+        frozenset(
+            {
+                "schema",
+                "candidate",
+                "candidate_build_evidence",
+                "transaction_authorization_digest",
+                "published_surfaces",
+            }
+        ),
+        label="expected release-promotion predicate context",
+    )
+    predicate = receipts._copy_json_object(  # noqa: SLF001
+        receipts._object(  # noqa: SLF001
+            statement.get("predicate"), label="GitHub attestation predicate"
+        ),
+        label="GitHub attestation predicate",
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        predicate,
+        frozenset(
+            {
+                "schema",
+                "candidate",
+                "candidate_build_evidence",
+                "transaction_authorization_digest",
+                "execution_authorization_digest",
+                "promotion_run",
+                "published_surfaces",
+            }
+        ),
+        label="GitHub attestation predicate",
+    )
+    for field in (
+        "schema",
+        "candidate",
+        "candidate_build_evidence",
+        "transaction_authorization_digest",
     ):
-        raise receipts.ReleaseControlError("GitHub attestation subject identity mismatch")
+        if predicate.get(field) != context.get(field):
+            raise receipts.ReleaseControlError(
+                f"GitHub attestation predicate {field} mismatch"
+            )
+    if _release_promotion_published_surface_identity(
+        predicate.get("published_surfaces")
+    ) != _release_promotion_published_surface_identity(context.get("published_surfaces")):
+        raise receipts.ReleaseControlError(
+            "GitHub attestation predicate published_surfaces identity mismatch"
+        )
+    execution_digest = predicate.get("execution_authorization_digest")
+    if execution_digest is not None:
+        receipts._digest(  # noqa: SLF001
+            execution_digest,
+            label="GitHub attestation execution authorization digest",
+        )
+    run = receipts._copy_json_object(  # noqa: SLF001
+        receipts._object(  # noqa: SLF001
+            predicate.get("promotion_run"),
+            label="GitHub attestation promotion run",
+        ),
+        label="GitHub attestation promotion run",
+    )
+    candidate = receipts._object(  # noqa: SLF001
+        context.get("candidate"), label="GitHub attestation candidate"
+    )
+    build_evidence = receipts._object(  # noqa: SLF001
+        context.get("candidate_build_evidence"),
+        label="GitHub attestation candidate build evidence",
+    )
+    repository_id = receipts._safe_integer(  # noqa: SLF001
+        build_evidence.get("repository_id"),
+        label="GitHub attestation repository ID",
+        positive=True,
+    )
+    expected_ref = (
+        "refs/heads/main"
+        if execution_digest is None
+        else f"refs/tags/{candidate.get('tag')}"
+    )
+    run_id = receipts._safe_integer(  # noqa: SLF001
+        run.get("run_id"), label="GitHub attestation run ID", positive=True
+    )
+    if (
+        run.get("repository_id") != repository_id
+        or run.get("workflow_path") != _RELEASE_WORKFLOW_PATH
+        or run.get("run_attempt") != 1
+        or run.get("event") != "workflow_dispatch"
+        or run.get("ref") != expected_ref
+        or run.get("head_sha") != candidate.get("source_sha")
+        or run.get("workflow_sha") != candidate.get("source_sha")
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub attestation promotion run is not mode-aware attempt one"
+        )
+
+    signature = receipts._object(  # noqa: SLF001
+        result.get("signature"), label="GitHub attestation signature"
+    )
+    certificate = receipts._object(  # noqa: SLF001
+        signature.get("certificate"), label="GitHub attestation certificate"
+    )
+    source_sha = candidate.get("source_sha")
+    workflow_uri = (
+        f"https://github.com/{_RELEASE_REPOSITORY}/{_RELEASE_WORKFLOW_PATH}@{expected_ref}"
+    )
+    expected_certificate = {
+        "issuer": "https://token.actions.githubusercontent.com",
+        "runnerEnvironment": "github-hosted",
+        "sourceRepositoryURI": f"https://github.com/{_RELEASE_REPOSITORY}",
+        "sourceRepositoryDigest": source_sha,
+        "sourceRepositoryRef": expected_ref,
+        "sourceRepositoryIdentifier": str(repository_id),
+        "sourceRepositoryOwnerURI": f"https://github.com/{_RELEASE_OWNER}",
+        "sourceRepositoryOwnerIdentifier": str(_RELEASE_OWNER_ID),
+        "sourceRepositoryVisibilityAtSigning": "public",
+        "buildSignerURI": workflow_uri,
+        "buildSignerDigest": source_sha,
+        "buildConfigURI": workflow_uri,
+        "buildConfigDigest": source_sha,
+        "subjectAlternativeName": workflow_uri,
+        "githubWorkflowName": "Release",
+        "githubWorkflowRepository": _RELEASE_REPOSITORY,
+        "githubWorkflowRef": expected_ref,
+        "githubWorkflowSHA": source_sha,
+        "githubWorkflowTrigger": "workflow_dispatch",
+        "buildTrigger": "workflow_dispatch",
+        "runInvocationURI": (
+            f"https://github.com/{_RELEASE_REPOSITORY}/actions/runs/{run_id}/attempts/1"
+        ),
+    }
+    if any(certificate.get(key) != expected for key, expected in expected_certificate.items()):
+        raise receipts.ReleaseControlError(
+            "GitHub attestation certificate signer identity mismatch"
+        )
+    timestamps = [
+        receipts._object(item, label="GitHub attestation verified timestamp")  # noqa: SLF001
+        for item in receipts._array(  # noqa: SLF001
+            result.get("verifiedTimestamps"),
+            label="GitHub attestation verified timestamps",
+        )
+    ]
+    if not timestamps or len(timestamps) > 8:
+        raise receipts.ReleaseControlError(
+            "GitHub attestation verified timestamp cardinality is invalid"
+        )
+    parsed_timestamps: list[datetime] = []
+    for timestamp in timestamps:
+        receipts._require_exact_fields(  # noqa: SLF001
+            timestamp,
+            frozenset({"type", "uri", "timestamp"}),
+            label="GitHub attestation verified timestamp",
+        )
+        if timestamp.get("type") != "Tlog" or not receipts._validate_string(  # noqa: SLF001
+            timestamp.get("uri"), label="GitHub attestation timestamp URI"
+        ).startswith("https://"):
+            raise receipts.ReleaseControlError(
+                "GitHub attestation timestamp source is invalid"
+            )
+        parsed_timestamps.append(
+            _parse_external_attestation_timestamp(timestamp.get("timestamp"))
+        )
+    verified_at = min(parsed_timestamps)
+    signed_surfaces = receipts._object(  # noqa: SLF001
+        predicate.get("published_surfaces"),
+        label="GitHub attestation signed published surfaces",
+    )
+    signed_ghcr = receipts._object(  # noqa: SLF001
+        signed_surfaces.get("ghcr"), label="GitHub attestation signed GHCR state"
+    )
+    for raw_object in receipts._array(  # noqa: SLF001
+        signed_ghcr.get("objects"), label="GitHub attestation signed GHCR objects"
+    ):
+        item = receipts._object(  # noqa: SLF001
+            raw_object, label="GitHub attestation signed GHCR object"
+        )
+        observed_at = receipts.parse_timestamp(
+            item.get("available_by_digest_at"),
+            label="GitHub attestation signed GHCR availability time",
+        )
+        if observed_at > verified_at:
+            raise receipts.ReleaseControlError(
+                "GitHub attestation claims GHCR availability after signing"
+            )
+    return {
+        "predicate": predicate,
+        "promotion_run": run,
+        "execution_authorization_digest": execution_digest,
+        "run_id": run_id,
+        "verified_at": receipts._format_timestamp(  # noqa: SLF001
+            verified_at, label="GitHub attestation verified timestamp"
+        ),
+    }
+
+
+def _verify_attestation_output(
+    raw: bytes,
+    *,
+    expected_name: str,
+    expected_digest: str,
+    expected_context: Mapping[str, object],
+    recovery_capsule_digest: str,
+    authority_verification: Mapping[str, object],
+    allowed_subjects: Mapping[str, str] | None = None,
+) -> receipts.JSONObject:
+    claim = _verified_promotion_attestation_claim(
+        raw,
+        expected_name=expected_name,
+        expected_digest=expected_digest,
+        expected_context=expected_context,
+        allowed_subjects=allowed_subjects,
+    )
+    verified_at = receipts.parse_timestamp(
+        claim.get("verified_at"), label="GitHub attestation authority replay time"
+    )
+    if authority_verification.get("verified_at") != claim.get("verified_at"):
+        raise receipts.ReleaseControlError(
+            "GitHub attestation authority verification time mismatch"
+        )
+    authority = _verified_authority_from_record(
+        authority_verification,
+        verification_schema="kestrel.github_release_authority_verification.v1",
+        authority_schema=receipts.GITHUB_AUTHORITY_SCHEMA,
+        label="GitHub attestation commit authority verification",
+        require_current=False,
+        _clock=lambda: verified_at,
+    )
+    context_candidate = receipts._object(  # noqa: SLF001
+        expected_context.get("candidate"), label="GitHub attestation expected candidate"
+    )
+    execution_digest = cast(str | None, claim["execution_authorization_digest"])
+    _require_github_authority_binding(
+        authority,
+        candidate=context_candidate,
+        phase="commit",
+        transaction_authorization_digest=cast(
+            str, expected_context["transaction_authorization_digest"]
+        ),
+        execution_authorization_digest=execution_digest,
+        recovery_capsule_digest=receipts._digest(  # noqa: SLF001
+            recovery_capsule_digest,
+            label="GitHub attestation recovery capsule digest",
+        ),
+        commit_marker_digest=None,
+    )
+    environment = receipts._object(  # noqa: SLF001
+        authority.get("environment"), label="GitHub attestation authority environment"
+    )
+    expected_mode = "initiate" if execution_digest is None else "recover_committed"
+    if (
+        authority.get("mode") != expected_mode
+        or authority.get("promotion_run") != claim.get("promotion_run")
+        or environment.get("name") != "release-commit"
+    ):
+        raise receipts.ReleaseControlError(
+            "GitHub attestation commit authority signer binding mismatch"
+        )
+    return claim
+
+
+def _attestation_commit_authority_verification(
+    *,
+    claim: Mapping[str, object],
+    expected_context: Mapping[str, object],
+    api: GitHubReadAPI,
+) -> receipts.JSONObject:
+    """Fetch and replay the signer run's immutable commit authority."""
+
+    run_id = receipts._safe_integer(  # noqa: SLF001
+        claim.get("run_id"), label="attestation authority run ID", positive=True
+    )
+    verified_at = receipts.parse_timestamp(
+        claim.get("verified_at"), label="attestation authority replay time"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="kestrel-attestation-commit-authority-"
+    ) as temporary_root:
+        authority_root = Path(temporary_root) / "commit-authority"
+        fetch_github_boundary_authority(
+            boundary="commit",
+            run_id=run_id,
+            output_dir=authority_root,
+            api=api,
+            timeout_seconds=30.0,
+            poll_interval_seconds=1.0,
+        )
+        receipt = receipts._read_regular(  # noqa: SLF001
+            authority_root / "github-commit-authority.json",
+            label="attestation commit authority receipt",
+            max_bytes=receipts.MAX_SOURCE_ENVELOPE_BYTES,
+        )
+        signature = receipts._read_regular(  # noqa: SLF001
+            authority_root / "github-commit-authority.json.sig",
+            label="attestation commit authority signature",
+            max_bytes=receipts.MAX_SOURCE_ENVELOPE_BYTES,
+        )
+        owner_keys = receipts._read_regular(  # noqa: SLF001
+            authority_root / "owner-signing-keys-observation.json",
+            label="attestation commit authority owner keys",
+            max_bytes=receipts.MAX_SOURCE_ENVELOPE_BYTES,
+        )
+    authority = receipts.validate_github_authority(
+        receipts._object(  # noqa: SLF001
+            receipts.strict_canonical_json(
+                receipt, label="attestation commit authority receipt"
+            ),
+            label="attestation commit authority",
+        )
+    )
+    environment = receipts._object(  # noqa: SLF001
+        authority.get("environment"), label="attestation commit authority environment"
+    )
+    candidate = receipts._object(  # noqa: SLF001
+        expected_context.get("candidate"), label="attestation expected candidate"
+    )
+    return receipts.verify_github_authority(
+        receipt=receipt,
+        signature=signature,
+        owner_signing_keys_observation=owner_keys,
+        expected_run_id=run_id,
+        expected_candidate_digest=cast(str, candidate["candidate_manifest_digest"]),
+        expected_environment_id=receipts._safe_integer(  # noqa: SLF001
+            environment.get("id"),
+            label="attestation commit authority environment ID",
+            positive=True,
+        ),
+        _clock=lambda: verified_at,
+    )
+
+
+def authorize_promotion_attestation_observation(
+    value: object,
+    *,
+    manifest: Mapping[str, object],
+    expected_context: Mapping[str, object],
+    recovery_capsule_digest: str,
+    api: GitHubReadAPI,
+) -> receipts.JSONObject:
+    """Attach independently replayed signed authority to each verified bundle."""
+
+    observation = receipts._object(  # noqa: SLF001
+        value, label="raw promotion attestation observation"
+    )
+    receipts._require_exact_fields(  # noqa: SLF001
+        observation,
+        frozenset({"subjects"}),
+        label="raw promotion attestation observation",
+    )
+    expected_subjects = [
+        receipts._object(item, label="candidate attestation subject")  # noqa: SLF001
+        for item in receipts._array(  # noqa: SLF001
+            manifest.get("attestation_subjects"),
+            label="candidate attestation subjects",
+        )
+    ]
+    expected_by_kind: dict[str, dict[str, str]] = {"file": {}, "oci_index": {}}
+    for item in expected_subjects:
+        kind = receipts._validate_string(  # noqa: SLF001
+            item.get("kind"), label="candidate attestation subject kind"
+        )
+        name = receipts._validate_string(  # noqa: SLF001
+            item.get("name"), label="candidate attestation subject name"
+        )
+        digest = receipts._digest(  # noqa: SLF001
+            item.get("digest"), label="candidate attestation subject digest"
+        )
+        if kind not in expected_by_kind or name in expected_by_kind[kind]:
+            raise receipts.ReleaseControlError(
+                "candidate attestation subject inventory is invalid"
+            )
+        expected_by_kind[kind][name] = digest
+    raw_subjects = [
+        receipts._object(item, label="raw promotion attestation subject")  # noqa: SLF001
+        for item in receipts._array(  # noqa: SLF001
+            observation.get("subjects"), label="raw promotion attestation subjects"
+        )
+    ]
+    expected_identities = [
+        (item.get("kind"), item.get("name"), item.get("digest"))
+        for item in expected_subjects
+    ]
+    observed_identities = [
+        (item.get("kind"), item.get("name"), item.get("digest"))
+        for item in raw_subjects
+    ]
+    if observed_identities != expected_identities:
+        raise receipts.ReleaseControlError(
+            "raw promotion attestation subject inventory does not match the candidate"
+        )
+    authority_cache: dict[tuple[int, str], receipts.JSONObject] = {}
+    authorized_subjects: list[receipts.JSONValue] = []
+    for item in raw_subjects:
+        receipts._require_exact_fields(  # noqa: SLF001
+            item,
+            frozenset({"kind", "name", "digest", "inventory", "verification"}),
+            label="raw promotion attestation subject",
+        )
+        kind = cast(str, item["kind"])
+        name = cast(str, item["name"])
+        digest = cast(str, item["digest"])
+        verification = item.get("verification")
+        if verification is None:
+            authorized_subjects.append({**item, "authority_verification": None})
+            continue
+        verification_raw = receipts.canonical_external_json_bytes(verification)
+        claim = _verified_promotion_attestation_claim(
+            verification_raw,
+            expected_name=name,
+            expected_digest=digest,
+            expected_context=expected_context,
+            allowed_subjects=expected_by_kind[kind],
+        )
+        cache_key = (cast(int, claim["run_id"]), cast(str, claim["verified_at"]))
+        authority_verification = authority_cache.get(cache_key)
+        if authority_verification is None:
+            authority_verification = _attestation_commit_authority_verification(
+                claim=claim,
+                expected_context=expected_context,
+                api=api,
+            )
+            authority_cache[cache_key] = authority_verification
+        _verify_attestation_output(
+            verification_raw,
+            expected_name=name,
+            expected_digest=digest,
+            expected_context=expected_context,
+            recovery_capsule_digest=recovery_capsule_digest,
+            authority_verification=authority_verification,
+            allowed_subjects=expected_by_kind[kind],
+        )
+        authorized_subjects.append(
+            {**item, "authority_verification": authority_verification}
+        )
+    authorized: receipts.JSONObject = {
+        "subjects": authorized_subjects
+    }
+    _classify_promotion_attestation_observation(
+        authorized,
+        manifest=manifest,
+        expected_context=expected_context,
+        recovery_capsule_digest=recovery_capsule_digest,
+    )
+    return authorized
 
 
 def _run_github_surface_verifications(
@@ -8669,7 +12800,9 @@ def _run_github_surface_verifications(
     candidate: Mapping[str, object],
     bundle_root: Path,
     pinned_gh: Path,
-    source_ref: str,
+    expected_context: Mapping[str, object],
+    recovery_capsule_digest: str,
+    authority_verifications: Mapping[tuple[int, str], Mapping[str, object]],
 ) -> tuple[list[receipts.JSONObject], dict[str, bytes]]:
     """Run the complete read-only GitHub verification set with one pinned CLI."""
 
@@ -8687,9 +12820,6 @@ def _run_github_surface_verifications(
     tag = receipts._validate_string(  # noqa: SLF001
         candidate.get("tag"), label="verification tag"
     )
-    if source_ref not in {"refs/heads/main", f"refs/tags/{tag}"}:
-        raise receipts.ReleaseControlError("verification source ref mismatch")
-
     release_artifacts: list[tuple[str, Path, str, int]] = []
     artifact_digests: dict[str, str] = {}
     for raw_item in receipts._array(  # noqa: SLF001
@@ -8712,7 +12842,11 @@ def _run_github_surface_verifications(
     if not release_artifacts:
         raise receipts.ReleaseControlError("candidate has no GitHub Release assets")
 
-    attestation_targets: list[tuple[str, str, str]] = []
+    attestation_targets: list[tuple[str, str, str, str]] = []
+    attestation_subjects_by_kind: dict[str, dict[str, str]] = {
+        "file": {},
+        "oci_index": {},
+    }
     for raw_item in receipts._array(  # noqa: SLF001
         candidate.get("attestation_subjects"), label="verification attestation subjects"
     ):
@@ -8742,7 +12876,10 @@ def _run_github_surface_verifications(
             target = f"oci://{name}@{digest}"
         else:
             raise receipts.ReleaseControlError("verification attestation subject kind is invalid")
-        attestation_targets.append((name, target, digest))
+        if name in attestation_subjects_by_kind[kind]:
+            raise receipts.ReleaseControlError("verification attestation subject is duplicated")
+        attestation_subjects_by_kind[kind][name] = digest
+        attestation_targets.append((kind, name, target, digest))
 
     checked_release_artifacts: list[tuple[str, Path, str]] = []
     for name, path, digest, size in release_artifacts:
@@ -8803,7 +12940,7 @@ def _run_github_surface_verifications(
             raw=raw,
         )
 
-    signer_workflow = f"{repository}/.github/workflows/release-transaction.yml"
+    signer_workflow = f"{repository}/.github/workflows/release.yml"
     common_arguments = [
         "--repo",
         repository,
@@ -8813,20 +12950,39 @@ def _run_github_surface_verifications(
         source_sha,
         "--source-digest",
         source_sha,
-        "--source-ref",
-        source_ref,
         "--predicate-type",
         _RELEASE_PROMOTION_PREDICATE_TYPE,
         "--deny-self-hosted-runners",
         "--format",
         "json",
     ]
-    for index, (name, target, digest) in enumerate(attestation_targets, start=1):
+    for index, (kind, name, target, digest) in enumerate(attestation_targets, start=1):
         raw = receipts._run_pinned_gh_verification(  # noqa: SLF001
             pinned_gh,
             ["attestation", "verify", target, *common_arguments],
         )
-        _verify_attestation_output(raw, expected_name=name, expected_digest=digest)
+        claim = _verified_promotion_attestation_claim(
+            raw,
+            expected_name=name,
+            expected_digest=digest,
+            expected_context=expected_context,
+            allowed_subjects=attestation_subjects_by_kind[kind],
+        )
+        key = (cast(int, claim["run_id"]), cast(str, claim["verified_at"]))
+        authority_verification = authority_verifications.get(key)
+        if authority_verification is None:
+            raise receipts.ReleaseControlError(
+                "controller attestation verification lacks signer authority"
+            )
+        _verify_attestation_output(
+            raw,
+            expected_name=name,
+            expected_digest=digest,
+            expected_context=expected_context,
+            recovery_capsule_digest=recovery_capsule_digest,
+            authority_verification=authority_verification,
+            allowed_subjects=attestation_subjects_by_kind[kind],
+        )
         record(
             key=f"repository-attestation-{index:03d}",
             check=f"repository-attestation-{index:03d}",
@@ -8919,6 +13075,14 @@ def _command_verify_github_ghcr(args: argparse.Namespace) -> int:
     ghcr_state = _classify_ghcr_digest_observation(
         fresh.get("ghcr"), expected_digests=expected_oci_digests
     )
+    predicate_context = _release_promotion_predicate_context(
+        manifest=candidate_manifest,
+        transaction_authorization_digest=transaction,
+        release_listing=fresh.get("release_list"),
+        release_contract=release_contract,
+        ghcr_observation=fresh.get("ghcr"),
+        expected_oci_digests=expected_oci_digests,
+    )
     tag_state = _classify_commit_tag_observation(
         fresh.get("tag"),
         candidate=candidate,
@@ -8926,8 +13090,57 @@ def _command_verify_github_ghcr(args: argparse.Namespace) -> int:
         recovery_capsule_digest=capsule,
     )
     attestation_state = _classify_promotion_attestation_observation(
-        fresh.get("attestations"), manifest=candidate_manifest
+        fresh.get("attestations"),
+        manifest=candidate_manifest,
+        expected_context=predicate_context,
+        recovery_capsule_digest=capsule,
     )
+    authority_verifications: dict[tuple[int, str], Mapping[str, object]] = {}
+    allowed_subjects_by_kind: dict[str, dict[str, str]] = {
+        "file": {},
+        "oci_index": {},
+    }
+    for raw_subject in receipts._array(  # noqa: SLF001
+        candidate_manifest.get("attestation_subjects"),
+        label="GitHub/GHCR candidate attestation subjects",
+    ):
+        expected_subject = receipts._object(  # noqa: SLF001
+            raw_subject, label="GitHub/GHCR candidate attestation subject"
+        )
+        allowed_subjects_by_kind[cast(str, expected_subject["kind"])][
+            cast(str, expected_subject["name"])
+        ] = cast(str, expected_subject["digest"])
+    attestation_observation = receipts._object(  # noqa: SLF001
+        fresh.get("attestations"), label="GitHub/GHCR attestation observations"
+    )
+    for raw_subject in receipts._array(  # noqa: SLF001
+        attestation_observation.get("subjects"),
+        label="GitHub/GHCR attestation subjects",
+    ):
+        observed_subject = receipts._object(  # noqa: SLF001
+            raw_subject, label="GitHub/GHCR attestation subject"
+        )
+        if observed_subject.get("verification") is None:
+            continue
+        claim = _verified_promotion_attestation_claim(
+            receipts.canonical_external_json_bytes(observed_subject["verification"]),
+            expected_name=cast(str, observed_subject["name"]),
+            expected_digest=cast(str, observed_subject["digest"]),
+            expected_context=predicate_context,
+            allowed_subjects=allowed_subjects_by_kind[
+                cast(str, observed_subject["kind"])
+            ],
+        )
+        key = (cast(int, claim["run_id"]), cast(str, claim["verified_at"]))
+        authority = receipts._object(  # noqa: SLF001
+            observed_subject.get("authority_verification"),
+            label="GitHub/GHCR attestation authority verification",
+        )
+        if key in authority_verifications and authority_verifications[key] != authority:
+            raise receipts.ReleaseControlError(
+                "GitHub/GHCR attestation signer authority conflicts"
+            )
+        authority_verifications[key] = authority
     remote_complete = (
         release_state["release"] == "immutable_exact"
         and release_state["assets"] == "existing_exact"
@@ -8941,7 +13154,9 @@ def _command_verify_github_ghcr(args: argparse.Namespace) -> int:
         candidate=candidate_manifest,
         bundle_root=Path(args.bundle_root),
         pinned_gh=pinned_gh,
-        source_ref=("refs/heads/main" if execution is None else f"refs/tags/{candidate['tag']}"),
+        expected_context=predicate_context,
+        recovery_capsule_digest=capsule,
+        authority_verifications=authority_verifications,
     )
     supplied_results = receipts._array(  # noqa: SLF001
         fresh.get("verification_results"),
@@ -9031,8 +13246,8 @@ def _command_record_pypi(args: argparse.Namespace) -> int:
         verification_schema="kestrel.pypi_upload_authority_verification.v1",
         authority_schema=receipts.PYPI_AUTHORITY_SCHEMA,
         label="PyPI authority verification",
+        require_current=False,
     )
-    _require_current_authority(verified_authority, label="PyPI authority")
     _require_pypi_authority_binding(
         verified_authority,
         candidate=candidate,
@@ -9140,7 +13355,16 @@ def _command_record_pypi(args: argparse.Namespace) -> int:
         operation.get("operation") != "publish_pypi_missing_files"
         or operation.get("request_digest") != expected_request_digest
         or (not pre_missing and outcome != "existing_exact")
-        or (pre_missing and not post_missing and outcome != "created")
+        or (
+            pre_missing
+            and not post_missing
+            and outcome not in {"created", "unknown"}
+        )
+        or (
+            pre_missing
+            and post_missing
+            and outcome not in {"unknown", "not_attempted"}
+        )
     ):
         raise receipts.ReleaseControlError(
             "PyPI publication outcome does not match the missing-only request"
@@ -9245,6 +13469,14 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
     )
     intent_raw, intent = read_record(args.dispatch_intent, "dispatch-intent")
     receipts._validate_dispatch_intent(intent)  # noqa: SLF001
+    intent_inputs = receipts._object(  # noqa: SLF001
+        intent.get("inputs"), label="reconciliation dispatch inputs"
+    )
+    transaction_mode = receipts._validate_string(  # noqa: SLF001
+        intent_inputs.get("mode"), label="reconciliation transaction mode"
+    )
+    if transaction_mode not in {"initiate", "recover_committed"}:
+        raise receipts.ReleaseControlError("reconciliation transaction mode is invalid")
     dispatch_raw, dispatch_reconciliation = read_record(
         args.dispatch_reconciliation, "dispatch-reconciliation"
     )
@@ -9458,7 +13690,200 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
         ),
         default_branch_workflow=source_bodies["default-branch-workflow-contents"],
         expected_workflow=workflow_source,
+        transaction_mode=transaction_mode,
     )
+
+    final_authority_inputs = (
+        args.final_github_authority_verification,
+        args.final_boundary_root,
+    )
+    if any(value is not None for value in final_authority_inputs) and not all(
+        value is not None for value in final_authority_inputs
+    ):
+        raise receipts.ReleaseControlError(
+            "final GitHub authority requires its complete live boundary"
+        )
+    final_authority_joined = False
+    if all(value is not None for value in final_authority_inputs):
+        if (
+            candidate is None
+            or transaction_digest is None
+            or capsule_digest is None
+            or args.stage_records is None
+        ):
+            raise receipts.ReleaseControlError(
+                "final GitHub authority lacks the committed transaction chain"
+            )
+        verification_raw, verification = read_record(
+            cast(str, args.final_github_authority_verification),
+            "final-github-authority-verification",
+        )
+        authority = _verified_authority_from_record(
+            verification,
+            verification_schema="kestrel.github_release_authority_verification.v1",
+            authority_schema=receipts.GITHUB_AUTHORITY_SCHEMA,
+            label="final GitHub authority verification",
+        )
+        if authority.get("phase") != "commit":
+            raise receipts.ReleaseControlError(
+                "terminal GitHub authority is not the signed commit authority"
+            )
+        commit_path = Path(args.stage_records) / "release-commit-outcome.json"
+        commit_raw = receipts._read_regular(  # noqa: SLF001
+            commit_path,
+            label="final GitHub authority commit outcome",
+            max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+        )
+        commit = _canonical_object(commit_raw, label="final GitHub authority commit outcome")
+        validate_release_stage_record(commit)
+        _require_completed_stage_binding(
+            commit,
+            candidate=candidate,
+            transaction_authorization_digest=transaction_digest,
+            execution_authorization_digest=execution_digest,
+            recovery_capsule_digest=capsule_digest,
+            label="final GitHub authority commit outcome",
+        )
+        _require_github_authority_binding(
+            authority,
+            candidate=candidate,
+            phase="commit",
+            transaction_authorization_digest=transaction_digest,
+            execution_authorization_digest=execution_digest,
+            recovery_capsule_digest=capsule_digest,
+            commit_marker_digest=None,
+        )
+
+        boundary_root = Path(cast(str, args.final_boundary_root))
+
+        def final_boundary_source(name: str) -> tuple[bytes, receipts.JSONObject]:
+            raw, _body, value = _authorization_file(
+                boundary_root / f"{name}.json",
+                label=f"final GitHub boundary {name}",
+                source_name=name,
+            )
+            source_records[f"final-boundary-{name}"] = raw
+            return raw, value
+
+        def final_boundary_bytes(name: str) -> tuple[bytes, bytes]:
+            path = boundary_root / f"{name}.json"
+            raw = receipts._read_regular(  # noqa: SLF001
+                path,
+                label=f"final GitHub boundary {name}",
+                max_bytes=receipts.MAX_SOURCE_ENVELOPE_BYTES,
+            )
+            body = _read_contract_source(
+                path,
+                label=f"final GitHub boundary {name}",
+                receipt_schema=receipts.SOURCE_OBSERVATION_SCHEMA,
+                phase="release-control",
+                mode=None,
+                name=name,
+            )
+            source_records[f"final-boundary-{name}"] = raw
+            return raw, body
+
+        owner_keys_raw, _owner_keys = final_boundary_source(
+            "owner-signing-keys-observation"
+        )
+        _owner_public_key, owner_fingerprint = receipts.owner_signing_key(
+            owner_signing_keys_observation=owner_keys_raw,
+            principal=receipts.SIGNING_PRINCIPAL,
+        )
+        _tag_raw, tag_ruleset = final_boundary_source(
+            "tag-ruleset-detail-observation"
+        )
+        _ingress_raw, ingress_ruleset = final_boundary_source(
+            "ingress-ruleset-detail-observation"
+        )
+        _workflow_raw, boundary_workflow = final_boundary_source(
+            "workflow-observation"
+        )
+        _default_raw, default_workflow = final_boundary_bytes(
+            "default-branch-workflow-contents"
+        )
+        _candidate_raw, candidate_workflow = final_boundary_bytes(
+            "candidate-workflow-contents"
+        )
+        _main_raw, main_branch = final_boundary_source("main-branch-observation")
+        _immutable_raw, immutable = final_boundary_source(
+            "immutable-releases-observation"
+        )
+        main_commit = main_branch.get("commit")
+        main_sha = (
+            receipts._object(  # noqa: SLF001
+                main_commit, label="final GitHub boundary main commit"
+            ).get("sha")
+            if main_commit is not None
+            else main_branch.get("sha", main_branch.get("commit_sha"))
+        )
+        immutable_enabled = immutable.get(
+            "enabled", immutable.get("immutable_releases_enabled")
+        )
+        _require_operational_github_authority_join(
+            github_authority=authority,
+            github_verification=verification,
+            live_owner_signing_fingerprint=owner_fingerprint,
+            live_owner_keys_observation=owner_keys_raw,
+            tag_ruleset=tag_ruleset,
+            ingress_ruleset=ingress_ruleset,
+            workflow=boundary_workflow,
+            default_workflow=default_workflow,
+            candidate_workflow=candidate_workflow,
+            main_sha=cast(str, main_sha),
+            immutable_releases=cast(bool, immutable_enabled),
+            transaction_mode=transaction_mode,
+        )
+        environments: dict[str, receipts.JSONObject] = {}
+        observed_policies: dict[str, tuple[tuple[int, str], ...]] = {}
+        for environment_name in _BOUNDARY_ENVIRONMENTS:
+            _environment_raw, environment = final_boundary_source(
+                f"environment-{environment_name}-observation"
+            )
+            policies_raw, policies = final_boundary_source(
+                f"environment-{environment_name}-policies-observation"
+            )
+            checked_environment, checked_policies = _environment_gate_from_observations(
+                environment=environment,
+                policies=policies,
+                policies_digest=receipts._sha256(policies_raw),  # noqa: SLF001
+                expected_name=environment_name,
+                expected_owner_login="John-MiracleWorker",
+                expected_owner_user_id=58918509,
+            )
+            environments[environment_name] = checked_environment
+            observed_policies[environment_name] = checked_policies
+        _require_operational_environment_policy_join(
+            github_authority=authority,
+            environments=environments,
+            observed_policies=observed_policies,
+        )
+        final_ingress = receipts._object(  # noqa: SLF001
+            receipts.parse_external_json_bytes(
+                source_bodies["ingress-ruleset-detail-observation"],
+                label="final observed ingress lock",
+            ),
+            label="final observed ingress lock",
+        )
+        final_workflow = receipts._object(  # noqa: SLF001
+            receipts.parse_external_json_bytes(
+                source_bodies["workflow-observation"],
+                label="final observed workflow",
+            ),
+            label="final observed workflow",
+        )
+        if (
+            final_ingress.get("id") != ingress_ruleset.get("id")
+            or final_ingress.get("updated_at") != ingress_ruleset.get("updated_at")
+            or final_workflow.get("id") != boundary_workflow.get("id")
+            or final_workflow.get("state") != boundary_workflow.get("state")
+            or source_bodies["default-branch-workflow-contents"] != default_workflow
+        ):
+            raise receipts.ReleaseControlError(
+                "final lock observation drifted after authority capture"
+            )
+        source_records["final-github-authority-verification"] = verification_raw
+        final_authority_joined = True
 
     remote_complete = False
     if can_classify_products:
@@ -9476,19 +13901,23 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
             transaction_authorization_digest=transaction_digest,
             recovery_capsule_digest=capsule_digest,
         )
+        final_release_listing = receipts.parse_external_json_bytes(
+            source_bodies["final-release-list-observation"],
+            label="final product Release listing",
+        )
         release_state = _classify_product_release_listing(
-            receipts.parse_external_json_bytes(
-                source_bodies["final-release-list-observation"],
-                label="final product Release listing",
-            ),
-            contract=release_contract,
+            final_release_listing, contract=release_contract
+        )
+        final_ghcr_observation = receipts.parse_external_json_bytes(
+            source_bodies["final-ghcr-observation"],
+            label="final GHCR observation",
+        )
+        expected_oci_digests = _expected_oci_object_digests_from_manifest(
+            manifest_value
         )
         ghcr_state = _classify_ghcr_digest_observation(
-            receipts.parse_external_json_bytes(
-                source_bodies["final-ghcr-observation"],
-                label="final GHCR observation",
-            ),
-            expected_digests=_expected_oci_object_digests_from_manifest(manifest_value),
+            final_ghcr_observation,
+            expected_digests=expected_oci_digests,
         )
         tag_state = _classify_commit_tag_observation(
             receipts.parse_external_json_bytes(
@@ -9499,13 +13928,32 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
             transaction_authorization_digest=transaction_digest,
             recovery_capsule_digest=capsule_digest,
         )
-        attestation_states = _classify_promotion_attestation_observation(
-            receipts.parse_external_json_bytes(
-                source_bodies["final-attestation-observation"],
-                label="final promotion attestation observation",
-            ),
-            manifest=manifest_value,
-        )
+        attestations_exact = False
+        if (
+            release_state.get("release") == "immutable_exact"
+            and release_state.get("assets") == "existing_exact"
+            and ghcr_state == "existing_exact"
+        ):
+            predicate_context = _release_promotion_predicate_context(
+                manifest=manifest_value,
+                transaction_authorization_digest=transaction_digest,
+                release_listing=final_release_listing,
+                release_contract=release_contract,
+                ghcr_observation=final_ghcr_observation,
+                expected_oci_digests=expected_oci_digests,
+            )
+            attestation_states = _classify_promotion_attestation_observation(
+                receipts.parse_external_json_bytes(
+                    source_bodies["final-attestation-observation"],
+                    label="final promotion attestation observation",
+                ),
+                manifest=manifest_value,
+                expected_context=predicate_context,
+                recovery_capsule_digest=capsule_digest,
+            )
+            attestations_exact = all(
+                state == "existing_exact" for state in attestation_states.values()
+            )
         expected_pypi_files = _candidate_pypi_files(manifest_value)
         pypi_state = _classify_pypi_project_observation(
             receipts.parse_external_json_bytes(
@@ -9535,7 +13983,7 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
             and release_state.get("assets") == "existing_exact"
             and ghcr_state == "existing_exact"
             and tag_state == "existing_exact"
-            and all(state == "existing_exact" for state in attestation_states.values())
+            and attestations_exact
             and pypi_files_complete
         )
         if remote_complete and not full_chain:
@@ -9561,6 +14009,10 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
         failure_code=requested_failure,
         next_action=next_action,
     )
+    if completed and not final_authority_joined:
+        completed = False
+        pending = True
+        next_action = "reconcile"
     dispatch_inputs_source = receipts._object(  # noqa: SLF001
         intent.get("inputs"), label="reconciliation dispatch inputs"
     )
@@ -9572,6 +14024,8 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
         "dispatch_binding": dispatch_inputs_source["dispatch_binding"],
     }
     mode = dispatch_inputs["mode"]
+    if mode != transaction_mode:
+        raise receipts.ReleaseControlError("reconciliation transaction mode drifted")
     if execution_digest is not None and mode != "recover_committed":
         raise receipts.ReleaseControlError(
             "initiate reconciliation cannot carry execution authorization"
@@ -9601,6 +14055,7 @@ def _command_reconcile_release(args: argparse.Namespace) -> int:
         and full_chain
         and next_action == "none"
         and remote_complete
+        and final_authority_joined
     )
     record: receipts.JSONObject = {
         "schema": RELEASE_RECONCILIATION_SCHEMA,
@@ -9762,6 +14217,11 @@ def _parser() -> argparse.ArgumentParser:
 
     prerequisites = commands.add_parser("inspect-prerequisites")
     prerequisites.add_argument("--mode", required=True, choices=("hosted-smoke", "operational"))
+    prerequisites.add_argument(
+        "--transaction-mode",
+        choices=("initiate", "recover_committed"),
+        default="initiate",
+    )
     for argument in (
         "repository-observation",
         "repository-collaborators-observation",
@@ -9792,6 +14252,48 @@ def _parser() -> argparse.ArgumentParser:
     prerequisites.add_argument("--pypi-authority-verification")
     prerequisites.add_argument("--output", required=True)
     prerequisites.set_defaults(handler=_command_inspect_prerequisites)
+
+    capture_boundary = commands.add_parser("capture-prerequisite-boundary")
+    capture_boundary.add_argument("--registry", required=True)
+    capture_boundary.add_argument("--repository", required=True)
+    capture_boundary.add_argument("--recovery-repository", required=True)
+    capture_boundary.add_argument("--candidate-ref", required=True)
+    capture_boundary.add_argument("--run-id", required=True, type=int)
+    capture_boundary.add_argument("--output-dir", required=True)
+    capture_boundary.set_defaults(handler=_command_capture_prerequisite_boundary)
+
+    fetch_boundary = commands.add_parser("fetch-github-boundary-authority")
+    fetch_boundary.add_argument(
+        "--boundary", required=True, choices=tuple(_BOUNDARY_AUTHORITY_RELEASES)
+    )
+    fetch_boundary.add_argument("--run-id", required=True, type=int)
+    fetch_boundary.add_argument("--output-dir", required=True)
+    fetch_boundary.set_defaults(handler=_command_fetch_github_boundary_authority)
+
+    publish_boundary = commands.add_parser("publish-github-boundary-authority")
+    publish_boundary.add_argument(
+        "--boundary", required=True, choices=tuple(_BOUNDARY_AUTHORITY_RELEASES)
+    )
+    publish_boundary.add_argument("--run-id", required=True, type=int)
+    publish_boundary.add_argument("--candidate-manifest-digest", required=True)
+    publish_boundary.add_argument("--environment-id", required=True, type=int)
+    publish_boundary.add_argument("--asset-root", required=True)
+    publish_boundary.add_argument("--journal", required=True)
+    publish_boundary.add_argument("--output", required=True)
+    publish_boundary.set_defaults(handler=_command_publish_github_boundary_authority)
+
+    verify_boundary = commands.add_parser("verify-github-boundary-binding")
+    verify_boundary.add_argument(
+        "--phase", required=True, choices=("prepare", "commit", "verify", "pypi", "final")
+    )
+    verify_boundary.add_argument("--authority-verification", required=True)
+    verify_boundary.add_argument("--manifest", required=True)
+    verify_boundary.add_argument("--transaction-authorization", required=True)
+    verify_boundary.add_argument("--execution-authorization")
+    verify_boundary.add_argument("--recovery-capsule-verification", required=True)
+    verify_boundary.add_argument("--commit-outcome")
+    verify_boundary.add_argument("--output", required=True)
+    verify_boundary.set_defaults(handler=_command_verify_github_boundary_binding)
 
     verify_capsule = commands.add_parser("verify-recovery-capsule")
     for argument in (
@@ -9901,6 +14403,8 @@ def _parser() -> argparse.ArgumentParser:
     final_reconcile.add_argument("--execution-authorization")
     final_reconcile.add_argument("--recovery-capsule-verification")
     final_reconcile.add_argument("--stage-records")
+    final_reconcile.add_argument("--final-github-authority-verification")
+    final_reconcile.add_argument("--final-boundary-root")
     final_reconcile.set_defaults(handler=_command_reconcile_release)
     return parser
 

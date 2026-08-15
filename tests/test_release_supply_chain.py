@@ -490,9 +490,13 @@ def test_oci_record_builder_rejects_non_digest_inputs() -> None:
 
 
 def test_release_workflow_builds_once_then_tests_the_exact_wheel_matrix() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
 
-    assert workflow.index("  build-release-candidate:") < workflow.index("  cross-platform:")
+    assert workflow.index("  build-release-candidate:") < workflow.index(
+        "  cross-platform-exact-wheel:"
+    )
     assert "needs: build-release-candidate" in workflow
     assert '- os: windows-latest\n            python: "3.11"' in workflow
     assert '- os: windows-latest\n            python: "3.13"' in workflow
@@ -518,12 +522,14 @@ def test_release_workflow_builds_once_then_tests_the_exact_wheel_matrix() -> Non
         ROOT / "scripts" / "verify_exact_wheel_install.py"
     ).read_text(encoding="utf-8")
     assert "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093" in workflow
-    assert "- cross-platform\n      - build-release-candidate" in workflow
+    assert "needs: cross-platform-exact-wheel" in workflow
     assert "pip install --upgrade pip" not in workflow
 
 
 def test_release_payload_stages_and_checksums_windows_diagnostics() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
 
     assert "cp install.ps1 dist/install.ps1" in workflow
     assert 'Path("dist/install.ps1")' in workflow
@@ -531,22 +537,26 @@ def test_release_payload_stages_and_checksums_windows_diagnostics() -> None:
 
 
 def test_release_requires_successful_exact_sha_main_ci_before_build() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-
-    assert "actions: read\n  contents: read" in workflow
-    assert "Require successful exact-SHA main CI" in workflow
-    assert 'actions/workflows/ci.yml/runs"' in workflow
-    assert "RELEASE_COMMIT_SHA=%s" in workflow
-    assert '-f head_sha="$RELEASE_COMMIT_SHA"' in workflow
-    assert "-f branch=main" in workflow
-    assert 'run.get("conclusion") == "success"' in workflow
-    assert workflow.index("Require successful exact-SHA main CI") < workflow.index(
-        "Build Python release artifacts"
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
     )
+
+    gate = workflow.index(
+        "Prove the exact protected-main source and select attempt-one prerequisites"
+    )
+    build = workflow.index("Build Python release artifacts")
+    assert "actions: read\n      contents: read" in workflow
+    assert "actions/workflows/${path}/runs?head_sha=${CANDIDATE_SOURCE_SHA}" in workflow
+    assert "branch=main&event=push&per_page=100" in workflow
+    assert 'run.get("head_sha") == os.environ["CANDIDATE_SOURCE_SHA"]' in workflow
+    assert 'run.get("conclusion") == "success"' in workflow
+    assert gate < build
 
 
 def test_release_secret_scan_materializes_only_exact_candidate_source() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
 
     assert 'git archive --format=tar "$RELEASE_COMMIT_SHA"' in workflow
     assert '-v "$candidate_source:/repo:ro"' in workflow
@@ -555,16 +565,21 @@ def test_release_secret_scan_materializes_only_exact_candidate_source() -> None:
 
 
 def test_release_requires_exact_tagged_installer_supervisor() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
 
-    assert "supervisor=scripts/installer-server-supervisor.sh" in workflow
-    assert 'git ls-files --error-unmatch "$supervisor"' in workflow
-    assert 'git cat-file -e "$TAG_COMMIT:$supervisor"' in workflow
-    assert 'git hash-object "$supervisor"' in workflow
+    assert "scripts/installer-server-supervisor.sh" in installer
+    assert 'git archive --format=tar "$CANDIDATE_SOURCE_SHA"' in workflow
+    assert "Create the exact candidate source archive" in workflow
+    assert "source_tree" in workflow
 
 
 def test_staged_release_workflow_rejects_all_artifact_url_overrides() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
 
     for variable in (
         "KESTREL_REQUIREMENTS_URL",
@@ -576,7 +591,9 @@ def test_staged_release_workflow_rejects_all_artifact_url_overrides() -> None:
 
 
 def test_staged_release_installer_uses_runner_owned_home_paths() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
     staged_installer = workflow.split(
         "      - name: Validate staged release installer plan", 1
     )[1].split("      - name: Export locked default release dependencies", 1)[0]
@@ -585,209 +602,239 @@ def test_staged_release_installer_uses_runner_owned_home_paths() -> None:
     assert staged_installer.count('KESTREL_HOME="${RUNNER_TEMP}/kestrel-installer-') == 7
 
 
-def test_release_revalidates_the_current_remote_tag_without_fetching_it() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    publish = workflow.split("  publish:", 1)[1]
+def test_release_transaction_atomically_creates_and_reobserves_the_tag() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["commit-github-release"]["steps"]
+    by_name = {step.get("name"): step for step in steps if step.get("name")}
+    execute = by_name["Atomically create the marker and publish the exact draft"]["run"]
+    observe = by_name["Observe exact commit surfaces and create the commit plan"]["run"]
+    record = by_name["Record commit outcome from fresh post-state"]
 
-    assert 'direct_ref="refs/tags/$GITHUB_REF_NAME"' in publish
-    assert 'peeled_ref="${direct_ref}^{}"' in publish
-    assert 'git ls-remote --tags origin "$direct_ref" "$peeled_ref"' in publish
-    assert 'remote_tag_commit="${peeled_sha:-$direct_sha}"' in publish
-    assert 'test "$remote_tag_commit" = "$event_commit"' in publish
-    assert "git fetch --no-tags origin refs/heads/main" in publish
-    assert 'git merge-base --is-ancestor "$event_commit" "$remote_main_commit"' in publish
-    assert "git fetch --tags" not in publish
-    assert publish.count('git ls-remote --tags origin "$direct_ref" "$peeled_ref"') == 4
-    first_remote_check = publish.index('git ls-remote --tags origin "$direct_ref" "$peeled_ref"')
-    assert first_remote_check < publish.index(
-        "Publish exact images without overwriting conflicting GHCR refs"
-    )
-    assert first_remote_check < publish.index('docker push "$candidate"')
-    assert publish.index("Revalidate the current remote tag") < publish.index(
-        "Attest multi-architecture container provenance"
-    )
-    final_revalidation = publish.index(
-        "Revalidate remote tag and publish version immediately before GitHub release"
-    )
-    draft_creation = publish.index("Create draft GitHub release and upload the complete payload")
-    final_peel = publish.index("Revalidate remote tag and main after draft upload")
-    immutable_publish = publish.index("Publish and verify immutable GitHub release")
-    assert publish.index("Attest release payload provenance") < final_revalidation
-    assert final_revalidation < draft_creation < final_peel < immutable_publish
-    assert publish.index('gh release upload "$GITHUB_REF_NAME" dist/* --clobber') < final_peel
-    assert final_peel < publish.index('gh release edit "$GITHUB_REF_NAME" --draft=false')
-    immutable_gate = publish.index(
-        "Require immutable GitHub releases before any publication mutation"
-    )
-    first_ghcr_mutation = publish.index(
-        "Publish exact images without overwriting conflicting GHCR refs"
-    )
-    assert publish.index("Inspect an existing release before any GHCR mutation") < immutable_gate
-    assert immutable_gate < first_ghcr_mutation < draft_creation
-    assert immutable_gate < publish.index('docker push "$candidate"')
+    assert "plan-commit" in observe
+    assert "commit-tag-source.json" in observe
+    tag_post = execute.index("/git/tags")
+    ref_post = execute.index("/git/refs")
+    release_patch = execute.index("/releases/")
+    assert tag_post < ref_post < release_patch
+    assert "transaction._product_release_publish_patch()" in execute
+    assert "release_verification = run_gh" in execute
+    assert '"verify-asset"' in execute
+    assert record["if"] == "${{ always() }}"
+    assert "commit-post-release-list.json" in record["run"]
+    assert "git fetch --tags" not in execute
+    assert "--clobber" not in execute
 
 
 def test_release_publishes_only_verified_distributions_through_pypi_oidc() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    pypi = workflow.split("  publish-pypi:", 1)[1]
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    job = workflow["jobs"]["publish-pypi"]
+    pypi = json.dumps(job, sort_keys=True)
 
-    assert "needs: publish" in pypi
-    assert "environment:\n      name: pypi" in pypi
-    assert "permissions:\n      actions: read\n      contents: read\n      id-token: write" in pypi
-    assert "secrets." not in pypi
-    assert "Download exact immutable release payload" in pypi
-    assert "name: kestrel-published-release-${{ github.sha }}" in pypi
-    assert "name: kestrel-release-${{ github.sha }}\n" not in pypi
-    assert "sha256sum -c SHA256SUMS" in pypi
-    assert 'test "${#wheels[@]}" -eq 1' in pypi
-    assert 'test "${#sdists[@]}" -eq 1' in pypi
-    assert "release_publication_guard.py pypi-plan" in pypi
-    assert "Compare every PyPI file by exact filename and SHA-256" in pypi
-    assert "if: steps.pypi-state.outputs.upload_required == 'true'" in pypi
+    assert job["needs"] == "verify-github-ghcr"
+    assert job["environment"] == {"name": "pypi"}
+    assert job["permissions"] == {
+        "actions": "read",
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert "pypi-attestations 0.0.30" in pypi
+    assert "pypi-attestations verify pypi --offline" in pypi
+    assert "https://pypi.org/integrity/nested-memvid-agent/" in pypi
+    assert "_verify_pypi_integrity_provenance" in pypi
+    assert 'state[\\"missing\\"]' in pypi
     assert "skip-existing" not in pypi
-    assert ("pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247") in pypi
-    assert "packages-dir: pypi-dist/" in pypi
+    assert (
+        "pypa/gh-action-pypi-publish@"
+        "ba38be9e461d3875417946c167d0b5f3d385a247"
+    ) in pypi
+    assert "transaction/pypi-dist" in pypi
+    publish = next(
+        step for step in job["steps"] if step.get("name") == "Publish only the missing exact PyPI distributions"
+    )
+    assert publish["if"] == "${{ steps.pypi-plan.outputs.publish == 'create' }}"
 
 
 def test_release_transfers_scanned_images_and_publishes_exact_multiarch_manifest() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    build = workflow.split("  build-release-candidate:", 1)[1].split("  cross-platform:", 1)[0]
-    publish = workflow.split("  publish:", 1)[1]
+    candidate = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    transaction = (
+        ROOT / ".github" / "workflows" / "release-transaction.yml"
+    ).read_text(encoding="utf-8")
+    build = candidate.split("  build-release-candidate:", 1)[1].split(
+        "  cross-platform-exact-wheel:", 1
+    )[0]
+    prepare = transaction.split("  prepare-github-ghcr:", 1)[1].split(
+        "  commit-github-release:", 1
+    )[0]
 
-    assert build.index("check_container_vulnerabilities.py") < build.index('docker save "$image"')
-    assert "name: kestrel-containers-${{ github.sha }}" in build
-    assert "name: kestrel-containers-${{ github.sha }}" in publish
-    assert "sha256sum -c SHA256SUMS" in publish
-    assert "docker buildx build" not in publish
+    assert build.index("check_container_vulnerabilities.py") < build.index(
+        'RAW_OCI_ROOT="$raw_oci_root"'
+    )
+    assert "name: kestrel-containers-${{ inputs.source_sha }}" in build
+    assert "containers/oci-descriptor.json" in build
+    assert "docker buildx build" not in prepare
     for label in (
         "org.opencontainers.image.revision",
         "org.opencontainers.image.source",
         "org.opencontainers.image.version",
     ):
         assert label in build
-        assert label in publish
-    assert 'stable_arch="$IMAGE_NAME:sha-${GITHUB_SHA}-${architecture}"' in publish
-    assert '--tag "$stable_index"' in publish
-    assert '--tag "$version_ref"' in publish
-    assert '"$IMAGE_NAME@$amd64_digest"' in publish
-    assert '"$IMAGE_NAME@$arm64_digest"' in publish
-    assert '"$IMAGE_NAME:sha-${GITHUB_SHA}-amd64" \\' not in publish
-    assert "kestrel-${architecture}-pushed.digest" in publish
-    assert 'r"(?m)^[^\\s]+: digest: (sha256:[0-9a-f]{64}) size:' in publish
-    assert '("linux", "amd64"): amd64_digest_path.read_text' in publish
-    assert '("linux", "arm64"): arm64_digest_path.read_text' in publish
-    assert "platforms != expected" in publish
-    assert "len(descriptors) != 2" in publish
-    assert 'docker pull --platform "linux/${architecture}"' in publish
-    assert 'docker run --rm --platform "linux/${architecture}"' in publish
-    assert "nest-agent doctor" in publish
+    assert '"index_ref": f"{repository}@{index_digest}"' in build
+    assert '"manifest_ref": f"{repository}@{manifest_digest}"' in build
+    assert "transaction.fetch_ghcr_push_token(" in prepare
+    assert 'principal=os.environ["PROMOTION_ACTOR"]' in prepare
+    assert "transaction.DirectOCIWriteAPI(" in prepare
+    assert "registry_writer.upload_blob(" in prepare
+    assert "registry_writer.put_manifest(" in prepare
+    assert "transaction._product_release_publish_patch()" in transaction
+    assert '"make_latest": False' not in transaction
+    assert "docker push" not in prepare
+    assert "/manifests/{candidate" not in prepare
 
 
 def test_release_reruns_are_noop_or_collision_safe_across_publication_surfaces() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    publish = workflow.split("  publish:", 1)[1]
-
-    release_probe = publish.index("Inspect an existing release before any GHCR mutation")
-    first_registry_write = publish.index('docker push "$candidate"')
-    assert release_probe < first_registry_write
-    assert 'test "$(jq -r \'.immutable // false\' "$release_json")" = true' in publish
-    assert "published OCI digest record does not match SHA256SUMS" in publish
-    assert publish.count("release_publication_guard.py verify-oci-index") == 1
-    assert 'release_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"' in publish
-    assert 'platform_ref="$IMAGE_NAME:sha-${GITHUB_SHA}-${architecture}"' in publish
-    assert 'test "$actual_digest" = "$expected_digest"' in publish
-    assert "printf 'complete=true\\n' >> \"$GITHUB_OUTPUT\"" in publish
-    assert publish.count("if: steps.release-state.outputs.complete != 'true'") >= 10
-
-    assert (
-        'candidate="$IMAGE_NAME:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${architecture}"'
-        in publish
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
     )
-    assert (
-        'candidate_index="$IMAGE_NAME:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-index"'
-        in publish
-    )
-    assert 'echo "refusing to overwrite $reference@$existing with $expected"' in publish
-    assert 'echo "refusing to overwrite $version_ref@$version_digest' in publish
-    assert 'require_absent_ref "$candidate"' in publish
-    assert 'ensure_exact_ref "$stable_arch" "$candidate_digest"' in publish
-    assert 'ensure_exact_ref "$stable_index" "$index_digest"' in publish
-    assert "--prefer-index=false" in publish
+    jobs = workflow["jobs"]
+    prepare = json.dumps(jobs["prepare-github-ghcr"], sort_keys=True)
+    commit = json.dumps(jobs["commit-github-release"], sort_keys=True)
+    pypi = json.dumps(jobs["publish-pypi"], sort_keys=True)
 
-    record = publish.index("Bind the verified OCI digest into the release payload")
-    payload_attestation = publish.index("Attest release payload provenance")
-    draft = publish.index("Create draft GitHub release and upload the complete payload")
-    assert first_registry_write < record < payload_attestation < draft
-    assert "write-oci-record dist" in publish
-
-    immutable_publish = publish.index("Publish and verify immutable GitHub release")
-    full_download = publish.index("Download and verify the complete immutable release payload")
-    downstream_upload = publish.index("Upload exact immutable payload for PyPI recovery")
-    assert immutable_publish < full_download < downstream_upload
-    immutable_step = publish[full_download:downstream_upload]
-    assert "kestrel-immutable-release.json" in immutable_step
-    assert "verify-release-assets" in immutable_step
-    assert "verify_release_payload.py" in immutable_step
-    assert "verify-oci-record" in immutable_step
-    assert '"repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"' in immutable_step
-    assert "oci-image-digests.json" in immutable_step
-    assert (
-        "if: steps.release-state.outputs.complete != 'true'"
-        not in publish[full_download : publish.index("Remove registry credentials from the runner")]
-    )
+    assert "plan-preparation" in prepare
+    assert "plan-commit" in commit
+    assert "_missing_product_release_assets" in prepare
+    assert "uploaded Release asset is not exact by Release ID" in prepare
+    assert 'for filename in state[\\"missing\\"]' in pypi
+    assert "recover_committed" in prepare
+    assert "release-execution-authorization.json" in prepare
+    assert "--clobber" not in prepare + commit
+    assert "skip-existing" not in pypi
+    for job_name, outcome in (
+        ("prepare-github-ghcr", "release-preparation-outcome.json"),
+        ("commit-github-release", "release-commit-outcome.json"),
+        ("publish-pypi", "release-pypi-outcome.json"),
+    ):
+        record = next(
+            step
+            for step in jobs[job_name]["steps"]
+            if outcome in str(step.get("run", ""))
+        )
+        assert record["if"] == "${{ always() }}"
 
 
 def test_draft_release_assets_are_exact_and_digest_verified_before_publish() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    publish = workflow.split("  publish:", 1)[1]
-    draft = publish.index("Create draft GitHub release and upload the complete payload")
-    upload = publish.index('gh release upload "$GITHUB_REF_NAME" dist/* --clobber')
-    exact = publish.index('--downloaded-root "$downloaded"')
-    final_revalidation = publish.index("Revalidate remote tag and main after draft upload")
-    immutable_publish = publish.index("Publish and verify immutable GitHub release")
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    prepare_steps = workflow["jobs"]["prepare-github-ghcr"]["steps"]
+    commit_steps = workflow["jobs"]["commit-github-release"]["steps"]
+    prepare = next(
+        step["run"]
+        for step in prepare_steps
+        if step.get("name") == "Execute only the authorized preparation plan"
+    )
+    commit = next(
+        step["run"]
+        for step in commit_steps
+        if step.get("name") == "Atomically create the marker and publish the exact draft"
+    )
 
-    assert draft < upload < exact < final_revalidation < immutable_publish
-    assert "verify-release-assets" in publish
-    assert "--allow-missing" in publish
-    assert publish.count("kestrel-draft-after-upload.json") >= 4
-    assert '"repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"' in publish
+    assert "create_github_release_draft" in prepare
+    assert "upload_github_release_assets" in prepare
+    assert "_missing_product_release_assets" in prepare
+    assert "_product_release_asset_upload_request" in prepare
+    assert "_resolve_product_release_asset_upload_target" in prepare
+    assert "authorized_release_id" in prepare
+    assert "uploaded Release asset is not exact by Release ID" in prepare
+    assert "candidate Release asset changed before upload" in prepare
+    assert "transaction._product_release_publish_patch()" in commit
+    assert "commit-last-moment-preconditions.json" in commit
+    assert "_classify_ghcr_digest_observation" in commit
+    assert "initiate marker no longer targets exact locked main" in commit
+    assert "last-moment tag state differs from its plan" in commit
+    assert "commit-last-moment-prepublish-release-list.json" in commit
+    assert "product Release changed after marker verification" in commit
+    assert "release_verification = run_gh" in commit
+    assert '"verify-asset"' in commit
+    assert "--clobber" not in prepare
 
 
 def test_container_publish_is_least_privilege_and_attested_by_digest() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    before_publish, publish = workflow.split("  publish:", 1)
+    workflow_path = ROOT / ".github" / "workflows" / "release-transaction.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    jobs = workflow["jobs"]
+    assert jobs["prepare-github-ghcr"]["permissions"]["packages"] == "write"
+    assert jobs["commit-github-release"]["permissions"]["packages"] == "read"
+    assert jobs["verify-github-ghcr"]["permissions"]["packages"] == "read"
+    assert sum(
+        job["permissions"].get("packages") == "write" for job in jobs.values()
+    ) == 1
 
-    assert "packages: write" not in before_publish
-    assert publish.count("packages: write") == 1
-    assert "GHCR_TOKEN: ${{ github.token }}" in publish
-    assert "push-to-registry: true" in publish
-    assert "subject-name: ${{ steps.image.outputs.name }}" in publish
-    assert "subject-digest: ${{ steps.verify-image.outputs.digest }}" in publish
-    assert publish.index("Verify public multi-architecture manifest") < publish.index(
-        "Attest multi-architecture container provenance"
+    attestation = next(
+        step
+        for step in jobs["commit-github-release"]["steps"]
+        if step.get("name") == "Create only the missing OCI repository custom attestation"
     )
-    assert publish.index("docker logout ghcr.io") < publish.index(
-        "Verify public multi-architecture manifest"
+    assert attestation["with"]["subject-name"] == (
+        "${{ steps.commit-plan.outputs.oci_name }}"
     )
-
-
-def test_release_push_digest_capture_accepts_one_unambiguous_docker_result() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    pattern = r"(?m)^[^\s]+: digest: (sha256:[0-9a-f]{64}) size: [0-9]+\s*$"
-    digest = "sha256:" + "a" * 64
-    output = (
-        "The push refers to repository [ghcr.io/example/kestrel]\n"
-        "layer: Layer already exists\n"
-        f"sha-deadbeef-amd64: digest: {digest} size: 1234\n"
+    assert attestation["with"]["subject-digest"] == (
+        "${{ steps.commit-plan.outputs.oci_digest }}"
     )
+    assert attestation["with"]["predicate-type"] == (
+        "https://kestrel.dev/attestations/release-promotion/v1"
+    )
+    assert "push-to-registry" not in attestation["with"]
+    assert "create-storage-record" not in attestation["with"]
+    assert workflow_text.count(
+        "users/John-MiracleWorker/packages/container/kestrel/versions?per_page=100"
+    ) == 7
+    assert workflow_text.count("tags_by_digest.get(digest, [])") == 8
+    assert workflow_text.count("transaction.DirectOCIReadAPI(") == 9
+    assert workflow_text.count("registry_api.read_digest(") == 8
+    assert workflow_text.count("max_bytes=2_147_483_648") == 10
+    assert "response.read(2_147_483_649)" not in workflow_text
+    assert '"tags": []' not in workflow_text
 
-    assert re.findall(pattern, output) == [digest]
-    assert re.findall(pattern, output + output) == [digest, digest]
-    assert 'r"(?m)^[^\\s]+: digest: (sha256:[0-9a-f]{64}) size:' in workflow
+
+def test_release_uses_candidate_digests_not_docker_push_output() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "release-transaction.yml"
+    ).read_text(encoding="utf-8")
+    prepare = workflow.split("  prepare-github-ghcr:", 1)[1].split(
+        "  commit-github-release:", 1
+    )[0]
+
+    assert "_expected_oci_object_digests" in prepare
+    assert "transaction.fetch_ghcr_push_token(" in prepare
+    assert "transaction.DirectOCIWriteAPI(" in prepare
+    assert "registry_writer.put_manifest(" in prepare
+    assert "transaction.DirectOCIReadAPI(" in prepare
+    assert "registry_api.read_digest(" in prepare
+    assert "max_bytes=2_147_483_648" in prepare
+    assert "docker push" not in prepare
+    assert r"digest: (sha256:[0-9a-f]{64}) size:" not in prepare
 
 
 def test_trivy_dockerfile_exception_is_exact_not_rule_wide() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
     policy = (ROOT / "config" / "trivy-dockerfile-ignore.rego").read_text(encoding="utf-8")
 
     assert "--ignore-policy config/trivy-dockerfile-ignore.rego" in workflow

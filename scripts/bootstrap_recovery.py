@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import subprocess  # nosec B404
 import sys
@@ -26,6 +27,29 @@ MAX_MEMBER_BYTES = 2_147_483_648
 MAX_TOTAL_BYTES = 2_147_483_648
 MAX_BOOTSTRAP_OUTPUT_BYTES = 4 * 1024 * 1024
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+TRUSTED_RECOVERY_PYTHON_IDENTITIES = {
+    ("linux", "x86_64"): frozenset(
+        {
+            (
+                "sha256:dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8",
+                "Python 3.11.14",
+                "CPython",
+                "3.11.14",
+                "cp311",
+            )
+        }
+    )
+}
+TRUSTED_OS_SANDBOX_IDENTITIES = {
+    ("linux", "x86_64"): frozenset(
+        {
+            (
+                "sha256:52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712",
+                "bubblewrap 0.9.0",
+            )
+        }
+    )
+}
 
 
 class RecoveryBootstrapError(ValueError):
@@ -281,7 +305,14 @@ def _bootstrap_dependency_inputs(
         "abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
     }:
         raise RecoveryBootstrapError("recovery bootstrap Python runtime mismatch")
-    if closure.get("sys_path") != [str(capsule_root)]:
+    declared_sys_path = closure.get("sys_path")
+    if (
+        type(declared_sys_path) is not list
+        or not declared_sys_path
+        or declared_sys_path[0] != str(capsule_root)
+        or any(type(item) is not str for item in declared_sys_path)
+        or len(declared_sys_path) != len(set(cast(list[str], declared_sys_path)))
+    ):
         raise RecoveryBootstrapError("recovery bootstrap capsule path mismatch")
     network = closure.get("network_policy")
     if type(network) is not dict or network.get("default_deny") is not True:
@@ -302,6 +333,20 @@ def _bootstrap_dependency_inputs(
     if venv_root.exists() or venv_root.is_symlink():
         raise RecoveryBootstrapError("recovery capsule contains a prebuilt execution environment")
     expected_python = python_item.get("sha256")
+    python_identity = (
+        expected_python,
+        python_item.get("version"),
+        runtime.get("implementation"),
+        runtime.get("version"),
+        runtime.get("abi"),
+    )
+    trusted_python = TRUSTED_RECOVERY_PYTHON_IDENTITIES.get(
+        (sys.platform, platform.machine()), frozenset()
+    )
+    if python_identity not in trusted_python:
+        raise RecoveryBootstrapError(
+            "recovery bootstrap Python is not a Kestrel-trusted platform identity"
+        )
     base_python = Path(sys.executable).resolve(strict=True)
     if type(expected_python) is not str or _path_digest(base_python)[1] != _checked_digest(
         expected_python, label="recovery bootstrap Python digest"
@@ -370,6 +415,51 @@ def _bootstrap_dependency_inputs(
     return venv_root, venv_python, wheelhouse, requirements
 
 
+def _prepare_trusted_os_sandbox(*, capsule_root: Path, closure: dict[str, object]) -> Path:
+    """Make only the independently pinned capsule sandbox executable."""
+
+    executables = closure.get("external_executables")
+    resources = closure.get("data_resources")
+    if type(executables) is not list or type(resources) is not list:
+        raise RecoveryBootstrapError("recovery bootstrap sandbox inventory is invalid")
+    sandbox_items = [
+        item for item in executables if type(item) is dict and item.get("name") == "sandbox"
+    ]
+    if len(sandbox_items) != 1:
+        raise RecoveryBootstrapError("Kestrel-trusted recovery sandbox is absent or ambiguous")
+    sandbox = sandbox_items[0]
+    expected_path = capsule_root / "recovery" / "bin" / "bwrap"
+    if sandbox.get("path") != str(expected_path):
+        raise RecoveryBootstrapError("recovery sandbox path is outside the capsule")
+    digest = sandbox.get("sha256")
+    version = sandbox.get("version")
+    if type(digest) is not str or type(version) is not str:
+        raise RecoveryBootstrapError("recovery sandbox identity is invalid")
+    checked_digest = _checked_digest(digest, label="recovery sandbox digest")
+    trusted = TRUSTED_OS_SANDBOX_IDENTITIES.get(
+        (sys.platform, platform.machine()), frozenset()
+    )
+    if (checked_digest, version) not in trusted:
+        raise RecoveryBootstrapError(
+            "recovery sandbox is not a Kestrel-trusted platform identity"
+        )
+    resource_items = [
+        item
+        for item in resources
+        if type(item) is dict and item.get("path") == "recovery/bin/bwrap"
+    ]
+    if len(resource_items) != 1 or resource_items[0].get("sha256") != checked_digest:
+        raise RecoveryBootstrapError("recovery sandbox is not bound as a capsule resource")
+    if (
+        not expected_path.is_file()
+        or expected_path.is_symlink()
+        or _path_digest(expected_path)[1] != checked_digest
+    ):
+        raise RecoveryBootstrapError("recovery sandbox binary identity mismatch")
+    expected_path.chmod(0o500)
+    return expected_path
+
+
 def _verify_with_bootstrapped_environment(
     *,
     venv_python: Path,
@@ -384,8 +474,11 @@ def _verify_with_bootstrapped_environment(
         "r.verify_recovery_capsule_root(root,expected_owner_key_fingerprint=sys.argv[2]);"
         "raw=r._read_regular(root/'recovery-execution-closure.json',"
         "label='recovery execution closure',max_bytes=l.MAX_CLOSURE_BYTES);"
+        "probed,runtime=l.inspect_isolated_python(Path(sys.executable));"
+        "active=l.effective_recovery_sys_path(capsule_root=root,"
+        "interpreter_sys_path=probed);"
         "value=l.verify_execution_closure(closure=raw,capsule_root=root,"
-        "active_sys_path=[str(root)]);"
+        "active_sys_path=active,active_python_runtime=runtime);"
         "sys.stdout.buffer.write(r.canonical_json_bytes(value))"
     )
     completed = subprocess.run(  # noqa: S603  # nosec B603
@@ -444,6 +537,7 @@ def bootstrap_recovery_environment(
         capsule_root=capsule_root,
         closure=closure,
     )
+    _prepare_trusted_os_sandbox(capsule_root=capsule_root, closure=closure)
     _run_bootstrap_command(
         [sys.executable, "-I", "-m", "venv", "--copies", str(venv_root)],
         environment=_bootstrap_environment(),

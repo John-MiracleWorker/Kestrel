@@ -5990,6 +5990,7 @@ _RECOVERY_CAPSULE_WORKFLOWS = frozenset(
         ".github/workflows/release.yml",
     }
 )
+_RECOVERY_SANDBOX_ASSET = "recovery/bin/bwrap"
 _RECOVERY_CAPSULE_SCHEMA_ASSETS = frozenset(
     {
         f"schemas/{name}"
@@ -6032,6 +6033,7 @@ def _capsule_asset_name_is_allowed(name: str) -> bool:
         | _RECOVERY_CAPSULE_SOURCE_ASSETS
         | _RECOVERY_CAPSULE_SCHEMA_ASSETS
         | {
+            _RECOVERY_SANDBOX_ASSET,
             "recovery/requirements.txt",
             "recovery/wheelhouse-manifest.json",
         }
@@ -6392,6 +6394,7 @@ def _validate_capsule_execution_asset_closure(
         _RECOVERY_CAPSULE_SOURCE_ASSETS
         | _RECOVERY_CAPSULE_SCHEMA_ASSETS
         | {
+            _RECOVERY_SANDBOX_ASSET,
             "recovery/requirements.txt",
             "recovery/wheelhouse-manifest.json",
         }
@@ -6406,6 +6409,28 @@ def _validate_capsule_execution_asset_closure(
         raw = asset_bytes.get(name)
         if raw is None or _sha256(raw) != expected_digest:
             raise ReleaseControlError(f"recovery capsule closure asset identity mismatch: {name}")
+
+    sandbox_items = [
+        _object(item, label="capsule sandbox executable")
+        for item in _array(
+            closure.get("external_executables"),
+            label="capsule external executables",
+        )
+        if _object(item, label="capsule external executable").get("name") == "sandbox"
+    ]
+    sandbox_digest = member_digests.get(_RECOVERY_SANDBOX_ASSET)
+    if len(sandbox_items) != 1 or sandbox_digest is None:
+        raise ReleaseControlError("recovery capsule lacks its bound sandbox executable")
+    sandbox = sandbox_items[0]
+    sandbox_path = Path(
+        _validate_string(sandbox.get("path"), label="capsule sandbox executable path")
+    )
+    if (
+        not sandbox_path.is_absolute()
+        or PurePosixPath(sandbox_path.as_posix()).parts[-3:] != ("recovery", "bin", "bwrap")
+        or sandbox.get("sha256") != sandbox_digest
+    ):
+        raise ReleaseControlError("recovery capsule sandbox binding mismatch")
 
     dependency_lock = _object(closure.get("dependency_lock"), label="capsule dependency lock")
     if dependency_lock.get("requirements_path") != "recovery/requirements.txt":
@@ -7112,6 +7137,12 @@ def _capsule_collect_recovery_dependencies(
         raise ReleaseControlError("recovery capsule dependency requirements path mismatch")
     _capsule_add_asset(
         assets,
+        name=_RECOVERY_SANDBOX_ASSET,
+        path=source_root / _RECOVERY_SANDBOX_ASSET,
+        max_bytes=16 * 1024 * 1024,
+    )
+    _capsule_add_asset(
+        assets,
         name="recovery/requirements.txt",
         path=source_root / "recovery/requirements.txt",
         max_bytes=16 * 1024 * 1024,
@@ -7527,6 +7558,112 @@ def _run_pinned_gh_verification(path: Path, arguments: Sequence[str]) -> bytes:
     return completed.stdout
 
 
+def _verify_pinned_gh_release_observation(
+    path: Path,
+    *,
+    repository: str,
+    tag: str,
+    asset_names: Sequence[str],
+) -> tuple[str, str]:
+    """Validate the exact result of network verification performed by the pinned CLI."""
+
+    raw = _read_regular(
+        path,
+        label="pinned GitHub CLI release verification observation",
+        max_bytes=MAX_SOURCE_BODY_BYTES,
+    )
+    value = _object(
+        strict_canonical_json(
+            raw,
+            label="pinned GitHub CLI release verification observation",
+        ),
+        label="pinned GitHub CLI release verification observation",
+    )
+    _require_exact_fields(
+        value,
+        frozenset(
+            {
+                "schema",
+                "pinned_gh_digest",
+                "pinned_gh_version",
+                "repository",
+                "tag",
+                "results",
+                "verified",
+                "validation_status",
+            }
+        ),
+        label="pinned GitHub CLI release verification observation",
+    )
+    platform_digest = PINNED_GH_BINARY_DIGESTS.get((sys.platform, platform.machine()))
+    expected_results = [
+        ("release:verify", "release-attestation.json"),
+        *(
+            (f"release:verify-asset:{name}", f"{name}.attestation.json")
+            for name in sorted(asset_names)
+        ),
+    ]
+    result_items = _array(
+        value.get("results"),
+        label="pinned GitHub CLI verification results",
+    )
+    if len(result_items) != len(expected_results):
+        raise ReleaseControlError("pinned GitHub CLI verification result inventory mismatch")
+    for raw_result, (expected_operation, expected_name) in zip(
+        result_items, expected_results, strict=True
+    ):
+        result = _object(raw_result, label="pinned GitHub CLI verification result")
+        _require_exact_fields(
+            result,
+            frozenset({"operation", "path", "sha256", "size_bytes"}),
+            label="pinned GitHub CLI verification result",
+        )
+        name = _validate_string(
+            result.get("path"), label="pinned GitHub CLI verification result path"
+        )
+        size = _safe_integer(
+            result.get("size_bytes"),
+            label="pinned GitHub CLI verification result size",
+            positive=True,
+        )
+        if (
+            result.get("operation") != expected_operation
+            or name != expected_name
+            or PurePosixPath(name).name != name
+        ):
+            raise ReleaseControlError("pinned GitHub CLI verification result identity mismatch")
+        result_raw = _read_regular(
+            path.parent / name,
+            label="pinned GitHub CLI verification result",
+            max_bytes=MAX_SOURCE_BODY_BYTES,
+        )
+        if (
+            len(result_raw) != size
+            or _sha256(result_raw)
+            != _digest(
+                result.get("sha256"),
+                label="pinned GitHub CLI verification result digest",
+            )
+        ):
+            raise ReleaseControlError("pinned GitHub CLI verification result digest mismatch")
+        parse_external_json_bytes(
+            result_raw,
+            label="pinned GitHub CLI verification result JSON",
+        )
+    if (
+        platform_digest is None
+        or value.get("schema") != "kestrel.pinned_gh_release_verification.v1"
+        or value.get("pinned_gh_digest") != platform_digest
+        or value.get("pinned_gh_version") != PINNED_GH_VERSION_LINE.decode("ascii")
+        or value.get("repository") != repository
+        or value.get("tag") != tag
+        or value.get("verified") is not True
+        or value.get("validation_status") != "validated"
+    ):
+        raise ReleaseControlError("pinned GitHub CLI release verification observation mismatch")
+    return platform_digest, _sha256(raw)
+
+
 def _load_external_file(path: Path, *, label: str) -> tuple[JSONValue, bytes]:
     raw = _read_regular(path, label=label, max_bytes=MAX_SOURCE_BODY_BYTES)
     return parse_external_json_bytes(raw, label=label), raw
@@ -7613,7 +7750,13 @@ def _command_publish_recovery_capsule(args: argparse.Namespace) -> int:
     if release_manifest.get("tag") != args.tag:
         raise ReleaseControlError("recovery publication tag mismatch")
     archive = deterministic_recovery_capsule_archive(root)
+    bootstrap = _read_regular(
+        root / "scripts" / "bootstrap_recovery.py",
+        label="recovery bootstrap release asset",
+        max_bytes=MAX_SOURCE_BODY_BYTES,
+    )
     expected_assets = {
+        "recovery-bootstrap.py": bootstrap,
         "recovery-capsule-manifest.json": manifest_raw,
         "recovery-capsule.tar": archive,
     }
@@ -7809,7 +7952,13 @@ def _command_verify_recovery_capsule_release(args: argparse.Namespace) -> int:
         label="fresh recovery asset observation",
     )
     archive = deterministic_recovery_capsule_archive(root)
+    bootstrap = _read_regular(
+        root / "scripts" / "bootstrap_recovery.py",
+        label="recovery bootstrap release asset",
+        max_bytes=MAX_SOURCE_BODY_BYTES,
+    )
     expected_assets = {
+        "recovery-bootstrap.py": (len(bootstrap), _sha256(bootstrap)),
         "recovery-capsule-manifest.json": (len(manifest_raw), _sha256(manifest_raw)),
         "recovery-capsule.tar": (len(archive), _sha256(archive)),
     }
@@ -7835,24 +7984,33 @@ def _command_verify_recovery_capsule_release(args: argparse.Namespace) -> int:
         or publication.get("archive_digest") != _sha256(archive)
     ):
         raise ReleaseControlError("recovery capsule Release verification mismatch")
-    pinned_gh = Path(args.pinned_gh)
-    pinned_gh_digest = _verify_pinned_gh(pinned_gh)
     repository_name = cast(str, repository["full_name"])
-    _run_pinned_gh_verification(
-        pinned_gh,
-        ["release", "verify", tag, "--repo", repository_name],
-    )
-    for asset_name in sorted(expected_assets):
+    observation_digest: str | None = None
+    if args.pinned_gh is not None:
+        pinned_gh = Path(args.pinned_gh)
+        pinned_gh_digest = _verify_pinned_gh(pinned_gh)
         _run_pinned_gh_verification(
             pinned_gh,
-            [
-                "release",
-                "verify-asset",
-                tag,
-                asset_name,
-                "--repo",
-                repository_name,
-            ],
+            ["release", "verify", tag, "--repo", repository_name],
+        )
+        for asset_name in sorted(expected_assets):
+            _run_pinned_gh_verification(
+                pinned_gh,
+                [
+                    "release",
+                    "verify-asset",
+                    tag,
+                    asset_name,
+                    "--repo",
+                    repository_name,
+                ],
+            )
+    else:
+        pinned_gh_digest, observation_digest = _verify_pinned_gh_release_observation(
+            Path(args.pinned_gh_verification_observation),
+            repository=repository_name,
+            tag=tag,
+            asset_names=tuple(expected_assets),
         )
     verification: JSONObject = {
         "schema": "kestrel.recovery_capsule_release_verification.v1",
@@ -7871,6 +8029,8 @@ def _command_verify_recovery_capsule_release(args: argparse.Namespace) -> int:
         "verified": True,
         "validation_status": "validated",
     }
+    if observation_digest is not None:
+        verification["pinned_gh_verification_observation_digest"] = observation_digest
     _write_cli_output(output, canonical_json_bytes(verification))
     return 0
 
@@ -8040,7 +8200,9 @@ def _parser() -> argparse.ArgumentParser:
     verify_capsule_release.add_argument("--fresh-repository-observation", required=True)
     verify_capsule_release.add_argument("--fresh-release-observation", required=True)
     verify_capsule_release.add_argument("--fresh-assets-observation", required=True)
-    verify_capsule_release.add_argument("--pinned-gh", required=True)
+    gh_verification = verify_capsule_release.add_mutually_exclusive_group(required=True)
+    gh_verification.add_argument("--pinned-gh")
+    gh_verification.add_argument("--pinned-gh-verification-observation")
     verify_capsule_release.add_argument("--output", required=True)
     verify_capsule_release.set_defaults(handler=_command_verify_recovery_capsule_release)
     return parser

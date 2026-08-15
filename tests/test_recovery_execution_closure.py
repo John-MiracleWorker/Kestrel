@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import sys
+import sysconfig
 import tarfile
 from pathlib import Path
 
@@ -28,6 +29,37 @@ def _sha(raw: bytes) -> str:
 
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def test_recovery_platform_identities_are_independent_and_hash_pinned() -> None:
+    expected_python = {
+        ("linux", "x86_64"): frozenset(
+            {
+                (
+                    "sha256:dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8",
+                    "Python 3.11.14",
+                    "CPython",
+                    "3.11.14",
+                    "cp311",
+                )
+            }
+        )
+    }
+    expected_sandbox = {
+        ("linux", "x86_64"): frozenset(
+            {
+                (
+                    "sha256:52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712",
+                    "bubblewrap 0.9.0",
+                )
+            }
+        )
+    }
+
+    assert bootstrap.TRUSTED_RECOVERY_PYTHON_IDENTITIES == expected_python
+    assert launcher.TRUSTED_RECOVERY_PYTHON_IDENTITIES == expected_python
+    assert bootstrap.TRUSTED_OS_SANDBOX_IDENTITIES == expected_sandbox
+    assert launcher.TRUSTED_OS_SANDBOX_IDENTITIES == expected_sandbox
 
 
 @pytest.mark.parametrize(
@@ -61,6 +93,13 @@ def test_recovery_entrypoint_rejects_nonisolated_start_before_sibling_import(
     assert result.returncode != 0
     assert not sentinel.exists()
     assert "isolat" in result.stderr.lower()
+
+
+def test_capsule_launcher_does_not_import_the_checkout_bootstrap_module() -> None:
+    source = (ROOT / "scripts" / "recovery_launcher.py").read_text(encoding="utf-8")
+
+    assert "from scripts import bootstrap_recovery" not in source
+    assert "recovery_bootstrap.extract_recovery_capsule" not in source
 
 
 def _write(path: Path, raw: bytes, *, executable: bool = False) -> None:
@@ -186,6 +225,28 @@ def test_execution_closure_verifies_exact_members_imports_and_tool(
     )
 
 
+def test_closure_verification_never_executes_self_declared_tools_before_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule, closure, _tool_path = _closure(tmp_path)
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("self-declared tool executed before the sandbox")
+        ),
+    )
+
+    verified = launcher.verify_execution_closure(
+        closure=closure,
+        capsule_root=capsule,
+        active_sys_path=[str(capsule)],
+    )
+
+    assert verified["validation_status"] == "validated"
+
+
 def test_execution_closure_rejects_poison_ambient_sys_path(tmp_path: Path) -> None:
     capsule, closure, tool_path = _closure(tmp_path)
     poison = tmp_path / "poison"
@@ -198,6 +259,82 @@ def test_execution_closure_rejects_poison_ambient_sys_path(tmp_path: Path) -> No
             active_sys_path=[str(poison), str(capsule)],
             executable_versions={str(tool_path): "exact-tool 1.0"},
         )
+
+
+def test_execution_closure_requires_the_complete_active_sys_path(tmp_path: Path) -> None:
+    capsule, closure, tool_path = _closure(tmp_path)
+    standard_library = tmp_path / "stdlib"
+    standard_library.mkdir()
+    value = json.loads(closure)
+    value["sys_path"] = [str(capsule), str(standard_library)]
+    value["io_roots"].append({"path": str(standard_library), "access": "read"})
+    value["io_roots"].sort(key=lambda item: item["path"])
+
+    with pytest.raises(ValueError, match="sys.path|complete|closure"):
+        launcher.verify_execution_closure(
+            closure=_canonical(value),
+            capsule_root=capsule,
+            active_sys_path=[str(capsule)],
+            executable_versions={str(tool_path): "exact-tool 1.0"},
+        )
+
+
+def test_effective_recovery_sys_path_prepends_the_capsule_to_the_probe(
+    tmp_path: Path,
+) -> None:
+    capsule = tmp_path / "capsule"
+    standard_library = tmp_path / "stdlib"
+    capsule.mkdir()
+    standard_library.mkdir()
+
+    assert launcher.effective_recovery_sys_path(
+        capsule_root=capsule,
+        interpreter_sys_path=[str(standard_library)],
+    ) == [str(capsule), str(standard_library)]
+
+    with pytest.raises(ValueError, match="duplicated|sys.path"):
+        launcher.effective_recovery_sys_path(
+            capsule_root=capsule,
+            interpreter_sys_path=[str(capsule)],
+        )
+
+
+def test_isolated_python_probe_includes_hash_locked_environment_dependencies() -> None:
+    observed, _runtime = launcher.inspect_isolated_python(Path(sys.executable))
+
+    assert sysconfig.get_paths()["purelib"] in observed
+
+
+def test_isolated_runpy_bootstrap_can_import_capsule_launcher_dependencies() -> None:
+    observed, _runtime = launcher.inspect_isolated_python(Path(sys.executable))
+    purelib = sysconfig.get_paths()["purelib"]
+    effective = launcher.effective_recovery_sys_path(
+        capsule_root=ROOT,
+        # The development venv adds editable-project paths after purelib. A
+        # production recovery venv is wheel-only, so model its frozen prefix.
+        interpreter_sys_path=observed[: observed.index(purelib) + 1],
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            launcher.ISOLATED_PYTHON_BOOTSTRAP,
+            json.dumps(effective, separators=(",", ":")),
+            str(ROOT / "scripts" / "recovery_launcher.py"),
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"},
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_launcher_does_not_self_certify_declared_sys_path(tmp_path: Path) -> None:
@@ -238,9 +375,14 @@ def test_launcher_refuses_direct_execution_without_a_pinned_os_sandbox(
     monkeypatch.setattr(launcher, "resolve_external_executable", resolve)
     monkeypatch.setattr(
         launcher,
+        "resolve_trusted_recovery_python",
+        lambda **_kwargs: Path(sys.executable),
+    )
+    monkeypatch.setattr(
+        launcher,
         "inspect_isolated_python",
         lambda executable: (
-            [str(capsule)],
+            [],
             value["python_runtime"],
         ),
     )
@@ -298,8 +440,13 @@ def test_launcher_rejects_a_self_declared_os_sandbox(
     monkeypatch.setattr(launcher, "resolve_external_executable", resolve)
     monkeypatch.setattr(
         launcher,
+        "resolve_trusted_recovery_python",
+        lambda **_kwargs: Path(sys.executable),
+    )
+    monkeypatch.setattr(
+        launcher,
         "inspect_isolated_python",
-        lambda executable: ([str(capsule)], value["python_runtime"]),
+        lambda executable: ([], value["python_runtime"]),
     )
     monkeypatch.setattr(launcher, "verify_execution_closure", lambda **kwargs: value)
     monkeypatch.setattr(
@@ -318,6 +465,82 @@ def test_launcher_rejects_a_self_declared_os_sandbox(
                 "exact-tool",
                 str(closure_path),
             ]
+        )
+
+
+def test_launcher_accepts_only_the_exact_independently_pinned_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capsule, closure, _tool_path = _closure(tmp_path)
+    sandbox = tmp_path / "exact-bin" / "bwrap"
+    _write(sandbox, b"trusted bubblewrap fixture\n", executable=True)
+    value = json.loads(closure)
+    identity = (_sha(sandbox.read_bytes()), "bubblewrap fixture 1.0")
+    value["external_executables"].append(
+        {
+            "name": "sandbox",
+            "path": str(sandbox),
+            "sha256": identity[0],
+            "version": identity[1],
+        }
+    )
+    value["external_executables"].sort(key=lambda item: item["name"])
+    closure = _canonical(value)
+    monkeypatch.setattr(
+        launcher,
+        "TRUSTED_OS_SANDBOX_IDENTITIES",
+        {(sys.platform, launcher.platform.machine()): frozenset({identity})},
+    )
+
+    assert launcher.resolve_trusted_os_sandbox(closure=closure) == sandbox
+
+    sandbox.write_bytes(b"changed bubblewrap fixture\n")
+    with pytest.raises(ValueError, match="identity|digest"):
+        launcher.resolve_trusted_os_sandbox(closure=closure)
+
+
+def test_bubblewrap_profile_is_offline_and_mounts_only_declared_roots(
+    tmp_path: Path,
+) -> None:
+    capsule, closure, tool_path = _closure(tmp_path)
+    sandbox = tmp_path / "exact-bin" / "bwrap"
+    _write(sandbox, b"trusted bubblewrap fixture\n", executable=True)
+    value = json.loads(closure)
+    value["external_executables"].append(
+        {
+            "name": "sandbox",
+            "path": str(sandbox),
+            "sha256": _sha(sandbox.read_bytes()),
+            "version": "bubblewrap fixture 1.0",
+        }
+    )
+    value["external_executables"].sort(key=lambda item: item["name"])
+    closure = _canonical(value)
+
+    arguments = launcher.build_os_sandbox_arguments(
+        closure=closure,
+        sandbox=sandbox,
+        command=[str(tool_path), "--version"],
+        declared_endpoints=[],
+    )
+
+    assert arguments[0] == str(sandbox)
+    assert "--unshare-net" in arguments
+    assert "--share-net" not in arguments
+    assert arguments[-3:] == ["--", str(tool_path), "--version"]
+    capsule_root = str(capsule.resolve(strict=True))
+    assert any(
+        arguments[index : index + 3] == ["--bind", capsule_root, capsule_root]
+        for index in range(len(arguments) - 2)
+    )
+    assert str(tmp_path.resolve(strict=True)) not in arguments
+
+    with pytest.raises(ValueError, match="network.*sandbox|sandbox.*network"):
+        launcher.build_os_sandbox_arguments(
+            closure=closure,
+            sandbox=sandbox,
+            command=[str(tool_path), "--version"],
+            declared_endpoints=["https://api.github.com"],
         )
 
 
@@ -449,6 +672,47 @@ def test_execution_closure_rejects_unlisted_or_nonliteral_dynamic_import(
         )
 
 
+def test_launcher_materializes_candidate_only_from_the_bound_capsule_archive(
+    tmp_path: Path,
+) -> None:
+    capsule, closure, _tool_path = _closure(tmp_path)
+    candidate_archive = capsule / "candidate-archive.tar"
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        payload = b'{"schema":"kestrel.release_candidate.v1"}'
+        member = tarfile.TarInfo("candidate-manifest.json")
+        member.mode = 0o644
+        member.uid = 0
+        member.gid = 0
+        member.mtime = 0
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+    _write(candidate_archive, stream.getvalue())
+    value = json.loads(closure)
+    value["data_resources"].append(
+        {"path": "candidate-archive.tar", "sha256": _sha(candidate_archive.read_bytes())}
+    )
+    value["data_resources"].sort(key=lambda item: item["path"])
+    value["io_roots"].append({"path": str(tmp_path), "access": "read_write"})
+    value["io_roots"].sort(key=lambda item: item["path"])
+    destination = tmp_path / "candidate"
+
+    launcher.materialize_candidate_from_capsule(
+        closure=_canonical(value),
+        capsule_root=capsule,
+        destination=destination,
+    )
+
+    assert destination.joinpath("candidate-manifest.json").read_bytes() == payload
+    candidate_archive.write_bytes(candidate_archive.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="capsule|archive|digest|member"):
+        launcher.materialize_candidate_from_capsule(
+            closure=_canonical(value),
+            capsule_root=capsule,
+            destination=tmp_path / "second-candidate",
+        )
+
+
 def _tar_with_member(name: str, *, kind: bytes = tarfile.REGTYPE) -> bytes:
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w", format=tarfile.USTAR_FORMAT) as archive:
@@ -501,7 +765,12 @@ def test_bootstrap_recovery_extracts_only_deterministic_regular_members(
     assert not (tmp_path / "escape").exists()
 
 
-def _bootstrap_archive(tmp_path: Path, *, extra_wheel: bool = False) -> tuple[Path, Path]:
+def _bootstrap_archive(
+    tmp_path: Path,
+    *,
+    extra_wheel: bool = False,
+    include_sandbox: bool = True,
+) -> tuple[Path, Path]:
     source = tmp_path / "capsule-source"
     destination = tmp_path / "capsule"
     app = b"VALUE = 1\n"
@@ -517,33 +786,56 @@ def _bootstrap_archive(tmp_path: Path, *, extra_wheel: bool = False) -> tuple[Pa
         "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"
     )
     base_python = Path(sys.executable)
+    sandbox = source / "recovery" / "bin" / "bwrap"
+    sandbox_raw = b"trusted bubblewrap fixture\n"
+    if include_sandbox:
+        _write(sandbox, sandbox_raw)
+    data_resources = [
+        {
+            "path": "recovery/requirements.txt",
+            "sha256": _sha(requirements),
+        },
+        {
+            "path": "recovery/wheelhouse-manifest.json",
+            "sha256": _sha(wheelhouse_manifest),
+        },
+    ]
+    external_executables = [
+        {
+            "name": "python",
+            "path": str(venv_python),
+            "sha256": _sha(base_python.read_bytes()),
+            "version": (
+                f"Python {sys.version_info.major}."
+                f"{sys.version_info.minor}.{sys.version_info.micro}"
+            ),
+        }
+    ]
+    if include_sandbox:
+        data_resources.append(
+            {
+                "path": "recovery/bin/bwrap",
+                "sha256": _sha(sandbox_raw),
+            }
+        )
+        data_resources.sort(key=lambda item: item["path"])
+        external_executables.append(
+            {
+                "name": "sandbox",
+                "path": str(destination / "recovery" / "bin" / "bwrap"),
+                "sha256": _sha(sandbox_raw),
+                "version": "bubblewrap fixture 1.0",
+            }
+        )
+        external_executables.sort(key=lambda item: item["name"])
     closure = {
         "schema": "kestrel.recovery_execution_closure.v1",
         "python_members": [{"path": "app.py", "sha256": _sha(app)}],
         "static_imports": [],
         "dynamic_imports": [],
         "shell_helpers": [],
-        "data_resources": [
-            {
-                "path": "recovery/requirements.txt",
-                "sha256": _sha(requirements),
-            },
-            {
-                "path": "recovery/wheelhouse-manifest.json",
-                "sha256": _sha(wheelhouse_manifest),
-            },
-        ],
-        "external_executables": [
-            {
-                "name": "python",
-                "path": str(venv_python),
-                "sha256": _sha(base_python.read_bytes()),
-                "version": (
-                    f"Python {sys.version_info.major}."
-                    f"{sys.version_info.minor}.{sys.version_info.micro}"
-                ),
-            }
-        ],
+        "data_resources": data_resources,
+        "external_executables": external_executables,
         "python_runtime": {
             "implementation": "CPython",
             "version": (
@@ -608,11 +900,48 @@ def _bootstrap_trust(archive: Path) -> dict[str, str]:
     }
 
 
+def _trust_current_bootstrap_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime_version = (
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "TRUSTED_RECOVERY_PYTHON_IDENTITIES",
+        {
+            (sys.platform, bootstrap.platform.machine()): frozenset(
+                {
+                    (
+                        _sha(Path(sys.executable).resolve(strict=True).read_bytes()),
+                        f"Python {runtime_version}",
+                        "CPython",
+                        runtime_version,
+                        f"cp{sys.version_info.major}{sys.version_info.minor}",
+                    )
+                }
+            )
+        },
+    )
+
+
+def _trust_fixture_bootstrap_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        bootstrap,
+        "TRUSTED_OS_SANDBOX_IDENTITIES",
+        {
+            (sys.platform, bootstrap.platform.machine()): frozenset(
+                {(_sha(b"trusted bubblewrap fixture\n"), "bubblewrap fixture 1.0")}
+            )
+        },
+    )
+
+
 def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     archive, destination = _bootstrap_archive(tmp_path)
+    _trust_current_bootstrap_python(monkeypatch)
+    _trust_fixture_bootstrap_sandbox(monkeypatch)
     monkeypatch.setattr(
         bootstrap,
         "_verify_with_bootstrapped_environment",
@@ -633,11 +962,71 @@ def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     assert verification["validation_status"] == "validated"
 
 
+def test_bootstrap_recovery_rejects_a_self_declared_python_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive, destination = _bootstrap_archive(tmp_path)
+    monkeypatch.setattr(bootstrap, "TRUSTED_RECOVERY_PYTHON_IDENTITIES", {})
+
+    with pytest.raises(ValueError, match="trusted.*Python|Python.*trusted"):
+        bootstrap.bootstrap_recovery_environment(
+            archive=archive,
+            destination=destination,
+            **_bootstrap_trust(archive),
+        )
+
+    assert not (destination / "venv").exists()
+
+
+def test_bootstrap_recovery_prepares_only_an_independently_trusted_capsule_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive, destination = _bootstrap_archive(tmp_path, include_sandbox=True)
+    _trust_current_bootstrap_python(monkeypatch)
+    _trust_fixture_bootstrap_sandbox(monkeypatch)
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_with_bootstrapped_environment",
+        lambda **kwargs: {"validation_status": "validated"},
+    )
+
+    bootstrap.bootstrap_recovery_environment(
+        archive=archive,
+        destination=destination,
+        **_bootstrap_trust(archive),
+    )
+
+    sandbox = destination / "recovery" / "bin" / "bwrap"
+    assert sandbox.read_bytes() == b"trusted bubblewrap fixture\n"
+    assert stat.S_IMODE(sandbox.stat().st_mode) == 0o500
+
+
+def test_bootstrap_recovery_rejects_a_self_declared_capsule_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive, destination = _bootstrap_archive(tmp_path, include_sandbox=True)
+    _trust_current_bootstrap_python(monkeypatch)
+    monkeypatch.setattr(bootstrap, "TRUSTED_OS_SANDBOX_IDENTITIES", {})
+
+    with pytest.raises(ValueError, match="trusted.*sandbox|sandbox.*trusted"):
+        bootstrap.bootstrap_recovery_environment(
+            archive=archive,
+            destination=destination,
+            **_bootstrap_trust(archive),
+        )
+
+    assert not (destination / "venv").exists()
+
+
 def test_bootstrap_recovery_rejects_unlisted_wheel_before_environment_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     archive, destination = _bootstrap_archive(tmp_path, extra_wheel=True)
+    _trust_current_bootstrap_python(monkeypatch)
     monkeypatch.setattr(
         bootstrap,
         "_verify_with_bootstrapped_environment",

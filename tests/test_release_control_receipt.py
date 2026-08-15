@@ -3919,6 +3919,19 @@ def test_owner_signed_authority_vectors_verify_policy_and_freshness(
     assert verification["validation_status"] == "validated"
 
 
+def test_github_authority_rejects_unversioned_authorize_boundary() -> None:
+    receipt, _signature = _positive_contract_vector("github-authority")
+    authority = json.loads(receipt)
+    authority["phase"] = "authorize"
+    authority["maintenance_window_acknowledgement"]["statement"] = (
+        "I hold exclusive owner control of GitHub and GHCR authority through the "
+        "bounded release transaction authority window."
+    )
+
+    with pytest.raises(ValueError, match="schema validation"):
+        subject.validate_github_authority(authority)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -4811,10 +4824,12 @@ def _complete_recovery_capsule_assets(
         ".github/workflows/release.yml": b"name: Release\n",
         ".github/workflows/release-transaction.yml": b"name: Release transaction\n",
     }
+    sandbox = b"fixture bubblewrap binary\n"
     closure_assets: dict[str, bytes] = {
         **workflows,
         ".gitleaksignore": b"fixture\n",
         "evidence/normalized-source.json": b"{}",
+        "recovery/bin/bwrap": sandbox,
         "recovery/requirements.txt": b"# no third-party recovery dependencies\n",
         "recovery/wheelhouse-manifest.json": _canonical(
             {
@@ -4860,7 +4875,13 @@ def _complete_recovery_capsule_assets(
                     "path": "/capsule/venv/bin/python",
                     "sha256": "sha256:" + "3" * 64,
                     "version": "Python 3.11.14",
-                }
+                },
+                {
+                    "name": "sandbox",
+                    "path": "/capsule/recovery/bin/bwrap",
+                    "sha256": _sha256(sandbox),
+                    "version": "bubblewrap fixture 1.0",
+                },
             ],
             "python_runtime": {
                 "implementation": "CPython",
@@ -4948,6 +4969,19 @@ def _complete_recovery_capsule_assets(
         "recovery/wheelhouse/fixture-1.0-py3-none-any.whl": wheel,
     }
     return assets, closure
+
+
+def test_recovery_capsule_requires_a_bound_sandbox_asset(tmp_path: Path) -> None:
+    transaction_raw = (FIXTURE_ROOT / "server-authorization" / "initiate.json").read_bytes()
+    assets, closure = _complete_recovery_capsule_assets(transaction_raw, tmp_path)
+    value = json.loads(closure)
+    value["external_executables"] = [
+        item for item in value["external_executables"] if item["name"] != "sandbox"
+    ]
+    assets["recovery-execution-closure.json"] = _canonical(value)
+
+    with pytest.raises(ValueError, match="sandbox"):
+        subject._validate_capsule_execution_asset_closure(assets)  # noqa: SLF001
 
 
 def _write_valid_recovery_capsule_root(tmp_path: Path) -> tuple[Path, dict[str, object]]:
@@ -5061,8 +5095,11 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
             ],
         }
     )
+    sandbox = b"fixture bubblewrap binary\n"
     source = tmp_path / "source"
     (source / "recovery" / "wheelhouse").mkdir(parents=True)
+    (source / "recovery" / "bin").mkdir()
+    (source / "recovery" / "bin" / "bwrap").write_bytes(sandbox)
     (source / "recovery" / "requirements.txt").write_bytes(requirements)
     (source / "recovery" / "wheelhouse-manifest.json").write_bytes(manifest)
     (source / "recovery" / "wheelhouse" / "fixture-1.0-py3-none-any.whl").write_bytes(wheel)
@@ -5081,6 +5118,7 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
     )
 
     assert assets == {
+        "recovery/bin/bwrap": sandbox,
         "recovery/requirements.txt": requirements,
         "recovery/wheelhouse-manifest.json": manifest,
         "recovery/wheelhouse/fixture-1.0-py3-none-any.whl": wheel,
@@ -5196,6 +5234,7 @@ def _recovery_capsule_release_verification_inputs(
     root, manifest = _write_valid_recovery_capsule_root(tmp_path)
     manifest_raw = (root / "recovery-capsule-manifest.json").read_bytes()
     archive = subject.deterministic_recovery_capsule_archive(root)
+    bootstrap = (root / "scripts" / "bootstrap_recovery.py").read_bytes()
     release = manifest["release"]
     assert isinstance(release, dict)
     tag = str(release["tag"])
@@ -5230,6 +5269,12 @@ def _recovery_capsule_release_verification_inputs(
             "immutable": True,
         },
         "assets": [
+            {
+                "id": 1800,
+                "name": "recovery-bootstrap.py",
+                "size": len(bootstrap),
+                "digest": _sha256(bootstrap),
+            },
             {
                 "id": 1801,
                 "name": "recovery-capsule-manifest.json",
@@ -5306,6 +5351,15 @@ def test_verify_recovery_capsule_release_accepts_external_json_and_runs_pinned_g
             "release",
             "verify-asset",
             tag,
+            "recovery-bootstrap.py",
+            "--repo",
+            repository,
+        ],
+        [
+            str(paths["pinned_gh"]),
+            "release",
+            "verify-asset",
+            tag,
             "recovery-capsule-manifest.json",
             "--repo",
             repository,
@@ -5321,6 +5375,232 @@ def test_verify_recovery_capsule_release_accepts_external_json_and_runs_pinned_g
         ],
     ]
     assert json.loads(paths["output"].read_bytes())["verified"] is True
+
+
+def test_verify_recovery_capsule_release_accepts_exact_offline_gh_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, paths, tag = _recovery_capsule_release_verification_inputs(tmp_path)
+    platform_digest = "sha256:" + "d" * 64
+    monkeypatch.setitem(
+        subject.PINNED_GH_BINARY_DIGESTS,
+        (subject.sys.platform, subject.platform.machine()),
+        platform_digest,
+    )
+    result_specs = [
+        ("release:verify", "release-attestation.json"),
+        (
+            "release:verify-asset:recovery-bootstrap.py",
+            "recovery-bootstrap.py.attestation.json",
+        ),
+        (
+            "release:verify-asset:recovery-capsule-manifest.json",
+            "recovery-capsule-manifest.json.attestation.json",
+        ),
+        (
+            "release:verify-asset:recovery-capsule.tar",
+            "recovery-capsule.tar.attestation.json",
+        ),
+    ]
+    results = []
+    for operation, name in result_specs:
+        raw = _canonical({"operation": operation, "verified": True})
+        (tmp_path / name).write_bytes(raw)
+        results.append(
+            {
+                "operation": operation,
+                "path": name,
+                "sha256": _sha256(raw),
+                "size_bytes": len(raw),
+            }
+        )
+    observation = _canonical(
+        {
+            "schema": "kestrel.pinned_gh_release_verification.v1",
+            "pinned_gh_digest": platform_digest,
+            "pinned_gh_version": subject.PINNED_GH_VERSION_LINE.decode("ascii"),
+            "repository": "John-MiracleWorker/Kestrel-Release-Recovery",
+            "tag": tag,
+            "results": results,
+            "verified": True,
+            "validation_status": "validated",
+        }
+    )
+    observation_path = tmp_path / "pinned-gh-verification.json"
+    observation_path.write_bytes(observation)
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("offline capsule verification attempted a subprocess")
+        ),
+    )
+
+    assert (
+        subject.main(
+            [
+                "verify-recovery-capsule-release",
+                str(root),
+                "--publication-receipt",
+                str(paths["publication"]),
+                "--fresh-repository-observation",
+                str(paths["repository"]),
+                "--fresh-release-observation",
+                str(paths["release"]),
+                "--fresh-assets-observation",
+                str(paths["assets"]),
+                "--pinned-gh-verification-observation",
+                str(observation_path),
+                "--output",
+                str(paths["output"]),
+            ]
+        )
+        == 0
+    )
+
+    result = json.loads(paths["output"].read_bytes())
+    assert result["pinned_gh_digest"] == platform_digest
+    assert result["pinned_gh_verification_observation_digest"] == _sha256(observation)
+
+
+def test_verify_recovery_capsule_release_rejects_incomplete_offline_gh_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, paths, tag = _recovery_capsule_release_verification_inputs(tmp_path)
+    platform_digest = "sha256:" + "d" * 64
+    monkeypatch.setitem(
+        subject.PINNED_GH_BINARY_DIGESTS,
+        (subject.sys.platform, subject.platform.machine()),
+        platform_digest,
+    )
+    observation_path = tmp_path / "pinned-gh-verification.json"
+    release_result = _canonical({"operation": "release:verify", "verified": True})
+    (tmp_path / "release-attestation.json").write_bytes(release_result)
+    observation_path.write_bytes(
+        _canonical(
+            {
+                "schema": "kestrel.pinned_gh_release_verification.v1",
+                "pinned_gh_digest": platform_digest,
+                "pinned_gh_version": subject.PINNED_GH_VERSION_LINE.decode("ascii"),
+                "repository": "John-MiracleWorker/Kestrel-Release-Recovery",
+                "tag": tag,
+                "results": [
+                    {
+                        "operation": "release:verify",
+                        "path": "release-attestation.json",
+                        "sha256": _sha256(release_result),
+                        "size_bytes": len(release_result),
+                    }
+                ],
+                "verified": True,
+                "validation_status": "validated",
+            }
+        )
+    )
+
+    assert (
+        subject.main(
+            [
+                "verify-recovery-capsule-release",
+                str(root),
+                "--publication-receipt",
+                str(paths["publication"]),
+                "--fresh-repository-observation",
+                str(paths["repository"]),
+                "--fresh-release-observation",
+                str(paths["release"]),
+                "--fresh-assets-observation",
+                str(paths["assets"]),
+                "--pinned-gh-verification-observation",
+                str(observation_path),
+                "--output",
+                str(paths["output"]),
+            ]
+        )
+        == 1
+    )
+    assert not paths["output"].exists()
+
+
+def test_verify_recovery_capsule_release_rejects_tampered_offline_gh_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, paths, tag = _recovery_capsule_release_verification_inputs(tmp_path)
+    platform_digest = "sha256:" + "d" * 64
+    monkeypatch.setitem(
+        subject.PINNED_GH_BINARY_DIGESTS,
+        (subject.sys.platform, subject.platform.machine()),
+        platform_digest,
+    )
+    specs = [
+        ("release:verify", "release-attestation.json"),
+        (
+            "release:verify-asset:recovery-bootstrap.py",
+            "recovery-bootstrap.py.attestation.json",
+        ),
+        (
+            "release:verify-asset:recovery-capsule-manifest.json",
+            "recovery-capsule-manifest.json.attestation.json",
+        ),
+        (
+            "release:verify-asset:recovery-capsule.tar",
+            "recovery-capsule.tar.attestation.json",
+        ),
+    ]
+    results = []
+    for operation, name in specs:
+        raw = _canonical({"operation": operation, "verified": True})
+        (tmp_path / name).write_bytes(raw)
+        results.append(
+            {
+                "operation": operation,
+                "path": name,
+                "sha256": _sha256(raw),
+                "size_bytes": len(raw),
+            }
+        )
+    observation_path = tmp_path / "pinned-gh-verification.json"
+    observation_path.write_bytes(
+        _canonical(
+            {
+                "schema": "kestrel.pinned_gh_release_verification.v1",
+                "pinned_gh_digest": platform_digest,
+                "pinned_gh_version": subject.PINNED_GH_VERSION_LINE.decode("ascii"),
+                "repository": "John-MiracleWorker/Kestrel-Release-Recovery",
+                "tag": tag,
+                "results": results,
+                "verified": True,
+                "validation_status": "validated",
+            }
+        )
+    )
+    (tmp_path / "recovery-capsule.tar.attestation.json").write_bytes(b"{}")
+
+    assert (
+        subject.main(
+            [
+                "verify-recovery-capsule-release",
+                str(root),
+                "--publication-receipt",
+                str(paths["publication"]),
+                "--fresh-repository-observation",
+                str(paths["repository"]),
+                "--fresh-release-observation",
+                str(paths["release"]),
+                "--fresh-assets-observation",
+                str(paths["assets"]),
+                "--pinned-gh-verification-observation",
+                str(observation_path),
+                "--output",
+                str(paths["output"]),
+            ]
+        )
+        == 1
+    )
+    assert not paths["output"].exists()
 
 
 def test_verify_recovery_capsule_release_rejects_duplicate_remote_asset(

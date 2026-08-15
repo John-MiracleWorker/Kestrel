@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import io
 import json
 import ssl
@@ -250,6 +251,41 @@ def _dispatch_preparation_observations(
     }
 
 
+def test_recovery_dispatch_allows_advanced_main_and_preserves_tagged_workflow() -> None:
+    observations = _dispatch_preparation_observations(default_branch_sha="2" * 40)
+    tagged_workflow = observations["contents"]
+    advanced_workflow = b"name: advanced release transaction\n"
+
+    journal, _intent, _request = subject.prepare_dispatch_from_observations(
+        repository_observation=observations["repository"],
+        workflow_observation=observations["workflow"],
+        default_branch_workflow_contents=advanced_workflow,
+        candidate_workflow_contents=tagged_workflow,
+        candidate_manifest=observations["manifest"],
+        mode="recover_committed",
+        dispatcher_observation=observations["dispatcher"],
+        prior_intents_observation=observations["prior"],
+        _nonce_source=lambda count: NONCE,
+        _clock=lambda: datetime(2026, 8, 13, 20, 0, 0, tzinfo=UTC),
+        _monotonic=lambda: 100.0,
+    )
+
+    assert journal["target"]["full_ref"] == "refs/tags/v0.6.0"  # type: ignore[index]
+    assert journal["target"]["head_sha"] == SOURCE_SHA  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="ingress workflow bytes"):
+        subject.prepare_dispatch_from_observations(
+            repository_observation=observations["repository"],
+            workflow_observation=observations["workflow"],
+            default_branch_workflow_contents=advanced_workflow,
+            candidate_workflow_contents=tagged_workflow,
+            candidate_manifest=observations["manifest"],
+            mode="initiate",
+            dispatcher_observation=observations["dispatcher"],
+            prior_intents_observation=observations["prior"],
+        )
+
+
 def _source_envelope(name: str, body: bytes) -> bytes:
     return _canonical(
         {
@@ -392,6 +428,12 @@ def _signed_recovery_capsule_verification(
         },
         "release": {"id": 4101, "tag": "recovery-707-1", "immutable": True},
         "assets": [
+            {
+                "id": 5100,
+                "name": "recovery-bootstrap.py",
+                "size_bytes": 512,
+                "sha256": "sha256:" + "0" * 64,
+            },
             {
                 "id": 5101,
                 "name": "recovery-capsule-manifest.json",
@@ -2561,11 +2603,12 @@ def _signed_terminal_vector(name: str) -> tuple[bytes, bytes]:
 
 def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[str, bytes], bytes]:
     wheel = b"fixture wheel bytes"
+    sandbox = b"fixture bubblewrap binary\n"
     closure_assets: dict[str, bytes] = {
         ".github/workflows/release.yml": b"name: Release\n",
-        ".github/workflows/release-transaction.yml": b"name: Release transaction\n",
         ".gitleaksignore": b"fixture\n",
         "evidence/normalized-source.json": b"{}",
+        "recovery/bin/bwrap": sandbox,
         "recovery/requirements.txt": b"# no third-party recovery dependencies\n",
         "recovery/wheelhouse-manifest.json": _canonical(
             {
@@ -2609,7 +2652,13 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
                     "path": "/capsule/venv/bin/python",
                     "sha256": "sha256:" + "3" * 64,
                     "version": "Python 3.11.14",
-                }
+                },
+                {
+                    "name": "sandbox",
+                    "path": "/capsule/recovery/bin/bwrap",
+                    "sha256": _sha256(sandbox),
+                    "version": "bubblewrap fixture 1.0",
+                },
             ],
             "python_runtime": {
                 "implementation": "CPython",
@@ -2752,6 +2801,7 @@ def _recovery_capsule_verification_inputs(
     manifest_raw = _canonical(manifest)
     (root / "recovery-capsule-manifest.json").write_bytes(manifest_raw)
     archive = receipts.deterministic_recovery_capsule_archive(root)
+    bootstrap = (root / "scripts" / "bootstrap_recovery.py").read_bytes()
     repository = _canonical(
         {
             "id": 304,
@@ -2775,6 +2825,12 @@ def _recovery_capsule_verification_inputs(
     )
     public_assets = _canonical(
         [
+            {
+                "id": 5100,
+                "name": "recovery-bootstrap.py",
+                "size": len(bootstrap),
+                "digest": _sha256(bootstrap),
+            },
             {
                 "id": 5101,
                 "name": "recovery-capsule-manifest.json",
@@ -4579,6 +4635,76 @@ def test_authority_consumer_rejects_digest_only_verification_claim() -> None:
         )
 
 
+def test_operational_boundary_joins_live_state_to_zero_app_signed_authority() -> None:
+    raw, _signature = _contract_vector("github-authority")
+    authority = json.loads(raw)
+    workflow_bytes = b"name: exact release ingress\n"
+    workflow_digest = _sha256(workflow_bytes)
+    authority["workflow_ingress"]["default_branch_blob_sha256"] = workflow_digest
+    authority["workflow_ingress"]["candidate_blob_sha256"] = workflow_digest
+    snapshot = authority["source_snapshots"][0]
+    installed_snapshot = {**snapshot, "name": "installed-apps-owner"}
+    authority["source_snapshots"] = sorted(
+        [snapshot, installed_snapshot], key=lambda item: item["name"]
+    )
+    fingerprint = "sha256:" + "f" * 64
+
+    subject._require_operational_github_authority_join(  # noqa: SLF001
+        github_authority=authority,
+        github_verification={"signing_key_fingerprint": fingerprint},
+        live_owner_signing_fingerprint=fingerprint,
+        live_owner_keys_observation=_canonical(
+            {"captured_at": "2026-08-13T20:01:00Z"}
+        ),
+        tag_ruleset=authority["tag_ruleset"],
+        ingress_ruleset=authority["ingress_ruleset"],
+        workflow={
+            "id": 404,
+            "path": ".github/workflows/release.yml",
+            "state": "active",
+        },
+        default_workflow=workflow_bytes,
+        candidate_workflow=workflow_bytes,
+        main_sha=SOURCE_SHA,
+        immutable_releases=True,
+        transaction_mode="initiate",
+        _clock=lambda: datetime(2026, 8, 13, 20, 1, tzinfo=UTC),
+    )
+
+
+def test_operational_boundary_rejects_controller_key_rotation() -> None:
+    raw, _signature = _contract_vector("github-authority")
+    authority = json.loads(raw)
+    snapshot = authority["source_snapshots"][0]
+    authority["source_snapshots"] = sorted(
+        [snapshot, {**snapshot, "name": "installed-apps-owner"}],
+        key=lambda item: item["name"],
+    )
+
+    with pytest.raises(ValueError, match="signing key"):
+        subject._require_operational_github_authority_join(  # noqa: SLF001
+            github_authority=authority,
+            github_verification={"signing_key_fingerprint": "sha256:" + "f" * 64},
+            live_owner_signing_fingerprint="sha256:" + "e" * 64,
+            live_owner_keys_observation=_canonical(
+                {"captured_at": "2026-08-13T20:01:00Z"}
+            ),
+            tag_ruleset=authority["tag_ruleset"],
+            ingress_ruleset=authority["ingress_ruleset"],
+            workflow={
+                "id": 404,
+                "path": ".github/workflows/release.yml",
+                "state": "active",
+            },
+            default_workflow=b"irrelevant",
+            candidate_workflow=b"irrelevant",
+            main_sha=SOURCE_SHA,
+            immutable_releases=True,
+            transaction_mode="initiate",
+            _clock=lambda: datetime(2026, 8, 13, 20, 1, tzinfo=UTC),
+        )
+
+
 @pytest.mark.parametrize("stage", [1, 2])
 def test_build_release_stage_plan_has_only_fixed_operations(stage: int) -> None:
     vector_name = "release-preparation-outcome" if stage == 1 else "release-commit-outcome"
@@ -4663,8 +4789,17 @@ def test_product_release_state_is_derived_from_complete_api_listing() -> None:
         "draft": True,
         "prerelease": False,
         "generate_release_notes": False,
+        "make_latest": "false",
+    }
+    serialized_create = receipts.canonical_external_json_bytes(contract["create_request"])
+    assert json.loads(serialized_create)["make_latest"] == "false"
+    legacy_boolean_create = {
+        **contract["create_request"],  # type: ignore[dict-item]
         "make_latest": False,
     }
+    assert receipts._sha256(serialized_create) != receipts._sha256(  # noqa: SLF001
+        receipts.canonical_external_json_bytes(legacy_boolean_create)
+    )
     assert subject._classify_product_release_listing(  # noqa: SLF001
         [[]], contract=contract
     ) == {
@@ -4686,6 +4821,7 @@ def test_product_release_state_is_derived_from_complete_api_listing() -> None:
                 "name": asset["name"],
                 "size": asset["size_bytes"],
                 "digest": asset["sha256"],
+                "content_type": asset["media_type"],
             }
         ],
     }
@@ -4698,9 +4834,163 @@ def test_product_release_state_is_derived_from_complete_api_listing() -> None:
     }
 
 
+def test_product_release_publish_patch_serializes_string_enum_into_request_digest() -> None:
+    patch = subject._product_release_publish_patch()  # noqa: SLF001
+    raw = receipts.canonical_external_json_bytes(patch)
+
+    assert raw == b'{"draft":false,"make_latest":"false"}'
+    assert receipts._sha256(raw) != receipts._sha256(  # noqa: SLF001
+        receipts.canonical_external_json_bytes(
+            {"draft": False, "make_latest": False}
+        )
+    )
+
+
+def test_missing_only_release_asset_request_excludes_preexisting_exact_asset() -> None:
+    manifest = _candidate_manifest()
+    contract = subject._candidate_product_release_contract(  # noqa: SLF001
+        manifest,
+        transaction_authorization_digest="sha256:" + "1" * 64,
+        recovery_capsule_digest="sha256:" + "2" * 64,
+    )
+    first = contract["assets"][0]  # type: ignore[index]
+    second = {
+        "name": "second.txt",
+        "path": "release/second.txt",
+        "media_type": "text/plain",
+        "sha256": "sha256:" + "e" * 64,
+        "size_bytes": 2,
+    }
+    contract["assets"].append(second)  # type: ignore[union-attr]
+    release = {
+        "id": 91,
+        **contract["persisted"],  # type: ignore[dict-item]
+        "draft": True,
+        "immutable": False,
+        "assets": [
+            {
+                "id": 92,
+                "name": first["name"],
+                "size": first["size_bytes"],
+                "digest": first["sha256"],
+                "content_type": first["media_type"],
+            }
+        ],
+    }
+
+    assert subject._missing_product_release_assets(  # noqa: SLF001
+        [[release]], contract=contract
+    ) == [second]
+
+
+def test_missing_draft_upload_request_binds_created_id_to_exact_create_request() -> None:
+    manifest = _candidate_manifest()
+    transaction_digest = "sha256:" + "1" * 64
+    capsule_digest = "sha256:" + "2" * 64
+    candidate = {"tag": manifest["tag"]}
+    contract = subject._candidate_product_release_contract(  # noqa: SLF001
+        manifest,
+        transaction_authorization_digest=transaction_digest,
+        recovery_capsule_digest=capsule_digest,
+    )
+    create_request = contract["create_request"]
+    create_digest = subject.release_stage_operation_request_digest(
+        candidate=candidate,
+        operation="create_github_release_draft",
+        request=create_request,  # type: ignore[arg-type]
+        transaction_authorization_digest=transaction_digest,
+        recovery_capsule_digest=capsule_digest,
+    )
+    missing_state = {"release": "missing", "assets": "missing", "release_id": None}
+    request = subject._product_release_asset_upload_request(  # noqa: SLF001
+        contract=contract,
+        release_state=missing_state,
+        missing_assets=contract["assets"],  # type: ignore[arg-type]
+        create_operation_request_digest=create_digest,
+    )
+
+    assert request["release_locator"] == {
+        "strategy": "created_response_and_exact_relist",
+        "tag_name": "v0.6.0",
+        "release_id": None,
+        "create_operation_request_digest": create_digest,
+    }
+    resolved_state = {
+        "release": "draft_exact",
+        "assets": "missing",
+        "release_id": 91,
+    }
+    assert (
+        subject._resolve_product_release_asset_upload_target(  # noqa: SLF001
+            request,
+            release_state=resolved_state,
+            created_release_id=91,
+            create_operation_request_digest=create_digest,
+        )
+        == 91
+    )
+
+    with pytest.raises(ValueError, match="not authorized"):
+        subject._resolve_product_release_asset_upload_target(  # noqa: SLF001
+            request,
+            release_state=resolved_state,
+            created_release_id=92,
+            create_operation_request_digest=create_digest,
+        )
+
+
+def test_existing_draft_upload_request_cannot_switch_release_ids() -> None:
+    manifest = _candidate_manifest()
+    contract = subject._candidate_product_release_contract(  # noqa: SLF001
+        manifest,
+        transaction_authorization_digest="sha256:" + "1" * 64,
+        recovery_capsule_digest="sha256:" + "2" * 64,
+    )
+    state = {"release": "draft_exact", "assets": "missing", "release_id": 91}
+    request = subject._product_release_asset_upload_request(  # noqa: SLF001
+        contract=contract,
+        release_state=state,
+        missing_assets=contract["assets"],  # type: ignore[arg-type]
+        create_operation_request_digest="sha256:" + "3" * 64,
+    )
+
+    assert request["release_locator"] == {
+        "strategy": "preobserved_exact_release_id",
+        "tag_name": "v0.6.0",
+        "release_id": 91,
+        "create_operation_request_digest": None,
+    }
+    assert (
+        subject._resolve_product_release_asset_upload_target(  # noqa: SLF001
+            request,
+            release_state=state,
+            created_release_id=None,
+            create_operation_request_digest="sha256:" + "3" * 64,
+        )
+        == 91
+    )
+
+    changed = {**state, "release_id": 92}
+    with pytest.raises(ValueError, match="changed before mutation"):
+        subject._resolve_product_release_asset_upload_target(  # noqa: SLF001
+            request,
+            release_state=changed,
+            created_release_id=None,
+            create_operation_request_digest="sha256:" + "3" * 64,
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
-    ("duplicate", "mutable", "asset-digest", "extra-asset", "flat-pagination"),
+    (
+        "duplicate",
+        "mutable",
+        "immutable-partial-assets",
+        "asset-digest",
+        "asset-media-type",
+        "extra-asset",
+        "flat-pagination",
+    ),
 )
 def test_product_release_state_rejects_ambiguous_or_divergent_remote_state(
     mutation: str,
@@ -4723,6 +5013,7 @@ def test_product_release_state_rejects_ambiguous_or_divergent_remote_state(
                 "name": asset["name"],
                 "size": asset["size_bytes"],
                 "digest": asset["sha256"],
+                "content_type": asset["media_type"],
             }
         ],
     }
@@ -4731,8 +5022,14 @@ def test_product_release_state_rejects_ambiguous_or_divergent_remote_state(
         listing = [[release], [{**release, "id": 93}]]
     elif mutation == "mutable":
         release["draft"] = False
+    elif mutation == "immutable-partial-assets":
+        release["draft"] = False
+        release["immutable"] = True
+        release["assets"] = []
     elif mutation == "asset-digest":
         release["assets"][0]["digest"] = "sha256:" + "f" * 64  # type: ignore[index]
+    elif mutation == "asset-media-type":
+        release["assets"][0]["content_type"] = "application/octet-stream"  # type: ignore[index]
     elif mutation == "extra-asset":
         release["assets"].append(  # type: ignore[union-attr]
             {
@@ -4740,6 +5037,7 @@ def test_product_release_state_rejects_ambiguous_or_divergent_remote_state(
                 "name": "unexpected.txt",
                 "size": 1,
                 "digest": "sha256:" + "f" * 64,
+                "content_type": "text/plain",
             }
         )
     else:
@@ -4751,11 +5049,220 @@ def test_product_release_state_rejects_ambiguous_or_divergent_remote_state(
         )
 
 
+def test_ghcr_package_versions_bind_complete_tag_inventory_to_digests() -> None:
+    first = "sha256:" + "a" * 64
+    second = "sha256:" + "b" * 64
+    pages = [
+        [
+            {
+                "id": 11,
+                "name": first,
+                "metadata": {
+                    "package_type": "container",
+                    "container": {"tags": ["v0.5.9", "stable"]},
+                },
+            }
+        ],
+        [
+            {
+                "id": 12,
+                "name": second,
+                "metadata": {
+                    "package_type": "container",
+                    "container": {"tags": []},
+                },
+            }
+        ],
+    ]
+
+    assert subject._ghcr_tags_by_digest_from_package_versions(pages) == {  # noqa: SLF001
+        first: ["stable", "v0.5.9"],
+        second: [],
+    }
+
+
+def test_ghcr_package_presence_comes_from_the_complete_user_inventory() -> None:
+    absent = [[]]
+    present = [
+        [
+            {
+                "id": 71,
+                "name": "unrelated",
+                "package_type": "container",
+                "owner": {"login": "John-MiracleWorker", "id": 58918509},
+            },
+            {
+                "id": 72,
+                "name": "kestrel",
+                "package_type": "container",
+                "owner": {"login": "John-MiracleWorker", "id": 58918509},
+            },
+        ]
+    ]
+
+    assert not subject._ghcr_package_is_present(absent)  # noqa: SLF001
+    assert subject._ghcr_package_is_present(present)  # noqa: SLF001
+
+    duplicate = copy.deepcopy(present)
+    duplicate[0].append(copy.deepcopy(duplicate[0][1]))
+    with pytest.raises(ValueError, match="duplicated"):
+        subject._ghcr_package_is_present(duplicate)  # noqa: SLF001
+
+    wrong_owner = copy.deepcopy(present)
+    wrong_owner[0][1]["owner"]["id"] = 7
+    with pytest.raises(ValueError, match="owner"):
+        subject._ghcr_package_is_present(wrong_owner)  # noqa: SLF001
+
+
+def test_repository_attestation_inventory_proves_exact_absence_or_presence() -> None:
+    assert subject._repository_attestation_inventory_count(  # noqa: SLF001
+        [{"attestations": []}], expected_repository_id=303
+    ) == 0
+    inventory = [
+        {
+            "attestations": [
+                {
+                    "repository_id": 303,
+                    "bundle_url": "https://example.invalid/attestation-1",
+                    "initiator": "user",
+                }
+            ]
+        }
+    ]
+    assert subject._repository_attestation_inventory_count(  # noqa: SLF001
+        inventory, expected_repository_id=303
+    ) == 1
+
+    wrong_repository = copy.deepcopy(inventory)
+    wrong_repository[0]["attestations"][0]["repository_id"] = 404
+    with pytest.raises(ValueError, match="repository"):
+        subject._repository_attestation_inventory_count(  # noqa: SLF001
+            wrong_repository, expected_repository_id=303
+        )
+
+    duplicate = [
+        {
+            "attestations": [
+                copy.deepcopy(inventory[0]["attestations"][0]),
+                copy.deepcopy(inventory[0]["attestations"][0]),
+            ]
+        }
+    ]
+    with pytest.raises(ValueError, match="duplicated"):
+        subject._repository_attestation_inventory_count(  # noqa: SLF001
+            duplicate, expected_repository_id=303
+        )
+
+
+def test_attestation_verification_error_cannot_be_reclassified_as_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inventory = [
+        {
+            "attestations": [
+                {
+                    "repository_id": 303,
+                    "bundle_url": "https://example.invalid/attestation-1",
+                    "initiator": "user",
+                }
+            ]
+        }
+    ]
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(arguments)
+        if arguments[1] == "api":
+            return subprocess.CompletedProcess(arguments, 0, _canonical(inventory), b"")
+        return subprocess.CompletedProcess(arguments, 1, b"", b"verification failed")
+
+    monkeypatch.setattr(subject.subprocess, "run", fake_run)
+    attestation_subject = _candidate_manifest()["attestation_subjects"][0]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="verification failed"):
+        subject._observe_promotion_attestation_subject(  # noqa: SLF001
+            subject=attestation_subject,
+            target=str(tmp_path / "release.whl"),
+            pinned_gh=tmp_path / "gh",
+            repository="John-MiracleWorker/Kestrel",
+            expected_repository_id=303,
+            common_arguments=("--format", "json"),
+            token="token",
+            label="commit attestation",
+        )
+
+    assert [call[1] for call in calls] == ["api", "attestation"]
+
+
+def test_remote_digest_stream_is_bounded_and_incremental() -> None:
+    payload = b"abcdefghij"
+    assert subject._sha256_stream(io.BytesIO(payload), max_bytes=len(payload), chunk_bytes=3) == (  # noqa: SLF001
+        "sha256:" + hashlib.sha256(payload).hexdigest(),
+        len(payload),
+    )
+
+    with pytest.raises(ValueError, match="stream exceeds"):
+        subject._sha256_stream(  # noqa: SLF001
+            io.BytesIO(payload), max_bytes=len(payload) - 1, chunk_bytes=3
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["flat", "empty-pages", "duplicate-id", "duplicate-digest", "duplicate-tag", "wrong-type"],
+)
+def test_ghcr_package_version_tag_inventory_fails_closed(mutation: str) -> None:
+    digest = "sha256:" + "a" * 64
+    version = {
+        "id": 11,
+        "name": digest,
+        "metadata": {
+            "package_type": "container",
+            "container": {"tags": ["v0.6.0"]},
+        },
+    }
+    pages: object = [[version]]
+    if mutation == "flat":
+        pages = [version]
+    elif mutation == "empty-pages":
+        pages = []
+    elif mutation == "duplicate-id":
+        pages = [[version, {**version, "name": "sha256:" + "b" * 64}]]
+    elif mutation == "duplicate-digest":
+        pages = [[version, {**version, "id": 12}]]
+    elif mutation == "duplicate-tag":
+        pages = [
+            [
+                version,
+                {
+                    **version,
+                    "id": 12,
+                    "name": "sha256:" + "b" * 64,
+                },
+            ]
+        ]
+    elif mutation == "wrong-type":
+        pages = [[{**version, "metadata": {"package_type": "npm"}}]]
+
+    with pytest.raises(ValueError, match="GHCR package version"):
+        subject._ghcr_tags_by_digest_from_package_versions(pages)  # noqa: SLF001
+
+
 def test_ghcr_state_is_derived_from_exact_digest_queries_without_tags() -> None:
     expected = ("sha256:" + "a" * 64, "sha256:" + "b" * 64)
     observation = {
         "repository": subject.candidates.OCI_REPOSITORY,
-        "objects": [{"digest": digest, "http_status": 200, "tags": []} for digest in expected],
+        "package_present": True,
+        "objects": [
+            {
+                "digest": digest,
+                "http_status": 200,
+                "tags": [],
+                "tag_inventory_complete": True,
+                "observed_at": "2026-08-13T20:00:00Z",
+            }
+            for digest in expected
+        ],
     }
     assert (
         subject._classify_ghcr_digest_observation(  # noqa: SLF001
@@ -4771,12 +5278,184 @@ def test_ghcr_state_is_derived_from_exact_digest_queries_without_tags() -> None:
         )
         == "missing"
     )
+    assert subject._missing_ghcr_object_digests(  # noqa: SLF001
+        observation, expected_digests=expected
+    ) == [expected[0]]
 
     observation["objects"][0]["tags"] = ["v0.6.0"]
     with pytest.raises(ValueError, match="tag"):
         subject._classify_ghcr_digest_observation(  # noqa: SLF001
             observation, expected_digests=expected
         )
+
+
+def test_ghcr_first_publication_requires_package_visibility_before_exact_presence() -> None:
+    expected = ("sha256:" + "a" * 64,)
+    observation = {
+        "repository": subject.candidates.OCI_REPOSITORY,
+        "package_present": False,
+        "objects": [
+            {
+                "digest": expected[0],
+                "http_status": 404,
+                "tags": [],
+                "tag_inventory_complete": True,
+                "observed_at": "2026-08-13T20:00:00Z",
+            }
+        ],
+    }
+    assert (
+        subject._classify_ghcr_digest_observation(  # noqa: SLF001
+            observation, expected_digests=expected
+        )
+        == "missing"
+    )
+
+    observation["objects"][0]["http_status"] = 200
+    with pytest.raises(ValueError, match="converg"):
+        subject._classify_ghcr_digest_observation(  # noqa: SLF001
+            observation, expected_digests=expected
+        )
+
+    observation["package_present"] = True
+    observation["objects"][0]["tag_inventory_complete"] = False
+    with pytest.raises(ValueError, match="converg"):
+        subject._classify_ghcr_digest_observation(  # noqa: SLF001
+            observation, expected_digests=expected
+        )
+
+
+def test_ghcr_first_publication_waits_for_package_and_digest_convergence() -> None:
+    expected = ("sha256:" + "a" * 64,)
+    split_view = {
+        "repository": subject.candidates.OCI_REPOSITORY,
+        "package_present": False,
+        "objects": [
+            {
+                "digest": expected[0],
+                "http_status": 200,
+                "tags": [],
+                "tag_inventory_complete": False,
+                "observed_at": "2026-08-13T20:00:00Z",
+            }
+        ],
+    }
+    version_lag = copy.deepcopy(split_view)
+    version_lag["package_present"] = True
+    converged = copy.deepcopy(version_lag)
+    converged["objects"][0]["tag_inventory_complete"] = True
+    observations = iter((split_view, version_lag, converged))
+    clocks = iter((100.0, 101.0, 102.0, 103.0, 104.0, 105.0))
+    sleeps: list[float] = []
+
+    result = subject.wait_for_ghcr_digest_convergence(
+        observe=lambda: next(observations),
+        expected_digests=expected,
+        timeout_seconds=10.0,
+        poll_interval_seconds=2.0,
+        _monotonic=lambda: next(clocks),
+        _sleep=sleeps.append,
+    )
+
+    assert result == converged
+    assert result is not converged
+    assert sleeps == [2.0, 2.0]
+
+
+def test_ghcr_first_publication_convergence_has_one_fixed_monotonic_deadline() -> None:
+    expected = ("sha256:" + "a" * 64,)
+    split_view = {
+        "repository": subject.candidates.OCI_REPOSITORY,
+        "package_present": False,
+        "objects": [
+            {
+                "digest": expected[0],
+                "http_status": 200,
+                "tags": [],
+                "tag_inventory_complete": False,
+                "observed_at": "2026-08-13T20:00:00Z",
+            }
+        ],
+    }
+    clocks = iter((100.0, 101.0, 110.0))
+    sleeps: list[float] = []
+    calls = 0
+
+    def observe() -> object:
+        nonlocal calls
+        calls += 1
+        return copy.deepcopy(split_view)
+
+    with pytest.raises(ValueError, match="convergence deadline"):
+        subject.wait_for_ghcr_digest_convergence(
+            observe=observe,
+            expected_digests=expected,
+            timeout_seconds=10.0,
+            poll_interval_seconds=2.0,
+            _monotonic=lambda: next(clocks),
+            _sleep=sleeps.append,
+        )
+
+    assert calls == 1
+    assert sleeps == [2.0]
+
+
+def test_ghcr_convergence_rejects_a_late_settled_observation() -> None:
+    expected = ("sha256:" + "a" * 64,)
+    exact = {
+        "repository": subject.candidates.OCI_REPOSITORY,
+        "package_present": True,
+        "objects": [
+            {
+                "digest": expected[0],
+                "http_status": 200,
+                "tags": [],
+                "tag_inventory_complete": True,
+                "observed_at": "2026-08-13T20:00:00Z",
+            }
+        ],
+    }
+    clocks = iter((100.0, 111.0))
+
+    with pytest.raises(ValueError, match="convergence deadline"):
+        subject.wait_for_ghcr_digest_convergence(
+            observe=lambda: exact,
+            expected_digests=expected,
+            timeout_seconds=10.0,
+            poll_interval_seconds=2.0,
+            _monotonic=lambda: next(clocks),
+            _sleep=lambda _seconds: None,
+        )
+
+
+def test_ghcr_convergence_does_not_retry_conflicting_state() -> None:
+    expected = ("sha256:" + "a" * 64,)
+    conflict = {
+        "repository": subject.candidates.OCI_REPOSITORY,
+        "package_present": False,
+        "objects": [
+            {
+                "digest": expected[0],
+                "http_status": 200,
+                "tags": ["unexpected"],
+                "tag_inventory_complete": False,
+                "observed_at": "2026-08-13T20:00:00Z",
+            }
+        ],
+    }
+    sleeps: list[float] = []
+
+    with pytest.raises(ValueError, match="tag"):
+        subject.wait_for_ghcr_digest_convergence(
+            observe=lambda: conflict,
+            expected_digests=expected,
+            timeout_seconds=10.0,
+            poll_interval_seconds=2.0,
+            _monotonic=lambda: 100.0,
+            _sleep=sleeps.append,
+        )
+
+    assert sleeps == []
 
 
 def test_commit_tag_state_is_derived_from_ref_and_annotated_peel() -> None:
@@ -4834,50 +5513,528 @@ def test_commit_tag_state_is_derived_from_ref_and_annotated_peel() -> None:
         )
 
 
-def test_attestation_state_is_derived_from_verified_subject_outputs() -> None:
-    manifest = _candidate_manifest()
+def _promotion_predicate_fixture(
+    manifest: dict[str, object],
+    *,
+    transaction_digest: str = "sha256:" + "1" * 64,
+    capsule_digest: str = "sha256:" + "2" * 64,
+) -> tuple[dict[str, object], str, str]:
+    contract = subject._candidate_product_release_contract(  # noqa: SLF001
+        manifest,
+        transaction_authorization_digest=transaction_digest,
+        recovery_capsule_digest=capsule_digest,
+    )
+    asset = contract["assets"][0]  # type: ignore[index]
+    release = {
+        "id": 91,
+        **contract["persisted"],  # type: ignore[dict-item]
+        "draft": False,
+        "immutable": True,
+        "assets": [
+            {
+                "id": 92,
+                "name": asset["name"],
+                "size": asset["size_bytes"],
+                "digest": asset["sha256"],
+                "content_type": asset["media_type"],
+            }
+        ],
+    }
+    expected_oci = subject._expected_oci_object_digests_from_manifest(manifest)  # noqa: SLF001
+    ghcr = {
+        "repository": subject.candidates.OCI_REPOSITORY,
+        "package_present": True,
+        "objects": [
+            {
+                "digest": digest,
+                "http_status": 200,
+                "tags": [],
+                "tag_inventory_complete": True,
+                "observed_at": "2026-08-13T20:00:00Z",
+            }
+            for digest in expected_oci
+        ],
+    }
+    context = subject._release_promotion_predicate_context(  # noqa: SLF001
+        manifest=manifest,
+        transaction_authorization_digest=transaction_digest,
+        release_listing=[[release]],
+        release_contract=contract,
+        ghcr_observation=ghcr,
+        expected_oci_digests=expected_oci,
+    )
+    return context, transaction_digest, capsule_digest
+
+
+def _promotion_authority_proof(
+    tmp_path: Path,
+    *,
+    context: dict[str, object],
+    capsule_digest: str,
+    run_id: int = 808,
+    execution_digest: str | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    vector, _signature = _contract_vector("github-authority")
+    authority = json.loads(vector)
+    candidate = copy.deepcopy(context["candidate"])
+    mode = "initiate" if execution_digest is None else "recover_committed"
+    authority["phase"] = "commit"
+    authority["mode"] = mode
+    authority["candidate"] = candidate
+    authority["promotion_run"].update(
+        {
+            "repository_id": context["candidate_build_evidence"]["repository_id"],  # type: ignore[index]
+            "run_id": run_id,
+            "run_attempt": 1,
+            "event": "workflow_dispatch",
+            "ref": (
+                "refs/heads/main"
+                if execution_digest is None
+                else f"refs/tags/{candidate['tag']}"
+            ),
+            "head_sha": candidate["source_sha"],
+            "workflow_sha": candidate["source_sha"],
+            "workflow_path": ".github/workflows/release.yml",
+        }
+    )
+    authority["environment"] = {"name": "release-commit", "id": 903}
+    authority["bindings"] = {
+        "transaction_authorization_digest": context[
+            "transaction_authorization_digest"
+        ],
+        "execution_authorization_digest": execution_digest,
+        "recovery_capsule_manifest_digest": capsule_digest,
+        "commit_marker_digest": None,
+    }
+    authority["workflow_ingress"]["capsule_blob_sha256"] = authority[
+        "workflow_ingress"
+    ]["candidate_blob_sha256"]
+    receipt = _canonical(receipts.validate_github_authority(authority))
+    signature = receipts.sign_receipt_detached(
+        receipt=receipt,
+        identity_file=_signing_identity(tmp_path),
+        principal=receipts.SIGNING_PRINCIPAL,
+        namespace=receipts.SIGNING_NAMESPACE,
+    )
+    proof = receipts.verify_github_authority(
+        receipt=receipt,
+        signature=signature,
+        owner_signing_keys_observation=_canonical(
+            _owner_signing_keys_observation("2026-08-13T20:00:00Z")
+        ),
+        expected_run_id=run_id,
+        expected_candidate_digest=candidate["candidate_manifest_digest"],
+        expected_environment_id=903,
+        _clock=lambda: datetime(2026, 8, 13, 20, 1, 0, tzinfo=UTC),
+    )
+    return proof, authority["promotion_run"]
+
+
+def _promotion_verification(
+    *,
+    context: dict[str, object],
+    promotion_run: dict[str, object],
+    execution_digest: str | None,
+    subjects: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    predicate = subject.build_release_promotion_predicate(
+        context=context,
+        execution_authorization_digest=execution_digest,
+        promotion_run=promotion_run,
+    )
+    source_sha = context["candidate"]["source_sha"]  # type: ignore[index]
+    repository_id = context["candidate_build_evidence"]["repository_id"]  # type: ignore[index]
+    ref = promotion_run["ref"]
+    workflow_uri = (
+        "https://github.com/John-MiracleWorker/Kestrel/"
+        f".github/workflows/release.yml@{ref}"
+    )
+    certificate = {
+        "issuer": "https://token.actions.githubusercontent.com",
+        "runnerEnvironment": "github-hosted",
+        "sourceRepositoryURI": "https://github.com/John-MiracleWorker/Kestrel",
+        "sourceRepositoryDigest": source_sha,
+        "sourceRepositoryRef": ref,
+        "sourceRepositoryIdentifier": str(repository_id),
+        "sourceRepositoryOwnerURI": "https://github.com/John-MiracleWorker",
+        "sourceRepositoryOwnerIdentifier": "58918509",
+        "sourceRepositoryVisibilityAtSigning": "public",
+        "buildSignerURI": workflow_uri,
+        "buildSignerDigest": source_sha,
+        "buildConfigURI": workflow_uri,
+        "buildConfigDigest": source_sha,
+        "subjectAlternativeName": workflow_uri,
+        "githubWorkflowName": "Release",
+        "githubWorkflowRepository": "John-MiracleWorker/Kestrel",
+        "githubWorkflowRef": ref,
+        "githubWorkflowSHA": source_sha,
+        "githubWorkflowTrigger": "workflow_dispatch",
+        "buildTrigger": "workflow_dispatch",
+        "runInvocationURI": (
+            "https://github.com/John-MiracleWorker/Kestrel/actions/runs/"
+            f"{promotion_run['run_id']}/attempts/1"
+        ),
+    }
+    return [
+        {
+            "attestation": {},
+            "verificationResult": {
+                "signature": {"certificate": certificate},
+                "verifiedTimestamps": [
+                    {
+                        "timestamp": "2026-08-13T16:01:00-04:00",
+                        "type": "Tlog",
+                        "uri": "https://rekor.sigstore.dev",
+                    }
+                ],
+                "statement": {
+                    "_type": "https://in-toto.io/Statement/v1",
+                    "predicateType": subject._RELEASE_PROMOTION_PREDICATE_TYPE,  # noqa: SLF001
+                    "subject": [
+                        {
+                            "name": item["name"],
+                            "digest": {
+                                "sha256": str(item["digest"]).removeprefix("sha256:")
+                            },
+                        }
+                        for item in subjects
+                    ],
+                    "predicate": predicate,
+                },
+            },
+        }
+    ]
+
+
+def _authorized_promotion_observation(
+    tmp_path: Path,
+    *,
+    manifest: dict[str, object],
+    execution_digest: str | None = None,
+    run_id: int = 808,
+) -> tuple[dict[str, object], dict[str, object], str]:
+    context, _transaction_digest, capsule_digest = _promotion_predicate_fixture(manifest)
+    proof, promotion_run = _promotion_authority_proof(
+        tmp_path,
+        context=context,
+        capsule_digest=capsule_digest,
+        run_id=run_id,
+        execution_digest=execution_digest,
+    )
     subjects = []
-    for expected in manifest["attestation_subjects"]:
-        digest = expected["digest"]
+    for index, expected in enumerate(  # type: ignore[union-attr]
+        manifest["attestation_subjects"]
+    ):
+        verification = _promotion_verification(
+            context=context,
+            promotion_run=promotion_run,
+            execution_digest=execution_digest,
+            subjects=[expected],
+        )
         subjects.append(
             {
                 **expected,
-                "verification": [
+                "inventory": [
                     {
-                        "verificationResult": {
-                            "statement": {
-                                "predicateType": (
-                                    "https://kestrel.dev/attestations/release-promotion/v1"
+                        "attestations": [
+                            {
+                                "repository_id": 303,
+                                "bundle_url": (
+                                    "https://example.invalid/attestations/"
+                                    f"promotion-{index}"
                                 ),
-                                "subject": [
-                                    {
-                                        "name": expected["name"],
-                                        "digest": {"sha256": digest.removeprefix("sha256:")},
-                                    }
-                                ],
+                                "initiator": "user",
                             }
-                        }
+                        ]
                     }
                 ],
+                "verification": verification,
+                "authority_verification": copy.deepcopy(proof),
             }
         )
-    observation = {"subjects": subjects}
+    return {"subjects": subjects}, context, capsule_digest
+
+
+def test_attestation_state_is_derived_from_predicate_certificate_and_authority(
+    tmp_path: Path,
+) -> None:
+    manifest = _candidate_manifest()
+    observation, context, capsule_digest = _authorized_promotion_observation(
+        tmp_path, manifest=manifest
+    )
     assert subject._classify_promotion_attestation_observation(  # noqa: SLF001
-        observation, manifest=manifest
+        observation,
+        manifest=manifest,
+        expected_context=context,
+        recovery_capsule_digest=capsule_digest,
     ) == {"file": "existing_exact", "oci_index": "existing_exact"}
 
-    subjects[0]["verification"] = None
+    observation["subjects"][0]["verification"] = None  # type: ignore[index]
+    observation["subjects"][0]["authority_verification"] = None  # type: ignore[index]
+    observation["subjects"][0]["inventory"] = [{"attestations": []}]  # type: ignore[index]
     assert (
         subject._classify_promotion_attestation_observation(  # noqa: SLF001
-            observation, manifest=manifest
+            observation,
+            manifest=manifest,
+            expected_context=context,
+            recovery_capsule_digest=capsule_digest,
         )["file"]
         == "missing"
     )
 
-    subjects[0]["digest"] = "sha256:" + "f" * 64
-    with pytest.raises(ValueError, match="subject inventory"):
+
+def test_attestation_inventory_nonabsence_cannot_be_classified_as_missing(
+    tmp_path: Path,
+) -> None:
+    manifest = _candidate_manifest()
+    observation, context, capsule_digest = _authorized_promotion_observation(
+        tmp_path, manifest=manifest
+    )
+    observation["subjects"][0]["verification"] = None  # type: ignore[index]
+    observation["subjects"][0]["authority_verification"] = None  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="inventory.*verification|verification.*inventory"):
         subject._classify_promotion_attestation_observation(  # noqa: SLF001
-            observation, manifest=manifest
+            observation,
+            manifest=manifest,
+            expected_context=context,
+            recovery_capsule_digest=capsule_digest,
+        )
+
+
+def test_attestation_recovery_compares_stable_surface_identity_not_observation_time(
+    tmp_path: Path,
+) -> None:
+    manifest = _candidate_manifest()
+    observation, signed_context, capsule_digest = _authorized_promotion_observation(
+        tmp_path, manifest=manifest
+    )
+    current_context = copy.deepcopy(signed_context)
+    current_context["published_surfaces"]["ghcr"]["objects"][0][  # type: ignore[index]
+        "available_by_digest_at"
+    ] = "2026-08-13T20:02:00Z"
+
+    assert subject._classify_promotion_attestation_observation(  # noqa: SLF001
+        observation,
+        manifest=manifest,
+        expected_context=current_context,
+        recovery_capsule_digest=capsule_digest,
+    ) == {"file": "existing_exact", "oci_index": "existing_exact"}
+
+
+def test_attestation_request_identity_excludes_only_fresh_availability_time() -> None:
+    manifest = _candidate_manifest()
+    context, _transaction_digest, _capsule_digest = _promotion_predicate_fixture(
+        manifest
+    )
+    promotion_run = {
+        "repository_id": 303,
+        "run_id": 808,
+        "run_attempt": 1,
+        "event": "workflow_dispatch",
+        "ref": "refs/heads/main",
+        "head_sha": SOURCE_SHA,
+        "workflow_sha": SOURCE_SHA,
+        "workflow_path": ".github/workflows/release.yml",
+    }
+    first = subject.build_release_promotion_predicate(
+        context=context,
+        execution_authorization_digest=None,
+        promotion_run=promotion_run,
+    )
+    fresh_context = copy.deepcopy(context)
+    fresh_context["published_surfaces"]["ghcr"]["objects"][0][  # type: ignore[index]
+        "available_by_digest_at"
+    ] = "2026-08-13T20:00:30Z"
+    fresh = subject.build_release_promotion_predicate(
+        context=fresh_context,
+        execution_authorization_digest=None,
+        promotion_run=promotion_run,
+    )
+    subjects = manifest["attestation_subjects"][:1]  # type: ignore[index]
+
+    assert subject._promotion_attestation_request_identity(  # noqa: SLF001
+        predicate=first, subjects=subjects
+    ) == subject._promotion_attestation_request_identity(  # noqa: SLF001
+        predicate=fresh, subjects=subjects
+    )
+    assert fresh["published_surfaces"]["ghcr"]["objects"][0][  # type: ignore[index]
+        "available_by_digest_at"
+    ] == "2026-08-13T20:00:30Z"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "transaction-authorization",
+        "execution-authorization",
+        "run-id",
+        "run-attempt",
+        "run-ref",
+        "run-sha",
+        "build-receipt",
+        "release-field",
+        "ghcr-field",
+    ),
+)
+def test_attestation_predicate_and_signer_binding_mutants_fail_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    manifest = _candidate_manifest()
+    observation, context, capsule_digest = _authorized_promotion_observation(
+        tmp_path, manifest=manifest
+    )
+    statement = observation["subjects"][0]["verification"][0]["verificationResult"][  # type: ignore[index]
+        "statement"
+    ]
+    predicate = statement["predicate"]
+    if mutation == "transaction-authorization":
+        predicate["transaction_authorization_digest"] = "sha256:" + "9" * 64
+    elif mutation == "execution-authorization":
+        predicate["execution_authorization_digest"] = "sha256:" + "8" * 64
+    elif mutation == "run-id":
+        predicate["promotion_run"]["run_id"] = 999
+    elif mutation == "run-attempt":
+        predicate["promotion_run"]["run_attempt"] = 2
+    elif mutation == "run-ref":
+        predicate["promotion_run"]["ref"] = "refs/tags/v0.6.0"
+    elif mutation == "run-sha":
+        predicate["promotion_run"]["workflow_sha"] = "c" * 40
+    elif mutation == "build-receipt":
+        predicate["candidate_build_evidence"]["checks"][0][
+            "receipt_sha256"
+        ] = "sha256:" + "7" * 64
+    elif mutation == "release-field":
+        predicate["published_surfaces"]["github_release"]["release_id"] = 999
+    else:
+        predicate["published_surfaces"]["ghcr"]["objects"][0][
+            "available_by_digest"
+        ] = False
+
+    with pytest.raises(
+        ValueError, match="attestation|predicate|authority|run|release-promotion"
+    ):
+        subject._classify_promotion_attestation_observation(  # noqa: SLF001
+            observation,
+            manifest=manifest,
+            expected_context=context,
+            recovery_capsule_digest=capsule_digest,
+        )
+
+
+def test_recovery_accepts_one_prior_authorized_bundle_from_a_different_attempt_one_run(
+    tmp_path: Path,
+) -> None:
+    manifest = _candidate_manifest()
+    old_execution = "sha256:" + "6" * 64
+    observation, context, capsule_digest = _authorized_promotion_observation(
+        tmp_path,
+        manifest=manifest,
+        execution_digest=old_execution,
+        run_id=809,
+    )
+
+    assert subject._classify_promotion_attestation_observation(  # noqa: SLF001
+        observation,
+        manifest=manifest,
+        expected_context=context,
+        recovery_capsule_digest=capsule_digest,
+    ) == {"file": "existing_exact", "oci_index": "existing_exact"}
+
+
+def test_attestation_state_accepts_only_bounded_same_kind_subject_batches(
+    tmp_path: Path,
+) -> None:
+    manifest = _candidate_manifest()
+    original_file = copy.deepcopy(manifest["attestation_subjects"][0])
+    second_file = {
+        "kind": "file",
+        "name": "release/second.whl",
+        "digest": "sha256:" + "e" * 64,
+    }
+    third_file = {
+        "kind": "file",
+        "name": "release/third.whl",
+        "digest": "sha256:" + "1" * 64,
+    }
+    oci = copy.deepcopy(manifest["attestation_subjects"][1])
+    manifest["attestation_subjects"] = [original_file, second_file, third_file, oci]
+    context, _transaction, capsule_digest = _promotion_predicate_fixture(manifest)
+    proof, promotion_run = _promotion_authority_proof(
+        tmp_path, context=context, capsule_digest=capsule_digest
+    )
+    file_batch = _promotion_verification(
+        context=context,
+        promotion_run=promotion_run,
+        execution_digest=None,
+        subjects=[original_file, second_file, third_file],
+    )
+    oci_verification = _promotion_verification(
+        context=context,
+        promotion_run=promotion_run,
+        execution_digest=None,
+        subjects=[oci],
+    )
+    observation = {
+        "subjects": [
+            {
+                **item,
+                "inventory": [
+                    {
+                        "attestations": [
+                            {
+                                "repository_id": 303,
+                                "bundle_url": (
+                                    "https://example.invalid/attestations/file-batch"
+                                ),
+                                "initiator": "user",
+                            }
+                        ]
+                    }
+                ],
+                "verification": file_batch,
+                "authority_verification": copy.deepcopy(proof),
+            }
+            for item in (original_file, second_file, third_file)
+        ]
+        + [
+            {
+                **oci,
+                "inventory": [
+                    {
+                        "attestations": [
+                            {
+                                "repository_id": 303,
+                                "bundle_url": (
+                                    "https://example.invalid/attestations/oci-index"
+                                ),
+                                "initiator": "user",
+                            }
+                        ]
+                    }
+                ],
+                "verification": oci_verification,
+                "authority_verification": copy.deepcopy(proof),
+            }
+        ]
+    }
+    assert subject._classify_promotion_attestation_observation(  # noqa: SLF001
+        observation,
+        manifest=manifest,
+        expected_context=context,
+        recovery_capsule_digest=capsule_digest,
+    ) == {"file": "existing_exact", "oci_index": "existing_exact"}
+
+    foreign = copy.deepcopy(observation)
+    foreign["subjects"][0]["verification"][0]["verificationResult"]["statement"][  # type: ignore[index]
+        "subject"
+    ].append({"name": "release/foreign.whl", "digest": {"sha256": "f" * 64}})
+    with pytest.raises(ValueError, match="subject identity"):
+        subject._classify_promotion_attestation_observation(  # noqa: SLF001
+            foreign,
+            manifest=manifest,
+            expected_context=context,
+            recovery_capsule_digest=capsule_digest,
         )
 
 
@@ -5035,14 +6192,23 @@ def test_pypi_provenance_evidence_joins_every_file_to_pinned_verifier(
     files = dict(sorted(files.items()))
     integrity_files = []
     verification_files = []
+    verifier_provenance: list[bytes] = []
     for filename, item in files.items():
         provenance = _publish_provenance(filename, item["sha256"])
-        integrity_files.append({"filename": filename, "provenance": provenance})
+        provenance_raw = receipts.canonical_external_json_bytes(provenance) + b"\n"
+        integrity_files.append(
+            {
+                "filename": filename,
+                "provenance_response_base64": base64.b64encode(provenance_raw).decode(
+                    "ascii"
+                ),
+            }
+        )
         verification_files.append(
             {
                 "filename": filename,
                 "distribution_sha256": item["sha256"],
-                "provenance_sha256": _sha256(receipts.canonical_external_json_bytes(provenance)),
+                "provenance_sha256": _sha256(provenance_raw),
                 "exit_code": 0,
             }
         )
@@ -5059,7 +6225,8 @@ def test_pypi_provenance_evidence_joins_every_file_to_pinned_verifier(
     monkeypatch.setattr(
         subject,
         "_run_pypi_attestations_verifier",
-        lambda **_: b"verified",
+        lambda **kwargs: verifier_provenance.append(kwargs["provenance"])
+        or b"verified",
     )
     results = subject._validate_pypi_provenance_evidence(  # noqa: SLF001
         integrity_observations=integrity,
@@ -5069,6 +6236,13 @@ def test_pypi_provenance_evidence_joins_every_file_to_pinned_verifier(
         distribution_root=tmp_path,
     )
     assert [item["filename"] for item in results] == list(files)
+    assert verifier_provenance == [
+        receipts.canonical_external_json_bytes(
+            _publish_provenance(filename, files[filename]["sha256"])
+        )
+        + b"\n"
+        for filename in files
+    ]
 
     verification["tool"]["version"] = "0.0.29"
     with pytest.raises(ValueError, match="verifier version"):
@@ -5092,9 +6266,17 @@ def test_pypi_provenance_rejects_forged_success_without_running_verifier(
     distribution_path.write_bytes(distribution)
     digest = _sha256(distribution)
     provenance = _publish_provenance(filename, digest)
+    provenance_raw = receipts.canonical_external_json_bytes(provenance)
     integrity = {
         "schema": "pypi.integrity_observations.v1",
-        "files": [{"filename": filename, "provenance": provenance}],
+        "files": [
+            {
+                "filename": filename,
+                "provenance_response_base64": base64.b64encode(
+                    provenance_raw
+                ).decode("ascii"),
+            }
+        ],
     }
     claimed = {
         "schema": "pypi.provenance_verifications.v1",
@@ -5103,7 +6285,7 @@ def test_pypi_provenance_rejects_forged_success_without_running_verifier(
             {
                 "filename": filename,
                 "distribution_sha256": digest,
-                "provenance_sha256": _sha256(receipts.canonical_external_json_bytes(provenance)),
+                "provenance_sha256": _sha256(provenance_raw),
                 "exit_code": 0,
             }
         ],
@@ -5408,6 +6590,17 @@ def test_github_surface_verification_is_controller_owned_and_uses_pinned_gh(
     release_digest = _sha256(b"x")
     candidate["artifacts"][0]["sha256"] = release_digest  # type: ignore[index]
     candidate["attestation_subjects"][0]["digest"] = release_digest  # type: ignore[index]
+    candidate["artifact_set_digest"] = receipts._sha256(  # noqa: SLF001
+        _canonical(candidate["artifacts"])
+    )
+    context, _transaction_digest, capsule_digest = _promotion_predicate_fixture(
+        candidate
+    )
+    authority_proof, promotion_run = _promotion_authority_proof(
+        tmp_path,
+        context=context,
+        capsule_digest=capsule_digest,
+    )
     pinned_gh = tmp_path / "gh"
     pinned_gh.write_bytes(b"pinned gh")
     pinned_gh.chmod(0o700)
@@ -5420,27 +6613,17 @@ def test_github_surface_verification_is_controller_owned_and_uses_pinned_gh(
         elif command[1:3] == ["attestation", "verify"]:
             target = command[3]
             if target.startswith("oci://"):
-                name = candidate["attestation_subjects"][1]["name"]  # type: ignore[index]
-                digest = "d" * 64
+                expected = candidate["attestation_subjects"][1]  # type: ignore[index]
             else:
-                name = "release/kestrel.whl"
-                digest = release_digest.removeprefix("sha256:")
-            stdout = json.dumps(
-                [
-                    {
-                        "attestation": {},
-                        "verificationResult": {
-                            "statement": {
-                                "predicateType": (
-                                    "https://kestrel.dev/attestations/release-promotion/v1"
-                                ),
-                                "subject": [{"name": name, "digest": {"sha256": digest}}],
-                                "predicate": {},
-                            }
-                        },
-                    }
-                ]
-            ).encode()
+                expected = candidate["attestation_subjects"][0]  # type: ignore[index]
+            stdout = _canonical(
+                _promotion_verification(
+                    context=context,
+                    promotion_run=promotion_run,
+                    execution_digest=None,
+                    subjects=[expected],
+                )
+            )
         else:
             stdout = b'{"verified":true}'
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=b"")
@@ -5453,7 +6636,9 @@ def test_github_surface_verification_is_controller_owned_and_uses_pinned_gh(
         candidate=candidate,
         bundle_root=bundle,
         pinned_gh=pinned_gh,
-        source_ref="refs/heads/main",
+        expected_context=context,
+        recovery_capsule_digest=capsule_digest,
+        authority_verifications={(808, "2026-08-13T20:01:00Z"): authority_proof},
     )
 
     repository = "John-MiracleWorker/Kestrel"
@@ -5461,13 +6646,11 @@ def test_github_surface_verification_is_controller_owned_and_uses_pinned_gh(
         "--repo",
         repository,
         "--signer-workflow",
-        f"{repository}/.github/workflows/release-transaction.yml",
+        f"{repository}/.github/workflows/release.yml",
         "--signer-digest",
         SOURCE_SHA,
         "--source-digest",
         SOURCE_SHA,
-        "--source-ref",
-        "refs/heads/main",
         "--predicate-type",
         "https://kestrel.dev/attestations/release-promotion/v1",
         "--deny-self-hosted-runners",
@@ -5532,7 +6715,9 @@ def test_github_surface_verification_rejects_mutable_oci_subject(
             candidate=candidate,
             bundle_root=tmp_path / "bundle",
             pinned_gh=pinned_gh,
-            source_ref="refs/heads/main",
+            expected_context={},
+            recovery_capsule_digest="sha256:" + "f" * 64,
+            authority_verifications={},
         )
 
 
@@ -5664,6 +6849,32 @@ def test_github_authority_consumer_binds_phase_and_transaction() -> None:
         )
 
 
+def test_server_authorization_consumes_the_frozen_admission_authority() -> None:
+    raw, _ = _contract_vector("github-authority")
+    authority = json.loads(raw)
+    bindings = authority["bindings"]
+
+    subject._require_authorization_admission_authority(  # noqa: SLF001
+        authority,
+        candidate=authority["candidate"],
+        transaction_authorization_digest=bindings["transaction_authorization_digest"],
+        recovery_capsule_digest=bindings["recovery_capsule_manifest_digest"],
+        commit_marker_digest=bindings["commit_marker_digest"],
+    )
+
+    authority["phase"] = "commit"
+    with pytest.raises(ValueError, match="admission authority.*binding"):
+        subject._require_authorization_admission_authority(  # noqa: SLF001
+            authority,
+            candidate=authority["candidate"],
+            transaction_authorization_digest=bindings[
+                "transaction_authorization_digest"
+            ],
+            recovery_capsule_digest=bindings["recovery_capsule_manifest_digest"],
+            commit_marker_digest=bindings["commit_marker_digest"],
+        )
+
+
 def _genuine_github_authority_verification(
     *, verified_at: datetime = datetime(2026, 8, 13, 20, 1, 0, tzinfo=UTC)
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -5735,20 +6946,72 @@ def test_authority_verification_and_consumption_use_exclusive_expiry() -> None:
     )
 
     verification["verified_at"] = authority["expires_at"]
-    with pytest.raises(ValueError, match="outside authority lifetime"):
+    expires = datetime.fromisoformat(authority["expires_at"].replace("Z", "+00:00"))
+    # At the exclusive expiry boundary the embedded live source is already stale,
+    # so verification must fail closed before the signed lifetime is consumed.
+    with pytest.raises(ValueError, match="stale|not currently fresh"):
         subject._verified_authority_from_record(  # noqa: SLF001
             verification,
             verification_schema=("kestrel.github_release_authority_verification.v1"),
             authority_schema=receipts.GITHUB_AUTHORITY_SCHEMA,
             label="GitHub authority verification",
-            _clock=lambda: observed,
+            _clock=lambda: expires,
         )
-    with pytest.raises(ValueError, match="not currently fresh"):
+    with pytest.raises(ValueError, match="stale|not currently fresh"):
         subject._require_current_authority(  # noqa: SLF001
             authority,
             label="GitHub authority",
             _clock=lambda: datetime.fromisoformat(authority["expires_at"].replace("Z", "+00:00")),
         )
+
+
+def test_final_freshness_budget_uses_one_monotonic_deadline(tmp_path: Path) -> None:
+    marker = tmp_path / "final-freshness-budget.json"
+    second = 1_000_000_000
+
+    subject.begin_final_reconciliation_freshness_budget(
+        marker, _clock=lambda: 100 * second
+    )
+
+    assert subject.remaining_final_reconciliation_observation_seconds(
+        marker, _clock=lambda: 110 * second
+    ) == 65
+    subject.require_final_reconciliation_freshness_budget(
+        marker, _clock=lambda: 189 * second
+    )
+    with pytest.raises(ValueError, match="freshness budget is exhausted"):
+        subject.require_final_reconciliation_freshness_budget(
+            marker, _clock=lambda: 190 * second
+        )
+
+
+def test_historical_authority_proof_remains_verifiable_after_expiry() -> None:
+    verified_at = datetime(2026, 8, 13, 20, 1, 0, tzinfo=UTC)
+    verification, authority = _genuine_github_authority_verification(
+        verified_at=verified_at
+    )
+    after_expiry = datetime.fromisoformat(authority["expires_at"].replace("Z", "+00:00"))
+
+    with pytest.raises(ValueError, match="stale|not currently fresh"):
+        subject._verified_authority_from_record(  # noqa: SLF001
+            verification,
+            verification_schema="kestrel.github_release_authority_verification.v1",
+            authority_schema=receipts.GITHUB_AUTHORITY_SCHEMA,
+            label="GitHub authority verification",
+            _clock=lambda: after_expiry,
+        )
+
+    assert (
+        subject._verified_authority_from_record(  # noqa: SLF001
+            verification,
+            verification_schema="kestrel.github_release_authority_verification.v1",
+            authority_schema=receipts.GITHUB_AUTHORITY_SCHEMA,
+            label="historical GitHub authority verification",
+            require_current=False,
+            _clock=lambda: after_expiry,
+        )
+        == authority
+    )
 
 
 def test_pypi_stage_requires_exact_four_owner_approvals() -> None:
@@ -6082,10 +7345,12 @@ def _final_source_envelope(name: str, body: object | bytes) -> dict[str, object]
 
 
 def _final_remote_source_envelopes(
+    tmp_path: Path,
     *,
     manifest: dict[str, object],
     candidate: dict[str, object],
     transaction_digest: str,
+    execution_digest: str | None,
     capsule_digest: str,
     complete: bool,
 ) -> list[dict[str, object]]:
@@ -6100,6 +7365,7 @@ def _final_remote_source_envelopes(
             "name": item["name"],
             "size": item["size_bytes"],
             "digest": item["sha256"],
+            "content_type": item["media_type"],
         }
         for index, item in enumerate(release_contract["assets"])
     ]
@@ -6118,11 +7384,14 @@ def _final_remote_source_envelopes(
     )
     ghcr = {
         "repository": subject.candidates.OCI_REPOSITORY,
+        "package_present": True,
         "objects": [
             {
                 "digest": digest,
                 "http_status": 200 if complete else 404,
                 "tags": [],
+                "tag_inventory_complete": True,
+                "observed_at": "2026-08-13T20:00:00Z",
             }
             for digest in subject._expected_oci_object_digests_from_manifest(  # noqa: SLF001
                 manifest
@@ -6150,28 +7419,63 @@ def _final_remote_source_envelopes(
         }
     else:
         tag_observation = {"http_status": 404, "ref": None, "tag": None}
+    predicate_context: dict[str, object] | None = None
+    authority_verification: dict[str, object] | None = None
+    attestation_run: dict[str, object] | None = None
+    if complete:
+        predicate_context = subject._release_promotion_predicate_context(  # noqa: SLF001
+            manifest=manifest,
+            transaction_authorization_digest=transaction_digest,
+            release_listing=[release_listing],
+            release_contract=release_contract,
+            ghcr_observation=ghcr,
+            expected_oci_digests=subject._expected_oci_object_digests_from_manifest(  # noqa: SLF001
+                manifest
+            ),
+        )
+        authority_verification, attestation_run = _promotion_authority_proof(
+            tmp_path,
+            context=predicate_context,
+            capsule_digest=capsule_digest,
+            execution_digest=execution_digest,
+        )
     attestation_subjects = []
-    for item in manifest["attestation_subjects"]:
+    for index, item in enumerate(manifest["attestation_subjects"]):
         verification = None
         if complete:
-            verification = [
-                {
-                    "attestation": {},
-                    "verificationResult": {
-                        "statement": {
-                            "predicateType": subject._RELEASE_PROMOTION_PREDICATE_TYPE,  # noqa: SLF001
-                            "subject": [
+            assert predicate_context is not None
+            assert attestation_run is not None
+            verification = _promotion_verification(
+                context=predicate_context,
+                promotion_run=attestation_run,
+                execution_digest=execution_digest,
+                subjects=[item],
+            )
+        attestation_subjects.append(
+            {
+                **item,
+                "inventory": [
+                    {
+                        "attestations": (
+                            [
                                 {
-                                    "name": item["name"],
-                                    "digest": {"sha256": item["digest"].removeprefix("sha256:")},
+                                    "repository_id": 303,
+                                    "bundle_url": (
+                                        "https://example.invalid/attestations/"
+                                        f"final-promotion-{index}"
+                                    ),
+                                    "initiator": "user",
                                 }
-                            ],
-                            "predicate": {},
-                        }
-                    },
-                }
-            ]
-        attestation_subjects.append({**item, "verification": verification})
+                            ]
+                            if complete
+                            else []
+                        )
+                    }
+                ],
+                "verification": verification,
+                "authority_verification": authority_verification,
+            }
+        )
     expected_pypi = subject._candidate_pypi_files(manifest)  # noqa: SLF001
     if complete:
         pypi_project = _pypi_project_observation(manifest)
@@ -6179,12 +7483,20 @@ def _final_remote_source_envelopes(
         verification_files = []
         for filename, item in expected_pypi.items():
             provenance = _publish_provenance(filename, item["sha256"])
-            integrity_files.append({"filename": filename, "provenance": provenance})
+            provenance_raw = receipts.canonical_external_json_bytes(provenance)
+            integrity_files.append(
+                {
+                    "filename": filename,
+                    "provenance_response_base64": base64.b64encode(
+                        provenance_raw
+                    ).decode("ascii"),
+                }
+            )
             verification_files.append(
                 {
                     "filename": filename,
                     "distribution_sha256": item["sha256"],
-                    "provenance_sha256": _sha256(_canonical(provenance)),
+                    "provenance_sha256": _sha256(provenance_raw),
                     "exit_code": 0,
                 }
             )
@@ -6378,9 +7690,13 @@ def _final_reconciliation_cli_fixture(
             arguments.extend(["--execution-authorization", str(execution_path)])
         fresh_sources.extend(
             _final_remote_source_envelopes(
+                tmp_path,
                 manifest=manifest,
                 candidate=candidate,
                 transaction_digest=_sha256(transaction_raw),
+                execution_digest=(
+                    None if execution_raw is None else _sha256(execution_raw)
+                ),
                 capsule_digest=capsule_digest,
                 complete=actual_remote_complete,
             )
@@ -6391,6 +7707,252 @@ def _final_reconciliation_cli_fixture(
     }
     fresh_path.write_bytes(_canonical(fresh))
     return arguments, fresh_path, output_path
+
+
+def _attach_current_final_authority(
+    tmp_path: Path,
+    *,
+    arguments: list[str],
+    fresh_path: Path,
+    authority_binding_digest: str | None = None,
+    tamper_boundary_source: bool = False,
+) -> tuple[Path, Path]:
+    """Create the signed final authority and exact fresh boundary for one CLI fixture."""
+
+    def argument_path(name: str) -> Path:
+        return Path(arguments[arguments.index(name) + 1])
+
+    manifest_raw = argument_path("--manifest").read_bytes()
+    candidate, _repository_id = receipts._candidate_from_manifest(  # noqa: SLF001
+        manifest_raw
+    )
+    transaction_raw = argument_path("--transaction-authorization").read_bytes()
+    transaction_digest = _sha256(transaction_raw)
+    execution_digest = (
+        None
+        if "--execution-authorization" not in arguments
+        else _sha256(argument_path("--execution-authorization").read_bytes())
+    )
+    capsule = json.loads(argument_path("--recovery-capsule-verification").read_bytes())
+    capsule_digest = capsule["verification"]["capsule_manifest_digest"]
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    observed_at = now.isoformat().replace("+00:00", "Z")
+    expires_at = (now + timedelta(seconds=receipts.RECEIPT_LIFETIME_SECONDS)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    workflow_raw = (ROOT / ".github/workflows/release.yml").read_bytes()
+    workflow_digest = _sha256(workflow_raw)
+    intent = json.loads(argument_path("--dispatch-intent").read_bytes())
+    run_source = json.loads(argument_path("--run-observation").read_bytes())
+    run_body = json.loads(receipts.source_observation_body(_canonical(run_source)))
+    identity = json.loads(argument_path("--dispatch-identity").read_bytes())
+    promotion_run = subject._authorization_promotion_run(  # noqa: SLF001
+        run_observation=run_body,
+        run_observation_raw=_canonical(run_source),
+        identity=identity,
+        identity_raw=_canonical(identity),
+    )
+
+    raw, _signature = _contract_vector("github-authority")
+    authority = json.loads(raw)
+    authority.update(
+        {
+            "phase": "commit",
+            "mode": intent["inputs"]["mode"],
+            "candidate": candidate,
+            "promotion_run": promotion_run,
+            "environment": {"id": 903, "name": "release-commit"},
+            "bindings": {
+                "transaction_authorization_digest": (
+                    authority_binding_digest or transaction_digest
+                ),
+                "execution_authorization_digest": execution_digest,
+                "recovery_capsule_manifest_digest": capsule_digest,
+                "commit_marker_digest": None,
+            },
+            "installed_apps": [],
+            "observed_at": observed_at,
+            "expires_at": expires_at,
+            "maintenance_window_acknowledgement": {
+                "acknowledged_by_login": "John-MiracleWorker",
+                "acknowledged_by_id": 58918509,
+                "begins_at": observed_at,
+                "expires_at": expires_at,
+                "statement": authority["maintenance_window_acknowledgement"][
+                    "statement"
+                ],
+            },
+            "owner": {
+                "login": "John-MiracleWorker",
+                "id": 58918509,
+                "node_id": "MDQ6VXNlcjU4OTE4NTA5",
+                "type": "User",
+            },
+            "repository": {
+                "full_name": "John-MiracleWorker/Kestrel",
+                "id": 303,
+                "owner_login": "John-MiracleWorker",
+                "owner_id": 58918509,
+            },
+            "source_snapshots": [
+                {
+                    "name": "installed-apps-owner",
+                    "provider": "github.com",
+                    "locator": "GET /user/installations?per_page=100",
+                    "authenticated_as": "John-MiracleWorker",
+                    "freshness_class": "current",
+                    "captured_at": observed_at,
+                    "page_count": 1,
+                    "record_count": 0,
+                    "sha256": "sha256:" + "1" * 64,
+                    "size_bytes": 2,
+                    "complete": True,
+                }
+            ],
+            "ghcr_package": {
+                "state": "present",
+                "scope": "user",
+                "owner_login": "John-MiracleWorker",
+                "name": "kestrel",
+                "linked_repository": {
+                    "full_name": "John-MiracleWorker/Kestrel",
+                    "id": 303,
+                },
+                "inheritance_mode": "granular",
+                "direct_roles": [],
+                "team_roles": [],
+                "actions_access": [],
+                "upload_delete_principals": [
+                    {
+                        "kind": "repository",
+                        "id": 303,
+                        "name": "John-MiracleWorker/Kestrel",
+                        "capability": "upload",
+                    },
+                    {
+                        "kind": "user",
+                        "id": 58918509,
+                        "name": "John-MiracleWorker",
+                        "capability": "upload_and_delete",
+                    },
+                ],
+            },
+        }
+    )
+    authority["tag_ruleset"].update(
+        {
+            "id": 810,
+            "updated_at": observed_at,
+            "observation_digest": "sha256:" + "2" * 64,
+        }
+    )
+    authority["ingress_ruleset"].update(
+        {
+            "id": 811,
+            "updated_at": observed_at,
+            "observation_digest": "sha256:" + "3" * 64,
+        }
+    )
+    authority["workflow_ingress"].update(
+        {
+            "workflow_id": 707,
+            "default_branch_blob_sha256": workflow_digest,
+            "candidate_blob_sha256": workflow_digest,
+            "capsule_blob_sha256": workflow_digest,
+        }
+    )
+    receipts.validate_github_authority(authority)
+    authority_raw = _canonical(authority)
+    authority_signature = receipts.sign_receipt_detached(
+        receipt=authority_raw,
+        identity_file=_signing_identity(tmp_path),
+        principal=receipts.SIGNING_PRINCIPAL,
+        namespace=receipts.SIGNING_NAMESPACE,
+    )
+    owner_keys_raw = _canonical(_owner_signing_keys_observation(observed_at))
+    verification = receipts.verify_github_authority(
+        receipt=authority_raw,
+        signature=authority_signature,
+        owner_signing_keys_observation=owner_keys_raw,
+        expected_run_id=promotion_run["run_id"],
+        expected_candidate_digest=candidate["candidate_manifest_digest"],
+        expected_environment_id=903,
+        _clock=lambda: now,
+    )
+    verification_path = tmp_path / "final-github-authority-verification.json"
+    verification_path.write_bytes(_canonical(verification))
+
+    boundary_root = tmp_path / "final-boundary"
+    boundary_root.mkdir()
+
+    def write_source(name: str, body: object | bytes) -> None:
+        boundary_root.joinpath(f"{name}.json").write_bytes(
+            _canonical(_final_source_envelope(name, body))
+        )
+
+    boundary_root.joinpath("owner-signing-keys-observation.json").write_bytes(
+        owner_keys_raw
+    )
+    write_source("tag-ruleset-detail-observation", authority["tag_ruleset"])
+    ingress = copy.deepcopy(authority["ingress_ruleset"])
+    if tamper_boundary_source:
+        ingress["updated_at"] = (now + timedelta(seconds=1)).isoformat().replace(
+            "+00:00", "Z"
+        )
+    write_source("ingress-ruleset-detail-observation", ingress)
+    workflow = {
+        "id": 707,
+        "path": ".github/workflows/release.yml",
+        "state": "active",
+        "default_branch": "main",
+    }
+    write_source("workflow-observation", workflow)
+    write_source("default-branch-workflow-contents", workflow_raw)
+    write_source("candidate-workflow-contents", workflow_raw)
+    write_source(
+        "main-branch-observation",
+        {"name": "main", "commit": {"sha": candidate["source_sha"]}},
+    )
+    write_source("immutable-releases-observation", {"enabled": True})
+    for environment_name, environment_id in (
+        ("release", 901),
+        ("release-prepare", 902),
+        ("release-commit", 903),
+        ("pypi", 904),
+    ):
+        write_source(
+            f"environment-{environment_name}-observation",
+            _environment_gate_observation(environment_name, environment_id),
+        )
+        write_source(
+            f"environment-{environment_name}-policies-observation",
+            _environment_policy_observation(environment_id),
+        )
+
+    fresh = json.loads(fresh_path.read_bytes())
+    replacement_sources = {
+        "default-branch-workflow-contents": workflow_raw,
+        "ingress-ruleset-detail-observation": authority["ingress_ruleset"],
+        "workflow-observation": workflow,
+    }
+    fresh["sources"] = [
+        _final_source_envelope(name, replacement_sources[name])
+        if (name := str(source["name"])) in replacement_sources
+        else source
+        for source in fresh["sources"]
+    ]
+    fresh_path.write_bytes(_canonical(fresh))
+
+    arguments.extend(
+        [
+            "--final-github-authority-verification",
+            str(verification_path),
+            "--final-boundary-root",
+            str(boundary_root),
+        ]
+    )
+    return verification_path, boundary_root
 
 
 def test_reconciliation_stage_chain_binds_authority_and_previous_bytes(
@@ -6525,6 +8087,47 @@ def test_final_lock_proof_requires_active_exact_ingress() -> None:
         )
 
 
+def test_final_lock_sources_allow_advanced_main_only_during_tag_recovery() -> None:
+    proof = _final_lock_proof()
+    tagged_workflow = b"name: tagged release transaction\n"
+    advanced_workflow = b"name: advanced release transaction\n"
+
+    subject._validate_final_lock_sources(  # noqa: SLF001
+        main_lock=proof["main_lock"],
+        workflow=proof["workflow"],
+        default_branch_workflow=advanced_workflow,
+        expected_workflow=tagged_workflow,
+        transaction_mode="recover_committed",
+    )
+
+    with pytest.raises(ValueError, match="ingress byte source"):
+        subject._validate_final_lock_sources(  # noqa: SLF001
+            main_lock=proof["main_lock"],
+            workflow=proof["workflow"],
+            default_branch_workflow=advanced_workflow,
+            expected_workflow=tagged_workflow,
+            transaction_mode="initiate",
+        )
+
+
+def test_failed_pypi_publisher_stays_uncertain_when_files_become_visible() -> None:
+    filenames = ("nested_memvid_agent-1.2.3-py3-none-any.whl", "nested_memvid_agent-1.2.3.tar.gz")
+
+    assert subject._pypi_publication_outcome(  # noqa: SLF001
+        pre_missing=filenames,
+        post_missing=(),
+        publisher_outcome="failure",
+    ) == "unknown"
+
+
+def test_pypi_recovery_treats_preexisting_exact_files_as_noop() -> None:
+    assert subject._pypi_publication_outcome(  # noqa: SLF001
+        pre_missing=(),
+        post_missing=(),
+        publisher_outcome="skipped",
+    ) == "existing_exact"
+
+
 def test_final_reconcile_without_candidate_records_truthful_nulls(
     tmp_path: Path,
 ) -> None:
@@ -6566,7 +8169,7 @@ def test_final_reconcile_derives_each_partial_stage_as_pending(
 
 
 @pytest.mark.parametrize("mode", ["initiate", "recover_committed"])
-def test_final_reconcile_full_success_requires_exact_lock_proof(
+def test_final_reconcile_full_remote_success_stays_pending_without_final_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
@@ -6587,12 +8190,82 @@ def test_final_reconcile_full_success_requires_exact_lock_proof(
     assert subject.main(arguments) == 0
     record = json.loads(output.read_bytes())
     assert len(record["stage_chain"]) == 4
-    assert record["completed"] is True
+    assert record["completed"] is False
     assert record["uncertain"] is False
-    assert record["pending"] is False
-    assert record["lock_release_permitted"] is True
+    assert record["pending"] is True
+    assert record["lock_release_permitted"] is False
+    assert record["next_action"] == "reconcile"
     assert (record["execution_authorization_digest"] is not None) is (mode == "recover_committed")
     assert len(provenance_calls) == 1
+
+
+def test_final_reconcile_current_bound_authority_releases_the_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject, "_validate_pypi_provenance_evidence", lambda **_: [])
+    arguments, fresh_path, output = _final_reconciliation_cli_fixture(
+        tmp_path,
+        mode="initiate",
+        stage_count=4,
+    )
+    _attach_current_final_authority(
+        tmp_path,
+        arguments=arguments,
+        fresh_path=fresh_path,
+    )
+
+    assert subject.main(arguments) == 0
+    record = json.loads(output.read_bytes())
+    assert record["completed"] is True
+    assert record["pending"] is False
+    assert record["uncertain"] is False
+    assert record["lock_release_permitted"] is True
+    assert record["next_action"] == "none"
+
+
+@pytest.mark.parametrize("tamper", ["authority-binding", "boundary-source"])
+def test_final_reconcile_authority_or_boundary_tamper_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    monkeypatch.setattr(subject, "_validate_pypi_provenance_evidence", lambda **_: [])
+    arguments, fresh_path, output = _final_reconciliation_cli_fixture(
+        tmp_path,
+        mode="initiate",
+        stage_count=4,
+    )
+    _attach_current_final_authority(
+        tmp_path,
+        arguments=arguments,
+        fresh_path=fresh_path,
+        authority_binding_digest=(
+            "sha256:" + "9" * 64 if tamper == "authority-binding" else None
+        ),
+        tamper_boundary_source=tamper == "boundary-source",
+    )
+
+    assert subject.main(arguments) == 1
+    assert not output.exists()
+
+
+def test_final_reconcile_observation_failure_still_writes_locked_receipt(
+    tmp_path: Path,
+) -> None:
+    arguments, _fresh_path, output = _final_reconciliation_cli_fixture(
+        tmp_path,
+        mode="initiate",
+        stage_count=None,
+    )
+    arguments[arguments.index("--failure-code") + 1] = "final_observation_failed"
+
+    assert subject.main(arguments) == 0
+    record = json.loads(output.read_bytes())
+    assert record["failure_code"] == "final_observation_failed"
+    assert record["completed"] is False
+    assert record["pending"] is True
+    assert record["lock_release_permitted"] is False
 
 
 def test_final_reconcile_full_stage_chain_stays_locked_when_remote_evidence_is_incomplete(
@@ -6790,6 +8463,877 @@ def test_pinned_github_transport_sends_body_once_and_keeps_token_internal() -> N
 
 
 @pytest.mark.parametrize(
+    "target",
+    [
+        "GET /repos/John-MiracleWorker/Kestrel-evil",
+        "GET /repos/John-MiracleWorker/KestrelReleaseRecovery",
+    ],
+)
+def test_prerequisite_reader_rejects_repository_prefix_confusion(target: str) -> None:
+    with pytest.raises(ValueError, match="pinned origin"):
+        subject.DirectGitHubReadAPI._validate_request_target(target)  # noqa: SLF001
+
+
+def test_prerequisite_reader_follows_one_pinned_asset_redirect_without_auth() -> None:
+    class Response:
+        def __init__(
+            self, *, status: int, body: bytes, headers: list[tuple[str, str]]
+        ) -> None:
+            self.status = status
+            self.body = body
+            self.headers = headers
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return self.headers
+
+        def read(self, amount: int | None = None) -> bytes:
+            assert amount == receipts.MAX_SOURCE_BODY_BYTES + 1
+            return self.body
+
+    class Connection:
+        def __init__(self, response: Response) -> None:
+            self.response = response
+            self.requests: list[tuple[str, str]] = []
+            self.headers: list[tuple[str, str]] = []
+            self.closed = False
+
+        def connect(self) -> None:
+            return None
+
+        def putrequest(
+            self,
+            method: str,
+            target: str,
+            skip_host: bool = False,
+            skip_accept_encoding: bool = False,
+        ) -> None:
+            assert skip_host is False
+            assert skip_accept_encoding is True
+            self.requests.append((method, target))
+
+        def putheader(self, name: str, value: str) -> None:
+            self.headers.append((name, value))
+
+        def endheaders(self) -> None:
+            return None
+
+        def getresponse(self) -> Response:
+            return self.response
+
+        def close(self) -> None:
+            self.closed = True
+
+    location = (
+        "https://release-assets.githubusercontent.com/"
+        "github-production-release-asset/1/example?sp=r&sig=exact"
+    )
+    api_connection = Connection(
+        Response(status=302, body=b"", headers=[("Location", location)])
+    )
+    asset_connection = Connection(Response(status=200, body=b"authority", headers=[]))
+    calls: list[str] = []
+
+    def factory(host: str, context: ssl.SSLContext, timeout: float) -> Connection:
+        assert context.check_hostname is True
+        assert timeout == 30.0
+        calls.append(host)
+        return api_connection if host == "api.github.com" else asset_connection
+
+    api = subject.DirectGitHubReadAPI(
+        token=b"qualified-reader-token",
+        connection_factory=factory,
+    )
+
+    exchange = api(
+        "GET /repos/John-MiracleWorker/Kestrel-Release-Recovery/"
+        "releases/assets/101",
+        accept="application/octet-stream",
+    )
+
+    assert exchange.http_status == 200
+    assert exchange.response_body == b"authority"
+    assert calls == ["api.github.com", "release-assets.githubusercontent.com"]
+    assert any(name == "Authorization" for name, _value in api_connection.headers)
+    assert all(name != "Authorization" for name, _value in asset_connection.headers)
+    assert asset_connection.requests == [
+        (
+            "GET",
+            "/github-production-release-asset/1/example?sp=r&sig=exact",
+        )
+    ]
+    assert api_connection.closed is True
+    assert asset_connection.closed is True
+
+
+def test_ghcr_reader_follows_one_pinned_blob_redirect_without_auth() -> None:
+    body = b"exact GHCR object bytes"
+    digest = _sha256(body)
+
+    class Response:
+        def __init__(
+            self, *, status: int, body: bytes, headers: list[tuple[str, str]]
+        ) -> None:
+            self.status = status
+            self._body = io.BytesIO(body)
+            self._headers = headers
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return self._headers
+
+        def read(self, amount: int | None = None) -> bytes:
+            return self._body.read() if amount is None else self._body.read(amount)
+
+    class Connection:
+        def __init__(self, response: Response) -> None:
+            self.response = response
+            self.requests: list[tuple[str, str]] = []
+            self.headers: list[tuple[str, str]] = []
+            self.closed = False
+
+        def connect(self) -> None:
+            return None
+
+        def putrequest(
+            self,
+            method: str,
+            target: str,
+            skip_host: bool = False,
+            skip_accept_encoding: bool = False,
+        ) -> None:
+            assert skip_host is False
+            assert skip_accept_encoding is True
+            self.requests.append((method, target))
+
+        def putheader(self, name: str, value: str) -> None:
+            self.headers.append((name, value))
+
+        def endheaders(self) -> None:
+            return None
+
+        def getresponse(self) -> Response:
+            return self.response
+
+        def close(self) -> None:
+            self.closed = True
+
+    location = (
+        "https://pkg-containers.githubusercontent.com/ghcrblobs01/blobs/"
+        f"{digest}?se=exact&sig=exact&sp=r&spr=https&sr=b&sv=2025"
+    )
+    registry_connection = Connection(
+        Response(
+            status=307,
+            body=b"",
+            headers=[("Location", location)],
+        )
+    )
+    storage_connection = Connection(Response(status=200, body=body, headers=[]))
+    calls: list[str] = []
+
+    def factory(host: str, context: ssl.SSLContext, timeout: float) -> Connection:
+        assert context.check_hostname is True
+        assert timeout == 30.0
+        calls.append(host)
+        return registry_connection if host == "ghcr.io" else storage_connection
+
+    api = subject.DirectOCIReadAPI(
+        token=b"exact-registry-bearer",
+        connection_factory=factory,
+    )
+
+    observation = api.read_digest(kind="blobs", digest=digest, max_bytes=1024)
+
+    assert observation == subject.OCIReadObservation(
+        http_status=200,
+        observed_digest=digest,
+        size_bytes=len(body),
+    )
+    assert calls == ["ghcr.io", "pkg-containers.githubusercontent.com"]
+    assert any(name == "Authorization" for name, _value in registry_connection.headers)
+    assert all(name != "Authorization" for name, _value in storage_connection.headers)
+    assert registry_connection.closed is True
+    assert storage_connection.closed is True
+
+
+def test_ghcr_reader_rejects_unpinned_redirect_before_replaying_auth() -> None:
+    digest = "sha256:" + "a" * 64
+
+    with pytest.raises(ValueError, match="pinned storage origin"):
+        subject.DirectOCIReadAPI._redirect_target(  # noqa: SLF001
+            (
+                "https://attacker.example/ghcrblobs14/blobs/"
+                f"{digest}?se=x&sig=bad&sp=r&spr=https&sr=b&sv=2025"
+            ),
+            digest=digest,
+        )
+
+
+def test_ghcr_writer_sends_auth_and_body_only_to_the_pinned_registry() -> None:
+    blob = b"exact candidate blob"
+    blob_digest = _sha256(blob)
+    manifest = b'{"mediaType":"application/vnd.oci.image.manifest.v1+json"}'
+    manifest_digest = _sha256(manifest)
+
+    class Response:
+        def __init__(self, status: int, headers: list[tuple[str, str]]) -> None:
+            self.status = status
+            self._headers = headers
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return self._headers
+
+        def read(self, amount: int | None = None) -> bytes:
+            assert amount == subject.MAX_TRANSPORT_RESPONSE_BYTES + 1
+            return b""
+
+    class Connection:
+        def __init__(self, response: Response) -> None:
+            self.response = response
+            self.requests: list[tuple[str, str]] = []
+            self.headers: list[tuple[str, str]] = []
+            self.sent: list[bytes] = []
+            self.closed = False
+
+        def connect(self) -> None:
+            return None
+
+        def putrequest(
+            self,
+            method: str,
+            target: str,
+            skip_host: bool = False,
+            skip_accept_encoding: bool = False,
+        ) -> None:
+            assert skip_host is False
+            assert skip_accept_encoding is True
+            self.requests.append((method, target))
+
+        def putheader(self, name: str, value: str) -> None:
+            self.headers.append((name, value))
+
+        def endheaders(
+            self, message_body: bytes | None = None, *, encode_chunked: bool = False
+        ) -> None:
+            assert message_body is None
+            assert encode_chunked is False
+
+        def send(self, data: bytes) -> None:
+            self.sent.append(data)
+
+        def getresponse(self) -> Response:
+            return self.response
+
+        def close(self) -> None:
+            self.closed = True
+
+    connections = iter(
+        (
+            Connection(
+                Response(
+                    202,
+                    [
+                        (
+                            "Location",
+                            "https://ghcr.io/v2/john-miracleworker/kestrel/"
+                            "blobs/uploads/exact-upload?_state=exact",
+                        )
+                    ],
+                )
+            ),
+            Connection(
+                Response(201, [("Docker-Content-Digest", blob_digest)])
+            ),
+            Connection(
+                Response(201, [("Docker-Content-Digest", manifest_digest)])
+            ),
+        )
+    )
+    created: list[tuple[str, Connection]] = []
+
+    def factory(host: str, context: ssl.SSLContext, timeout: float) -> Connection:
+        assert host == "ghcr.io"
+        assert context.check_hostname is True
+        assert timeout == 30.0
+        connection = next(connections)
+        created.append((host, connection))
+        return connection
+
+    writer = subject.DirectOCIWriteAPI(
+        token=b"exact-registry-bearer",
+        connection_factory=factory,
+    )
+
+    writer.upload_blob(digest=blob_digest, content=blob)
+    writer.put_manifest(
+        digest=manifest_digest,
+        media_type="application/vnd.oci.image.manifest.v1+json",
+        content=manifest,
+    )
+
+    assert [host for host, _connection in created] == ["ghcr.io"] * 3
+    assert created[0][1].requests == [
+        ("POST", "/v2/john-miracleworker/kestrel/blobs/uploads/")
+    ]
+    assert created[1][1].requests[0][0] == "PUT"
+    assert "digest=sha256%3A" in created[1][1].requests[0][1]
+    assert created[1][1].sent == [blob]
+    assert created[2][1].sent == [manifest]
+    assert all(
+        any(name == "Authorization" for name, _value in connection.headers)
+        for _host, connection in created
+    )
+
+
+def test_ghcr_writer_rejects_an_unpinned_upload_location_before_auth_replay() -> None:
+    digest = "sha256:" + "a" * 64
+
+    with pytest.raises(ValueError, match="pinned registry origin"):
+        subject.DirectOCIWriteAPI._upload_target(  # noqa: SLF001
+            "https://attacker.example/v2/john-miracleworker/kestrel/"
+            "blobs/uploads/exact?_state=bad",
+            digest=digest,
+        )
+
+
+def test_ghcr_push_token_uses_the_bound_workflow_actor_principal() -> None:
+    credential = b"github-token-at-least-twenty-bytes"
+    connection = FakeHTTPSConnection(
+        response=FakeHTTPResponse(
+            status=200,
+            body=_canonical({"token": "registry-bearer-token"}),
+        )
+    )
+
+    token = subject.fetch_ghcr_push_token(
+        credential,
+        principal="kestrel-release-dispatcher[bot]",
+        connection_factory=lambda host, context, timeout: connection,
+    )
+
+    assert token == "registry-bearer-token"
+    assert connection.requests == [
+        (
+            "GET",
+            "/token?service=ghcr.io&scope=repository:"
+            "john-miracleworker/kestrel:pull,push",
+            False,
+            True,
+        )
+    ]
+    authorization = next(
+        values for name, values in connection.headers if name == "Authorization"
+    )[0]
+    assert base64.b64decode(authorization.removeprefix("Basic ")) == (
+        b"kestrel-release-dispatcher[bot]:" + credential
+    )
+
+
+def test_prerequisite_pagination_consumes_the_complete_pinned_link_chain() -> None:
+    calls: list[str] = []
+    next_url = (
+        "https://api.github.com/users/John-MiracleWorker/"
+        "ssh_signing_keys?page=2&per_page=100"
+    )
+
+    def api(request_target: str, *, accept: str) -> subject.GitHubReadExchange:
+        assert accept == "application/vnd.github+json"
+        calls.append(request_target)
+        if len(calls) == 1:
+            return subject.GitHubReadExchange(
+                http_status=200,
+                response_headers=(("link", f'<{next_url}>; rel="next"'),),
+                response_body=_canonical([{"id": 1}]),
+            )
+        return subject.GitHubReadExchange(
+            http_status=200,
+            response_headers=(),
+            response_body=_canonical([{"id": 2}]),
+        )
+
+    raw, items = subject._boundary_paginated_source(  # noqa: SLF001
+        api,
+        request_target="GET /users/John-MiracleWorker/ssh_signing_keys?per_page=100",
+        locator="GET /users/John-MiracleWorker/ssh_signing_keys?per_page=100",
+        label="owner signing keys",
+    )
+
+    assert calls == [
+        "GET /users/John-MiracleWorker/ssh_signing_keys?per_page=100",
+        "GET /users/John-MiracleWorker/ssh_signing_keys?page=2&per_page=100",
+    ]
+    assert items == [{"id": 1}, {"id": 2}]
+    pages = json.loads(raw)["pages"]
+    assert [page["request_url"] for page in pages] == [
+        "GET /users/John-MiracleWorker/ssh_signing_keys?per_page=100",
+        next_url,
+    ]
+
+
+def test_boundary_authority_fetch_polls_then_downloads_exact_immutable_assets(
+    tmp_path: Path,
+) -> None:
+    expected_assets = {
+        "approval-history-observation.json": b"approval",
+        "owner-signing-keys-observation.json": b"keys",
+        **{
+            name: name.encode("ascii")
+            for name in subject._BOUNDARY_CREDENTIAL_ASSETS  # noqa: SLF001
+        },
+    }
+    assets = [
+        {
+            "id": 100 + index,
+            "name": name,
+            "size": len(body),
+        }
+        for index, (name, body) in enumerate(sorted(expected_assets.items()))
+    ]
+    release = _canonical(
+        {
+            "tag_name": "release-preparation-authority-707-1",
+            "name": "release-preparation-authority-707-1",
+            "body": "Kestrel prepare authority for promotion run 707",
+            "draft": False,
+            "prerelease": False,
+            "immutable": True,
+            "assets": assets,
+        }
+    )
+    calls: list[tuple[str, str]] = []
+    release_polls = 0
+
+    def api(request_target: str, *, accept: str) -> subject.GitHubReadExchange:
+        nonlocal release_polls
+        calls.append((request_target, accept))
+        if request_target == "GET /user":
+            return subject.GitHubReadExchange(
+                http_status=200,
+                response_headers=(),
+                response_body=_canonical(
+                    {"login": "John-MiracleWorker", "id": 58918509, "type": "User"}
+                ),
+            )
+        if request_target == (
+            "GET /repos/John-MiracleWorker/Kestrel-Release-Recovery"
+        ):
+            return subject.GitHubReadExchange(
+                http_status=200,
+                response_headers=(),
+                response_body=_canonical(
+                    {
+                        "id": 808,
+                        "full_name": "John-MiracleWorker/Kestrel-Release-Recovery",
+                        "private": True,
+                        "visibility": "private",
+                        "archived": False,
+                        "disabled": False,
+                        "owner": {
+                            "login": "John-MiracleWorker",
+                            "id": 58918509,
+                            "type": "User",
+                        },
+                    }
+                ),
+            )
+        if "/releases/tags/" in request_target:
+            release_polls += 1
+            return subject.GitHubReadExchange(
+                http_status=404 if release_polls == 1 else 200,
+                response_headers=(),
+                response_body=b"{}" if release_polls == 1 else release,
+            )
+        asset_id = int(request_target.rsplit("/", 1)[1])
+        asset = next(item for item in assets if item["id"] == asset_id)
+        return subject.GitHubReadExchange(
+            http_status=200,
+            response_headers=(),
+            response_body=expected_assets[asset["name"]],
+        )
+
+    sleeps: list[float] = []
+    ticks = iter((0.0, 0.0, 5.0))
+    output = tmp_path / "authority"
+    written = subject.fetch_github_boundary_authority(
+        boundary="prepare",
+        run_id=707,
+        output_dir=output,
+        api=api,
+        timeout_seconds=30.0,
+        poll_interval_seconds=5.0,
+        _monotonic=lambda: next(ticks),
+        _sleep=sleeps.append,
+    )
+
+    assert written == tuple(sorted(expected_assets))
+    assert sleeps == [5.0]
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == expected_assets
+    assert calls[1] == calls[2]
+    assert all(accept == "application/octet-stream" for _, accept in calls[3:])
+
+
+def _write_boundary_authority_asset_root(root: Path, *, boundary: str) -> None:
+    root.mkdir()
+    _tag_prefix, authority_stem, extra_assets = subject._BOUNDARY_AUTHORITY_RELEASES[  # noqa: SLF001
+        boundary
+    ]
+    names = {
+        "owner-signing-keys-observation.json",
+        *extra_assets,
+    }
+    if authority_stem is not None:
+        names.update({f"{authority_stem}.json", f"{authority_stem}.json.sig"})
+    for name in names:
+        body = b"signature" if name.endswith(".sig") else b"{}"
+        (root / name).write_bytes(body)
+
+
+def test_boundary_authority_publisher_creates_one_exact_immutable_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_root = tmp_path / "assets"
+    _write_boundary_authority_asset_root(asset_root, boundary="final")
+    api = FakeTerminalReleaseAPI()
+    verification_calls: list[str] = []
+
+    def verify_runtime_credential(**kwargs: object) -> dict[str, object]:
+        token = kwargs["token_bytes"]
+        assert type(token) is bytes
+        verification_calls.append(token.decode("ascii"))
+        return {"validation_status": "validated"}
+
+    monkeypatch.setattr(receipts, "verify_runtime_credential", verify_runtime_credential)
+    journal = tmp_path / "boundary-publication.json"
+    reader_calls: list[str] = []
+
+    def recovery_reader(
+        request_target: str, *, accept: str
+    ) -> subject.GitHubReadExchange:
+        reader_calls.append(request_target)
+        if request_target == "GET /user":
+            return subject.GitHubReadExchange(
+                http_status=200,
+                response_headers=(),
+                response_body=_canonical(
+                    {"login": "John-MiracleWorker", "id": 58918509, "type": "User"}
+                ),
+            )
+        if request_target == (
+            "GET /repos/John-MiracleWorker/Kestrel-Release-Recovery"
+        ):
+            return subject.GitHubReadExchange(
+                http_status=200,
+                response_headers=(),
+                response_body=_canonical(
+                    {
+                        "id": 808,
+                        "full_name": "John-MiracleWorker/Kestrel-Release-Recovery",
+                        "private": True,
+                        "visibility": "private",
+                        "archived": False,
+                        "disabled": False,
+                        "owner": {
+                            "login": "John-MiracleWorker",
+                            "id": 58918509,
+                            "type": "User",
+                        },
+                    }
+                ),
+            )
+        if "/releases/tags/" in request_target:
+            if not api.releases:
+                return subject.GitHubReadExchange(
+                    http_status=404,
+                    response_headers=(),
+                    response_body=b"{}",
+                )
+            release = api.releases[0]
+            return subject.GitHubReadExchange(
+                http_status=200,
+                response_headers=(),
+                response_body=_canonical(
+                    {
+                        "tag_name": release.tag_name,
+                        "name": release.name,
+                        "body": release.body,
+                        "draft": release.draft,
+                        "prerelease": release.prerelease,
+                        "immutable": release.immutable,
+                        "assets": [
+                            {
+                                "id": asset.asset_id,
+                                "name": asset.name,
+                                "size": asset.size_bytes,
+                            }
+                            for asset in release.assets
+                        ],
+                    }
+                ),
+            )
+        asset_id = int(request_target.rsplit("/", 1)[1])
+        asset = next(
+            asset for asset in api.releases[0].assets if asset.asset_id == asset_id
+        )
+        return subject.GitHubReadExchange(
+            http_status=200,
+            response_headers=(),
+            response_body=(asset_root / asset.name).read_bytes(),
+        )
+
+    receipt = subject.publish_github_boundary_authority(
+        boundary="final",
+        run_id=707,
+        candidate_manifest_digest="sha256:" + "a" * 64,
+        environment_id=505,
+        asset_root=asset_root,
+        journal_path=journal,
+        credential_tokens={
+            "recovery-reader": b"recovery-reader-token",
+            "release-guard": b"release-guard-token",
+        },
+        api=api,
+        recovery_reader_api=recovery_reader,
+    )
+
+    assert verification_calls == [
+        "recovery-reader-token",
+        "release-guard-token",
+    ]
+    assert receipt["tag_name"] == "release-final-authority-707-1"
+    assert receipt["immutable"] is True
+    assert api.create_calls == 1
+    assert api.publish_calls == 1
+    assert api.upload_calls == sorted(path.name for path in asset_root.iterdir())
+    assert journal.is_file()
+    assert reader_calls[0] == "GET /user"
+    assert len(reader_calls) == len(tuple(asset_root.iterdir())) + 5
+
+    replay = subject.publish_github_boundary_authority(
+        boundary="final",
+        run_id=707,
+        candidate_manifest_digest="sha256:" + "a" * 64,
+        environment_id=505,
+        asset_root=asset_root,
+        journal_path=journal,
+        credential_tokens={
+            "recovery-reader": b"recovery-reader-token",
+            "release-guard": b"release-guard-token",
+        },
+        api=api,
+        recovery_reader_api=recovery_reader,
+    )
+
+    assert replay == receipt
+    assert api.create_calls == 1
+    assert api.publish_calls == 1
+    assert api.upload_calls == sorted(path.name for path in asset_root.iterdir())
+
+
+def test_boundary_authority_publisher_rejects_incomplete_assets_before_mutation(
+    tmp_path: Path,
+) -> None:
+    asset_root = tmp_path / "assets"
+    _write_boundary_authority_asset_root(asset_root, boundary="final")
+    (asset_root / "release-guard-endpoint-probes.json").unlink()
+    api = FakeTerminalReleaseAPI()
+
+    with pytest.raises(ValueError, match="asset inventory"):
+        subject.publish_github_boundary_authority(
+            boundary="final",
+            run_id=707,
+            candidate_manifest_digest="sha256:" + "a" * 64,
+            environment_id=505,
+            asset_root=asset_root,
+            journal_path=tmp_path / "boundary-publication.json",
+            credential_tokens={
+                "recovery-reader": b"recovery-reader-token",
+                "release-guard": b"release-guard-token",
+            },
+            api=api,
+            recovery_reader_api=lambda request_target, *, accept: subject.GitHubReadExchange(
+                http_status=500,
+                response_headers=(),
+                response_body=b"{}",
+            ),
+        )
+
+    assert api.create_calls == 0
+    assert api.upload_calls == []
+    assert api.publish_calls == 0
+
+
+def test_pypi_boundary_publisher_verifies_pypi_authority_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_root = tmp_path / "assets"
+    _write_boundary_authority_asset_root(asset_root, boundary="pypi")
+    api = FakeTerminalReleaseAPI()
+    monkeypatch.setattr(
+        receipts,
+        "verify_github_authority",
+        lambda **_: {"validation_status": "validated"},
+    )
+    monkeypatch.setattr(
+        receipts,
+        "verify_runtime_credential",
+        lambda **_: {"validation_status": "validated"},
+    )
+    monkeypatch.setattr(
+        receipts,
+        "verify_pypi_authority",
+        lambda **_: (_ for _ in ()).throw(ValueError("untrusted PyPI authority")),
+    )
+
+    with pytest.raises(ValueError, match="untrusted PyPI authority"):
+        subject.publish_github_boundary_authority(
+            boundary="pypi",
+            run_id=707,
+            candidate_manifest_digest="sha256:" + "a" * 64,
+            environment_id=505,
+            asset_root=asset_root,
+            journal_path=tmp_path / "boundary-publication.json",
+            credential_tokens={
+                "recovery-reader": b"recovery-reader-token",
+                "release-guard": b"release-guard-token",
+            },
+            api=api,
+            recovery_reader_api=lambda request_target, *, accept: subject.GitHubReadExchange(
+                http_status=500,
+                response_headers=(),
+                response_body=b"{}",
+            ),
+        )
+
+    assert api.create_calls == 0
+    assert api.upload_calls == []
+    assert api.publish_calls == 0
+
+
+def test_boundary_authority_publisher_requires_independent_reader_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_root = tmp_path / "assets"
+    _write_boundary_authority_asset_root(asset_root, boundary="final")
+    api = FakeTerminalReleaseAPI()
+    monkeypatch.setattr(
+        receipts,
+        "verify_github_authority",
+        lambda **_: {"validation_status": "validated"},
+    )
+    monkeypatch.setattr(
+        receipts,
+        "verify_runtime_credential",
+        lambda **_: {"validation_status": "validated"},
+    )
+
+    with pytest.raises(ValueError, match="recovery reader identity"):
+        subject.publish_github_boundary_authority(
+            boundary="final",
+            run_id=707,
+            candidate_manifest_digest="sha256:" + "a" * 64,
+            environment_id=505,
+            asset_root=asset_root,
+            journal_path=tmp_path / "boundary-publication.json",
+            credential_tokens={
+                "recovery-reader": b"recovery-reader-token",
+                "release-guard": b"release-guard-token",
+            },
+            api=api,
+            recovery_reader_api=lambda request_target, *, accept: (
+                subject.GitHubReadExchange(
+                    http_status=403,
+                    response_headers=(),
+                    response_body=b"{}",
+                )
+            ),
+        )
+
+    assert api.create_calls == 0
+    assert api.publish_calls == 0
+
+
+def test_boundary_authority_publisher_preflights_reader_repository_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_root = tmp_path / "assets"
+    _write_boundary_authority_asset_root(asset_root, boundary="final")
+    api = FakeTerminalReleaseAPI()
+    monkeypatch.setattr(
+        receipts,
+        "verify_github_authority",
+        lambda **_: {"validation_status": "validated"},
+    )
+    monkeypatch.setattr(
+        receipts,
+        "verify_runtime_credential",
+        lambda **_: {"validation_status": "validated"},
+    )
+
+    def reader(request_target: str, *, accept: str) -> subject.GitHubReadExchange:
+        if request_target == "GET /user":
+            return subject.GitHubReadExchange(
+                http_status=200,
+                response_headers=(),
+                response_body=_canonical(
+                    {"login": "John-MiracleWorker", "id": 58918509, "type": "User"}
+                ),
+            )
+        return subject.GitHubReadExchange(
+            http_status=404,
+            response_headers=(),
+            response_body=b"{}",
+        )
+
+    with pytest.raises(ValueError, match="repository access"):
+        subject.publish_github_boundary_authority(
+            boundary="final",
+            run_id=707,
+            candidate_manifest_digest="sha256:" + "a" * 64,
+            environment_id=505,
+            asset_root=asset_root,
+            journal_path=tmp_path / "boundary-publication.json",
+            credential_tokens={
+                "recovery-reader": b"recovery-reader-token",
+                "release-guard": b"release-guard-token",
+            },
+            api=api,
+            recovery_reader_api=reader,
+        )
+
+    assert api.create_calls == 0
+    assert api.publish_calls == 0
+
+
+def test_boundary_authority_publisher_is_exposed_as_a_controller_command() -> None:
+    parser = subject._parser()  # noqa: SLF001
+
+    arguments = parser.parse_args(
+        [
+            "publish-github-boundary-authority",
+            "--boundary",
+            "commit",
+            "--run-id",
+            "707",
+            "--candidate-manifest-digest",
+            "sha256:" + "a" * 64,
+            "--environment-id",
+            "505",
+            "--asset-root",
+            "authority-assets",
+            "--journal",
+            "authority-publication.json",
+            "--output",
+            "authority-publication-receipt.json",
+        ]
+    )
+
+    assert arguments.handler is subject._command_publish_github_boundary_authority  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
     ("fail_at", "may_have_reached"),
     [("connect", False), ("endheaders", True)],
 )
@@ -6887,12 +9431,15 @@ def test_promotion_cli_exposes_the_exact_transaction_command_set() -> None:
     assert command_action.choices is not None
     assert set(command_action.choices) == {
         "authorize",
+        "capture-prerequisite-boundary",
         "contain-dispatch",
         "create-dispatch-intent",
+        "fetch-github-boundary-authority",
         "inspect-prerequisites",
         "plan-commit",
         "plan-preparation",
         "prepare-dispatch",
+        "publish-github-boundary-authority",
         "publish-dispatch-admission",
         "publish-dispatch-tombstone",
         "reconcile",
@@ -6903,6 +9450,7 @@ def test_promotion_cli_exposes_the_exact_transaction_command_set() -> None:
         "send-dispatch",
         "tag-message",
         "verify-github-ghcr",
+        "verify-github-boundary-binding",
         "verify-recovery-capsule",
     }
 
