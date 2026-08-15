@@ -890,11 +890,32 @@ def test_recovery_capsule_locator_comes_from_the_committed_publication_receipt()
         if step.get("name") == "Bootstrap and verify the immutable recovery capsule"
     )["run"]
 
-    for run in (download, bootstrap):
+    downstream = [
+        next(
+            step["run"]
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("name") == step_name
+        )
+        for job_name, step_name in (
+            (
+                "commit-github-release",
+                "Reverify the immutable recovery capsule before commit",
+            ),
+            (
+                "verify-github-ghcr",
+                "Reverify the immutable recovery capsule before surface verification",
+            ),
+            (
+                "publish-pypi",
+                "Reverify the immutable recovery capsule before PyPI admission",
+            ),
+        )
+    ]
+
+    for run in (download, bootstrap, *downstream):
         assert "recovery-${PROMOTION_RUN_ID}-1" not in run
         assert 'publication["tag"]' in run
-    assert "recovery-capsule-publication.json" in download
-    assert "recovery-capsule-publication.json" in bootstrap
+        assert "recovery-capsule-publication.json" in run
 
 
 def test_recovery_candidate_and_original_authorization_are_capsule_only() -> None:
@@ -985,6 +1006,154 @@ def test_capsule_verification_never_reintroduces_the_checkout_with_pythonpath() 
     )
 
 
+def test_capsule_activation_quarantines_checkout_scripts_before_recovered_commands() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    jobs = workflow["jobs"]
+    activations = (
+        (
+            "identity-admission",
+            "Restore committed release candidate from the immutable capsule",
+        ),
+        (
+            "prepare-github-ghcr",
+            "Bootstrap and verify the immutable recovery capsule",
+        ),
+        (
+            "commit-github-release",
+            "Reverify the immutable recovery capsule before commit",
+        ),
+        (
+            "verify-github-ghcr",
+            "Reverify the immutable recovery capsule before surface verification",
+        ),
+        (
+            "publish-pypi",
+            "Reverify the immutable recovery capsule before PyPI admission",
+        ),
+    )
+
+    for job_name, step_name in activations:
+        source = next(
+            step["run"]
+            for step in jobs[job_name]["steps"]
+            if step.get("name") == step_name
+        )
+        capsule_authority = source.index(
+            '"$capsule_root/scripts/recovery_launcher.py"'
+        )
+        quarantine = source.index(
+            'mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"'
+        )
+        replacement = source.index(
+            'ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"'
+        )
+        assert capsule_authority < quarantine < replacement
+        assert source.count('disabled_checkout_scripts="${RUNNER_TEMP}/') == 1
+        assert 'test ! -L "$GITHUB_WORKSPACE/scripts"' in source
+        assert 'test -L "$GITHUB_WORKSPACE/scripts"' in source
+        assert (
+            'test "$(readlink "$GITHUB_WORKSPACE/scripts")" = '
+            '"$capsule_root/scripts"'
+        ) in source
+
+
+def test_final_reconciliation_quarantines_checkout_release_code_authority() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["reconcile-final"]["steps"]
+    names = [step.get("name") for step in steps]
+    by_name = {step.get("name"): step for step in steps}
+
+    checkouts = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkouts) == 1
+    assert checkouts[0]["continue-on-error"] is True
+    assert checkouts[0]["with"] == {
+        "fetch-depth": 0,
+        "persist-credentials": False,
+        "ref": "${{ github.sha }}",
+    }
+    assert "Install the pinned reconciliation runtime" not in names
+
+    initialize_name = "Initialize fail-closed reconciliation evidence"
+    download_name = "Download every preserved transaction artifact"
+    activation_name = "Activate immutable recovery capsule for reconciliation"
+    bootstrap_name = "Bootstrap pinned GitHub CLI"
+    normalize_name = "Normalize unique role-specific reconciliation inputs"
+    assert names.index("Check out the dispatch-pinned transaction source") < names.index(
+        initialize_name
+    )
+    assert names.index(initialize_name) < names.index("Set up Python 3.11")
+    assert names.index(bootstrap_name) < names.index(download_name)
+    assert names.index(download_name) < names.index(activation_name)
+    assert names.index(activation_name) < names.index(normalize_name)
+    assert by_name[bootstrap_name]["continue-on-error"] is True
+    assert "reconciliation/reconciliation-fallback.json" in by_name[initialize_name][
+        "run"
+    ]
+
+    activation = by_name[activation_name]
+    assert activation["id"] == "activate-reconciliation-capsule"
+    assert activation["continue-on-error"] is True
+    source = activation["run"]
+    for required in (
+        "recovery-bootstrap.py",
+        "recovery-capsule-manifest.json",
+        "recovery-capsule-publication.json",
+        "recovery-capsule-verification.json",
+        "recovery-capsule.tar",
+        "kestrel.recovery_capsule_verification.v1",
+        "len(assets) != 3",
+        "python -I -S -B",
+        "reconciliation/capsule-input/recovery-bootstrap.py",
+        "--destination transaction/capsule",
+        'mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"',
+        'ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"',
+        'capsule_python="$capsule_root/venv/bin/python"',
+        "PYPI_ATTESTATIONS",
+        "active=1",
+    ):
+        assert required in source
+
+    active_gate = (
+        "steps.activate-reconciliation-capsule.outputs.active == '1'"
+    )
+    assert active_gate in by_name[normalize_name]["if"]
+    assert active_gate in by_name[
+        "Download the fresh terminal final authority boundary"
+    ]["if"]
+
+    observation = by_name[
+        "Observe the active lock, ingress, and every available release surface"
+    ]["run"]
+    reconcile = by_name["Reconcile the transaction without inventing authority"]["run"]
+    for source in (observation, reconcile):
+        gate = source.index("activate-reconciliation-capsule.outputs.active")
+        first_release_import = source.index("from scripts")
+        assert gate < first_release_import
+    assert "recovery_capsule_unavailable" in reconcile
+    assert "reconciliation/reconciliation-fallback.json" in reconcile
+    assert "reconciliation/release-reconciliation.json" in reconcile
+
+    final_text = "\n".join(str(step.get("run", "")) for step in steps)
+    assert "--registry transaction/capsule/release-control-source-registry.json" in (
+        final_text
+    )
+    assert 'Path("transaction/capsule/release-control-source-registry.json")' in (
+        final_text
+    )
+
+
 def test_transaction_jobs_pin_the_exact_recovery_python_patch() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
@@ -1030,7 +1199,6 @@ def test_recovery_bootstrap_executes_only_the_immutable_release_asset() -> None:
 
     assert "-B scripts/bootstrap_recovery.py" not in workflow_text
     assert workflow_text.count("--pattern recovery-bootstrap.py") == 1
-    assert workflow_text.count("transaction/capsule-download/recovery-bootstrap.py") == 4
     invocations = re.findall(
         r"^\s+(transaction(?:-identity)?/[^\s]*recovery-bootstrap\.py) \\$",
         workflow_text,
@@ -1044,6 +1212,59 @@ def test_recovery_bootstrap_executes_only_the_immutable_release_asset() -> None:
         "transaction-identity/recovery-capsule-download/recovery-bootstrap.py"
         in workflow_text
     )
+
+
+def test_recovery_bootstrap_is_byte_bound_before_every_execution() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    activations = (
+        (
+            "identity-admission",
+            "Restore committed release candidate from the immutable capsule",
+            "transaction-identity/recovery-capsule-download/recovery-bootstrap.py",
+        ),
+        (
+            "prepare-github-ghcr",
+            "Bootstrap and verify the immutable recovery capsule",
+            "transaction/capsule-download/recovery-bootstrap.py",
+        ),
+        (
+            "commit-github-release",
+            "Reverify the immutable recovery capsule before commit",
+            "transaction/capsule-download/recovery-bootstrap.py",
+        ),
+        (
+            "verify-github-ghcr",
+            "Reverify the immutable recovery capsule before surface verification",
+            "transaction/capsule-download/recovery-bootstrap.py",
+        ),
+        (
+            "publish-pypi",
+            "Reverify the immutable recovery capsule before PyPI admission",
+            "transaction/capsule-download/recovery-bootstrap.py",
+        ),
+        (
+            "reconcile-final",
+            "Activate immutable recovery capsule for reconciliation",
+            "reconciliation/capsule-input/recovery-bootstrap.py",
+        ),
+    )
+
+    for job_name, step_name, bootstrap_path in activations:
+        source = next(
+            step["run"]
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("name") == step_name
+        )
+        invocation = source.index(f"{bootstrap_path} \\")
+        checkout_binding = source.index("cmp --silent scripts/bootstrap_recovery.py")
+        assert source.index(f'"{bootstrap_path}"', checkout_binding) < invocation
+        digest_binding = source.index("sha256sum", checkout_binding)
+        assert source.index(f'"{bootstrap_path}"', digest_binding) < invocation
+        assert checkout_binding < digest_binding < invocation
 
 
 def test_release_transaction_bootstraps_pinned_tools_and_actions() -> None:
@@ -1085,6 +1306,8 @@ def test_release_transaction_bootstraps_pinned_tools_and_actions() -> None:
                 for token in ("Release", "asset", "attestation", "surface", "capsule")
             )
             and "Bootstrap" not in str(step.get("name", ""))
+            and step.get("name")
+            != "Activate immutable recovery capsule for reconciliation"
         ]
         assert all(bootstrap_index < index for index in authoritative_indexes)
 

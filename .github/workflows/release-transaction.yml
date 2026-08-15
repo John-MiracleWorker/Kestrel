@@ -767,9 +767,10 @@ jobs:
           print(capsule_digest)
           print(claim["signing_key_fingerprint"])
           print(claim["release"]["id"])
+          print(assets["recovery-bootstrap.py"]["sha256"])
           PY
           )
-          test "${#capsule_inputs[@]}" -eq 5
+          test "${#capsule_inputs[@]}" -eq 6
           capsule_tag="${capsule_inputs[0]}"
           "$PINNED_GH" api \
             "repos/${PROMOTION_RECOVERY_REPOSITORY}/releases/tags/${capsule_tag}" \
@@ -823,6 +824,11 @@ jobs:
             --pattern recovery-capsule-manifest.json \
             --pattern recovery-capsule.tar \
             --dir transaction-identity/recovery-capsule-download
+          cmp --silent scripts/bootstrap_recovery.py \
+            "transaction-identity/recovery-capsule-download/recovery-bootstrap.py"
+          test "$(sha256sum \
+            "transaction-identity/recovery-capsule-download/recovery-bootstrap.py" | \
+            cut -d ' ' -f 1)" = "${capsule_inputs[5]#sha256:}"
           "$KESTREL_PYTHON" -I -S -B \
             transaction-identity/recovery-capsule-download/recovery-bootstrap.py \
             transaction-identity/recovery-capsule-download/recovery-capsule.tar \
@@ -877,6 +883,14 @@ jobs:
             "$capsule_root/recovery-execution-closure.json" \
             --capsule-root "$capsule_root" \
             --destination "$GITHUB_WORKSPACE/candidate"
+          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
+          test -d "$GITHUB_WORKSPACE/scripts"
+          test ! -L "$GITHUB_WORKSPACE/scripts"
+          test ! -e "$disabled_checkout_scripts"
+          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
+          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
+          test -L "$GITHUB_WORKSPACE/scripts"
+          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
 
       - name: Verify exact release candidate
         shell: bash
@@ -1515,12 +1529,19 @@ jobs:
               Path("transaction/prepare-authority/recovery-capsule-publication.json").read_bytes()
           )
           claim = signed["verification"]
+          assets = {item["name"]: item for item in claim["assets"]}
           print(publication["archive_digest"])
           print(claim["capsule_manifest_digest"])
           print(claim["signing_key_fingerprint"])
+          print(assets["recovery-bootstrap.py"]["sha256"])
           PY
           )
-          test "${#capsule_inputs[@]}" -eq 3
+          test "${#capsule_inputs[@]}" -eq 4
+          cmp --silent scripts/bootstrap_recovery.py \
+            "transaction/capsule-download/recovery-bootstrap.py"
+          test "$(sha256sum \
+            "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
+            "${capsule_inputs[3]#sha256:}"
           "$KESTREL_PYTHON" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
@@ -1668,6 +1689,14 @@ jobs:
               --output \
                 "$GITHUB_WORKSPACE/transaction/capsule-download/capsule-release-verification.json"
           )
+          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
+          test -d "$GITHUB_WORKSPACE/scripts"
+          test ! -L "$GITHUB_WORKSPACE/scripts"
+          test ! -e "$disabled_checkout_scripts"
+          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
+          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
+          test -L "$GITHUB_WORKSPACE/scripts"
+          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
           printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
 
       - name: Observe and plan draft Release and digest-only GHCR preparation
@@ -2709,6 +2738,7 @@ jobs:
           test ! -e transaction/capsule
           readarray -t capsule_inputs < <("$KESTREL_PYTHON" - <<'PY'
           import json
+          import re
           from pathlib import Path
 
           signed = json.loads(
@@ -2718,12 +2748,23 @@ jobs:
               Path("transaction/prepare-authority/recovery-capsule-publication.json").read_bytes()
           )
           claim = signed["verification"]
+          assets = {item["name"]: item for item in claim["assets"]}
+          tag = publication["tag"]
+          if not isinstance(tag, str) or re.fullmatch(r"recovery-[1-9][0-9]*-1", tag) is None:
+              raise SystemExit("recovery capsule publication tag is invalid")
           print(publication["archive_digest"])
           print(claim["capsule_manifest_digest"])
           print(claim["signing_key_fingerprint"])
+          print(tag)
+          print(assets["recovery-bootstrap.py"]["sha256"])
           PY
           )
-          test "${#capsule_inputs[@]}" -eq 3
+          test "${#capsule_inputs[@]}" -eq 5
+          cmp --silent scripts/bootstrap_recovery.py \
+            "transaction/capsule-download/recovery-bootstrap.py"
+          test "$(sha256sum \
+            "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
+            "${capsule_inputs[4]#sha256:}"
           "$KESTREL_PYTHON" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
@@ -2733,10 +2774,11 @@ jobs:
             --expected-owner-key-fingerprint "${capsule_inputs[2]}"
           test -f transaction/capsule/recovery-capsule-manifest.json
           install -d -m 0700 transaction/commit-capsule-observation
+          recovery_tag="${capsule_inputs[3]}"
           "$PINNED_GH" api "repos/${PROMOTION_RECOVERY_REPOSITORY}" \
             > transaction/commit-capsule-observation/repository.json
           "$PINNED_GH" api \
-            "repos/${PROMOTION_RECOVERY_REPOSITORY}/releases/tags/recovery-${PROMOTION_RUN_ID}-1" \
+            "repos/${PROMOTION_RECOVERY_REPOSITORY}/releases/tags/${recovery_tag}" \
             > transaction/commit-capsule-observation/release.json
           release_id="$("$KESTREL_PYTHON" -c \
             'import json; print(json.load(open("transaction/commit-capsule-observation/release.json"))["id"])')"
@@ -2759,7 +2801,6 @@ jobs:
               encoding="utf-8",
           )
           PY
-          recovery_tag="recovery-${PROMOTION_RUN_ID}-1"
           "$PINNED_GH" release verify "$recovery_tag" \
             --repo "$PROMOTION_RECOVERY_REPOSITORY" \
             --format json \
@@ -2861,6 +2902,14 @@ jobs:
                 "$GITHUB_WORKSPACE/transaction/commit-capsule-observation/pinned-gh-release-verification.json" \
               --output "$GITHUB_WORKSPACE/transaction/commit-capsule-release-verification.json"
           )
+          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
+          test -d "$GITHUB_WORKSPACE/scripts"
+          test ! -L "$GITHUB_WORKSPACE/scripts"
+          test ! -e "$disabled_checkout_scripts"
+          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
+          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
+          test -L "$GITHUB_WORKSPACE/scripts"
+          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
           printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
 
       - name: Download exact owner-signed commit authority
@@ -5035,6 +5084,7 @@ jobs:
           test ! -e transaction/capsule
           readarray -t capsule_inputs < <("$KESTREL_PYTHON" - <<'PY'
           import json
+          import re
           from pathlib import Path
 
           signed = json.loads(
@@ -5044,12 +5094,23 @@ jobs:
               Path("transaction/prepare-authority/recovery-capsule-publication.json").read_bytes()
           )
           claim = signed["verification"]
+          assets = {item["name"]: item for item in claim["assets"]}
+          tag = publication["tag"]
+          if not isinstance(tag, str) or re.fullmatch(r"recovery-[1-9][0-9]*-1", tag) is None:
+              raise SystemExit("recovery capsule publication tag is invalid")
           print(publication["archive_digest"])
           print(claim["capsule_manifest_digest"])
           print(claim["signing_key_fingerprint"])
+          print(tag)
+          print(assets["recovery-bootstrap.py"]["sha256"])
           PY
           )
-          test "${#capsule_inputs[@]}" -eq 3
+          test "${#capsule_inputs[@]}" -eq 5
+          cmp --silent scripts/bootstrap_recovery.py \
+            "transaction/capsule-download/recovery-bootstrap.py"
+          test "$(sha256sum \
+            "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
+            "${capsule_inputs[4]#sha256:}"
           "$KESTREL_PYTHON" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
@@ -5058,10 +5119,11 @@ jobs:
             --expected-manifest-digest "${capsule_inputs[1]}" \
             --expected-owner-key-fingerprint "${capsule_inputs[2]}"
           install -d -m 0700 transaction/verify-capsule-observation
+          recovery_tag="${capsule_inputs[3]}"
           "$PINNED_GH" api "repos/${PROMOTION_RECOVERY_REPOSITORY}" \
             > transaction/verify-capsule-observation/repository.json
           "$PINNED_GH" api \
-            "repos/${PROMOTION_RECOVERY_REPOSITORY}/releases/tags/recovery-${PROMOTION_RUN_ID}-1" \
+            "repos/${PROMOTION_RECOVERY_REPOSITORY}/releases/tags/${recovery_tag}" \
             > transaction/verify-capsule-observation/release.json
           release_id="$("$KESTREL_PYTHON" -c \
             'import json; print(json.load(open("transaction/verify-capsule-observation/release.json"))["id"])')"
@@ -5084,7 +5146,6 @@ jobs:
               encoding="utf-8",
           )
           PY
-          recovery_tag="recovery-${PROMOTION_RUN_ID}-1"
           "$PINNED_GH" release verify "$recovery_tag" \
             --repo "$PROMOTION_RECOVERY_REPOSITORY" \
             --format json \
@@ -5186,6 +5247,14 @@ jobs:
                 "$GITHUB_WORKSPACE/transaction/verify-capsule-observation/pinned-gh-release-verification.json" \
               --output "$GITHUB_WORKSPACE/transaction/verify-capsule-release-verification.json"
           )
+          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
+          test -d "$GITHUB_WORKSPACE/scripts"
+          test ! -L "$GITHUB_WORKSPACE/scripts"
+          test ! -e "$disabled_checkout_scripts"
+          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
+          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
+          test -L "$GITHUB_WORKSPACE/scripts"
+          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
           printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
 
       - name: Download the fresh verification authority boundary
@@ -5735,6 +5804,7 @@ jobs:
           test ! -e transaction/capsule
           readarray -t capsule_inputs < <("$KESTREL_PYTHON" - <<'PY'
           import json
+          import re
           from pathlib import Path
 
           signed = json.loads(
@@ -5744,12 +5814,23 @@ jobs:
               Path("transaction/prepare-authority/recovery-capsule-publication.json").read_bytes()
           )
           claim = signed["verification"]
+          assets = {item["name"]: item for item in claim["assets"]}
+          tag = publication["tag"]
+          if not isinstance(tag, str) or re.fullmatch(r"recovery-[1-9][0-9]*-1", tag) is None:
+              raise SystemExit("recovery capsule publication tag is invalid")
           print(publication["archive_digest"])
           print(claim["capsule_manifest_digest"])
           print(claim["signing_key_fingerprint"])
+          print(tag)
+          print(assets["recovery-bootstrap.py"]["sha256"])
           PY
           )
-          test "${#capsule_inputs[@]}" -eq 3
+          test "${#capsule_inputs[@]}" -eq 5
+          cmp --silent scripts/bootstrap_recovery.py \
+            "transaction/capsule-download/recovery-bootstrap.py"
+          test "$(sha256sum \
+            "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
+            "${capsule_inputs[4]#sha256:}"
           "$KESTREL_PYTHON" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
@@ -5758,10 +5839,11 @@ jobs:
             --expected-manifest-digest "${capsule_inputs[1]}" \
             --expected-owner-key-fingerprint "${capsule_inputs[2]}"
           install -d -m 0700 transaction/pypi-capsule-observation
+          recovery_tag="${capsule_inputs[3]}"
           "$PINNED_GH" api "repos/${PROMOTION_RECOVERY_REPOSITORY}" \
             > transaction/pypi-capsule-observation/repository.json
           "$PINNED_GH" api \
-            "repos/${PROMOTION_RECOVERY_REPOSITORY}/releases/tags/recovery-${PROMOTION_RUN_ID}-1" \
+            "repos/${PROMOTION_RECOVERY_REPOSITORY}/releases/tags/${recovery_tag}" \
             > transaction/pypi-capsule-observation/release.json
           release_id="$("$KESTREL_PYTHON" -c \
             'import json; print(json.load(open("transaction/pypi-capsule-observation/release.json"))["id"])')"
@@ -5784,7 +5866,6 @@ jobs:
               encoding="utf-8",
           )
           PY
-          recovery_tag="recovery-${PROMOTION_RUN_ID}-1"
           "$PINNED_GH" release verify "$recovery_tag" \
             --repo "$PROMOTION_RECOVERY_REPOSITORY" \
             --format json \
@@ -5886,6 +5967,14 @@ jobs:
                 "$GITHUB_WORKSPACE/transaction/pypi-capsule-observation/pinned-gh-release-verification.json" \
               --output "$GITHUB_WORKSPACE/transaction/pypi-capsule-release-verification.json"
           )
+          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
+          test -d "$GITHUB_WORKSPACE/scripts"
+          test ! -L "$GITHUB_WORKSPACE/scripts"
+          test ! -e "$disabled_checkout_scripts"
+          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
+          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
+          test -L "$GITHUB_WORKSPACE/scripts"
+          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
           capsule_verifier="$GITHUB_WORKSPACE/transaction/capsule/venv/bin/pypi-attestations"
           test -x "$capsule_verifier"
           test "$($capsule_verifier --version)" = "pypi-attestations 0.0.30"
@@ -6766,11 +6855,20 @@ jobs:
       packages: read
     steps:
       - name: Check out the dispatch-pinned transaction source
+        continue-on-error: true
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
+
+      - name: Initialize fail-closed reconciliation evidence
+        shell: bash
+        run: |
+          install -d -m 0700 reconciliation/input reconciliation/stages reconciliation/final
+          printf '%s\n' \
+            '{"lock_release_permitted":false,"reason":"terminal success not yet proven","schema":"kestrel.release_reconciliation_fallback.v1"}' \
+            > reconciliation/reconciliation-fallback.json
 
       - name: Set up Python 3.11
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -6787,30 +6885,8 @@ jobs:
             "dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8"
           test "$(python --version)" = "Python 3.11.14"
 
-      - name: Install the pinned reconciliation runtime
-        shell: bash
-        run: |
-          python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-uv"
-          pinned_uv="${RUNNER_TEMP}/kestrel-uv/uv"
-          test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
-          python -m venv "${RUNNER_TEMP}/kestrel-transaction-venv"
-          "$pinned_uv" export --frozen --no-dev --no-emit-local \
-            --extra dev --group release --format requirements.txt \
-            --output-file "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
-          "${RUNNER_TEMP}/kestrel-transaction-venv/bin/python" -m pip install \
-            --require-hashes --only-binary=:all: \
-            -r "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
-          "${RUNNER_TEMP}/kestrel-transaction-venv/bin/python" -m pip install \
-            --no-build-isolation --no-deps -e '.[dev]'
-          "${RUNNER_TEMP}/kestrel-transaction-venv/bin/python" -m pip check
-          verifier="${RUNNER_TEMP}/kestrel-transaction-venv/bin/pypi-attestations"
-          test -x "$verifier"
-          test "$($verifier --version)" = "pypi-attestations 0.0.30"
-          printf 'KESTREL_PYTHON=%s\n' \
-            "${RUNNER_TEMP}/kestrel-transaction-venv/bin/python" >> "$GITHUB_ENV"
-          printf 'PYPI_ATTESTATIONS=%s\n' "$verifier" >> "$GITHUB_ENV"
-
       - name: Bootstrap pinned GitHub CLI
+        continue-on-error: true
         shell: bash
         run: |
           scripts/bootstrap_workflow_tools.sh "${RUNNER_TEMP}/kestrel-workflow-tools"
@@ -6827,14 +6903,176 @@ jobs:
         with:
           path: reconcile-artifacts
 
-      - name: Normalize unique role-specific reconciliation inputs
-        id: normalize-reconciliation-inputs
+      - name: Activate immutable recovery capsule for reconciliation
+        id: activate-reconciliation-capsule
+        continue-on-error: true
         shell: bash
         run: |
-          install -d -m 0700 reconciliation/input reconciliation/stages reconciliation/final
+          install -d -m 0700 \
+            transaction \
+            reconciliation/capsule-input \
+            reconciliation/input \
+            reconciliation/stages \
+            reconciliation/final
           printf '%s\n' \
             '{"lock_release_permitted":false,"reason":"terminal success not yet proven","schema":"kestrel.release_reconciliation_fallback.v1"}' \
             > reconciliation/reconciliation-fallback.json
+          python -I -S -B - <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          source_root = Path("reconcile-artifacts")
+          output_root = Path("reconciliation/capsule-input")
+          required = (
+              "recovery-bootstrap.py",
+              "recovery-capsule-manifest.json",
+              "recovery-capsule-publication.json",
+              "recovery-capsule-verification.json",
+              "recovery-capsule.tar",
+          )
+
+          def select(name: str) -> bytes:
+              matches = sorted(
+                  (
+                      path
+                      for path in source_root.rglob(name)
+                      if path.is_file() and not path.is_symlink()
+                  ),
+                  key=lambda path: path.as_posix(),
+              )
+              if not matches:
+                  raise SystemExit(f"preserved recovery capsule input is missing: {name}")
+              values = [path.read_bytes() for path in matches]
+              if len({hashlib.sha256(raw).digest() for raw in values}) != 1:
+                  raise SystemExit(f"preserved recovery capsule copies conflict: {name}")
+              destination = output_root / name
+              destination.write_bytes(values[0])
+              destination.chmod(0o600)
+              return values[0]
+
+          selected = {name: select(name) for name in required}
+          publication = json.loads(selected["recovery-capsule-publication.json"])
+          signed = json.loads(selected["recovery-capsule-verification.json"])
+          claim = signed["verification"]
+          tag = publication["tag"]
+          if (
+              publication.get("schema") != "kestrel.recovery_capsule_publication.v1"
+              or publication.get("immutable") is not True
+              or publication.get("validation_status") != "validated"
+              or signed.get("schema")
+              != "kestrel.recovery_capsule_verification.v1"
+              or signed.get("validation_status") != "validated"
+              or claim.get("schema")
+              != "kestrel.recovery_capsule_verification_claim.v1"
+              or claim.get("verified") is not True
+              or claim.get("confidence") != 1
+              or claim.get("validation_status") != "validated"
+              or not isinstance(tag, str)
+              or re.fullmatch(r"recovery-[1-9][0-9]*-1", tag) is None
+              or claim.get("release", {}).get("tag") != tag
+              or claim.get("release", {}).get("id") != publication.get("release_id")
+              or claim.get("repository", {}).get("full_name")
+              != publication.get("repository")
+              or claim.get("repository", {}).get("id")
+              != publication.get("repository_id")
+          ):
+              raise SystemExit("preserved recovery capsule publication binding is invalid")
+          assets = claim.get("assets")
+          asset_fields = {"id", "name", "size_bytes", "sha256"}
+          if (
+              not isinstance(assets, list)
+              or len(assets) != 3
+              or any(not isinstance(item, dict) or set(item) != asset_fields for item in assets)
+          ):
+              raise SystemExit("preserved recovery capsule asset claim is invalid")
+          expected = {item["name"]: item for item in assets}
+          if len(expected) != 3 or set(expected) != {
+              "recovery-bootstrap.py",
+              "recovery-capsule-manifest.json",
+              "recovery-capsule.tar",
+          }:
+              raise SystemExit("preserved recovery capsule asset inventory is invalid")
+          for name in expected:
+              raw = selected[name]
+              if (
+                  expected[name].get("size_bytes") != len(raw)
+                  or expected[name].get("sha256")
+                  != "sha256:" + hashlib.sha256(raw).hexdigest()
+              ):
+                  raise SystemExit(f"preserved recovery capsule asset changed: {name}")
+          if (
+              publication.get("manifest_digest")
+              != expected["recovery-capsule-manifest.json"]["sha256"]
+              or publication.get("archive_digest")
+              != expected["recovery-capsule.tar"]["sha256"]
+              or claim.get("capsule_manifest_digest")
+              != expected["recovery-capsule-manifest.json"]["sha256"]
+          ):
+              raise SystemExit("preserved recovery capsule digest binding is invalid")
+          PY
+          readarray -t capsule_inputs < <(python -I -S -B - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("reconciliation/capsule-input")
+          publication = json.loads(
+              root.joinpath("recovery-capsule-publication.json").read_bytes()
+          )
+          signed = json.loads(
+              root.joinpath("recovery-capsule-verification.json").read_bytes()
+          )
+          claim = signed["verification"]
+          assets = {item["name"]: item for item in claim["assets"]}
+          print(publication["archive_digest"])
+          print(claim["capsule_manifest_digest"])
+          print(claim["signing_key_fingerprint"])
+          print(assets["recovery-bootstrap.py"]["sha256"])
+          PY
+          )
+          test "${#capsule_inputs[@]}" -eq 4
+          cmp --silent scripts/bootstrap_recovery.py \
+            "reconciliation/capsule-input/recovery-bootstrap.py"
+          test "$(sha256sum \
+            "reconciliation/capsule-input/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
+            "${capsule_inputs[3]#sha256:}"
+          python -I -S -B \
+            reconciliation/capsule-input/recovery-bootstrap.py \
+            reconciliation/capsule-input/recovery-capsule.tar \
+            --destination transaction/capsule \
+            --expected-archive-digest "${capsule_inputs[0]}" \
+            --expected-manifest-digest "${capsule_inputs[1]}" \
+            --expected-owner-key-fingerprint "${capsule_inputs[2]}"
+          capsule_root="$GITHUB_WORKSPACE/transaction/capsule"
+          capsule_python="$capsule_root/venv/bin/python"
+          capsule_verifier="$capsule_root/venv/bin/pypi-attestations"
+          test -x "$capsule_python"
+          test -x "$capsule_verifier"
+          test "$($capsule_verifier --version)" = "pypi-attestations 0.0.30"
+          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-reconcile-checkout-scripts"
+          test -d "$GITHUB_WORKSPACE/scripts"
+          test ! -L "$GITHUB_WORKSPACE/scripts"
+          test ! -e "$disabled_checkout_scripts"
+          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
+          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
+          test -L "$GITHUB_WORKSPACE/scripts"
+          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
+          printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
+          printf 'PYPI_ATTESTATIONS=%s\n' "$capsule_verifier" >> "$GITHUB_ENV"
+          printf '%s\n' 'active=1' >> "$GITHUB_OUTPUT"
+
+      - name: Normalize unique role-specific reconciliation inputs
+        id: normalize-reconciliation-inputs
+        if: >-
+          ${{
+            always() &&
+            steps.activate-reconciliation-capsule.outcome == 'success' &&
+            steps.activate-reconciliation-capsule.outputs.active == '1'
+          }}
+        shell: bash
+        run: |
+          install -d -m 0700 reconciliation/input reconciliation/stages reconciliation/final
           "$KESTREL_PYTHON" - <<'PY'
           import hashlib
           import os
@@ -6913,6 +7151,7 @@ jobs:
               "dispatch-reconciliation.json",
               "release-authorization.json",
               "release-execution-authorization.json",
+              "recovery-capsule-publication.json",
               "recovery-capsule-verification.json",
               "github-commit-authority-verification.json",
           )
@@ -6961,13 +7200,52 @@ jobs:
                   key, value = line.split("=", 1)
                   stream.write(f"{key.lower()}={value}\n")
           PY
+          cmp --silent \
+            reconciliation/capsule-input/recovery-capsule-publication.json \
+            reconciliation/input/recovery-capsule-publication.json
+          cmp --silent \
+            reconciliation/capsule-input/recovery-capsule-verification.json \
+            reconciliation/input/recovery-capsule-verification.json
+
+      - name: Verify capsule-bound reconciliation product authority
+        id: verify-reconciliation-capsule-binding
+        if: >-
+          ${{
+            always() &&
+            steps.activate-reconciliation-capsule.outputs.active == '1' &&
+            steps.normalize-reconciliation-inputs.outputs.product_available == '1'
+          }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_RECOVERY_READER_TOKEN }}
+        run: |
+          "$KESTREL_PYTHON" - <<'PY'
+          from pathlib import Path
+
+          from scripts import release_promotion_transaction as transaction
+
+          root = Path("reconciliation/input")
+          execution = root / "release-execution-authorization.json"
+          transaction._stage_candidate_and_authority(  # noqa: SLF001
+              manifest_path=root / "candidate-manifest.json",
+              bundle_root=None,
+              transaction_authorization_path=root / "release-authorization.json",
+              execution_authorization_path=(execution if execution.is_file() else None),
+              recovery_capsule_verification_path=(
+                  root / "recovery-capsule-verification.json"
+              ),
+          )
+          PY
 
       - name: Download the fresh terminal final authority boundary
         id: fetch-final-authority
         if: >-
           ${{
             always() &&
+            steps.activate-reconciliation-capsule.outputs.active == '1' &&
             steps.normalize-reconciliation-inputs.outputs.product_available == '1' &&
+            steps.verify-reconciliation-capsule-binding.outcome == 'success' &&
             needs.identity-admission.result == 'success' &&
             needs.authorize-release.result == 'success' &&
             needs.prepare-github-ghcr.result == 'success' &&
@@ -7039,7 +7317,7 @@ jobs:
           PY
           "$KESTREL_PYTHON" -m scripts.release_promotion_transaction \
             capture-prerequisite-boundary \
-            --registry release-control-source-registry.json \
+            --registry transaction/capsule/release-control-source-registry.json \
             --repository "$PROMOTION_REPOSITORY" \
             --recovery-repository "$PROMOTION_RECOVERY_REPOSITORY" \
             --candidate-ref "$PROMOTION_SHA" \
@@ -7137,6 +7415,9 @@ jobs:
           GHCR_READ_TOKEN: ${{ secrets.RELEASE_GUARD_TOKEN }}
           RELEASE_RECOVERY_READER_TOKEN_BYTES: ${{ secrets.RELEASE_RECOVERY_READER_TOKEN }}
         run: |
+          if test "${{ steps.activate-reconciliation-capsule.outputs.active }}" != 1; then
+            exit 0
+          fi
           if ! test -e reconciliation/final-freshness-budget.json; then
             "$KESTREL_PYTHON" - <<'PY'
           from pathlib import Path
@@ -7297,7 +7578,9 @@ jobs:
               ),
               "complete": True,
           }
-          registry = json.loads(Path("release-control-source-registry.json").read_bytes())
+          registry = json.loads(
+              Path("transaction/capsule/release-control-source-registry.json").read_bytes()
+          )
 
           def source(name, raw, *, owner=True):
               value = receipts.capture_source(
@@ -7709,11 +7992,20 @@ jobs:
           VERIFICATION_RESULT: ${{ needs.verify-github-ghcr.result }}
           PYPI_RESULT: ${{ needs.publish-pypi.result }}
           OBSERVATION_OUTCOME: ${{ steps.observe-final-surfaces.outcome }}
+          CAPSULE_BINDING_OUTCOME: ${{ steps.verify-reconciliation-capsule-binding.outcome }}
           FINAL_AUTHORITY_OUTCOME: ${{ steps.revalidate-final-authority.outcome }}
           FINAL_BOUNDARY_OUTCOME: ${{ steps.capture-final-boundary.outcome }}
           FINAL_BINDING_OUTCOME: ${{ steps.verify-final-binding.outcome }}
           FINAL_BOUND: ${{ steps.verify-final-binding.outputs.bound }}
         run: |
+          if test "${{ steps.activate-reconciliation-capsule.outputs.active }}" != 1; then
+            printf '%s\n' recovery_capsule_unavailable \
+              > reconciliation/reconciliation-failure-code.txt
+            cp -- \
+              reconciliation/reconciliation-fallback.json \
+              reconciliation/release-reconciliation.json
+            exit 0
+          fi
           if test "${{ steps.normalize-reconciliation-inputs.outputs.core_available }}" != 1; then
             printf '%s\n' reconciliation_input_missing \
               > reconciliation/reconciliation-failure-code.txt
@@ -7753,6 +8045,10 @@ jobs:
           done
           if test "$OBSERVATION_OUTCOME" != success; then
             failure_code=final_observation_failed
+          fi
+          if test "${{ steps.normalize-reconciliation-inputs.outputs.product_available }}" = 1 && \
+             test "$CAPSULE_BINDING_OUTCOME" != success; then
+            failure_code=recovery_capsule_binding_failed
           fi
           if test "$final_freshness_current" != 1 && test "$failure_code" = none; then
             failure_code=final_freshness_budget_exhausted
