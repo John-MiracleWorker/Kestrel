@@ -9,7 +9,7 @@ import hashlib
 import json
 import os
 import platform
-import subprocess
+import subprocess  # nosec B404
 import sys
 import tarfile
 from collections.abc import Mapping, Sequence
@@ -32,7 +32,11 @@ MAX_ARCHIVE_MEMBERS = 8192
 MAX_ARCHIVE_MEMBER_BYTES = 2_147_483_648
 MAX_ARCHIVE_TOTAL_BYTES = 2_147_483_648
 ISOLATED_PYTHON_BOOTSTRAP = (
-    "import json,runpy,sys;"
+    "import json,os,runpy,sys;"
+    "allowed={'LANG','LC_ALL','LD_LIBRARY_PATH','PATH','PYTHONNOUSERSITE',"
+    "'PYTHONSAFEPATH','__CF_USER_TEXT_ENCODING'};"
+    "unexpected=set(os.environ)-allowed;"
+    "len(unexpected)==0 or (_ for _ in ()).throw(RuntimeError('ambient recovery environment'));"
     "sys.path[:]=json.loads(sys.argv.pop(1));"
     "target=sys.argv.pop(1);"
     "runpy.run_path(target,run_name='__main__')"
@@ -87,7 +91,13 @@ def _relative_member(value: object, *, label: str) -> PurePosixPath:
     return path
 
 
-def _regular_member(root: Path, relative: PurePosixPath, *, label: str) -> Path:
+def _regular_member(
+    root: Path,
+    relative: PurePosixPath,
+    *,
+    label: str,
+    max_bytes: int = MAX_MEMBER_BYTES,
+) -> Path:
     path = root.joinpath(*relative.parts)
     try:
         resolved_root = root.resolve(strict=True)
@@ -98,7 +108,7 @@ def _regular_member(root: Path, relative: PurePosixPath, *, label: str) -> Path:
         resolved_root not in (resolved, *resolved.parents)
         or not path.is_file()
         or path.is_symlink()
-        or path.stat().st_size > MAX_MEMBER_BYTES
+        or path.stat().st_size > max_bytes
     ):
         raise receipts.ReleaseControlError(f"{label} is not a bounded regular member")
     return path
@@ -240,6 +250,13 @@ def _verify_member_inventory(
 
     actual_python: set[str] = set()
     actual_shell: set[str] = set()
+    actual_resources: set[str] = set()
+    declared_resources = set(data_resources)
+    nonclosure_assets = set(receipts._RECOVERY_CAPSULE_FIXED_ASSETS) | {  # noqa: SLF001
+        "recovery-capsule-manifest.json",
+        "recovery/requirements.txt",
+        "recovery/wheelhouse-manifest.json",
+    }
     for path in capsule_root.rglob("*"):
         if path.is_symlink():
             raise receipts.ReleaseControlError(
@@ -252,8 +269,19 @@ def _verify_member_inventory(
         relative = path.relative_to(capsule_root).as_posix()
         if path.suffix == ".py":
             actual_python.add(relative)
-        if path.suffix == ".sh":
+        elif path.suffix == ".sh":
             actual_shell.add(relative)
+        elif relative in declared_resources:
+            actual_resources.add(relative)
+        else:
+            relative_path = PurePosixPath(relative)
+            is_wheel = (
+                len(relative_path.parts) == 3
+                and relative_path.parts[:2] == ("recovery", "wheelhouse")
+                and relative_path.name.endswith(".whl")
+            )
+            if relative not in nonclosure_assets and not is_wheel:
+                actual_resources.add(relative)
     if actual_python != set(python_members):
         raise receipts.ReleaseControlError(
             "recovery Python member inventory has missing or extra files"
@@ -262,15 +290,6 @@ def _verify_member_inventory(
         raise receipts.ReleaseControlError(
             "recovery shell helper inventory has missing or extra files"
         )
-    resource_parents = {PurePosixPath(path).parent.as_posix() for path in data_resources}
-    actual_resources: set[str] = set()
-    for parent in resource_parents:
-        directory = capsule_root.joinpath(*PurePosixPath(parent).parts)
-        if not directory.is_dir() or directory.is_symlink():
-            raise receipts.ReleaseControlError("recovery data resource directory is missing")
-        for path in directory.rglob("*"):
-            if path.is_file() and not path.is_symlink():
-                actual_resources.add(path.relative_to(capsule_root).as_posix())
     if actual_resources != set(data_resources):
         raise receipts.ReleaseControlError(
             "recovery data resource inventory has missing or extra files"
@@ -296,6 +315,327 @@ def _verify_dependency_lock(closure: receipts.JSONObject, capsule_root: Path) ->
     )
     if _member_digest(wheelhouse) != lock.get("wheelhouse_manifest_sha256"):
         raise receipts.ReleaseControlError("recovery wheelhouse manifest digest mismatch")
+    runtime_digest = lock.get("runtime_manifest_sha256")
+    if runtime_digest is not None:
+        runtime_manifest = _regular_member(
+            capsule_root,
+            PurePosixPath("recovery/runtime-manifest.json"),
+            label="recovery runtime manifest",
+        )
+        if _member_digest(runtime_manifest) != runtime_digest:
+            raise receipts.ReleaseControlError("recovery runtime manifest digest mismatch")
+    for field, relative, label in (
+        (
+            "python_runtime_manifest_sha256",
+            PurePosixPath("recovery/python-runtime-manifest.json"),
+            "recovery Python runtime manifest",
+        ),
+        (
+            "python_runtime_archive_sha256",
+            PurePosixPath("recovery/python-runtime.tar.gz"),
+            "recovery Python runtime archive",
+        ),
+    ):
+        expected = lock.get(field)
+        if expected is None:
+            continue
+        member = _regular_member(
+            capsule_root,
+            relative,
+            label=label,
+            max_bytes=(
+                MAX_ARCHIVE_TOTAL_BYTES
+                if field == "python_runtime_archive_sha256"
+                else MAX_MEMBER_BYTES
+            ),
+        )
+        if _member_digest(member) != expected:
+            raise receipts.ReleaseControlError(f"{label} digest mismatch")
+
+
+def _python_runtime_tree_identity(root: Path) -> tuple[int, int, str]:
+    """Re-authenticate the extracted link-free Python tree before every launch."""
+
+    if root.is_symlink() or not root.is_dir():
+        raise receipts.ReleaseControlError("recovery Python runtime tree root is unsafe")
+    records: list[dict[str, object]] = []
+    total = 0
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if path.is_symlink():
+            raise receipts.ReleaseControlError("recovery Python runtime tree contains a link")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise receipts.ReleaseControlError(
+                "recovery Python runtime tree contains a special file"
+            )
+        size = path.stat().st_size
+        total += size
+        if size < 0 or size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise receipts.ReleaseControlError("recovery Python runtime file is too large")
+        if total > MAX_ARCHIVE_TOTAL_BYTES or len(records) >= MAX_ARCHIVE_MEMBERS * 2:
+            raise receipts.ReleaseControlError("recovery Python runtime tree is too large")
+        mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
+        records.append(
+            {
+                "mode": f"{mode:04o}",
+                "path": path.relative_to(root).as_posix(),
+                "sha256": _member_digest(path),
+                "size_bytes": size,
+            }
+        )
+    if not records:
+        raise receipts.ReleaseControlError("recovery Python runtime tree is empty")
+    digest = receipts._sha256(  # noqa: SLF001
+        json.dumps(records, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    )
+    return len(records), total, digest
+
+
+def _verify_extracted_python_runtime(
+    *, closure: bytes, capsule_root: Path
+) -> Path | None:
+    """Verify the staged base tree and return its private library root."""
+
+    value = _closure(closure)
+    lock = receipts._object(  # noqa: SLF001
+        value.get("dependency_lock"), label="recovery dependency lock"
+    )
+    manifest_digest = lock.get("python_runtime_manifest_sha256")
+    archive_digest = lock.get("python_runtime_archive_sha256")
+    if manifest_digest is None and archive_digest is None:
+        return None
+    if not isinstance(manifest_digest, str) or not isinstance(archive_digest, str):
+        raise receipts.ReleaseControlError("recovery Python runtime lock is incomplete")
+    _verify_dependency_lock(value, capsule_root)
+    manifest_path = _regular_member(
+        capsule_root,
+        PurePosixPath("recovery/python-runtime-manifest.json"),
+        label="recovery Python runtime manifest",
+    )
+    manifest = receipts._object(  # noqa: SLF001
+        receipts.strict_canonical_json(
+            manifest_path.read_bytes(), label="recovery Python runtime manifest"
+        ),
+        label="recovery Python runtime manifest",
+    )
+    receipts._validate_schema(  # noqa: SLF001
+        "kestrel.recovery_python_runtime.v1",
+        manifest,
+        label="recovery Python runtime manifest",
+    )
+    python = resolve_external_executable(closure=closure, name="python")
+    runtime_root = capsule_root.resolve(strict=True).parent / "recovery-runtime"
+    expected_python = runtime_root / "environment" / "bin" / "python"
+    if python != expected_python.resolve(strict=True):
+        raise receipts.ReleaseControlError("recovery Python runtime path is not exact")
+    base_root = runtime_root / "base"
+    count, total, tree_digest = _python_runtime_tree_identity(base_root)
+    if (
+        count != manifest.get("runtime_file_count")
+        or total != manifest.get("runtime_total_size_bytes")
+        or tree_digest != manifest.get("runtime_tree_sha256")
+        or _member_digest(base_root / "bin" / "python3.11")
+        != manifest.get("python_executable_sha256")
+    ):
+        raise receipts.ReleaseControlError("recovery Python runtime tree identity mismatch")
+    library_root = (base_root / "lib").resolve(strict=True)
+    _authorize_io_path(value, path=library_root)
+    return library_root
+
+
+def _validated_runtime_files(
+    closure: receipts.JSONObject,
+) -> tuple[tuple[Path, Path], ...]:
+    raw_runtime = closure.get("runtime_files")
+    if raw_runtime is None:
+        return ()
+    sys_path = receipts._array(closure.get("sys_path"), label="recovery sys.path")  # noqa: SLF001
+    capsule_root = Path(
+        receipts._validate_string(  # noqa: SLF001
+            sys_path[0], label="recovery capsule sys.path"
+        )
+    ).resolve(strict=True)
+    resources = _member_table(closure, field="data_resources", capsule_root=capsule_root)
+    runtime_files: list[tuple[Path, Path]] = []
+    previous = ""
+    for raw_item in receipts._array(raw_runtime, label="recovery runtime files"):  # noqa: SLF001
+        item = receipts._object(raw_item, label="recovery runtime file")  # noqa: SLF001
+        asset_name = _relative_member(
+            item.get("asset_path"), label="recovery runtime asset path"
+        ).as_posix()
+        sandbox_name = receipts._validate_string(  # noqa: SLF001
+            item.get("sandbox_path"), label="recovery runtime sandbox path"
+        )
+        sandbox_path = Path(sandbox_name)
+        source_entry = resources.get(asset_name)
+        if (
+            source_entry is None
+            or not sandbox_path.is_absolute()
+            or sandbox_path.as_posix() != sandbox_name
+            or any(part in {".", ".."} for part in sandbox_path.parts)
+            or sandbox_name <= previous
+            or sandbox_name.startswith(("/dev/", "/proc/", "/sys/", "/tmp/"))  # nosec B108
+        ):
+            raise receipts.ReleaseControlError("recovery runtime file binding is unsafe")
+        source, member_digest = source_entry
+        expected_digest = receipts._digest(  # noqa: SLF001
+            item.get("sha256"), label="recovery runtime file digest"
+        )
+        expected_size = receipts._safe_integer(  # noqa: SLF001
+            item.get("size_bytes"), label="recovery runtime file size", positive=True
+        )
+        if (
+            member_digest != expected_digest
+            or _member_digest(source) != expected_digest
+            or source.stat().st_size != expected_size
+            or source.is_symlink()
+            or not source.is_file()
+        ):
+            raise receipts.ReleaseControlError("recovery runtime file identity mismatch")
+        runtime_files.append((source.resolve(strict=True), sandbox_path))
+        previous = sandbox_name
+    return tuple(runtime_files)
+
+
+def _ensure_no_global_loader_preload(
+    *, preload_path: Path = Path("/etc/ld.so.preload")
+) -> None:
+    """Fail before a global loader preload can cross the recovery TCB boundary."""
+
+    if preload_path.exists() or preload_path.is_symlink():
+        raise receipts.ReleaseControlError(
+            "global dynamic-loader preload is outside the recovery closure"
+        )
+
+
+def private_loader_command(
+    *,
+    closure: bytes,
+    executable: Path,
+    arguments: Sequence[str],
+    additional_library_roots: Sequence[Path] = (),
+    preload_path: Path = Path("/etc/ld.so.preload"),
+) -> list[str]:
+    """Preflight and build an invocation resolved only by digest-bound libraries."""
+
+    _ensure_no_global_loader_preload(preload_path=preload_path)
+    value = _closure(closure)
+    checked_executable = executable.resolve(strict=True)
+    external = {
+        resolve_external_executable(closure=closure, name=cast(str, item["name"]))
+        for raw_item in receipts._array(  # noqa: SLF001
+            value.get("external_executables"), label="recovery external executables"
+        )
+        if (item := receipts._object(raw_item, label="recovery external executable"))  # noqa: SLF001
+    }
+    if checked_executable not in external:
+        raise receipts.ReleaseControlError(
+            "private-loader executable is outside the exact recovery closure"
+        )
+    runtime_files = _validated_runtime_files(value)
+    if not runtime_files:
+        raise receipts.ReleaseControlError("private recovery runtime is empty")
+    runtime_roots = {source.parent for source, _target in runtime_files}
+    if len(runtime_roots) != 1:
+        raise receipts.ReleaseControlError("private recovery runtime directory is ambiguous")
+    runtime_root = next(iter(runtime_roots)).resolve(strict=True)
+    runtime_names: set[str] = set()
+    loaders: list[Path] = []
+    for source, target in runtime_files:
+        if (
+            source.parent != runtime_root
+            or source.name != target.name
+            or source.name in runtime_names
+        ):
+            raise receipts.ReleaseControlError(
+                "private recovery runtime has a basename collision"
+            )
+        runtime_names.add(source.name)
+        if target.name.startswith("ld-linux-"):
+            loaders.append(source)
+    if len(loaders) != 1:
+        raise receipts.ReleaseControlError("private recovery dynamic loader is ambiguous")
+    if any(path.is_dir() for path in runtime_root.iterdir()):
+        raise receipts.ReleaseControlError(
+            "private recovery runtime contains an unexpected loader search directory"
+        )
+    library_roots = [runtime_root]
+    for raw_root in additional_library_roots:
+        if raw_root.is_symlink() or not raw_root.is_dir():
+            raise receipts.ReleaseControlError("private recovery library root is unsafe")
+        root = raw_root.resolve(strict=True)
+        if root in library_roots:
+            raise receipts.ReleaseControlError("private recovery library root is duplicated")
+        library_roots.append(root)
+    allowed_files = {
+        path.resolve(strict=True)
+        for root in library_roots
+        for path in root.iterdir()
+        if path.is_file() and not path.is_symlink()
+    }
+    loader = loaders[0]
+    library_path = ":".join(str(path) for path in library_roots)
+    preflight = subprocess.run(  # noqa: S603  # nosec B603
+        [
+            str(loader),
+            "--inhibit-cache",
+            "--library-path",
+            library_path,
+            "--list",
+            str(checked_executable),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        timeout=10,
+    )
+    combined = "\n".join(part for part in (preflight.stdout, preflight.stderr) if part)
+    if (
+        preflight.returncode != 0
+        or "not found" in combined
+        or len(combined.encode()) > 1024 * 1024
+    ):
+        raise receipts.ReleaseControlError("private recovery loader preflight failed")
+    resolved_dependencies: set[Path] = set()
+    for raw_line in preflight.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("linux-vdso.so"):
+            continue
+        token = (
+            line.split("=>", 1)[1].strip().split(None, 1)[0]
+            if "=>" in line
+            else line.split(None, 1)[0]
+        )
+        path = Path(token)
+        if not path.is_absolute():
+            raise receipts.ReleaseControlError(
+                "private recovery loader reported an ambient dependency"
+            )
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise receipts.ReleaseControlError(
+                "private recovery loader dependency is missing"
+            ) from exc
+        if resolved not in allowed_files or resolved.parent not in library_roots:
+            raise receipts.ReleaseControlError(
+                "private recovery loader resolved an ambient dependency"
+            )
+        resolved_dependencies.add(resolved)
+    if loader not in resolved_dependencies:
+        raise receipts.ReleaseControlError(
+            "private recovery loader did not resolve its own exact identity"
+        )
+    return [
+        str(loader),
+        "--inhibit-cache",
+        "--library-path",
+        library_path,
+        str(checked_executable),
+        *arguments,
+    ]
 
 
 def resolve_external_executable(*, closure: bytes, name: str) -> Path:
@@ -616,6 +956,7 @@ def build_os_sandbox_arguments(
     }
     resolved_target = target.resolve(strict=True)
     roots = _validated_io_roots(value)
+    runtime_files = _validated_runtime_files(value)
     if not any(resolved_target == root or root in resolved_target.parents for root, _ in roots):
         if resolved_target not in external_paths:
             raise receipts.ReleaseControlError(
@@ -642,16 +983,56 @@ def build_os_sandbox_arguments(
         "--dev",
         "/dev",
         "--tmpfs",
-        "/tmp",
+        "/tmp",  # nosec B108
     ]
+    runtime_directories = {
+        parent
+        for _source, target in runtime_files
+        for parent in target.parents
+        if parent != Path("/")
+    }
+    for directory in sorted(runtime_directories, key=lambda item: (len(item.parts), str(item))):
+        arguments.extend(("--dir", str(directory)))
     for root, access in roots:
         operation = "--bind" if access == "read_write" else "--ro-bind"
         arguments.extend((operation, str(root), str(root)))
     for executable in sorted(external_paths, key=str):
-        if any(executable == root or root in executable.parents for root, _ in roots):
+        containing_roots = [
+            access
+            for root, access in roots
+            if executable == root or root in executable.parents
+        ]
+        if containing_roots and all(access == "read" for access in containing_roots):
             continue
         arguments.extend(("--ro-bind", str(executable), str(executable)))
+    for source, target in runtime_files:
+        if any(
+            access == "read_write"
+            and (source == root or root in source.parents)
+            for root, access in roots
+        ):
+            arguments.extend(("--ro-bind", str(source), str(source)))
+        arguments.extend(("--ro-bind", str(source), str(target)))
     environment = build_isolated_environment(closure=closure)
+    if runtime_files:
+        base_library_root = _verify_extracted_python_runtime(
+            closure=closure,
+            capsule_root=Path(
+                receipts._validate_string(  # noqa: SLF001
+                    receipts._array(  # noqa: SLF001
+                        value.get("sys_path"), label="recovery sys.path"
+                    )[0],
+                    label="recovery capsule sys.path",
+                )
+            ),
+        )
+        if base_library_root is not None:
+            private_roots = sorted(
+                {target.parent for _source, target in runtime_files}, key=str
+            )
+            environment["LD_LIBRARY_PATH"] = ":".join(
+                [*(str(path) for path in private_roots), str(base_library_root)]
+            )
     arguments.append("--clearenv")
     for name, setting in sorted(environment.items()):
         arguments.extend(("--setenv", name, setting))
@@ -790,7 +1171,12 @@ def _extract_deterministic_archive(*, archive: Path, destination: Path) -> None:
             target.chmod(0o644)
 
 
-def inspect_isolated_python(executable: Path) -> tuple[list[str], dict[str, str]]:
+def inspect_isolated_python(
+    executable: Path,
+    *,
+    closure: bytes | None = None,
+    additional_library_roots: Sequence[Path] = (),
+) -> tuple[list[str], dict[str, str]]:
     """Read the exact isolated target runtime and its hash-locked dependency path."""
 
     probe = (
@@ -800,8 +1186,19 @@ def inspect_isolated_python(executable: Path) -> tuple[list[str], dict[str, str]
         "'abi':f'cp{sys.version_info.major}{sys.version_info.minor}',"
         "'sys_path':sys.path},sort_keys=True,separators=(',',':')))"
     )
+    arguments = ["-I", "-B", "-c", probe]
+    command = (
+        [str(executable), *arguments]
+        if closure is None
+        else private_loader_command(
+            closure=closure,
+            executable=executable,
+            arguments=arguments,
+            additional_library_roots=additional_library_roots,
+        )
+    )
     completed = subprocess.run(  # noqa: S603  # nosec B603
-        [str(executable), "-I", "-B", "-c", probe],
+        command,
         capture_output=True,
         check=False,
         env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"},
@@ -998,19 +1395,9 @@ def verify_execution_closure(
                     raise receipts.ReleaseControlError(
                         "recovery sandbox identity changed during closure verification"
                     )
-                result = subprocess.run(
-                    [str(path), "--version"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    env=build_isolated_environment(closure=closure),
-                    timeout=10,
-                )
-                if result.returncode != 0:
-                    raise receipts.ReleaseControlError(
-                        "recovery external executable version check failed"
-                    )
-                version = (result.stdout or result.stderr).splitlines()[0]
+                # Its independently frozen digest binds this exact version. The
+                # first execution occurs only through private_loader_command.
+                version = cast(str, item.get("version"))
             else:
                 # The digest and closure membership authorize this tool, but its
                 # first execution must occur inside the OS sandbox. A caller may
@@ -1019,7 +1406,197 @@ def verify_execution_closure(
         if version != item.get("version"):
             raise receipts.ReleaseControlError("recovery external executable version mismatch")
     _verify_dependency_lock(value, capsule_root)
+    _validated_runtime_files(value)
+    _verify_extracted_python_runtime(closure=closure, capsule_root=capsule_root)
     return value
+
+
+def build_host_actuator_binding(
+    *,
+    closure: bytes,
+    capsule_root: Path,
+    host_root: Path,
+    host_python: Path,
+    host_gh: Path,
+) -> receipts.JSONObject:
+    """Bind the offline authority plane to a byte-identical host actuation plane."""
+
+    value = _closure(closure)
+    if host_root.is_symlink() or not host_root.is_dir():
+        raise receipts.ReleaseControlError("recovery host actuator root is invalid")
+    checked_host_root = _authorize_io_path(
+        value,
+        path=host_root.resolve(strict=True),
+    )
+    members: dict[str, tuple[Path, str]] = {}
+    for field in ("python_members", "shell_helpers", "data_resources"):
+        for name, identity in _member_table(
+            value,
+            field=field,
+            capsule_root=capsule_root,
+        ).items():
+            if name in members:
+                raise receipts.ReleaseControlError(
+                    "recovery host actuator closure member is duplicated"
+                )
+            members[name] = identity
+    required_names = (
+        receipts._RECOVERY_CAPSULE_SOURCE_ASSETS  # noqa: SLF001
+        | receipts._RECOVERY_CAPSULE_SCHEMA_ASSETS  # noqa: SLF001
+    )
+    if not receipts._RECOVERY_CAPSULE_WORKFLOWS.issubset(required_names):  # noqa: SLF001
+        raise receipts.ReleaseControlError(
+            "recovery host actuator source lacks the frozen workflow pair"
+        )
+    if not required_names.issubset(members):
+        raise receipts.ReleaseControlError(
+            "recovery host actuator source is absent from the execution closure"
+        )
+    host_source: dict[str, bytes] = {}
+    for name in sorted(required_names):
+        capsule_path, expected_digest = members[name]
+        host_path = checked_host_root.joinpath(*PurePosixPath(name).parts)
+        capsule_raw = receipts._read_regular(  # noqa: SLF001
+            capsule_path,
+            label=f"recovery capsule actuator source {name}",
+            max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+        )
+        host_raw = receipts._read_regular(  # noqa: SLF001
+            host_path,
+            label=f"recovery host actuator source {name}",
+            max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+        )
+        if (
+            receipts._sha256(capsule_raw) != expected_digest  # noqa: SLF001
+            or host_raw != capsule_raw
+        ):
+            raise receipts.ReleaseControlError(
+                "recovery host actuator source identity mismatch"
+            )
+        host_source[name] = host_raw
+
+    python_items = [
+        receipts._object(item, label="recovery host actuator Python")  # noqa: SLF001
+        for item in receipts._array(  # noqa: SLF001
+            value.get("external_executables"),
+            label="recovery external executables",
+        )
+        if receipts._object(  # noqa: SLF001
+            item, label="recovery external executable"
+        ).get("name")
+        == "python"
+    ]
+    if len(python_items) != 1:
+        raise receipts.ReleaseControlError(
+            "recovery host actuator Python identity is absent or ambiguous"
+        )
+    python_item = python_items[0]
+    if (
+        not host_python.is_absolute()
+        or host_python.is_symlink()
+        or not host_python.is_file()
+        or not os.access(host_python, os.X_OK)
+    ):
+        raise receipts.ReleaseControlError("recovery host actuator Python path is invalid")
+    host_python_raw = receipts._read_regular(  # noqa: SLF001
+        host_python,
+        label="recovery host actuator Python",
+        max_bytes=256 * 1024 * 1024,
+    )
+    python_digest = receipts._sha256(host_python_raw)  # noqa: SLF001
+    python_version = receipts._validate_string(  # noqa: SLF001
+        python_item.get("version"), label="recovery host actuator Python version"
+    )
+    if python_digest != python_item.get("sha256"):
+        raise receipts.ReleaseControlError("recovery host actuator Python identity mismatch")
+
+    if (
+        not host_gh.is_absolute()
+        or host_gh.is_symlink()
+        or not host_gh.is_file()
+        or not os.access(host_gh, os.X_OK)
+    ):
+        raise receipts.ReleaseControlError("recovery host actuator GitHub CLI path is invalid")
+    gh_raw = receipts._read_regular(  # noqa: SLF001
+        host_gh,
+        label="recovery host actuator GitHub CLI",
+        max_bytes=256 * 1024 * 1024,
+    )
+    gh_digest = receipts._sha256(gh_raw)  # noqa: SLF001
+    expected_gh_digest = receipts.PINNED_GH_BINARY_DIGESTS.get(
+        (sys.platform, platform.machine())
+    )
+    if gh_digest != expected_gh_digest:
+        raise receipts.ReleaseControlError("recovery host actuator GitHub CLI identity mismatch")
+
+    manifest_raw = receipts._read_regular(  # noqa: SLF001
+        capsule_root / "recovery-capsule-manifest.json",
+        label="recovery host actuator capsule manifest",
+        max_bytes=receipts.MAX_SOURCE_BODY_BYTES,
+    )
+    manifest = receipts._object(  # noqa: SLF001
+        receipts.strict_canonical_json(
+            manifest_raw,
+            label="recovery host actuator capsule manifest",
+        ),
+        label="recovery host actuator capsule manifest",
+    )
+    candidate = receipts._object(  # noqa: SLF001
+        manifest.get("candidate"), label="recovery host actuator candidate"
+    )
+    source_sha = receipts._validate_string(  # noqa: SLF001
+        candidate.get("source_sha"), label="recovery host actuator candidate source SHA"
+    )
+    if receipts.GIT_SHA_RE.fullmatch(source_sha) is None:
+        raise receipts.ReleaseControlError(
+            "recovery host actuator candidate source SHA is invalid"
+        )
+    workflow_digests = [
+        {"path": name, "sha256": receipts._sha256(host_source[name])}  # noqa: SLF001
+        for name in sorted(receipts._RECOVERY_CAPSULE_WORKFLOWS)  # noqa: SLF001
+    ]
+    binding: receipts.JSONObject = {
+        "schema": "kestrel.recovery_host_actuator_binding.v1",
+        "candidate_source_sha": source_sha,
+        "capsule_manifest_sha256": receipts._sha256(manifest_raw),  # noqa: SLF001
+        "execution_closure_sha256": receipts._sha256(closure),  # noqa: SLF001
+        "host_source": {
+            "asset_count": len(host_source),
+            "source_bundle_digest": receipts.source_bundle_digest(host_source),
+            "workflow_digests": workflow_digests,
+        },
+        "host_python": {"sha256": python_digest, "version": python_version},
+        "host_gh": {
+            "sha256": gh_digest,
+            "version": receipts.PINNED_GH_VERSION_LINE.decode("ascii"),
+        },
+        "authority_plane": {
+            "name": "offline_capsule",
+            "network_authority": "deny_all",
+            "role": "interpret_and_verify",
+        },
+        "actuation_plane": {
+            "name": "dispatch_pinned_host_workflow",
+            "network_authority": "workflow_scoped",
+            "role": "acquire_and_mutate",
+        },
+        "provenance": {
+            "producer": "scripts/recovery_launcher.py",
+            "provider": "local",
+            "method": "offline-authority-host-actuator-binding",
+        },
+        "confidence": 1,
+        "validation_status": "validated",
+    }
+    binding["binding_digest"] = receipts._sha256(  # noqa: SLF001
+        receipts.canonical_json_bytes(binding)
+    )
+    receipts._validate_schema(  # noqa: SLF001
+        "kestrel.recovery_host_actuator_binding.v1",
+        binding,
+        label="recovery host actuator binding",
+    )
+    return binding
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1032,6 +1609,13 @@ def _parser() -> argparse.ArgumentParser:
     materialize.add_argument("closure")
     materialize.add_argument("--capsule-root", required=True)
     materialize.add_argument("--destination", required=True)
+    bind_host = commands.add_parser("bind-host-actuator")
+    bind_host.add_argument("closure")
+    bind_host.add_argument("--capsule-root", required=True)
+    bind_host.add_argument("--host-root", required=True)
+    bind_host.add_argument("--host-python", required=True)
+    bind_host.add_argument("--host-gh", required=True)
+    bind_host.add_argument("--output", required=True)
     launch = commands.add_parser("launch")
     launch.add_argument("closure")
     launch.add_argument("--capsule-root", required=True)
@@ -1048,30 +1632,71 @@ def main(argv: Sequence[str] | None = None) -> int:
         closure_path, label="recovery execution closure", max_bytes=MAX_CLOSURE_BYTES
     )
     value = _closure(closure)
-    if args.command == "materialize-candidate":
-        materialize_candidate_from_capsule(
-            closure=closure,
-            capsule_root=Path(args.capsule_root),
-            destination=Path(args.destination),
-        )
-        return 0
     try:
         python_executable = resolve_trusted_recovery_python(closure=closure)
     except receipts.ReleaseControlError as exc:
         raise receipts.ReleaseControlError(
             "recovery Python interpreter is absent from the exact closure"
         ) from exc
-    interpreter_sys_path, active_runtime = inspect_isolated_python(python_executable)
+    capsule_root = Path(args.capsule_root)
+    runtime_files = receipts._array(  # noqa: SLF001
+        value.get("runtime_files"), label="recovery runtime files"
+    )
+    base_library_root = _verify_extracted_python_runtime(
+        closure=closure, capsule_root=capsule_root
+    )
+    if runtime_files and base_library_root is None:
+        raise receipts.ReleaseControlError("recovery Python runtime lock is absent")
+    interpreter_sys_path, active_runtime = (
+        inspect_isolated_python(
+            python_executable,
+            closure=closure,
+            additional_library_roots=(base_library_root,),
+        )
+        if runtime_files and base_library_root is not None
+        else inspect_isolated_python(python_executable)
+    )
     active_sys_path = effective_recovery_sys_path(
-        capsule_root=Path(args.capsule_root),
+        capsule_root=capsule_root,
         interpreter_sys_path=interpreter_sys_path,
     )
     verify_execution_closure(
         closure=closure,
-        capsule_root=Path(args.capsule_root),
+        capsule_root=capsule_root,
         active_sys_path=active_sys_path,
         active_python_runtime=active_runtime,
     )
+    if args.command == "materialize-candidate":
+        materialize_candidate_from_capsule(
+            closure=closure,
+            capsule_root=capsule_root,
+            destination=Path(args.destination),
+        )
+        return 0
+    if args.command == "bind-host-actuator":
+        binding = build_host_actuator_binding(
+            closure=closure,
+            capsule_root=capsule_root,
+            host_root=Path(args.host_root),
+            host_python=Path(args.host_python),
+            host_gh=Path(args.host_gh),
+        )
+        output = Path(args.output)
+        _authorize_io_path(value, path=output, require_write=True)
+        if output.exists() or output.is_symlink() or not output.parent.is_dir():
+            raise receipts.ReleaseControlError(
+                "recovery host actuator binding output must be absent"
+            )
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(receipts.canonical_json_bytes(binding))
+            target.flush()
+            os.fsync(target.fileno())
+        return 0
     if args.command == "verify":
         return 0
     declared_endpoints = cast(list[str], args.network_endpoint)
@@ -1095,7 +1720,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         members = _member_table(
             value,
             field="python_members",
-            capsule_root=Path(args.capsule_root),
+            capsule_root=capsule_root,
         )
         if resolved_target not in {path.resolve(strict=True) for path, _digest in members.values()}:
             raise receipts.ReleaseControlError(
@@ -1125,7 +1750,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         command=arguments,
         declared_endpoints=declared_endpoints,
     )
-    os.execve(str(sandbox), sandbox_arguments, environment)
+    if runtime_files:
+        private_command = private_loader_command(
+            closure=closure,
+            executable=sandbox,
+            arguments=sandbox_arguments[1:],
+        )
+        os.execve(private_command[0], private_command, environment)  # nosec B606
+    os.execve(str(sandbox), sandbox_arguments, environment)  # nosec B606
     return 1  # pragma: no cover
 
 

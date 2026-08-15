@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.recovery_dependency_staging.v1.schema.json",
+  "title": "kestrel.recovery_dependency_staging.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "required": [
+    "schema",
+    "inputs",
+    "outputs",
+    "provenance",
+    "confidence",
+    "validation_status",
+    "receipt_digest"
+  ],
+  "properties": {
+    "schema": {"const": "kestrel.recovery_dependency_staging.v1"},
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bubblewrap_package_url",
+        "bubblewrap_package_sha256",
+        "requirements_sha256",
+        "python_package_url",
+        "python_package_sha256",
+        "python_version",
+        "python_abi",
+        "wheel_platform",
+        "source_sha"
+      ],
+      "properties": {
+        "bubblewrap_package_url": {
+          "const": "https://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.1_amd64.deb"
+        },
+        "bubblewrap_package_sha256": {
+          "const": "sha256:1b506492bd9c7fd0cdb4f02ac822f1d3e336b0aead5113c1239baf8db5db562a"
+        },
+        "requirements_sha256": {"$ref": "#/$defs/digest"},
+        "python_package_url": {
+          "const": "https://github.com/actions/python-versions/releases/download/3.11.14-18393181605/python-3.11.14-linux-24.04-x64.tar.gz"
+        },
+        "python_package_sha256": {
+          "const": "sha256:295c25eeb4fdad1ec9526a27fbd9b476d7c79b00547d74d809b306381d0796d5"
+        },
+        "python_version": {"const": "3.11.14"},
+        "python_abi": {"const": "cp311"},
+        "wheel_platform": {"const": "manylinux2014_x86_64"},
+        "source_sha": {"$ref": "#/$defs/git_sha"}
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bubblewrap_sha256",
+        "bubblewrap_version",
+        "wheelhouse_manifest_sha256",
+        "wheel_count",
+        "runtime_manifest_sha256",
+        "runtime_file_count",
+        "python_runtime_manifest_sha256",
+        "python_runtime_archive_sha256"
+      ],
+      "properties": {
+        "bubblewrap_sha256": {"$ref": "#/$defs/digest"},
+        "bubblewrap_version": {"const": "bubblewrap 0.9.0"},
+        "wheelhouse_manifest_sha256": {"$ref": "#/$defs/digest"},
+        "wheel_count": {"$ref": "#/$defs/positive_integer"},
+        "runtime_manifest_sha256": {"$ref": "#/$defs/digest"},
+        "runtime_file_count": {"$ref": "#/$defs/positive_integer"},
+        "python_runtime_manifest_sha256": {"$ref": "#/$defs/digest"},
+        "python_runtime_archive_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["producer", "provider", "method"],
+      "properties": {
+        "producer": {"const": "scripts/stage_recovery_dependencies.py"},
+        "provider": {"const": "github.com+archive.ubuntu.com+pypi.org"},
+        "method": {"const": "checksum-pinned-recovery-dependency-staging"}
+      }
+    },
+    "confidence": {"type": "integer", "const": 1},
+    "validation_status": {"const": "validated"},
+    "receipt_digest": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "positive_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    }
+  }
+}

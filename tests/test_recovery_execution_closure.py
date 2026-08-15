@@ -159,6 +159,7 @@ def _closure(tmp_path: Path) -> tuple[Path, bytes, Path]:
                 "version": "exact-tool 1.0",
             }
         ],
+        "runtime_files": [],
         "python_runtime": {
             "implementation": "CPython",
             "version": (
@@ -169,6 +170,9 @@ def _closure(tmp_path: Path) -> tuple[Path, bytes, Path]:
         "dependency_lock": {
             "requirements_path": "recovery/requirements.txt",
             "requirements_sha256": _sha(requirements),
+            "runtime_manifest_sha256": None,
+            "python_runtime_manifest_sha256": None,
+            "python_runtime_archive_sha256": None,
             "wheelhouse_manifest_sha256": _sha(wheelhouse),
         },
         "sys_path": [str(capsule)],
@@ -223,6 +227,109 @@ def test_execution_closure_verifies_exact_members_imports_and_tool(
         )
         == tool_path
     )
+
+
+def test_execution_closure_distinguishes_root_resources_from_fixed_authority_assets(
+    tmp_path: Path,
+) -> None:
+    capsule, closure, tool_path = _closure(tmp_path)
+    ignore = b"fixture allowlist\n"
+    _write(capsule / ".gitleaksignore", ignore)
+    _write(capsule / "release-authorization.json", b"{}")
+    value = json.loads(closure)
+    value["data_resources"].append(
+        {"path": ".gitleaksignore", "sha256": _sha(ignore)}
+    )
+    value["data_resources"].sort(key=lambda item: item["path"])
+
+    verified = launcher.verify_execution_closure(
+        closure=_canonical(value),
+        capsule_root=capsule,
+        active_sys_path=[str(capsule)],
+        executable_versions={str(tool_path): "exact-tool 1.0"},
+    )
+
+    assert verified["validation_status"] == "validated"
+
+
+def test_offline_capsule_binds_an_exact_separate_host_actuator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule, closure, host_python = _closure(tmp_path)
+    host = tmp_path / "host"
+    workflows = {
+        ".github/workflows/release-transaction.yml": b"name: Release transaction\n",
+        ".github/workflows/release.yml": b"name: Release\n",
+    }
+    for name, raw in workflows.items():
+        _write(capsule / name, raw)
+    source_assets = frozenset(
+        {"pkg/entry.py", "pkg/helper.py", "pkg/plugin.py", *workflows}
+    )
+    schema_assets = frozenset({"schemas/example.schema.json"})
+    for name in sorted(source_assets | schema_assets):
+        _write(host / name, (capsule / name).read_bytes())
+    _write(
+        capsule / "recovery-capsule-manifest.json",
+        _canonical({"candidate": {"source_sha": "a" * 40}}),
+    )
+    host_gh = tmp_path / "host-tools" / "gh"
+    _write(host_gh, b"pinned gh\n", executable=True)
+    value = json.loads(closure)
+    value["external_executables"] = [
+        {
+            "name": "python",
+            "path": str(host_python),
+            "sha256": _sha(host_python.read_bytes()),
+            "version": "Python 3.11.14",
+        }
+    ]
+    value["data_resources"].extend(
+        {"path": name, "sha256": _sha(raw)} for name, raw in workflows.items()
+    )
+    value["data_resources"].sort(key=lambda item: item["path"])
+    value["io_roots"].append({"path": str(host), "access": "read"})
+    value["io_roots"].sort(key=lambda item: item["path"])
+    closure = _canonical(value)
+    monkeypatch.setattr(receipts, "_RECOVERY_CAPSULE_SOURCE_ASSETS", source_assets)
+    monkeypatch.setattr(receipts, "_RECOVERY_CAPSULE_SCHEMA_ASSETS", schema_assets)
+    monkeypatch.setattr(
+        receipts,
+        "PINNED_GH_BINARY_DIGESTS",
+        {(sys.platform, launcher.platform.machine()): _sha(host_gh.read_bytes())},
+    )
+
+    binding = launcher.build_host_actuator_binding(
+        closure=closure,
+        capsule_root=capsule,
+        host_root=host,
+        host_python=host_python,
+        host_gh=host_gh,
+    )
+
+    assert binding["authority_plane"] == {
+        "name": "offline_capsule",
+        "network_authority": "deny_all",
+        "role": "interpret_and_verify",
+    }
+    assert binding["actuation_plane"] == {
+        "name": "dispatch_pinned_host_workflow",
+        "network_authority": "workflow_scoped",
+        "role": "acquire_and_mutate",
+    }
+    assert binding["candidate_source_sha"] == "a" * 40
+    assert binding["validation_status"] == "validated"
+
+    (host / "pkg" / "helper.py").write_bytes(b"VALUE = 'drifted'\n")
+    with pytest.raises(ValueError, match="host actuator.*identity|source.*mismatch"):
+        launcher.build_host_actuator_binding(
+            closure=closure,
+            capsule_root=capsule,
+            host_root=host,
+            host_python=host_python,
+            host_gh=host_gh,
+        )
 
 
 def test_closure_verification_never_executes_self_declared_tools_before_sandbox(
@@ -335,6 +442,54 @@ def test_isolated_runpy_bootstrap_can_import_capsule_launcher_dependencies() -> 
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_isolated_runpy_bootstrap_rejects_an_ambient_secret() -> None:
+    observed, _runtime = launcher.inspect_isolated_python(Path(sys.executable))
+    purelib = sysconfig.get_paths()["purelib"]
+    effective = launcher.effective_recovery_sys_path(
+        capsule_root=ROOT,
+        interpreter_sys_path=observed[: observed.index(purelib) + 1],
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            launcher.ISOLATED_PYTHON_BOOTSTRAP,
+            json.dumps(effective, separators=(",", ":")),
+            str(ROOT / "scripts" / "recovery_launcher.py"),
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "KESTREL_RECOVERY_SMOKE_SENTINEL": "sandbox-environment-sentinel",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONNOUSERSITE": "1",
+        },
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
+    assert "ambient recovery environment" in completed.stderr
+
+
+def test_python_runtime_tree_identity_detects_stdlib_drift(tmp_path: Path) -> None:
+    runtime = tmp_path / "base"
+    library = runtime / "lib" / "python3.11" / "pathlib.py"
+    _write(library, b"trusted stdlib bytes\n")
+
+    original = launcher._python_runtime_tree_identity(runtime)  # noqa: SLF001
+    library.write_bytes(b"drifted stdlib bytes\n")
+    drifted = launcher._python_runtime_tree_identity(runtime)  # noqa: SLF001
+
+    assert original != drifted
 
 
 def test_launcher_does_not_self_certify_declared_sys_path(tmp_path: Path) -> None:
@@ -541,6 +696,259 @@ def test_bubblewrap_profile_is_offline_and_mounts_only_declared_roots(
             sandbox=sandbox,
             command=[str(tool_path), "--version"],
             declared_endpoints=["https://api.github.com"],
+        )
+
+
+def test_bubblewrap_profile_mounts_only_digest_bound_runtime_files(
+    tmp_path: Path,
+) -> None:
+    capsule, closure, tool_path = _closure(tmp_path)
+    sandbox = tmp_path / "exact-bin" / "bwrap"
+    runtime = b"fixture dynamic loader"
+    runtime_asset = (
+        "recovery/runtime/" + "4" * 64 + "-ld-linux-x86-64.so.2"
+    )
+    runtime_source = capsule / runtime_asset
+    _write(runtime_source, runtime)
+    _write(sandbox, b"trusted bubblewrap fixture\n", executable=True)
+    value = json.loads(closure)
+    value["data_resources"].append(
+        {"path": runtime_asset, "sha256": _sha(runtime)}
+    )
+    value["data_resources"].sort(key=lambda item: item["path"])
+    value["runtime_files"] = [
+        {
+            "asset_path": runtime_asset,
+            "sandbox_path": "/lib64/ld-linux-x86-64.so.2",
+            "sha256": _sha(runtime),
+            "size_bytes": len(runtime),
+        }
+    ]
+    value["external_executables"].append(
+        {
+            "name": "sandbox",
+            "path": str(sandbox),
+            "sha256": _sha(sandbox.read_bytes()),
+            "version": "bubblewrap fixture 1.0",
+        }
+    )
+    value["external_executables"].sort(key=lambda item: item["name"])
+    closure = _canonical(value)
+
+    arguments = launcher.build_os_sandbox_arguments(
+        closure=closure,
+        sandbox=sandbox,
+        command=[str(tool_path), "--version"],
+        declared_endpoints=[],
+    )
+
+    assert ["--dir", "/lib64"] == arguments[
+        arguments.index("/lib64") - 1 : arguments.index("/lib64") + 1
+    ]
+    assert any(
+        arguments[index : index + 3]
+        == [
+            "--ro-bind",
+            str(runtime_source.resolve(strict=True)),
+            "/lib64/ld-linux-x86-64.so.2",
+        ]
+        for index in range(len(arguments) - 2)
+    )
+    assert any(
+        arguments[index : index + 3]
+        == [
+            "--ro-bind",
+            str(runtime_source.resolve(strict=True)),
+            str(runtime_source.resolve(strict=True)),
+        ]
+        for index in range(len(arguments) - 2)
+    )
+
+    runtime_source.write_bytes(b"tampered loader")
+    with pytest.raises(ValueError, match="runtime file identity|member digest"):
+        launcher.build_os_sandbox_arguments(
+            closure=closure,
+            sandbox=sandbox,
+            command=[str(tool_path), "--version"],
+            declared_endpoints=[],
+        )
+
+
+def test_private_loader_rejects_preload_and_ambient_dependency_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule, closure, _tool_path = _closure(tmp_path)
+    sandbox = capsule / "recovery" / "bin" / "bwrap"
+    loader = capsule / "recovery" / "runtime" / "ld-linux-x86-64.so.2"
+    libc = capsule / "recovery" / "runtime" / "libc.so.6"
+    _write(sandbox, b"fixture bwrap", executable=True)
+    _write(loader, b"fixture loader", executable=True)
+    _write(libc, b"fixture libc")
+    value = json.loads(closure)
+    for path, target in (
+        (loader, "/lib64/ld-linux-x86-64.so.2"),
+        (libc, "/lib/x86_64-linux-gnu/libc.so.6"),
+    ):
+        relative = path.relative_to(capsule).as_posix()
+        value["data_resources"].append(
+            {"path": relative, "sha256": _sha(path.read_bytes())}
+        )
+        value["runtime_files"].append(
+            {
+                "asset_path": relative,
+                "sandbox_path": target,
+                "sha256": _sha(path.read_bytes()),
+                "size_bytes": path.stat().st_size,
+            }
+        )
+    value["data_resources"].sort(key=lambda item: item["path"])
+    value["runtime_files"].sort(key=lambda item: item["sandbox_path"])
+    value["external_executables"].append(
+        {
+            "name": "sandbox",
+            "path": str(sandbox),
+            "sha256": _sha(sandbox.read_bytes()),
+            "version": "bubblewrap fixture 1.0",
+        }
+    )
+    value["external_executables"].sort(key=lambda item: item["name"])
+    checked = _canonical(value)
+
+    preload = tmp_path / "ld.so.preload"
+    preload.write_text("/tmp/poison.so\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="preload"):
+        launcher._ensure_no_global_loader_preload(preload_path=preload)  # noqa: SLF001
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x1)\n"
+
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *_args, **_kwargs: Completed())
+    with pytest.raises(ValueError, match="ambient|private|loader"):
+        launcher.private_loader_command(
+            closure=checked,
+            executable=sandbox,
+            arguments=("--version",),
+            preload_path=tmp_path / "absent-preload",
+        )
+
+    Completed.stdout = f"libc.so.6 => {libc} (0x1)\n{loader} (0x2)\n"
+    command = launcher.private_loader_command(
+        closure=checked,
+        executable=sandbox,
+        arguments=("--version",),
+        preload_path=tmp_path / "absent-preload",
+    )
+    assert command[:4] == [
+        str(loader),
+        "--inhibit-cache",
+        "--library-path",
+        str(loader.parent),
+    ]
+    assert command[-2:] == [str(sandbox), "--version"]
+
+
+def test_materialize_main_verifies_complete_closure_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule, closure, tool = _closure(tmp_path)
+    closure_path = capsule / "closure.json"
+    closure_path.write_bytes(closure)
+    destination = tmp_path / "candidate"
+    mutated = False
+
+    monkeypatch.setattr(launcher, "resolve_trusted_recovery_python", lambda **_kwargs: tool)
+    monkeypatch.setattr(
+        launcher,
+        "inspect_isolated_python",
+        lambda *_args, **_kwargs: (
+            [str(capsule)],
+            {
+                "implementation": "CPython",
+                "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                "abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "effective_recovery_sys_path",
+        lambda **_kwargs: [str(capsule)],
+    )
+
+    def reject(**_kwargs: object) -> dict[str, object]:
+        raise receipts.ReleaseControlError("full closure rejected")
+
+    def mutate(**_kwargs: object) -> None:
+        nonlocal mutated
+        mutated = True
+
+    monkeypatch.setattr(launcher, "verify_execution_closure", reject)
+    monkeypatch.setattr(launcher, "materialize_candidate_from_capsule", mutate)
+
+    with pytest.raises(ValueError, match="full closure rejected"):
+        launcher.main(
+            [
+                "materialize-candidate",
+                str(closure_path),
+                "--capsule-root",
+                str(capsule),
+                "--destination",
+                str(destination),
+            ]
+        )
+    assert mutated is False
+
+
+def test_host_binding_cli_output_is_authorized_write_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capsule, closure, tool = _closure(tmp_path)
+    closure_path = capsule / "closure.json"
+    closure_path.write_bytes(closure)
+    output = capsule / "binding.json"
+    output.write_bytes(b"existing")
+    monkeypatch.setattr(launcher, "resolve_trusted_recovery_python", lambda **_kwargs: tool)
+    monkeypatch.setattr(
+        launcher,
+        "inspect_isolated_python",
+        lambda *_args, **_kwargs: (
+            [str(capsule)],
+            {
+                "implementation": "CPython",
+                "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                "abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            },
+        ),
+    )
+    monkeypatch.setattr(launcher, "effective_recovery_sys_path", lambda **_kwargs: [str(capsule)])
+    monkeypatch.setattr(launcher, "verify_execution_closure", lambda **_kwargs: json.loads(closure))
+    monkeypatch.setattr(
+        launcher,
+        "build_host_actuator_binding",
+        lambda **_kwargs: {"binding_digest": _sha(b"binding")},
+    )
+
+    with pytest.raises((FileExistsError, ValueError), match="exist|write once|output"):
+        launcher.main(
+            [
+                "bind-host-actuator",
+                str(closure_path),
+                "--capsule-root",
+                str(capsule),
+                "--host-root",
+                str(capsule),
+                "--host-python",
+                str(tool),
+                "--host-gh",
+                str(tool),
+                "--output",
+                str(output),
+            ]
         )
 
 
@@ -782,15 +1190,97 @@ def _bootstrap_archive(
     (source / "recovery" / "wheelhouse").mkdir()
     if extra_wheel:
         _write(source / "recovery" / "wheelhouse" / "unexpected.whl", b"wheel")
-    venv_python = destination / (
-        "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"
-    )
+    venv_python = destination.parent / "recovery-runtime" / "environment" / "bin" / "python"
     base_python = Path(sys.executable)
+    python_digest = _sha(base_python.read_bytes())
+    runtime_raw = b"trusted runtime fixture"
+    runtime_asset = "recovery/runtime/ld-linux-x86-64.so.2"
+    runtime_files = [
+        {
+            "asset_path": runtime_asset,
+            "sandbox_path": "/lib64/ld-linux-x86-64.so.2",
+            "sha256": _sha(runtime_raw),
+            "size_bytes": len(runtime_raw),
+        }
+    ]
+    runtime_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_runtime.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": (
+                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            ),
+            "python_executable_sha256": python_digest,
+            "files": runtime_files,
+        }
+    )
+    _write(source / runtime_asset, runtime_raw)
+    _write(source / "recovery" / "runtime-manifest.json", runtime_manifest)
+    python_runtime_stream = io.BytesIO()
+    with tarfile.open(fileobj=python_runtime_stream, mode="w:gz") as archive:
+        directory = tarfile.TarInfo("bin")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        directory.uid = directory.gid = directory.mtime = 0
+        archive.addfile(directory)
+        binary = tarfile.TarInfo("bin/python3.11")
+        binary.mode = 0o755
+        binary.uid = binary.gid = binary.mtime = 0
+        binary.size = base_python.stat().st_size
+        with base_python.open("rb") as body:
+            archive.addfile(binary, body)
+    python_runtime_archive = python_runtime_stream.getvalue()
+    python_tree_records = [
+        {
+            "mode": "0755",
+            "path": "bin/python3.11",
+            "sha256": python_digest,
+            "size_bytes": base_python.stat().st_size,
+        }
+    ]
+    python_runtime_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_python_runtime.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": (
+                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            ),
+            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "python_executable_path": "bin/python3.11",
+            "python_executable_sha256": python_digest,
+            "source_archive_url": bootstrap.RECOVERY_PYTHON_PACKAGE_URL,
+            "source_archive_sha256": bootstrap.RECOVERY_PYTHON_PACKAGE_DIGEST,
+            "runtime_archive_path": "recovery/python-runtime.tar.gz",
+            "runtime_archive_sha256": _sha(python_runtime_archive),
+            "runtime_archive_size_bytes": len(python_runtime_archive),
+            "runtime_tree_sha256": _sha(_canonical(python_tree_records)),
+            "runtime_file_count": 1,
+            "runtime_total_size_bytes": base_python.stat().st_size,
+        }
+    )
+    _write(source / "recovery" / "python-runtime-manifest.json", python_runtime_manifest)
+    _write(source / "recovery" / "python-runtime.tar.gz", python_runtime_archive)
     sandbox = source / "recovery" / "bin" / "bwrap"
     sandbox_raw = b"trusted bubblewrap fixture\n"
     if include_sandbox:
         _write(sandbox, sandbox_raw)
     data_resources = [
+        {
+            "path": "recovery/runtime-manifest.json",
+            "sha256": _sha(runtime_manifest),
+        },
+        {
+            "path": "recovery/python-runtime-manifest.json",
+            "sha256": _sha(python_runtime_manifest),
+        },
+        {
+            "path": "recovery/python-runtime.tar.gz",
+            "sha256": _sha(python_runtime_archive),
+        },
+        {
+            "path": runtime_asset,
+            "sha256": _sha(runtime_raw),
+        },
         {
             "path": "recovery/requirements.txt",
             "sha256": _sha(requirements),
@@ -804,7 +1294,7 @@ def _bootstrap_archive(
         {
             "name": "python",
             "path": str(venv_python),
-            "sha256": _sha(base_python.read_bytes()),
+            "sha256": python_digest,
             "version": (
                 f"Python {sys.version_info.major}."
                 f"{sys.version_info.minor}.{sys.version_info.micro}"
@@ -818,7 +1308,6 @@ def _bootstrap_archive(
                 "sha256": _sha(sandbox_raw),
             }
         )
-        data_resources.sort(key=lambda item: item["path"])
         external_executables.append(
             {
                 "name": "sandbox",
@@ -828,6 +1317,7 @@ def _bootstrap_archive(
             }
         )
         external_executables.sort(key=lambda item: item["name"])
+    data_resources.sort(key=lambda item: item["path"])
     closure = {
         "schema": "kestrel.recovery_execution_closure.v1",
         "python_members": [{"path": "app.py", "sha256": _sha(app)}],
@@ -836,6 +1326,7 @@ def _bootstrap_archive(
         "shell_helpers": [],
         "data_resources": data_resources,
         "external_executables": external_executables,
+        "runtime_files": runtime_files,
         "python_runtime": {
             "implementation": "CPython",
             "version": (
@@ -846,6 +1337,9 @@ def _bootstrap_archive(
         "dependency_lock": {
             "requirements_path": "recovery/requirements.txt",
             "requirements_sha256": _sha(requirements),
+            "runtime_manifest_sha256": _sha(runtime_manifest),
+            "python_runtime_manifest_sha256": _sha(python_runtime_manifest),
+            "python_runtime_archive_sha256": _sha(python_runtime_archive),
             "wheelhouse_manifest_sha256": _sha(wheelhouse_manifest),
         },
         "sys_path": [str(destination)],
@@ -933,6 +1427,14 @@ def _trust_fixture_bootstrap_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
             )
         },
     )
+    monkeypatch.setattr(
+        bootstrap,
+        "_private_loader_command",
+        lambda *, executable, arguments, **_kwargs: [
+            str(executable if "environment" in executable.parts else Path(sys.executable)),
+            *arguments,
+        ],
+    )
 
 
 def test_bootstrap_recovery_builds_hash_locked_offline_environment(
@@ -954,9 +1456,7 @@ def test_bootstrap_recovery_builds_hash_locked_offline_environment(
         **_bootstrap_trust(archive),
     )
 
-    venv_python = destination / (
-        "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"
-    )
+    venv_python = destination.parent / "recovery-runtime" / "environment" / "bin" / "python"
     assert venv_python.is_file()
     assert not venv_python.is_symlink()
     assert verification["validation_status"] == "validated"
@@ -976,7 +1476,7 @@ def test_bootstrap_recovery_rejects_a_self_declared_python_identity(
             **_bootstrap_trust(archive),
         )
 
-    assert not (destination / "venv").exists()
+    assert not (destination.parent / "recovery-runtime").exists()
 
 
 def test_bootstrap_recovery_prepares_only_an_independently_trusted_capsule_sandbox(
@@ -1018,7 +1518,7 @@ def test_bootstrap_recovery_rejects_a_self_declared_capsule_sandbox(
             **_bootstrap_trust(archive),
         )
 
-    assert not (destination / "venv").exists()
+    assert not (destination.parent / "recovery-runtime").exists()
 
 
 def test_bootstrap_recovery_rejects_unlisted_wheel_before_environment_creation(
@@ -1040,7 +1540,7 @@ def test_bootstrap_recovery_rejects_unlisted_wheel_before_environment_creation(
             **_bootstrap_trust(archive),
         )
 
-    assert not (destination / "venv").exists()
+    assert not (destination.parent / "recovery-runtime").exists()
 
 
 def test_bootstrap_recovery_requires_verified_capsule_before_environment_creation(
@@ -1059,4 +1559,4 @@ def test_bootstrap_recovery_requires_verified_capsule_before_environment_creatio
             ),
         )
 
-    assert not (destination / "venv").exists()
+    assert not (destination.parent / "recovery-runtime").exists()

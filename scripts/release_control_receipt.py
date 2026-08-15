@@ -5956,6 +5956,36 @@ _RECOVERY_ARCHIVE_POLICY: JSONObject = {
 _GITLEAKS_IMAGE = (
     "zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
 )
+_RECOVERY_BWRAP_PACKAGE_URL = (
+    "https://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/"
+    "bubblewrap_0.9.0-1ubuntu0.1_amd64.deb"
+)
+_RECOVERY_BWRAP_PACKAGE_DIGEST = (
+    "sha256:1b506492bd9c7fd0cdb4f02ac822f1d3e336b0aead5113c1239baf8db5db562a"
+)
+_RECOVERY_BWRAP_BINARY_DIGEST = (
+    "sha256:52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712"
+)
+_RECOVERY_BWRAP_VERSION = "bubblewrap 0.9.0"
+_RECOVERY_PYTHON_VERSION = "3.11.14"
+_RECOVERY_PYTHON_ABI = "cp311"
+_RECOVERY_PYTHON_PACKAGE_URL = (
+    "https://github.com/actions/python-versions/releases/download/"
+    "3.11.14-18393181605/python-3.11.14-linux-24.04-x64.tar.gz"
+)
+_RECOVERY_PYTHON_PACKAGE_DIGEST = (
+    "sha256:295c25eeb4fdad1ec9526a27fbd9b476d7c79b00547d74d809b306381d0796d5"
+)
+_RECOVERY_PYTHON_BINARY_DIGEST = (
+    "sha256:dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8"
+)
+_RECOVERY_WHEEL_PLATFORM = "manylinux2014_x86_64"
+_RECOVERY_RUNTIME_PLATFORM = "ubuntu-24.04-x86_64"
+_RECOVERY_DEPENDENCY_STAGING_PROVENANCE: JSONObject = {
+    "method": "checksum-pinned-recovery-dependency-staging",
+    "producer": "scripts/stage_recovery_dependencies.py",
+    "provider": "github.com+archive.ubuntu.com+pypi.org",
+}
 _RECOVERY_CAPSULE_FIXED_ASSETS = frozenset(
     {
         "candidate-archive.tar",
@@ -5965,6 +5995,7 @@ _RECOVERY_CAPSULE_FIXED_ASSETS = frozenset(
         "owner-signing-keys-observation.json",
         "recovery-authority.json",
         "recovery-authority.json.sig",
+        "recovery/dependency-staging-receipt.json",
         "recovery-execution-closure.json",
         "recovery-repository-observation.json",
         "release-authorization.json",
@@ -5978,6 +6009,7 @@ _RECOVERY_CAPSULE_SOURCE_ASSETS = frozenset(
         "release-control-credential-policy.json",
         "release-control-source-registry.json",
         "scripts/bootstrap_recovery.py",
+        "scripts/bootstrap_recovery_tcb.sh",
         "scripts/recovery_launcher.py",
         "scripts/release_candidate_manifest.py",
         "scripts/release_control_receipt.py",
@@ -6003,8 +6035,13 @@ _RECOVERY_CAPSULE_SCHEMA_ASSETS = frozenset(
             "kestrel.dispatch_tombstone.v1.schema.json",
             "kestrel.github_release_authority.v3.schema.json",
             "kestrel.pypi_upload_authority_prerequisite.v3.schema.json",
+            "kestrel.recovery_capsule_smoke.v1.schema.json",
+            "kestrel.recovery_dependency_staging.v1.schema.json",
             "kestrel.recovery_execution_closure.v1.schema.json",
+            "kestrel.recovery_host_actuator_binding.v1.schema.json",
+            "kestrel.recovery_python_runtime.v1.schema.json",
             "kestrel.recovery_repository_authority.v1.schema.json",
+            "kestrel.recovery_runtime.v1.schema.json",
             "kestrel.release_candidate.v1.schema.json",
             "kestrel.release_commit_outcome.v2.schema.json",
             "kestrel.release_dispatch_intent.v2.schema.json",
@@ -6035,6 +6072,9 @@ def _capsule_asset_name_is_allowed(name: str) -> bool:
         | {
             _RECOVERY_SANDBOX_ASSET,
             "recovery/requirements.txt",
+            "recovery/python-runtime-manifest.json",
+            "recovery/python-runtime.tar.gz",
+            "recovery/runtime-manifest.json",
             "recovery/wheelhouse-manifest.json",
         }
     ):
@@ -6043,6 +6083,10 @@ def _capsule_asset_name_is_allowed(name: str) -> bool:
     if path.parts[0] == "evidence" and path.suffix in {".json", ".sig"}:
         return True
     return (
+        len(path.parts) == 3
+        and path.parts[:2] == ("recovery", "runtime")
+        and re.fullmatch(r"[A-Za-z0-9._+-]+", path.name) is not None
+    ) or (
         len(path.parts) == 3
         and path.parts[:2] == ("recovery", "wheelhouse")
         and path.name.endswith(".whl")
@@ -6396,6 +6440,9 @@ def _validate_capsule_execution_asset_closure(
         | {
             _RECOVERY_SANDBOX_ASSET,
             "recovery/requirements.txt",
+            "recovery/python-runtime-manifest.json",
+            "recovery/python-runtime.tar.gz",
+            "recovery/runtime-manifest.json",
             "recovery/wheelhouse-manifest.json",
         }
     )
@@ -6439,6 +6486,92 @@ def _validate_capsule_execution_asset_closure(
         "recovery/requirements.txt"
     ):
         raise ReleaseControlError("recovery capsule dependency requirements digest mismatch")
+    runtime_manifest_raw = asset_bytes.get("recovery/runtime-manifest.json")
+    if (
+        runtime_manifest_raw is None
+        or dependency_lock.get("runtime_manifest_sha256")
+        != _sha256(runtime_manifest_raw)
+        or member_digests.get("recovery/runtime-manifest.json")
+        != _sha256(runtime_manifest_raw)
+    ):
+        raise ReleaseControlError("recovery capsule runtime manifest binding mismatch")
+    runtime_manifest = _object(
+        strict_canonical_json(
+            runtime_manifest_raw,
+            label="recovery capsule runtime manifest",
+        ),
+        label="recovery capsule runtime manifest",
+    )
+    _validate_schema(
+        "kestrel.recovery_runtime.v1",
+        runtime_manifest,
+        label="recovery capsule runtime manifest",
+    )
+    runtime_items = _array(runtime_manifest.get("files"), label="recovery capsule runtime files")
+    if _array(closure.get("runtime_files"), label="capsule recovery runtime files") != runtime_items:
+        raise ReleaseControlError("recovery capsule runtime closure binding mismatch")
+    for raw_runtime in runtime_items:
+        runtime_item = _object(raw_runtime, label="recovery capsule runtime file")
+        name = _validate_capsule_asset_name(runtime_item.get("asset_path"))
+        raw = asset_bytes.get(name)
+        if (
+            raw is None
+            or member_digests.get(name) != runtime_item.get("sha256")
+            or len(raw) != runtime_item.get("size_bytes")
+            or _sha256(raw) != runtime_item.get("sha256")
+        ):
+            raise ReleaseControlError("recovery capsule runtime file binding mismatch")
+    python_manifest_raw = asset_bytes.get("recovery/python-runtime-manifest.json")
+    python_archive_raw = asset_bytes.get("recovery/python-runtime.tar.gz")
+    if (
+        python_manifest_raw is None
+        or python_archive_raw is None
+        or dependency_lock.get("python_runtime_manifest_sha256")
+        != _sha256(python_manifest_raw)
+        or dependency_lock.get("python_runtime_archive_sha256")
+        != _sha256(python_archive_raw)
+        or member_digests.get("recovery/python-runtime-manifest.json")
+        != _sha256(python_manifest_raw)
+        or member_digests.get("recovery/python-runtime.tar.gz")
+        != _sha256(python_archive_raw)
+    ):
+        raise ReleaseControlError("recovery capsule Python runtime binding mismatch")
+    python_manifest = _object(
+        strict_canonical_json(
+            python_manifest_raw,
+            label="recovery capsule Python runtime manifest",
+        ),
+        label="recovery capsule Python runtime manifest",
+    )
+    _validate_schema(
+        "kestrel.recovery_python_runtime.v1",
+        python_manifest,
+        label="recovery capsule Python runtime manifest",
+    )
+    if (
+        python_manifest.get("runtime_archive_sha256") != _sha256(python_archive_raw)
+        or python_manifest.get("runtime_archive_size_bytes") != len(python_archive_raw)
+    ):
+        raise ReleaseControlError("recovery capsule Python runtime archive identity mismatch")
+    python_items = [
+        _object(item, label="capsule Python executable")
+        for item in _array(
+            closure.get("external_executables"), label="capsule external executables"
+        )
+        if _object(item, label="capsule external executable").get("name") == "python"
+    ]
+    if len(python_items) != 1:
+        raise ReleaseControlError("recovery capsule Python executable is ambiguous")
+    python_path = PurePosixPath(
+        _validate_string(python_items[0].get("path"), label="capsule Python path")
+    )
+    if (
+        not python_path.is_absolute()
+        or python_path.parts[-4:] != ("recovery-runtime", "environment", "bin", "python")
+        or python_items[0].get("sha256")
+        != python_manifest.get("python_executable_sha256")
+    ):
+        raise ReleaseControlError("recovery capsule Python executable binding mismatch")
     wheelhouse_manifest_raw = asset_bytes.get("recovery/wheelhouse-manifest.json")
     if (
         wheelhouse_manifest_raw is None
@@ -7130,29 +7263,254 @@ def _capsule_collect_tree(assets: dict[str, bytes], *, root: Path, prefix: str) 
 
 
 def _capsule_collect_recovery_dependencies(
-    assets: dict[str, bytes], *, source_root: Path, closure: JSONObject
+    assets: dict[str, bytes],
+    *,
+    dependency_root: Path,
+    closure: JSONObject,
+    expected_source_sha: str,
 ) -> None:
+    if GIT_SHA_RE.fullmatch(expected_source_sha) is None:
+        raise ReleaseControlError("recovery dependency candidate source SHA is invalid")
     lock = _object(closure.get("dependency_lock"), label="capsule dependency lock")
     if lock.get("requirements_path") != "recovery/requirements.txt":
         raise ReleaseControlError("recovery capsule dependency requirements path mismatch")
     _capsule_add_asset(
         assets,
         name=_RECOVERY_SANDBOX_ASSET,
-        path=source_root / _RECOVERY_SANDBOX_ASSET,
+        path=dependency_root / _RECOVERY_SANDBOX_ASSET,
         max_bytes=16 * 1024 * 1024,
     )
     _capsule_add_asset(
         assets,
         name="recovery/requirements.txt",
-        path=source_root / "recovery/requirements.txt",
+        path=dependency_root / "recovery/requirements.txt",
         max_bytes=16 * 1024 * 1024,
     )
     _capsule_add_asset(
         assets,
         name="recovery/wheelhouse-manifest.json",
-        path=source_root / "recovery/wheelhouse-manifest.json",
+        path=dependency_root / "recovery/wheelhouse-manifest.json",
         max_bytes=16 * 1024 * 1024,
     )
+    _capsule_add_asset(
+        assets,
+        name="recovery/runtime-manifest.json",
+        path=dependency_root / "recovery/runtime-manifest.json",
+        max_bytes=16 * 1024 * 1024,
+    )
+    _capsule_add_asset(
+        assets,
+        name="recovery/python-runtime-manifest.json",
+        path=dependency_root / "recovery/python-runtime-manifest.json",
+        max_bytes=16 * 1024 * 1024,
+    )
+    _capsule_add_asset(
+        assets,
+        name="recovery/python-runtime.tar.gz",
+        path=dependency_root / "recovery/python-runtime.tar.gz",
+        max_bytes=512 * 1024 * 1024,
+    )
+    _capsule_add_asset(
+        assets,
+        name="recovery/dependency-staging-receipt.json",
+        path=dependency_root / "recovery/dependency-staging-receipt.json",
+        max_bytes=16 * 1024 * 1024,
+    )
+    receipt = _object(
+        strict_canonical_json(
+            assets["recovery/dependency-staging-receipt.json"],
+            label="recovery capsule dependency staging receipt",
+        ),
+        label="recovery capsule dependency staging receipt",
+    )
+    _require_exact_fields(
+        receipt,
+        frozenset(
+            {
+                "schema",
+                "inputs",
+                "outputs",
+                "provenance",
+                "confidence",
+                "validation_status",
+                "receipt_digest",
+            }
+        ),
+        label="recovery capsule dependency staging receipt",
+    )
+    if receipt.get("schema") != "kestrel.recovery_dependency_staging.v1":
+        raise ReleaseControlError("recovery capsule dependency staging schema mismatch")
+    _validate_schema(
+        "kestrel.recovery_dependency_staging.v1",
+        receipt,
+        label="recovery capsule dependency staging receipt",
+    )
+    receipt_digest = _digest(
+        receipt.get("receipt_digest"),
+        label="recovery capsule dependency staging receipt digest",
+    )
+    unsigned_receipt = dict(receipt)
+    del unsigned_receipt["receipt_digest"]
+    if receipt_digest != _sha256(canonical_json_bytes(unsigned_receipt)):
+        raise ReleaseControlError("recovery capsule dependency staging receipt digest mismatch")
+    inputs = _object(receipt.get("inputs"), label="recovery dependency staging inputs")
+    _require_exact_fields(
+        inputs,
+        frozenset(
+            {
+                "bubblewrap_package_url",
+                "bubblewrap_package_sha256",
+                "requirements_sha256",
+                "python_package_url",
+                "python_package_sha256",
+                "python_version",
+                "python_abi",
+                "wheel_platform",
+                "source_sha",
+            }
+        ),
+        label="recovery dependency staging inputs",
+    )
+    if (
+        inputs.get("bubblewrap_package_url") != _RECOVERY_BWRAP_PACKAGE_URL
+        or inputs.get("bubblewrap_package_sha256") != _RECOVERY_BWRAP_PACKAGE_DIGEST
+        or inputs.get("requirements_sha256") != _sha256(assets["recovery/requirements.txt"])
+        or inputs.get("requirements_sha256") != lock.get("requirements_sha256")
+        or inputs.get("python_package_url") != _RECOVERY_PYTHON_PACKAGE_URL
+        or inputs.get("python_package_sha256") != _RECOVERY_PYTHON_PACKAGE_DIGEST
+        or inputs.get("python_version") != _RECOVERY_PYTHON_VERSION
+        or inputs.get("python_abi") != _RECOVERY_PYTHON_ABI
+        or inputs.get("wheel_platform") != _RECOVERY_WHEEL_PLATFORM
+        or inputs.get("source_sha") != expected_source_sha
+    ):
+        raise ReleaseControlError("recovery capsule dependency staging input binding mismatch")
+    outputs = _object(receipt.get("outputs"), label="recovery dependency staging outputs")
+    _require_exact_fields(
+        outputs,
+        frozenset(
+            {
+                "bubblewrap_sha256",
+                "bubblewrap_version",
+                "wheelhouse_manifest_sha256",
+                "wheel_count",
+                "runtime_manifest_sha256",
+                "runtime_file_count",
+                "python_runtime_manifest_sha256",
+                "python_runtime_archive_sha256",
+            }
+        ),
+        label="recovery dependency staging outputs",
+    )
+    if (
+        outputs.get("bubblewrap_sha256") != _RECOVERY_BWRAP_BINARY_DIGEST
+        or outputs.get("bubblewrap_sha256") != _sha256(assets[_RECOVERY_SANDBOX_ASSET])
+        or outputs.get("bubblewrap_version") != _RECOVERY_BWRAP_VERSION
+        or outputs.get("wheelhouse_manifest_sha256")
+        != _sha256(assets["recovery/wheelhouse-manifest.json"])
+        or outputs.get("wheelhouse_manifest_sha256")
+        != lock.get("wheelhouse_manifest_sha256")
+        or outputs.get("runtime_manifest_sha256")
+        != _sha256(assets["recovery/runtime-manifest.json"])
+        or outputs.get("runtime_manifest_sha256")
+        != lock.get("runtime_manifest_sha256")
+        or outputs.get("python_runtime_manifest_sha256")
+        != _sha256(assets["recovery/python-runtime-manifest.json"])
+        or outputs.get("python_runtime_manifest_sha256")
+        != lock.get("python_runtime_manifest_sha256")
+        or outputs.get("python_runtime_archive_sha256")
+        != _sha256(assets["recovery/python-runtime.tar.gz"])
+        or outputs.get("python_runtime_archive_sha256")
+        != lock.get("python_runtime_archive_sha256")
+    ):
+        raise ReleaseControlError("recovery capsule dependency staging output binding mismatch")
+    if (
+        receipt.get("provenance") != _RECOVERY_DEPENDENCY_STAGING_PROVENANCE
+        or receipt.get("confidence") != 1
+        or receipt.get("validation_status") != "validated"
+    ):
+        raise ReleaseControlError("recovery capsule dependency staging evidence mismatch")
+    runtime_manifest = _object(
+        strict_canonical_json(
+            assets["recovery/runtime-manifest.json"],
+            label="recovery capsule runtime manifest",
+        ),
+        label="recovery capsule runtime manifest",
+    )
+    _validate_schema(
+        "kestrel.recovery_runtime.v1",
+        runtime_manifest,
+        label="recovery capsule runtime manifest",
+    )
+    if (
+        runtime_manifest.get("platform") != _RECOVERY_RUNTIME_PLATFORM
+        or runtime_manifest.get("python_version") != _RECOVERY_PYTHON_VERSION
+        or runtime_manifest.get("python_executable_sha256")
+        != _RECOVERY_PYTHON_BINARY_DIGEST
+    ):
+        raise ReleaseControlError("recovery capsule runtime identity mismatch")
+    python_runtime_manifest = _object(
+        strict_canonical_json(
+            assets["recovery/python-runtime-manifest.json"],
+            label="recovery capsule Python runtime manifest",
+        ),
+        label="recovery capsule Python runtime manifest",
+    )
+    _validate_schema(
+        "kestrel.recovery_python_runtime.v1",
+        python_runtime_manifest,
+        label="recovery capsule Python runtime manifest",
+    )
+    if (
+        python_runtime_manifest.get("runtime_archive_sha256")
+        != _sha256(assets["recovery/python-runtime.tar.gz"])
+        or python_runtime_manifest.get("runtime_archive_size_bytes")
+        != len(assets["recovery/python-runtime.tar.gz"])
+        or python_runtime_manifest.get("python_executable_sha256")
+        != _RECOVERY_PYTHON_BINARY_DIGEST
+    ):
+        raise ReleaseControlError("recovery capsule Python runtime identity mismatch")
+    runtime_items = _array(
+        runtime_manifest.get("files"), label="recovery capsule runtime files"
+    )
+    if outputs.get("runtime_file_count") != len(runtime_items):
+        raise ReleaseControlError("recovery capsule runtime file count mismatch")
+    closure_runtime_items = _array(
+        closure.get("runtime_files"), label="capsule recovery runtime files"
+    )
+    if closure_runtime_items != runtime_items:
+        raise ReleaseControlError("recovery capsule runtime closure binding mismatch")
+    previous_runtime = ""
+    for raw_runtime in runtime_items:
+        runtime_item = _object(raw_runtime, label="recovery capsule runtime file")
+        _require_exact_fields(
+            runtime_item,
+            frozenset({"asset_path", "sandbox_path", "sha256", "size_bytes"}),
+            label="recovery capsule runtime file",
+        )
+        asset_path = _validate_capsule_asset_name(runtime_item.get("asset_path"))
+        sandbox_path = _validate_string(
+            runtime_item.get("sandbox_path"), label="recovery runtime sandbox path"
+        )
+        size_bytes = _safe_integer(
+            runtime_item.get("size_bytes"),
+            label="recovery runtime file size",
+            positive=True,
+        )
+        if sandbox_path <= previous_runtime or not sandbox_path.startswith("/"):
+            raise ReleaseControlError("recovery runtime paths are not sorted absolute paths")
+        previous_runtime = sandbox_path
+        _capsule_add_asset(
+            assets,
+            name=asset_path,
+            path=dependency_root / asset_path,
+            max_bytes=256 * 1024 * 1024,
+        )
+        if (
+            len(assets[asset_path]) != size_bytes
+            or _sha256(assets[asset_path])
+            != _digest(runtime_item.get("sha256"), label="recovery runtime file digest")
+        ):
+            raise ReleaseControlError("recovery capsule runtime file identity mismatch")
     manifest = _object(
         strict_canonical_json(
             assets["recovery/wheelhouse-manifest.json"],
@@ -7170,6 +7528,8 @@ def _capsule_collect_recovery_dependencies(
     wheel_items = _array(manifest.get("wheels"), label="recovery capsule wheels")
     if not wheel_items:
         raise ReleaseControlError("recovery capsule wheelhouse must not be empty")
+    if outputs.get("wheel_count") != len(wheel_items):
+        raise ReleaseControlError("recovery capsule dependency wheel count mismatch")
     previous = ""
     for raw_item in wheel_items:
         item = _object(raw_item, label="recovery capsule wheel")
@@ -7191,7 +7551,7 @@ def _capsule_collect_recovery_dependencies(
         _capsule_add_asset(
             assets,
             name=f"recovery/wheelhouse/{filename}",
-            path=source_root / "recovery" / "wheelhouse" / filename,
+            path=dependency_root / "recovery" / "wheelhouse" / filename,
         )
 
 
@@ -7243,7 +7603,11 @@ def _write_capsule_assets(root: Path, assets: Mapping[str, bytes]) -> None:
         os.chmod(path, 0o644)
 
 
-def _command_create_recovery_capsule(args: argparse.Namespace) -> int:
+def _command_create_recovery_capsule(
+    args: argparse.Namespace,
+    *,
+    _clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> int:
     output_root = Path(args.output_root)
     _prepare_capsule_output_root(output_root)
     transaction = _read_regular(
@@ -7287,6 +7651,7 @@ def _command_create_recovery_capsule(args: argparse.Namespace) -> int:
         owner_signing_keys_observation=owner_keys,
         principal=SIGNING_PRINCIPAL,
         namespace=SIGNING_NAMESPACE,
+        _clock=_clock,
     )
     admission_verification = _read_regular(
         Path(args.admission_verification),
@@ -7335,6 +7700,7 @@ def _command_create_recovery_capsule(args: argparse.Namespace) -> int:
         owner_signing_keys_observation=owner_keys,
         expected_repository="John-MiracleWorker/Kestrel-Release-Recovery",
         expected_repository_id=repository_id,
+        _clock=_clock,
     )
     execution_closure = _read_regular(
         Path(args.execution_closure),
@@ -7376,8 +7742,11 @@ def _command_create_recovery_capsule(args: argparse.Namespace) -> int:
     _capsule_add_asset(assets, name=args.gitleaks_ignore, path=ignore_path)
     _capsule_collect_recovery_dependencies(
         assets,
-        source_root=source_root,
+        dependency_root=Path(args.dependency_root),
         closure=_object(closure_value, label="capsule recovery execution closure"),
+        expected_source_sha=_validate_string(
+            candidate.get("source_sha"), label="capsule candidate source SHA"
+        ),
     )
     _validate_capsule_execution_asset_closure(assets)
     _write_capsule_assets(output_root, assets)
@@ -8175,6 +8544,7 @@ def _parser() -> argparse.ArgumentParser:
         "normalized-evidence-root",
         "schema-root",
         "source-root",
+        "dependency-root",
         "gitleaks-image",
         "gitleaks-ignore",
         "recovery-authority-receipt",
@@ -8208,9 +8578,19 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    _clock: Callable[[], datetime] | None = None,
+) -> int:
     try:
         args = _parser().parse_args(argv)
+        if _clock is not None:
+            if args.handler is not _command_create_recovery_capsule:
+                raise ReleaseControlError(
+                    "an explicit verification clock is limited to recovery capsule creation"
+                )
+            return _command_create_recovery_capsule(args, _clock=_clock)
         return cast(int, args.handler(args))
     except (ReleaseControlError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

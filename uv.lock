@@ -1177,6 +1177,12 @@ server = [
 ]
 
 [package.dev-dependencies]
+recovery = [
+    { name = "cryptography" },
+    { name = "jsonschema" },
+    { name = "pypi-attestations" },
+    { name = "rfc8785" },
+]
 release = [
     { name = "cyclonedx-bom" },
     { name = "pip-audit" },
@@ -1230,6 +1236,12 @@ requires-dist = [
 provides-extras = ["runtime", "memvid", "openai", "anthropic", "gemini", "server", "mcp", "keyring", "dev"]
 
 [package.metadata.requires-dev]
+recovery = [
+    { name = "cryptography", specifier = "==50.0.0" },
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "pypi-attestations", specifier = "==0.0.30" },
+    { name = "rfc8785", specifier = "==0.1.4" },
+]
 release = [
     { name = "cyclonedx-bom", specifier = "==7.3.0" },
     { name = "pip-audit", specifier = "==2.10.1" },

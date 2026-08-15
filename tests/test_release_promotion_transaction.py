@@ -2604,12 +2604,56 @@ def _signed_terminal_vector(name: str) -> tuple[bytes, bytes]:
 def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[str, bytes], bytes]:
     wheel = b"fixture wheel bytes"
     sandbox = b"fixture bubblewrap binary\n"
+    runtime = b"fixture recovery runtime\n"
+    runtime_asset = "recovery/runtime/libpython3.11.so.1.0"
+    runtime_files = [
+        {
+            "asset_path": runtime_asset,
+            "sandbox_path": (
+                "/opt/hostedtoolcache/Python/3.11.14/x64/lib/libpython3.11.so.1.0"
+            ),
+            "sha256": _sha256(runtime),
+            "size_bytes": len(runtime),
+        }
+    ]
+    runtime_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_runtime.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": "3.11.14",
+            "python_executable_sha256": receipts._RECOVERY_PYTHON_BINARY_DIGEST,  # noqa: SLF001
+            "files": runtime_files,
+        }
+    )
+    python_runtime_archive = b"fixture deterministic Python runtime archive"
+    python_runtime_manifest = _canonical(
+        {
+            "schema": "kestrel.recovery_python_runtime.v1",
+            "platform": "ubuntu-24.04-x86_64",
+            "python_version": "3.11.14",
+            "python_abi": "cp311",
+            "python_executable_path": "bin/python3.11",
+            "python_executable_sha256": receipts._RECOVERY_PYTHON_BINARY_DIGEST,  # noqa: SLF001
+            "source_archive_url": receipts._RECOVERY_PYTHON_PACKAGE_URL,  # noqa: SLF001
+            "source_archive_sha256": receipts._RECOVERY_PYTHON_PACKAGE_DIGEST,  # noqa: SLF001
+            "runtime_archive_path": "recovery/python-runtime.tar.gz",
+            "runtime_archive_sha256": _sha256(python_runtime_archive),
+            "runtime_archive_size_bytes": len(python_runtime_archive),
+            "runtime_tree_sha256": "sha256:" + "5" * 64,
+            "runtime_file_count": 1,
+            "runtime_total_size_bytes": 1,
+        }
+    )
     closure_assets: dict[str, bytes] = {
         ".github/workflows/release.yml": b"name: Release\n",
         ".gitleaksignore": b"fixture\n",
         "evidence/normalized-source.json": b"{}",
         "recovery/bin/bwrap": sandbox,
         "recovery/requirements.txt": b"# no third-party recovery dependencies\n",
+        "recovery/python-runtime-manifest.json": python_runtime_manifest,
+        "recovery/python-runtime.tar.gz": python_runtime_archive,
+        "recovery/runtime-manifest.json": runtime_manifest,
+        runtime_asset: runtime,
         "recovery/wheelhouse-manifest.json": _canonical(
             {
                 "schema": "kestrel.recovery_wheelhouse.v1",
@@ -2649,8 +2693,8 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
             "external_executables": [
                 {
                     "name": "python",
-                    "path": "/capsule/venv/bin/python",
-                    "sha256": "sha256:" + "3" * 64,
+                    "path": "/recovery-runtime/environment/bin/python",
+                    "sha256": receipts._RECOVERY_PYTHON_BINARY_DIGEST,  # noqa: SLF001
                     "version": "Python 3.11.14",
                 },
                 {
@@ -2660,6 +2704,7 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
                     "version": "bubblewrap fixture 1.0",
                 },
             ],
+            "runtime_files": runtime_files,
             "python_runtime": {
                 "implementation": "CPython",
                 "version": "3.11.14",
@@ -2668,6 +2713,9 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
             "dependency_lock": {
                 "requirements_path": "recovery/requirements.txt",
                 "requirements_sha256": _sha256(closure_assets["recovery/requirements.txt"]),
+                "runtime_manifest_sha256": _sha256(runtime_manifest),
+                "python_runtime_manifest_sha256": _sha256(python_runtime_manifest),
+                "python_runtime_archive_sha256": _sha256(python_runtime_archive),
                 "wheelhouse_manifest_sha256": _sha256(
                     closure_assets["recovery/wheelhouse-manifest.json"]
                 ),
@@ -2731,6 +2779,36 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
         principal=receipts.SIGNING_PRINCIPAL,
         namespace=receipts.SIGNING_NAMESPACE,
     )
+    dependency_receipt = {
+        "schema": "kestrel.recovery_dependency_staging.v1",
+        "inputs": {
+            "bubblewrap_package_url": receipts._RECOVERY_BWRAP_PACKAGE_URL,  # noqa: SLF001
+            "bubblewrap_package_sha256": receipts._RECOVERY_BWRAP_PACKAGE_DIGEST,  # noqa: SLF001
+            "requirements_sha256": _sha256(closure_assets["recovery/requirements.txt"]),
+            "python_package_url": receipts._RECOVERY_PYTHON_PACKAGE_URL,  # noqa: SLF001
+            "python_package_sha256": receipts._RECOVERY_PYTHON_PACKAGE_DIGEST,  # noqa: SLF001
+            "python_version": receipts._RECOVERY_PYTHON_VERSION,  # noqa: SLF001
+            "python_abi": receipts._RECOVERY_PYTHON_ABI,  # noqa: SLF001
+            "wheel_platform": receipts._RECOVERY_WHEEL_PLATFORM,  # noqa: SLF001
+            "source_sha": transaction_value["candidate"]["source_sha"],
+        },
+        "outputs": {
+            "bubblewrap_sha256": _sha256(sandbox),
+            "bubblewrap_version": receipts._RECOVERY_BWRAP_VERSION,  # noqa: SLF001
+            "wheelhouse_manifest_sha256": _sha256(
+                closure_assets["recovery/wheelhouse-manifest.json"]
+            ),
+            "wheel_count": 1,
+            "runtime_manifest_sha256": _sha256(runtime_manifest),
+            "runtime_file_count": 1,
+            "python_runtime_manifest_sha256": _sha256(python_runtime_manifest),
+            "python_runtime_archive_sha256": _sha256(python_runtime_archive),
+        },
+        "provenance": receipts._RECOVERY_DEPENDENCY_STAGING_PROVENANCE,  # noqa: SLF001
+        "confidence": 1,
+        "validation_status": "validated",
+    }
+    dependency_receipt["receipt_digest"] = _sha256(_canonical(dependency_receipt))
     return (
         {
             **closure_assets,
@@ -2743,6 +2821,7 @@ def _complete_capsule_assets(transaction: bytes, tmp_path: Path) -> tuple[dict[s
             ),
             "recovery-authority.json": recovery_authority,
             "recovery-authority.json.sig": recovery_authority_signature,
+            "recovery/dependency-staging-receipt.json": _canonical(dependency_receipt),
             "recovery-execution-closure.json": closure,
             "recovery-repository-observation.json": b"{}",
             "release-authorization.json": transaction,

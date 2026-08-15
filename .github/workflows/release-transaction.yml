@@ -71,7 +71,7 @@ jobs:
       - name: Verify the pinned recovery Python identity
         shell: bash
         run: |
-          python_executable="$(command -v python)"
+          python_executable="$(readlink -f -- "$(command -v python)")"
           test -f "$python_executable"
           test ! -L "$python_executable"
           test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
@@ -154,7 +154,7 @@ jobs:
           python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-uv"
           pinned_uv="${RUNNER_TEMP}/kestrel-uv/uv"
           test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
-          python -m venv "${RUNNER_TEMP}/kestrel-transaction-venv"
+          python -m venv --copies "${RUNNER_TEMP}/kestrel-transaction-venv"
           "$pinned_uv" export --frozen --no-dev --no-emit-local \
             --extra dev --group release --format requirements.txt \
             --output-file "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
@@ -829,7 +829,10 @@ jobs:
           test "$(sha256sum \
             "transaction-identity/recovery-capsule-download/recovery-bootstrap.py" | \
             cut -d ' ' -f 1)" = "${capsule_inputs[5]#sha256:}"
-          "$KESTREL_PYTHON" -I -S -B \
+          recovery_tcb_python="$(bash scripts/bootstrap_recovery_tcb.sh \
+            "${RUNNER_TEMP}/kestrel-recovery-bootstrap-tcb")"
+          env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+            "$recovery_tcb_python" -I -S -B \
             transaction-identity/recovery-capsule-download/recovery-bootstrap.py \
             transaction-identity/recovery-capsule-download/recovery-capsule.tar \
             --destination transaction/capsule \
@@ -873,24 +876,78 @@ jobs:
               raise SystemExit("original transaction authorization differs from the capsule")
           PY
           capsule_root="$GITHUB_WORKSPACE/transaction/capsule"
-          capsule_python="$capsule_root/venv/bin/python"
+          capsule_python="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/environment/bin/python")"
+          capsule_runtime="$(readlink -f -- "$capsule_root/recovery/runtime")"
+          capsule_base_lib="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/base/lib")"
+          capsule_loader="$capsule_runtime/ld-linux-x86-64.so.2"
+          capsule_library_path="$capsule_runtime:$capsule_base_lib"
+          test ! -e /etc/ld.so.preload
+          test -x "$capsule_python"
+          test -x "$capsule_loader"
+          test -z "$(find "$capsule_runtime" -mindepth 1 -type d -print -quit)"
+          capsule_private_loader() {
+            local loader_report loader_line dependency
+            loader_report="$(env -i "$capsule_loader" --inhibit-cache \
+              --library-path "$capsule_library_path" --list "$capsule_python")"
+            case "$loader_report" in *"not found"*) return 1 ;; esac
+            while IFS= read -r loader_line; do
+              loader_line="${loader_line#"${loader_line%%[![:space:]]*}"}"
+              if [[ "$loader_line" == *" => "* ]]; then
+                dependency="${loader_line#* => }"
+                dependency="${dependency%% *}"
+              elif [[ "$loader_line" == /* ]]; then
+                dependency="${loader_line%% *}"
+              else
+                continue
+              fi
+              case "$dependency" in
+                "$capsule_runtime"/*|"$capsule_base_lib"/*) ;;
+                *) return 1 ;;
+              esac
+            done <<< "$loader_report"
+            (
+              exec -c "$capsule_loader" --inhibit-cache \
+                --library-path "$capsule_library_path" "$capsule_python" "$@"
+            )
+          }
           test -f "$capsule_root/candidate-archive.tar"
-          "$capsule_python" -I -S -B -c \
+          capsule_private_loader -I -S -B -c \
             'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
             "$capsule_root" \
             "$capsule_root/scripts/recovery_launcher.py" \
-            materialize-candidate \
-            "$capsule_root/recovery-execution-closure.json" \
+            launch "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --executable python -- \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            materialize-candidate "$capsule_root/recovery-execution-closure.json" \
             --capsule-root "$capsule_root" \
             --destination "$GITHUB_WORKSPACE/candidate"
-          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
-          test -d "$GITHUB_WORKSPACE/scripts"
-          test ! -L "$GITHUB_WORKSPACE/scripts"
-          test ! -e "$disabled_checkout_scripts"
-          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
-          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
-          test -L "$GITHUB_WORKSPACE/scripts"
-          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
+          actuator_input_dir="$GITHUB_WORKSPACE/transaction-identity/recovery/inputs"
+          install -d -m 0700 "$actuator_input_dir"
+          install -m 0500 "$KESTREL_PYTHON" "$actuator_input_dir/python"
+          install -m 0500 "$PINNED_GH" "$actuator_input_dir/gh"
+          host_binding="$GITHUB_WORKSPACE/transaction-identity/recovery/host-actuator-binding.json"
+          test ! -e "$host_binding"
+          capsule_private_loader -I -S -B -c \
+            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            "$capsule_root" \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            launch "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --executable python -- \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            bind-host-actuator "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --host-root "$GITHUB_WORKSPACE" \
+            --host-python "$actuator_input_dir/python" \
+            --host-gh "$actuator_input_dir/gh" \
+            --output "$host_binding"
+          grep -Fq '"method":"offline-authority-host-actuator-binding"' \
+            "$host_binding"
+          printf 'KESTREL_HOST_ACTUATOR_BINDING=%s\n' \
+            "$host_binding" >> "$GITHUB_ENV"
 
       - name: Verify exact release candidate
         shell: bash
@@ -981,7 +1038,7 @@ jobs:
       - name: Verify the pinned recovery Python identity
         shell: bash
         run: |
-          python_executable="$(command -v python)"
+          python_executable="$(readlink -f -- "$(command -v python)")"
           test -f "$python_executable"
           test ! -L "$python_executable"
           test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
@@ -994,7 +1051,7 @@ jobs:
           python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-uv"
           pinned_uv="${RUNNER_TEMP}/kestrel-uv/uv"
           test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
-          python -m venv "${RUNNER_TEMP}/kestrel-transaction-venv"
+          python -m venv --copies "${RUNNER_TEMP}/kestrel-transaction-venv"
           "$pinned_uv" export --frozen --no-dev --no-emit-local \
             --extra dev --group release --format requirements.txt \
             --output-file "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
@@ -1397,7 +1454,7 @@ jobs:
       - name: Verify the pinned recovery Python identity
         shell: bash
         run: |
-          python_executable="$(command -v python)"
+          python_executable="$(readlink -f -- "$(command -v python)")"
           test -f "$python_executable"
           test ! -L "$python_executable"
           test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
@@ -1410,7 +1467,7 @@ jobs:
           python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-uv"
           pinned_uv="${RUNNER_TEMP}/kestrel-uv/uv"
           test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
-          python -m venv "${RUNNER_TEMP}/kestrel-transaction-venv"
+          python -m venv --copies "${RUNNER_TEMP}/kestrel-transaction-venv"
           "$pinned_uv" export --frozen --no-dev --no-emit-local \
             --extra dev --group release --format requirements.txt \
             --output-file "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
@@ -1542,7 +1599,10 @@ jobs:
           test "$(sha256sum \
             "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
             "${capsule_inputs[3]#sha256:}"
-          "$KESTREL_PYTHON" -I -S -B \
+          recovery_tcb_python="$(bash scripts/bootstrap_recovery_tcb.sh \
+            "${RUNNER_TEMP}/kestrel-recovery-bootstrap-tcb")"
+          env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+            "$recovery_tcb_python" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
             --destination transaction/capsule \
@@ -1662,13 +1722,47 @@ jobs:
           output.chmod(0o600)
           PY
           capsule_root="$GITHUB_WORKSPACE/transaction/capsule"
-          capsule_python="$capsule_root/venv/bin/python"
+          capsule_python="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/environment/bin/python")"
+          capsule_runtime="$(readlink -f -- "$capsule_root/recovery/runtime")"
+          capsule_base_lib="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/base/lib")"
+          capsule_loader="$capsule_runtime/ld-linux-x86-64.so.2"
+          capsule_library_path="$capsule_runtime:$capsule_base_lib"
           capsule_receipts="$GITHUB_WORKSPACE/transaction/capsule/scripts/release_control_receipt.py"
+          test ! -e /etc/ld.so.preload
           test -x "$capsule_python"
+          test -x "$capsule_loader"
           test -f "$capsule_receipts"
+          test -z "$(find "$capsule_runtime" -mindepth 1 -type d -print -quit)"
+          capsule_private_loader() {
+            local loader_report loader_line dependency
+            loader_report="$(env -i "$capsule_loader" --inhibit-cache \
+              --library-path "$capsule_library_path" --list "$capsule_python")"
+            case "$loader_report" in *"not found"*) return 1 ;; esac
+            while IFS= read -r loader_line; do
+              loader_line="${loader_line#"${loader_line%%[![:space:]]*}"}"
+              if [[ "$loader_line" == *" => "* ]]; then
+                dependency="${loader_line#* => }"
+                dependency="${dependency%% *}"
+              elif [[ "$loader_line" == /* ]]; then
+                dependency="${loader_line%% *}"
+              else
+                continue
+              fi
+              case "$dependency" in
+                "$capsule_runtime"/*|"$capsule_base_lib"/*) ;;
+                *) return 1 ;;
+              esac
+            done <<< "$loader_report"
+            (
+              exec -c "$capsule_loader" --inhibit-cache \
+                --library-path "$capsule_library_path" "$capsule_python" "$@"
+            )
+          }
           (
             cd transaction/capsule-download
-            "$capsule_python" -I -S -B -c \
+            capsule_private_loader -I -S -B -c \
               'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
@@ -1689,15 +1783,30 @@ jobs:
               --output \
                 "$GITHUB_WORKSPACE/transaction/capsule-download/capsule-release-verification.json"
           )
-          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
-          test -d "$GITHUB_WORKSPACE/scripts"
-          test ! -L "$GITHUB_WORKSPACE/scripts"
-          test ! -e "$disabled_checkout_scripts"
-          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
-          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
-          test -L "$GITHUB_WORKSPACE/scripts"
-          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
-          printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
+          actuator_input_dir="$GITHUB_WORKSPACE/transaction/host-actuator/prepare/inputs"
+          install -d -m 0700 "$actuator_input_dir"
+          install -m 0500 "$KESTREL_PYTHON" "$actuator_input_dir/python"
+          install -m 0500 "$PINNED_GH" "$actuator_input_dir/gh"
+          host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/prepare/host-actuator-binding.json"
+          test ! -e "$host_binding"
+          capsule_private_loader -I -S -B -c \
+            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            "$capsule_root" \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            launch "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --executable python -- \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            bind-host-actuator "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --host-root "$GITHUB_WORKSPACE" \
+            --host-python "$actuator_input_dir/python" \
+            --host-gh "$actuator_input_dir/gh" \
+            --output "$host_binding"
+          grep -Fq '"method":"offline-authority-host-actuator-binding"' \
+            "$host_binding"
+          printf 'KESTREL_HOST_ACTUATOR_BINDING=%s\n' \
+            "$host_binding" >> "$GITHUB_ENV"
 
       - name: Observe and plan draft Release and digest-only GHCR preparation
         id: preparation-plan
@@ -2685,7 +2794,7 @@ jobs:
       - name: Verify the pinned recovery Python identity
         shell: bash
         run: |
-          python_executable="$(command -v python)"
+          python_executable="$(readlink -f -- "$(command -v python)")"
           test -f "$python_executable"
           test ! -L "$python_executable"
           test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
@@ -2698,7 +2807,7 @@ jobs:
           python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-uv"
           pinned_uv="${RUNNER_TEMP}/kestrel-uv/uv"
           test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
-          python -m venv "${RUNNER_TEMP}/kestrel-transaction-venv"
+          python -m venv --copies "${RUNNER_TEMP}/kestrel-transaction-venv"
           "$pinned_uv" export --frozen --no-dev --no-emit-local \
             --extra dev --group release --format requirements.txt \
             --output-file "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
@@ -2765,7 +2874,10 @@ jobs:
           test "$(sha256sum \
             "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
             "${capsule_inputs[4]#sha256:}"
-          "$KESTREL_PYTHON" -I -S -B \
+          recovery_tcb_python="$(bash scripts/bootstrap_recovery_tcb.sh \
+            "${RUNNER_TEMP}/kestrel-recovery-bootstrap-tcb")"
+          env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+            "$recovery_tcb_python" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
             --destination transaction/capsule \
@@ -2876,13 +2988,47 @@ jobs:
           output.chmod(0o600)
           PY
           capsule_root="$GITHUB_WORKSPACE/transaction/capsule"
-          capsule_python="$capsule_root/venv/bin/python"
+          capsule_python="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/environment/bin/python")"
+          capsule_runtime="$(readlink -f -- "$capsule_root/recovery/runtime")"
+          capsule_base_lib="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/base/lib")"
+          capsule_loader="$capsule_runtime/ld-linux-x86-64.so.2"
+          capsule_library_path="$capsule_runtime:$capsule_base_lib"
           capsule_receipts="$GITHUB_WORKSPACE/transaction/capsule/scripts/release_control_receipt.py"
+          test ! -e /etc/ld.so.preload
           test -x "$capsule_python"
+          test -x "$capsule_loader"
           test -f "$capsule_receipts"
+          test -z "$(find "$capsule_runtime" -mindepth 1 -type d -print -quit)"
+          capsule_private_loader() {
+            local loader_report loader_line dependency
+            loader_report="$(env -i "$capsule_loader" --inhibit-cache \
+              --library-path "$capsule_library_path" --list "$capsule_python")"
+            case "$loader_report" in *"not found"*) return 1 ;; esac
+            while IFS= read -r loader_line; do
+              loader_line="${loader_line#"${loader_line%%[![:space:]]*}"}"
+              if [[ "$loader_line" == *" => "* ]]; then
+                dependency="${loader_line#* => }"
+                dependency="${dependency%% *}"
+              elif [[ "$loader_line" == /* ]]; then
+                dependency="${loader_line%% *}"
+              else
+                continue
+              fi
+              case "$dependency" in
+                "$capsule_runtime"/*|"$capsule_base_lib"/*) ;;
+                *) return 1 ;;
+              esac
+            done <<< "$loader_report"
+            (
+              exec -c "$capsule_loader" --inhibit-cache \
+                --library-path "$capsule_library_path" "$capsule_python" "$@"
+            )
+          }
           (
             cd transaction/capsule-download
-            "$capsule_python" -I -S -B -c \
+            capsule_private_loader -I -S -B -c \
               'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
@@ -2902,15 +3048,30 @@ jobs:
                 "$GITHUB_WORKSPACE/transaction/commit-capsule-observation/pinned-gh-release-verification.json" \
               --output "$GITHUB_WORKSPACE/transaction/commit-capsule-release-verification.json"
           )
-          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
-          test -d "$GITHUB_WORKSPACE/scripts"
-          test ! -L "$GITHUB_WORKSPACE/scripts"
-          test ! -e "$disabled_checkout_scripts"
-          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
-          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
-          test -L "$GITHUB_WORKSPACE/scripts"
-          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
-          printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
+          actuator_input_dir="$GITHUB_WORKSPACE/transaction/host-actuator/commit/inputs"
+          install -d -m 0700 "$actuator_input_dir"
+          install -m 0500 "$KESTREL_PYTHON" "$actuator_input_dir/python"
+          install -m 0500 "$PINNED_GH" "$actuator_input_dir/gh"
+          host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/commit/host-actuator-binding.json"
+          test ! -e "$host_binding"
+          capsule_private_loader -I -S -B -c \
+            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            "$capsule_root" \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            launch "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --executable python -- \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            bind-host-actuator "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --host-root "$GITHUB_WORKSPACE" \
+            --host-python "$actuator_input_dir/python" \
+            --host-gh "$actuator_input_dir/gh" \
+            --output "$host_binding"
+          grep -Fq '"method":"offline-authority-host-actuator-binding"' \
+            "$host_binding"
+          printf 'KESTREL_HOST_ACTUATOR_BINDING=%s\n' \
+            "$host_binding" >> "$GITHUB_ENV"
 
       - name: Download exact owner-signed commit authority
         shell: bash
@@ -5033,7 +5194,7 @@ jobs:
       - name: Verify the pinned recovery Python identity
         shell: bash
         run: |
-          python_executable="$(command -v python)"
+          python_executable="$(readlink -f -- "$(command -v python)")"
           test -f "$python_executable"
           test ! -L "$python_executable"
           test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
@@ -5046,7 +5207,7 @@ jobs:
           python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-uv"
           pinned_uv="${RUNNER_TEMP}/kestrel-uv/uv"
           test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
-          python -m venv "${RUNNER_TEMP}/kestrel-transaction-venv"
+          python -m venv --copies "${RUNNER_TEMP}/kestrel-transaction-venv"
           "$pinned_uv" export --frozen --no-dev --no-emit-local \
             --extra dev --group release --format requirements.txt \
             --output-file "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
@@ -5111,7 +5272,10 @@ jobs:
           test "$(sha256sum \
             "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
             "${capsule_inputs[4]#sha256:}"
-          "$KESTREL_PYTHON" -I -S -B \
+          recovery_tcb_python="$(bash scripts/bootstrap_recovery_tcb.sh \
+            "${RUNNER_TEMP}/kestrel-recovery-bootstrap-tcb")"
+          env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+            "$recovery_tcb_python" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
             --destination transaction/capsule \
@@ -5221,13 +5385,47 @@ jobs:
           output.chmod(0o600)
           PY
           capsule_root="$GITHUB_WORKSPACE/transaction/capsule"
-          capsule_python="$capsule_root/venv/bin/python"
+          capsule_python="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/environment/bin/python")"
+          capsule_runtime="$(readlink -f -- "$capsule_root/recovery/runtime")"
+          capsule_base_lib="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/base/lib")"
+          capsule_loader="$capsule_runtime/ld-linux-x86-64.so.2"
+          capsule_library_path="$capsule_runtime:$capsule_base_lib"
           capsule_receipts="$GITHUB_WORKSPACE/transaction/capsule/scripts/release_control_receipt.py"
+          test ! -e /etc/ld.so.preload
           test -x "$capsule_python"
+          test -x "$capsule_loader"
           test -f "$capsule_receipts"
+          test -z "$(find "$capsule_runtime" -mindepth 1 -type d -print -quit)"
+          capsule_private_loader() {
+            local loader_report loader_line dependency
+            loader_report="$(env -i "$capsule_loader" --inhibit-cache \
+              --library-path "$capsule_library_path" --list "$capsule_python")"
+            case "$loader_report" in *"not found"*) return 1 ;; esac
+            while IFS= read -r loader_line; do
+              loader_line="${loader_line#"${loader_line%%[![:space:]]*}"}"
+              if [[ "$loader_line" == *" => "* ]]; then
+                dependency="${loader_line#* => }"
+                dependency="${dependency%% *}"
+              elif [[ "$loader_line" == /* ]]; then
+                dependency="${loader_line%% *}"
+              else
+                continue
+              fi
+              case "$dependency" in
+                "$capsule_runtime"/*|"$capsule_base_lib"/*) ;;
+                *) return 1 ;;
+              esac
+            done <<< "$loader_report"
+            (
+              exec -c "$capsule_loader" --inhibit-cache \
+                --library-path "$capsule_library_path" "$capsule_python" "$@"
+            )
+          }
           (
             cd transaction/capsule-download
-            "$capsule_python" -I -S -B -c \
+            capsule_private_loader -I -S -B -c \
               'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
@@ -5247,15 +5445,30 @@ jobs:
                 "$GITHUB_WORKSPACE/transaction/verify-capsule-observation/pinned-gh-release-verification.json" \
               --output "$GITHUB_WORKSPACE/transaction/verify-capsule-release-verification.json"
           )
-          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
-          test -d "$GITHUB_WORKSPACE/scripts"
-          test ! -L "$GITHUB_WORKSPACE/scripts"
-          test ! -e "$disabled_checkout_scripts"
-          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
-          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
-          test -L "$GITHUB_WORKSPACE/scripts"
-          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
-          printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
+          actuator_input_dir="$GITHUB_WORKSPACE/transaction/host-actuator/verify/inputs"
+          install -d -m 0700 "$actuator_input_dir"
+          install -m 0500 "$KESTREL_PYTHON" "$actuator_input_dir/python"
+          install -m 0500 "$PINNED_GH" "$actuator_input_dir/gh"
+          host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/verify/host-actuator-binding.json"
+          test ! -e "$host_binding"
+          capsule_private_loader -I -S -B -c \
+            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            "$capsule_root" \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            launch "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --executable python -- \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            bind-host-actuator "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --host-root "$GITHUB_WORKSPACE" \
+            --host-python "$actuator_input_dir/python" \
+            --host-gh "$actuator_input_dir/gh" \
+            --output "$host_binding"
+          grep -Fq '"method":"offline-authority-host-actuator-binding"' \
+            "$host_binding"
+          printf 'KESTREL_HOST_ACTUATOR_BINDING=%s\n' \
+            "$host_binding" >> "$GITHUB_ENV"
 
       - name: Download the fresh verification authority boundary
         shell: bash
@@ -5749,7 +5962,7 @@ jobs:
       - name: Verify the pinned recovery Python identity
         shell: bash
         run: |
-          python_executable="$(command -v python)"
+          python_executable="$(readlink -f -- "$(command -v python)")"
           test -f "$python_executable"
           test ! -L "$python_executable"
           test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
@@ -5762,7 +5975,7 @@ jobs:
           python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-uv"
           pinned_uv="${RUNNER_TEMP}/kestrel-uv/uv"
           test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
-          python -m venv "${RUNNER_TEMP}/kestrel-transaction-venv"
+          python -m venv --copies "${RUNNER_TEMP}/kestrel-transaction-venv"
           "$pinned_uv" export --frozen --no-dev --no-emit-local \
             --extra dev --group release --format requirements.txt \
             --output-file "${RUNNER_TEMP}/kestrel-transaction-requirements.txt"
@@ -5831,7 +6044,10 @@ jobs:
           test "$(sha256sum \
             "transaction/capsule-download/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
             "${capsule_inputs[4]#sha256:}"
-          "$KESTREL_PYTHON" -I -S -B \
+          recovery_tcb_python="$(bash scripts/bootstrap_recovery_tcb.sh \
+            "${RUNNER_TEMP}/kestrel-recovery-bootstrap-tcb")"
+          env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+            "$recovery_tcb_python" -I -S -B \
             transaction/capsule-download/recovery-bootstrap.py \
             transaction/capsule-download/recovery-capsule.tar \
             --destination transaction/capsule \
@@ -5941,13 +6157,47 @@ jobs:
           output.chmod(0o600)
           PY
           capsule_root="$GITHUB_WORKSPACE/transaction/capsule"
-          capsule_python="$capsule_root/venv/bin/python"
+          capsule_python="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/environment/bin/python")"
+          capsule_runtime="$(readlink -f -- "$capsule_root/recovery/runtime")"
+          capsule_base_lib="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/base/lib")"
+          capsule_loader="$capsule_runtime/ld-linux-x86-64.so.2"
+          capsule_library_path="$capsule_runtime:$capsule_base_lib"
           capsule_receipts="$GITHUB_WORKSPACE/transaction/capsule/scripts/release_control_receipt.py"
+          test ! -e /etc/ld.so.preload
           test -x "$capsule_python"
+          test -x "$capsule_loader"
           test -f "$capsule_receipts"
+          test -z "$(find "$capsule_runtime" -mindepth 1 -type d -print -quit)"
+          capsule_private_loader() {
+            local loader_report loader_line dependency
+            loader_report="$(env -i "$capsule_loader" --inhibit-cache \
+              --library-path "$capsule_library_path" --list "$capsule_python")"
+            case "$loader_report" in *"not found"*) return 1 ;; esac
+            while IFS= read -r loader_line; do
+              loader_line="${loader_line#"${loader_line%%[![:space:]]*}"}"
+              if [[ "$loader_line" == *" => "* ]]; then
+                dependency="${loader_line#* => }"
+                dependency="${dependency%% *}"
+              elif [[ "$loader_line" == /* ]]; then
+                dependency="${loader_line%% *}"
+              else
+                continue
+              fi
+              case "$dependency" in
+                "$capsule_runtime"/*|"$capsule_base_lib"/*) ;;
+                *) return 1 ;;
+              esac
+            done <<< "$loader_report"
+            (
+              exec -c "$capsule_loader" --inhibit-cache \
+                --library-path "$capsule_library_path" "$capsule_python" "$@"
+            )
+          }
           (
             cd transaction/capsule-download
-            "$capsule_python" -I -S -B -c \
+            capsule_private_loader -I -S -B -c \
               'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
               "$capsule_root" "$capsule_root/scripts/recovery_launcher.py" \
               launch "$capsule_root/recovery-execution-closure.json" \
@@ -5967,19 +6217,30 @@ jobs:
                 "$GITHUB_WORKSPACE/transaction/pypi-capsule-observation/pinned-gh-release-verification.json" \
               --output "$GITHUB_WORKSPACE/transaction/pypi-capsule-release-verification.json"
           )
-          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-checkout-scripts"
-          test -d "$GITHUB_WORKSPACE/scripts"
-          test ! -L "$GITHUB_WORKSPACE/scripts"
-          test ! -e "$disabled_checkout_scripts"
-          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
-          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
-          test -L "$GITHUB_WORKSPACE/scripts"
-          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
-          capsule_verifier="$GITHUB_WORKSPACE/transaction/capsule/venv/bin/pypi-attestations"
-          test -x "$capsule_verifier"
-          test "$($capsule_verifier --version)" = "pypi-attestations 0.0.30"
-          printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
-          printf 'PYPI_ATTESTATIONS=%s\n' "$capsule_verifier" >> "$GITHUB_ENV"
+          actuator_input_dir="$GITHUB_WORKSPACE/transaction/host-actuator/pypi/inputs"
+          install -d -m 0700 "$actuator_input_dir"
+          install -m 0500 "$KESTREL_PYTHON" "$actuator_input_dir/python"
+          install -m 0500 "$PINNED_GH" "$actuator_input_dir/gh"
+          host_binding="$GITHUB_WORKSPACE/transaction/host-actuator/pypi/host-actuator-binding.json"
+          test ! -e "$host_binding"
+          capsule_private_loader -I -S -B -c \
+            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            "$capsule_root" \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            launch "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --executable python -- \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            bind-host-actuator "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --host-root "$GITHUB_WORKSPACE" \
+            --host-python "$actuator_input_dir/python" \
+            --host-gh "$actuator_input_dir/gh" \
+            --output "$host_binding"
+          grep -Fq '"method":"offline-authority-host-actuator-binding"' \
+            "$host_binding"
+          printf 'KESTREL_HOST_ACTUATOR_BINDING=%s\n' \
+            "$host_binding" >> "$GITHUB_ENV"
 
       - name: Observe public PyPI and stage only missing distributions
         id: pypi-plan
@@ -6878,7 +7139,7 @@ jobs:
       - name: Verify the pinned recovery Python identity
         shell: bash
         run: |
-          python_executable="$(command -v python)"
+          python_executable="$(readlink -f -- "$(command -v python)")"
           test -f "$python_executable"
           test ! -L "$python_executable"
           test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
@@ -7037,7 +7298,10 @@ jobs:
           test "$(sha256sum \
             "reconciliation/capsule-input/recovery-bootstrap.py" | cut -d ' ' -f 1)" = \
             "${capsule_inputs[3]#sha256:}"
-          python -I -S -B \
+          recovery_tcb_python="$(bash scripts/bootstrap_recovery_tcb.sh \
+            "${RUNNER_TEMP}/kestrel-recovery-bootstrap-tcb")"
+          env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+            "$recovery_tcb_python" -I -S -B \
             reconciliation/capsule-input/recovery-bootstrap.py \
             reconciliation/capsule-input/recovery-capsule.tar \
             --destination transaction/capsule \
@@ -7045,21 +7309,86 @@ jobs:
             --expected-manifest-digest "${capsule_inputs[1]}" \
             --expected-owner-key-fingerprint "${capsule_inputs[2]}"
           capsule_root="$GITHUB_WORKSPACE/transaction/capsule"
-          capsule_python="$capsule_root/venv/bin/python"
-          capsule_verifier="$capsule_root/venv/bin/pypi-attestations"
+          capsule_python="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/environment/bin/python")"
+          capsule_runtime="$(readlink -f -- "$capsule_root/recovery/runtime")"
+          capsule_base_lib="$(readlink -f -- \
+            "$capsule_root/../recovery-runtime/base/lib")"
+          capsule_loader="$capsule_runtime/ld-linux-x86-64.so.2"
+          capsule_library_path="$capsule_runtime:$capsule_base_lib"
+          test ! -e /etc/ld.so.preload
           test -x "$capsule_python"
-          test -x "$capsule_verifier"
-          test "$($capsule_verifier --version)" = "pypi-attestations 0.0.30"
-          disabled_checkout_scripts="${RUNNER_TEMP}/kestrel-reconcile-checkout-scripts"
-          test -d "$GITHUB_WORKSPACE/scripts"
-          test ! -L "$GITHUB_WORKSPACE/scripts"
-          test ! -e "$disabled_checkout_scripts"
-          mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"
-          ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"
-          test -L "$GITHUB_WORKSPACE/scripts"
-          test "$(readlink "$GITHUB_WORKSPACE/scripts")" = "$capsule_root/scripts"
-          printf 'KESTREL_PYTHON=%s\n' "$capsule_python" >> "$GITHUB_ENV"
-          printf 'PYPI_ATTESTATIONS=%s\n' "$capsule_verifier" >> "$GITHUB_ENV"
+          test -x "$capsule_loader"
+          test -z "$(find "$capsule_runtime" -mindepth 1 -type d -print -quit)"
+          capsule_private_loader() {
+            local loader_report loader_line dependency
+            loader_report="$(env -i "$capsule_loader" --inhibit-cache \
+              --library-path "$capsule_library_path" --list "$capsule_python")"
+            case "$loader_report" in *"not found"*) return 1 ;; esac
+            while IFS= read -r loader_line; do
+              loader_line="${loader_line#"${loader_line%%[![:space:]]*}"}"
+              if [[ "$loader_line" == *" => "* ]]; then
+                dependency="${loader_line#* => }"
+                dependency="${dependency%% *}"
+              elif [[ "$loader_line" == /* ]]; then
+                dependency="${loader_line%% *}"
+              else
+                continue
+              fi
+              case "$dependency" in
+                "$capsule_runtime"/*|"$capsule_base_lib"/*) ;;
+                *) return 1 ;;
+              esac
+            done <<< "$loader_report"
+            (
+              exec -c "$capsule_loader" --inhibit-cache \
+                --library-path "$capsule_library_path" "$capsule_python" "$@"
+            )
+          }
+          host_venv="${RUNNER_TEMP}/kestrel-reconcile-actuator-venv"
+          test ! -e "$host_venv"
+          python -I -m venv --copies "$host_venv"
+          KESTREL_PYTHON="$host_venv/bin/python"
+          test -x "$KESTREL_PYTHON"
+          test ! -L "$KESTREL_PYTHON"
+          "$KESTREL_PYTHON" -I -m pip --isolated install \
+            --no-index \
+            --find-links "$capsule_root/recovery/wheelhouse" \
+            --require-hashes \
+            --only-binary=:all: \
+            --requirement "$capsule_root/recovery/requirements.txt"
+          "$KESTREL_PYTHON" -I -m pip --isolated check
+          host_verifier="$host_venv/bin/pypi-attestations"
+          test -x "$host_verifier"
+          test "$($host_verifier --version)" = "pypi-attestations 0.0.30"
+          actuator_input_dir="$GITHUB_WORKSPACE/reconciliation/host-actuator/inputs"
+          install -d -m 0700 "$actuator_input_dir"
+          install -m 0500 "$KESTREL_PYTHON" "$actuator_input_dir/python"
+          install -m 0500 "$PINNED_GH" "$actuator_input_dir/gh"
+          host_binding="$GITHUB_WORKSPACE/reconciliation/host-actuator/host-actuator-binding.json"
+          test ! -e "$host_binding"
+          capsule_private_loader -I -S -B -c \
+            'import json,runpy,sys;root=sys.argv.pop(1);target=sys.argv.pop(1);sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"];runpy.run_path(target,run_name="__main__")' \
+            "$capsule_root" \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            launch "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --executable python -- \
+            "$capsule_root/scripts/recovery_launcher.py" \
+            bind-host-actuator "$capsule_root/recovery-execution-closure.json" \
+            --capsule-root "$capsule_root" \
+            --host-root "$GITHUB_WORKSPACE" \
+            --host-python "$actuator_input_dir/python" \
+            --host-gh "$actuator_input_dir/gh" \
+            --output "$host_binding"
+          grep -Fq '"method":"offline-authority-host-actuator-binding"' \
+            "$host_binding"
+          {
+            printf 'KESTREL_PYTHON=%s\n' "$KESTREL_PYTHON"
+            printf 'PYPI_ATTESTATIONS=%s\n' "$host_verifier"
+            printf 'KESTREL_HOST_ACTUATOR_BINDING=%s\n' \
+              "$host_binding"
+          } >> "$GITHUB_ENV"
           printf '%s\n' 'active=1' >> "$GITHUB_OUTPUT"
 
       - name: Normalize unique role-specific reconciliation inputs

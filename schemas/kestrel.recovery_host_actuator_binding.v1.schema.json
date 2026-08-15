@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.recovery_host_actuator_binding.v1.schema.json",
+  "title": "kestrel.recovery_host_actuator_binding.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "required": [
+    "schema",
+    "candidate_source_sha",
+    "capsule_manifest_sha256",
+    "execution_closure_sha256",
+    "host_source",
+    "host_python",
+    "host_gh",
+    "authority_plane",
+    "actuation_plane",
+    "provenance",
+    "confidence",
+    "validation_status",
+    "binding_digest"
+  ],
+  "properties": {
+    "schema": {"const": "kestrel.recovery_host_actuator_binding.v1"},
+    "candidate_source_sha": {"$ref": "#/$defs/git_sha"},
+    "capsule_manifest_sha256": {"$ref": "#/$defs/digest"},
+    "execution_closure_sha256": {"$ref": "#/$defs/digest"},
+    "host_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_count", "source_bundle_digest", "workflow_digests"],
+      "properties": {
+        "asset_count": {"$ref": "#/$defs/positive_integer"},
+        "source_bundle_digest": {"$ref": "#/$defs/digest"},
+        "workflow_digests": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "x-sort-key": ["path"],
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": {
+                "enum": [
+                  ".github/workflows/release-transaction.yml",
+                  ".github/workflows/release.yml"
+                ]
+              },
+              "sha256": {"$ref": "#/$defs/digest"}
+            }
+          }
+        }
+      }
+    },
+    "host_python": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "version"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/digest"},
+        "version": {"pattern": "^Python 3\\.11\\.[0-9]+$", "type": "string"}
+      }
+    },
+    "host_gh": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "version"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/digest"},
+        "version": {"const": "gh version 2.97.0 (2026-02-26)"}
+      }
+    },
+    "authority_plane": {
+      "const": {
+        "name": "offline_capsule",
+        "network_authority": "deny_all",
+        "role": "interpret_and_verify"
+      }
+    },
+    "actuation_plane": {
+      "const": {
+        "name": "dispatch_pinned_host_workflow",
+        "network_authority": "workflow_scoped",
+        "role": "acquire_and_mutate"
+      }
+    },
+    "provenance": {
+      "const": {
+        "producer": "scripts/recovery_launcher.py",
+        "provider": "local",
+        "method": "offline-authority-host-actuator-binding"
+      }
+    },
+    "confidence": {"type": "integer", "const": 1},
+    "validation_status": {"const": "validated"},
+    "binding_digest": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "positive_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    }
+  }
+}

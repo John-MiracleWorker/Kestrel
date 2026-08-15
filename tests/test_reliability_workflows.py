@@ -867,7 +867,7 @@ def test_release_transaction_rebootstraps_capsules_after_artifact_transport() ->
         step = next(step for step in jobs[consumer]["steps"] if step.get("name") == step_name)
         run = step["run"]
         bootstrap = run.index("transaction/capsule-download/recovery-bootstrap.py")
-        executable_check = run.index('capsule_python="$capsule_root/venv/bin/python"')
+        executable_check = run.index("recovery-runtime/environment/bin/python")
         assert "test ! -e transaction/capsule" in run[:bootstrap]
         assert bootstrap < executable_check
 
@@ -987,7 +987,7 @@ def test_capsule_verification_never_reintroduces_the_checkout_with_pythonpath() 
     assert "PYTHONPATH=" not in workflow_text
     assert workflow_text.count("transaction/capsule/scripts/release_control_receipt.py") == 4
     assert workflow_text.count("runpy.run_path(target,run_name=\"__main__\")") >= 5
-    assert workflow_text.count('"$capsule_root/scripts/recovery_launcher.py" \\') == 5
+    assert workflow_text.count('"$capsule_root/scripts/recovery_launcher.py" \\') == 18
     assert '"$capsule_root" "$capsule_receipts" verify-' not in workflow_text
     assert workflow_text.count("--executable python") >= 4
     assert (
@@ -1002,11 +1002,11 @@ def test_capsule_verification_never_reintroduces_the_checkout_with_pythonpath() 
         workflow_text.count(
             'sys.path[:]=json.load(open(root+"/recovery-execution-closure.json"))["sys_path"]'
         )
-        == 5
+        == 11
     )
 
 
-def test_capsule_activation_quarantines_checkout_scripts_before_recovered_commands() -> None:
+def test_capsule_activation_binds_exact_host_source_before_host_actuation() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
             encoding="utf-8"
@@ -1042,26 +1042,124 @@ def test_capsule_activation_quarantines_checkout_scripts_before_recovered_comman
             for step in jobs[job_name]["steps"]
             if step.get("name") == step_name
         )
-        capsule_authority = source.index(
-            '"$capsule_root/scripts/recovery_launcher.py"'
+        capsule_authority = source.index('"$capsule_root/scripts/recovery_launcher.py"')
+        binding = source.index("bind-host-actuator")
+        validation = source.index("offline-authority-host-actuator-binding")
+        assert capsule_authority < binding < validation
+        assert 'mv -- "$GITHUB_WORKSPACE/scripts"' not in source
+        assert 'ln -s -- "$capsule_root/scripts"' not in source
+        assert 'printf \'KESTREL_PYTHON=%s\\n\' "$capsule_python"' not in source
+
+
+def test_recovery_capsule_authority_is_offline_and_host_actuation_is_explicitly_bound() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+            encoding="utf-8"
         )
-        quarantine = source.index(
-            'mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"'
+    )
+    workflow_text = (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"' not in workflow_text
+    assert "bind-host-actuator" in workflow_text
+    assert workflow_text.count("bind-host-actuator") == 6
+    assert "offline-authority-host-actuator-binding" in workflow_text
+    assert 'printf \'KESTREL_PYTHON=%s\\n\' "$capsule_python"' not in workflow_text
+
+    activations = (
+        (
+            "identity-admission",
+            "Restore committed release candidate from the immutable capsule",
+            "transaction-identity/recovery/host-actuator-binding.json",
+        ),
+        (
+            "prepare-github-ghcr",
+            "Bootstrap and verify the immutable recovery capsule",
+            "transaction/host-actuator/prepare/host-actuator-binding.json",
+        ),
+        (
+            "commit-github-release",
+            "Reverify the immutable recovery capsule before commit",
+            "transaction/host-actuator/commit/host-actuator-binding.json",
+        ),
+        (
+            "verify-github-ghcr",
+            "Reverify the immutable recovery capsule before surface verification",
+            "transaction/host-actuator/verify/host-actuator-binding.json",
+        ),
+        (
+            "publish-pypi",
+            "Reverify the immutable recovery capsule before PyPI admission",
+            "transaction/host-actuator/pypi/host-actuator-binding.json",
+        ),
+        (
+            "reconcile-final",
+            "Activate immutable recovery capsule for reconciliation",
+            "reconciliation/host-actuator/host-actuator-binding.json",
+        ),
+    )
+    for job_name, step_name, binding_path in activations:
+        source = next(
+            step["run"]
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("name") == step_name
         )
-        replacement = source.index(
-            'ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"'
-        )
-        assert capsule_authority < quarantine < replacement
-        assert source.count('disabled_checkout_scripts="${RUNNER_TEMP}/') == 1
-        assert 'test ! -L "$GITHUB_WORKSPACE/scripts"' in source
-        assert 'test -L "$GITHUB_WORKSPACE/scripts"' in source
+        assert "bind-host-actuator" in source
+        assert "--host-root \"$GITHUB_WORKSPACE\"" in source
+        assert 'install -m 0500 "$KESTREL_PYTHON" "$actuator_input_dir/python"' in source
+        assert 'install -m 0500 "$PINNED_GH" "$actuator_input_dir/gh"' in source
+        assert '--host-python "$actuator_input_dir/python"' in source
+        assert '--host-gh "$actuator_input_dir/gh"' in source
+        assert '--output "$host_binding"' in source
+        assert "--executable python" in source
+        assert f'host_binding="$GITHUB_WORKSPACE/{binding_path}"' in source
+        binding_parent = str(Path(binding_path).parent)
         assert (
-            'test "$(readlink "$GITHUB_WORKSPACE/scripts")" = '
-            '"$capsule_root/scripts"'
-        ) in source
+            f'actuator_input_dir="$GITHUB_WORKSPACE/{binding_parent}/inputs"'
+            in source
+        )
+        assert 'install -d -m 0700 "$actuator_input_dir"' in source
+        assert 'test ! -e "$host_binding"' in source
+        assert "offline-authority-host-actuator-binding" in source
+
+    for job_name, boundary, output_dir, binding_dir in (
+        (
+            "prepare-github-ghcr",
+            "prepare",
+            "transaction/preparation-authority",
+            "transaction/host-actuator/prepare/",
+        ),
+        (
+            "commit-github-release",
+            "commit",
+            "transaction/commit-authority",
+            "transaction/host-actuator/commit/",
+        ),
+        (
+            "verify-github-ghcr",
+            "verify",
+            "transaction/verification-authority",
+            "transaction/host-actuator/verify/",
+        ),
+        (
+            "publish-pypi",
+            "pypi",
+            "transaction/pypi-authority",
+            "transaction/host-actuator/pypi/",
+        ),
+    ):
+        fetch = next(
+            step["run"]
+            for step in workflow["jobs"][job_name]["steps"]
+            if "fetch-github-boundary-authority" in str(step.get("run", ""))
+        )
+        assert f"--boundary {boundary}" in fetch
+        assert f"--output-dir {output_dir}" in fetch
+        assert binding_dir not in fetch
 
 
-def test_final_reconciliation_quarantines_checkout_release_code_authority() -> None:
+def test_final_reconciliation_binds_an_offline_materialized_host_actuator() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(
             encoding="utf-8"
@@ -1114,14 +1212,18 @@ def test_final_reconciliation_quarantines_checkout_release_code_authority() -> N
         "recovery-capsule.tar",
         "kestrel.recovery_capsule_verification.v1",
         "len(assets) != 3",
-        "python -I -S -B",
-        "reconciliation/capsule-input/recovery-bootstrap.py",
-        "--destination transaction/capsule",
-        'mv -- "$GITHUB_WORKSPACE/scripts" "$disabled_checkout_scripts"',
-        'ln -s -- "$capsule_root/scripts" "$GITHUB_WORKSPACE/scripts"',
-        'capsule_python="$capsule_root/venv/bin/python"',
-        "PYPI_ATTESTATIONS",
-        "active=1",
+            '"$recovery_tcb_python" -I -S -B',
+            "reconciliation/capsule-input/recovery-bootstrap.py",
+            "--destination transaction/capsule",
+            "recovery-runtime/environment/bin/python",
+            'host_venv="${RUNNER_TEMP}/kestrel-reconcile-actuator-venv"',
+            "python -I -m venv --copies",
+            "--no-index",
+            "bind-host-actuator",
+            "offline-authority-host-actuator-binding",
+            "host-actuator-binding.json",
+            "PYPI_ATTESTATIONS",
+            "active=1",
     ):
         assert required in source
 
@@ -1189,6 +1291,8 @@ def test_transaction_jobs_verify_the_pinned_python_before_first_use() -> None:
         verification = job["steps"][setup_index + 1]
         assert verification["name"] == "Verify the pinned recovery Python identity"
         assert expected_digest in verification["run"], job_name
+        assert 'readlink -f -- "$(command -v python)"' in verification["run"], job_name
+        assert 'python_executable="$(command -v python)"' not in verification["run"], job_name
         assert "python --version" in verification["run"]
 
 
