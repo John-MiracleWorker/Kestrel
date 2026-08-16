@@ -2514,6 +2514,11 @@ def verify_actions_artifact(
     expected_run_attempt: int,
     expected_source_sha: str,
     retention_days: int,
+    expected_workflow_path: str = CANDIDATE_WORKFLOW_PATH,
+    require_completed_success: bool = True,
+    expected_artifact_id: int | None = None,
+    expected_api_digest: str | None = None,
+    direct_artifact_observation: bytes | None = None,
 ) -> JSONObject:
     """Validate exhaustive Actions metadata and emit an external receipt."""
 
@@ -2527,10 +2532,32 @@ def verify_actions_artifact(
         label="workflow run observation",
         max_bytes=MAX_ACTIONS_OBSERVATION_BYTES,
     )
+    direct_observation_snapshot = (
+        None
+        if direct_artifact_observation is None
+        else _immutable_bounded_bytes(
+            direct_artifact_observation,
+            label="direct artifact observation",
+            max_bytes=MAX_ACTIONS_OBSERVATION_BYTES,
+        )
+    )
     if isinstance(expected_run_attempt, bool) or expected_run_attempt != 1:
         raise ReleaseCandidateError("only workflow run attempt 1 is accepted")
+    if type(require_completed_success) is not bool:
+        raise ReleaseCandidateError("artifact workflow completion policy is invalid")
     _positive_integer(expected_run_id, label="expected run ID")
     _require_pattern(expected_source_sha, SHA_RE, label="expected source SHA")
+    if expected_workflow_path not in {
+        CANDIDATE_WORKFLOW_PATH,
+        ".github/workflows/recovery-dependency-staging.yml",
+        ".github/workflows/release.yml",
+    }:
+        raise ReleaseCandidateError("artifact workflow path policy is invalid")
+    if (expected_artifact_id is None) != (expected_api_digest is None):
+        raise ReleaseCandidateError("artifact expected transport identity is incomplete")
+    if expected_artifact_id is not None:
+        _positive_integer(expected_artifact_id, label="expected artifact ID")
+        _require_pattern(expected_api_digest, DIGEST_RE, label="expected artifact digest")
     validated_retention_days = _positive_integer(
         retention_days, label="retention days"
     )
@@ -2548,10 +2575,10 @@ def verify_actions_artifact(
         raise ReleaseCandidateError("workflow run ID mismatch")
     _positive_integer(run.get("workflow_id"), label="workflow ID")
     if run.get("path") not in {
-        CANDIDATE_WORKFLOW_PATH,
-        f"{CANDIDATE_WORKFLOW_PATH}@main",
+        expected_workflow_path,
+        f"{expected_workflow_path}@main",
     }:
-        raise ReleaseCandidateError("workflow run path is not the candidate workflow")
+        raise ReleaseCandidateError("workflow run path is not the expected artifact workflow")
     if run.get("event") != "workflow_dispatch" or run.get("head_branch") != "main":
         raise ReleaseCandidateError("workflow run is not a main candidate dispatch")
     repository = _object(run.get("repository"), label="workflow run repository")
@@ -2564,8 +2591,18 @@ def verify_actions_artifact(
         raise ReleaseCandidateError("workflow run attempt mismatch")
     if run.get("head_sha") != expected_source_sha:
         raise ReleaseCandidateError("workflow run source SHA mismatch")
-    if run.get("status") != "completed" or run.get("conclusion") != "success":
-        raise ReleaseCandidateError("workflow run is not a completed success")
+    if require_completed_success:
+        if run.get("status") != "completed" or run.get("conclusion") != "success":
+            raise ReleaseCandidateError("workflow run is not a completed success")
+    elif (
+        (run.get("status"), run.get("conclusion"))
+        not in {
+            ("in_progress", None),
+            ("waiting", None),
+            ("completed", "success"),
+        }
+    ):
+        raise ReleaseCandidateError("active artifact workflow run state is invalid")
     artifacts = _artifact_pages(
         _parse_json(
             observation_snapshot,
@@ -2581,6 +2618,10 @@ def verify_actions_artifact(
     artifact = matches[0]
     artifact_id = _positive_integer(artifact.get("id"), label="artifact ID")
     digest = _require_pattern(artifact.get("digest"), DIGEST_RE, label="artifact digest")
+    if expected_artifact_id is not None and (
+        artifact_id != expected_artifact_id or digest != expected_api_digest
+    ):
+        raise ReleaseCandidateError("artifact server transport identity mismatch")
     size = _positive_integer(artifact.get("size_in_bytes"), label="artifact size")
     if artifact.get("expired") is not False:
         raise ReleaseCandidateError("artifact is expired")
@@ -2609,6 +2650,48 @@ def verify_actions_artifact(
         or artifact_run.get("head_sha") != expected_source_sha
     ):
         raise ReleaseCandidateError("artifact workflow run identity mismatch")
+    if direct_observation_snapshot is not None:
+        direct = _object(
+            _parse_json(
+                direct_observation_snapshot,
+                label="direct artifact observation",
+                canonical=False,
+            ),
+            label="direct artifact observation",
+        )
+        for field in (
+            "id",
+            "name",
+            "size_in_bytes",
+            "expired",
+            "digest",
+            "created_at",
+            "expires_at",
+        ):
+            if direct.get(field) != artifact.get(field):
+                raise ReleaseCandidateError(
+                    "direct artifact observation identity mismatch"
+                )
+        direct_run = _object(
+            direct.get("workflow_run"), label="direct artifact workflow_run"
+        )
+        for field in (
+            "id",
+            "repository_id",
+            "head_repository_id",
+            "head_branch",
+            "head_sha",
+        ):
+            if direct_run.get(field) != artifact_run.get(field):
+                raise ReleaseCandidateError(
+                    "direct artifact workflow run identity mismatch"
+                )
+    source_records = {
+        "artifact-observation": observation_snapshot,
+        "workflow-run-observation": run_observation_snapshot,
+    }
+    if direct_observation_snapshot is not None:
+        source_records["direct-artifact-observation"] = direct_observation_snapshot
     receipt: JSONObject = {
         "schema": ARTIFACT_OBSERVATION_SCHEMA,
         "artifact": {
@@ -2624,12 +2707,7 @@ def verify_actions_artifact(
             "source_sha": expected_source_sha,
         },
         "evidence": {
-            "source_bundle_digest": source_bundle_digest(
-                {
-                    "artifact-observation": observation_snapshot,
-                    "workflow-run-observation": run_observation_snapshot,
-                }
-            ),
+            "source_bundle_digest": source_bundle_digest(source_records),
             "canonicalization_vector_digest": CANONICALIZATION_VECTOR_DIGEST,
         },
         "provenance": {

@@ -11,19 +11,120 @@ ambient code.
 
 ## Current implementation boundary
 
-This document describes the intended production boundary and the protocol/staging slice that
-implements its fail-closed primitives. It does **not** claim that S2 is production-operable or
-qualified. No production controller in this repository currently downloads the staged dependency
-artifact by its server artifact ID, constructs the path-specific execution closure from real
-authorization evidence, creates and publishes the corresponding recovery capsule, or supplies the
-later role-specific authority releases. Those are dependent controller-integration and hosted
-qualification gates. The private recovery repository, owner signing material, protected
-environments, and scoped credentials are separate external owner gates.
+This document describes the intended production boundary and the locally implemented
+protocol/staging/controller slices. It does **not** claim that S2 is production-operable or
+qualified. `scripts/recovery_capsule_controller.py` is an explicit Ubuntu x86_64 owner-side
+controller. It observes and downloads the authorization and dependency artifacts by exact server
+artifact ID, binds both server-computed digests, reconstructs the installed environment at the
+exact later runner path, creates and publishes the immutable recovery capsule, independently
+recaptures and verifies its Release, signs the verification, and publishes the distinct exact
+three-asset `release-prepare-authority-{run_id}-1` handoff.
 
-Until that controller slice and its exact-SHA hosted receipts exist, a successful reusable staging
-run and capsule smoke can qualify only these implementation primitives. They grant no release
-authority, do not make the release transaction runnable, and do not change the `not_started` S2
-status in `docs/V0_6_PROOF_RELEASE_SOURCE_OF_TRUTH.md`.
+That local implementation is not a hosted receipt. It has not been run against the private
+recovery repository, and it does not replace the later per-role `release-preparation-authority`,
+`release-commit-authority`, verification, PyPI, and final authority publications. The private
+recovery repository, owner signing material, protected environments, scoped credentials, later
+role authorities, and exact-SHA hosted qualification are separate external owner gates. Until
+those gates produce append-only receipts, the implementation grants no release authority, does
+not make the production transaction qualified, and does not change the `not_started` S2 status in
+`docs/V0_6_PROOF_RELEASE_SOURCE_OF_TRUTH.md`.
+
+## Owner-side controller invocation
+
+The controller must run on Ubuntu 24.04 x86_64 under CPython 3.11.14 from the exact clean source
+commit with the frozen project dependencies installed. The pinned Gitleaks container image also
+requires a working Docker daemon. `--target-workspace-root` must be a separate, empty, real
+directory mounted at the exact absolute path that the later Actions job will expose as
+`GITHUB_WORKSPACE`; generated virtual-environment scripts and the installed tree are path-bound.
+The controller requires the checksum-pinned GitHub CLI named by `--pinned-gh`, an owner mutation
+credential in `GH_TOKEN`, the independently scoped reader in
+`RELEASE_RECOVERY_READER_TOKEN`, and the owner's private signing identity named by
+`--identity-file`. The four `--current-recovery-*` paths are freshly captured, signed-source
+envelopes for the bounded owner acknowledgement, sole-writer repository state, immutable Release
+policy, and controller context. Credentials are runtime inputs and are never capsule assets.
+
+After recording the exact server IDs and `sha256:` API digests from the authorization and staging
+workflow artifacts, the owner-side command is:
+
+```sh
+BOOTSTRAP_ROOT=/absolute/new/recovery-controller-bootstrap
+BOOTSTRAP_PYTHON="$(bash scripts/bootstrap_recovery_tcb.sh "$BOOTSTRAP_ROOT")"
+
+env -i \
+  GH_TOKEN="$GH_TOKEN" \
+  RELEASE_RECOVERY_READER_TOKEN="$RELEASE_RECOVERY_READER_TOKEN" \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 \
+  "$BOOTSTRAP_PYTHON" -I -S -B scripts/bootstrap_recovery_capsule_controller.py \
+  --bootstrap-root "$BOOTSTRAP_ROOT" \
+  --pinned-gh /absolute/checksum-pinned/gh \
+  --source-root /absolute/clean/kestrel \
+  --source-sha "$SOURCE_SHA" \
+  --staging-run-id "$STAGING_RUN_ID" \
+  --staging-artifact-id "$STAGING_ARTIFACT_ID" \
+  --staging-artifact-digest "$STAGING_ARTIFACT_DIGEST" \
+  --candidate-manifest-digest "$CANDIDATE_MANIFEST_DIGEST" \
+  --promotion-run-id "$PROMOTION_RUN_ID" \
+  --authorization-artifact-id "$AUTHORIZATION_ARTIFACT_ID" \
+  --authorization-artifact-digest "$AUTHORIZATION_ARTIFACT_DIGEST" \
+  --target-workspace-root /exact/later/GITHUB_WORKSPACE \
+  --recovery-repository-id "$RECOVERY_REPOSITORY_ID" \
+  --identity-file /absolute/private/owner-signing-key \
+  --current-recovery-owner-authority-snapshot /absolute/fresh/recovery-owner.json \
+  --current-recovery-repository-observation /absolute/fresh/recovery-repository.json \
+  --current-recovery-immutable-releases-observation /absolute/fresh/immutable-releases.json \
+  --current-recovery-controller-context /absolute/fresh/controller-context.json \
+  --work-root /absolute/new/controller-work \
+  --output /absolute/new/recovery-controller-receipt.json \
+  --prepare-only
+```
+
+The first invocation is deliberately non-authoritative. It acquires and validates the two exact
+artifacts, creates the deterministic candidate archive, and completes the slow path-bound offline
+environment probe. It performs no owner/reader authority capture and no remote mutation. After it
+returns, replace the bytes at the same four `--current-recovery-*` slot paths with one newly
+captured, internally consistent generation, then rerun the exact command without
+`--prepare-only`. The bootstrap root, request paths, server IDs, digests, and all other arguments
+remain identical. The outer bootstrap and slow preparation replay exact bytes without transport or
+reinstallation.
+
+Each remote mutation rechecks the private signing identity and clean source, obtains a new owner
+key observation and independently scoped reader runtime proof, atomically snapshots all four
+authority slots, and validates the full sole-writer policy. It then signs an exact stage grant
+bound to the request journal, source/candidate/run/repository/transaction identities, release
+name/tag/body digest, complete asset inventory, allowed operations, reader scope/token, signing
+identity, and authority generation. A grant expires no later than its five-minute source authority
+and cannot cross from capsule publication to prepare-authority publication. If the window expires,
+replace all four slot bytes with a new generation; completed failed generations remain as evidence.
+The immutable capsule retains only its first issuance generation as historical evidence. Later
+renewals are sibling controller journals and cannot mutate capsule policy or add capsule authority.
+
+The stdlib-only outer controller validates the exact clean checkout, Actions Python bootstrap tree,
+checksum-pinned GitHub CLI, server artifact identity, hash-locked wheels, and installed
+`site-packages` tree before it makes project or third-party imports. If it is interrupted after an
+atomic artifact acquisition or offline environment install, the next invocation replays the saved
+server evidence, archive extraction, dependency receipt, environment build receipt, interpreter,
+and installed tree without transport or reinstall; a byte or inventory conflict stops. The
+bootstrap receipt itself is fsynced in hidden scratch and atomically installed without replacement;
+matching abandoned scratch and a legacy noncanonical partial regular receipt are recoverable, while
+a canonical conflict or symlink fails closed. The
+authenticated bootstrap archive and pinned content/link inventory are reusable only when the
+runtime still has the separately enforced read-only modes. The inner command is crash-safe at
+immutable publication boundaries: an exact request journal and exact pre-existing bytes resume;
+critical incomplete unpublished capsule, authority-binding, normalized-evidence, prepare-asset,
+receipt-temp, and target-runtime scratch is removed only inside its request-bound paths. Other
+uniquely named inert staging remnants confer no authority and are ignored. An authority binding
+and its atomically staged normalized evidence remain renewable scratch until the complete
+capsule directory, closure, authority pair, and directory-identity marker are joined; an interruption
+before that marker may renew an expired five-minute generation without rewriting history. Empty or
+exact-runtime-only target transaction scratch is recoverable, and every other target entry fails.
+A changed journal, Release identity, asset inventory, server ID, server digest, downloaded archive,
+signed authority, generation provenance, owner key, or independent-reader result fails closed. Unsigned
+verification-source scratch is renewable; once a signed verification exists, its source evidence
+is historical and replays at capture time. Every remote mutation reruns the current authority,
+reader, source, and exact-stage-grant guard, then reobserves the exact release ID, draft state, and
+asset inventory before acting. Running the command without `--prepare-only` performs external
+publication and therefore still requires explicit owner authority.
 
 ## Bootstrap trust boundary
 
@@ -64,8 +165,9 @@ executes every authority command in the OS sandbox with the network namespace un
 The capsule-construction protocol requires its controller to build a reference virtual
 environment at the exact target path before capsule creation, with bytecode generation disabled,
 and bind a schema-validated `site-packages` tree identity into the immutable execution closure.
-The production smoke exercises that protocol primitive; the production controller named above
-is still a separate integration gate. Bootstrap freshly creates that same virtual environment
+The production smoke and owner-side controller share this one closure builder. Hosted execution of
+the controller against real authorization evidence remains a separate qualification gate.
+Bootstrap freshly creates that same virtual environment
 from the hash-locked capsule wheelhouse, uses `--no-index`, runs `pip check`, requires an exact
 match to the controller-bound tree, and freezes the installed files read-only. Every later
 launcher invocation re-hashes the complete bound `site-packages` tree before authority code can
@@ -120,9 +222,9 @@ package-index outage without turning the capsule interpreter into an online proc
 ## Reproducible recovery dependencies
 
 `.github/workflows/recovery-dependency-staging.yml` is the reusable, production-intended staging
-path for the offline dependency closure. It is not yet consumed by the production controller
-described in the current implementation boundary above. The workflow accepts one exact
-40-character source commit and checks out that commit without persisted credentials.
+path for the offline dependency closure and is consumed by the outer production controller by
+exact workflow run ID, server artifact ID, and server-computed digest. The workflow accepts exactly
+one 40-character source commit and checks out that commit without persisted credentials.
 `scripts/stage_recovery_dependencies.py` then:
 
 1. downloads the exact Ubuntu Noble bubblewrap package URL and the exact Actions Python 3.11.14
@@ -169,11 +271,13 @@ The launcher re-hashes the complete base tree before every command. Runtime-imag
 closed instead of silently changing the authority interpreter.
 
 The reusable workflow exposes the server artifact ID and server-computed artifact digest. The
-dependent production controller must record both values and download that exact artifact by ID;
-that integration is not implemented in this slice. Artifact retention is transport availability,
-not authority: the staged receipt and every dependency byte must become immutable capsule assets
-before recovery publication. If the transport artifact expires, the controller must restage the
-same source commit and create a new pre-publication capsule; it must not substitute ambient files.
+owner-side controller requires both values, independently observes the run, exhaustive artifact
+listing, and direct artifact endpoint, downloads only that artifact ID, and rejects any metadata,
+size, digest, workflow, attempt, repository, branch, or source-SHA substitution before extraction.
+Artifact retention is transport availability, not authority: the staged receipt and every
+dependency byte become immutable capsule assets before recovery publication. If the transport
+artifact expires, the controller must restage the same source commit and create a new
+pre-publication capsule; it must not substitute ambient files.
 
 ## Production smoke requirement
 

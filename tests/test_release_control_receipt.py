@@ -4734,6 +4734,229 @@ def test_recovery_capsule_controller_clis_are_exposed() -> None:
         assert command in help_text
 
 
+def test_recovery_capsule_publication_rechecks_authority_before_each_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    output = tmp_path / "publication.json"
+    manifest_raw = b'{"manifest":true}'
+    archive_raw = b"archive"
+    bootstrap_raw = b"bootstrap"
+    release: dict[str, object] | None = None
+    next_asset_id = 100
+    guard_states: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        subject,
+        "verify_recovery_capsule_root",
+        lambda _root: ({"release": {"tag": "recovery-701-1"}}, manifest_raw),
+    )
+    monkeypatch.setattr(
+        subject,
+        "deterministic_recovery_capsule_archive",
+        lambda _root: archive_raw,
+    )
+    monkeypatch.setattr(subject, "_pinned_gh", lambda: tmp_path / "gh")
+    monkeypatch.setattr(subject, "_verify_pinned_gh", lambda _path: None)
+    monkeypatch.setattr(
+        subject,
+        "_read_regular",
+        lambda *_args, **_kwargs: bootstrap_raw,
+    )
+
+    def run_gh_json(command: list[str], *, input_value: object | None = None) -> object:
+        nonlocal release
+        if command == [
+            "api",
+            "repos/John-MiracleWorker/Kestrel-Release-Recovery",
+        ]:
+            return {
+                "id": 304,
+                "full_name": "John-MiracleWorker/Kestrel-Release-Recovery",
+            }
+        if "--paginate" in command:
+            return [] if release is None else [dict(release)]
+        if "POST" in command:
+            assert isinstance(input_value, dict)
+            release = {
+                "id": 4100,
+                "tag_name": input_value["tag_name"],
+                "name": input_value["name"],
+                "body": input_value["body"],
+                "draft": True,
+                "prerelease": False,
+                "immutable": False,
+                "assets": [],
+            }
+            return dict(release)
+        if "PATCH" in command:
+            assert release is not None
+            release["draft"] = False
+            release["immutable"] = True
+            return dict(release)
+        raise AssertionError(f"unexpected GitHub command: {command}")
+
+    def upload(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        nonlocal next_asset_id
+        assert release is not None
+        path = Path(command[4])
+        raw = path.read_bytes()
+        assets = release["assets"]
+        assert isinstance(assets, list)
+        assets.append(
+            {
+                "id": next_asset_id,
+                "name": path.name,
+                "size": len(raw),
+                "digest": _sha256(raw),
+            }
+        )
+        next_asset_id += 1
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    def mutation_guard() -> None:
+        if release is None:
+            guard_states.append(("absent", 0))
+            return
+        assets = release["assets"]
+        assert isinstance(assets, list)
+        guard_states.append(("draft", len(assets)))
+
+    monkeypatch.setattr(subject, "_run_gh_json", run_gh_json)
+    monkeypatch.setattr(subject.subprocess, "run", upload)
+
+    result = subject.publish_recovery_capsule(
+        capsule_root=capsule,
+        repository="John-MiracleWorker/Kestrel-Release-Recovery",
+        tag="recovery-701-1",
+        expected_repository_id=304,
+        output=output,
+        mutation_guard=mutation_guard,
+    )
+
+    assert result == 0
+    assert guard_states == [
+        ("absent", 0),
+        ("draft", 0),
+        ("draft", 1),
+        ("draft", 2),
+        ("draft", 3),
+    ]
+
+
+def test_recovery_capsule_publication_reconciles_draft_after_guard_before_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    output = tmp_path / "publication.json"
+    manifest_raw = b'{"manifest":true}'
+    archive_raw = b"archive"
+    bootstrap_raw = b"bootstrap"
+    release: dict[str, object] | None = None
+    next_asset_id = 100
+    patch_attempts = 0
+
+    monkeypatch.setattr(
+        subject,
+        "verify_recovery_capsule_root",
+        lambda _root: ({"release": {"tag": "recovery-701-1"}}, manifest_raw),
+    )
+    monkeypatch.setattr(
+        subject,
+        "deterministic_recovery_capsule_archive",
+        lambda _root: archive_raw,
+    )
+    monkeypatch.setattr(subject, "_pinned_gh", lambda: tmp_path / "gh")
+    monkeypatch.setattr(subject, "_verify_pinned_gh", lambda _path: None)
+    monkeypatch.setattr(
+        subject,
+        "_read_regular",
+        lambda *_args, **_kwargs: bootstrap_raw,
+    )
+
+    def run_gh_json(command: list[str], *, input_value: object | None = None) -> object:
+        nonlocal release, patch_attempts
+        if command == [
+            "api",
+            "repos/John-MiracleWorker/Kestrel-Release-Recovery",
+        ]:
+            return {
+                "id": 304,
+                "full_name": "John-MiracleWorker/Kestrel-Release-Recovery",
+            }
+        if "--paginate" in command:
+            return [] if release is None else [dict(release)]
+        if "POST" in command:
+            assert isinstance(input_value, dict)
+            release = {
+                "id": 4100,
+                "tag_name": input_value["tag_name"],
+                "name": input_value["name"],
+                "body": input_value["body"],
+                "draft": True,
+                "prerelease": False,
+                "immutable": False,
+                "assets": [],
+            }
+            return dict(release)
+        if "PATCH" in command:
+            patch_attempts += 1
+            raise AssertionError("conflicting draft must not be published")
+        raise AssertionError(f"unexpected GitHub command: {command}")
+
+    def upload(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        nonlocal next_asset_id
+        assert release is not None
+        path = Path(command[4])
+        raw = path.read_bytes()
+        assets = release["assets"]
+        assert isinstance(assets, list)
+        assets.append(
+            {
+                "id": next_asset_id,
+                "name": path.name,
+                "size": len(raw),
+                "digest": _sha256(raw),
+            }
+        )
+        next_asset_id += 1
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    def mutation_guard() -> None:
+        if release is None:
+            return
+        assets = release["assets"]
+        assert isinstance(assets, list)
+        if len(assets) == 3:
+            assets.append(
+                {
+                    "id": 999,
+                    "name": "owner-conflict.txt",
+                    "size": 1,
+                    "digest": _sha256(b"x"),
+                }
+            )
+
+    monkeypatch.setattr(subject, "_run_gh_json", run_gh_json)
+    monkeypatch.setattr(subject.subprocess, "run", upload)
+
+    with pytest.raises(ValueError, match="unexpected asset"):
+        subject.publish_recovery_capsule(
+            capsule_root=capsule,
+            repository="John-MiracleWorker/Kestrel-Release-Recovery",
+            tag="recovery-701-1",
+            expected_repository_id=304,
+            output=output,
+            mutation_guard=mutation_guard,
+        )
+
+    assert patch_attempts == 0
+    assert release is not None
+    assert release["draft"] is True
+
+
 def test_capsule_dispatch_admission_binds_exact_transaction_run(
     tmp_path: Path,
 ) -> None:
@@ -4848,9 +5071,7 @@ def _fixture_recovery_environment(
             "python_version": "3.11.14",
             "python_abi": "cp311",
             "environment_root": environment_root,
-            "site_packages_path": (
-                f"{environment_root}/lib/python3.11/site-packages"
-            ),
+            "site_packages_path": (f"{environment_root}/lib/python3.11/site-packages"),
             "site_packages_tree_sha256": "sha256:" + "6" * 64,
             "site_packages_file_count": 1,
             "site_packages_total_size_bytes": 1,
@@ -4874,9 +5095,7 @@ def _complete_recovery_capsule_assets(
     runtime_files = [
         {
             "asset_path": runtime_asset,
-            "sandbox_path": (
-                "/opt/hostedtoolcache/Python/3.11.14/x64/lib/libpython3.11.so.1.0"
-            ),
+            "sandbox_path": ("/opt/hostedtoolcache/Python/3.11.14/x64/lib/libpython3.11.so.1.0"),
             "sha256": _sha256(runtime),
             "size_bytes": len(runtime),
         }
@@ -4890,9 +5109,7 @@ def _complete_recovery_capsule_assets(
             "files": runtime_files,
         }
     )
-    python_runtime_manifest, python_runtime_archive = (
-        _fixture_recovery_python_runtime()
-    )
+    python_runtime_manifest, python_runtime_archive = _fixture_recovery_python_runtime()
     environment_manifest = _fixture_recovery_environment()
     closure_assets: dict[str, bytes] = {
         **workflows,
@@ -5117,12 +5334,8 @@ def test_recovery_capsule_command_accepts_only_an_explicit_programmatic_clock(
         "transaction-authorization.json": transaction_raw,
         "dispatch-admission.json": assets["dispatch-admission.json"],
         "dispatch-admission.json.sig": assets["dispatch-admission.json.sig"],
-        "dispatch-admission-verification.json": assets[
-            "dispatch-admission-verification.json"
-        ],
-        "owner-signing-keys-observation.json": assets[
-            "owner-signing-keys-observation.json"
-        ],
+        "dispatch-admission-verification.json": assets["dispatch-admission-verification.json"],
+        "owner-signing-keys-observation.json": assets["owner-signing-keys-observation.json"],
         "recovery-authority.json": assets["recovery-authority.json"],
         "recovery-authority.json.sig": assets["recovery-authority.json.sig"],
         "recovery-repository-observation.json": _canonical(
@@ -5131,12 +5344,8 @@ def test_recovery_capsule_command_accepts_only_an_explicit_programmatic_clock(
                 "id": 304,
             }
         ),
-        "recovery-execution-closure.json": assets[
-            "recovery-execution-closure.json"
-        ],
-        "recovery-environment-manifest.json": assets[
-            "recovery/environment-manifest.json"
-        ],
+        "recovery-execution-closure.json": assets["recovery-execution-closure.json"],
+        "recovery-environment-manifest.json": assets["recovery/environment-manifest.json"],
     }
     for name, raw in input_assets.items():
         (inputs / name).write_bytes(raw)
@@ -5350,9 +5559,7 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
     runtime_files = [
         {
             "asset_path": runtime_asset,
-            "sandbox_path": (
-                "/opt/hostedtoolcache/Python/3.11.14/x64/lib/libpython3.11.so.1.0"
-            ),
+            "sandbox_path": ("/opt/hostedtoolcache/Python/3.11.14/x64/lib/libpython3.11.so.1.0"),
             "sha256": _sha256(runtime),
             "size_bytes": len(runtime),
         }
@@ -5366,9 +5573,7 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
             "files": runtime_files,
         }
     )
-    python_runtime_manifest, python_runtime_archive = (
-        _fixture_recovery_python_runtime()
-    )
+    python_runtime_manifest, python_runtime_archive = _fixture_recovery_python_runtime()
     environment_manifest = _fixture_recovery_environment()
     source = tmp_path / "source"
     (source / "recovery" / "wheelhouse").mkdir(parents=True)
@@ -5377,12 +5582,8 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
     (source / "recovery" / "requirements.txt").write_bytes(requirements)
     (source / "recovery" / "wheelhouse-manifest.json").write_bytes(manifest)
     (source / "recovery" / "runtime-manifest.json").write_bytes(runtime_manifest)
-    (source / "recovery" / "python-runtime-manifest.json").write_bytes(
-        python_runtime_manifest
-    )
-    (source / "recovery" / "python-runtime.tar.gz").write_bytes(
-        python_runtime_archive
-    )
+    (source / "recovery" / "python-runtime-manifest.json").write_bytes(python_runtime_manifest)
+    (source / "recovery" / "python-runtime.tar.gz").write_bytes(python_runtime_archive)
     runtime_path = source / runtime_asset
     runtime_path.parent.mkdir()
     runtime_path.write_bytes(runtime)
@@ -5426,9 +5627,7 @@ def test_recovery_capsule_collects_hash_locked_offline_dependencies(
     receipt["receipt_digest"] = _sha256(_canonical(receipt))
     receipt_raw = _canonical(receipt)
     (source / "recovery" / "dependency-staging-receipt.json").write_bytes(receipt_raw)
-    assets: dict[str, bytes] = {
-        "recovery/environment-manifest.json": environment_manifest
-    }
+    assets: dict[str, bytes] = {"recovery/environment-manifest.json": environment_manifest}
     monkeypatch.setattr(subject, "_RECOVERY_BWRAP_BINARY_DIGEST", _sha256(sandbox))
 
     subject._capsule_collect_recovery_dependencies(  # noqa: SLF001
@@ -5487,9 +5686,7 @@ def test_recovery_capsule_rejects_dependency_staging_receipt_source_drift(
     runtime_files = [
         {
             "asset_path": runtime_asset,
-            "sandbox_path": (
-                "/opt/hostedtoolcache/Python/3.11.14/x64/lib/libpython3.11.so.1.0"
-            ),
+            "sandbox_path": ("/opt/hostedtoolcache/Python/3.11.14/x64/lib/libpython3.11.so.1.0"),
             "sha256": _sha256(runtime),
             "size_bytes": len(runtime),
         }
@@ -5503,9 +5700,7 @@ def test_recovery_capsule_rejects_dependency_staging_receipt_source_drift(
             "files": runtime_files,
         }
     )
-    python_runtime_manifest, python_runtime_archive = (
-        _fixture_recovery_python_runtime()
-    )
+    python_runtime_manifest, python_runtime_archive = _fixture_recovery_python_runtime()
     environment_manifest = _fixture_recovery_environment()
     root = tmp_path / "dependencies" / "recovery"
     (root / "bin").mkdir(parents=True)
@@ -5562,9 +5757,7 @@ def test_recovery_capsule_rejects_dependency_staging_receipt_source_drift(
                     "requirements_sha256": _sha256(requirements),
                     "environment_manifest_sha256": _sha256(environment_manifest),
                     "runtime_manifest_sha256": _sha256(runtime_manifest),
-                    "python_runtime_manifest_sha256": _sha256(
-                        python_runtime_manifest
-                    ),
+                    "python_runtime_manifest_sha256": _sha256(python_runtime_manifest),
                     "python_runtime_archive_sha256": _sha256(python_runtime_archive),
                     "wheelhouse_manifest_sha256": _sha256(manifest),
                 },

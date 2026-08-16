@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from scripts import bootstrap_recovery, recovery_launcher
+from scripts import recovery_capsule_controller as controller
 from scripts import release_control_receipt as receipts
 from scripts import run_recovery_capsule_smoke as smoke
 from scripts import stage_recovery_dependencies as staging
@@ -487,6 +488,13 @@ def test_production_recovery_smoke_script_starts_in_isolated_mode() -> None:
     assert "--dependency-root" in completed.stdout
 
 
+def test_production_smoke_uses_the_controller_execution_closure_builder() -> None:
+    assert (
+        smoke._execution_closure  # noqa: SLF001
+        is controller.build_recovery_execution_closure
+    )
+
+
 def test_release_recovery_mutations_enter_only_through_nested_offline_sandbox() -> None:
     workflow = (
         Path(__file__).resolve().parents[1]
@@ -526,6 +534,21 @@ def test_recovery_tcb_bootstrap_authenticates_tree_before_first_python() -> None
     assert "PYTHONPATH" not in script
     assert "PYTHONHOME" not in script
     assert script.index("runtime-tree") < script.index("bin/python3.11")
+
+
+def test_recovery_tcb_bootstrap_resumes_only_an_exact_runtime_without_transport() -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "scripts" / "bootstrap_recovery_tcb.sh").read_text(
+        encoding="utf-8"
+    )
+
+    resume = script.index('if test -e "$destination" || test -L "$destination"; then')
+    transport = script.index("curl --proto")
+    assert resume < transport
+    assert "verify_exact_runtime" in script[resume:transport]
+    assert "cmp --silent" in script
+    assert 'test ! -L "$destination"' in script
+    assert 'test ! -e "$destination"' not in script
 
 
 def test_production_smoke_builds_a_schema_valid_complete_execution_closure(
@@ -644,7 +667,7 @@ def test_production_smoke_builds_a_schema_valid_complete_execution_closure(
     python_digest = "sha256:" + "3" * 64
     runtime = {"implementation": "CPython", "version": "3.11.14", "abi": "cp311"}
     monkeypatch.setattr(
-        smoke,
+        controller,
         "_probe_final_python",
         lambda **_kwargs: (
             [str(destination)],

@@ -5957,8 +5957,7 @@ _GITLEAKS_IMAGE = (
     "zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
 )
 _RECOVERY_BWRAP_PACKAGE_URL = (
-    "https://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/"
-    "bubblewrap_0.9.0-1ubuntu0.1_amd64.deb"
+    "https://archive.ubuntu.com/ubuntu/pool/main/b/bubblewrap/bubblewrap_0.9.0-1ubuntu0.1_amd64.deb"
 )
 _RECOVERY_BWRAP_PACKAGE_DIGEST = (
     "sha256:1b506492bd9c7fd0cdb4f02ac822f1d3e336b0aead5113c1239baf8db5db562a"
@@ -6492,8 +6491,7 @@ def _validate_capsule_execution_asset_closure(
     environment_manifest_raw = asset_bytes.get("recovery/environment-manifest.json")
     if (
         environment_manifest_raw is None
-        or dependency_lock.get("environment_manifest_sha256")
-        != _sha256(environment_manifest_raw)
+        or dependency_lock.get("environment_manifest_sha256") != _sha256(environment_manifest_raw)
         or member_digests.get("recovery/environment-manifest.json")
         != _sha256(environment_manifest_raw)
     ):
@@ -6513,10 +6511,8 @@ def _validate_capsule_execution_asset_closure(
     runtime_manifest_raw = asset_bytes.get("recovery/runtime-manifest.json")
     if (
         runtime_manifest_raw is None
-        or dependency_lock.get("runtime_manifest_sha256")
-        != _sha256(runtime_manifest_raw)
-        or member_digests.get("recovery/runtime-manifest.json")
-        != _sha256(runtime_manifest_raw)
+        or dependency_lock.get("runtime_manifest_sha256") != _sha256(runtime_manifest_raw)
+        or member_digests.get("recovery/runtime-manifest.json") != _sha256(runtime_manifest_raw)
     ):
         raise ReleaseControlError("recovery capsule runtime manifest binding mismatch")
     runtime_manifest = _object(
@@ -6532,7 +6528,10 @@ def _validate_capsule_execution_asset_closure(
         label="recovery capsule runtime manifest",
     )
     runtime_items = _array(runtime_manifest.get("files"), label="recovery capsule runtime files")
-    if _array(closure.get("runtime_files"), label="capsule recovery runtime files") != runtime_items:
+    if (
+        _array(closure.get("runtime_files"), label="capsule recovery runtime files")
+        != runtime_items
+    ):
         raise ReleaseControlError("recovery capsule runtime closure binding mismatch")
     for raw_runtime in runtime_items:
         runtime_item = _object(raw_runtime, label="recovery capsule runtime file")
@@ -6550,14 +6549,11 @@ def _validate_capsule_execution_asset_closure(
     if (
         python_manifest_raw is None
         or python_archive_raw is None
-        or dependency_lock.get("python_runtime_manifest_sha256")
-        != _sha256(python_manifest_raw)
-        or dependency_lock.get("python_runtime_archive_sha256")
-        != _sha256(python_archive_raw)
+        or dependency_lock.get("python_runtime_manifest_sha256") != _sha256(python_manifest_raw)
+        or dependency_lock.get("python_runtime_archive_sha256") != _sha256(python_archive_raw)
         or member_digests.get("recovery/python-runtime-manifest.json")
         != _sha256(python_manifest_raw)
-        or member_digests.get("recovery/python-runtime.tar.gz")
-        != _sha256(python_archive_raw)
+        or member_digests.get("recovery/python-runtime.tar.gz") != _sha256(python_archive_raw)
     ):
         raise ReleaseControlError("recovery capsule Python runtime binding mismatch")
     python_manifest = _object(
@@ -6572,10 +6568,9 @@ def _validate_capsule_execution_asset_closure(
         python_manifest,
         label="recovery capsule Python runtime manifest",
     )
-    if (
-        python_manifest.get("runtime_archive_sha256") != _sha256(python_archive_raw)
-        or python_manifest.get("runtime_archive_size_bytes") != len(python_archive_raw)
-    ):
+    if python_manifest.get("runtime_archive_sha256") != _sha256(
+        python_archive_raw
+    ) or python_manifest.get("runtime_archive_size_bytes") != len(python_archive_raw):
         raise ReleaseControlError("recovery capsule Python runtime archive identity mismatch")
     python_items = [
         _object(item, label="capsule Python executable")
@@ -6604,8 +6599,7 @@ def _validate_capsule_execution_asset_closure(
         != str(environment_root / "lib" / "python3.11" / "site-packages")
         or environment_manifest.get("python_version") != python_runtime.get("version")
         or environment_manifest.get("python_abi") != python_runtime.get("abi")
-        or python_items[0].get("sha256")
-        != python_manifest.get("python_executable_sha256")
+        or python_items[0].get("sha256") != python_manifest.get("python_executable_sha256")
     ):
         raise ReleaseControlError("recovery capsule Python executable binding mismatch")
     wheelhouse_manifest_raw = asset_bytes.get("recovery/wheelhouse-manifest.json")
@@ -7311,9 +7305,8 @@ def _capsule_collect_recovery_dependencies(
     if lock.get("requirements_path") != "recovery/requirements.txt":
         raise ReleaseControlError("recovery capsule dependency requirements path mismatch")
     environment_raw = assets.get("recovery/environment-manifest.json")
-    if (
-        environment_raw is None
-        or lock.get("environment_manifest_sha256") != _sha256(environment_raw)
+    if environment_raw is None or lock.get("environment_manifest_sha256") != _sha256(
+        environment_raw
     ):
         raise ReleaseControlError("recovery capsule environment manifest binding mismatch")
     environment_manifest = _object(
@@ -7461,20 +7454,17 @@ def _capsule_collect_recovery_dependencies(
         or outputs.get("bubblewrap_version") != _RECOVERY_BWRAP_VERSION
         or outputs.get("wheelhouse_manifest_sha256")
         != _sha256(assets["recovery/wheelhouse-manifest.json"])
-        or outputs.get("wheelhouse_manifest_sha256")
-        != lock.get("wheelhouse_manifest_sha256")
+        or outputs.get("wheelhouse_manifest_sha256") != lock.get("wheelhouse_manifest_sha256")
         or outputs.get("runtime_manifest_sha256")
         != _sha256(assets["recovery/runtime-manifest.json"])
-        or outputs.get("runtime_manifest_sha256")
-        != lock.get("runtime_manifest_sha256")
+        or outputs.get("runtime_manifest_sha256") != lock.get("runtime_manifest_sha256")
         or outputs.get("python_runtime_manifest_sha256")
         != _sha256(assets["recovery/python-runtime-manifest.json"])
         or outputs.get("python_runtime_manifest_sha256")
         != lock.get("python_runtime_manifest_sha256")
         or outputs.get("python_runtime_archive_sha256")
         != _sha256(assets["recovery/python-runtime.tar.gz"])
-        or outputs.get("python_runtime_archive_sha256")
-        != lock.get("python_runtime_archive_sha256")
+        or outputs.get("python_runtime_archive_sha256") != lock.get("python_runtime_archive_sha256")
     ):
         raise ReleaseControlError("recovery capsule dependency staging output binding mismatch")
     if (
@@ -7498,8 +7488,7 @@ def _capsule_collect_recovery_dependencies(
     if (
         runtime_manifest.get("platform") != _RECOVERY_RUNTIME_PLATFORM
         or runtime_manifest.get("python_version") != _RECOVERY_PYTHON_VERSION
-        or runtime_manifest.get("python_executable_sha256")
-        != _RECOVERY_PYTHON_BINARY_DIGEST
+        or runtime_manifest.get("python_executable_sha256") != _RECOVERY_PYTHON_BINARY_DIGEST
     ):
         raise ReleaseControlError("recovery capsule runtime identity mismatch")
     python_runtime_manifest = _object(
@@ -7519,13 +7508,10 @@ def _capsule_collect_recovery_dependencies(
         != _sha256(assets["recovery/python-runtime.tar.gz"])
         or python_runtime_manifest.get("runtime_archive_size_bytes")
         != len(assets["recovery/python-runtime.tar.gz"])
-        or python_runtime_manifest.get("python_executable_sha256")
-        != _RECOVERY_PYTHON_BINARY_DIGEST
+        or python_runtime_manifest.get("python_executable_sha256") != _RECOVERY_PYTHON_BINARY_DIGEST
     ):
         raise ReleaseControlError("recovery capsule Python runtime identity mismatch")
-    runtime_items = _array(
-        runtime_manifest.get("files"), label="recovery capsule runtime files"
-    )
+    runtime_items = _array(runtime_manifest.get("files"), label="recovery capsule runtime files")
     if outputs.get("runtime_file_count") != len(runtime_items):
         raise ReleaseControlError("recovery capsule runtime file count mismatch")
     closure_runtime_items = _array(
@@ -7559,10 +7545,8 @@ def _capsule_collect_recovery_dependencies(
             path=dependency_root / asset_path,
             max_bytes=256 * 1024 * 1024,
         )
-        if (
-            len(assets[asset_path]) != size_bytes
-            or _sha256(assets[asset_path])
-            != _digest(runtime_item.get("sha256"), label="recovery runtime file digest")
+        if len(assets[asset_path]) != size_bytes or _sha256(assets[asset_path]) != _digest(
+            runtime_item.get("sha256"), label="recovery runtime file digest"
         ):
             raise ReleaseControlError("recovery capsule runtime file identity mismatch")
     manifest = _object(
@@ -8065,13 +8049,9 @@ def _verify_pinned_gh_release_observation(
             label="pinned GitHub CLI verification result",
             max_bytes=MAX_SOURCE_BODY_BYTES,
         )
-        if (
-            len(result_raw) != size
-            or _sha256(result_raw)
-            != _digest(
-                result.get("sha256"),
-                label="pinned GitHub CLI verification result digest",
-            )
+        if len(result_raw) != size or _sha256(result_raw) != _digest(
+            result.get("sha256"),
+            label="pinned GitHub CLI verification result digest",
         ):
             raise ReleaseControlError("pinned GitHub CLI verification result digest mismatch")
         parse_external_json_bytes(
@@ -8155,7 +8135,34 @@ def _verify_remote_capsule_assets(
     return normalized
 
 
-def _command_publish_recovery_capsule(args: argparse.Namespace) -> int:
+def publish_recovery_capsule(
+    *,
+    capsule_root: Path,
+    repository: str,
+    tag: str,
+    expected_repository_id: int,
+    output: Path,
+    mutation_guard: Callable[[], None] | None = None,
+) -> int:
+    """Publish one exact capsule while reauthorizing every remote mutation."""
+
+    return _command_publish_recovery_capsule(
+        argparse.Namespace(
+            capsule_root=str(capsule_root),
+            repository=repository,
+            tag=tag,
+            expected_repository_id=expected_repository_id,
+            output=str(output),
+        ),
+        mutation_guard=mutation_guard,
+    )
+
+
+def _command_publish_recovery_capsule(
+    args: argparse.Namespace,
+    *,
+    mutation_guard: Callable[[], None] | None = None,
+) -> int:
     output = Path(args.output)
     if output.exists() or output.is_symlink():
         raise ReleaseControlError("recovery publication output path must be empty")
@@ -8204,65 +8211,126 @@ def _command_publish_recovery_capsule(args: argparse.Namespace) -> int:
         )
         return [item for item in _release_items(listed) if item.get("tag_name") == args.tag]
 
-    matching = list_matching()
-    if len(matching) > 1:
-        raise ReleaseControlError("recovery publication Release is ambiguous")
-    if not matching:
-        created = _object(
-            _run_gh_json(
-                ["api", "--method", "POST", f"repos/{args.repository}/releases", "--input", "-"],
-                input_value={
-                    "tag_name": args.tag,
-                    "name": name,
-                    "body": body,
-                    "draft": True,
-                    "prerelease": False,
-                    "generate_release_notes": False,
-                    "make_latest": "false",
-                },
-            ),
-            label="created recovery Release",
-        )
-        matching = list_matching()
-        if len(matching) != 1 or matching[0].get("id") != created.get("id"):
-            raise ReleaseControlError(
-                "recovery publication create response is not uniquely observable"
-            )
-    release = matching[0]
-    if (
-        release.get("name") != name
-        or release.get("body") != body
-        or release.get("prerelease") is not False
-    ):
-        raise ReleaseControlError("recovery publication Release identity conflicts")
-    observed_assets = {
-        cast(str, _object(item, label="recovery Release asset").get("name")): _object(  # noqa: SLF001
-            item, label="recovery Release asset"
-        )
-        for item in _array(release.get("assets"), label="recovery Release assets")
+    expected_asset_identities = {
+        asset_name: (len(raw), _sha256(raw)) for asset_name, raw in expected_assets.items()
     }
-    if any(name not in expected_assets for name in observed_assets):
-        raise ReleaseControlError("recovery publication has an unexpected asset")
+
+    def observe_exact(
+        *, expected_release_id: int | None = None
+    ) -> tuple[JSONObject, dict[str, JSONObject]] | None:
+        matching = list_matching()
+        if len(matching) > 1:
+            raise ReleaseControlError("recovery publication Release is ambiguous")
+        if not matching:
+            return None
+        release = matching[0]
+        release_id = _safe_integer(release.get("id"), label="recovery Release ID", positive=True)
+        if expected_release_id is not None and release_id != expected_release_id:
+            raise ReleaseControlError("recovery publication Release ID changed")
+        if (
+            release.get("tag_name") != args.tag
+            or release.get("name") != name
+            or release.get("body") != body
+            or type(release.get("draft")) is not bool
+            or release.get("prerelease") is not False
+            or type(release.get("immutable")) is not bool
+            or release.get("draft") is release.get("immutable")
+        ):
+            raise ReleaseControlError("recovery publication Release identity conflicts")
+        observed_assets: dict[str, JSONObject] = {}
+        observed_ids: set[int] = set()
+        for raw_asset in _array(release.get("assets"), label="recovery Release assets"):
+            asset = _object(raw_asset, label="recovery Release asset")
+            asset_name = _validate_string(asset.get("name"), label="recovery Release asset name")
+            asset_id = _safe_integer(
+                asset.get("id"), label="recovery Release asset ID", positive=True
+            )
+            if asset_name in observed_assets or asset_id in observed_ids:
+                raise ReleaseControlError("recovery publication assets are duplicated")
+            expected = expected_asset_identities.get(asset_name)
+            if expected is None:
+                raise ReleaseControlError("recovery publication has an unexpected asset")
+            size = _safe_integer(
+                asset.get("size"), label="recovery Release asset size", positive=True
+            )
+            digest = _digest(asset.get("digest"), label="recovery Release asset digest")
+            if (size, digest) != expected:
+                raise ReleaseControlError("recovery publication asset identity conflicts")
+            observed_assets[asset_name] = asset
+            observed_ids.add(asset_id)
+        if release.get("draft") is False and set(observed_assets) != set(expected_assets):
+            raise ReleaseControlError("published recovery publication is missing an asset")
+        return release, observed_assets
+
+    observed_release = observe_exact()
+    if observed_release is None:
+        if mutation_guard is not None:
+            mutation_guard()
+        observed_release = observe_exact()
+        if observed_release is None:
+            created = _object(
+                _run_gh_json(
+                    [
+                        "api",
+                        "--method",
+                        "POST",
+                        f"repos/{args.repository}/releases",
+                        "--input",
+                        "-",
+                    ],
+                    input_value={
+                        "tag_name": args.tag,
+                        "name": name,
+                        "body": body,
+                        "draft": True,
+                        "prerelease": False,
+                        "generate_release_notes": False,
+                        "make_latest": "false",
+                    },
+                ),
+                label="created recovery Release",
+            )
+            created_id = _safe_integer(
+                created.get("id"), label="created recovery Release ID", positive=True
+            )
+            observed_release = observe_exact(expected_release_id=created_id)
+            if observed_release is None:
+                raise ReleaseControlError(
+                    "recovery publication create response is not uniquely observable"
+                )
+    release, observed_assets = observed_release
+    release_id = _safe_integer(release.get("id"), label="recovery Release ID", positive=True)
     with tempfile.TemporaryDirectory(prefix="kestrel-recovery-publish-") as temporary:
         temporary_root = Path(temporary)
-        upload_paths: list[str] = []
         for asset_name, raw in expected_assets.items():
+            observed_release = observe_exact(expected_release_id=release_id)
+            if observed_release is None:
+                raise ReleaseControlError("recovery publication Release disappeared")
+            release, observed_assets = observed_release
             observed = observed_assets.get(asset_name)
             if observed is not None:
-                if observed.get("size") != len(raw) or observed.get("digest") != _sha256(raw):
-                    raise ReleaseControlError("recovery publication asset identity conflicts")
                 continue
+            if release.get("draft") is not True:
+                raise ReleaseControlError("published recovery publication is missing an asset")
             path = temporary_root / asset_name
             _write_secure_temporary(path, raw, mode=0o600)
-            upload_paths.append(str(path))
-        if upload_paths:
+            if mutation_guard is not None:
+                mutation_guard()
+            observed_release = observe_exact(expected_release_id=release_id)
+            if observed_release is None:
+                raise ReleaseControlError("recovery publication Release disappeared")
+            release, observed_assets = observed_release
+            if asset_name in observed_assets:
+                continue
+            if release.get("draft") is not True:
+                raise ReleaseControlError("published recovery publication is missing an asset")
             completed = subprocess.run(  # noqa: S603  # nosec B603
                 [
                     str(pinned_gh),
                     "release",
                     "upload",
                     args.tag,
-                    *upload_paths,
+                    str(path),
                     "--repo",
                     args.repository,
                 ],
@@ -8276,23 +8344,42 @@ def _command_publish_recovery_capsule(args: argparse.Namespace) -> int:
             )
             if completed.returncode != 0:
                 raise ReleaseControlError("recovery capsule asset upload failed")
-    release_id = _safe_integer(release.get("id"), label="recovery Release ID", positive=True)
+            observed_release = observe_exact(expected_release_id=release_id)
+            if observed_release is None or asset_name not in observed_release[1]:
+                raise ReleaseControlError("recovery capsule asset upload was not observed exactly")
+    observed_release = observe_exact(expected_release_id=release_id)
+    if observed_release is None:
+        raise ReleaseControlError("recovery publication Release disappeared")
+    release, observed_assets = observed_release
+    if set(observed_assets) != set(expected_assets):
+        raise ReleaseControlError("recovery publication asset inventory is incomplete")
     if release.get("draft") is True:
-        _run_gh_json(
-            [
-                "api",
-                "--method",
-                "PATCH",
-                f"repos/{args.repository}/releases/{release_id}",
-                "--input",
-                "-",
-            ],
-            input_value={"draft": False, "make_latest": "false"},
-        )
-    final = list_matching()
-    if len(final) != 1:
+        if mutation_guard is not None:
+            mutation_guard()
+        observed_release = observe_exact(expected_release_id=release_id)
+        if observed_release is None:
+            raise ReleaseControlError("recovery publication Release disappeared")
+        release, observed_assets = observed_release
+        if set(observed_assets) != set(expected_assets):
+            raise ReleaseControlError(
+                "recovery publication asset inventory changed before publication"
+            )
+        if release.get("draft") is True:
+            _run_gh_json(
+                [
+                    "api",
+                    "--method",
+                    "PATCH",
+                    f"repos/{args.repository}/releases/{release_id}",
+                    "--input",
+                    "-",
+                ],
+                input_value={"draft": False, "make_latest": "false"},
+            )
+    observed_release = observe_exact(expected_release_id=release_id)
+    if observed_release is None:
         raise ReleaseControlError("recovery capsule Release is not uniquely immutable")
-    final_release = final[0]
+    final_release, _final_assets = observed_release
     if (
         final_release.get("id") != release_id
         or final_release.get("tag_name") != args.tag
@@ -8650,7 +8737,7 @@ def main(
                 raise ReleaseControlError(
                     "an explicit verification clock is limited to recovery capsule creation"
                 )
-            return _command_create_recovery_capsule(args, _clock=_clock)
+            return cast(int, _command_create_recovery_capsule(args, _clock=_clock))
         return cast(int, args.handler(args))
     except (ReleaseControlError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

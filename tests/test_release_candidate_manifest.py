@@ -3301,6 +3301,105 @@ def test_verify_actions_artifact_accepts_branch_qualified_workflow_path() -> Non
     assert receipt["artifact"]["run_id"] == WORKFLOW_RUN_ID  # type: ignore[index]
 
 
+def test_verify_actions_artifact_accepts_exact_recovery_staging_transport() -> None:
+    artifact = _artifact(
+        name="kestrel-recovery-dependencies-" + "a" * 40,
+    )
+    direct = _canonical(artifact)
+    receipt = subject.verify_actions_artifact(
+        _artifact_pages([artifact]),
+        _run_observation(
+            path=".github/workflows/recovery-dependency-staging.yml@main"
+        ),
+        expected_name="kestrel-recovery-dependencies-" + "a" * 40,
+        expected_run_id=WORKFLOW_RUN_ID,
+        expected_run_attempt=1,
+        expected_source_sha="a" * 40,
+        retention_days=30,
+        expected_workflow_path=(
+            ".github/workflows/recovery-dependency-staging.yml"
+        ),
+        expected_artifact_id=5150,
+        expected_api_digest="sha256:" + "a" * 64,
+        direct_artifact_observation=direct,
+    )
+
+    assert receipt["artifact"]["artifact_id"] == 5150  # type: ignore[index]
+    assert receipt["artifact"]["api_digest"] == "sha256:" + "a" * 64  # type: ignore[index]
+    assert receipt["evidence"]["source_bundle_digest"] == _source_bundle_digest(  # type: ignore[index]
+        {
+            "artifact-observation": _artifact_pages([artifact]),
+            "direct-artifact-observation": direct,
+            "workflow-run-observation": _run_observation(
+                path=".github/workflows/recovery-dependency-staging.yml@main"
+            ),
+        }
+    )
+
+
+@pytest.mark.parametrize("status", ["in_progress", "waiting"])
+def test_verify_actions_artifact_accepts_active_authorization_transport(
+    status: str,
+) -> None:
+    receipt = subject.verify_actions_artifact(
+        _artifact_pages([_artifact()]),
+        _run_observation(
+            path=".github/workflows/release.yml",
+            status=status,
+            conclusion=None,
+        ),
+        expected_name=ARTIFACT_NAME,
+        expected_run_id=WORKFLOW_RUN_ID,
+        expected_run_attempt=1,
+        expected_source_sha="a" * 40,
+        retention_days=30,
+        expected_workflow_path=".github/workflows/release.yml",
+        require_completed_success=False,
+        expected_artifact_id=5150,
+        expected_api_digest="sha256:" + "a" * 64,
+        direct_artifact_observation=_canonical(_artifact()),
+    )
+
+    assert receipt["artifact"]["run_id"] == WORKFLOW_RUN_ID  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("expected_id", "expected_digest", "direct_mutation"),
+    [
+        (5151, "sha256:" + "a" * 64, None),
+        (5150, "sha256:" + "b" * 64, None),
+        (5150, "sha256:" + "a" * 64, {"size_in_bytes": 4097}),
+    ],
+)
+def test_verify_actions_artifact_rejects_controller_transport_substitution(
+    expected_id: int,
+    expected_digest: str,
+    direct_mutation: dict[str, object] | None,
+) -> None:
+    direct = _artifact()
+    if direct_mutation is not None:
+        direct.update(direct_mutation)
+
+    with pytest.raises(ValueError, match="artifact"):
+        subject.verify_actions_artifact(
+            _artifact_pages([_artifact()]),
+            _run_observation(
+                path=".github/workflows/recovery-dependency-staging.yml"
+            ),
+            expected_name=ARTIFACT_NAME,
+            expected_run_id=WORKFLOW_RUN_ID,
+            expected_run_attempt=1,
+            expected_source_sha="a" * 40,
+            retention_days=30,
+            expected_workflow_path=(
+                ".github/workflows/recovery-dependency-staging.yml"
+            ),
+            expected_artifact_id=expected_id,
+            expected_api_digest=expected_digest,
+            direct_artifact_observation=_canonical(direct),
+        )
+
+
 @pytest.mark.parametrize(
     ("observation", "run"),
     [

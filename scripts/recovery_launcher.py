@@ -1943,7 +1943,7 @@ def build_host_actuator_binding(
         raise receipts.ReleaseControlError(
             "recovery host actuator candidate source SHA is invalid"
         )
-    workflow_digests = [
+    workflow_digests: list[receipts.JSONValue] = [
         {"path": name, "sha256": receipts._sha256(host_source[name])}  # noqa: SLF001
         for name in sorted(receipts._RECOVERY_CAPSULE_WORKFLOWS)  # noqa: SLF001
     ]
@@ -2084,10 +2084,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(receipts.canonical_json_bytes(binding))
-            target.flush()
-            os.fsync(target.fileno())
+        with os.fdopen(descriptor, "wb") as output_handle:
+            output_handle.write(receipts.canonical_json_bytes(binding))
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
         return 0
     if args.command == "verify":
         return 0
@@ -2107,8 +2107,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raw_arguments = raw_arguments[1:]
         if not raw_arguments:
             raise receipts.ReleaseControlError("isolated recovery Python target is missing")
-        target = Path(raw_arguments[0])
-        resolved_target = _authorize_io_path(value, path=target)
+        target_path = Path(raw_arguments[0])
+        resolved_target = _authorize_io_path(value, path=target_path)
         members = _member_table(
             value,
             field="python_members",
