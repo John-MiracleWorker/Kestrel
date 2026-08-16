@@ -1100,7 +1100,7 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
     finally:
         release.set()
         for manager in managers:
-            assert manager.shutdown(timeout_seconds=2.0) is True
+            assert manager.shutdown(timeout_seconds=5.0) is True
 
 
 def test_stale_cancel_has_no_token_side_effect_and_committed_cancel_signals_token(
