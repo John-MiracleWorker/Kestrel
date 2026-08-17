@@ -1958,6 +1958,27 @@ def test_mutation_gate_rejects_signing_identity_substitution_before_transport(
         )
 
 
+def test_signing_identity_owner_privacy_is_posix_only() -> None:
+    # Regression guard for F3: on Windows CPython reports group/other read bits
+    # set for every regular file (NTFS ACLs, not POSIX modes, govern access, and
+    # chmod(0o600) is a no-op for those bits). The owner-privacy check must be
+    # enforced only on POSIX, or every legitimate Windows identity file is
+    # falsely rejected with "signing identity bytes changed".
+    windows_like_st_mode = 0o100000 | 0o644  # regular file, group/other readable
+    assert (
+        subject._owner_privacy_group_or_other_bits(  # noqa: SLF001
+            windows_like_st_mode, platform_name="nt"
+        )
+        == 0
+    )
+    assert (
+        subject._owner_privacy_group_or_other_bits(  # noqa: SLF001
+            windows_like_st_mode, platform_name="posix"
+        )
+        == 0o644 & 0o077
+    )
+
+
 def test_fresh_recovery_sources_resume_only_an_exact_validated_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
