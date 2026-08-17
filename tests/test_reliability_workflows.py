@@ -1056,6 +1056,7 @@ def test_capsule_activation_binds_exact_host_source_before_host_actuation() -> N
         assert 'printf \'KESTREL_PYTHON=%s\\n\' "$capsule_python"' not in source
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery capsule host actuation uses POSIX path separators")
 def test_recovery_capsule_authority_is_offline_and_host_actuation_is_explicitly_bound() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "release-transaction.yml").read_text(

@@ -187,6 +187,7 @@ def test_wrong_reported_version_fails_closed(
         subject.bootstrap(destination)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="uv bootstrap supports POSIX release hosts only")
 def test_archive_checksum_mismatch_fails_before_inspection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -206,6 +207,7 @@ def test_archive_checksum_mismatch_fails_before_inspection(
     assert inspected is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="uv bootstrap supports POSIX release hosts only")
 def test_extracted_binary_checksum_mismatch_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -221,6 +223,7 @@ def test_extracted_binary_checksum_mismatch_fails_closed(
     "unsafe",
     ["duplicate", "traversal", "symlink", "hardlink", "device", "fifo", "unexpected"],
 )
+@pytest.mark.skipif(os.name == "nt", reason="uv bootstrap supports POSIX release hosts only")
 def test_unsafe_or_unexpected_archive_members_fail_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unsafe: str
 ) -> None:

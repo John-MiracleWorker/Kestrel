@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -106,6 +107,7 @@ def test_python_runtime_tree_identity_rejects_stdlib_drift(tmp_path: Path) -> No
     assert staging._python_runtime_tree_identity(root)[2] != manifest["runtime_tree_sha256"]  # noqa: SLF001
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery dependency staging requires Linux (dpkg-deb, ELF, bubblewrap)")
 def test_stage_recovery_dependencies_is_pinned_and_emits_a_bound_receipt(
     tmp_path: Path,
 ) -> None:
@@ -358,6 +360,7 @@ def test_recovery_wheel_acquisition_ignores_ambient_pip_configuration(
     assert not any(name.startswith("PIP_INDEX") for name in environment)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery dependency staging requires Linux (dpkg-deb, ELF, bubblewrap)")
 def test_runtime_manifest_rejects_unsafe_or_ambiguous_targets(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     runtime.write_bytes(b"runtime")
@@ -379,6 +382,7 @@ def test_runtime_manifest_rejects_unsafe_or_ambiguous_targets(tmp_path: Path) ->
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery dependency staging requires Linux (dpkg-deb, ELF, bubblewrap)")
 def test_runtime_dependency_parser_requires_complete_absolute_elf_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -551,6 +555,7 @@ def test_recovery_tcb_bootstrap_resumes_only_an_exact_runtime_without_transport(
     assert 'test ! -e "$destination"' not in script
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery dependency staging requires Linux (dpkg-deb, ELF, bubblewrap)")
 def test_production_smoke_builds_a_schema_valid_complete_execution_closure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import stat
 import subprocess
 import zipfile
@@ -2240,6 +2241,7 @@ def test_prepare_mutation_scope_rejects_asset_substitution(tmp_path: Path) -> No
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery capsule controller requires POSIX (fchmod, bubblewrap)")
 def test_production_preparation_replays_the_slow_environment_without_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

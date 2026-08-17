@@ -4,6 +4,7 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -194,6 +195,7 @@ def test_staging_artifact_rejects_direct_metadata_substitution_before_download(
     assert not output.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery capsule bootstrap requires POSIX (fchmod, ELF, bubblewrap)")
 def test_staging_artifact_exact_resume_revalidates_without_transport(
     tmp_path: Path, subject: ModuleType
 ) -> None:
@@ -434,6 +436,7 @@ def test_staging_validator_binds_every_wheel_before_installation(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery capsule bootstrap requires POSIX (fchmod, ELF, bubblewrap)")
 def test_environment_builder_installs_offline_and_freezes_import_tree(
     tmp_path: Path, subject: ModuleType
 ) -> None:
@@ -508,6 +511,7 @@ def test_environment_builder_installs_offline_and_freezes_import_tree(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery capsule bootstrap requires POSIX (fchmod, ELF, bubblewrap)")
 def test_initial_bootstrap_records_environment_then_executes_inner_gate(
     tmp_path: Path, subject: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -629,6 +633,7 @@ def test_initial_bootstrap_records_environment_then_executes_inner_gate(
     assert receipt["environment"]["site_packages_file_count"] == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery capsule bootstrap requires POSIX (fchmod, ELF, bubblewrap)")
 def test_bootstrap_write_once_never_exposes_a_partial_final_file(
     tmp_path: Path, subject: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -694,6 +699,7 @@ def test_prepare_only_is_a_resume_mode_not_part_of_the_bootstrap_identity(
     assert "--prepare-only" not in prepared.controller_arguments
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery capsule bootstrap requires POSIX (fchmod, ELF, bubblewrap)")
 def test_frozen_runtime_replay_separates_pinned_content_from_frozen_modes(
     tmp_path: Path, subject: ModuleType
 ) -> None:

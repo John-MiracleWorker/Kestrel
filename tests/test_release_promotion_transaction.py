@@ -7,6 +7,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import ssl
 import subprocess
 import sys
@@ -2953,6 +2954,7 @@ def _recovery_capsule_verification_inputs(
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release promotion recovery capsule requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_binds_immutable_remote_and_local_state(
     tmp_path: Path,
 ) -> None:
@@ -2983,6 +2985,7 @@ def test_verify_recovery_capsule_binds_immutable_remote_and_local_state(
     assert verification["verified"] is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release promotion recovery capsule requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_command_emits_owner_signed_authorization(
     tmp_path: Path,
 ) -> None:
@@ -3090,6 +3093,7 @@ def test_verify_recovery_capsule_command_emits_owner_signed_authorization(
     ) == _sha256(manifest)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release promotion recovery capsule requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_command_rejects_raw_remote_json(tmp_path: Path) -> None:
     """Catch an owner signature that blesses caller-fabricated GitHub observations."""
 
@@ -3138,6 +3142,7 @@ def test_verify_recovery_capsule_command_rejects_raw_remote_json(tmp_path: Path)
         subject._command_verify_recovery_capsule(args)  # noqa: SLF001
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release promotion recovery capsule requires POSIX (bubblewrap, ELF)")
 @pytest.mark.parametrize("mutation", ["candidate", "transaction", "repository", "release", "asset"])
 def test_verify_recovery_capsule_rejects_cross_boundary_mutants(
     tmp_path: Path, mutation: str
@@ -4459,6 +4464,7 @@ def test_authorization_external_input_rejects_raw_caller_json(tmp_path: Path) ->
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release promotion recovery capsule requires POSIX (bubblewrap, ELF)")
 def test_hosted_smoke_prerequisites_accept_pretty_paged_api_observations(
     tmp_path: Path,
 ) -> None:

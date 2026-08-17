@@ -199,6 +199,7 @@ def _closure(tmp_path: Path) -> tuple[Path, bytes, Path]:
     return capsule, _canonical(closure), tool_path
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_verifies_exact_members_imports_and_tool(
     tmp_path: Path,
 ) -> None:
@@ -230,6 +231,7 @@ def test_execution_closure_verifies_exact_members_imports_and_tool(
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_distinguishes_root_resources_from_fixed_authority_assets(
     tmp_path: Path,
 ) -> None:
@@ -253,6 +255,7 @@ def test_execution_closure_distinguishes_root_resources_from_fixed_authority_ass
     assert verified["validation_status"] == "validated"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_offline_capsule_binds_an_exact_separate_host_actuator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -333,6 +336,7 @@ def test_offline_capsule_binds_an_exact_separate_host_actuator(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_closure_verification_never_executes_self_declared_tools_before_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -887,6 +891,7 @@ def test_launcher_does_not_self_certify_declared_sys_path(tmp_path: Path) -> Non
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_refuses_direct_execution_without_a_pinned_os_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -936,6 +941,7 @@ def test_launcher_refuses_direct_execution_without_a_pinned_os_sandbox(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_rejects_a_self_declared_os_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -998,6 +1004,7 @@ def test_launcher_rejects_a_self_declared_os_sandbox(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_accepts_only_the_exact_independently_pinned_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1029,6 +1036,7 @@ def test_launcher_accepts_only_the_exact_independently_pinned_sandbox(
         launcher.resolve_trusted_os_sandbox(closure=closure)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bubblewrap_profile_is_offline_and_mounts_only_declared_roots(
     tmp_path: Path,
 ) -> None:
@@ -1074,6 +1082,7 @@ def test_bubblewrap_profile_is_offline_and_mounts_only_declared_roots(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bubblewrap_profile_mounts_only_digest_bound_runtime_files(
     tmp_path: Path,
 ) -> None:
@@ -1149,6 +1158,7 @@ def test_bubblewrap_profile_mounts_only_digest_bound_runtime_files(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_private_loader_rejects_preload_and_ambient_dependency_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1225,6 +1235,7 @@ def test_private_loader_rejects_preload_and_ambient_dependency_resolution(
     assert command[-2:] == [str(sandbox), "--version"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_materialize_main_verifies_complete_closure_before_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1327,6 +1338,7 @@ def test_host_binding_cli_output_is_authorized_write_once(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_uses_absolute_tool_not_path_shadow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1348,6 +1360,7 @@ def test_execution_closure_uses_absolute_tool_not_path_shadow(
     assert "PYTHONHOME" not in environment
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_recovery_network_policy_allows_only_the_exact_frozen_origin(
     tmp_path: Path,
 ) -> None:
@@ -1391,6 +1404,7 @@ def test_recovery_network_policy_allows_only_the_exact_frozen_origin(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_requires_capsule_inside_an_exact_io_root(
     tmp_path: Path,
 ) -> None:
@@ -1409,6 +1423,7 @@ def test_execution_closure_requires_capsule_inside_an_exact_io_root(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 @pytest.mark.parametrize("mutation", ["missing", "changed", "extra"])
 def test_execution_closure_rejects_member_inventory_drift(tmp_path: Path, mutation: str) -> None:
     capsule, closure, tool_path = _closure(tmp_path)
@@ -1428,6 +1443,7 @@ def test_execution_closure_rejects_member_inventory_drift(tmp_path: Path, mutati
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_rejects_unlisted_or_nonliteral_dynamic_import(
     tmp_path: Path,
 ) -> None:
@@ -1455,6 +1471,7 @@ def test_execution_closure_rejects_unlisted_or_nonliteral_dynamic_import(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_materializes_candidate_only_from_the_bound_capsule_archive(
     tmp_path: Path,
 ) -> None:
@@ -1533,6 +1550,7 @@ def test_bootstrap_recovery_rejects_traversal_and_links(tmp_path: Path, archive:
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_extracts_only_deterministic_regular_members(
     tmp_path: Path,
 ) -> None:
@@ -1838,6 +1856,7 @@ def _trust_fixture_bootstrap_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1878,6 +1897,7 @@ def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     assert verification["validation_status"] == "validated"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_rejects_a_self_declared_python_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1895,6 +1915,7 @@ def test_bootstrap_recovery_rejects_a_self_declared_python_identity(
     assert not (destination.parent / "recovery-runtime").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_prepares_only_an_independently_trusted_capsule_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1919,6 +1940,7 @@ def test_bootstrap_recovery_prepares_only_an_independently_trusted_capsule_sandb
     assert stat.S_IMODE(sandbox.stat().st_mode) == 0o500
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_rejects_a_self_declared_capsule_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1937,6 +1959,7 @@ def test_bootstrap_recovery_rejects_a_self_declared_capsule_sandbox(
     assert not (destination.parent / "recovery-runtime").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_rejects_unlisted_wheel_before_environment_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1959,6 +1982,7 @@ def test_bootstrap_recovery_rejects_unlisted_wheel_before_environment_creation(
     assert not (destination.parent / "recovery-runtime").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_requires_verified_capsule_before_environment_creation(
     tmp_path: Path,
 ) -> None:
