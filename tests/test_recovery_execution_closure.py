@@ -1554,6 +1554,13 @@ def _bootstrap_archive(
     extra_wheel: bool = False,
     include_sandbox: bool = True,
 ) -> tuple[Path, Path]:
+    # The production recovery runtime is pinned to CPython 3.11.14 (see
+    # scripts/bootstrap_recovery.py and the recovery_* schemas). The fixture
+    # declares that exact identity so the bootstrap's hard version gate and
+    # trusted-identity check pass on ANY test runner (3.11.15, 3.12, 3.13 ...).
+    # The ambient interpreter's bytes stand in for the trusted 3.11.14 binary.
+    pin_version = "3.11.14"
+    pin_abi = "cp311"
     source = tmp_path / "capsule-source"
     destination = tmp_path / "capsule"
     app = b"VALUE = 1\n"
@@ -1582,9 +1589,7 @@ def _bootstrap_archive(
         {
             "schema": "kestrel.recovery_runtime.v1",
             "platform": "ubuntu-24.04-x86_64",
-            "python_version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
+            "python_version": pin_version,
             "python_executable_sha256": python_digest,
             "files": runtime_files,
         }
@@ -1617,10 +1622,8 @@ def _bootstrap_archive(
         {
             "schema": "kestrel.recovery_python_runtime.v1",
             "platform": "ubuntu-24.04-x86_64",
-            "python_version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
-            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "python_version": pin_version,
+            "python_abi": pin_abi,
             "python_executable_path": "bin/python3.11",
             "python_executable_sha256": python_digest,
             "source_archive_url": bootstrap.RECOVERY_PYTHON_PACKAGE_URL,
@@ -1639,10 +1642,8 @@ def _bootstrap_archive(
         {
             "schema": "kestrel.recovery_environment.v1",
             "platform": "ubuntu-24.04-x86_64",
-            "python_version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
-            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "python_version": pin_version,
+            "python_abi": pin_abi,
             "environment_root": str(venv_python.parent.parent),
             "site_packages_path": str(
                 venv_python.parent.parent / "lib" / "python3.11" / "site-packages"
@@ -1692,10 +1693,7 @@ def _bootstrap_archive(
             "name": "python",
             "path": str(venv_python),
             "sha256": python_digest,
-            "version": (
-                f"Python {sys.version_info.major}."
-                f"{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
+            "version": f"Python {pin_version}",
         }
     ]
     if include_sandbox:
@@ -1726,10 +1724,8 @@ def _bootstrap_archive(
         "runtime_files": runtime_files,
         "python_runtime": {
             "implementation": "CPython",
-            "version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
-            "abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "version": pin_version,
+            "abi": pin_abi,
         },
         "dependency_lock": {
             "requirements_path": "recovery/requirements.txt",
@@ -1793,9 +1789,11 @@ def _bootstrap_trust(archive: Path) -> dict[str, str]:
 
 
 def _trust_current_bootstrap_python(monkeypatch: pytest.MonkeyPatch) -> None:
-    runtime_version = (
-        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    )
+    # The production recovery runtime is pinned to CPython 3.11.14 (see
+    # scripts/bootstrap_recovery.py). Trust that exact pinned identity on the
+    # current runner's platform so the gate logic is exercised deterministically
+    # regardless of the ambient interpreter version. The ambient executable's
+    # bytes stand in for the trusted 3.11.14 binary's digest.
     monkeypatch.setattr(
         bootstrap,
         "TRUSTED_RECOVERY_PYTHON_IDENTITIES",
@@ -1804,10 +1802,10 @@ def _trust_current_bootstrap_python(monkeypatch: pytest.MonkeyPatch) -> None:
                 {
                     (
                         _sha(Path(sys.executable).resolve(strict=True).read_bytes()),
-                        f"Python {runtime_version}",
+                        "Python 3.11.14",
                         "CPython",
-                        runtime_version,
-                        f"cp{sys.version_info.major}{sys.version_info.minor}",
+                        "3.11.14",
+                        "cp311",
                     )
                 }
             )

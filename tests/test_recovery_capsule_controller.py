@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import json
+import platform
 import stat
 import subprocess
 import zipfile
@@ -345,6 +346,13 @@ def test_controller_platform_requires_exact_ubuntu_24_04(
 ) -> None:
     monkeypatch.setattr(subject.sys, "platform", "linux")
     monkeypatch.setattr(subject.platform, "machine", lambda: "x86_64")
+    # The controller requires the exact production CPython 3.11.14 runtime. Pin
+    # the interpreter identity so this test exercises the Ubuntu 24.04 gate it
+    # is named for, regardless of the ambient runner's Python version.
+    monkeypatch.setattr(
+        subject.platform, "python_implementation", lambda: "CPython"
+    )
+    monkeypatch.setattr(subject.platform, "python_version", lambda: "3.11.14")
 
     subject._require_controller_platform(  # noqa: SLF001
         os_release='ID=ubuntu\nVERSION_ID="24.04"\n'
