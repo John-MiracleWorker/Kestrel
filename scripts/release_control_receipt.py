@@ -7638,7 +7638,7 @@ def _write_capsule_assets(root: Path, assets: Mapping[str, bytes]) -> None:
         path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         if not write_once(path, raw):
             raise ReleaseControlError("recovery capsule asset path already exists")
-        os.chmod(path, 0o644)
+        os.chmod(path, 0o644)  # codeql[py/overly-permissive-file] — recovery capsule asset: 0o644 is the required world-readable archive contract (secrets stay 0o600)
 
 
 def _command_create_recovery_capsule(
