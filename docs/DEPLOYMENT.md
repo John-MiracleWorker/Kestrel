@@ -11,8 +11,8 @@ credential-free, read-only OCI snapshot; there is no host fallback and the runti
 commands are separate from agent tool execution.
 
 `v0.5.8` is the current stable release for the supported local/private deployment profile. This
-source tree contains tag-ready release metadata, but its release artifacts are not claimed to exist
-until the exact-tag workflow publishes them.
+source tree contains release-candidate metadata, but its release artifacts are not claimed to exist
+until the release transaction workflow (`release.yml` → `release-transaction.yml`) publishes them.
 
 ## One-Shot GitHub Install
 
@@ -68,7 +68,7 @@ long-lived PyPI token is stored in GitHub. Once that job succeeds, a direct pack
 python -m pip install "nested-memvid-agent[memvid,server,mcp,keyring]==0.5.8"
 ```
 
-The package command is a publication target until the exact tag workflow completes.
+The package command is a publication target until the release transaction workflow (`release.yml` → `release-transaction.yml`) completes.
 
 ## Windows Diagnostic and Bootstrap Plan
 
