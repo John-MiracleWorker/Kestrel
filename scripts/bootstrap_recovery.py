@@ -153,7 +153,7 @@ def extract_recovery_capsule(*, archive: Path, destination: Path) -> None:
                     raise RecoveryBootstrapError("recovery archive regular member has no body")
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 flags |= getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(target, flags, 0o644)  # codeql[py/overly-permissive-file] — recovery capsule asset: 0o644 is the required world-readable archive contract (secrets stay 0o600)
+                descriptor = os.open(target, flags, 0o644)
                 written = 0
                 try:
                     with os.fdopen(descriptor, "wb", closefd=True) as output:

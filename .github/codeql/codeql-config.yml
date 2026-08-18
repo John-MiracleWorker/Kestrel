@@ -16,11 +16,19 @@
 # every other file in the repo (including src/), and it is the only rule that
 # currently fires on these five files (verified against the open-alert set).
 #
-# NOTE on inline suppression: the `# codeql[...]` / `# lgtm[...]` comments at
-# these sites are present in the source but do NOT take effect in this CodeQL
-# setup — the alerts remain open and the gate still fails on the same sites.
-# A version-controlled config file is the reliable, auditable mechanism, which
-# is why this file exists.
+# MECHANISM: this file is the single version-controlled source of truth for
+# which paths carry this accepted exception. The workflow references it via
+# the `config-file` init input (a file *path*), NOT the `config` input (a
+# YAML *string*). The earlier red gate was a wiring bug: the path was passed
+# to `config`, so the action tried to set `.queries` on that string and
+# crashed at init ("Cannot create property 'queries' on string ...") before
+# ever reading this file. That is why the suppression had zero effect and the
+# gate failed on the same five sites. Passing it via `config-file` (see
+# .github/workflows/ci.yml) is the fix.
+#
+# The old inline `# codeql[...]` / `# lgtm[...]` comments at these sites have
+# been removed so the config file is the one, authoritative mechanism rather
+# than two competing ones. The 0o644 write modes themselves are unchanged.
 #
 # Ignored files (all in scripts/, the recovery/staging tooling):
 #   - scripts/bootstrap_recovery.py          (recovery bootstrap; 0o644 archive contract)
