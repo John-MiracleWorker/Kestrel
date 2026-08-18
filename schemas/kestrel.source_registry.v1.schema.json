@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.source_registry.v1.schema.json",
+  "title": "kestrel.source_registry.v1",
+  "type": "object",
+  "required": ["schema", "entries"],
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {"const": "kestrel.source_registry.v1"},
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "uniqueItems": true,
+      "x-sort-key": ["receipt_schema", "phase", "mode", "name"],
+      "items": {
+        "type": "object",
+        "required": ["receipt_schema", "phase", "mode", "name", "provider", "locator", "authentication_mode", "body_mode", "count_mode", "freshness_class"],
+        "additionalProperties": false,
+        "properties": {
+          "receipt_schema": {"type": "string", "pattern": "^kestrel[.][a-z0-9_.-]+[.]v[0-9]+$"},
+          "phase": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 64}]},
+          "mode": {"oneOf": [{"type": "null"}, {"enum": ["hosted-smoke", "initiate", "operational", "recover_committed"]}]},
+          "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,255}$"},
+          "provider": {"enum": ["controller", "github.com", "local", "pypi.org"]},
+          "locator": {"type": "string", "minLength": 1, "maxLength": 16384},
+          "authentication_mode": {"enum": ["controller-owner", "github-actions-run", "github-owner", "local", "pypi-public"]},
+          "body_mode": {"enum": ["paginated-json", "singleton-bytes", "singleton-json"]},
+          "count_mode": {"enum": ["one", "sum-page-array", "top-level-array", "zero"]},
+          "freshness_class": {"enum": ["current", "historical"]}
+        }
+      }
+    }
+  }
+}

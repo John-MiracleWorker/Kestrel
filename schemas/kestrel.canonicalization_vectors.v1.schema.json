@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.canonicalization_vectors.v1.schema.json",
+  "title": "kestrel.canonicalization_vectors.v1",
+  "type": "object",
+  "required": ["schema", "vectors"],
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {"const": "kestrel.canonicalization_vectors.v1"},
+    "vectors": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "x-sort-key": ["name"],
+      "items": {
+        "type": "object",
+        "required": ["canonical_hex", "input_hex", "name"],
+        "additionalProperties": false,
+        "properties": {
+          "canonical_hex": {"type": "string", "pattern": "^(?:[0-9a-f]{2})+$", "maxLength": 4096},
+          "input_hex": {"type": "string", "pattern": "^(?:[0-9a-f]{2})+$", "maxLength": 4096},
+          "name": {"enum": ["object-order-nfc", "safe-integer-bounds"]}
+        }
+      }
+    }
+  }
+}

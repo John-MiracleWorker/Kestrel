@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import io
+import os
 import re
+import stat
 import subprocess
 import sys
+import tarfile
 import tomllib
+import warnings
+import zipfile
 from pathlib import Path
+
+import pytest
 
 from nested_memvid_agent.config import AgentConfig
 from scripts.check_project_metadata import PUBLISHED_RELEASE, _release_mode_errors
@@ -13,6 +21,574 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_TEST_IMAGE = (
     "python@sha256:5c34b355088846dddc8afb7442c20b9433dccdc8d66192dc52c616adeaa106a3"
 )
+POSIX_WORKFLOW_LINTER_BOOTSTRAP = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="workflow-linter bootstrap intentionally supports only Darwin and Linux",
+)
+
+
+def test_release_candidate_builds_exact_payload_and_digest_only_oci_layout_once() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow.count("Build Python release artifacts") == 1
+    assert workflow.count("python -m build --no-isolation") == 1
+    assert "containers/oci-layout/index.json" in workflow
+    assert "containers/oci-descriptor.json" in workflow
+    assert "containers/kestrel-linux-amd64.tar" in workflow
+    assert "containers/kestrel-linux-arm64.tar" in workflow
+    assert "ghcr.io/john-miracleworker/kestrel@${" not in workflow
+    assert '"index_ref": f"{repository}@{index_digest}"' in workflow
+    assert '"manifest_ref": f"{repository}@{manifest_digest}"' in workflow
+    assert '"schema": "kestrel.oci_descriptor.v1"' in workflow
+    assert "kestrel.oci_candidate_descriptor.v1" not in workflow
+    assert '"release/oci-image-digests.json"' in workflow
+    assert "attestations.json" in workflow
+    assert '"kind": "oci_index"' in workflow
+    assert '"kind": "file"' in workflow
+
+
+def test_workflow_linter_bootstrap_is_version_and_archive_digest_pinned() -> None:
+    bootstrap = (ROOT / "scripts" / "bootstrap_workflow_linters.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "actionlint 1.7.7" in bootstrap
+    assert "ShellCheck - shell script analysis tool" in bootstrap
+    assert "version: 0.11.0" in bootstrap
+    assert "Darwin:arm64" in bootstrap
+    assert "Linux:x86_64" in bootstrap
+    for url in (
+        "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_darwin_arm64.tar.gz",
+        "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz",
+        "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.xz",
+        "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz",
+    ):
+        assert url in bootstrap
+    for digest in (
+        "2693315b9093aeacb4ebd91a993fea54fc215057bf0da2659056b4bc033873db",
+        "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757",
+        "56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0a79",
+        "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198",
+    ):
+        assert digest in bootstrap
+    assert "shasum -a 256" in bootstrap
+    assert "tar -tf" in bootstrap
+    assert "tar -tJf" in bootstrap
+    assert "../" in bootstrap
+    assert "destination must be absent or empty" in bootstrap
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _write_linter_archives(root: Path, *, unsafe_member: str | None = None) -> tuple[Path, Path]:
+    actionlint_archive = root / "actionlint.tar.gz"
+    shellcheck_archive = root / "shellcheck.tar.xz"
+
+    with tarfile.open(actionlint_archive, "w:gz") as archive:
+        payload = b"#!/bin/sh\nprintf '1.7.7\\n'\n"
+        member = tarfile.TarInfo("actionlint")
+        member.mode = 0o755
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+        if unsafe_member == "duplicate":
+            duplicate = tarfile.TarInfo("actionlint")
+            duplicate.mode = 0o755
+            duplicate.size = len(payload)
+            archive.addfile(duplicate, io.BytesIO(payload))
+        elif unsafe_member == "traversal":
+            traversal = tarfile.TarInfo("../escape")
+            traversal.size = 1
+            archive.addfile(traversal, io.BytesIO(b"x"))
+        elif unsafe_member == "link":
+            link = tarfile.TarInfo("actionlint-link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "actionlint"
+            archive.addfile(link)
+
+    with tarfile.open(shellcheck_archive, "w:xz") as archive:
+        payload = (
+            b"#!/bin/sh\n"
+            b"printf '%s\\n' 'ShellCheck - shell script analysis tool' 'version: 0.11.0'\n"
+        )
+        member = tarfile.TarInfo("shellcheck-v0.11.0/shellcheck")
+        member.mode = 0o755
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+
+    return actionlint_archive, shellcheck_archive
+
+
+def _bootstrap_fixture_environment(
+    fake_bin: Path,
+    *,
+    actionlint_archive: Path,
+    shellcheck_archive: Path,
+    checksum_exit: int = 0,
+    system: str = "Darwin",
+    machine: str = "arm64",
+) -> dict[str, str]:
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "uname",
+        f"#!/bin/sh\ncase \"$1\" in -s) printf '%s\\n' {system} ;; -m) printf '%s\\n' {machine} ;; esac\n",
+    )
+    _write_executable(
+        fake_bin / "curl",
+        """#!/bin/sh
+output=
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) shift; output=$1 ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+case "$url" in
+  *actionlint*) cp "$BOOTSTRAP_ACTIONLINT_ARCHIVE" "$output" ;;
+  *shellcheck*) cp "$BOOTSTRAP_SHELLCHECK_ARCHIVE" "$output" ;;
+  *) exit 64 ;;
+esac
+""",
+    )
+    _write_executable(
+        fake_bin / "shasum",
+        f"#!/bin/sh\ncat >/dev/null\nexit {checksum_exit}\n",
+    )
+    return {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BOOTSTRAP_ACTIONLINT_ARCHIVE": str(actionlint_archive),
+        "BOOTSTRAP_SHELLCHECK_ARCHIVE": str(shellcheck_archive),
+    }
+
+
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_installs_only_verified_executables(tmp_path: Path) -> None:
+    actionlint_archive, shellcheck_archive = _write_linter_archives(tmp_path)
+    environment = _bootstrap_fixture_environment(
+        tmp_path / "bin",
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+    )
+    destination = tmp_path / "linters"
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(destination)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert sorted(path.name for path in destination.iterdir()) == ["actionlint", "shellcheck"]
+    assert all(path.stat().st_mode & 0o111 for path in destination.iterdir())
+
+
+@pytest.mark.parametrize("unsafe_member", ["duplicate", "traversal", "link"])
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_rejects_unsafe_archives(
+    tmp_path: Path, unsafe_member: str
+) -> None:
+    actionlint_archive, shellcheck_archive = _write_linter_archives(
+        tmp_path, unsafe_member=unsafe_member
+    )
+    environment = _bootstrap_fixture_environment(
+        tmp_path / "bin",
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+    )
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(tmp_path / "linters")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "unsafe or duplicate member" in completed.stderr or "link or special member" in completed.stderr
+
+
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_checks_digest_before_archive_inspection(
+    tmp_path: Path,
+) -> None:
+    actionlint_archive = tmp_path / "not-actionlint.tar.gz"
+    shellcheck_archive = tmp_path / "not-shellcheck.tar.xz"
+    actionlint_archive.write_bytes(b"not an archive")
+    shellcheck_archive.write_bytes(b"not an archive")
+    fake_bin = tmp_path / "bin"
+    environment = _bootstrap_fixture_environment(
+        fake_bin,
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+        checksum_exit=1,
+    )
+    tar_marker = tmp_path / "tar-invoked"
+    _write_executable(
+        fake_bin / "tar",
+        "#!/bin/sh\n: >\"$BOOTSTRAP_TAR_MARKER\"\nexit 99\n",
+    )
+    environment["BOOTSTRAP_TAR_MARKER"] = str(tar_marker)
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(tmp_path / "linters")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert not tar_marker.exists()
+
+
+@pytest.mark.parametrize("destination_kind", ["nonempty", "symlink"])
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_rejects_unsafe_destination(
+    tmp_path: Path, destination_kind: str
+) -> None:
+    destination = tmp_path / "linters"
+    if destination_kind == "nonempty":
+        destination.mkdir()
+        (destination / "unexpected").write_text("occupied", encoding="utf-8")
+    else:
+        target = tmp_path / "target"
+        target.mkdir()
+        destination.symlink_to(target, target_is_directory=True)
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(destination)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "destination must be absent or empty" in completed.stderr
+
+
+@POSIX_WORKFLOW_LINTER_BOOTSTRAP
+def test_workflow_linter_bootstrap_rejects_unsupported_platform(tmp_path: Path) -> None:
+    actionlint_archive, shellcheck_archive = _write_linter_archives(tmp_path)
+    environment = _bootstrap_fixture_environment(
+        tmp_path / "bin",
+        actionlint_archive=actionlint_archive,
+        shellcheck_archive=shellcheck_archive,
+        system="Plan9",
+        machine="riscv64",
+    )
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_linters.sh"), str(tmp_path / "linters")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "unsupported workflow-linter bootstrap platform: Plan9:riscv64" in completed.stderr
+
+
+def test_workflow_tools_bootstrap_is_exactly_pinned_and_proxy_free() -> None:
+    bootstrap = (ROOT / "scripts" / "bootstrap_workflow_tools.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for value in (
+        "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_amd64.tar.gz",
+        "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112",
+        "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_macOS_arm64.zip",
+        "a58b8fd77b417a38f47a0b54d1370c59b0fcdb324ccc9ca002b0998f7c4c999e",
+        "gh version 2.97.0 (2026-02-26)",
+        "Linux:x86_64",
+        "Darwin:arm64",
+        "--proxy ''",
+        "--noproxy '*'",
+    ):
+        assert value in bootstrap
+
+
+def _tar_add(archive: tarfile.TarFile, name: str, payload: bytes | None = None) -> None:
+    member = tarfile.TarInfo(name)
+    if payload is None:
+        member.type = tarfile.DIRTYPE
+        member.mode = 0o755
+        archive.addfile(member)
+        return
+    member.mode = 0o755
+    member.size = len(payload)
+    archive.addfile(member, io.BytesIO(payload))
+
+
+def _zip_add(archive: zipfile.ZipFile, name: str, payload: bytes, mode: int) -> None:
+    member = zipfile.ZipInfo(name)
+    member.create_system = 3
+    member.external_attr = mode << 16
+    archive.writestr(member, payload)
+
+
+def _gh_archive(
+    root: Path,
+    *,
+    archive_kind: str,
+    explicit_directories: bool = True,
+    unsafe: str | None = None,
+    version: str = "gh version 2.97.0 (2026-02-26)",
+) -> Path:
+    gh_payload = f"#!/bin/sh\nprintf '%s\\n' '{version}' 'https://github.com/cli/cli/releases/tag/v2.97.0'\n".encode()
+    if archive_kind == "tar":
+        archive_path = root / "gh.tar.gz"
+        archive_root = "gh_2.97.0_linux_amd64"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            if explicit_directories:
+                _tar_add(archive, f"{archive_root}/")
+            _tar_add(archive, f"{archive_root}/LICENSE", b"license")
+            if explicit_directories:
+                _tar_add(archive, f"{archive_root}/bin/")
+            _tar_add(archive, f"{archive_root}/bin/gh", gh_payload)
+            if unsafe == "duplicate":
+                _tar_add(archive, f"{archive_root}/bin/gh", gh_payload)
+            elif unsafe == "traversal":
+                _tar_add(archive, "../escape", b"x")
+            elif unsafe in {"symlink", "hardlink", "device", "fifo"}:
+                member = tarfile.TarInfo(f"{archive_root}/{unsafe}")
+                member.type = {
+                    "symlink": tarfile.SYMTYPE,
+                    "hardlink": tarfile.LNKTYPE,
+                    "device": tarfile.CHRTYPE,
+                    "fifo": tarfile.FIFOTYPE,
+                }[unsafe]
+                member.linkname = f"{archive_root}/bin/gh"
+                archive.addfile(member)
+            elif unsafe == "unexpected":
+                _tar_add(archive, f"{archive_root}/evil", b"x")
+        return archive_path
+
+    archive_path = root / "gh.zip"
+    archive_root = "gh_2.97.0_macOS_arm64"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        if explicit_directories:
+            _zip_add(archive, f"{archive_root}/", b"", stat.S_IFDIR | 0o755)
+        _zip_add(archive, f"{archive_root}/LICENSE", b"license", stat.S_IFREG | 0o644)
+        if explicit_directories:
+            _zip_add(archive, f"{archive_root}/bin/", b"", stat.S_IFDIR | 0o755)
+        _zip_add(archive, f"{archive_root}/bin/gh", gh_payload, stat.S_IFREG | 0o755)
+        if unsafe == "duplicate":
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                _zip_add(archive, f"{archive_root}/bin/gh", gh_payload, stat.S_IFREG | 0o755)
+        elif unsafe == "traversal":
+            _zip_add(archive, "../escape", b"x", stat.S_IFREG | 0o644)
+        elif unsafe == "symlink":
+            _zip_add(
+                archive,
+                f"{archive_root}/link",
+                f"{archive_root}/bin/gh".encode(),
+                stat.S_IFLNK | 0o777,
+            )
+        elif unsafe == "device":
+            _zip_add(archive, f"{archive_root}/device", b"", stat.S_IFCHR | 0o600)
+        elif unsafe == "fifo":
+            _zip_add(archive, f"{archive_root}/fifo", b"", stat.S_IFIFO | 0o600)
+        elif unsafe == "unexpected":
+            _zip_add(archive, f"{archive_root}/evil", b"x", stat.S_IFREG | 0o644)
+    return archive_path
+
+
+def _workflow_tools_environment(
+    fake_bin: Path,
+    *,
+    archive: Path,
+    system: str,
+    machine: str,
+    checksum_exit: int = 0,
+) -> dict[str, str]:
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "uname",
+        f"#!/bin/sh\ncase \"$1\" in -s) printf '%s\\n' {system} ;; -m) printf '%s\\n' {machine} ;; esac\n",
+    )
+    _write_executable(
+        fake_bin / "curl",
+        """#!/bin/sh
+output=
+while [ "$#" -gt 0 ]; do
+  case "$1" in --output) shift; output=$1 ;; esac
+  shift
+done
+cp "$BOOTSTRAP_GH_ARCHIVE" "$output"
+""",
+    )
+    _write_executable(
+        fake_bin / "shasum",
+        f"#!/bin/sh\ncat >/dev/null\nexit {checksum_exit}\n",
+    )
+    return {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BOOTSTRAP_GH_ARCHIVE": str(archive),
+    }
+
+
+POSIX_GH_BOOTSTRAP = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="GitHub CLI bootstrap intentionally supports only Darwin and Linux",
+)
+
+
+@POSIX_GH_BOOTSTRAP
+@pytest.mark.parametrize(
+    ("archive_kind", "system", "machine", "explicit_directories"),
+    [
+        ("tar", "Linux", "x86_64", True),
+        ("tar", "Linux", "x86_64", False),
+        ("zip", "Darwin", "arm64", True),
+        ("zip", "Darwin", "arm64", False),
+    ],
+)
+def test_workflow_tools_bootstrap_installs_only_absolute_verified_gh(
+    tmp_path: Path,
+    archive_kind: str,
+    system: str,
+    machine: str,
+    explicit_directories: bool,
+) -> None:
+    archive = _gh_archive(
+        tmp_path,
+        archive_kind=archive_kind,
+        explicit_directories=explicit_directories,
+    )
+    environment = _workflow_tools_environment(
+        tmp_path / "bin", archive=archive, system=system, machine=machine
+    )
+    destination = tmp_path / "tools"
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_tools.sh"), str(destination)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert sorted(path.name for path in destination.iterdir()) == ["gh"]
+    assert (destination / "gh").stat().st_mode & stat.S_IXUSR
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+
+
+@POSIX_GH_BOOTSTRAP
+@pytest.mark.parametrize(
+    ("archive_kind", "system", "machine", "unsafe"),
+    [
+        *(('tar', 'Linux', 'x86_64', unsafe) for unsafe in (
+            "duplicate", "traversal", "symlink", "hardlink", "device", "fifo", "unexpected"
+        )),
+        *(('zip', 'Darwin', 'arm64', unsafe) for unsafe in (
+            "duplicate", "traversal", "symlink", "device", "fifo", "unexpected"
+        )),
+    ],
+)
+def test_workflow_tools_bootstrap_rejects_unsafe_or_unexpected_archive(
+    tmp_path: Path, archive_kind: str, system: str, machine: str, unsafe: str
+) -> None:
+    archive = _gh_archive(tmp_path, archive_kind=archive_kind, unsafe=unsafe)
+    environment = _workflow_tools_environment(
+        tmp_path / "bin", archive=archive, system=system, machine=machine
+    )
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_tools.sh"), str(tmp_path / "tools")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "archive" in completed.stderr
+
+
+@POSIX_GH_BOOTSTRAP
+def test_workflow_tools_bootstrap_checks_checksum_before_inspection(tmp_path: Path) -> None:
+    archive = tmp_path / "invalid.tar.gz"
+    archive.write_bytes(b"not an archive")
+    fake_bin = tmp_path / "bin"
+    environment = _workflow_tools_environment(
+        fake_bin,
+        archive=archive,
+        system="Linux",
+        machine="x86_64",
+        checksum_exit=1,
+    )
+    python_marker = tmp_path / "python-invoked"
+    _write_executable(
+        fake_bin / "python3",
+        "#!/bin/sh\n: >\"$BOOTSTRAP_PYTHON_MARKER\"\nexit 99\n",
+    )
+    environment["BOOTSTRAP_PYTHON_MARKER"] = str(python_marker)
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_tools.sh"), str(tmp_path / "tools")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert not python_marker.exists()
+
+
+@POSIX_GH_BOOTSTRAP
+def test_workflow_tools_bootstrap_rejects_wrong_version(tmp_path: Path) -> None:
+    archive = _gh_archive(tmp_path, archive_kind="tar", version="gh version 2.96.0 (wrong)")
+    environment = _workflow_tools_environment(
+        tmp_path / "bin", archive=archive, system="Linux", machine="x86_64"
+    )
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap_workflow_tools.sh"), str(tmp_path / "tools")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "version verification failed" in completed.stderr
+
+
+@POSIX_GH_BOOTSTRAP
+def test_workflow_tools_bootstrap_rejects_destination_and_platform(tmp_path: Path) -> None:
+    script = ROOT / "scripts" / "bootstrap_workflow_tools.sh"
+    destination = tmp_path / "tools"
+    destination.mkdir(mode=0o700)
+    (destination / "occupied").write_text("x", encoding="utf-8")
+    rejected_destination = subprocess.run(
+        [str(script), str(destination)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected_destination.returncode != 0
+    assert "absent or empty" in rejected_destination.stderr
+
+    archive = _gh_archive(tmp_path, archive_kind="tar")
+    environment = _workflow_tools_environment(
+        tmp_path / "bin", archive=archive, system="Plan9", machine="riscv64"
+    )
+    rejected_platform = subprocess.run(
+        [str(script), str(tmp_path / "unsupported")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected_platform.returncode != 0
+    assert "unsupported workflow-tools bootstrap platform: Plan9:riscv64" in rejected_platform.stderr
 
 
 def test_package_metadata_identifies_kestrel_release() -> None:
@@ -78,7 +654,7 @@ def test_release_metadata_gate_accepts_exact_published_dated_release() -> None:
 
 
 def test_release_workflow_strictly_checks_and_smokes_wheel_and_sdist() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
         encoding="utf-8"
     )
 
@@ -99,7 +675,7 @@ def test_release_workflow_strictly_checks_and_smokes_wheel_and_sdist() -> None:
 
 def test_cross_platform_workflows_install_and_import_keyring_client() -> None:
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+    release = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
         encoding="utf-8"
     )
     exact_wheel = (ROOT / "scripts" / "verify_exact_wheel_install.py").read_text(
@@ -120,23 +696,37 @@ def test_cross_platform_workflows_install_and_import_keyring_client() -> None:
 
 
 def test_release_publish_is_isolated_and_provenance_attested() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+    candidate = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
         encoding="utf-8"
     )
+    transaction = (
+        ROOT / ".github" / "workflows" / "release-transaction.yml"
+    ).read_text(encoding="utf-8")
+    prepare = transaction.split("  prepare-github-ghcr:", 1)[1].split(
+        "  commit-github-release:", 1
+    )[0]
+    commit = transaction.split("  commit-github-release:", 1)[1].split(
+        "  verify-github-ghcr:", 1
+    )[0]
 
-    assert "permissions:\n  actions: read\n  contents: read" in workflow
-    assert "name: Publish exact payload and multi-architecture image" in workflow
-    assert "contents: write\n      id-token: write\n      attestations: write" in workflow
-    assert "packages: write" in workflow
-    assert "Upload validated release payload" in workflow
-    assert "Download validated release payload" in workflow
-    assert "Verify downloaded payload identity and checksums" in workflow
-    assert "verify_release_payload.py dist --expected-version" in workflow
-    assert "actions/attest-build-provenance@" in workflow
+    assert "permissions: {}" in candidate
+    assert "contents: write" not in candidate
+    assert "packages: write" not in candidate
+    assert "Upload validated release payload" in candidate
+    assert "verify_release_payload.py dist --expected-version" in candidate
+    assert "packages: write" in prepare
+    assert "attestations: write" in commit
+    assert "id-token: write" in commit
+    assert "actions/attest@daf44fb950173508f38bd2406030372c1d1162b1" in commit
+    assert "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d" not in commit
+    assert "https://kestrel.dev/attestations/release-promotion/v1" in commit
+    assert "create-storage-record" not in commit
+    assert "actions/attest-build-provenance@" not in transaction
+    assert "push-to-registry" not in transaction
 
 
 def test_release_workflow_executes_and_scans_amd64_and_arm64_images() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
         encoding="utf-8"
     )
 
@@ -146,10 +736,11 @@ def test_release_workflow_executes_and_scans_amd64_and_arm64_images() -> None:
     assert '--platform "linux/${architecture}"' in workflow
     assert '-t "kestrel-agent:release-${architecture}"' in workflow
     assert "kestrel-release-container-trivy-${architecture}.json" in workflow
-    assert '("linux", "amd64"): amd64_digest_path.read_text' in workflow
-    assert '("linux", "arm64"): arm64_digest_path.read_text' in workflow
-    assert '"$IMAGE_NAME@$amd64_digest"' in workflow
-    assert '"$IMAGE_NAME@$arm64_digest"' in workflow
+    assert 'archive_paths = {' in workflow
+    assert '"amd64": "containers/kestrel-linux-amd64.tar"' in workflow
+    assert '"arm64": "containers/kestrel-linux-arm64.tar"' in workflow
+    assert '"index_ref": f"{repository}@{index_digest}"' in workflow
+    assert '"manifest_ref": f"{repository}@{manifest_digest}"' in workflow
 
 
 def test_default_user_facing_branding_is_kestrel() -> None:
@@ -445,7 +1036,12 @@ def test_readme_behavior_delta_validation_fails_on_regression() -> None:
 
 
 def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    transaction = (
+        ROOT / ".github" / "workflows" / "release-transaction.yml"
+    ).read_text(encoding="utf-8")
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
     default_extras_match = re.search(r'^DEFAULT_EXTRAS="([^"]+)"$', installer, flags=re.MULTILINE)
     release_extras_match = re.search(r'^\s+RELEASE_EXTRAS: "([^"]+)"$', workflow, flags=re.MULTILINE)
@@ -453,8 +1049,10 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert default_extras_match is not None
     assert release_extras_match is not None
     assert release_extras_match.group(1) == default_extras_match.group(1)
-    assert not re.search(r"uses:\s+[^\s#]+@v\d+", workflow)
-    assert 'tags: ["v*"]' in workflow
+    assert not re.search(r"uses:\s+[^\s#]+@v\d+", workflow + transaction)
+    assert "workflow_dispatch:" in workflow
+    assert "source_sha:" in workflow
+    assert "transaction_nonce:" in workflow
     assert "npm audit --audit-level=high" in workflow
     assert "npm run licenses:check" in workflow
     assert "npm run build" in workflow
@@ -472,8 +1070,8 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert 'test "$unauthenticated_code" = 401' in workflow
     assert 'Authorization: Bearer $NEST_AGENT_API_TOKEN' in workflow
     assert "Verify tag matches package version" in workflow
-    assert 'test "$GITHUB_REF_NAME" = "v$VERSION"' in workflow
-    assert 'python scripts/check_project_metadata.py --release-tag "$GITHUB_REF_NAME"' in workflow
+    assert 'test "$RELEASE_TAG" = "v$VERSION"' in workflow
+    assert 'python scripts/check_project_metadata.py --release-tag "$RELEASE_TAG"' in workflow
     assert "scripts/run_golden_evals.py --backend memvid --provider mock" in workflow
     assert workflow.count("--max-case-latency-ms 45000") == 2
     assert "--response-contract mock-echo" in workflow
@@ -499,7 +1097,7 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert '"nested-memvid-agent"' in workflow
     assert '"google-genai"' in workflow
     assert "Stage version-pinned installer" in workflow
-    assert 'os.environ["GITHUB_REF_NAME"]' in workflow
+    assert 'os.environ["RELEASE_TAG"]' in workflow
     assert 'os.environ["RELEASE_EXTRAS"]' in workflow
     assert 'DEFAULT_REQUIREMENTS_URL=""' in workflow
     assert 'DEFAULT_WHEEL_URL=""' in workflow
@@ -517,19 +1115,20 @@ def test_release_workflow_builds_and_publishes_tagged_artifacts() -> None:
     assert "bash < dist/install.sh" in workflow
     assert "verify SHA256SUMS" in workflow
     assert 'sha256sum install.sh install.ps1 requirements-release.txt "${wheels[@]}"' in workflow
-    assert '"repos/$GITHUB_REPOSITORY/immutable-releases"' in workflow
-    assert 'test "$enabled" = "true"' in workflow
-    assert 'gh release create "$GITHUB_REF_NAME"' in workflow
-    assert "--draft" in workflow
-    assert 'gh release upload "$GITHUB_REF_NAME" dist/* --clobber' in workflow
-    assert 'gh release edit "$GITHUB_REF_NAME" --draft=false' in workflow
-    assert "--json isDraft,isImmutable,tagName" in workflow
-    assert "publish-pypi:" in workflow
-    assert "needs: publish" in workflow
-    assert "name: pypi" in workflow
-    assert "id-token: write" in workflow
-    assert "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247" in workflow
-    assert "packages-dir: pypi-dist/" in workflow
+    assert "immutable-releases-observation.json" in transaction
+    assert "create_github_release_draft" in transaction
+    assert "upload_github_release_assets" in transaction
+    assert "publish_github_release_draft" in transaction
+    assert "--clobber" not in transaction
+    assert "publish-pypi:" in transaction
+    assert "needs: verify-github-ghcr" in transaction
+    assert "name: pypi" in transaction
+    assert "id-token: write" in transaction
+    assert (
+        "pypa/gh-action-pypi-publish@"
+        "ba38be9e461d3875417946c167d0b5f3d385a247"
+    ) in transaction
+    assert "packages-dir: transaction/pypi-dist" in transaction
     assert 'extra_args+=(--extra "$extra")' in workflow
     assert '"keyring"' in workflow
     assert "import keyring; assert callable(keyring.get_keyring)" in workflow

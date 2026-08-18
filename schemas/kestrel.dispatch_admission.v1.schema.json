@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.dispatch_admission.v1.schema.json",
+  "title": "kestrel.dispatch_admission.v1",
+  "type": "object",
+  "required": ["schema", "transaction_nonce", "dispatch_binding", "reconciliation_digest", "adopted_run_id", "run_attempt", "containment_digest", "repository", "repository_id", "workflow_id", "workflow_path", "expected_ref", "expected_head_sha", "issued_at", "expires_at", "signing_principal", "signing_key_fingerprint"],
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {"const": "kestrel.dispatch_admission.v1"},
+    "transaction_nonce": {"$ref": "#/$defs/nonce"},
+    "dispatch_binding": {"$ref": "#/$defs/digest"},
+    "reconciliation_digest": {"$ref": "#/$defs/digest"},
+    "adopted_run_id": {"$ref": "#/$defs/id"},
+    "run_attempt": {"const": 1},
+    "containment_digest": {"$ref": "#/$defs/digest"},
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "repository_id": {"$ref": "#/$defs/id"},
+    "workflow_id": {"$ref": "#/$defs/id"},
+    "workflow_path": {"const": ".github/workflows/release.yml"},
+    "expected_ref": {"type": "string", "pattern": "^refs/(heads/main|tags/v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*))$"},
+    "expected_head_sha": {"$ref": "#/$defs/git_sha"},
+    "issued_at": {"$ref": "#/$defs/timestamp"},
+    "expires_at": {"$ref": "#/$defs/timestamp"},
+    "signing_principal": {"const": "John-MiracleWorker"},
+    "signing_key_fingerprint": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"}
+  }
+}

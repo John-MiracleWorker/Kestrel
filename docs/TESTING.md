@@ -474,7 +474,7 @@ The pinned image is part of the golden evidence: the procedural-promotion case e
 
 ## Release Validation
 
-Use `docs/RELEASE_CHECKLIST.md` before tagging or publishing a build. The checklist includes
+Use `docs/RELEASE_CHECKLIST.md` before dispatching the release candidate or publishing a build. The checklist includes
 compile, metadata alignment, lint, typecheck, unit tests, golden evals, the deterministic
 end-to-end agent learning gate, web build/test, required
 credential-free Memvid/MCP integration, executable-skill OCI containment, and packaging/Docker smoke checks.

@@ -1,6 +1,6 @@
 # Project Manifest - Kestrel
 
-Last updated: 2026-07-20
+Last updated: 2026-08-13
 
 ## Purpose
 
@@ -48,8 +48,21 @@ The repo now goes beyond the original scaffold: it includes a conversational CLI
 - `src/nested_memvid_agent/mcp_manager.py` - managed MCP server sessions and tool adapters.
 - `src/nested_memvid_agent/plugin_manager.py` - alpha GitHub plugin registry and skill/MCP materialization.
 - `src/nested_memvid_agent/tools/builtin.py` - built-in tools and high-risk gates.
-- `src/nested_memvid_agent/state_store.py` - SQLite control-plane state, currently schema version 19, including durable run provenance, revisioned routines/occurrences, hashed manual-run idempotency claims, and renewable approval-execution claims with exact scheduler continuation bindings.
+- `src/nested_memvid_agent/state_store.py` - SQLite control-plane state, currently schema version 21, including durable run provenance, revisioned routines/occurrences, hashed manual-run idempotency claims, and renewable approval-execution claims with exact scheduler continuation bindings.
 - `scripts/check_project_metadata.py` - development/published-release and Python/web metadata consistency gate.
+- `scripts/release_candidate_manifest.py` - canonical, create-once S2 candidate-manifest and
+  candidate-bundle verifier, including source/Git/OCI bindings and safe Actions artifact
+  observation/extraction; it has no tag, promotion, or publication authority.
+- `scripts/release_control_receipt.py` - canonical signed release-authority, one-wire dispatch,
+  credential-scope, immutable terminal-publication, and recovery-capsule contracts.
+- `scripts/release_promotion_transaction.py` - fail-closed dispatch reconciliation, server
+  authorization, ordered promotion planning/recording, pinned-surface verification, and final
+  release reconciliation.
+- `scripts/bootstrap_recovery.py` and `scripts/recovery_launcher.py` - safe deterministic capsule
+  extraction, offline hash-locked environment creation, and exact executable/import/network
+  closure enforcement.
+- `release-control-source-registry.json` and `release-control-credential-policy.json` - canonical
+  release observation provenance and least-privilege credential policies.
 - `scripts/release_publication_guard.py` - exact GitHub Release asset, OCI digest/ref, and PyPI retry-integrity gates.
 - `scripts/run_golden_evals.py` - deterministic and live-provider golden eval harness.
 - `scripts/run_live_learning_eval.py` - isolated live-provider learning/safety E2E harness.
@@ -62,6 +75,19 @@ The repo now goes beyond the original scaffold: it includes a conversational CLI
 - `tests/integration/test_extension_container_integration.py` - required Docker-backed executable-skill containment integration when enabled.
 - `tests/test_routines.py` and `tests/test_server_routine_routes.py` - routine concurrency, fencing, provenance, owner API, and dispatch coverage.
 - `tests/test_repair_integrity.py` - adversarial repair receipt, literal commit, timeout, and rollback coverage.
+- `schemas/kestrel.release_candidate.v1.schema.json` and
+  `schemas/kestrel.actions_artifact_observation.v1.schema.json` - recursively closed candidate
+  and Actions artifact evidence contracts for the S2 release transaction.
+- `schemas/kestrel.release_*.schema.json`, `schemas/kestrel.dispatch_*.schema.json`, and the
+  supporting credential/source/recovery schemas - recursively closed authority, dispatch,
+  recovery, stage, prerequisite, and reconciliation contracts for the recoverable release
+  transaction.
+- `tests/test_release_candidate_manifest.py` - deterministic candidate-manifest, source/Git,
+  complete OCI graph, exact inventory, Actions identity/retention, and safe extraction coverage.
+- `tests/test_release_control_receipt.py`, `tests/test_release_promotion_transaction.py`,
+  `tests/test_release_schema_closure.py`, and `tests/test_recovery_execution_closure.py` - signed
+  authority, response-loss, stage-chain, recursive-schema, capsule, and isolated-recovery
+  qualification coverage.
 - `web/` - local React/Vite workbench.
 
 ## Current Capability

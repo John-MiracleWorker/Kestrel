@@ -102,6 +102,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ARG INSTALL_EXTRAS=server,mcp,memvid,openai,anthropic,gemini,keyring
 
 WORKDIR /app
+# Refresh distro packages to the current trixie-security releases before
+# installing anything else: the container vulnerability policy gate
+# (scripts/check_container_vulnerabilities.py) hard-fails exceptions for any
+# CVE that now has a Debian fixed version, so the DSA-fixed util-linux/login
+# family must come from apt, not from the exceptions file. OpenSSL is the one
+# HIGH CVE with no trixie fix yet (Debian: postponed, no DSA; upstream fixed
+# in 3.5.8) and stays covered by a reviewed, expiring exception in
+# config/container_vulnerability_exceptions.json.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
+    && rm -r /var/lib/apt/lists/*
 RUN chmod a-s /usr/bin/mount /usr/bin/umount /usr/bin/su \
     && groupadd --system kestrel \
     && useradd --system --gid kestrel --home-dir /app kestrel

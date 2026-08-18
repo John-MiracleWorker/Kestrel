@@ -1,0 +1,197 @@
+name: Recovery dependency staging
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact admitted Kestrel source commit.
+        required: true
+        type: string
+    outputs:
+      artifact_id:
+        description: Immutable workflow artifact ID for the staged dependency closure.
+        value: ${{ jobs.stage.outputs.artifact_id }}
+      artifact_digest:
+        description: Server-computed digest for the staged dependency artifact.
+        value: ${{ jobs.stage.outputs.artifact_digest }}
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact admitted Kestrel source commit.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-dependencies-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RECOVERY_SOURCE_SHA: ${{ inputs.source_sha }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - name: Require an exact source commit input
+        shell: bash
+        run: |
+          [[ "$RECOVERY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11.14"
+      - name: Require the exact clean source commit
+        shell: bash
+        run: |
+          test "$(git rev-parse 'HEAD^{commit}')" = "$RECOVERY_SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Require the recovery dependency export to match the frozen lock
+        shell: bash
+        run: |
+          python scripts/bootstrap_uv.py "${RUNNER_TEMP}/kestrel-recovery-uv"
+          pinned_uv="${RUNNER_TEMP}/kestrel-recovery-uv/uv"
+          test "$($pinned_uv --version)" = "uv 0.9.21 (0dc9556ad 2025-12-30)"
+          "$pinned_uv" export --frozen --only-group recovery \
+            --format requirements.txt --no-emit-project --no-header --no-annotate \
+            --output-file "${RUNNER_TEMP}/recovery-requirements.txt"
+          cmp --silent config/recovery-requirements.txt \
+            "${RUNNER_TEMP}/recovery-requirements.txt"
+      - name: Stage checksum-pinned offline recovery dependencies
+        shell: bash
+        run: >-
+          python -m scripts.stage_recovery_dependencies
+          --source-root "$GITHUB_WORKSPACE"
+          --source-sha "$RECOVERY_SOURCE_SHA"
+          --output-root "${RUNNER_TEMP}/kestrel-recovery-dependencies"
+      - name: Validate the staged receipt and exact inventory
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "kestrel-recovery-dependencies" / "recovery"
+          receipt = json.loads((root / "dependency-staging-receipt.json").read_bytes())
+          if receipt.get("validation_status") != "validated":
+              raise SystemExit("recovery dependency staging is not validated")
+          if receipt.get("inputs", {}).get("source_sha") != os.environ[
+              "RECOVERY_SOURCE_SHA"
+          ]:
+              raise SystemExit("recovery dependency receipt source mismatch")
+          expected = {
+              "bin/bwrap",
+              "dependency-staging-receipt.json",
+              "python-runtime-manifest.json",
+              "python-runtime.tar.gz",
+              "requirements.txt",
+              "runtime-manifest.json",
+              "wheelhouse-manifest.json",
+          }
+          manifest = json.loads((root / "wheelhouse-manifest.json").read_bytes())
+          expected.update(f"wheelhouse/{item['filename']}" for item in manifest["wheels"])
+          runtime = json.loads((root / "runtime-manifest.json").read_bytes())
+          expected.update(
+              Path(item["asset_path"]).relative_to("recovery").as_posix()
+              for item in runtime["files"]
+          )
+          for item in runtime["files"]:
+              path = root.parent / item["asset_path"]
+              if (
+                  path.stat().st_size != item["size_bytes"]
+                  or "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                  != item["sha256"]
+              ):
+                  raise SystemExit("recovery runtime file identity mismatch")
+          python_runtime = json.loads(
+              (root / "python-runtime-manifest.json").read_bytes()
+          )
+          python_archive = root / "python-runtime.tar.gz"
+          python_archive_digest = (
+              "sha256:" + hashlib.sha256(python_archive.read_bytes()).hexdigest()
+          )
+          if (
+              python_archive.stat().st_size
+              != python_runtime["runtime_archive_size_bytes"]
+              or python_archive_digest != python_runtime["runtime_archive_sha256"]
+              or receipt["outputs"]["python_runtime_manifest_sha256"]
+              != "sha256:"
+              + hashlib.sha256(
+                  (root / "python-runtime-manifest.json").read_bytes()
+              ).hexdigest()
+              or receipt["outputs"]["python_runtime_archive_sha256"]
+              != python_archive_digest
+          ):
+              raise SystemExit("recovery Python runtime identity mismatch")
+          observed = {
+              path.relative_to(root).as_posix()
+              for path in root.rglob("*")
+              if path.is_file() and not path.is_symlink()
+          }
+          if observed != expected:
+              raise SystemExit("recovery dependency staging inventory mismatch")
+          projection = dict(receipt)
+          claimed = projection.pop("receipt_digest")
+          canonical = json.dumps(
+              projection, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+          ).encode()
+          if claimed != "sha256:" + hashlib.sha256(canonical).hexdigest():
+              raise SystemExit("recovery dependency staging receipt digest mismatch")
+          PY
+      - name: Require the frozen host actuator Python identity
+        shell: bash
+        run: |
+          python_executable="$(readlink -f -- "$(command -v python)")"
+          test -f "$python_executable"
+          test ! -L "$python_executable"
+          test "$(sha256sum "$python_executable" | cut -d ' ' -f 1)" = \
+            "dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8"
+          test "$(python --version)" = "Python 3.11.14"
+      - name: Install the staged controller dependencies without network access
+        shell: bash
+        run: >-
+          python -I -m pip --isolated install
+          --no-index
+          --find-links "${RUNNER_TEMP}/kestrel-recovery-dependencies/recovery/wheelhouse"
+          --require-hashes
+          --only-binary=:all:
+          --requirement "${RUNNER_TEMP}/kestrel-recovery-dependencies/recovery/requirements.txt"
+      - name: Bootstrap the checksum-pinned host actuator GitHub CLI
+        shell: bash
+        run: |
+          scripts/bootstrap_workflow_tools.sh \
+            "${RUNNER_TEMP}/kestrel-recovery-smoke-tools"
+          pinned_gh="${RUNNER_TEMP}/kestrel-recovery-smoke-tools/gh"
+          test "$($pinned_gh --version | head -n 1)" = \
+            "gh version 2.97.0 (2026-02-26)"
+          printf 'RECOVERY_SMOKE_GH=%s\n' "$pinned_gh" >> "$GITHUB_ENV"
+      - name: Create, extract, bootstrap, and fully verify a real recovery capsule
+        shell: bash
+        run: >-
+          python -I -B scripts/run_recovery_capsule_smoke.py
+          --source-root "$GITHUB_WORKSPACE"
+          --dependency-root "${RUNNER_TEMP}/kestrel-recovery-dependencies"
+          --source-sha "$RECOVERY_SOURCE_SHA"
+          --work-root "${RUNNER_TEMP}/kestrel-recovery-capsule-smoke"
+          --host-gh "$RECOVERY_SMOKE_GH"
+          --output "${RUNNER_TEMP}/kestrel-recovery-dependencies/recovery-smoke-report.json"
+      - name: Upload immutable staged recovery dependencies
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kestrel-recovery-dependencies-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/kestrel-recovery-dependencies
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.release_shared.v1.schema.json",
+  "title": "kestrel.release_shared.v1",
+  "type": "null",
+  "const": null,
+  "unevaluatedProperties": false,
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "safe_integer": {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991},
+    "positive_integer": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"},
+    "actor": {
+      "type": "object",
+      "required": ["login", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "login": {"type": "string", "minLength": 1, "maxLength": 128},
+        "id": {"$ref": "#/$defs/positive_integer"}
+      }
+    },
+    "principal": {
+      "type": "object",
+      "required": ["login", "id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "login": {"type": "string", "minLength": 1, "maxLength": 128},
+        "id": {"$ref": "#/$defs/positive_integer"},
+        "type": {"enum": ["Bot", "User"]}
+      }
+    },
+    "repository": {
+      "type": "object",
+      "required": ["full_name", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "full_name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "id": {"$ref": "#/$defs/positive_integer"}
+      }
+    },
+    "candidate_identity": {
+      "type": "object",
+      "required": ["candidate_manifest_digest", "artifact_set_digest", "version", "tag", "source_sha", "source_tree", "candidate_run_id", "candidate_run_attempt"],
+      "additionalProperties": false,
+      "properties": {
+        "candidate_manifest_digest": {"$ref": "#/$defs/digest"},
+        "artifact_set_digest": {"$ref": "#/$defs/digest"},
+        "version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$"},
+        "tag": {"type": "string", "pattern": "^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$"},
+        "source_sha": {"$ref": "#/$defs/git_sha"},
+        "source_tree": {"$ref": "#/$defs/git_sha"},
+        "candidate_run_id": {"$ref": "#/$defs/positive_integer"},
+        "candidate_run_attempt": {"type": "integer", "const": 1}
+      }
+    },
+    "promotion_run": {
+      "type": "object",
+      "required": ["repository_id", "workflow_id", "workflow_path", "run_id", "run_attempt", "event", "ref", "head_sha", "workflow_sha", "actor", "triggering_actor", "transaction_nonce", "rest_observation_digest", "context_observation_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "repository_id": {"$ref": "#/$defs/positive_integer"},
+        "workflow_id": {"$ref": "#/$defs/positive_integer"},
+        "workflow_path": {"const": ".github/workflows/release.yml"},
+        "run_id": {"$ref": "#/$defs/positive_integer"},
+        "run_attempt": {"type": "integer", "const": 1},
+        "event": {"const": "workflow_dispatch"},
+        "ref": {"type": "string", "pattern": "^refs/(heads/main|tags/v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*))$"},
+        "head_sha": {"$ref": "#/$defs/git_sha"},
+        "workflow_sha": {"$ref": "#/$defs/git_sha"},
+        "actor": {"$ref": "#/$defs/actor"},
+        "triggering_actor": {"$ref": "#/$defs/actor"},
+        "transaction_nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "rest_observation_digest": {"$ref": "#/$defs/digest"},
+        "context_observation_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": ["name", "provider", "locator", "authenticated_as", "freshness_class", "captured_at", "page_count", "record_count", "sha256", "size_bytes", "complete"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "provider": {"enum": ["controller", "github.com", "local", "pypi.org"]},
+        "locator": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "authenticated_as": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 256}]},
+        "freshness_class": {"enum": ["current", "historical"]},
+        "captured_at": {"$ref": "#/$defs/timestamp"},
+        "page_count": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "record_count": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "sha256": {"$ref": "#/$defs/digest"},
+        "size_bytes": {"$ref": "#/$defs/positive_integer"},
+        "complete": {"const": true}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["source_bundle_digest", "canonicalization_vector_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "source_bundle_digest": {"$ref": "#/$defs/digest"},
+        "canonicalization_vector_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["producer", "provider", "method"],
+      "additionalProperties": false,
+      "properties": {
+        "producer": {"type": "string", "minLength": 1, "maxLength": 512},
+        "provider": {"enum": ["controller", "github.com", "local", "pypi.org"]},
+        "method": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    }
+  }
+}

@@ -96,7 +96,7 @@ This repository is a production candidate for the supported single-user, single-
 - `examples/golden_repair_demo` provides a deterministic broken-then-fixed repository fixture for the golden repair workflow, including a failing subtraction test and an `expected_fix.patch`; the main test suite verifies the fixture fails before the patch and passes after it.
 - Dated review material records earlier local-provider validation, but historical prose does not upgrade the v2 matrix without a fresh accepted receipt for the exact subject, provider, tested model, and profile.
 - Determinism is a release-visible gate: the golden suite emits canonical per-case records, a 20-repeat runner rejects outcome drift, and CI uploads the aggregate report. Time-sensitive reliability paths use monotonic deadline/polling semantics where appropriate.
-- Release publication has a disposable rehearsal workflow that validates the exact finalized tag/archive/wheel/install payload and conflict behavior before the production release workflow may publish an immutable tag.
+- Release publication has a disposable rehearsal workflow that validates the exact candidate wheel/sdist/archive/install payload and conflict behavior before the release transaction may create an immutable tag.
 - Native Windows has a non-mutating PowerShell doctor/bootstrap planner, absolute system-process helpers, and Windows-specific CI regressions. Actual native/WSL2/Docker execution remains platform-hosted evidence rather than a claim inferred from macOS/Linux tests.
 
 ## Partially Implemented

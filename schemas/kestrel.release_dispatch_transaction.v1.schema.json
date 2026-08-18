@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.release_dispatch_transaction.v1.schema.json",
+  "title": "kestrel.release_dispatch_transaction.v1",
+  "type": "object",
+  "required": ["schema", "state", "transaction_nonce", "logical_dispatch_ordinal", "repository", "workflow", "api_version", "endpoint", "method", "accept", "content_type", "target", "actor", "inputs", "dispatch_binding", "expected_display_title", "canonical_request_sha256", "prepared_at", "send_started_at", "monotonic_started_seconds", "monotonic_deadline_seconds", "response_contract", "transport_policy", "evidence", "provenance", "confidence", "validation_status"],
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {"const": "kestrel.release_dispatch_transaction.v1"},
+    "state": {"const": "prepared"},
+    "transaction_nonce": {"$ref": "#/$defs/nonce"},
+    "logical_dispatch_ordinal": {"const": 1},
+    "repository": {"$ref": "#/$defs/repository"},
+    "workflow": {"$ref": "#/$defs/workflow"},
+    "api_version": {"const": "2026-03-10"},
+    "endpoint": {"type": "string", "pattern": "^https://api[.]github[.]com/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/workflows/[1-9][0-9]*/dispatches$"},
+    "method": {"const": "POST"},
+    "accept": {"const": "application/vnd.github+json"},
+    "content_type": {"const": "application/json"},
+    "target": {"$ref": "#/$defs/target"},
+    "actor": {"$ref": "#/$defs/actor"},
+    "inputs": {"$ref": "#/$defs/inputs"},
+    "dispatch_binding": {"$ref": "#/$defs/digest"},
+    "expected_display_title": {"type": "string", "pattern": "^Kestrel release tx [0-9a-f]{64} bind sha256:[0-9a-f]{64}$"},
+    "canonical_request_sha256": {"$ref": "#/$defs/digest"},
+    "prepared_at": {"$ref": "#/$defs/timestamp"},
+    "send_started_at": {"type": "null"},
+    "monotonic_started_seconds": {"$ref": "#/$defs/nonnegative"},
+    "monotonic_deadline_seconds": {"$ref": "#/$defs/nonnegative"},
+    "response_contract": {"const": "api-2026-03-10-always-run-details"},
+    "transport_policy": {"$ref": "#/$defs/transport_policy"},
+    "evidence": {"$ref": "#/$defs/evidence"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "confidence": {"const": 1},
+    "validation_status": {"const": "validated"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "nonnegative": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"},
+    "repository": {
+      "type": "object",
+      "required": ["full_name", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "full_name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "required": ["id", "path", "state", "default_branch_sha", "observation_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "path": {"const": ".github/workflows/release.yml"},
+        "state": {"const": "active"},
+        "default_branch_sha": {"$ref": "#/$defs/git_sha"},
+        "observation_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["mode", "short_ref", "full_ref", "head_sha", "workflow_ref", "workflow_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {"enum": ["initiate", "recover_committed"]},
+        "short_ref": {"type": "string", "pattern": "^(main|v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*))$"},
+        "full_ref": {"type": "string", "pattern": "^refs/(heads/main|tags/v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*))$"},
+        "head_sha": {"$ref": "#/$defs/git_sha"},
+        "workflow_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[.]github/workflows/release[.]yml@refs/(heads/main|tags/v[^/]+)$"},
+        "workflow_sha": {"$ref": "#/$defs/git_sha"}
+      }
+    },
+    "actor": {
+      "type": "object",
+      "required": ["login", "id", "app_id", "installation_id"],
+      "additionalProperties": false,
+      "properties": {
+        "login": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+\\[bot\\]$"},
+        "id": {"$ref": "#/$defs/id"},
+        "app_id": {"$ref": "#/$defs/id"},
+        "installation_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": ["candidate_run_id", "candidate_manifest_digest", "dispatch_binding", "mode", "transaction_nonce"],
+      "additionalProperties": false,
+      "properties": {
+        "candidate_run_id": {"type": "string", "pattern": "^[1-9][0-9]*$", "maxLength": 16},
+        "candidate_manifest_digest": {"$ref": "#/$defs/digest"},
+        "dispatch_binding": {"$ref": "#/$defs/digest"},
+        "mode": {"enum": ["initiate", "recover_committed"]},
+        "transaction_nonce": {"$ref": "#/$defs/nonce"}
+      }
+    },
+    "transport_policy": {
+      "type": "object",
+      "required": ["maximum_wire_transmissions", "redirects", "retries", "auth_replay", "proxies", "failover"],
+      "additionalProperties": false,
+      "properties": {
+        "maximum_wire_transmissions": {"const": 1},
+        "redirects": {"const": false},
+        "retries": {"const": false},
+        "auth_replay": {"const": false},
+        "proxies": {"const": false},
+        "failover": {"const": false}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["source_bundle_digest", "canonicalization_vector_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "source_bundle_digest": {"$ref": "#/$defs/digest"},
+        "canonicalization_vector_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["producer", "provider", "method"],
+      "additionalProperties": false,
+      "properties": {
+        "producer": {"const": "scripts/release_control_receipt.py"},
+        "provider": {"const": "controller"},
+        "method": {"const": "one-wire-dispatch-preparation"}
+      }
+    }
+  }
+}

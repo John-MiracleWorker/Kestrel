@@ -273,12 +273,15 @@ docker build -t kestrel-agent:local .
 docker run --rm kestrel-agent:local nest-agent doctor --backend memvid --memory-dir /data/memory --provider mock
 ```
 
-The tag workflow first proves that the exact tag SHA already has a successful `main` push run of
+Release publication is dispatch-driven and two-lane; no tag exists until the transaction creates it.
+The candidate lane (`release-candidate.yml`, `workflow_dispatch`) first proves that the exact
+candidate SHA already has a successful `main` push run of
 the complete CI workflow and a successful exact-SHA `release-rehearsal.yml` push run. The
 rehearsal has read-only repository permission and writes only to a new runner-local repository and
 package namespace named `kestrel-rehearsal-*`; it exposes no production repository, GHCR, GitHub
-Release, or PyPI target. Run it on the clean candidate before creating the immutable production
-tag. The tag workflow refuses to build or publish when that exact-SHA receipt is absent. It then
+Release, or PyPI target. Run it on the clean candidate before dispatching the candidate lane. The
+candidate lane refuses to finalize the candidate, and refuses to build or publish, when that
+exact-SHA receipt is absent or the candidate source already has a stable tag. It then
 builds the wheel once and installs that identical downloaded
 wheel plus its hash-locked dependency payload on Linux x86_64, Apple-silicon macOS,
 and native Windows x86_64 with Python 3.11, 3.12, and 3.13. The macOS
@@ -293,7 +296,7 @@ both `linux/amd64` and `linux/arm64` images under pinned Buildx/QEMU tooling; a 
 image does not replace that release gate. After the image checks pass, CI archives those exact
 images and transfers them to the publication job instead of rebuilding them. Only that final job
 has `packages: write`; it runs after the wheel matrix and every candidate gate. Before its first
-registry write it queries the tag's GitHub release. A rerun against an already published immutable
+registry write it queries the GitHub Release. A rerun against an already published immutable
 release verifies the checksum-bound OCI digest record, both public index refs, and both stable
 per-architecture refs, then performs no GHCR or GitHub Release mutation. Draft/partial runs push
 each architecture through a run-attempt
@@ -398,7 +401,7 @@ Do not tag the release if any of these are true:
 - The source candidate has not passed repository CI, including the native Windows source lane.
 - The exact release tag SHA has no successful complete CI `push` run on `main`.
 - The exact release tag SHA has no successful `release-rehearsal.yml` `push` run on `main`, or the
-  production tag was created before that rehearsal completed.
+  candidate dispatch occurred before that rehearsal completed.
 - The exact release tag SHA has no successful `determinism.yml` `push` run on `main`, or its
   downloaded commit-bound machine receipt does not prove twenty derived passes, one functional
   signature, a streak of twenty, zero observed flakes, and the release-qualified deadlines.

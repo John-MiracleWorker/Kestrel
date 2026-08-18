@@ -717,6 +717,7 @@ Live provider, Memvid, MCP, and containment integration suites are opt-in and do
 | [Memory Operations](docs/MEMORY_OPERATIONS.md) | Memvid verification, migration, backup, and recovery |
 | [Runtime Security](docs/SECURITY.md) | Auth, secrets, approvals, webhooks, tools, MCP, and execution boundaries |
 | [Testing](docs/TESTING.md) | Deterministic, integration, provider, and certification test paths |
+| [Release Recovery Boundary](docs/RELEASE_RECOVERY_BOUNDARY.md) | Recovery authority design, staged qualification, and remaining controller gate |
 | [Controlled Self-Modification](docs/CONTROLLED_SELF_MODIFICATION.md) | Behavior deltas, mutation gates, replay, review, and rollback |
 | [Productization Roadmap](docs/PRODUCTIZATION_ROADMAP.md) | Longer-horizon hosted and team platform direction |
 | [Changelog](CHANGELOG.md) | Version history and security changes |
