@@ -681,7 +681,7 @@ def _write_exclusive(path: Path, value: bytes, *, mode: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, mode)  # codeql[py/overly-permissive-file] — staged recovery dependency: 0o644 is the required world-readable archive contract (secrets stay 0o600)
+    descriptor = os.open(path, flags, mode)  # lgtm[py/overly-permissive-file] — staged recovery dependency: 0o644 is the required world-readable archive contract (secrets stay 0o600)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1

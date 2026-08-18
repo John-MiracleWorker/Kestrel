@@ -3173,8 +3173,8 @@ def extract_actions_artifact(
                         target.mkdir(parents=True, exist_ok=True)
                         continue
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    descriptor = os.open(
-                        target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644  # codeql[py/overly-permissive-file] — staged recovery asset: 0o644 is the required world-readable archive contract (secrets stay 0o600)
+                    descriptor = os.open(  # lgtm[py/overly-permissive-file] — staged recovery asset: 0o644 is the required world-readable archive contract (secrets stay 0o600)
+                        target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
                     )
                     with os.fdopen(descriptor, "wb") as handle:
                         with archive.open(info, mode="r") as source:
