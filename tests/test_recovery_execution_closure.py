@@ -1538,6 +1538,10 @@ def _tar_with_member(name: str, *, kind: bytes = tarfile.REGTYPE) -> bytes:
         _tar_with_member("../escape"),
         _tar_with_member("absolute", kind=tarfile.SYMTYPE),
     ],
+    # Short, stable ids. The raw tar archives are ~2KB of bytes each; pytest
+    # embeds repr(param) in the node id, which overflows the 32767-char
+    # Windows os.putenv limit (PYTEST_CURRENT_TEST) at setup/teardown.
+    ids=["traversal-escape", "symlink-member"],
 )
 def test_bootstrap_recovery_rejects_traversal_and_links(tmp_path: Path, archive: bytes) -> None:
     archive_path = tmp_path / "capsule.tar"
