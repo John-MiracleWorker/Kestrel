@@ -273,6 +273,20 @@ def run_installed_artifact_mission(
     finally:
         if server.poll() is None:
             os.kill(server_pid, signal.SIGTERM)
+            if os.name == "nt":
+                # The installed console-script launcher (nest-agent.exe shim)
+                # spawns the real python.exe as a child; TerminateProcess on
+                # the shim leaves the listener alive. Kill the whole tree so
+                # the port and state-lock release probes observe true cleanup.
+                try:
+                    subprocess.run(  # noqa: S603
+                        ["taskkill", "/PID", str(server_pid), "/T", "/F"],
+                        capture_output=True,
+                        check=False,
+                        timeout=10,
+                    )
+                except OSError:
+                    pass
     exit_code = _wait_for_server_exit(server, pid=server_pid)
     log_handle.close()
     steps.append("server_stopped")

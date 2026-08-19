@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 60
     env:
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-      BATTERY_SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+      BATTERY_SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

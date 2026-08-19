@@ -2552,6 +2552,10 @@ def test_release_rehearsal_battery_lane_rehearses_twenty_without_publication_aut
     assert "scripts/run_release_rehearsal_battery.py" in workflow
     assert "--repeats 20" in workflow
     assert "--commit \"$BATTERY_SOURCE_SHA\"" in workflow
+    assert (
+        "BATTERY_SOURCE_SHA: ${{ inputs.source_sha || "
+        "github.event.pull_request.head.sha || github.sha }}"
+    ) in workflow
     assert "cancel-in-progress: false" in workflow
     assert "if: always()" in workflow
     for forbidden in (
