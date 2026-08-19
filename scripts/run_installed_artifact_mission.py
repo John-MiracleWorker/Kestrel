@@ -146,6 +146,7 @@ def run_installed_artifact_mission(
     work_root: Path,
     extras: str = DEFAULT_EXTRAS,
     mission_message: str = DEFAULT_MISSION_MESSAGE,
+    readiness_deadline_seconds: float = READINESS_DEADLINE_SECONDS,
 ) -> dict[str, Any]:
     payload = payload.resolve(strict=True)
     source_root = source_root.resolve(strict=True)
@@ -256,7 +257,11 @@ def run_installed_artifact_mission(
     readiness: dict[str, Any]
     mission: dict[str, Any]
     try:
-        readiness = _await_readiness(base_url, auth_headers=auth_headers)
+        readiness = _await_readiness(
+            base_url,
+            auth_headers=auth_headers,
+            deadline_seconds=readiness_deadline_seconds,
+        )
         steps.append("readiness_observed")
         mission = _complete_mock_mission(
             base_url,
@@ -497,6 +502,11 @@ def main() -> int:
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--extras", default=DEFAULT_EXTRAS)
     parser.add_argument("--mission-message", default=DEFAULT_MISSION_MESSAGE)
+    parser.add_argument(
+        "--readiness-deadline-seconds",
+        type=float,
+        default=READINESS_DEADLINE_SECONDS,
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
@@ -507,6 +517,7 @@ def main() -> int:
             work_root=args.work_root,
             extras=args.extras,
             mission_message=args.mission_message,
+            readiness_deadline_seconds=args.readiness_deadline_seconds,
         )
         if args.output is not None:
             _write_json(args.output, report)
