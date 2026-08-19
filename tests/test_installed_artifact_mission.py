@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,20 @@ def test_entry_point_path_per_platform(tmp_path: Path) -> None:
 
 def test_report_schema_constant_is_versioned() -> None:
     assert REPORT_SCHEMA == "kestrel.installed_artifact_mission.v1"
+
+
+def test_readiness_probe_retries_bounded_window_before_failing() -> None:
+    from scripts.run_installed_artifact_mission import _await_readiness
+
+    port = free_port()
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="did not accept readiness probes"):
+        _await_readiness(
+            f"http://127.0.0.1:{port}",
+            auth_headers={"Authorization": "Bearer test"},
+            deadline_seconds=2.0,
+        )
+    assert time.monotonic() - started < 15
 
 
 @pytest.mark.skipif(

@@ -164,6 +164,7 @@ def run_installed_artifact_mission(
     environment = _environment()
     environment["NEST_AGENT_API_TOKEN"] = secrets.token_urlsafe(24)
     environment["NEST_AGENT_REQUIRE_API_AUTH"] = "1"
+    environment["PYTHONUNBUFFERED"] = "1"
     token = environment["NEST_AGENT_API_TOKEN"]
     auth_headers = {"Authorization": f"Bearer {token}"}
 
@@ -309,18 +310,42 @@ def run_installed_artifact_mission(
     }
 
 
-def _await_readiness(base_url: str, *, auth_headers: dict[str, str]) -> dict[str, Any]:
-    unauthenticated_status, _ = _http_json(
-        f"{base_url}/api/health/ready", headers={}, method="GET", payload=None
-    )
+def _await_readiness(
+    base_url: str,
+    *,
+    auth_headers: dict[str, str],
+    deadline_seconds: float = READINESS_DEADLINE_SECONDS,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    deadline = started + deadline_seconds
+
+    # The installed server needs a bounded window to import the runtime and
+    # bind its port; a refused connection during that window means "not up
+    # yet", not a failure. Only after a real HTTP response arrives must the
+    # unauthenticated readiness probe be exactly 401.
+    unauthenticated_status: int | None = None
+    attempts = 0
+    while unauthenticated_status is None:
+        attempts += 1
+        try:
+            unauthenticated_status, _ = _http_json(
+                f"{base_url}/api/health/ready",
+                headers={},
+                method="GET",
+                payload=None,
+            )
+        except urllib.error.URLError:
+            if time.monotonic() >= deadline:
+                raise ValueError(
+                    "installed server did not accept readiness probes within "
+                    f"{READINESS_DEADLINE_SECONDS:.0f}s"
+                ) from None
+            time.sleep(1.0)
     if unauthenticated_status != 401:
         raise ValueError(
             "unauthenticated readiness probe returned "
             f"{unauthenticated_status}, expected 401"
         )
-    started = time.monotonic()
-    deadline = started + READINESS_DEADLINE_SECONDS
-    attempts = 0
     while True:
         attempts += 1
         status, body = _http_json(

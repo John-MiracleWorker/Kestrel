@@ -1,6 +1,7 @@
 name: Release rehearsal battery
 
 on:
+  pull_request:
   push:
     branches: [main]
   workflow_dispatch:

@@ -87,10 +87,18 @@ jobs:
             --no-deps \
             "${wheels[0]}[${RELEASE_EXTRAS}]"
           "${RUNNER_TEMP}/kestrel-mission-smoke/bin/python" -m pip check
-      - name: Stage installers and generate the payload checksum manifest
+      - name: Stage installers
         run: |
           cp install.sh dist/install.sh
           cp install.ps1 dist/install.ps1
+      - name: Generate the release SBOM
+        run: |
+          cyclonedx-py environment "${RUNNER_TEMP}/kestrel-mission-smoke/bin/python" \
+            --output-reproducible \
+            --output-format JSON \
+            --output-file dist/sbom.cdx.json
+      - name: Generate the payload checksum manifest
+        run: |
           python - <<'PY'
           import hashlib
           from pathlib import Path
@@ -106,6 +114,7 @@ jobs:
               "requirements-release.txt",
               wheels[0].name,
               sdists[0].name,
+              "sbom.cdx.json",
           ]
           lines = []
           for name in names:
@@ -113,12 +122,6 @@ jobs:
               lines.append(f"{digest}  {name}")
           (root / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
-      - name: Generate the release SBOM
-        run: |
-          cyclonedx-py environment "${RUNNER_TEMP}/kestrel-mission-smoke/bin/python" \
-            --output-reproducible \
-            --output-format JSON \
-            --output-file dist/sbom.cdx.json
       - name: Verify the complete exact release payload
         run: |
           python scripts/verify_release_payload.py dist \

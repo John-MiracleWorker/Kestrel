@@ -2545,6 +2545,7 @@ def test_release_rehearsal_battery_lane_rehearses_twenty_without_publication_aut
         ROOT / ".github" / "workflows" / "release-rehearsal-battery.yml"
     ).read_text(encoding="utf-8")
 
+    assert "pull_request:" in workflow
     assert "push:\n    branches: [main]" in workflow
     assert "workflow_dispatch:" in workflow
     assert "permissions:\n  contents: read" in workflow
