@@ -116,6 +116,18 @@ def _http_json(
         return int(exc.code), parsed if isinstance(parsed, dict) else {}
 
 
+def _accepted_exit_code(exit_code: int, *, os_name: str) -> bool:
+    """A clean shutdown either exits 0 itself or, on POSIX, is re-raised by
+    uvicorn after the graceful shutdown completes — uvicorn restores the
+    default handler and re-raises the captured SIGTERM so the parent observes
+    signal death, the canonical POSIX daemon outcome. Windows terminate()
+    yields an implementation-defined code, so only the port and state-lock
+    release probes judge cleanliness there."""
+    if os_name == "nt":
+        return True
+    return exit_code in (0, -signal.SIGTERM)
+
+
 def _wait_for_server_exit(process: subprocess.Popen[Any], *, pid: int) -> int:
     try:
         return process.wait(timeout=SHUTDOWN_DEADLINE_SECONDS)
@@ -260,7 +272,7 @@ def run_installed_artifact_mission(
     log_handle.close()
     steps.append("server_stopped")
 
-    if os.name != "nt" and exit_code != 0:
+    if os.name != "nt" and not _accepted_exit_code(exit_code, os_name=os.name):
         raise ValueError(
             f"installed server exited uncleanly after SIGTERM: {exit_code} "
             f"(see {server_log})"

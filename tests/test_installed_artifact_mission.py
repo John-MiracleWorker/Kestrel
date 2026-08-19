@@ -49,6 +49,18 @@ def test_readiness_probe_retries_bounded_window_before_failing() -> None:
     assert time.monotonic() - started < 15
 
 
+def test_clean_exit_code_accepts_signal_death_on_posix_only() -> None:
+    import signal as signal_module
+
+    from scripts.run_installed_artifact_mission import _accepted_exit_code
+
+    assert _accepted_exit_code(0, os_name="posix") is True
+    assert _accepted_exit_code(-signal_module.SIGTERM, os_name="posix") is True
+    assert _accepted_exit_code(1, os_name="posix") is False
+    assert _accepted_exit_code(-signal_module.SIGKILL, os_name="posix") is False
+    assert _accepted_exit_code(1, os_name="nt") is True
+
+
 @pytest.mark.skipif(
     os.environ.get("RUN_INSTALLED_ARTIFACT_MISSION") != "1",
     reason="integration mission exercise is opt-in via RUN_INSTALLED_ARTIFACT_MISSION=1",
