@@ -2538,3 +2538,120 @@ def test_release_candidate_prerequisite_selector_rejects_nonqualifying_runs(
     assert "no exact successful attempt-one prerequisite: release-rehearsal" in (
         completed.stderr
     )
+
+
+def test_release_rehearsal_battery_lane_rehearses_twenty_without_publication_authority() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "release-rehearsal-battery.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "pull_request:" in workflow
+    assert "push:\n    branches: [main]" in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "permissions:\n  contents: read" in workflow
+    assert "scripts/run_release_rehearsal_battery.py" in workflow
+    assert "--repeats 20" in workflow
+    assert "--commit \"$BATTERY_SOURCE_SHA\"" in workflow
+    assert (
+        "BATTERY_SOURCE_SHA: ${{ inputs.source_sha || "
+        "github.event.pull_request.head.sha || github.sha }}"
+    ) in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert "if: always()" in workflow
+    for forbidden in (
+        "packages: write",
+        "contents: write",
+        "id-token: write",
+        "secrets.",
+        "gh release",
+        "docker push",
+        "pypa/gh-action-pypi-publish",
+        "git push",
+    ):
+        assert forbidden not in workflow
+
+
+def test_release_rehearsal_battery_script_enforces_unique_namespaces_without_retry() -> None:
+    script = (ROOT / "scripts" / "run_release_rehearsal_battery.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "kestrel.release_rehearsal_battery.v1" in script
+    assert "for index, namespace in enumerate(namespaces, start=1)" in script
+    assert "failed on first attempt" in script
+    assert "zero_flaky_failures" in script
+    assert "aggregate_digest" in script
+
+
+def test_installed_artifact_mission_matrix_covers_every_supported_os_python_cell() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "installed-artifact-mission.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    matrix = workflow["jobs"]["installed-mission"]["strategy"]["matrix"]["include"]
+    cells = {(row["os"], row["python"], row["machine"]) for row in matrix}
+
+    expected = {
+        (os_name, python, machine)
+        for os_name, machines in (
+            ("ubuntu-latest", "x86_64"),
+            ("macos-latest", "arm64"),
+            ("windows-latest", "AMD64"),
+        )
+        for python in ("3.11", "3.12", "3.13")
+        for machine in (machines,)
+    }
+    assert cells == expected
+    assert len(cells) == 9
+    assert workflow["jobs"]["installed-mission"]["strategy"]["fail-fast"] is False
+    assert workflow["jobs"]["installed-mission"]["needs"] == "build-payload"
+    steps_text = "\n".join(
+        str(step.get("run", "")) for step in workflow["jobs"]["installed-mission"]["steps"]
+    )
+    assert "python -m scripts.run_installed_artifact_mission dist" in steps_text
+    assert "platform.machine().casefold()" in steps_text
+    assert "kestrel.installed_artifact_mission_cell.v1" in steps_text
+    for forbidden in (
+        "contents: write",
+        "packages: write",
+        "id-token: write",
+        "secrets.",
+        "gh release",
+        "docker push",
+        "pypa/gh-action-pypi-publish",
+        "git push",
+    ):
+        assert forbidden not in workflow["jobs"]["installed-mission"]
+        assert forbidden not in workflow["jobs"]["build-payload"]
+
+
+def test_installed_artifact_mission_payload_is_exact_and_self_checksummed() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "installed-artifact-mission.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "python -m build --no-isolation --wheel --sdist --outdir dist" in workflow
+    assert "uv export --frozen --no-dev --no-emit-local" in workflow
+    assert "SHA256SUMS" in workflow
+    assert "python scripts/verify_release_payload.py dist" in workflow
+    assert "--require-hashes" in workflow
+    assert "kestrel-mission-payload-${{ env.MISSION_SOURCE_SHA }}" in workflow
+    assert "persist-credentials: false" in workflow
+
+
+def test_installed_artifact_mission_runner_verifies_readiness_mission_and_cleanup() -> None:
+    script = (ROOT / "scripts" / "run_installed_artifact_mission.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "kestrel.installed_artifact_mission.v1" in script
+    assert "/api/health/ready" in script
+    assert "expected 401" in script
+    assert "POST" in script
+    assert "/api/runs" in script
+    assert "terminal_status" in script
+    assert "SIGTERM" in script
+    assert "port_released" in script
+    assert "lock_released" in script
+    assert "verify_exact_wheel_install" in script

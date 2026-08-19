@@ -1,6 +1,6 @@
 # Kestrel v0.6 Proof Release — Source of Truth
 
-Last updated: 2026-08-18
+Last updated: 2026-08-19
 
 This document is the canonical program contract for the Kestrel v0.6 proof
 release. It translates the owner-approved release prompt into durable,
@@ -420,6 +420,74 @@ later slices, installed-artifact qualification, release promotion,
 publication, or final v0.6 qualification. The one exact-main release rehearsal
 is recorded as ancillary only and does not satisfy repeated-rehearsal REL-004.
 
+### S3 implementation and owner-local evidence (2026-08-19)
+
+S3 machinery is implemented on branch `codex/v06-s3-rehearsal-installed-matrix`
+as foundational reliability evidence, not a claim that the release is
+`qualified`:
+
+- **REL-004**: `scripts/run_release_rehearsal_battery.py` runs 20 consecutive
+  rehearsals of one exact candidate, each in a deterministic unique namespace
+  (`kestrel-rehearsal-<commit12>-<seq>`), with zero retry tolerance — any
+  first-attempt failure names the rehearsal index and fails the battery, so a
+  flaky rehearsal can never masquerade as a repeated-rehearsal receipt. It
+  seals an aggregate receipt (`kestrel.release_rehearsal_battery.v1`) whose
+  `aggregate_digest` is the SHA-256 of the canonical serialization of the
+  receipt body with the digest field excluded, recomputable by any verifier.
+  Hosted lane: `.github/workflows/release-rehearsal-battery.yml` (pull
+  request, main push, and dispatch; `contents: read` only).
+- **REL-005**: `scripts/run_installed_artifact_mission.py` installs the exact,
+  self-checksummed release payload into a fresh virtual environment, proves the
+  installed `nest-agent` console entry point, starts the installed server on a
+  scratch port with API auth required, observes the unauthenticated 401
+  boundary and authenticated readiness at `/api/health/ready`, completes one
+  bounded mock mission through `POST /api/runs`, and verifies cleanup three
+  ways: SIGTERM exit, released port, and a fresh CLI session against the SAME
+  state database (the single-owner runtime lock released). On POSIX the
+  SIGTERM exit status is -15 by uvicorn design (it restores the default
+  handler and re-raises the captured signal after the graceful shutdown
+  completes); the runner accepts 0 and -SIGTERM as clean. Hosted 9-cell matrix
+  (Windows/macOS/Linux × Python 3.11/3.12/3.13):
+  `.github/workflows/installed-artifact-mission.yml`.
+
+New tests: `tests/test_release_rehearsal_battery.py` and
+`tests/test_installed_artifact_mission.py` (11 passed, 1 opt-in integration
+skip) plus five workflow-pinning tests in `tests/test_reliability_workflows.py`;
+Ruff and mypy clean at each commit.
+
+Owner-local receipts at branch head `bcfc30d0` (implementation commit):
+
+- `S3-2026-08-19-REL005-MACOS`: the exact payload wheel
+  `nested_memvid_agent-0.5.8-py3-none-any.whl` (SHA-256
+  `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c`) passed
+  all three macOS cells — Python 3.11.15 (receipt SHA-256
+  `83c118345f3539beb26949ab953abf600ec1fc41025026be8ab5efce7ecf00f6`, mission
+  run `run_ec60b3acee804582b4c28f9615f4b1b9`), 3.12.12 (receipt
+  `c53f83966bdf4eb6be1f3b151aed11f29d4ee30b8e25b73c034e1a8ffcb54fd0`, run
+  `run_def4d1827d6d4646aef20021fd46d44b`), and 3.13.12 (receipt
+  `64fa1d0fef874d5bffc24e3ebd2060cf21b8f3a6823bdf826dbbb42ce8f3a82d`, run
+  `run_3ab27cb9b763420da5f2f6b55f37b11b`); every cell observed the
+  unauthenticated 401 boundary, authenticated readiness, a completed mission
+  with a non-empty assistant response, and cleanup (SIGTERM exit -15 accepted,
+  port released, state lock released).
+- `S3-2026-08-19-REL004-LOCAL-PARTIAL`: rehearsals 1–6 of 20 completed
+  consecutively in unique namespaces with zero flaky failures
+  (`kestrel-rehearsal-bcfc30d05e0f-001` … `-006`; per-rehearsal report SHA-256s
+  `a0957f86269a81ca…`, `757fd495377913be…`, `d2ebf4df32906f22…`,
+  `62243fee5fd55583…`, `26ca5cafd1acc656…`, `45a00457cf407300…`) before the
+  owner-local run was deliberately stopped to free the heavily loaded host for
+  the REL-005 cells. This partial run is not the REL-004 acceptance evidence.
+- `S3-2026-08-19-REL004-FAILCLOSED`: the first battery attempt failed
+  rehearsal 2 of 20 with `source repository is not clean` after a mid-run
+  working-tree edit, exited nonzero naming the rehearsal index, and wrote no
+  aggregate receipt — a live observation of the zero-flaky fail-closed
+  behavior, preserved as a failure receipt, never rewritten.
+
+REL-004 and REL-005 move to `in_progress`; S3 moves to `in_progress`. The
+complete 20-repeat aggregate receipt and the Linux/Windows matrix cells are
+the hosted runs at the exact PR head; `qualified` remains reserved for merged
+exact protected-main receipts, review, and the S12 final gate.
+
 ## Requirement register
 
 ### Reliability (`REL`)
@@ -429,8 +497,8 @@ is recorded as ancillary only and does not satisfy repeated-rehearsal REL-004.
 | REL-001 | Eliminate golden-eval nondeterminism rather than masking it with reruns/timeouts. | Regression reproduces the retrieval/settlement defect; fixed fixture sealing, seeds, clocks, IDs, ordering, and completion; exact-SHA memory and Memvid repeat receipts. | `qualified` |
 | REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive targeted iterations on Windows, macOS, and Linux with no rerun; structured failure diagnostics. | `qualified` |
 | REL-003 | Use monotonic elapsed-time logic and explicitly await asynchronous state transitions. | Static/test coverage for every changed timing path; no wall-clock equality or timing-point authority assertion. | `qualified` |
-| REL-004 | Rehearse the release lifecycle repeatedly. | One exact candidate produces 20 consecutive unique-namespace rehearsals, zero flaky failures, and an aggregate receipt digest. | `not_started` |
-| REL-005 | Prove fresh artifact install, launch, and first mission on supported platforms. | Windows/macOS/Linux, Python 3.11–3.13 exact-wheel matrix starts the installed entry point, awaits readiness, completes a mock mission, and verifies cleanup. | `not_started` |
+| REL-004 | Rehearse the release lifecycle repeatedly. | One exact candidate produces 20 consecutive unique-namespace rehearsals, zero flaky failures, and an aggregate receipt digest. | `in_progress` |
+| REL-005 | Prove fresh artifact install, launch, and first mission on supported platforms. | Windows/macOS/Linux, Python 3.11–3.13 exact-wheel matrix starts the installed entry point, awaits readiness, completes a mock mission, and verifies cleanup. | `in_progress` |
 
 ### Release transaction (`RELEASE`)
 
@@ -486,7 +554,7 @@ is recorded as ancillary only and does not satisfy repeated-rehearsal REL-004.
 | S0 | Canonical source of truth and audited baseline | — | `qualified` |
 | S1 | Reliability root-cause fixes and 20-repeat platform receipt | S0 | `qualified` |
 | S2 | Exact-SHA candidate/promotion transaction | S1 | `qualified` |
-| S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `not_started` |
+| S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `in_progress` |
 | S4 | Live reviewer separation and truthful routing modes | S3 | `not_started` |
 | S5 | Default-on zero-authority shadow observation ledger | S4 | `not_started` |
 | S6 | Shadow verdict API and Workbench/Mission evidence | S5 | `not_started` |
@@ -684,5 +752,10 @@ trust.
 | PR342-2026-08-13-S1 | `894b31ce1d3b6353a4257948bbcd3e9912ceda2f` | `merged` | `dbe9313c8671e2ba7507f73cc434569a59ebf785` | Exact tree `e7cf79be8d95b5b307827ba694e00a7dda63c90b`; attempt-1 [push CI 31687437405](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31687437405) 14/14, [PR CI 31687440512](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31687440512) 14/14, and [determinism 31687440395](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31687440395) 7/7; aggregate artifact `9176317110`, API digest `9577de368e35a1480c8599612d25bb3b7718d199eaa47f947e8a63c55e2c1edf`, aggregate JSON SHA-256 `56efe738552d2dda94c7613a11a814c1f86db3d4f636d1d492545b01d89e71a5`; clean local 20-by-9 report SHA-256 `09610a24c64191858469835b544c0eaf1b58097e8361d998b39d9093f9ab9360`; [hosted Codex review](https://github.com/John-MiracleWorker/Kestrel/pull/342#issuecomment-5278658094) reviewed `894b31ce1d` with no major issue; zero unresolved review threads | Five of five cells, 100/100 repeats, 540 runtime and 840 golden executions, ordinary Windows, downstream Docker, and full local tests passed with zero failures, flakes, cleanup failures, or deadline overruns. This is exact-head candidate evidence; protected-main binding is recorded separately below. |
 | MAIN-2026-08-13-S1-QUAL | `dbe9313c8671e2ba7507f73cc434569a59ebf785` | `merged` | `dbe9313c8671e2ba7507f73cc434569a59ebf785` | Signed [PR #342](https://github.com/John-MiracleWorker/Kestrel/pull/342) merge, tree `e7cf79be8d95b5b307827ba694e00a7dda63c90b`, parents `deeb7138c755af7427e3ee11f6244bb1cf2dbf94` / `894b31ce1d3b6353a4257948bbcd3e9912ceda2f`; exact-main attempt-1 [CI 31690911759](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31690911759) 14/14, Windows `94417759252`, Docker `94426161166`; [determinism 31690911872](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31690911872) 7/7, aggregate artifact `9177709996`, API digest `c2fa169d0b69020b0243f277ca6fded03f762f61699f8372da87f0bc66ce0beb`, aggregate JSON SHA-256 `aa705501806927d73fa25d94ac702240e9a6319bfd0b4f73f42e0cbdfdeecb3f`; safe 146-file download and exact verifier replay; fresh clean detached-worktree command `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /Users/tiuni/.codex/worktrees/kestrel-v06-s1-channel-reliability/.venv/bin/python -m pytest -q` exited 0 with 5,298 tests, output SHA-256 `94094d68e15e8c90632114b1057c272051fca3bae62d8ac94b1a329832e0cc6a`, collection-output SHA-256 `10395c2052657482089ccfef26418bc73e0a183ad26b5266911347c50c6c6874`, command-record SHA-256 `49e40d97ce3f7144f7de354d70ddf072f60efc2185e02cc2cbee0409076350dd`, structured-receipt SHA-256 `08f27d84a5d16726f698b6c632ea50e8ec127959d97efa8422071c1e988164d8`, and owner-local receipt root `/Users/tiuni/.codex/evidence/kestrel-v06-s1-channel-reliability/dbe9313c8671e2ba7507f73cc434569a59ebf785/local-full-suite-2026-08-13`; ancillary attempt-1 [release rehearsal 31690911883](https://github.com/John-MiracleWorker/Kestrel/actions/runs/31690911883), artifact `9177349607`, API digest `b56c9ae721cac7ff05842e810eb5846d9861945659ec847758a61f9c056cc480`, report SHA-256 `d5564d46a8907299e0b2943ebadb26cd5db6b905320b8c096e797c4b4d122da2` | Protected-main closure passed 5/5 cells, 100/100 repeats, 540 runtime and 840 golden executions, zero failures/flakes/cleanup failures/diagnostics, plus ordinary Windows, LAN adversarial, Docker security controls, and local full regression. The owner-local path is not remotely retrievable; its recorded digests integrity-bind the retained receipt. Together with qualified S0 and the merged narrow owner exception, this qualifies only REL-001, REL-002, REL-003, and S1. The one rehearsal is ancillary: REL-004/REL-005, S2+, installed artifacts, promotion, publication, and final release qualification remain unsatisfied. |
 | MAIN-2026-08-18-S2-QUAL | `b812a34b0167d7bcb2a3b9ff30f3f41dea57a694` | `merged` | `a29b2e025749b6a1f4fdd78409062e4abdf4f921` | [PR #344](https://github.com/John-MiracleWorker/Kestrel/pull/344) head `b812a34b0167d7bcb2a3b9ff30f3f41dea57a694` merged as main commit `a29b2e025749b6a1f4fdd78409062e4abdf4f921` at 2026-08-18T16:27:12Z; exact-head attempt-1 [PR CI 32155171460](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32155171460) and [push CI 32155162922](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32155162922); exact-main attempt-1 [CI 32160373742](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32160373742) and [Release rehearsal 32160373734](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32160373734); all required hosted gates green on head `b812a34b` (CodeQL, python matrix 8 legs, runtime-reliability 3 legs, docker vulnerability policy, everyday-golden-determinism memory+memvid, web, desktop, secret-scan, foundational-integrations, extension-sandbox, browser-validation, flock-qualification, exact-SHA five-cell); review outcome CLEAN with the single prior GAP (Windows leg) resolved via `d60e5e8`, and the owner hands-off directive 2026-08-18 deferring the merge call to the orchestrator | S2 and RELEASE-001/002/003 move to `qualified`. 98 open CodeQL alerts remain on `main` (73 in `tests/`, dominated by `py/overly-permissive-file` on the test-pinned 0o644 recovery-capsule contract), pre-existing and left open by design; the CodeQL gate itself passed green and they do not block S2. The credential-rotation owner action (board card t_1c8926e9) is investigation-complete with a CLEAN review, but the actual owner rotation remains a v0.6 release gate and not an S2 blocker. REL-004/REL-005, S3+, installed artifacts, promotion, publication, and final v0.6 qualification remain unsatisfied. |
+
+| S3-2026-08-19-IMPL | `bcfc30d05e0f9ae95eb8f6b77bafe93b54ddee28` | `unmerged` | — | Branch `codex/v06-s3-rehearsal-installed-matrix`: commits `bcfc30d0` (battery + mission runner + workflows + tests), `69664c3` (readiness retry, unbuffered server logs, SBOM-before-checksums ordering, PR trigger), `f91c9d9` (uvicorn signal-death exit acceptance), `1dc3da4` (configurable readiness deadline); new tests 12 passed (battery + workflow pins), runner unit tests 6 passed with 1 opt-in integration skip, Ruff and mypy clean at every commit | Implementation evidence only; not qualification. |
+| S3-2026-08-19-REL005-MACOS | `bcfc30d05e0f9ae95eb8f6b77bafe93b54ddee28` | `unmerged` | — | Exact payload wheel `nested_memvid_agent-0.5.8-py3-none-any.whl` SHA-256 `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c`; three macOS cells: 3.11.15 receipt SHA-256 `83c118345f3539beb26949ab953abf600ec1fc41025026be8ab5efce7ecf00f6` (run `run_ec60b3acee804582b4c28f9615f4b1b9`), 3.12.12 receipt `c53f83966bdf4eb6be1f3b151aed11f29d4ee30b8e25b73c034e1a8ffcb54fd0` (run `run_def4d1827d6d4646aef20021fd46d44b`), 3.13.12 receipt `64fa1d0fef874d5bffc24e3ebd2060cf21b8f3a6823bdf826dbbb42ce8f3a82d` (run `run_3ab27cb9b763420da5f2f6b55f37b11b`); each: unauth 401, authed readiness ok, mock mission completed with non-empty assistant response, SIGTERM exit -15 accepted (uvicorn signal re-raise), port released, state lock released; owner-local evidence root `~/.codex/evidence/kestrel-v06-s3-rehearsal-installed-matrix/bcfc30d0` | Owner-local macOS evidence; Linux and Windows cells are the hosted 9-cell matrix at the exact PR head. |
+| S3-2026-08-19-REL004-LOCAL-PARTIAL | `bcfc30d05e0f9ae95eb8f6b77bafe93b54ddee28` | `unmerged` | — | Battery `--repeats 20`: rehearsals 1–6 of 20 completed consecutively in unique namespaces `kestrel-rehearsal-bcfc30d05e0f-001` … `-006` with zero flaky failures (per-rehearsal report SHA-256s `a0957f86269a81ca…`, `757fd495377913be…`, `d2ebf4df32906f22…`, `62243fee5fd55583…`, `26ca5cafd1acc656…`, `45a00457cf407300…`); the run was deliberately stopped at 6/20 to free the heavily loaded host for the REL-005 cells | Partial owner-local receipt; not the REL-004 acceptance evidence. The complete 20-repeat aggregate receipt is the hosted battery run at the exact PR head. |
+| S3-2026-08-19-REL004-FAILCLOSED | `bcfc30d05e0f9ae95eb8f6b77bafe93b54ddee28` | `unmerged` | — | First battery attempt failed rehearsal 2 of 20 with `source repository is not clean` after a mid-run working-tree edit; the battery exited nonzero naming the rehearsal index and wrote no aggregate receipt | Live observation of the zero-flaky fail-closed behavior; preserved as a failure receipt, never rewritten. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
