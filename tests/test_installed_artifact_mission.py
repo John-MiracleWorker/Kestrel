@@ -57,7 +57,8 @@ def test_clean_exit_code_accepts_signal_death_on_posix_only() -> None:
     assert _accepted_exit_code(0, os_name="posix") is True
     assert _accepted_exit_code(-signal_module.SIGTERM, os_name="posix") is True
     assert _accepted_exit_code(1, os_name="posix") is False
-    assert _accepted_exit_code(-signal_module.SIGKILL, os_name="posix") is False
+    # -9 is SIGKILL's numeric value on POSIX; other signal deaths are unclean.
+    assert _accepted_exit_code(-9, os_name="posix") is False
     assert _accepted_exit_code(1, os_name="nt") is True
 
 
