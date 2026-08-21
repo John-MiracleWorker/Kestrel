@@ -8,8 +8,6 @@ passed without trusted validation receipts.
 """
 from __future__ import annotations
 
-import pytest
-
 from nested_memvid_agent.routing.models import (
     AgentTaskContract,
     ModelTarget,
@@ -18,10 +16,10 @@ from nested_memvid_agent.routing.models import (
 )
 from nested_memvid_agent.routing.role_resolver import (
     GraphRoleAssignment,
+    ReviewAuthority,
     RoleAssignmentResolver,
     resolve_graph_roles,
 )
-from nested_memvid_agent.routing.router import RoutingUnavailableError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -149,8 +147,11 @@ class TestGraphRoleAssignment:
             policy=policy,
             mode="constrained",
         )
-        with pytest.raises(RoutingUnavailableError, match="no eligible routing target"):
-            resolver.resolve(EXEC_CONTRACT, PLAN_CONTRACT, REVIEW_CONTRACT)
+        assignment = resolver.resolve(EXEC_CONTRACT, PLAN_CONTRACT, REVIEW_CONTRACT)
+        assert assignment.reviewer_decision is None
+        assert assignment.review_fallback is True
+        assert assignment.review_authority == ReviewAuthority.DETERMINISTIC_FALLBACK
+        assert "review_target_not_independent" in assignment.review_rejection_reasons
 
     def test_review_diversity_policy_rejects_same_model_family(self):
         """When require_different_model_family_for_review is True, reviewer
@@ -169,8 +170,11 @@ class TestGraphRoleAssignment:
             policy=policy,
             mode="constrained",
         )
-        with pytest.raises(RoutingUnavailableError, match="no eligible routing target"):
-            resolver.resolve(EXEC_CONTRACT, PLAN_CONTRACT, REVIEW_CONTRACT)
+        assignment = resolver.resolve(EXEC_CONTRACT, PLAN_CONTRACT, REVIEW_CONTRACT)
+        assert assignment.reviewer_decision is None
+        assert assignment.review_fallback is True
+        assert assignment.review_authority == ReviewAuthority.DETERMINISTIC_FALLBACK
+        assert "review_model_family_not_independent" in assignment.review_rejection_reasons
 
 
 # ---------------------------------------------------------------------------
@@ -199,9 +203,11 @@ class TestReviewPrivacyPolicy:
             policy=RoutePolicy(),
             mode="constrained",
         )
-        with pytest.raises(RoutingUnavailableError) as exc_info:
-            resolver.resolve(EXEC_CONTRACT, PLAN_CONTRACT, local_contract)
-        assert "local_required" in exc_info.value.reason_codes
+        assignment = resolver.resolve(EXEC_CONTRACT, PLAN_CONTRACT, local_contract)
+        assert assignment.reviewer_decision is None
+        assert assignment.review_fallback is True
+        assert assignment.review_authority == ReviewAuthority.DETERMINISTIC_FALLBACK
+        assert "local_required" in assignment.review_rejection_reasons
 
     def test_reviewer_never_routes_to_forbidden_provider(self):
         """A reviewer contract with a forbidden provider profile is rejected."""
