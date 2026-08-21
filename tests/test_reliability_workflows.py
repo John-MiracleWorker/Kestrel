@@ -2166,8 +2166,11 @@ def test_runtime_reliability_matrix_runs_twenty_fresh_process_repeats_on_all_hos
     assert runtime["strategy"] == {
         "fail-fast": False,
         "matrix": {
-            "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
-            "python-version": ["3.11"],
+            "include": [
+                {"os": "ubuntu-latest", "python-version": "3.11.15"},
+                {"os": "macos-latest", "python-version": "3.11.9"},
+                {"os": "windows-latest", "python-version": "3.11.9"},
+            ],
         },
     }
     checkout = next(
