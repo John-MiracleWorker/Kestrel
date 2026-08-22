@@ -44,6 +44,7 @@ from .event_bus import RunEventBus
 from .event_log import redact_secrets
 from .graph_runtime import (
     DurableOrchestrationRuntime,
+    GraphRunState,
     GraphRuntimeServices,
     criterion_requires_validation_evidence,
     evaluate_turn_review,
@@ -3512,6 +3513,8 @@ class RunManager:
                 reconcile_root_task=self._reconcile_root_task,
                 is_cancelled=cancelled,
                 graph_amendments=self.graph_amendments,
+                review_authority_resolver=self._review_authority_resolver(),
+                build_reviewer_agent=self._build_reviewer_agent(),
             )
             try:
                 DurableOrchestrationRuntime(services).run_chat_turn(
@@ -5951,6 +5954,22 @@ class RunManager:
             ]
             for approval_id in expired:
                 self._approval_call_arguments.pop(approval_id, None)
+
+    def _review_authority_resolver(self) -> Callable[[GraphRunState], Any] | None:
+        """Live reviewer-separation hook (S4 / JOURNEY-004).
+
+        The base runtime does not route the graph reviewer through the role
+        resolver — ``evaluate_turn_review`` keeps its pre-S4 deterministic
+        behaviour.  ``AdaptiveFlockRunManager`` overrides this to return a
+        resolver that produces a durable ``GraphRoleAssignment``.
+        """
+
+        return None
+
+    def _build_reviewer_agent(self) -> Callable[[GraphRunState, Any], NestedMV2Agent | None] | None:
+        """Build a separate reviewer agent for an independent reviewer target."""
+
+        return None
 
     def _build_agent(self, config: AgentConfig) -> NestedMV2Agent:
         if self._shutdown_event.is_set():

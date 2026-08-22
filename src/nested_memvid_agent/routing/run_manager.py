@@ -4,10 +4,12 @@ from collections.abc import Callable
 from dataclasses import asdict, replace
 from threading import Lock
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 
+from ..agent import NestedMV2Agent
 from ..config import AgentConfig
 from ..event_bus import RunEventBus
+from ..graph_runtime import GraphRunState
 from ..mcp_manager import MCPManager
 from ..plugin_manager import PluginManager
 from ..projects import project_routing_constraints
@@ -21,10 +23,59 @@ from ..state_store import (
     TaskNodeRecord,
 )
 from .coordinator import DurableRoutingAssignment, DurableRoutingCoordinator
+from .models import AgentTaskContract, RoutingMode
 from .qualification_evidence import classify_failure_code, normalize_provider_attempt
+from .role_resolver import GraphRoleAssignment, RoleAssignmentResolver
 from .router import RoutingUnavailableError
+from .service import AdaptiveFlockRoutingService
 
 _TERMINAL_ROUTING_TASK_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def _graph_role_contracts(
+    ctx: GraphRunState,
+    *,
+    state: AgentStateStore,
+) -> tuple[AgentTaskContract, AgentTaskContract, AgentTaskContract]:
+    """Build executor/planner/reviewer contracts for the primary graph turn.
+
+    The graph runtime models planner/executor/reviewer as graph *nodes* over a
+    single root planner task, so there are no per-role task records to compile
+    from.  We synthesise three role contracts from the root task's durable
+    metadata (objective, risk, required tools) so the role resolver can route
+    each role independently.
+    """
+
+    tasks = state.list_task_nodes(ctx.run_id)
+    root = next(
+        (task for task in tasks if task.parent_id is None and task.profile == "planner"),
+        None,
+    )
+    objective = ctx.message.strip() or (root.goal if root is not None else "Run objective")
+    risk = root.risk if root is not None else "low"
+    required_tools = tuple(root.required_tools) if root is not None else ()
+    task_id = root.task_id if root is not None else ctx.run_id
+
+    def make(role: str, *, task_family: str, structured_output: bool) -> AgentTaskContract:
+        return AgentTaskContract(
+            task_id=task_id,
+            run_id=ctx.run_id,
+            role=role,
+            task_family=task_family,
+            objective=objective,
+            complexity=0.5,
+            ambiguity=0.4,
+            risk=risk,
+            required_tools=required_tools,
+            required_capabilities=("reasoning",) if role in {"planner", "reviewer"} else (),
+            structured_output_required=structured_output,
+        )
+
+    return (
+        make("executor", task_family="general", structured_output=False),
+        make("planner", task_family="planning", structured_output=True),
+        make("reviewer", task_family="review", structured_output=True),
+    )
 
 
 class AdaptiveFlockRunManager(RunManager):
@@ -75,6 +126,63 @@ class AdaptiveFlockRunManager(RunManager):
             read_only_observer=read_only_observer,
             auto_start=auto_start,
         )
+
+    def _review_authority_resolver(self) -> Callable[[GraphRunState], GraphRoleAssignment | None]:
+        coordinator = self.routing_coordinator
+
+        def resolve(ctx: GraphRunState) -> GraphRoleAssignment | None:
+            policy_entry = coordinator.ledger.get_policy(coordinator.policy_id)
+            if policy_entry is None or not policy_entry.enabled:
+                return None
+            profiles = tuple(
+                entry.profile for entry in coordinator.ledger.list_provider_profiles()
+            )
+            targets = tuple(entry.target for entry in coordinator.ledger.list_model_targets())
+            resolver = RoleAssignmentResolver(
+                profiles=profiles,
+                targets=targets,
+                policy=policy_entry.policy,
+                mode=cast(RoutingMode, coordinator.mode),
+            )
+            executor_contract, planner_contract, reviewer_contract = _graph_role_contracts(
+                ctx,
+                state=self.state,
+            )
+            return resolver.resolve(executor_contract, planner_contract, reviewer_contract)
+
+        return resolve
+
+    def _build_reviewer_agent(
+        self,
+    ) -> Callable[[GraphRunState, Any], NestedMV2Agent | None] | None:
+        coordinator = self.routing_coordinator
+
+        def build(ctx: GraphRunState, assignment: Any) -> NestedMV2Agent | None:
+            reviewer_decision = getattr(assignment, "reviewer_decision", None)
+            if reviewer_decision is None:
+                return None
+            # Shadow mode observes the independent reviewer target but must NOT
+            # execute the alternate provider call (SHADOW-001: no alternate
+            # provider call). Only constrained/adaptive decisions are actionable.
+            if not getattr(reviewer_decision, "actionable", False):
+                return None
+            policy_entry = coordinator.ledger.get_policy(coordinator.policy_id)
+            if policy_entry is None or not policy_entry.enabled:
+                return None
+            service = AdaptiveFlockRoutingService(
+                profiles=[
+                    entry.profile for entry in coordinator.ledger.list_provider_profiles()
+                ],
+                targets=[entry.target for entry in coordinator.ledger.list_model_targets()],
+                policy=policy_entry.policy,
+                mode=cast(RoutingMode, coordinator.mode),
+                lan_runtime_authority_resolver=coordinator.lan_runtime_authority_resolver,
+                clock=coordinator.clock,
+            )
+            reviewer_config = service.apply_decision(ctx.config, reviewer_decision)
+            return self._build_agent(reviewer_config)
+
+        return build
 
     def _prepare_scheduler_task_config(
         self,
