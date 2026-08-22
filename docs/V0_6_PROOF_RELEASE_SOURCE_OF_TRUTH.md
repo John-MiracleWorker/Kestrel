@@ -1,6 +1,6 @@
 # Kestrel v0.6 Proof Release — Source of Truth
 
-Last updated: 2026-08-19
+Last updated: 2026-08-21
 
 This document is the canonical program contract for the Kestrel v0.6 proof
 release. It translates the owner-approved release prompt into durable,
@@ -524,6 +524,68 @@ SHA; the five-cell gap is the pre-existing 3.11 patch drift owned by the
 separate pin-fix triage (PR #347, board card t_38674ee1) and is out of scope
 for this reflection.
 
+### S3 qualification closure (2026-08-21)
+
+[PR #347](https://github.com/John-MiracleWorker/Kestrel/pull/347)
+(`fix/pin-python-3-11-15-determinism`, head
+`ba199454bd821ade4dd4f9fefc5435051b689512` — the per-OS Python pin: Linux
+3.11.15, macOS/Windows 3.11.9) merged normally to protected `main` as signed
+commit `7b175e32ab9f849746f38f43786d819ab5722e25` at 2026-08-21T22:55:20Z. This
+is the pin-fix triage that was the sole remaining gap after the 2026-08-19 merge
+reflection; it resolves the exact-main five-cell patch drift by pinning the
+determinism workflow's Linux runtime cell to 3.11.15 and the macOS/Windows cells
+to 3.11.9. All exact-main hosted runs at `7b175e32` completed on attempt 1 with
+no rerun:
+
+- **Everyday golden determinism** [32534932310](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932310):
+  7/7 jobs green on attempt 1 — memory, memvid, flock-qualification-determinism,
+  runtime reliability on Linux (3.11.15), Windows (3.11.9), and macOS (3.11.9),
+  and the **Exact-SHA five-cell runtime reliability qualification** gate, which
+  was RED at `16144d67` and is now GREEN.
+- **CI** [32534932295](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932295):
+  14/14 jobs green on attempt 1.
+- **Release rehearsal battery** [32534932300](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932300):
+  20/20 rehearsals on attempt 1, unique namespaces
+  `kestrel-rehearsal-7b175e32ab9f-001` … `-020`, zero flaky failures; aggregate
+  artifact `9465119477`, aggregate receipt digest
+  `5947792d3f8b2ea8e04cc72a6e50d2b1d015916dacab5f5e276cc4758d477098` (recomputed
+  from the downloaded artifact and verified); uploaded artifact zip SHA-256
+  `aad498465851c58224a3b3a89917600efc398127d9013260f1ce3e66b9d7eb40`.
+- **Installed artifact mission matrix** [32534932330](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932330):
+  9/9 cells green on attempt 1 (Windows/macOS/Linux × Python 3.11/3.12/3.13);
+  every cell observed the unauthenticated 401 boundary, authenticated readiness,
+  a completed mock mission, and three-way cleanup (SIGTERM exit, port release,
+  state-lock release). Payload wheel
+  `nested_memvid_agent-0.5.8-py3-none-any.whl` SHA-256
+  `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c` (unchanged
+  from `16144d67` — PR #347 touches only the determinism workflow, not `src/` or
+  the package manifest); per-cell receipt SHA-256s macOS 3.11
+  `a9007f37…`, 3.12 `bee34988…`, 3.13 `9b27915b…`, Ubuntu 3.11 `862b8390…`,
+  3.12 `27312e33…`, 3.13 `0e661d58…`, Windows 3.11 `ba1ea64b…`, 3.12
+  `88f454ba…`, 3.13 `c699ed39…`; per-cell mission run IDs `run_e9fe4d15…`,
+  `run_aacc7c86…`, `run_4c5b0e35…`, `run_aeac1475…`, `run_fccdd095…`,
+  `run_f94a5ac4…`, `run_29d3f389…`, `run_cbb22323…`, `run_f8a151d8…`
+  (macOS/Ubuntu/Windows × 3.11/3.12/3.13 respectively).
+
+Review outcome on PR #347 is CLEAN/APPROVED (owner-orchestrator review
+t_3e5fd237); the single stale Codex P1 review thread
+(`.github/workflows/determinism.yml` — "3.11.15 not installable on macOS/Windows,
+use an installable version") was addressed by the per-OS pin in this PR and is
+now resolved (`reviewThreads` reports the one thread `isResolved: true`). Because
+PR #347 changes only the determinism workflow's Python pinning and no product
+code, the 20/20 battery and 9/9 matrix receipts from `16144d67` carry forward
+unchanged; both were independently re-verified green at `7b175e32` above.
+
+With the exact-main five-cell gate now green at `7b175e32`, and the 20/20 battery
+and 9/9 matrix receipts re-confirmed green at the same merged SHA, **REL-004,
+REL-005, and S3 move to `qualified`**. The failed and incomplete receipts
+(`S3-2026-08-19-REL004-FAILCLOSED`, `S3-2026-08-19-REL004-LOCAL-PARTIAL`, and
+the RED five-cell gate at `16144d67`) remain failures and are never rewritten.
+S4 becomes available to begin under its separately approved plan. This closure
+grants no evidence or authority for S4 or later slices, installed-artifact final
+release qualification, promotion, publication, post-publication verification, or
+final v0.6 qualification.
+
 ## Requirement register
 
 ### Reliability (`REL`)
@@ -533,8 +595,8 @@ for this reflection.
 | REL-001 | Eliminate golden-eval nondeterminism rather than masking it with reruns/timeouts. | Regression reproduces the retrieval/settlement defect; fixed fixture sealing, seeds, clocks, IDs, ordering, and completion; exact-SHA memory and Memvid repeat receipts. | `qualified` |
 | REL-002 | Remove Windows channel/full-runtime timing flakes with explicit synchronization. | Event/state-driven tests and 20 consecutive targeted iterations on Windows, macOS, and Linux with no rerun; structured failure diagnostics. | `qualified` |
 | REL-003 | Use monotonic elapsed-time logic and explicitly await asynchronous state transitions. | Static/test coverage for every changed timing path; no wall-clock equality or timing-point authority assertion. | `qualified` |
-| REL-004 | Rehearse the release lifecycle repeatedly. | One exact candidate produces 20 consecutive unique-namespace rehearsals, zero flaky failures, and an aggregate receipt digest. | `in_progress` |
-| REL-005 | Prove fresh artifact install, launch, and first mission on supported platforms. | Windows/macOS/Linux, Python 3.11–3.13 exact-wheel matrix starts the installed entry point, awaits readiness, completes a mock mission, and verifies cleanup. | `in_progress` |
+| REL-004 | Rehearse the release lifecycle repeatedly. | One exact candidate produces 20 consecutive unique-namespace rehearsals, zero flaky failures, and an aggregate receipt digest. | `qualified` |
+| REL-005 | Prove fresh artifact install, launch, and first mission on supported platforms. | Windows/macOS/Linux, Python 3.11–3.13 exact-wheel matrix starts the installed entry point, awaits readiness, completes a mock mission, and verifies cleanup. | `qualified` |
 
 ### Release transaction (`RELEASE`)
 
@@ -590,7 +652,7 @@ for this reflection.
 | S0 | Canonical source of truth and audited baseline | — | `qualified` |
 | S1 | Reliability root-cause fixes and 20-repeat platform receipt | S0 | `qualified` |
 | S2 | Exact-SHA candidate/promotion transaction | S1 | `qualified` |
-| S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `in_progress` |
+| S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `qualified` |
 | S4 | Live reviewer separation and truthful routing modes | S3 | `not_started` |
 | S5 | Default-on zero-authority shadow observation ledger | S4 | `not_started` |
 | S6 | Shadow verdict API and Workbench/Mission evidence | S5 | `not_started` |
@@ -794,5 +856,6 @@ trust.
 | S3-2026-08-19-REL004-LOCAL-PARTIAL | `bcfc30d05e0f9ae95eb8f6b77bafe93b54ddee28` | `unmerged` | — | Battery `--repeats 20`: rehearsals 1–6 of 20 completed consecutively in unique namespaces `kestrel-rehearsal-bcfc30d05e0f-001` … `-006` with zero flaky failures (per-rehearsal report SHA-256s `a0957f86269a81ca…`, `757fd495377913be…`, `d2ebf4df32906f22…`, `62243fee5fd55583…`, `26ca5cafd1acc656…`, `45a00457cf407300…`); the run was deliberately stopped at 6/20 to free the heavily loaded host for the REL-005 cells | Partial owner-local receipt; not the REL-004 acceptance evidence. The complete 20-repeat aggregate receipt is the hosted battery run at the exact PR head. |
 | S3-2026-08-19-REL004-FAILCLOSED | `bcfc30d05e0f9ae95eb8f6b77bafe93b54ddee28` | `unmerged` | — | First battery attempt failed rehearsal 2 of 20 with `source repository is not clean` after a mid-run working-tree edit; the battery exited nonzero naming the rehearsal index and wrote no aggregate receipt | Live observation of the zero-flaky fail-closed behavior; preserved as a failure receipt, never rewritten. |
 | MAIN-2026-08-19-S3-MERGE | `d8b6430537c907ea79f9af7bf39618159772a4f3` | `merged` | `16144d677cf03f1201b81aa308b19ff47d34e0d7` | [PR #348](https://github.com/John-MiracleWorker/Kestrel/pull/348) head `d8b6430537c907ea79f9af7bf39618159772a4f3` merged as main commit `16144d677cf03f1201b81aa308b19ff47d34e0d7` at 2026-08-19T16:33:14Z; exact-head attempt-1 [release rehearsal battery 32267779248](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32267779248) and [9-cell mission matrix 32267779245](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32267779245); exact-main attempt-1 [CI 32276568339](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568339) 14/14 jobs, [release rehearsal battery 32276568375](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568375) 20/20 rehearsals with aggregate artifact `9374264473` and receipt digest `664e615d13fe4ea7d39eb6d55d039796ebc48515bc0d012e68f6db857c7e1fa0` (recomputed from the downloaded artifact and verified), [installed artifact mission matrix 32276568481](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568481) 9/9 cells green at `16144d67` (payload wheel SHA-256 `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c`; per-cell receipt SHA-256s macOS 3.11 `5c2d1479…`, 3.12 `01992917…`, 3.13 `a2dc581f…`, Ubuntu 3.11 `3179f05a…`, 3.12 `d5f28534…`, 3.13 `b52348bb…`, Windows 3.11 `0ab37f3d…`, 3.12 `c00c55f3…`, 3.13 `9cea697d…`), [everyday golden determinism 32276568396](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568396) 6/7 (memory artifact `9374459713`, memvid `9375173937`, flock-qualification-determinism `9374241844`, runtime reliability Linux/Windows/macOS green; exact-SHA five-cell RED); review outcome CLEAN (no GAP) | REL-004 and REL-005 exact-main receipts are green at `16144d67` (20/20 battery, 9/9 matrix), but S3, REL-004, and REL-005 REMAIN `in_progress` — no qualification claimed — because the exact-main five-cell gate is RED: `qualification rejected: Linux runtime, memory, and Memvid cells must use the same Python patch version` (floating `python-version: "3.11"` resolved 3.11.16 against the 3.11.15-pinned cells). That pre-existing 3.11 patch drift is owned by the separate pin-fix triage (PR #347, board card t_38674ee1) and is out of scope for this receipt; S3 cannot become `qualified` until the five-cell gate is green at the merged main SHA. Hosted artifact digests are retained owner-locally under `~/.codex/evidence/kestrel-v06-s3-rehearsal-installed-matrix/`. |
+| MAIN-2026-08-21-S3-QUAL | `7b175e32ab9f849746f38f43786d819ab5722e25` | `merged` | `7b175e32ab9f849746f38f43786d819ab5722e25` | [PR #347](https://github.com/John-MiracleWorker/Kestrel/pull/347) head `ba199454bd821ade4dd4f9fefc5435051b689512` merged normally as protected-main commit `7b175e32ab9f849746f38f43786d819ab5722e25` at 2026-08-21T22:55:20Z (per-OS Python pin: Linux 3.11.15, macOS/Windows 3.11.9); exact-main attempt-1 [CI 32534932295](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932295) 14/14 jobs, [everyday golden determinism 32534932310](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932310) 7/7 jobs including the **Exact-SHA five-cell runtime reliability qualification** gate (previously RED at `16144d67`), [release rehearsal battery 32534932300](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932300) 20/20 rehearsals with aggregate artifact `9465119477` and receipt digest `5947792d3f8b2ea8e04cc72a6e50d2b1d015916dacab5f5e276cc4758d477098` (uploaded artifact zip SHA-256 `aad498465851c58224a3b3a89917600efc398127d9013260f1ce3e66b9d7eb40`), [installed artifact mission matrix 32534932330](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932330) 9/9 cells green at `7b175e32` (payload wheel SHA-256 `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c`; per-cell receipt SHA-256s macOS 3.11 `a9007f37…`, 3.12 `bee34988…`, 3.13 `9b27915b…`, Ubuntu 3.11 `862b8390…`, 3.12 `27312e33…`, 3.13 `0e661d58…`, Windows 3.11 `ba1ea64b…`, 3.12 `88f454ba…`, 3.13 `c699ed39…`); review CLEAN/APPROVED (owner-orchestrator review t_3e5fd237), the single stale Codex P1 thread resolved (`reviewThreads` → `isResolved: true`) | The exact-main five-cell gate is now green at `7b175e32`, binding S3/REL-004/REL-005 to `qualified` with the 20/20 battery and 9/9 matrix re-verified at the same merged SHA. The failed/incomplete receipts (`S3-2026-08-19-REL004-FAILCLOSED`, `S3-2026-08-19-REL004-LOCAL-PARTIAL`, and the RED five-cell gate at `16144d67`) remain failures and are never rewritten. S4 becomes available; no S4+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
