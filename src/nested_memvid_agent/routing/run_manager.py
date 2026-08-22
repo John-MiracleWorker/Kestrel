@@ -23,10 +23,10 @@ from ..state_store import (
     TaskNodeRecord,
 )
 from .coordinator import DurableRoutingAssignment, DurableRoutingCoordinator
-from .models import AgentTaskContract, RoutingMode
+from .models import AgentTaskContract, ModelTarget, ProviderProfile, RoutingMode
 from .qualification_evidence import classify_failure_code, normalize_provider_attempt
 from .role_resolver import GraphRoleAssignment, RoleAssignmentResolver
-from .router import RoutingUnavailableError
+from .router import ReviewDiversityContext, RoutingUnavailableError
 from .service import AdaptiveFlockRoutingService
 
 _TERMINAL_ROUTING_TASK_STATUSES = {"completed", "failed", "cancelled"}
@@ -56,6 +56,8 @@ def _graph_role_contracts(
     required_tools = tuple(root.required_tools) if root is not None else ()
     task_id = root.task_id if root is not None else ctx.run_id
 
+    constraints = _graph_role_project_constraints(ctx, state=state)
+
     def make(role: str, *, task_family: str, structured_output: bool) -> AgentTaskContract:
         return AgentTaskContract(
             task_id=task_id,
@@ -69,6 +71,13 @@ def _graph_role_contracts(
             required_tools=required_tools,
             required_capabilities=("reasoning",) if role in {"planner", "reviewer"} else (),
             structured_output_required=structured_output,
+            privacy_class=constraints["privacy_class"],
+            local_required=constraints["local_required"],
+            maximum_cost_usd=constraints["maximum_cost_usd"],
+            allowed_target_ids=constraints["allowed_target_ids"],
+            forbidden_target_ids=constraints["forbidden_target_ids"],
+            allowed_provider_profiles=constraints["allowed_provider_profiles"],
+            forbidden_provider_profiles=constraints["forbidden_provider_profiles"],
         )
 
     return (
@@ -76,6 +85,79 @@ def _graph_role_contracts(
         make("planner", task_family="planning", structured_output=True),
         make("reviewer", task_family="review", structured_output=True),
     )
+
+
+def _graph_role_project_constraints(
+    ctx: GraphRunState,
+    *,
+    state: AgentStateStore,
+) -> dict[str, Any]:
+    """Compile the run's project routing policy into graph role constraints.
+
+    The graph roles are synthesized from the root task, but they must still
+    honour the run's project routing policy — otherwise a local-required or
+    provider-restricted project's separate reviewer could be built for a
+    cloud/prohibited target and receive the objective/response.  When the run
+    is not project-bound, the contracts keep their default (unrestricted)
+    constraint fields.
+    """
+
+    run = state.get_run(ctx.run_id)
+    if run.project_id is None:
+        return {
+            "privacy_class": "approved_cloud",
+            "local_required": False,
+            "maximum_cost_usd": None,
+            "allowed_target_ids": (),
+            "forbidden_target_ids": (),
+            "allowed_provider_profiles": (),
+            "forbidden_provider_profiles": (),
+        }
+    project = state.get_project(run.project_id)
+    compiled = project_routing_constraints(project)
+    return {
+        "privacy_class": compiled["default_privacy_class"],
+        "local_required": bool(compiled["local_required"]),
+        "maximum_cost_usd": project.cost_budget,
+        "allowed_target_ids": compiled["allowed_target_ids"],
+        "forbidden_target_ids": compiled["forbidden_target_ids"],
+        "allowed_provider_profiles": compiled["allowed_provider_profiles"],
+        "forbidden_provider_profiles": compiled["forbidden_provider_profiles"],
+    }
+
+
+def _executor_diversity_anchor(
+    config: AgentConfig,
+    *,
+    targets: tuple[ModelTarget, ...],
+    profiles: tuple[ProviderProfile, ...],
+) -> ReviewDiversityContext | None:
+    """Derive the reviewer diversity anchor from the *executed* config.
+
+    The graph executor runs ``ctx.config`` directly (it is not routed through
+    the ledger), so the ledger's synthetic executor decision is not the config
+    that actually executed.  Anchor reviewer diversity to the ledger target
+    matching ``ctx.config``'s provider+model so a reviewer routed to the same
+    provider/model as the real executor is never mis-labeled ``independent``.
+
+    Returns ``None`` when the executed config matches no ledger target (a
+    direct provider outside the ledger), in which case the resolver falls back
+    to the synthetic executor decision.
+    """
+
+    profile_by_id = {profile.profile_id: profile for profile in profiles}
+    for target in targets:
+        profile = profile_by_id.get(target.provider_profile_id)
+        if profile is None:
+            continue
+        if profile.adapter == config.provider and target.model == config.model:
+            family = str(target.metadata.get("model_family", "")).strip()
+            return ReviewDiversityContext(
+                target_id=target.target_id,
+                provider_profile_id=target.provider_profile_id,
+                model_family=family or None,
+            )
+    return None
 
 
 class AdaptiveFlockRunManager(RunManager):
@@ -148,7 +230,17 @@ class AdaptiveFlockRunManager(RunManager):
                 ctx,
                 state=self.state,
             )
-            return resolver.resolve(executor_contract, planner_contract, reviewer_contract)
+            executor_diversity_context = _executor_diversity_anchor(
+                ctx.config,
+                targets=targets,
+                profiles=profiles,
+            )
+            return resolver.resolve(
+                executor_contract,
+                planner_contract,
+                reviewer_contract,
+                executor_diversity_context=executor_diversity_context,
+            )
 
         return resolve
 

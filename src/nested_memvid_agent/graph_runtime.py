@@ -312,22 +312,31 @@ class ReviewerNode:
                         reviewer_agent = services.build_reviewer_agent(ctx, review_assignment)
                     except Exception:  # noqa: BLE001 - executor agent remains the fallback
                         reviewer_agent = None
-            ctx.review = evaluate_turn_review(
-                message=ctx.message,
-                config=ctx.config,
-                result=ctx.result,
-                exception=ctx.exception,
-                root_task=root,
-                agent=ctx.agent,
-                review_assignment=review_assignment,
-                reviewer_agent=reviewer_agent,
-            )
-            if root is not None:
-                _persist_review_on_root(services.state, root, ctx.review)
-            services.events.publish(
-                ctx.run_id, "review.completed", {"node": self.name, **ctx.review}
-            )
-            span.set_result(status=str(ctx.review["status"]), output=ctx.review)
+            try:
+                ctx.review = evaluate_turn_review(
+                    message=ctx.message,
+                    config=ctx.config,
+                    result=ctx.result,
+                    exception=ctx.exception,
+                    root_task=root,
+                    agent=ctx.agent,
+                    review_assignment=review_assignment,
+                    reviewer_agent=reviewer_agent,
+                )
+                if root is not None:
+                    _persist_review_on_root(services.state, root, ctx.review)
+                services.events.publish(
+                    ctx.run_id, "review.completed", {"node": self.name, **ctx.review}
+                )
+                span.set_result(status=str(ctx.review["status"]), output=ctx.review)
+            finally:
+                # The separate reviewer agent holds its own Memvid handles and
+                # a concurrency slot; it is never attached to ``ctx.agent``, so
+                # the Finalizer/run-loop close paths do not see it.  Close it
+                # here on every path that built it so each reviewed turn cannot
+                # leak the reviewer's resources until process exit.
+                if reviewer_agent is not None:
+                    services.close_agent(ctx.run_id, reviewer_agent)
 
 
 def evaluate_turn_review(

@@ -457,6 +457,7 @@ def _node_services(
     resolver: Any,
     builder: Any | None,
     state: _State,
+    close_agent: Any = None,
 ) -> Any:
     from types import SimpleNamespace
 
@@ -466,6 +467,7 @@ def _node_services(
         events=_Events(),
         review_authority_resolver=resolver,
         build_reviewer_agent=builder,
+        close_agent=close_agent if close_agent is not None else (lambda _run_id, _agent: None),
     )
 
 
@@ -560,4 +562,66 @@ class TestReviewerNodeWiring:
         assert ctx.review["review_authority"] == "independent_target"
         assert built and built[0][1] is assignment
         assert ctx.review["artifact"]["provider"]["model"] == "review-model"
+
+    def test_node_closes_separate_reviewer_agent(self):
+        from nested_memvid_agent.graph_runtime import GraphRunState, ReviewerNode
+
+        independent = (
+            _target("tgt-exec", "prov-a", model="exec-model", model_family="family-a"),
+            _target(
+                "tgt-review",
+                "prov-b",
+                model="review-model",
+                model_family="family-b",
+                role_affinities=("reviewer",),
+            ),
+        )
+        assignment = _assignment(targets=independent)
+        assert assignment.review_authority.value == "independent_target"
+
+        reviewer_agent = _agent(
+            _StructuredMockProvider(
+                canned=[
+                    LLMResponse(
+                        content=(
+                            '{"verdict":"pass","summary":"ok","criteria":['
+                            '{"criterion":"The answer is concrete.","status":"satisfied",'
+                            '"evidence_refs":["assistant_response"],"reason":"evident"}],'
+                            '"remaining_risks":[],"confidence":0.9}'
+                        )
+                    )
+                ]
+            ),
+            replace(_config("openai_compatible"), model="review-model"),
+        )
+        closed: list[tuple[str, Any]] = []
+
+        def resolver(ctx: Any) -> Any:
+            return assignment
+
+        def builder(ctx: Any, resolved: Any) -> Any:
+            return reviewer_agent
+
+        def close_agent(run_id: str, agent: Any) -> None:
+            closed.append((run_id, agent))
+
+        state = _State(_root())
+        services = _node_services(
+            resolver=resolver, builder=builder, state=state, close_agent=close_agent
+        )
+        ctx = GraphRunState(
+            run_id="r",
+            config=_config("mock"),
+            message="Solve it.",
+            session_id="s",
+            agent=_agent(_StructuredMockProvider(), _config("mock")),
+            result=_turn(),
+        )
+
+        ReviewerNode().run(ctx, services, "span-0")
+
+        assert ctx.review["review_authority"] == "independent_target"
+        # The separate reviewer agent must be closed exactly once, with the run
+        # id and the reviewer agent it was built for.
+        assert closed == [("r", reviewer_agent)]
 

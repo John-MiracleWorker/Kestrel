@@ -114,12 +114,22 @@ class RoleAssignmentResolver:
         executor_contract: AgentTaskContract,
         planner_contract: AgentTaskContract,
         reviewer_contract: AgentTaskContract,
+        *,
+        executor_diversity_context: ReviewDiversityContext | None = None,
     ) -> GraphRoleAssignment:
         """Resolve all three role decisions in one call.
 
         The executor decision is always required. If the planner or reviewer
         has no eligible target, the corresponding decision is ``None`` and the
         caller must handle the fallback.
+
+        ``executor_diversity_context`` overrides the reviewer diversity anchor
+        with the *actually executed* executor identity.  The synthesized
+        executor contract routes the ledger's choice, but in direct-provider /
+        constrained runs the real executor is ``ctx.config`` — so a caller that
+        has the executed config must pass the matching anchor here, or the
+        reviewer can be labeled independent of a synthetic executor while being
+        identical to the one that actually ran.
         """
         executor_decision = self._route_role(executor_contract, review_context=None)
 
@@ -142,14 +152,16 @@ class RoleAssignmentResolver:
                 review_authority=ReviewAuthority.OFF_MODE_ABSTAINED,
             )
 
-        reviewer_context = ReviewDiversityContext(
-            target_id=executor_decision.selected_target.target_id,
-            provider_profile_id=executor_decision.selected_target.provider_profile_id,
-            model_family=str(
-                executor_decision.selected_target.metadata.get("model_family", "")
-            ).strip()
-            or None,
-        )
+        reviewer_context = executor_diversity_context
+        if reviewer_context is None:
+            reviewer_context = ReviewDiversityContext(
+                target_id=executor_decision.selected_target.target_id,
+                provider_profile_id=executor_decision.selected_target.provider_profile_id,
+                model_family=str(
+                    executor_decision.selected_target.metadata.get("model_family", "")
+                ).strip()
+                or None,
+            )
 
         reviewer_decision: RouteDecision | None = None
         review_fallback = False
@@ -222,6 +234,7 @@ def resolve_graph_roles(
     targets: tuple[ModelTarget, ...] | list[ModelTarget],
     policy: RoutePolicy | None = None,
     mode: RoutingMode = "shadow",
+    executor_diversity_context: ReviewDiversityContext | None = None,
 ) -> GraphRoleAssignment:
     """Convenience wrapper around ``RoleAssignmentResolver.resolve``."""
     resolver = RoleAssignmentResolver(
@@ -230,4 +243,9 @@ def resolve_graph_roles(
         policy=policy,
         mode=mode,
     )
-    return resolver.resolve(executor_contract, planner_contract, reviewer_contract)
+    return resolver.resolve(
+        executor_contract,
+        planner_contract,
+        reviewer_contract,
+        executor_diversity_context=executor_diversity_context,
+    )
