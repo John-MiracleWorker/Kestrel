@@ -377,7 +377,7 @@ def test_routing_v3_migrates_to_v4_without_rewriting_existing_evidence(
 ) -> None:
     before = routing_and_lan_digest(v3_state)
     ledger = RoutingLedger(v3_state)
-    assert ledger.schema_version() == 4
+    assert ledger.schema_version() == 5
     assert routing_and_lan_digest(v3_state) == before
 
 
