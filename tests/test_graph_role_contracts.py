@@ -17,11 +17,18 @@ from __future__ import annotations
 import os
 from typing import Any
 
+import pytest
+
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.graph_runtime import GraphRunState
 from nested_memvid_agent.routing.coordinator import DurableRoutingCoordinator
 from nested_memvid_agent.routing.ledger import RoutingLedger
-from nested_memvid_agent.routing.models import ModelTarget, ProviderProfile, RoutePolicy
+from nested_memvid_agent.routing.models import (
+    ModelTarget,
+    ProviderProfile,
+    RouteDecision,
+    RoutePolicy,
+)
 from nested_memvid_agent.routing.role_resolver import ReviewAuthority, RoleAssignmentResolver
 from nested_memvid_agent.routing.run_manager import (
     AdaptiveFlockRunManager,
@@ -364,3 +371,147 @@ class TestExecutorDiversityAnchorHelper:
             profiles=profiles,
         )
         assert anchor is None
+
+
+# ---------------------------------------------------------------------------
+# P2: the graph role reviewer contract must carry the REMAINING project budget
+#     (full budget minus prior actionable routing spend), mirroring the
+#     scheduler path.
+# ---------------------------------------------------------------------------
+
+
+class TestGraphRoleRemainingBudget:
+    def _budget_state(self, tmp_path: Any, *, cost_budget: float) -> AgentStateStore:
+        state = AgentStateStore(tmp_path / "state" / "agent.db")
+        repo = os.path.realpath(str(tmp_path))
+        state.create_project(
+            project_id="proj",
+            display_name="Proj",
+            repository_path=repo,
+            privacy_class="approved_cloud",
+            cost_budget=cost_budget,
+        )
+        state.create_run(
+            run_id="run-budget",
+            message="review budgeted work",
+            session_id="s",
+            workspace=repo,
+            provider="mock",
+            model="mock",
+            project_id="proj",
+        )
+        state.create_task_node(
+            task_id="root",
+            run_id="run-budget",
+            title="Plan",
+            goal="Review budgeted work.",
+            profile="planner",
+            approved=True,
+            required_tools=(),
+            risk="low",
+            acceptance_criteria=(),
+        )
+        return state
+
+    def _record_prior_spend(
+        self,
+        state: AgentStateStore,
+        *,
+        run_id: str,
+        task_id: str,
+        estimated_cost_usd: float,
+    ) -> None:
+        ledger = RoutingLedger(state)
+        profile = ProviderProfile(
+            profile_id="prov-cloud",
+            display_name="Cloud",
+            adapter="openai_compatible",
+            base_url="https://example.com",
+            secret_ref="secret://cloud",
+            locality="cloud",
+        )
+        target = ModelTarget(
+            target_id="tgt-prior",
+            provider_profile_id="prov-cloud",
+            provider="openai_compatible",
+            model="prior-model",
+            locality="cloud",
+            role_affinities=("worker",),
+            quality_tier=4,
+            supports_json=True,
+            estimated_cost_usd=estimated_cost_usd,
+        )
+        ledger.put_provider_profile(profile)
+        ledger.put_model_target(target)
+        policy_entry = ledger.put_policy(RoutePolicy())
+        decision = RouteDecision(
+            mode="constrained",
+            policy_id="balanced",
+            contract_digest="digest",
+            selected_target=target,
+            selection_kind="static",
+            score=1.0,
+            reason_codes=("selected",),
+            candidates=(),
+            actionable=True,
+        )
+        ledger.record_decision(
+            decision_id="prior-decision",
+            run_id=run_id,
+            task_id=task_id,
+            subagent_id=None,
+            attempt=1,
+            decision=decision,
+            policy_revision=policy_entry.revision,
+        )
+
+    def test_reviewer_contract_carries_remaining_budget(self, tmp_path: Any) -> None:
+        state = self._budget_state(tmp_path, cost_budget=2.0)
+        self._record_prior_spend(
+            state, run_id="run-budget", task_id="root", estimated_cost_usd=1.25
+        )
+
+        _, _, reviewer = _graph_role_contracts(_ctx("run-budget"), state=state)
+        assert reviewer.maximum_cost_usd == pytest.approx(0.75)
+
+    def test_reviewer_target_over_remaining_budget_is_not_eligible(
+        self, tmp_path: Any
+    ) -> None:
+        state = self._budget_state(tmp_path, cost_budget=2.0)
+        self._record_prior_spend(
+            state, run_id="run-budget", task_id="root", estimated_cost_usd=1.25
+        )
+        executor, planner, reviewer = _graph_role_contracts(_ctx("run-budget"), state=state)
+        assert reviewer.maximum_cost_usd == pytest.approx(0.75)
+
+        from datetime import UTC, datetime
+
+        from nested_memvid_agent.routing.router import (
+            ReviewDiversityContext,
+            evaluate_target_eligibility,
+        )
+
+        over_budget_reviewer = ModelTarget(
+            target_id="tgt-review",
+            provider_profile_id="prov-cloud",
+            provider="openai_compatible",
+            model="review-model",
+            locality="cloud",
+            role_affinities=("reviewer",),
+            supports_json=True,
+            supports_reasoning=True,
+            quality_tier=4,
+            estimated_cost_usd=1.0,
+        )
+        eligibility = evaluate_target_eligibility(
+            reviewer,
+            over_budget_reviewer,
+            RoutePolicy(),
+            review_context=ReviewDiversityContext(),
+            now=datetime.now(UTC),
+        )
+
+        # Over the remaining budget (0.75): must NOT be eligible, and the
+        # truthful cost-budget rejection reason must be present.
+        assert eligibility.eligible is False
+        assert "task_cost_budget_exceeded" in eligibility.reason_codes

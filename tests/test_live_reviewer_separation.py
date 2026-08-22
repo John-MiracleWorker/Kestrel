@@ -62,6 +62,23 @@ class _StructuredMockProvider(MockLLMProvider):
         return super().generate(messages, tools, options)
 
 
+class _RecordingProvider(_StructuredMockProvider):
+    """Structured mock that records whether ``generate`` was invoked."""
+
+    def __init__(self, canned: list[LLMResponse] | None = None) -> None:
+        super().__init__(canned=canned)
+        self.generate_calls = 0
+
+    def generate(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        options: LLMOptions | None = None,
+    ) -> LLMResponse:
+        self.generate_calls += 1
+        return super().generate(messages, tools, options)
+
+
 class _FakeAgent:
     """Minimal reviewer/executor agent double for the live review boundary."""
 
@@ -201,7 +218,7 @@ class TestIndependentTargetRouting:
         assignment = _assignment(targets=independent)
         assert assignment.review_authority.value == "independent_target"
 
-        executor_agent = _agent(_StructuredMockProvider(), _config("mock"))
+        executor_agent = _agent(_StructuredMockProvider(), _config("openai_compatible"))
         reviewer_agent = _agent(
             _StructuredMockProvider(
                 canned=[
@@ -220,7 +237,7 @@ class TestIndependentTargetRouting:
 
         review = evaluate_turn_review(
             message="Solve it.",
-            config=_config("mock"),
+            config=_config("openai_compatible"),
             result=_turn(),
             root_task=_root(),
             agent=executor_agent,
@@ -256,10 +273,10 @@ class TestIndependentTargetRouting:
         # downgraded to a same-agent review — it is a truthful fallback.
         review = evaluate_turn_review(
             message="Solve it.",
-            config=_config("mock"),
+            config=_config("openai_compatible"),
             result=_turn(),
             root_task=_root(),
-            agent=_agent(_StructuredMockProvider(), _config("mock")),
+            agent=_agent(_StructuredMockProvider(), _config("openai_compatible")),
             review_assignment=assignment,
             reviewer_agent=None,
         )
@@ -268,6 +285,64 @@ class TestIndependentTargetRouting:
         assert review["review_fallback"] is True
         assert review["off_mode_abstained"] is False
         assert review["review_rejection_reasons"] == ["reviewer_agent_unavailable"]
+
+
+# ---------------------------------------------------------------------------
+# 1b. Semantic opt-in — an independent reviewer target must not make a
+#     provider call when semantic orchestration is disabled.
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticOptInGate:
+    def test_independent_target_without_semantic_opt_in_falls_back_truthfully(self):
+        independent = (
+            _target("tgt-exec", "prov-a", model="exec-model", model_family="family-a"),
+            _target(
+                "tgt-review",
+                "prov-b",
+                model="review-model",
+                model_family="family-b",
+                role_affinities=("reviewer",),
+            ),
+        )
+        assignment = _assignment(targets=independent)
+        assert assignment.review_authority.value == "independent_target"
+
+        # A reviewer agent that WOULD pass if invoked — but semantic
+        # orchestration is off, so its provider must never be called.
+        reviewer_provider = _RecordingProvider(
+            canned=[
+                LLMResponse(
+                    content=(
+                        '{"verdict":"pass","summary":"ok","criteria":['
+                        '{"criterion":"The answer is concrete.","status":"satisfied",'
+                        '"evidence_refs":["assistant_response"],"reason":"evident"}],'
+                        '"remaining_risks":[],"confidence":0.9}'
+                    )
+                )
+            ]
+        )
+        reviewer_agent = _agent(reviewer_provider, _config("openai_compatible"))
+
+        review = evaluate_turn_review(
+            message="Solve it.",
+            config=_config("mock"),  # enable_semantic_orchestration=False
+            result=_turn(),
+            root_task=_root(),
+            agent=_agent(_StructuredMockProvider(), _config("mock")),
+            review_assignment=assignment,
+            reviewer_agent=reviewer_agent,
+        )
+
+        # The provider review was gated out and the deterministic evidence gate
+        # is the truthful review authority.
+        assert reviewer_provider.generate_calls == 0
+        assert review["review_authority"] == "deterministic_fallback"
+        assert review["review_fallback"] is True
+        assert review["off_mode_abstained"] is False
+        assert review["provider_review_status"] == "not_attempted"
+        assert review["review_rejection_reasons"] == ["semantic_review_not_enabled"]
+        assert review["artifact"]["evaluator"] == "deterministic_runtime_evidence"
 
 
 # ---------------------------------------------------------------------------
@@ -550,10 +625,10 @@ class TestReviewerNodeWiring:
         services = _node_services(resolver=resolver, builder=builder, state=state)
         ctx = GraphRunState(
             run_id="r",
-            config=_config("mock"),
+            config=_config("openai_compatible"),
             message="Solve it.",
             session_id="s",
-            agent=_agent(_StructuredMockProvider(), _config("mock")),
+            agent=_agent(_StructuredMockProvider(), _config("openai_compatible")),
             result=_turn(),
         )
 
@@ -611,10 +686,10 @@ class TestReviewerNodeWiring:
         )
         ctx = GraphRunState(
             run_id="r",
-            config=_config("mock"),
+            config=_config("openai_compatible"),
             message="Solve it.",
             session_id="s",
-            agent=_agent(_StructuredMockProvider(), _config("mock")),
+            agent=_agent(_StructuredMockProvider(), _config("openai_compatible")),
             result=_turn(),
         )
 

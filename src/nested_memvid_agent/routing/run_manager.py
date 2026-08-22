@@ -23,6 +23,7 @@ from ..state_store import (
     TaskNodeRecord,
 )
 from .coordinator import DurableRoutingAssignment, DurableRoutingCoordinator
+from .ledger import RoutingLedger
 from .models import AgentTaskContract, ModelTarget, ProviderProfile, RoutingMode
 from .qualification_evidence import classify_failure_code, normalize_provider_attempt
 from .role_resolver import GraphRoleAssignment, RoleAssignmentResolver
@@ -87,6 +88,35 @@ def _graph_role_contracts(
     )
 
 
+def _remaining_project_budget(
+    *,
+    state: AgentStateStore,
+    run_id: str,
+    cost_budget: float | None,
+) -> float | None:
+    """Remaining project budget after prior actionable routing spend.
+
+    Mirrors the scheduler path's budget accounting (``_assign_with_project_policy``):
+    every prior actionable routing decision's estimated cost is subtracted from
+    the project's cost budget, clamped at zero. A prior actionable decision with
+    unattributed cost fails closed (``project_route_cost_unknown``).
+    """
+
+    if cost_budget is None:
+        return None
+    spent = 0.0
+    for decision in RoutingLedger(state).list_decisions(run_id=run_id):
+        if not decision.actionable:
+            continue
+        if decision.estimated_cost_usd is None:
+            raise RoutingUnavailableError(
+                "project route budget has unattributed prior estimated cost",
+                reason_codes=("project_route_cost_unknown",),
+            )
+        spent += decision.estimated_cost_usd
+    return max(0.0, cost_budget - spent)
+
+
 def _graph_role_project_constraints(
     ctx: GraphRunState,
     *,
@@ -118,7 +148,11 @@ def _graph_role_project_constraints(
     return {
         "privacy_class": compiled["default_privacy_class"],
         "local_required": bool(compiled["local_required"]),
-        "maximum_cost_usd": project.cost_budget,
+        "maximum_cost_usd": _remaining_project_budget(
+            state=state,
+            run_id=run.run_id,
+            cost_budget=project.cost_budget,
+        ),
         "allowed_target_ids": compiled["allowed_target_ids"],
         "forbidden_target_ids": compiled["forbidden_target_ids"],
         "allowed_provider_profiles": compiled["allowed_provider_profiles"],

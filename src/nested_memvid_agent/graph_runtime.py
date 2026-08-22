@@ -450,6 +450,23 @@ def evaluate_turn_review(
         # role is satisfied ONLY by routing the provider review through that
         # target's separate agent; it must never silently degrade to the
         # executor's agent and still claim independence.
+        #
+        # S4 semantic opt-in: the independent provider review is gated on the
+        # same semantic-orchestration opt-in as the legacy same-agent review.
+        # With the opt-in off (the default), the independent target must fall
+        # through to the deterministic evidence gate with a truthful label and
+        # must NOT make a reviewer provider call.
+        if not _semantic_review_opt_in(config):
+            return _deterministic_review_with_authority(
+                result=result,
+                root_task=root_task,
+                evidence=evidence,
+                review_authority=_REVIEW_AUTHORITY_FALLBACK,
+                off_mode_abstained=False,
+                review_fallback=True,
+                review_rejection_reasons=("semantic_review_not_enabled",),
+                provider_review_status="not_attempted",
+            )
         if reviewer_agent is None or not reviewer_agent.llm.capabilities.supports_json_mode:
             return _deterministic_review_with_authority(
                 result=result,
@@ -555,10 +572,22 @@ def _provider_orchestration_enabled(ctx: GraphRunState) -> bool:
     return ctx.config.enable_semantic_orchestration and ctx.config.provider != "mock"
 
 
+def _semantic_review_opt_in(config: AgentConfig) -> bool:
+    """Whether the run's config permits a reviewer provider call.
+
+    This is the semantic orchestration opt-in that the legacy
+    ``_provider_review_enabled`` gate checks.  The independent reviewer target
+    (S4 / JOURNEY-004) must honour the same opt-in: with semantic orchestration
+    left at its default ``False`` (or a mock provider), no reviewer provider
+    call may be made.
+    """
+
+    return bool(config.enable_semantic_orchestration and config.provider != "mock")
+
+
 def _provider_review_enabled(config: AgentConfig, agent: NestedMV2Agent | None) -> bool:
     return bool(
-        config.enable_semantic_orchestration
-        and config.provider != "mock"
+        _semantic_review_opt_in(config)
         and agent is not None
         and agent.llm.capabilities.supports_json_mode
     )
