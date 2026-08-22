@@ -1,6 +1,6 @@
 # Kestrel v0.6 Proof Release — Source of Truth
 
-Last updated: 2026-08-21
+Last updated: 2026-08-22
 
 This document is the canonical program contract for the Kestrel v0.6 proof
 release. It translates the owner-approved release prompt into durable,
@@ -586,6 +586,51 @@ grants no evidence or authority for S4 or later slices, installed-artifact final
 release qualification, promotion, publication, post-publication verification, or
 final v0.6 qualification.
 
+### S4 qualification closure (2026-08-22)
+
+[PR #354](https://github.com/John-MiracleWorker/Kestrel/pull/354)
+(`codex/v06-s4-live-reviewer-separation`, head
+`added767db1c95313119df17e2f125fdff096438` — "feat(S4/JOURNEY-004): truthful
+routing modes + live reviewer separation") merged to protected `main` as commit
+`5f7708389cfc8215846972204ad5ff0b01d2f163` at 2026-08-22T18:18:51Z. The branch
+carried the three original S4 review defects (reviewer diversity anchored to the
+executed config; project routing constraints injected into graph role contracts;
+separate reviewer agent closed after use) and the three follow-up review defects
+(semantic opt-in gating the independent reviewer call; approval continuations
+routed through the reviewer resolver/builder; remaining project budget applied to
+graph roles). All six are fixed at the executed code and pinned by behavioral
+regression tests that assert behavior, not text.
+
+All required hosted gates green at head `added767db` on attempt 1 (no rerun):
+
+- **CI push** [32587763892](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587763892)
+  and **CI pull_request** [32587766902](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587766902):
+  14/14 jobs green — python matrix (Ubuntu 3.11/3.12/3.13, macOS 3.11/3.12,
+  Windows 3.11), the `docker` container-vulnerability-policy check (the required
+  status check, integration 15368), CodeQL, web, desktop, secret-scan,
+  foundational-integrations, extension-sandbox, and browser-validation.
+- **Everyday golden determinism** [32587766901](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587766901):
+  7/7 jobs green — memory, memvid, flock-qualification-determinism, runtime
+  reliability on Linux (3.11.15)/Windows (3.11.9)/macOS (3.11.9), and the
+  **Exact-SHA five-cell runtime reliability qualification** gate.
+
+Review outcome on PR #354 is CLEAN (no GAP). The two hosted Codex reviews filed
+six threads (three original P1/P1/P2 plus three follow-up P1/P2/P2); all six are
+resolved with substantive tie-backs to the executed fixes — `reviewThreads`
+reports every thread `isResolved: true` — none dismissed as noise. The regression
+suite pins behavior: `TestSemanticOptInGate` asserts the reviewer provider is not
+called with semantic orchestration off (`generate_calls == 0`);
+`test_approval_continuation_routes_reviewer_through_resolver` asserts the
+continuation review carries `independent_target` authority and the separate
+reviewer agent is closed; `TestGraphRoleRemainingBudget` asserts the reviewer
+contract carries the remaining budget and rejects an over-budget target.
+
+With the merge at `5f770838` and every hosted gate green at the head, **JOURNEY-004
+and S4 move to `qualified`**. S5 becomes available under its separately approved
+plan. This closure grants no evidence or authority for S5 or later slices,
+installed-artifact final release qualification, promotion, publication,
+post-publication verification, or final v0.6 qualification.
+
 ## Requirement register
 
 ### Reliability (`REL`)
@@ -623,7 +668,7 @@ final v0.6 qualification.
 | JOURNEY-001 | Persist the accepted launch binding/preflight with the admitted run. | Additive state migration and reload test proving project revision, objective/plan digest, and preflight cannot be substituted. | `not_started` |
 | JOURNEY-002 | Expose one server-authored mission proof projection. | `kestrel.mission_proof.v1` aggregates contract, roles, routing, isolation, change, validation, review, risks, approval, shipping, capsule, learning, and explicit missing/stale evidence. | `not_started` |
 | JOURNEY-003 | Make Mission Control the coherent command center. | Repo selection through proof/approval/ship/learn works without navigating admin pages; UI never derives authority from presentation state. | `not_started` |
-| JOURNEY-004 | Meaningfully separate planner/executor/reviewer responsibility. | Durable role assignments show distinct qualified targets/model families where required, or an explicit non-independent deterministic fallback. | `not_started` |
+| JOURNEY-004 | Meaningfully separate planner/executor/reviewer responsibility. | Durable role assignments show distinct qualified targets/model families where required, or an explicit non-independent deterministic fallback. | `qualified` |
 | JOURNEY-005 | Prove safe shipping. | Owner-rejected path creates no commit; approved flagship creates the exact reviewed local commit; live PR path is separately credentialed, approved, and disposable. | `not_started` |
 | JOURNEY-006 | Prove useful learning across tasks. | Task A produces receipt-bound non-policy learning; Task B retrieves the exact record and succeeds within the bound while a no-memory control fails or uses more failed attempts. | `not_started` |
 
@@ -653,7 +698,7 @@ final v0.6 qualification.
 | S1 | Reliability root-cause fixes and 20-repeat platform receipt | S0 | `qualified` |
 | S2 | Exact-SHA candidate/promotion transaction | S1 | `qualified` |
 | S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `qualified` |
-| S4 | Live reviewer separation and truthful routing modes | S3 | `not_started` |
+| S4 | Live reviewer separation and truthful routing modes | S3 | `qualified` |
 | S5 | Default-on zero-authority shadow observation ledger | S4 | `not_started` |
 | S6 | Shadow verdict API and Workbench/Mission evidence | S5 | `not_started` |
 | S7 | Durable mission proof projection and retrieval references | S6 | `not_started` |
@@ -857,5 +902,6 @@ trust.
 | S3-2026-08-19-REL004-FAILCLOSED | `bcfc30d05e0f9ae95eb8f6b77bafe93b54ddee28` | `unmerged` | — | First battery attempt failed rehearsal 2 of 20 with `source repository is not clean` after a mid-run working-tree edit; the battery exited nonzero naming the rehearsal index and wrote no aggregate receipt | Live observation of the zero-flaky fail-closed behavior; preserved as a failure receipt, never rewritten. |
 | MAIN-2026-08-19-S3-MERGE | `d8b6430537c907ea79f9af7bf39618159772a4f3` | `merged` | `16144d677cf03f1201b81aa308b19ff47d34e0d7` | [PR #348](https://github.com/John-MiracleWorker/Kestrel/pull/348) head `d8b6430537c907ea79f9af7bf39618159772a4f3` merged as main commit `16144d677cf03f1201b81aa308b19ff47d34e0d7` at 2026-08-19T16:33:14Z; exact-head attempt-1 [release rehearsal battery 32267779248](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32267779248) and [9-cell mission matrix 32267779245](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32267779245); exact-main attempt-1 [CI 32276568339](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568339) 14/14 jobs, [release rehearsal battery 32276568375](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568375) 20/20 rehearsals with aggregate artifact `9374264473` and receipt digest `664e615d13fe4ea7d39eb6d55d039796ebc48515bc0d012e68f6db857c7e1fa0` (recomputed from the downloaded artifact and verified), [installed artifact mission matrix 32276568481](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568481) 9/9 cells green at `16144d67` (payload wheel SHA-256 `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c`; per-cell receipt SHA-256s macOS 3.11 `5c2d1479…`, 3.12 `01992917…`, 3.13 `a2dc581f…`, Ubuntu 3.11 `3179f05a…`, 3.12 `d5f28534…`, 3.13 `b52348bb…`, Windows 3.11 `0ab37f3d…`, 3.12 `c00c55f3…`, 3.13 `9cea697d…`), [everyday golden determinism 32276568396](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32276568396) 6/7 (memory artifact `9374459713`, memvid `9375173937`, flock-qualification-determinism `9374241844`, runtime reliability Linux/Windows/macOS green; exact-SHA five-cell RED); review outcome CLEAN (no GAP) | REL-004 and REL-005 exact-main receipts are green at `16144d67` (20/20 battery, 9/9 matrix), but S3, REL-004, and REL-005 REMAIN `in_progress` — no qualification claimed — because the exact-main five-cell gate is RED: `qualification rejected: Linux runtime, memory, and Memvid cells must use the same Python patch version` (floating `python-version: "3.11"` resolved 3.11.16 against the 3.11.15-pinned cells). That pre-existing 3.11 patch drift is owned by the separate pin-fix triage (PR #347, board card t_38674ee1) and is out of scope for this receipt; S3 cannot become `qualified` until the five-cell gate is green at the merged main SHA. Hosted artifact digests are retained owner-locally under `~/.codex/evidence/kestrel-v06-s3-rehearsal-installed-matrix/`. |
 | MAIN-2026-08-21-S3-QUAL | `7b175e32ab9f849746f38f43786d819ab5722e25` | `merged` | `7b175e32ab9f849746f38f43786d819ab5722e25` | [PR #347](https://github.com/John-MiracleWorker/Kestrel/pull/347) head `ba199454bd821ade4dd4f9fefc5435051b689512` merged normally as protected-main commit `7b175e32ab9f849746f38f43786d819ab5722e25` at 2026-08-21T22:55:20Z (per-OS Python pin: Linux 3.11.15, macOS/Windows 3.11.9); exact-main attempt-1 [CI 32534932295](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932295) 14/14 jobs, [everyday golden determinism 32534932310](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932310) 7/7 jobs including the **Exact-SHA five-cell runtime reliability qualification** gate (previously RED at `16144d67`), [release rehearsal battery 32534932300](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932300) 20/20 rehearsals with aggregate artifact `9465119477` and receipt digest `5947792d3f8b2ea8e04cc72a6e50d2b1d015916dacab5f5e276cc4758d477098` (uploaded artifact zip SHA-256 `aad498465851c58224a3b3a89917600efc398127d9013260f1ce3e66b9d7eb40`), [installed artifact mission matrix 32534932330](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932330) 9/9 cells green at `7b175e32` (payload wheel SHA-256 `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c`; per-cell receipt SHA-256s macOS 3.11 `a9007f37…`, 3.12 `bee34988…`, 3.13 `9b27915b…`, Ubuntu 3.11 `862b8390…`, 3.12 `27312e33…`, 3.13 `0e661d58…`, Windows 3.11 `ba1ea64b…`, 3.12 `88f454ba…`, 3.13 `c699ed39…`); review CLEAN/APPROVED (owner-orchestrator review t_3e5fd237), the single stale Codex P1 thread resolved (`reviewThreads` → `isResolved: true`) | The exact-main five-cell gate is now green at `7b175e32`, binding S3/REL-004/REL-005 to `qualified` with the 20/20 battery and 9/9 matrix re-verified at the same merged SHA. The failed/incomplete receipts (`S3-2026-08-19-REL004-FAILCLOSED`, `S3-2026-08-19-REL004-LOCAL-PARTIAL`, and the RED five-cell gate at `16144d67`) remain failures and are never rewritten. S4 becomes available; no S4+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
+| MAIN-2026-08-22-S4-QUAL | `added767db1c95313119df17e2f125fdff096438` (head) | `merged` | `5f7708389cfc8215846972204ad5ff0b01d2f163` | [PR #354](https://github.com/John-MiracleWorker/Kestrel/pull/354) head `added767db` merged as main commit `5f770838` at 2026-08-22T18:18:51Z; exact-head attempt-1 [push CI 32587763892](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587763892) 14/14 and [PR CI 32587766902](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587766902) 14/14 (docker container-vulnerability-policy check green, python matrix 6 legs green, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green); exact-head attempt-1 [everyday golden determinism 32587766901](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587766901) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); review CLEAN (no GAP) — 6/6 Codex threads resolved with substantive tie-backs, `reviewThreads` all `isResolved: true` | JOURNEY-004 and S4 move to `qualified` at merged SHA `5f770838`. No S5+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
