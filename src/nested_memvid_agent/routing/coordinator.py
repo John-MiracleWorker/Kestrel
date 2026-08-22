@@ -25,6 +25,12 @@ from .models import AgentTaskContract, PrivacyClass, RouteDecision, RoutingMode
 from .qualification_evidence import PROVIDER_SIDE_FAILURE_CATEGORIES
 from .router import ReviewDiversityContext, RoutingUnavailableError
 from .service import AdaptiveFlockRoutingService, RoutingAssignment
+from .shadow_observation import (
+    ShadowObservationRecorder,
+    actual_authority_for,
+    build_shadow_observation_draft,
+    shadow_role_for,
+)
 
 
 class RoutingLeaseConflict(RuntimeError):
@@ -211,7 +217,107 @@ class DurableRoutingCoordinator:
             activation_effective=authority is not None and authority.effective,
             activation_reason=_activation_abstention_reason(authority),
         )
+        self._observe_shadow_attempt(
+            service=service,
+            assignment=assignment,
+            shadow=shadow,
+            authority=authority,
+            subagent_id=subagent_id,
+            attempt=attempt,
+            operator_pinned=effective_direct_target_id is not None,
+        )
         return DurableRoutingAssignment(assignment=assignment, record=record, reused=False)
+
+    def _observe_shadow_attempt(
+        self,
+        *,
+        service: AdaptiveFlockRoutingService,
+        assignment: RoutingAssignment,
+        shadow: RoutingShadowDraft,
+        authority: ActivationEvaluation | None,
+        subagent_id: str | None,
+        attempt: int,
+        operator_pinned: bool,
+    ) -> None:
+        """Record one zero-authority shadow observation as a side channel.
+
+        This is the S5 default-on observer.  It runs *after* the durable
+        decision is already recorded, reads only the resolved facts, and can
+        never change the returned assignment — a failure is swallowed by the
+        best-effort recorder (SHADOW-004).
+        """
+
+        contract = assignment.contract
+        decision = assignment.decision
+        draft = build_shadow_observation_draft(
+            run_id=contract.run_id,
+            task_id=contract.task_id,
+            subagent_id=subagent_id,
+            attempt=attempt,
+            role=shadow_role_for(contract.role),
+            actual_authority=actual_authority_for(
+                selection_kind=decision.selection_kind,
+                activation_effective=authority is not None and authority.effective,
+                operator_pinned=operator_pinned,
+            ),
+            decision=decision,
+            contract=contract,
+            shadow_target_id=shadow.learned_target_id,
+            shadow_targets={target.target_id: target for target in service.targets},
+            shadow_executed=bool(shadow.activated),
+            static_target_id=shadow.static_target_id,
+            qualification={
+                "evidence_count": shadow.evidence_count,
+                "target_example_count": shadow.target_example_count,
+                "confidence": shadow.confidence,
+                "cost_coverage": shadow.cost_coverage,
+                "utility_delta": shadow.utility_delta,
+                "static_utility": shadow.static_utility,
+                "learned_utility": shadow.learned_utility,
+                "abstention_reason": shadow.abstention_reason,
+            },
+            reason_codes=_observation_reason_codes(decision, shadow),
+            usage=None,
+            abstention_reason=shadow.abstention_reason,
+            utility_delta=shadow.utility_delta,
+            confidence=shadow.confidence,
+        )
+        recorder = ShadowObservationRecorder(self.ledger)
+        recorder.record(draft)
+
+    def resolve_observation_for_attempt(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        subagent_id: str | None,
+        attempt: int,
+        validation_passed: bool,
+        actual_cost_usd: float | None = None,
+        actual_latency_seconds: float | None = None,
+    ) -> None:
+        """Resolve the terminal outcome of the shadow observation for an attempt.
+
+        Best-effort and append-only: a missing observation or a write failure is
+        swallowed so terminal truth is never rewritten by the observer.
+        """
+
+        recorder = ShadowObservationRecorder(self.ledger)
+        for entry in self.ledger.list_shadow_observations(
+            run_id=run_id, task_id=task_id
+        ):
+            if (
+                entry.subagent_id == subagent_id
+                and entry.attempt == attempt
+                and entry.resolved_at is None
+            ):
+                recorder.resolve(
+                    entry.observation_id,
+                    validation_passed=validation_passed,
+                    actual_cost_usd=actual_cost_usd,
+                    actual_latency_seconds=actual_latency_seconds,
+                )
+
 
     def mark_started(self, durable: DurableRoutingAssignment) -> RouteDecisionEntry:
         return self.ledger.mark_decision_started(durable.record.decision_id)
@@ -255,7 +361,7 @@ class DurableRoutingCoordinator:
         labels.append(
             "cost_attributed" if resolved_cost is not None else "cost_unavailable"
         )
-        return self.ledger.record_outcome(
+        outcome = self.ledger.record_outcome(
             outcome_id=stable_outcome_id(durable.record.decision_id),
             decision_id=durable.record.decision_id,
             execution_status=execution_status,
@@ -275,6 +381,16 @@ class DurableRoutingCoordinator:
             outcome_labels=tuple(dict.fromkeys(labels)),
             evidence_refs=evidence_refs,
         )
+        self.resolve_observation_for_attempt(
+            run_id=durable.record.run_id,
+            task_id=durable.record.task_id,
+            subagent_id=durable.record.subagent_id,
+            attempt=durable.record.attempt,
+            validation_passed=validation_passed,
+            actual_cost_usd=resolved_cost,
+            actual_latency_seconds=latency_seconds,
+        )
+        return outcome
 
     def _evaluate_learned_route(
         self,
@@ -645,6 +761,26 @@ def _activation_abstention_reason(authority: ActivationEvaluation | None) -> str
     if authority.reason_codes:
         return authority.reason_codes[0]
     return "durable_grant_required"
+
+
+def _observation_reason_codes(
+    decision: RouteDecision,
+    shadow: RoutingShadowDraft,
+) -> tuple[str, ...]:
+    """Structured reasons for a shadow observation row.
+
+    Carries the decision's own reason codes plus the shadow abstention reason so
+    the observation's structured reasons are self-explanatory without any
+    hidden chain-of-thought.
+    """
+
+    codes: list[str] = list(decision.reason_codes)
+    if shadow.abstention_reason and shadow.abstention_reason not in codes:
+        codes.append(shadow.abstention_reason)
+    if shadow.activated:
+        codes.append("learned_route_activated")
+    return tuple(dict.fromkeys(codes))
+
 
 
 def _actual_cost_from_usage(
