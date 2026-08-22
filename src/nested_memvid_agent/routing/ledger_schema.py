@@ -4,7 +4,7 @@ import sqlite3
 
 from ..state_store import AgentStateStore, utc_now
 
-ROUTING_SCHEMA_VERSION = 4
+ROUTING_SCHEMA_VERSION = 5
 
 
 def ensure_routing_schema(state: AgentStateStore) -> None:
@@ -44,6 +44,11 @@ def ensure_routing_schema(state: AgentStateStore) -> None:
             current = 4
         if current >= 4:
             _ensure_routing_schema_v4_guards(conn)
+        if current < 5:
+            _apply_routing_schema_v5(conn)
+            current = 5
+        if current >= 5:
+            _ensure_routing_schema_v5_guards(conn)
         conn.execute(
             """
             INSERT INTO routing_schema_version (id, version, updated_at)
@@ -990,6 +995,111 @@ def _ensure_routing_schema_v4_guards(conn: sqlite3.Connection) -> None:
         WHEN OLD.status IN ('completed', 'failed', 'cancelled', 'ambiguous')
         BEGIN
             SELECT RAISE(ABORT, 'terminal_qualification_attempt_immutable');
+        END
+        """,
+    )
+    for statement in statements:
+        conn.execute(statement)
+
+
+def _apply_routing_schema_v5(conn: sqlite3.Connection) -> None:
+    """Add the zero-authority production shadow observation ledger.
+
+    The migration is intentionally additive.  Existing v1-v4 decisions,
+    outcomes, shadow evaluations, LAN evidence, and qualification/grant rows
+    are never rewritten.  The new table is a separate append-only side channel
+    so a shadow observation can never be mistaken for execution authority.
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_shadow_observations (
+            observation_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            subagent_id TEXT,
+            attempt INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            actual_authority TEXT NOT NULL,
+            actual_target_id TEXT,
+            actual_provider TEXT NOT NULL,
+            actual_model TEXT NOT NULL,
+            shadow_target_id TEXT,
+            shadow_provider TEXT NOT NULL,
+            shadow_model TEXT NOT NULL,
+            shadow_executed INTEGER NOT NULL,
+            static_target_id TEXT,
+            candidates_json TEXT NOT NULL,
+            constraints_json TEXT NOT NULL,
+            qualification_json TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            usage_json TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            verdict_reason TEXT NOT NULL,
+            evidence_basis_json TEXT NOT NULL,
+            counterfactual_proven INTEGER NOT NULL,
+            payload_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            validation_passed INTEGER,
+            actual_cost_usd REAL,
+            actual_latency_seconds REAL,
+            FOREIGN KEY (run_id) REFERENCES runs(run_id)
+        )
+        """
+    )
+    for statement in (
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_shadow_observations_run ON "
+            "routing_shadow_observations(run_id, created_at)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_shadow_observations_task ON "
+            "routing_shadow_observations(task_id, attempt)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_routing_shadow_observations_role ON "
+            "routing_shadow_observations(run_id, role)"
+        ),
+    ):
+        conn.execute(statement)
+
+
+def _ensure_routing_schema_v5_guards(conn: sqlite3.Connection) -> None:
+    """Install idempotent immutability guards for the shadow observation ledger."""
+
+    statements = (
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_shadow_observation_update_immutable
+        BEFORE UPDATE ON routing_shadow_observations
+        WHEN OLD.resolved_at IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'resolved_shadow_observation_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_shadow_observation_delete_immutable
+        BEFORE DELETE ON routing_shadow_observations
+        BEGIN
+            SELECT RAISE(ABORT, 'shadow_observation_immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_shadow_observation_id_insert_not_null
+        BEFORE INSERT ON routing_shadow_observations
+        WHEN NEW.observation_id IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'shadow_observation_identity_required');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_routing_shadow_observation_resolution_complete
+        BEFORE UPDATE OF resolved_at, validation_passed, actual_cost_usd,
+            actual_latency_seconds
+        ON routing_shadow_observations
+        WHEN NEW.resolved_at IS NOT NULL AND NEW.validation_passed IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'resolved_shadow_observation_requires_terminal_evidence');
         END
         """,
     )
