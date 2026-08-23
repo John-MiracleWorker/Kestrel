@@ -1162,10 +1162,41 @@ def register_routing_routes(
             "shadows": [
                 item.to_payload() for item in ledger.list_shadows(run_id=run_id, task_id=task_id)
             ],
+            "shadow_observations": [
+                item.to_payload()
+                for item in ledger.list_shadow_observations(run_id=run_id, task_id=task_id)
+            ],
             "calibrations": [
                 item.to_payload()
                 for item in ledger.list_calibrations(
                     project_id=ledger.state.get_run(run_id).project_id
+                )
+            ],
+        }
+
+    @app.get("/api/routing/shadow-observations")  # type: ignore[untyped-decorator]
+    def list_shadow_observations(
+        run_id: str,
+        task_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, object]:
+        """Read-only shadow comparison evidence for one run (SHADOW-005).
+
+        Backward-compatible additive endpoint: it exposes the zero-authority
+        observation rows already persisted by the S5 side channel, including the
+        explicit actual authority, observational verdict, evidence basis, and
+        terminal (or missing) outcome — without ever fabricating authority or
+        counterfactual proof.
+        """
+        return {
+            "schema": "kestrel.routing.shadow_observations.v1",
+            "run_id": run_id,
+            "task_id": task_id,
+            "role": role,
+            "observations": [
+                item.to_payload()
+                for item in ledger.list_shadow_observations(
+                    run_id=run_id, task_id=task_id, role=role
                 )
             ],
         }
