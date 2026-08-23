@@ -8,7 +8,8 @@ import secrets
 import stat
 import time
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
@@ -1011,6 +1012,29 @@ class LayeredMemorySystem:
 
     def put_frame(self, frame: MV2ContextFrame) -> str:
         return self.put(to_memory_record(frame))
+
+    @contextmanager
+    def reserve_record_ids_for_initial_write(
+        self,
+        record_ids: Iterable[str],
+    ) -> Iterator[bool]:
+        """Atomically check a record-ID namespace through the caller's first write.
+
+        Every layer lock is acquired in stable order because a turn's derived
+        evidence spans working and episodic memory. Backends use re-entrant locks,
+        so the caller can persist the initial frame before leaving this context.
+        """
+
+        candidate_ids = frozenset(record_ids)
+        ordered_layers = tuple(sorted(self.backends, key=lambda item: item.value))
+        with ExitStack() as reservations:
+            for layer in ordered_layers:
+                reservations.enter_context(self.backends[layer].identity_reservation())
+            available = not any(
+                self.backends[layer].has_any_record_identity(candidate_ids)
+                for layer in ordered_layers
+            )
+            yield available
 
     def retrieve(self, query: RetrievalQuery) -> list[MemoryHit]:
         hits: list[MemoryHit] = []

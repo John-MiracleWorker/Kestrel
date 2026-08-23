@@ -9,12 +9,14 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from queue import Empty
-from threading import Event, Thread
+from threading import Event, Lock, Thread, get_ident
 from time import monotonic, sleep
 from types import SimpleNamespace
 from typing import Any
@@ -539,15 +541,18 @@ def test_startup_reconciliation_fails_dead_workers_and_preserves_live_workers(
     assert heartbeat_result["worker_heartbeat_at"] != "2000-01-01T00:00:00+00:00"
 
 
-def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path) -> None:
+def test_run_manager_heartbeat_renews_and_releases_its_run_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = AgentConfig(
         memory_dir=tmp_path / "memory",
         state_path=tmp_path / "state.db",
         workspace=tmp_path,
         skills_dir=tmp_path / "skills",
         plugins_dir=tmp_path / "plugins",
-        run_lease_ttl_seconds=2.0,
-        run_heartbeat_interval_seconds=0.05,
+        run_lease_ttl_seconds=0.05,
+        run_heartbeat_interval_seconds=0.01,
     )
     state = AgentStateStore(config.state_path)
     manager = RunManager(
@@ -565,18 +570,42 @@ def test_run_manager_heartbeat_renews_and_releases_its_run_lease(tmp_path: Path)
         provider="mock",
         model="mock",
     )
+    renewal_succeeded = Event()
+    renewal_records: list[Any] = []
+    fixed_now = datetime(2035, 1, 2, 3, 4, 5, tzinfo=UTC)
+    acquire_run_lease = state.acquire_run_lease
+    renew_run_lease = state.renew_run_lease
+
+    def acquire_at_fixed_now(*args: Any, **kwargs: Any) -> Any:
+        assert "now" not in kwargs
+        return acquire_run_lease(*args, now=fixed_now, **kwargs)
+
+    def renew_and_signal(*args: Any, **kwargs: Any) -> Any:
+        assert "now" not in kwargs
+        renewed = renew_run_lease(*args, now=fixed_now, **kwargs)
+        if renewed is not None:
+            renewal_records.append(renewed)
+            renewal_succeeded.set()
+        return renewed
+
+    monkeypatch.setattr(state, "acquire_run_lease", acquire_at_fixed_now)
+    monkeypatch.setattr(state, "renew_run_lease", renew_and_signal)
 
     with manager._run_lease("heartbeat_run", config) as lease:
         assert lease is not None
-        first_heartbeat = state.get_run("heartbeat_run").heartbeat_at
-        renewed = state.get_run("heartbeat_run")
-        deadline = monotonic() + 3.0
-        while renewed.heartbeat_at == first_heartbeat and monotonic() < deadline:
-            sleep(0.01)
-            renewed = state.get_run("heartbeat_run")
-        assert renewed.heartbeat_at is not None
-        assert renewed.heartbeat_at != first_heartbeat
-        assert state.acquire_run_lease("heartbeat_run", owner="competitor", ttl_seconds=1) is None
+        assert renewal_succeeded.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        renewed = renewal_records[0]
+        assert renewed.run_id == "heartbeat_run"
+        assert renewed.lease_owner == manager._lease_owner
+        assert renewed.lease_generation == lease.lease_generation
+        assert renewed.heartbeat_at == fixed_now.isoformat()
+        assert renewed.lease_expires_at == (fixed_now + timedelta(seconds=0.05)).isoformat()
+        assert (
+            acquire_run_lease(
+                "heartbeat_run", owner="competitor", ttl_seconds=0.05, now=fixed_now
+            )
+            is None
+        )
 
     released = state.get_run("heartbeat_run")
     assert released.lease_owner is None
@@ -2640,6 +2669,129 @@ def test_server_exposes_local_operator_api_parity(
     assert diagnosis.json()["classification"] in {"missing_dependency", "import_error", "unknown"}
 
 
+def test_client_status_wait_uses_public_run_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 0.0
+
+    class DelayedRunClient:
+        def get(self, path: str) -> Any:
+            assert path == "/api/runs/run_delayed"
+            status = (
+                "completed"
+                if clock > _ASYNC_TEST_TIMEOUT_SECONDS
+                else "running"
+            )
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"run_id": "run_delayed", "status": status},
+            )
+
+    def advance(seconds: float) -> None:
+        nonlocal clock
+        del seconds
+        clock = _ASYNC_TEST_TIMEOUT_SECONDS + 0.05
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "monotonic", lambda: clock)
+    monkeypatch.setattr(module, "sleep", advance)
+
+    run = _wait_for_client_status(DelayedRunClient(), "run_delayed", {"completed"})
+
+    assert run["status"] == "completed"
+    assert _ASYNC_TEST_TIMEOUT_SECONDS < clock < _PUBLIC_RUN_TIMEOUT_SECONDS
+
+
+def test_client_status_wait_rejects_terminal_response_after_public_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = 0.0
+    late_terminal = {"run_id": "run_late", "status": "completed"}
+
+    class LateTerminalRunClient:
+        def get(self, path: str) -> Any:
+            nonlocal clock
+            assert path == "/api/runs/run_late"
+            clock = _PUBLIC_RUN_TIMEOUT_SECONDS + 0.05
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: late_terminal,
+            )
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "monotonic", lambda: clock)
+
+    with pytest.raises(AssertionError) as caught:
+        _wait_for_client_status(LateTerminalRunClient(), "run_late", {"completed"})
+
+    assert caught.value.args == (
+        {
+            "run_id": "run_late",
+            "expected_statuses": ["completed"],
+            "phase": "api_run_completion",
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": 1,
+            "public_run": late_terminal,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("pending", "expected_phase"),
+    [
+        (
+            {
+                "run_id": "run_pending",
+                "status": "running",
+                "stop_reason": "publication_pending",
+                "publication_pending": True,
+            },
+            "api_publication",
+        ),
+        (
+            {"run_id": "run_pending", "status": "running"},
+            "api_run_completion",
+        ),
+    ],
+)
+def test_client_status_wait_reports_last_public_run(
+    monkeypatch: pytest.MonkeyPatch,
+    pending: dict[str, object],
+    expected_phase: str,
+) -> None:
+    clock = 0.0
+
+    class PendingRunClient:
+        def get(self, path: str) -> Any:
+            assert path == "/api/runs/run_pending"
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: pending,
+            )
+
+    def expire_timeout(_seconds: float) -> None:
+        nonlocal clock
+        clock = _PUBLIC_RUN_TIMEOUT_SECONDS
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "monotonic", lambda: clock)
+    monkeypatch.setattr(module, "sleep", expire_timeout)
+
+    with pytest.raises(AssertionError) as caught:
+        _wait_for_client_status(PendingRunClient(), "run_pending", {"completed", "failed"})
+
+    assert caught.value.args == (
+        {
+            "run_id": "run_pending",
+            "expected_statuses": ["completed", "failed"],
+            "phase": expected_phase,
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": 1,
+            "public_run": pending,
+        },
+    )
+
+
 def test_server_exposes_observability_routes(tmp_path: Path, started_test_client: Any) -> None:
     from fastapi.testclient import TestClient
 
@@ -3603,7 +3755,7 @@ def test_cancelling_queued_run_finishes_publication_fence_without_worker(
     def hold_active(run_id: str) -> None:
         manager.state.transition_run(run_id, "running")
         active_started.set()
-        assert release_active.wait(timeout=5)
+        assert release_active.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
         manager.state.transition_run(run_id, "completed", stop_reason="complete")
         manager.events.publish(run_id, "run.completed", {})
 
@@ -3612,29 +3764,30 @@ def test_cancelling_queued_run_finishes_publication_fence_without_worker(
         queued_started.set()
 
     manager._schedule_primary_run(active.run_id, hold_active)
-    assert active_started.wait(timeout=1)
-    manager._schedule_primary_run(queued.run_id, should_not_start)
+    try:
+        # Exercise queue/publication behavior, not platform thread wake latency.
+        assert active_started.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        manager._schedule_primary_run(queued.run_id, should_not_start)
 
-    cancelled = manager.cancel_run(queued.run_id)
-    started = monotonic()
-    observed = manager.get_run(queued.run_id)
+        cancelled = manager.cancel_run(queued.run_id)
 
-    assert cancelled["status"] == "cancelled"
-    assert observed["status"] == "cancelled"
-    assert monotonic() - started < 1
-    assert not queued_started.is_set()
-    assert any(
-        event["type"] == "run.cancelled" for event in manager.state.list_run_steps(queued.run_id)
-    )
-    with manager._lock:
-        assert queued.run_id not in manager._publication_events
-        assert queued.run_id not in manager._publication_counts
+        assert cancelled["status"] == "cancelled"
+        assert not queued_started.is_set()
+        assert any(
+            event["type"] == "run.cancelled"
+            for event in manager.state.list_run_steps(queued.run_id)
+        )
+        with manager._lock:
+            assert queued.run_id not in manager._publication_events
+            assert queued.run_id not in manager._publication_counts
 
-    release_active.set()
-    deadline = monotonic() + 1
-    while manager.get_run(active.run_id)["status"] != "completed" and monotonic() < deadline:
-        sleep(0.01)
-    assert manager.get_run(active.run_id)["status"] == "completed"
+        observed = manager.get_run(queued.run_id)
+        assert observed["status"] == "cancelled"
+    finally:
+        release_active.set()
+        final = _wait_for_status(manager, active.run_id, {"completed", "failed"})
+
+    assert final["status"] == "completed"
 
 
 def test_run_manager_completes_background_mock_run(tmp_path: Path) -> None:
@@ -4480,6 +4633,7 @@ def test_cross_manager_scheduler_approval_waits_for_origin_lease_and_resumes(
 
 def test_cross_manager_task_approval_waits_for_origin_lease_and_wakes_scheduler(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager_a = _manager(tmp_path, enable_autonomous_scheduler=True)
     state_b = AgentStateStore(manager_a.config.state_path)
@@ -4522,28 +4676,98 @@ def test_cross_manager_task_approval_waits_for_origin_lease_and_wakes_scheduler(
     )
     manager_a.state.transition_run(run.run_id, "running")
     origin_observed_idle = Event()
+    resume_loop_entered = Event()
+    second_scoped_foreign_lease_observed = Event()
     release_origin_lease = Event()
+    observation_lock = Lock()
+    decision_thread_id: int | None = None
+    scoped_foreign_lease_reads = 0
+    original_state_b_get_run = state_b.get_run
+    original_approval_resume_lease = manager_b._approval_resume_lease
+
+    def observe_foreign_run_lease(observed_run_id: str) -> RunRecord:
+        nonlocal scoped_foreign_lease_reads
+        observed = original_state_b_get_run(observed_run_id)
+        if (
+            observed_run_id == run.run_id
+            and resume_loop_entered.is_set()
+            and get_ident() == decision_thread_id
+            and observed.lease_owner == manager_a._lease_owner
+        ):
+            with observation_lock:
+                scoped_foreign_lease_reads += 1
+                if scoped_foreign_lease_reads >= 2:
+                    second_scoped_foreign_lease_observed.set()
+        return observed
+
+    monkeypatch.setattr(state_b, "get_run", observe_foreign_run_lease)
+
+    @contextmanager
+    def record_approval_resume_loop_entry(
+        observed_run_id: str,
+        config: AgentConfig,
+    ) -> Iterator[RunRecord | None]:
+        nonlocal decision_thread_id
+        with observation_lock:
+            decision_thread_id = get_ident()
+        resume_loop_entered.set()
+        with original_approval_resume_lease(observed_run_id, config) as lease:
+            yield lease
+
+    monkeypatch.setattr(manager_b, "_approval_resume_lease", record_approval_resume_loop_entry)
 
     def hold_origin_lease_after_idle_observation() -> None:
         with manager_a._run_lease(run.run_id, manager_a.config) as lease:
             assert lease is not None
             assert manager_a._executable_ready_tasks(run.run_id) == []
             origin_observed_idle.set()
-            assert release_origin_lease.wait(timeout=3)
+            assert release_origin_lease.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         origin = executor.submit(hold_origin_lease_after_idle_observation)
-        assert origin_observed_idle.wait(timeout=3)
+        assert origin_observed_idle.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
         decision = executor.submit(manager_b.approve_task, run.run_id, task.task_id)
-        sleep(0.05)
-        assert decision.done() is False
-        assert state_b.get_task_node(task.task_id).status == "queued"
-        release_origin_lease.set()
-        origin.result(timeout=3)
-        approved = decision.result(timeout=5)
+        try:
+            assert resume_loop_entered.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+            if not second_scoped_foreign_lease_observed.wait(
+                timeout=_ASYNC_TEST_TIMEOUT_SECONDS
+            ):
+                with observation_lock:
+                    observed_thread_id = decision_thread_id
+                    observed_read_count = scoped_foreign_lease_reads
+                current = original_state_b_get_run(run.run_id)
+                pytest.fail(
+                    "approval-resume loop did not retry the live foreign lease: "
+                    + json.dumps(
+                        {
+                            "decision_thread_id": observed_thread_id,
+                            "scoped_foreign_lease_reads": observed_read_count,
+                            "run_status": current.status,
+                            "lease_owner": current.lease_owner,
+                            "lease_generation": current.lease_generation,
+                            "task_status": state_b.get_task_node(task.task_id).status,
+                            "decision_done": decision.done(),
+                            "last_run_steps": state_b.list_run_steps(run.run_id)[-5:],
+                        },
+                        default=str,
+                        sort_keys=True,
+                    )
+                )
+            with observation_lock:
+                assert decision_thread_id is not None
+                assert scoped_foreign_lease_reads >= 2
+            held_run = original_state_b_get_run(run.run_id)
+            assert held_run.lease_owner == manager_a._lease_owner
+            assert decision.done() is False
+            assert state_b.get_task_node(task.task_id).status == "queued"
+        finally:
+            release_origin_lease.set()
+        origin.result(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        final = _wait_for_status(manager_b, run.run_id, {"completed"})
+        approved = decision.result(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
 
     assert approved["scheduler"]["stop_reason"] == "idle"
-    assert state_b.get_run(run.run_id).status == "completed"
+    assert final["status"] == "completed"
     assert state_b.get_task_node(task.task_id).status == "completed"
     assert state_b.get_task_node(root.task_id).status == "completed"
     subagents = state_b.list_subagent_runs(run.run_id)
@@ -5674,8 +5898,8 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
             }
         )
 
-    def wait_for_terminal_event() -> tuple[str, list[dict[str, Any]]]:
-        deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
+    def wait_for_terminal_event(*, timeout_seconds: float) -> tuple[str, list[dict[str, Any]]]:
+        deadline = monotonic() + timeout_seconds
         observed: list[dict[str, Any]] = []
         while monotonic() < deadline:
             try:
@@ -5723,7 +5947,13 @@ def test_approved_repair_scheduler_flow_binds_real_validation_and_review_receipt
                 approved=True,
                 arguments=dict(approval["arguments"]),
             )
-        terminal_event, terminal_observed = wait_for_terminal_event()
+        # The final continuation performs a real git commit, closes the agent,
+        # reconciles the scheduler DAG, and publishes the terminal run event.
+        # Treat that as an end-to-end public run boundary rather than a single
+        # asynchronous wake-up.
+        terminal_event, terminal_observed = wait_for_terminal_event(
+            timeout_seconds=_PUBLIC_RUN_TIMEOUT_SECONDS
+        )
     finally:
         manager.events.unsubscribe(run.run_id, subscriber)
 
@@ -6636,7 +6866,7 @@ def test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization(
             context: ToolContext,
         ) -> ToolExecution:
             del context
-            assert renewal_started.wait(timeout=1)
+            assert renewal_started.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
             return ToolExecution(
                 call=ToolCall(name=self.spec.name, arguments=arguments),
                 success=True,
@@ -6683,7 +6913,7 @@ def test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization(
     def delayed_failed_renewal(*args: Any, **kwargs: Any) -> bool:
         del args, kwargs
         renewal_started.set()
-        assert release_renewal.wait(timeout=3)
+        assert release_renewal.wait(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
         renewal_returned.set()
         return False
 
@@ -6703,33 +6933,54 @@ def test_approval_heartbeat_delayed_renewal_cannot_cancel_after_finalization(
         memory=build_memory_system("memory", tmp_path / "execution-memory"),
         event_log=None,
     )
-    completed = Event()
+    heartbeat_threads: list[Thread] = []
+    original_thread = run_manager_module.Thread
+
+    def capture_heartbeat_thread(*args: Any, **kwargs: Any) -> Thread:
+        thread = original_thread(*args, **kwargs)
+        if str(kwargs.get("name", "")).startswith("kestrel-approval-heartbeat-"):
+            heartbeat_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(run_manager_module, "Thread", capture_heartbeat_thread)
     result: list[tuple[ToolCall, ToolExecution]] = []
+    execution_errors: list[BaseException] = []
 
     def execute() -> None:
-        result.append(
-            manager._execute_approved_tool(
-                agent,
-                approval,
-                {},
-                "session",
+        try:
+            result.append(
+                manager._execute_approved_tool(
+                    agent,
+                    approval,
+                    {},
+                    "session",
+                )
             )
-        )
-        completed.set()
+        except BaseException as exc:  # pragma: no cover - surfaced on the parent thread
+            execution_errors.append(exc)
 
     execution_thread = Thread(target=execute, daemon=True)
     execution_thread.start()
-    assert completed.wait(timeout=2)
-    assert result[0][1].success is True
-    assert manager.state.get_approval(str(approval["approval_id"]))["result"]["success"] is True
-    assert cancelled_runs == []
+    try:
+        execution_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        assert not execution_thread.is_alive()
+        assert execution_errors == []
+        assert result[0][1].success is True
+        assert manager.state.get_approval(str(approval["approval_id"]))["result"]["success"] is True
+        assert cancelled_runs == []
+    finally:
+        release_renewal.set()
+        execution_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
+        for heartbeat_thread in heartbeat_threads:
+            heartbeat_thread.join(timeout=_ASYNC_TEST_TIMEOUT_SECONDS)
 
     # Let the storage call return a rejected renewal only after the durable
     # result exists.  The heartbeat must re-check stop and exit without a late
     # cancellation.
-    release_renewal.set()
-    assert renewal_returned.wait(timeout=1)
-    sleep(0.05)
+    assert not execution_thread.is_alive()
+    assert len(heartbeat_threads) == 1
+    assert renewal_returned.is_set()
+    assert not heartbeat_threads[0].is_alive()
     assert cancelled_runs == []
 
 
@@ -8037,15 +8288,34 @@ def _wait_until(predicate: Any, timeout: float = _ASYNC_TEST_TIMEOUT_SECONDS) ->
 
 
 def _wait_for_client_status(client: Any, run_id: str, statuses: set[str]) -> dict[str, object]:
-    deadline = monotonic() + _ASYNC_TEST_TIMEOUT_SECONDS
+    deadline = monotonic() + _PUBLIC_RUN_TIMEOUT_SECONDS
+    last_run: dict[str, object] | None = None
+    poll_count = 0
     while monotonic() < deadline:
         response = client.get(f"/api/runs/{run_id}")
         response.raise_for_status()
-        run = response.json()
-        if str(run["status"]) in statuses:
-            return dict(run)
-        sleep(0.05)
-    raise AssertionError(f"run {run_id} did not reach {statuses}")
+        last_run = dict(response.json())
+        poll_count += 1
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        if str(last_run["status"]) in statuses:
+            return last_run
+        sleep(min(0.05, remaining))
+    publication_pending = last_run is not None and (
+        bool(last_run.get("publication_pending"))
+        or last_run.get("stop_reason") == "publication_pending"
+    )
+    raise AssertionError(
+        {
+            "run_id": run_id,
+            "expected_statuses": sorted(statuses),
+            "phase": "api_publication" if publication_pending else "api_run_completion",
+            "timeout_seconds": _PUBLIC_RUN_TIMEOUT_SECONDS,
+            "poll_count": poll_count,
+            "public_run": last_run,
+        }
+    )
 
 
 def _wait_for_subagent(

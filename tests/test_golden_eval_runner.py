@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 import scripts.run_golden_evals as golden_runner
 from nested_memvid_agent.config import AgentConfig
+from nested_memvid_agent.models import MemoryHit, MemoryKind, MemoryLayer, MemoryRecord
 from scripts.bounded_process import BoundedProcessResult
 from scripts.run_golden_evals import (
     _aggregate_passed,
     _case_config,
     _cost_measurement,
+    _eval_conflict_warning,
+    _eval_correction_persists,
     _eval_honest_test_failure,
     _golden_case_workspace,
     _report_exit_code,
@@ -38,12 +44,133 @@ def test_seeded_golden_case_results_have_stable_name_order() -> None:
         {"name": "zeta", "passed": True},
         {"name": "alpha", "passed": True},
     ]
-
     assert [item["name"] for item in _sort_case_results(results)] == [
         "alpha",
         "zeta",
     ]
 
+
+def test_correction_case_counts_only_matching_correction_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    eval_id = "golden_seed_correction"
+    matching = MemoryRecord(
+        id="matching-correction",
+        title="User correction",
+        content=f"{eval_id} user correction says concise answers are preferred.",
+        layer=MemoryLayer.WORKING,
+        kind=MemoryKind.CORRECTION,
+    )
+    same_text_observation = MemoryRecord(
+        id="collateral-user-message",
+        title="User message",
+        content=matching.content,
+        layer=MemoryLayer.WORKING,
+        kind=MemoryKind.OBSERVATION,
+    )
+    unrelated_correction = MemoryRecord(
+        id="unrelated-correction",
+        title="User correction",
+        content="another session correction says verbose answers are preferred.",
+        layer=MemoryLayer.WORKING,
+        kind=MemoryKind.CORRECTION,
+    )
+    hits = [
+        MemoryHit(record=matching, score=1.0, source_backend="memvid"),
+        MemoryHit(record=same_text_observation, score=1.0, source_backend="memvid"),
+        MemoryHit(record=unrelated_correction, score=1.0, source_backend="memvid"),
+    ]
+    chat_call: dict[str, object] = {}
+
+    class FirstAgent:
+        def chat(self, message: str, **kwargs: object) -> object:
+            chat_call.update({"message": message, **kwargs})
+            return SimpleNamespace(context_chars=787, tool_executions=())
+
+        def close(self) -> None:
+            return None
+
+    class ReopenedAgent:
+        memory = SimpleNamespace(retrieve=lambda _query: hits)
+
+        def close(self) -> None:
+            return None
+
+    agents = iter((FirstAgent(), ReopenedAgent()))
+    build_calls: list[dict[str, object]] = []
+
+    def fake_build_agent(_config: AgentConfig, **kwargs: object) -> object:
+        build_calls.append(kwargs)
+        return next(agents)
+
+    monkeypatch.setattr(golden_runner, "build_agent", fake_build_agent)
+    monkeypatch.setattr(golden_runner, "_ID_SEED", None)
+    monkeypatch.setattr(golden_runner, "_ID_COUNTER", 0)
+
+    result = _eval_correction_persists(
+        AgentConfig(memory_dir=tmp_path / "memory"),
+        eval_id,
+    )
+
+    assert result["passed"] is True
+    assert result["memory_hits"] == 1
+    assert chat_call["run_id"] == "run_golden_seed_correction_correction"
+    turn_id_factory = build_calls[0]["turn_id_factory"]
+    assert callable(turn_id_factory)
+    assert turn_id_factory() == "turn_golden_seed_correction_correction"
+    assert "turn_id" not in chat_call
+    assert golden_runner._ID_SEED is None
+    assert golden_runner._ID_COUNTER == 0
+
+
+def test_seeded_conflict_case_uses_stable_record_ids_and_timestamps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_runs: list[list[MemoryRecord]] = []
+
+    class FakeMemory:
+        def __init__(self) -> None:
+            self.records: list[MemoryRecord] = []
+
+        def put(self, record: MemoryRecord) -> str:
+            self.records.append(record)
+            return record.id
+
+        def seal_all(self) -> None:
+            return None
+
+        def close_all(self) -> None:
+            captured_runs.append(list(self.records))
+
+    memories = iter((FakeMemory(), FakeMemory()))
+    monkeypatch.setattr(
+        golden_runner,
+        "build_memory_system",
+        lambda *_args, **_kwargs: next(memories),
+    )
+    monkeypatch.setattr(
+        golden_runner,
+        "ContextPacker",
+        lambda _memory: SimpleNamespace(
+            pack=lambda _request: SimpleNamespace(
+                conflict_warnings=("stable conflict",),
+                items=(),
+                prompt="stable prompt",
+            )
+        ),
+    )
+    config = AgentConfig(memory_dir=tmp_path / "memory")
+
+    _eval_conflict_warning(config, "golden_seed_conflict")
+    _eval_conflict_warning(config, "golden_seed_conflict")
+
+    first = [(record.id, record.created_at, record.updated_at) for record in captured_runs[0]]
+    second = [(record.id, record.created_at, record.updated_at) for record in captured_runs[1]]
+    assert first == second
+    assert len({record_id for record_id, _created, _updated in first}) == 2
+    assert all(created.tzinfo is not None for _record_id, created, _updated in first)
 
 def test_golden_eval_report_exits_zero_only_for_explicit_pass() -> None:
     assert _report_exit_code({"passed": True}) == 0

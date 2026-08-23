@@ -187,6 +187,7 @@ export type RoutingRunReport = {
   decisions: RoutingDecisionRecord[];
   outcomes: RoutingOutcomeRecord[];
   shadows?: RoutingShadowRecord[];
+  shadow_observations?: ShadowObservationRecord[];
   calibrations?: TargetCalibrationRecord[];
 };
 
@@ -259,6 +260,41 @@ export type TargetCalibrationRecord = {
   example_count: number;
   effective_sample_size: number;
   updated_at: string;
+};
+
+export type ShadowVerdict = "supported" | "contradicted" | "inconclusive";
+
+export type ShadowObservationRecord = {
+  observation_id: string;
+  run_id: string;
+  task_id: string;
+  subagent_id: string | null;
+  attempt: number;
+  role: string;
+  actual_authority: string;
+  actual_target_id: string | null;
+  actual_provider: string;
+  actual_model: string;
+  shadow_target_id: string | null;
+  shadow_provider: string;
+  shadow_model: string;
+  shadow_executed: boolean;
+  static_target_id: string | null;
+  candidates: RouteCandidate[];
+  constraints: Record<string, unknown>;
+  qualification: Record<string, unknown>;
+  reason_codes: string[];
+  usage: Record<string, unknown>;
+  verdict: ShadowVerdict;
+  verdict_reason: string;
+  evidence_basis: string[];
+  counterfactual_proven: boolean;
+  payload_digest: string;
+  created_at: string;
+  resolved_at: string | null;
+  validation_passed: boolean | null;
+  actual_cost_usd: number | null;
+  actual_latency_seconds: number | null;
 };
 
 export type LanStaleReason =

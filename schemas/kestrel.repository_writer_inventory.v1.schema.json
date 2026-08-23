@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.repository_writer_inventory.v1.schema.json",
+  "title": "kestrel.repository_writer_inventory.v1",
+  "type": "object",
+  "required": ["schema", "phase", "repository", "owner", "repository_writers", "invitations", "write_deploy_keys", "installed_apps", "actions_write_principals", "mutation_capable_runs", "nonce_run_ids", "captured_at", "complete", "evidence", "provenance", "confidence", "validation_status"],
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {"const": "kestrel.repository_writer_inventory.v1"},
+    "phase": {"enum": ["pre_send", "post_containment", "pre_admission"]},
+    "repository": {"$ref": "#/$defs/repository"},
+    "owner": {"$ref": "#/$defs/owner"},
+    "repository_writers": {"type": "array", "minItems": 1, "maxItems": 1024, "uniqueItems": true, "x-sort-key": ["id", "login"], "items": {"$ref": "#/$defs/repository_writer"}},
+    "invitations": {"type": "array", "minItems": 0, "maxItems": 4096, "uniqueItems": true, "x-sort-key": ["id"], "items": {"$ref": "#/$defs/invitation"}},
+    "write_deploy_keys": {"type": "array", "minItems": 0, "maxItems": 4096, "uniqueItems": true, "x-sort-key": ["id"], "items": {"$ref": "#/$defs/deploy_key"}},
+    "installed_apps": {"type": "array", "minItems": 0, "maxItems": 1024, "uniqueItems": true, "x-sort-key": ["app_id", "installation_id"], "items": {"$ref": "#/$defs/installed_app"}},
+    "actions_write_principals": {"type": "array", "minItems": 0, "maxItems": 1024, "uniqueItems": true, "x-sort-key": ["kind", "id"], "items": {"$ref": "#/$defs/actions_principal"}},
+    "mutation_capable_runs": {"type": "array", "minItems": 0, "maxItems": 1024, "uniqueItems": true, "x-sort-key": ["run_id"], "items": {"$ref": "#/$defs/run"}},
+    "nonce_run_ids": {"type": "array", "minItems": 0, "maxItems": 1024, "uniqueItems": true, "x-sort-key": ["value"], "items": {"$ref": "#/$defs/id"}},
+    "captured_at": {"$ref": "#/$defs/timestamp"},
+    "complete": {"const": true},
+    "evidence": {"$ref": "#/$defs/evidence"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "confidence": {"const": 1},
+    "validation_status": {"const": "validated"}
+  },
+  "$defs": {
+    "id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"},
+    "login": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+(?:\\[bot\\])?$"},
+    "repository": {
+      "type": "object",
+      "required": ["full_name", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "full_name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "owner": {
+      "type": "object",
+      "required": ["login", "id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "login": {"$ref": "#/$defs/login"},
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"const": "User"}
+      }
+    },
+    "repository_writer": {
+      "type": "object",
+      "required": ["login", "id", "type", "role_name"],
+      "additionalProperties": false,
+      "properties": {
+        "login": {"$ref": "#/$defs/login"},
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"const": "User"},
+        "role_name": {"enum": ["write", "maintain", "admin"]}
+      }
+    },
+    "invitation": {
+      "type": "object",
+      "required": ["id", "login", "permission"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "login": {"$ref": "#/$defs/login"},
+        "permission": {"enum": ["write", "maintain", "admin"]}
+      }
+    },
+    "deploy_key": {
+      "type": "object",
+      "required": ["id", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "required": ["actions", "metadata"],
+      "additionalProperties": false,
+      "properties": {
+        "actions": {"const": "write"},
+        "metadata": {"const": "read"}
+      }
+    },
+    "installed_app": {
+      "type": "object",
+      "required": ["app_id", "installation_id", "bot_login", "bot_id", "permissions"],
+      "additionalProperties": false,
+      "properties": {
+        "app_id": {"$ref": "#/$defs/id"},
+        "installation_id": {"$ref": "#/$defs/id"},
+        "bot_login": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+\\[bot\\]$"},
+        "bot_id": {"$ref": "#/$defs/id"},
+        "permissions": {"$ref": "#/$defs/permissions"}
+      }
+    },
+    "actions_principal": {
+      "type": "object",
+      "required": ["kind", "login", "id", "app_id", "installation_id"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"enum": ["User", "GitHubApp"]},
+        "login": {"$ref": "#/$defs/login"},
+        "id": {"$ref": "#/$defs/id"},
+        "app_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "installation_id": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]}
+      }
+    },
+    "run": {
+      "type": "object",
+      "required": ["run_id", "workflow_id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {"$ref": "#/$defs/id"},
+        "workflow_id": {"$ref": "#/$defs/id"},
+        "status": {"enum": ["queued", "in_progress", "pending", "waiting", "requested"]}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["source_bundle_digest", "canonicalization_vector_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "source_bundle_digest": {"$ref": "#/$defs/digest"},
+        "canonicalization_vector_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["producer", "provider", "method"],
+      "additionalProperties": false,
+      "properties": {
+        "producer": {"const": "kestrel-release-controller"},
+        "provider": {"const": "github.com"},
+        "method": {"const": "complete-writer-inventory"}
+      }
+    }
+  }
+}

@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Cpu, GitBranch, RefreshCw, Route, ServerCog } from "lucide-react";
+import { Cpu, GitBranch, RefreshCw, Route, ServerCog, ShieldCheck } from "lucide-react";
 import { EmptyState, Field, InlineMeta, JsonBlock, Panel, StatusBadge } from "../components";
 import {
   getModelTargets,
@@ -21,6 +21,7 @@ import type {
   RoutingLocality,
   RoutingRunReport,
   RoutingStatus,
+  ShadowObservationRecord,
   TaskRoutePreview
 } from "./types";
 
@@ -729,7 +730,112 @@ export function RoutingCenter({
           <EmptyState>Select a run to inspect its route history.</EmptyState>
         )}
       </Panel>
+
+      <Panel title="Routing authority & evidence" icon={<ShieldCheck size={19} />}>
+        <p className="muted">
+          Zero-authority shadow observations recorded during each routed attempt. They state what actually executed,
+          what Adaptive Flock would have recommended, and the honest observational verdict — never a claim of
+          counterfactual proof for an unexecuted target.
+        </p>
+        <ShadowObservationHistory report={runReport} />
+      </Panel>
     </section>
+  );
+}
+
+type ShadowDisplayState =
+  | "deterministic"
+  | "shadow"
+  | "activated"
+  | "suspended-fallback"
+  | "operator-pinned";
+
+function shadowObservationState(observation: ShadowObservationRecord): ShadowDisplayState {
+  switch (observation.actual_authority) {
+    case "adaptive_activated":
+      return "activated";
+    case "deterministic_fallback_after_suspension":
+      return "suspended-fallback";
+    case "operator_pinned":
+      return "operator-pinned";
+    case "deterministic_static":
+    default:
+      // A deterministic decision that observed a differing, unexecuted shadow
+      // recommendation is the "shadow" (observed, not authoritative) state.
+      if (
+        observation.shadow_target_id !== null &&
+        observation.shadow_target_id !== observation.actual_target_id &&
+        !observation.shadow_executed
+      ) {
+        return "shadow";
+      }
+      return "deterministic";
+  }
+}
+
+function ShadowObservationHistory({ report }: { report: RoutingRunReport | null }) {
+  if (!report) {
+    return <EmptyState>Select a run to inspect its routing authority and evidence.</EmptyState>;
+  }
+  const observations = report.shadow_observations ?? [];
+  if (observations.length === 0) {
+    return (
+      <EmptyState>
+        No shadow observations recorded for this run yet. New routed attempts persist a zero-authority observation
+        for every eligible scheduler/subagent role.
+      </EmptyState>
+    );
+  }
+  return (
+    <div className="list separated" aria-label="Routing authority and evidence">
+      {observations.map((observation) => (
+        <ShadowObservationRow key={observation.observation_id} observation={observation} />
+      ))}
+    </div>
+  );
+}
+
+function ShadowObservationRow({ observation }: { observation: ShadowObservationRecord }) {
+  const state = shadowObservationState(observation);
+  const actual =
+    observation.actual_target_id ?? `${observation.actual_provider}/${observation.actual_model}`;
+  const shadow =
+    observation.shadow_target_id ??
+    (observation.shadow_target_id === null ? "abstained" : `${observation.shadow_provider}/${observation.shadow_model}`);
+  return (
+    <div className="data-row">
+      <strong>
+        {observation.role} · {observation.static_target_id ?? "static"} → {actual}
+      </strong>
+      <InlineMeta
+        items={[
+          `run ${observation.run_id}`,
+          `task ${observation.task_id}`,
+          `attempt ${observation.attempt}`,
+          `learned ${shadow}`
+        ]}
+      />
+      <StatusBadge value={state} />
+      <StatusBadge value={observation.verdict} />
+      <span>
+        {observation.counterfactual_proven
+          ? "Counterfactual proven by executed terminal evidence."
+          : observation.shadow_target_id !== null && observation.shadow_target_id !== observation.actual_target_id
+            ? "Not proven: the differing target was never executed."
+            : "No counterfactual claim."}
+        {" · "}
+        {observation.validation_passed === null
+          ? "Terminal evidence not yet recorded."
+          : observation.validation_passed
+            ? "Executed target validated."
+            : "Executed target failed validation."}
+        {" · "}
+        {humanizeReason(observation.verdict_reason)}
+      </span>
+      {observation.evidence_basis.length > 0 ? (
+        <InlineMeta items={["evidence:", ...observation.evidence_basis.map(humanizeReason)]} />
+      ) : null}
+    </div>
   );
 }
 

@@ -43,7 +43,7 @@ from .routine_schedule import (
 )
 from .security_boundary import redact_secrets, redact_text
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 DEFAULT_APPROVAL_TTL_SECONDS = 900.0
 CAPABILITY_KINDS = frozenset({"tool", "mcp_server", "skill"})
 _STATE_DIRECTORY_MODE = 0o700
@@ -130,6 +130,8 @@ class RunRecord:
     turn_origin: str = "primary_user"
     transcript_scope: str = "primary"
     project_id: str | None = None
+    mission_binding: dict[str, Any] | None = None
+    mission_preflight: dict[str, Any] | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -306,6 +308,8 @@ class AgentStateStore:
         project_id: str | None = None,
         expected_project_revision: int | None = None,
         max_nonterminal_runs: int | None = None,
+        mission_binding: dict[str, Any] | None = None,
+        mission_preflight: dict[str, Any] | None = None,
     ) -> RunRecord:
         now = utc_now()
         with self._connect() as conn:
@@ -344,8 +348,9 @@ class AgentStateStore:
                     run_id, status, message, session_id, workspace, provider, model,
                     assistant_message, context_chars, tool_count, stop_reason, error,
                     config_revision, config_snapshot_json, turn_source_json,
-                    turn_origin, transcript_scope, project_id, created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                    turn_origin, transcript_scope, project_id, mission_binding_json,
+                    mission_preflight_json, created_at, updated_at
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, '', 0, 0, '', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -360,6 +365,8 @@ class AgentStateStore:
                     turn_origin,
                     transcript_scope,
                     project_id,
+                    _encode(mission_binding) if mission_binding is not None else None,
+                    _encode(mission_preflight) if mission_preflight is not None else None,
                     now,
                     now,
                 ),
@@ -2421,14 +2428,18 @@ class AgentStateStore:
         status: str | None = None,
         *,
         expire: bool = True,
+        run_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if expire:
             self.expire_pending_approvals()
         sql = "SELECT * FROM approval_requests"
-        params: tuple[object, ...] = ()
+        params: list[object] = []
         if status is not None:
             sql += " WHERE status = ?"
-            params = (status,)
+            params.append(status)
+        if run_id is not None:
+            sql += " AND run_id = ?" if status is not None else " WHERE run_id = ?"
+            params.append(run_id)
         sql += " ORDER BY created_at DESC"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -5198,6 +5209,9 @@ class AgentStateStore:
             if current < 21:
                 _apply_schema_v21(conn)
                 current = 21
+            if current < 22:
+                _apply_schema_v22(conn)
+                current = 22
             if current < SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Unsupported schema migration target: {current} -> {SCHEMA_VERSION}"
@@ -6004,6 +6018,23 @@ def _apply_schema_v21(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_schema_v22(conn: sqlite3.Connection) -> None:
+    """Additive JOURNEY-001: persist the accepted mission launch binding/preflight.
+
+    The accepted launch binding and the admitted preflight projection are stored
+    on the run row so that project revision, objective/plan digest, and preflight
+    can never be substituted after admission. Existing databases only gain the
+    two new nullable columns; no existing column or row is rewritten.
+    """
+    existing = _columns(conn, "runs")
+    if not existing:
+        return
+    if "mission_binding_json" not in existing:
+        conn.execute("ALTER TABLE runs ADD COLUMN mission_binding_json TEXT")
+    if "mission_preflight_json" not in existing:
+        conn.execute("ALTER TABLE runs ADD COLUMN mission_preflight_json TEXT")
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -6311,6 +6342,8 @@ def _run_from_row(row: sqlite3.Row) -> RunRecord:
         turn_origin=str(_row_get(row, "turn_origin", "primary_user") or "primary_user"),
         transcript_scope=str(_row_get(row, "transcript_scope", "primary") or "primary"),
         project_id=_optional_str(_row_get(row, "project_id")),
+        mission_binding=_json_dict_or_none(_row_get(row, "mission_binding_json")),
+        mission_preflight=_json_dict_or_none(_row_get(row, "mission_preflight_json")),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )

@@ -199,6 +199,7 @@ def _closure(tmp_path: Path) -> tuple[Path, bytes, Path]:
     return capsule, _canonical(closure), tool_path
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_verifies_exact_members_imports_and_tool(
     tmp_path: Path,
 ) -> None:
@@ -230,6 +231,7 @@ def test_execution_closure_verifies_exact_members_imports_and_tool(
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_distinguishes_root_resources_from_fixed_authority_assets(
     tmp_path: Path,
 ) -> None:
@@ -253,6 +255,7 @@ def test_execution_closure_distinguishes_root_resources_from_fixed_authority_ass
     assert verified["validation_status"] == "validated"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_offline_capsule_binds_an_exact_separate_host_actuator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -333,6 +336,7 @@ def test_offline_capsule_binds_an_exact_separate_host_actuator(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_closure_verification_never_executes_self_declared_tools_before_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -887,6 +891,7 @@ def test_launcher_does_not_self_certify_declared_sys_path(tmp_path: Path) -> Non
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_refuses_direct_execution_without_a_pinned_os_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -936,6 +941,7 @@ def test_launcher_refuses_direct_execution_without_a_pinned_os_sandbox(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_rejects_a_self_declared_os_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -998,6 +1004,7 @@ def test_launcher_rejects_a_self_declared_os_sandbox(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_accepts_only_the_exact_independently_pinned_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1029,6 +1036,7 @@ def test_launcher_accepts_only_the_exact_independently_pinned_sandbox(
         launcher.resolve_trusted_os_sandbox(closure=closure)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bubblewrap_profile_is_offline_and_mounts_only_declared_roots(
     tmp_path: Path,
 ) -> None:
@@ -1074,6 +1082,7 @@ def test_bubblewrap_profile_is_offline_and_mounts_only_declared_roots(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bubblewrap_profile_mounts_only_digest_bound_runtime_files(
     tmp_path: Path,
 ) -> None:
@@ -1149,6 +1158,7 @@ def test_bubblewrap_profile_mounts_only_digest_bound_runtime_files(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_private_loader_rejects_preload_and_ambient_dependency_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1225,6 +1235,7 @@ def test_private_loader_rejects_preload_and_ambient_dependency_resolution(
     assert command[-2:] == [str(sandbox), "--version"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_materialize_main_verifies_complete_closure_before_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1327,6 +1338,7 @@ def test_host_binding_cli_output_is_authorized_write_once(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_uses_absolute_tool_not_path_shadow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1348,6 +1360,7 @@ def test_execution_closure_uses_absolute_tool_not_path_shadow(
     assert "PYTHONHOME" not in environment
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_recovery_network_policy_allows_only_the_exact_frozen_origin(
     tmp_path: Path,
 ) -> None:
@@ -1391,6 +1404,7 @@ def test_recovery_network_policy_allows_only_the_exact_frozen_origin(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_requires_capsule_inside_an_exact_io_root(
     tmp_path: Path,
 ) -> None:
@@ -1409,6 +1423,7 @@ def test_execution_closure_requires_capsule_inside_an_exact_io_root(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 @pytest.mark.parametrize("mutation", ["missing", "changed", "extra"])
 def test_execution_closure_rejects_member_inventory_drift(tmp_path: Path, mutation: str) -> None:
     capsule, closure, tool_path = _closure(tmp_path)
@@ -1428,6 +1443,7 @@ def test_execution_closure_rejects_member_inventory_drift(tmp_path: Path, mutati
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_execution_closure_rejects_unlisted_or_nonliteral_dynamic_import(
     tmp_path: Path,
 ) -> None:
@@ -1455,6 +1471,7 @@ def test_execution_closure_rejects_unlisted_or_nonliteral_dynamic_import(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_launcher_materializes_candidate_only_from_the_bound_capsule_archive(
     tmp_path: Path,
 ) -> None:
@@ -1521,6 +1538,10 @@ def _tar_with_member(name: str, *, kind: bytes = tarfile.REGTYPE) -> bytes:
         _tar_with_member("../escape"),
         _tar_with_member("absolute", kind=tarfile.SYMTYPE),
     ],
+    # Short, stable ids. The raw tar archives are ~2KB of bytes each; pytest
+    # embeds repr(param) in the node id, which overflows the 32767-char
+    # Windows os.putenv limit (PYTEST_CURRENT_TEST) at setup/teardown.
+    ids=["traversal-escape", "symlink-member"],
 )
 def test_bootstrap_recovery_rejects_traversal_and_links(tmp_path: Path, archive: bytes) -> None:
     archive_path = tmp_path / "capsule.tar"
@@ -1533,6 +1554,7 @@ def test_bootstrap_recovery_rejects_traversal_and_links(tmp_path: Path, archive:
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_extracts_only_deterministic_regular_members(
     tmp_path: Path,
 ) -> None:
@@ -1554,6 +1576,13 @@ def _bootstrap_archive(
     extra_wheel: bool = False,
     include_sandbox: bool = True,
 ) -> tuple[Path, Path]:
+    # The production recovery runtime is pinned to CPython 3.11.14 (see
+    # scripts/bootstrap_recovery.py and the recovery_* schemas). The fixture
+    # declares that exact identity so the bootstrap's hard version gate and
+    # trusted-identity check pass on ANY test runner (3.11.15, 3.12, 3.13 ...).
+    # The ambient interpreter's bytes stand in for the trusted 3.11.14 binary.
+    pin_version = "3.11.14"
+    pin_abi = "cp311"
     source = tmp_path / "capsule-source"
     destination = tmp_path / "capsule"
     app = b"VALUE = 1\n"
@@ -1582,9 +1611,7 @@ def _bootstrap_archive(
         {
             "schema": "kestrel.recovery_runtime.v1",
             "platform": "ubuntu-24.04-x86_64",
-            "python_version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
+            "python_version": pin_version,
             "python_executable_sha256": python_digest,
             "files": runtime_files,
         }
@@ -1617,10 +1644,8 @@ def _bootstrap_archive(
         {
             "schema": "kestrel.recovery_python_runtime.v1",
             "platform": "ubuntu-24.04-x86_64",
-            "python_version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
-            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "python_version": pin_version,
+            "python_abi": pin_abi,
             "python_executable_path": "bin/python3.11",
             "python_executable_sha256": python_digest,
             "source_archive_url": bootstrap.RECOVERY_PYTHON_PACKAGE_URL,
@@ -1639,10 +1664,8 @@ def _bootstrap_archive(
         {
             "schema": "kestrel.recovery_environment.v1",
             "platform": "ubuntu-24.04-x86_64",
-            "python_version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
-            "python_abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "python_version": pin_version,
+            "python_abi": pin_abi,
             "environment_root": str(venv_python.parent.parent),
             "site_packages_path": str(
                 venv_python.parent.parent / "lib" / "python3.11" / "site-packages"
@@ -1692,10 +1715,7 @@ def _bootstrap_archive(
             "name": "python",
             "path": str(venv_python),
             "sha256": python_digest,
-            "version": (
-                f"Python {sys.version_info.major}."
-                f"{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
+            "version": f"Python {pin_version}",
         }
     ]
     if include_sandbox:
@@ -1726,10 +1746,8 @@ def _bootstrap_archive(
         "runtime_files": runtime_files,
         "python_runtime": {
             "implementation": "CPython",
-            "version": (
-                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            ),
-            "abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
+            "version": pin_version,
+            "abi": pin_abi,
         },
         "dependency_lock": {
             "requirements_path": "recovery/requirements.txt",
@@ -1793,9 +1811,11 @@ def _bootstrap_trust(archive: Path) -> dict[str, str]:
 
 
 def _trust_current_bootstrap_python(monkeypatch: pytest.MonkeyPatch) -> None:
-    runtime_version = (
-        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    )
+    # The production recovery runtime is pinned to CPython 3.11.14 (see
+    # scripts/bootstrap_recovery.py). Trust that exact pinned identity on the
+    # current runner's platform so the gate logic is exercised deterministically
+    # regardless of the ambient interpreter version. The ambient executable's
+    # bytes stand in for the trusted 3.11.14 binary's digest.
     monkeypatch.setattr(
         bootstrap,
         "TRUSTED_RECOVERY_PYTHON_IDENTITIES",
@@ -1804,10 +1824,10 @@ def _trust_current_bootstrap_python(monkeypatch: pytest.MonkeyPatch) -> None:
                 {
                     (
                         _sha(Path(sys.executable).resolve(strict=True).read_bytes()),
-                        f"Python {runtime_version}",
+                        "Python 3.11.14",
                         "CPython",
-                        runtime_version,
-                        f"cp{sys.version_info.major}{sys.version_info.minor}",
+                        "3.11.14",
+                        "cp311",
                     )
                 }
             )
@@ -1840,6 +1860,7 @@ def _trust_fixture_bootstrap_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1880,6 +1901,7 @@ def test_bootstrap_recovery_builds_hash_locked_offline_environment(
     assert verification["validation_status"] == "validated"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_rejects_a_self_declared_python_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1897,6 +1919,7 @@ def test_bootstrap_recovery_rejects_a_self_declared_python_identity(
     assert not (destination.parent / "recovery-runtime").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_prepares_only_an_independently_trusted_capsule_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1921,6 +1944,7 @@ def test_bootstrap_recovery_prepares_only_an_independently_trusted_capsule_sandb
     assert stat.S_IMODE(sandbox.stat().st_mode) == 0o500
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_rejects_a_self_declared_capsule_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1939,6 +1963,7 @@ def test_bootstrap_recovery_rejects_a_self_declared_capsule_sandbox(
     assert not (destination.parent / "recovery-runtime").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_rejects_unlisted_wheel_before_environment_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1961,6 +1986,7 @@ def test_bootstrap_recovery_rejects_unlisted_wheel_before_environment_creation(
     assert not (destination.parent / "recovery-runtime").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="recovery execution closure requires POSIX (bubblewrap, ELF, fchmod)")
 def test_bootstrap_recovery_requires_verified_capsule_before_environment_creation(
     tmp_path: Path,
 ) -> None:

@@ -27,12 +27,19 @@ from .ledger_serialization import (
     _outcome_request_identity,
     _outcome_request_identity_values,
     _shadow_entry_from_row,
+    _shadow_observation_entry_from_row,
     _validate_outcome_numbers,
     _validate_reward_components,
     _validate_route_binding,
+    _validate_shadow_observation_draft_payload,
 )
 from .models import AgentTaskContract, RouteDecision
 from .qualification_evidence import PROVIDER_SIDE_FAILURE_CATEGORIES
+from .shadow_observation import (
+    ShadowObservationDraft,
+    ShadowObservationEntry,
+    stable_shadow_observation_id,
+)
 
 
 class RoutingLedger(RoutingRegistry):
@@ -500,6 +507,233 @@ class RoutingLedger(RoutingRegistry):
         with self.state._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [_shadow_entry_from_row(row) for row in rows]
+
+    def record_shadow_observation(
+        self,
+        draft: ShadowObservationDraft,
+        *,
+        observation_id: str | None = None,
+    ) -> ShadowObservationEntry:
+        """Persist one zero-authority shadow observation (idempotent on id).
+
+        The observation is an append-only side channel.  Recording it never
+        touches routing decisions, outcomes, shadow evaluations, calibration,
+        qualification, grants, or any policy memory.
+        """
+
+        _validate_shadow_observation_draft_payload(draft)
+        resolved_id = observation_id or stable_shadow_observation_id(
+            run_id=draft.run_id,
+            task_id=draft.task_id,
+            subagent_id=draft.subagent_id,
+            attempt=draft.attempt,
+            role=draft.role,
+            payload_digest=draft.payload_digest,
+        )
+        now = utc_now()
+        values = (
+            resolved_id,
+            draft.run_id,
+            draft.task_id,
+            draft.subagent_id,
+            draft.attempt,
+            draft.role.value,
+            draft.actual_authority.value,
+            draft.actual_target_id,
+            draft.actual_provider,
+            draft.actual_model,
+            draft.shadow_target_id,
+            draft.shadow_provider,
+            draft.shadow_model,
+            1 if draft.shadow_executed else 0,
+            draft.static_target_id,
+            _json(list(draft.candidates)),
+            _json(draft.constraints),
+            _json(draft.qualification),
+            _json(list(draft.reason_codes)),
+            _json(draft.usage),
+            draft.verdict.value,
+            draft.verdict_reason,
+            _json(list(draft.evidence_basis)),
+            1 if draft.counterfactual_proven else 0,
+            draft.payload_digest,
+            now,
+            None,
+            None if draft.validation_passed is None else 1 if draft.validation_passed else 0,
+            draft.actual_cost_usd,
+            draft.actual_latency_seconds,
+        )
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT run_id FROM runs WHERE run_id = ?", (draft.run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"Unknown run: {draft.run_id}")
+            existing = conn.execute(
+                "SELECT * FROM routing_shadow_observations WHERE observation_id = ?",
+                (resolved_id,),
+            ).fetchone()
+            if existing is not None:
+                return _shadow_observation_entry_from_row(existing)
+            conn.execute(
+                """
+                INSERT INTO routing_shadow_observations (
+                    observation_id, run_id, task_id, subagent_id, attempt, role,
+                    actual_authority, actual_target_id, actual_provider,
+                    actual_model, shadow_target_id, shadow_provider, shadow_model,
+                    shadow_executed, static_target_id, candidates_json,
+                    constraints_json, qualification_json, reason_codes_json,
+                    usage_json, verdict, verdict_reason, evidence_basis_json,
+                    counterfactual_proven, payload_digest, created_at, resolved_at,
+                    validation_passed, actual_cost_usd, actual_latency_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            row = conn.execute(
+                "SELECT * FROM routing_shadow_observations WHERE observation_id = ?",
+                (resolved_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("shadow_observation_write_lost")
+        return _shadow_observation_entry_from_row(row)
+
+    def get_shadow_observation(
+        self,
+        observation_id: str,
+    ) -> ShadowObservationEntry | None:
+        with self.state._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM routing_shadow_observations WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+        return None if row is None else _shadow_observation_entry_from_row(row)
+
+    def list_shadow_observations(
+        self,
+        *,
+        run_id: str,
+        task_id: str | None = None,
+        role: str | None = None,
+    ) -> list[ShadowObservationEntry]:
+        params: list[object] = [run_id]
+        sql = "SELECT * FROM routing_shadow_observations WHERE run_id = ?"
+        if task_id is not None:
+            sql += " AND task_id = ?"
+            params.append(task_id)
+        if role is not None:
+            sql += " AND role = ?"
+            params.append(role)
+        sql += " ORDER BY created_at ASC, observation_id ASC"
+        with self.state._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_shadow_observation_entry_from_row(row) for row in rows]
+
+    def resolve_shadow_observation(
+        self,
+        observation_id: str,
+        *,
+        validation_passed: bool,
+        actual_cost_usd: float | None = None,
+        actual_latency_seconds: float | None = None,
+    ) -> ShadowObservationEntry:
+        """Record the terminal outcome of an already-persisted observation.
+
+        Resolution is append-only and irreversible (guarded at the schema
+        level).  The verdict is recomputed so "was the evidence favorable?" is
+        answered with the executed target's actual terminal evidence in hand.
+        """
+
+        _validate_outcome_numbers(
+            latency_seconds=actual_latency_seconds,
+            input_tokens=None,
+            output_tokens=None,
+            actual_cost_usd=actual_cost_usd,
+            tool_count=0,
+            changed_file_count=None,
+            retry_count=0,
+        )
+        now = utc_now()
+        with self.state._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM routing_shadow_observations WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown shadow observation: {observation_id}")
+            entry = _shadow_observation_entry_from_row(row)
+            if entry.resolved_at is not None:
+                return entry
+            resolved_verdict = self._recompute_resolved_verdict(
+                entry, validation_passed=validation_passed
+            )
+            conn.execute(
+                """
+                UPDATE routing_shadow_observations
+                SET resolved_at = ?,
+                    validation_passed = ?,
+                    actual_cost_usd = ?,
+                    actual_latency_seconds = ?,
+                    verdict = ?,
+                    verdict_reason = ?,
+                    evidence_basis_json = ?
+                WHERE observation_id = ? AND resolved_at IS NULL
+                """,
+                (
+                    now,
+                    1 if validation_passed else 0,
+                    actual_cost_usd,
+                    actual_latency_seconds,
+                    resolved_verdict[0],
+                    resolved_verdict[1],
+                    _json(list(resolved_verdict[2])),
+                    observation_id,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM routing_shadow_observations WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("shadow_observation_resolution_lost")
+        return _shadow_observation_entry_from_row(updated)
+
+    def _recompute_resolved_verdict(
+        self,
+        entry: ShadowObservationEntry,
+        *,
+        validation_passed: bool,
+    ) -> tuple[str, str, tuple[str, ...]]:
+        """Re-derive the verdict once the executed target reached a terminal state."""
+
+        from .shadow_observation import (
+            compute_shadow_verdict,
+            shadow_favorability,
+        )
+
+        qualification = entry.qualification
+        favorable = shadow_favorability(
+            learned_target_id=entry.shadow_target_id,
+            utility_delta=float(qualification.get("utility_delta", 0.0) or 0.0),
+            confidence=float(qualification.get("confidence", 0.0) or 0.0),
+            abstention_reason=qualification.get("abstention_reason"),
+        )
+        verdict = compute_shadow_verdict(
+            shadow_target_id=entry.shadow_target_id,
+            actual_target_id=entry.actual_target_id,
+            shadow_executed=entry.shadow_executed,
+            abstention_reason=qualification.get("abstention_reason"),
+            favorable=favorable,
+            actual_validation_passed=validation_passed,
+        )
+        return (
+            verdict.verdict.value,
+            verdict.reason,
+            verdict.evidence_basis,
+        )
+
 
     def list_calibrations(
         self,

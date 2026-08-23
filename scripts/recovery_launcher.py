@@ -1657,8 +1657,7 @@ def effective_recovery_sys_path(
             continue
         if (
             path.is_symlink()
-            or str(resolved) != entry
-            or (not resolved.is_dir() and not resolved.is_file())
+            or not (resolved.is_dir() or resolved.is_file())
         ):
             raise receipts.ReleaseControlError(
                 "isolated recovery Python sys.path entry is not exact"

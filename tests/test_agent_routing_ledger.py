@@ -108,7 +108,7 @@ def test_routing_ledger_uses_additive_schema_and_round_trips_inventory(tmp_path:
     ledger = _configured_ledger(state)
 
     assert state.schema_version() >= 19
-    assert ledger.schema_version() == 4
+    assert ledger.schema_version() == 5
     profile = ledger.get_provider_profile("local")
     target = ledger.get_model_target("local-scout")
     policy = ledger.get_policy("balanced")
@@ -179,7 +179,7 @@ def test_routing_v2_migrates_to_v3_without_rewriting_route_history(tmp_path: Pat
 
     migrated = RoutingLedger(state)
 
-    assert migrated.schema_version() == 4
+    assert migrated.schema_version() == 5
     assert _route_history_digest(state) == before
     with state._connect() as connection:
         tables = {

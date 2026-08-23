@@ -43,8 +43,11 @@ from .engineering.outcomes import OutcomeAnalyticsService
 from .event_bus import RunEventBus
 from .event_log import redact_secrets
 from .graph_runtime import (
+    _REVIEW_AUTHORITY_INDEPENDENT,
     DurableOrchestrationRuntime,
+    GraphRunState,
     GraphRuntimeServices,
+    _review_authority_value,
     criterion_requires_validation_evidence,
     evaluate_turn_review,
 )
@@ -1428,6 +1431,8 @@ class RunManager:
         source: TurnSource | None = None,
         mission_plan: Sequence[Mapping[str, Any]] | None = None,
         project_revision: int | None = None,
+        mission_binding: Mapping[str, Any] | None = None,
+        mission_preflight: Mapping[str, Any] | None = None,
     ) -> RunRecord:
         self._require_mutable_runtime("create_run")
         resolved_workspace = workspace
@@ -1491,6 +1496,12 @@ class RunManager:
             transcript_scope=transcript_scope,
             mission_plan=normalized_mission_plan,
             project_revision=project_revision,
+            mission_binding=(
+                dict(mission_binding) if mission_binding is not None else None
+            ),
+            mission_preflight=(
+                dict(mission_preflight) if mission_preflight is not None else None
+            ),
         )
 
     def _validate_mission_plan(
@@ -1702,6 +1713,8 @@ class RunManager:
         transcript_scope: str,
         mission_plan: tuple[dict[str, Any], ...],
         project_revision: int | None,
+        mission_binding: dict[str, Any] | None = None,
+        mission_preflight: dict[str, Any] | None = None,
     ) -> RunRecord:
         self._reserve_primary_run(run_id)
         try:
@@ -1763,6 +1776,8 @@ class RunManager:
                 expected_project_revision=project_revision,
                 max_nonterminal_runs=self._primary_concurrency_limit(run_config)
                 + max(0, run_config.max_queued_runs),
+                mission_binding=mission_binding,
+                mission_preflight=mission_preflight,
             )
             self._initialize_primary_run(
                 run=run,
@@ -2685,6 +2700,7 @@ class RunManager:
                     "tool.completed" if execution.success else "tool.failed",
                     _execution_payload(execution),
                 )
+                self._publish_shipping_evidence(run_id, execution)
             return execution
         finally:
             self.close_runtime_agent(agent, run_id=run_id)
@@ -3512,6 +3528,8 @@ class RunManager:
                 reconcile_root_task=self._reconcile_root_task,
                 is_cancelled=cancelled,
                 graph_amendments=self.graph_amendments,
+                review_authority_resolver=self._review_authority_resolver(),
+                build_reviewer_agent=self._build_reviewer_agent(),
             )
             try:
                 DurableOrchestrationRuntime(services).run_chat_turn(
@@ -4806,6 +4824,7 @@ class RunManager:
         self.events.publish(
             run_id, "tool.completed" if execution.success else "tool.failed", payload
         )
+        self._publish_shipping_evidence(run_id, safe_execution)
         return call, safe_execution
 
     def _finish_agent_turn(
@@ -4828,31 +4847,72 @@ class RunManager:
             None,
         )
         run = self.state.get_run(run_id)
-        recorder = SpanRecorder(state=self.state, events=self.events)
-        with recorder.start(
+
+        # S4 / JOURNEY-004 — approval continuations route through the same
+        # reviewer resolver + separate reviewer-agent builder as primary turns,
+        # so the live-reviewer-separation guarantee covers resumed turns too.
+        review_assignment: Any = None
+        reviewer_agent: NestedMV2Agent | None = None
+        resolver = self._review_authority_resolver()
+        builder = self._build_reviewer_agent()
+        ctx = GraphRunState(
             run_id=run_id,
-            span_type="review",
-            name="ReviewerNode",
-            metadata={"continuation": "approval"},
-        ) as span:
-            review = evaluate_turn_review(
-                message=run.message,
-                config=config,
-                result=result,
-                root_task=root,
-                agent=agent,
-                additional_tool_executions=additional_tool_executions,
-            )
-            if root is not None:
-                root_result = dict(root.result or {})
-                root_result["orchestration_review"] = review
-                self.state.update_task_node(root.task_id, result=root_result)
-            self.events.publish(
-                run_id,
-                "review.completed",
-                {"node": "ReviewerNode", "continuation": "approval", **review},
-            )
-            span.set_result(status=str(review["status"]), output=review)
+            config=config,
+            message=run.message,
+            session_id=run.session_id,
+            agent=agent,
+            result=result,
+        )
+        if resolver is not None:
+            try:
+                review_assignment = resolver(ctx)
+            except Exception:  # noqa: BLE001 - resolver failure must not wedge the gate
+                review_assignment = None
+            if (
+                review_assignment is not None
+                and _review_authority_value(review_assignment)
+                == _REVIEW_AUTHORITY_INDEPENDENT
+                and builder is not None
+            ):
+                try:
+                    reviewer_agent = builder(ctx, review_assignment)
+                except Exception:  # noqa: BLE001 - executor agent remains the fallback
+                    reviewer_agent = None
+
+        recorder = SpanRecorder(state=self.state, events=self.events)
+        try:
+            with recorder.start(
+                run_id=run_id,
+                span_type="review",
+                name="ReviewerNode",
+                metadata={"continuation": "approval"},
+            ) as span:
+                review = evaluate_turn_review(
+                    message=run.message,
+                    config=config,
+                    result=result,
+                    root_task=root,
+                    agent=agent,
+                    additional_tool_executions=additional_tool_executions,
+                    review_assignment=review_assignment,
+                    reviewer_agent=reviewer_agent,
+                )
+                if root is not None:
+                    root_result = dict(root.result or {})
+                    root_result["orchestration_review"] = review
+                    self.state.update_task_node(root.task_id, result=root_result)
+                self.events.publish(
+                    run_id,
+                    "review.completed",
+                    {"node": "ReviewerNode", "continuation": "approval", **review},
+                )
+                span.set_result(status=str(review["status"]), output=review)
+        finally:
+            # The separate reviewer agent holds its own Memvid handles and a
+            # concurrency slot; close it on every path that built it (mirrors
+            # the graph runtime's ReviewerNode finally).
+            if reviewer_agent is not None:
+                self._close_agent_for_run(run_id, reviewer_agent)
 
         status = str(review["status"])
         if status == "completed":
@@ -5460,6 +5520,7 @@ class RunManager:
                     "tool.completed" if execution.success else "tool.failed",
                     _execution_payload(execution),
                 )
+                self._publish_shipping_evidence(run.run_id, execution)
             event_type = {
                 "blocked": "task.blocked",
                 "failed": "task.failed",
@@ -5951,6 +6012,22 @@ class RunManager:
             ]
             for approval_id in expired:
                 self._approval_call_arguments.pop(approval_id, None)
+
+    def _review_authority_resolver(self) -> Callable[[GraphRunState], Any] | None:
+        """Live reviewer-separation hook (S4 / JOURNEY-004).
+
+        The base runtime does not route the graph reviewer through the role
+        resolver — ``evaluate_turn_review`` keeps its pre-S4 deterministic
+        behaviour.  ``AdaptiveFlockRunManager`` overrides this to return a
+        resolver that produces a durable ``GraphRoleAssignment``.
+        """
+
+        return None
+
+    def _build_reviewer_agent(self) -> Callable[[GraphRunState, Any], NestedMV2Agent | None] | None:
+        """Build a separate reviewer agent for an independent reviewer target."""
+
+        return None
 
     def _build_agent(self, config: AgentConfig) -> NestedMV2Agent:
         if self._shutdown_event.is_set():
@@ -6481,6 +6558,22 @@ class RunManager:
                     "tool.completed" if execution.success else "tool.failed",
                     _execution_payload(execution),
                 )
+                self._publish_shipping_evidence(run_id, execution)
+
+    def _publish_shipping_evidence(
+        self, run_id: str, execution: ToolExecution | None
+    ) -> dict[str, Any] | None:
+        """Publish bounded ``commit.created``/``ship.completed`` shipping evidence.
+
+        JOURNEY-005: when an approved ``git.commit`` tool succeeds inside a
+        mission run, the mission proof projection's shipping section must be
+        able to report ``present``. This is the server-authored bridge — the
+        projection never infers authority from presentation state. No-op for
+        any other tool or a failed execution.
+        """
+        from .mission_flagship import publish_shipping_events
+
+        return publish_shipping_events(run_id, execution, self.events)
 
     def _abort_primary_admission(
         self,

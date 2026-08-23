@@ -313,6 +313,12 @@ jobs:
           languages: python,javascript-typescript
           build-mode: none
           queries: security-extended
+          # Version-controlled, path-scoped suppression config (see WHY in the
+          # config file). Note: this MUST be the `config-file` input (a file path),
+          # not the `config` input (a YAML string). Passing the path to `config`
+          # made the action crash at init:
+          #   "Cannot create property 'queries' on string '.github/codeql/codeql-config.yml'"
+          config-file: .github/codeql/codeql-config.yml
       - name: Analyze source
         uses: github/codeql-action/analyze@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3.37.1
 

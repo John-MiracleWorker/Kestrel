@@ -130,6 +130,9 @@ class ContextPacker:
 
     def _select_items(self, hits: list[MemoryHit], request: ContextPackRequest) -> list[PackedContextItem]:
         selected: list[PackedContextItem] = []
+        selected_canonical_contents: list[str] = []
+        selected_rendered_contents: list[str] = []
+        selected_linked_child_ids: set[str] = set()
         seen_hashes: set[str] = set()
         used_tokens = estimate_tokens(
             _prompt_scaffold(
@@ -143,9 +146,17 @@ class ContextPacker:
 
         for hit in hits:
             frame = _frame_for(hit)
-            if frame.content_hash in seen_hashes:
+            requires_independent_linked_evidence = _requires_independent_linked_evidence(
+                frame,
+                linked_child_ids=selected_linked_child_ids,
+                selected_contents=selected_rendered_contents,
+            )
+            if frame.content_hash in seen_hashes and not requires_independent_linked_evidence:
                 continue
-            if _too_similar(frame.content, [item.content for item in selected]):
+            if (
+                _too_similar(frame.content, selected_canonical_contents)
+                and not requires_independent_linked_evidence
+            ):
                 continue
             should_expand = _should_expand_raw(
                 frame,
@@ -157,6 +168,7 @@ class ContextPacker:
                 continue
             expand_children = frame.frame_type in SUMMARY_FRAME_TYPES and (request.expand_raw or needs_exact)
             content = frame.content if should_expand or expand_children else hit.snippet or frame.content
+            canonical_content = frame.content
             reason = _selection_reason(frame, should_expand)
             if should_expand:
                 content = frame.content
@@ -168,6 +180,7 @@ class ContextPacker:
                 )
                 if expanded_content != content:
                     content = expanded_content
+                    canonical_content = expanded_content
                     should_expand = True
                     reason = "expanded_child_frames"
             token_count = max(estimate_tokens(content, request.model_hint), frame.token_count if should_expand else 0)
@@ -175,6 +188,7 @@ class ContextPacker:
                 if selected:
                     continue
                 content = _truncate_to_tokens(content, max(request.token_budget - used_tokens, 64))
+                canonical_content = content
                 token_count = estimate_tokens(content, request.model_hint)
             selected.append(
                 PackedContextItem(
@@ -188,6 +202,9 @@ class ContextPacker:
             )
             used_tokens += token_count
             seen_hashes.add(frame.content_hash)
+            selected_canonical_contents.append(canonical_content)
+            selected_rendered_contents.append(content)
+            selected_linked_child_ids.update(frame.child_ids)
             if used_tokens >= request.token_budget:
                 break
 
@@ -244,11 +261,22 @@ class ContextPacker:
         return "\n".join(lines).strip()
 
     @staticmethod
-    def _rank_key(hit: MemoryHit) -> tuple[int, int, float, float, float]:
+    def _rank_key(
+        hit: MemoryHit,
+    ) -> tuple[int, int, float, float, float, str, str, str]:
         frame = _frame_for(hit)
         layer_rank = len(PACK_LAYER_ORDER) - PACK_LAYER_ORDER.index(frame.layer) if frame.layer in PACK_LAYER_ORDER else 0
         frame_rank = 3 if frame.frame_type in SUMMARY_FRAME_TYPES else 2 if frame.frame_type in CORRECTION_FRAME_TYPES else 1
-        return (layer_rank, frame_rank, hit.score, frame.importance, frame.confidence)
+        return (
+            layer_rank,
+            frame_rank,
+            hit.score,
+            frame.importance,
+            frame.confidence,
+            frame.title.casefold(),
+            frame.content_hash,
+            hit.record.id,
+        )
 
     def _content_with_child_frames(
         self,
@@ -370,8 +398,17 @@ def _should_expand_raw(
 
 def _needs_exact_evidence(objective: str, query: str) -> bool:
     text = f"{objective} {query}".lower()
-    markers = ("exact", "quote", "code", "diff", "stack trace", "error", "evidence", "line ")
-    return any(marker in text for marker in markers)
+    markers = (
+        r"\bexact\b",
+        r"\bquote\b",
+        r"\bcode\b",
+        r"\bdiff\b",
+        r"\bstack\s+trace\b",
+        r"\berror\b",
+        r"\bevidence\b",
+        r"\bline(?:s|-level)?\b",
+    )
+    return any(re.search(marker, text) for marker in markers)
 
 
 def _selection_reason(frame: MV2ContextFrame, expanded: bool) -> str:
@@ -403,6 +440,22 @@ def _too_similar(content: str, existing: list[str]) -> bool:
     return False
 
 
+def _requires_independent_linked_evidence(
+    frame: MV2ContextFrame,
+    *,
+    linked_child_ids: set[str],
+    selected_contents: list[str],
+) -> bool:
+    if frame.frame_type not in RAW_FRAME_TYPES | CORRECTION_FRAME_TYPES:
+        return False
+    if frame.id not in linked_child_ids and not frame.parent_ids:
+        return False
+    complete_content = frame.content.strip()
+    return bool(complete_content) and not any(
+        complete_content in selected_content for selected_content in selected_contents
+    )
+
+
 def _detect_conflicts(hits: list[MemoryHit]) -> list[str]:
     warnings: list[str] = []
     by_group: dict[str, list[MemoryHit]] = defaultdict(list)
@@ -416,11 +469,13 @@ def _detect_conflicts(hits: list[MemoryHit]) -> list[str]:
             by_title[_normalize_claim_key(hit.record.title)].append(hit)
 
     for group_id, grouped in sorted(by_group.items()):
+        grouped = sorted(grouped, key=_conflict_member_key)
         if len(grouped) > 1 or any(_frame_for(hit).frame_type == "conflict_set" for hit in grouped):
             titles = "; ".join(hit.record.title for hit in grouped[:4])
             warnings.append(f"conflict_group_id={group_id} has {len(grouped)} retrieved memories: {titles}")
 
-    for title_key, grouped in by_title.items():
+    for title_key, grouped in sorted(by_title.items()):
+        grouped = sorted(grouped, key=_conflict_member_key)
         if len(grouped) < 2:
             continue
         polarities = {_polarity(hit.record.content) for hit in grouped}
@@ -429,6 +484,11 @@ def _detect_conflicts(hits: list[MemoryHit]) -> list[str]:
             warnings.append(f"possible high-confidence disagreement around `{title_key}`: {titles}")
 
     return warnings
+
+
+def _conflict_member_key(hit: MemoryHit) -> tuple[str, str, str]:
+    frame = _frame_for(hit)
+    return (frame.title.casefold(), frame.content_hash, frame.id)
 
 
 def _normalize_claim_key(title: str) -> str:

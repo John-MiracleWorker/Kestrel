@@ -246,10 +246,12 @@ A release candidate is acceptable only when all of the following are green on th
 7. Wheel/sdist build, `twine check --strict`, separate clean wheel and sdist installs against the hash-locked release dependency set, and packaged React/license asset smoke in both environments.
 8. The exact wheel on Linux x86_64, macOS arm64 and x86_64, and native Windows x86_64 for Python 3.11 through 3.13, with runner architecture asserted, plus a successful exact-SHA `main` CI push run before release publication.
 9. Twenty identical seeded everyday golden outcomes with a machine-readable zero-flake receipt.
-10. A successful exact-SHA disposable release rehearsal on `main` before the production tag exists.
+10. A successful exact-SHA disposable release rehearsal on `main` before the candidate dispatch.
 11. Chaos recovery test and bounded soak.
 12. Memvid integration tests under `RUN_MEMVID_INTEGRATION=1` in a credential-safe environment.
 13. Independent security/spec/code review of the exact diff.
-14. Deliberate tag/release action; never publish from an unreviewed dirty tree.
+14. Deliberate candidate dispatch and transaction dispatch; never publish from an unreviewed dirty tree.
 15. Zero open GitHub secret alerts and a clean current-source candidate scan; any historical credential incident has confirmed provider revocation/rotation and documentation.
-16. One independent human approval, an approval-protected `pypi` environment and exact pending Trusted Publisher, repository immutable releases enabled before tagging, and a public GHCR package that passes anonymous pull after first publication.
+16. One independent human approval, an approval-protected `pypi` environment and exact pending Trusted Publisher, repository immutable releases enabled before dispatching the release transaction, and a public GHCR package that passes anonymous pull after first publication.
+
+The release transaction's recovery authority and actuation boundary — the two-plane capsule/actuator split, the fail-closed invariants, and what recovery does and does not grant — is defined in `docs/RELEASE_RECOVERY_BOUNDARY.md`.

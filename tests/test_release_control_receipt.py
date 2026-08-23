@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -5297,6 +5298,7 @@ def _complete_recovery_capsule_assets(
     return assets, closure
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_recovery_capsule_command_accepts_only_an_explicit_programmatic_clock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5489,6 +5491,7 @@ def _write_valid_recovery_capsule_root(tmp_path: Path) -> tuple[Path, dict[str, 
     return root, manifest
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_recovery_capsule_rejects_surplus_asset_outside_execution_closure(
     tmp_path: Path,
 ) -> None:
@@ -5766,6 +5769,7 @@ def test_recovery_capsule_rejects_dependency_staging_receipt_source_drift(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_recovery_capsule_root_verifies_exact_manifest_inventory(
     tmp_path: Path,
 ) -> None:
@@ -5777,6 +5781,7 @@ def test_recovery_capsule_root_verifies_exact_manifest_inventory(
     assert raw == _canonical(expected)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_recovery_capsule_root_requires_both_frozen_workflow_digests(
     tmp_path: Path,
 ) -> None:
@@ -5788,6 +5793,7 @@ def test_recovery_capsule_root_requires_both_frozen_workflow_digests(
         subject.verify_recovery_capsule_root(root)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_recovery_capsule_root_rejects_substituted_admission_verification(
     tmp_path: Path,
 ) -> None:
@@ -5818,6 +5824,7 @@ def test_recovery_capsule_root_rejects_substituted_admission_verification(
         subject.verify_recovery_capsule_root(root)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_recovery_capsule_root_cryptographically_verifies_embedded_admission(
     tmp_path: Path,
 ) -> None:
@@ -5855,6 +5862,7 @@ def test_recovery_capsule_root_cryptographically_verifies_embedded_admission(
         subject.verify_recovery_capsule_root(root)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 @pytest.mark.parametrize("mutation", ["tamper", "extra", "empty-directory"])
 def test_recovery_capsule_root_rejects_inventory_mutants(tmp_path: Path, mutation: str) -> None:
     root, _ = _write_valid_recovery_capsule_root(tmp_path)
@@ -5946,6 +5954,7 @@ def _recovery_capsule_release_verification_inputs(
     return root, paths, tag
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_release_accepts_external_json_and_runs_pinned_gh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6018,6 +6027,7 @@ def test_verify_recovery_capsule_release_accepts_external_json_and_runs_pinned_g
     assert json.loads(paths["output"].read_bytes())["verified"] is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_release_accepts_exact_offline_gh_observation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6105,6 +6115,7 @@ def test_verify_recovery_capsule_release_accepts_exact_offline_gh_observation(
     assert result["pinned_gh_verification_observation_digest"] == _sha256(observation)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_release_rejects_incomplete_offline_gh_observation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6165,6 +6176,7 @@ def test_verify_recovery_capsule_release_rejects_incomplete_offline_gh_observati
     assert not paths["output"].exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_release_rejects_tampered_offline_gh_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6244,6 +6256,7 @@ def test_verify_recovery_capsule_release_rejects_tampered_offline_gh_result(
     assert not paths["output"].exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release control receipt sandbox binding requires POSIX (bubblewrap, ELF)")
 def test_verify_recovery_capsule_release_rejects_duplicate_remote_asset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

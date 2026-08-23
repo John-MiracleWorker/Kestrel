@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.recovery_runtime.v1.schema.json",
+  "title": "kestrel.recovery_runtime.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "required": [
+    "schema",
+    "platform",
+    "python_version",
+    "python_executable_sha256",
+    "files"
+  ],
+  "properties": {
+    "schema": {"const": "kestrel.recovery_runtime.v1"},
+    "platform": {"const": "ubuntu-24.04-x86_64"},
+    "python_version": {"const": "3.11.14"},
+    "python_executable_sha256": {
+      "const": "sha256:dcd2d22a91c5adb37fa3f54a3a16d2ed7616b84931eb606c0fdfbca38395dab8"
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "uniqueItems": true,
+      "x-sort-key": ["sandbox_path"],
+      "items": {"$ref": "#/$defs/runtime_file"}
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "positive_integer": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "runtime_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_path", "sandbox_path", "sha256", "size_bytes"],
+      "properties": {
+        "asset_path": {
+          "type": "string",
+          "pattern": "^recovery/runtime/[A-Za-z0-9._+-]+$",
+          "maxLength": 512
+        },
+        "sandbox_path": {
+          "type": "string",
+          "pattern": "^/[^\\x00]+$",
+          "maxLength": 4096
+        },
+        "sha256": {"$ref": "#/$defs/digest"},
+        "size_bytes": {"$ref": "#/$defs/positive_integer"}
+      }
+    }
+  }
+}

@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nested-memvid-agent"
-version = "0.5.6"
+version = "0.5.8"
 description = "Kestrel: a local-first, memory-native AI engineering agent runtime."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-license = "Apache-2.0"
+license = "MIT"
 license-files = ["LICENSE", "web/public/THIRD_PARTY_NOTICES.txt"]
 authors = [{ name = "Kestrel Contributors" }]
 dependencies = [
@@ -36,10 +36,16 @@ gemini = ["google-genai>=0.3"]
 server = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.31", "starlette>=1.3.1"]
 mcp = ["mcp>=1.0,<2", "cryptography>=50.0.0", "httplib2>=0.32.0"]
 keyring = ["keyring>=25.6.0"]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "build==1.5.0", "cryptography>=50.0.0", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "pygments>=2.20.0"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7", "build==1.5.0", "cryptography>=50.0.0", "defusedxml>=0.7", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27", "jsonschema==4.26.0", "pygments>=2.20.0", "pyyaml>=6.0", "rfc8785==0.1.4"]
 
 [dependency-groups]
-release = ["cyclonedx-bom==7.3.0", "pip-audit==2.10.1", "pyinstaller==6.21.0", "twine==6.2.0"]
+recovery = [
+  "cryptography==50.0.0",
+  "jsonschema==4.26.0",
+  "pypi-attestations==0.0.30",
+  "rfc8785==0.1.4",
+]
+release = ["cyclonedx-bom==7.3.0", "pip-audit==2.10.1", "pyinstaller==6.21.0", "pypi-attestations==0.0.30", "twine==6.2.0"]
 
 [project.scripts]
 nested-memvid = "nested_memvid_agent.cli:main"

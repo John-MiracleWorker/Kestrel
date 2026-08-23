@@ -28,6 +28,37 @@ class EventPublisher(Protocol):
         raise NotImplementedError
 
 
+_REVIEW_AUTHORITY_INDEPENDENT = "independent_target"
+_REVIEW_AUTHORITY_FALLBACK = "deterministic_fallback"
+_REVIEW_AUTHORITY_ABSTAINED = "off_mode_abstained"
+
+
+def _review_authority_value(assignment: Any) -> str | None:
+    """Extract the durable review-authority label from a role assignment.
+
+    The graph runtime accepts a duck-typed ``GraphRoleAssignment`` (from
+    ``routing.role_resolver``) so it never imports the routing package, which
+    would create an import cycle through ``run_manager``.  ``review_authority``
+    is a ``StrEnum`` whose ``.value`` is the closed label string.
+    """
+
+    if assignment is None:
+        return None
+    authority = getattr(assignment, "review_authority", None)
+    if authority is None:
+        return None
+    return str(getattr(authority, "value", authority))
+
+
+def _review_rejection_reasons(assignment: Any) -> tuple[str, ...]:
+    if assignment is None:
+        return ()
+    reasons = getattr(assignment, "review_rejection_reasons", ())
+    if not reasons:
+        return ()
+    return tuple(str(reason) for reason in reasons)
+
+
 @dataclass
 class GraphRunState:
     run_id: str
@@ -64,6 +95,8 @@ class GraphRuntimeServices:
     reconcile_root_task: Callable[[str, str, str, bool], TaskNodeRecord | None]
     is_cancelled: Callable[[str], bool]
     graph_amendments: GraphAmendmentService
+    review_authority_resolver: Callable[[GraphRunState], Any] | None = None
+    build_reviewer_agent: Callable[[GraphRunState, Any], NestedMV2Agent | None] | None = None
 
 
 class PlannerNode:
@@ -262,20 +295,48 @@ class ReviewerNode:
                 (task for task in tasks if task.parent_id is None and task.profile == "planner"),
                 None,
             )
-            ctx.review = evaluate_turn_review(
-                message=ctx.message,
-                config=ctx.config,
-                result=ctx.result,
-                exception=ctx.exception,
-                root_task=root,
-                agent=ctx.agent,
-            )
-            if root is not None:
-                _persist_review_on_root(services.state, root, ctx.review)
-            services.events.publish(
-                ctx.run_id, "review.completed", {"node": self.name, **ctx.review}
-            )
-            span.set_result(status=str(ctx.review["status"]), output=ctx.review)
+            review_assignment: Any = None
+            reviewer_agent: NestedMV2Agent | None = None
+            if services.review_authority_resolver is not None:
+                try:
+                    review_assignment = services.review_authority_resolver(ctx)
+                except Exception:  # noqa: BLE001 - resolver failure must not wedge the gate
+                    review_assignment = None
+                if (
+                    review_assignment is not None
+                    and _review_authority_value(review_assignment)
+                    == _REVIEW_AUTHORITY_INDEPENDENT
+                    and services.build_reviewer_agent is not None
+                ):
+                    try:
+                        reviewer_agent = services.build_reviewer_agent(ctx, review_assignment)
+                    except Exception:  # noqa: BLE001 - executor agent remains the fallback
+                        reviewer_agent = None
+            try:
+                ctx.review = evaluate_turn_review(
+                    message=ctx.message,
+                    config=ctx.config,
+                    result=ctx.result,
+                    exception=ctx.exception,
+                    root_task=root,
+                    agent=ctx.agent,
+                    review_assignment=review_assignment,
+                    reviewer_agent=reviewer_agent,
+                )
+                if root is not None:
+                    _persist_review_on_root(services.state, root, ctx.review)
+                services.events.publish(
+                    ctx.run_id, "review.completed", {"node": self.name, **ctx.review}
+                )
+                span.set_result(status=str(ctx.review["status"]), output=ctx.review)
+            finally:
+                # The separate reviewer agent holds its own Memvid handles and
+                # a concurrency slot; it is never attached to ``ctx.agent``, so
+                # the Finalizer/run-loop close paths do not see it.  Close it
+                # here on every path that built it so each reviewed turn cannot
+                # leak the reviewer's resources until process exit.
+                if reviewer_agent is not None:
+                    services.close_agent(ctx.run_id, reviewer_agent)
 
 
 def evaluate_turn_review(
@@ -287,6 +348,8 @@ def evaluate_turn_review(
     agent: NestedMV2Agent | None,
     exception: Exception | None = None,
     additional_tool_executions: tuple[ToolExecution, ...] = (),
+    review_assignment: Any = None,
+    reviewer_agent: NestedMV2Agent | None = None,
 ) -> dict[str, Any]:
     """Build an evidence-backed completion gate for primary and resumed turns.
 
@@ -352,6 +415,110 @@ def evaluate_turn_review(
         )
 
     provider_review_status = "not_attempted"
+    authority = _review_authority_value(review_assignment)
+
+    # S4 / JOURNEY-004 — route the reviewer through the role resolver. When a
+    # resolver is wired, its durable review-authority label decides how the
+    # reviewer role is satisfied; it is never silently substituted for a
+    # fallback it did not actually take.
+    if authority == _REVIEW_AUTHORITY_ABSTAINED:
+        return _deterministic_review_with_authority(
+            result=result,
+            root_task=root_task,
+            evidence=evidence,
+            review_authority=_REVIEW_AUTHORITY_ABSTAINED,
+            off_mode_abstained=True,
+            review_fallback=False,
+            review_rejection_reasons=(),
+            provider_review_status="abstained",
+        )
+
+    if authority == _REVIEW_AUTHORITY_FALLBACK:
+        return _deterministic_review_with_authority(
+            result=result,
+            root_task=root_task,
+            evidence=evidence,
+            review_authority=_REVIEW_AUTHORITY_FALLBACK,
+            off_mode_abstained=False,
+            review_fallback=True,
+            review_rejection_reasons=_review_rejection_reasons(review_assignment),
+            provider_review_status="not_attempted",
+        )
+
+    if authority == _REVIEW_AUTHORITY_INDEPENDENT:
+        # The resolver chose a distinct, eligible reviewer target. The reviewer
+        # role is satisfied ONLY by routing the provider review through that
+        # target's separate agent; it must never silently degrade to the
+        # executor's agent and still claim independence.
+        #
+        # S4 semantic opt-in: the independent provider review is gated on the
+        # same semantic-orchestration opt-in as the legacy same-agent review.
+        # With the opt-in off (the default), the independent target must fall
+        # through to the deterministic evidence gate with a truthful label and
+        # must NOT make a reviewer provider call.
+        if not _semantic_review_opt_in(config):
+            return _deterministic_review_with_authority(
+                result=result,
+                root_task=root_task,
+                evidence=evidence,
+                review_authority=_REVIEW_AUTHORITY_FALLBACK,
+                off_mode_abstained=False,
+                review_fallback=True,
+                review_rejection_reasons=("semantic_review_not_enabled",),
+                provider_review_status="not_attempted",
+            )
+        if reviewer_agent is None or not reviewer_agent.llm.capabilities.supports_json_mode:
+            return _deterministic_review_with_authority(
+                result=result,
+                root_task=root_task,
+                evidence=evidence,
+                review_authority=_REVIEW_AUTHORITY_FALLBACK,
+                off_mode_abstained=False,
+                review_fallback=True,
+                review_rejection_reasons=("reviewer_agent_unavailable",),
+                provider_review_status="not_attempted",
+            )
+        try:
+            provider_artifact, provider_review_status = _request_provider_review(
+                reviewer_agent,
+                message=message,
+                result=result,
+                root_task=root_task,
+                evidence=evidence,
+            )
+        except Exception as exc:  # noqa: BLE001 - deterministic gate remains available
+            provider_artifact = None
+            provider_review_status = f"error:{type(exc).__name__}"
+        if provider_artifact is not None:
+            passed = provider_artifact["decision"] == "pass"
+            review = {
+                "status": "completed" if passed else "failed",
+                "stop_reason": result.stop_reason if passed else "semantic_review_failed",
+                "gate": "provider_semantic_review"
+                if passed
+                else "provider_semantic_review_rejected",
+                "artifact": provider_artifact,
+                "provider_review_status": provider_review_status,
+                "review_authority": _REVIEW_AUTHORITY_INDEPENDENT,
+                "review_fallback": False,
+                "off_mode_abstained": False,
+            }
+            if not passed:
+                review["error"] = str(
+                    provider_artifact.get("summary") or "Semantic review rejected completion"
+                )
+            return review
+        return _deterministic_review_with_authority(
+            result=result,
+            root_task=root_task,
+            evidence=evidence,
+            review_authority=_REVIEW_AUTHORITY_FALLBACK,
+            off_mode_abstained=False,
+            review_fallback=True,
+            review_rejection_reasons=(f"provider_review_status:{provider_review_status}",),
+            provider_review_status=provider_review_status,
+        )
+
     if _provider_review_enabled(config, agent):
         try:
             provider_artifact, provider_review_status = _request_provider_review(
@@ -366,7 +533,7 @@ def evaluate_turn_review(
             provider_review_status = f"error:{type(exc).__name__}"
         if provider_artifact is not None:
             passed = provider_artifact["decision"] == "pass"
-            review: dict[str, Any] = {
+            review = {
                 "status": "completed" if passed else "failed",
                 "stop_reason": result.stop_reason if passed else "semantic_review_failed",
                 "gate": "provider_semantic_review"
@@ -405,10 +572,22 @@ def _provider_orchestration_enabled(ctx: GraphRunState) -> bool:
     return ctx.config.enable_semantic_orchestration and ctx.config.provider != "mock"
 
 
+def _semantic_review_opt_in(config: AgentConfig) -> bool:
+    """Whether the run's config permits a reviewer provider call.
+
+    This is the semantic orchestration opt-in that the legacy
+    ``_provider_review_enabled`` gate checks.  The independent reviewer target
+    (S4 / JOURNEY-004) must honour the same opt-in: with semantic orchestration
+    left at its default ``False`` (or a mock provider), no reviewer provider
+    call may be made.
+    """
+
+    return bool(config.enable_semantic_orchestration and config.provider != "mock")
+
+
 def _provider_review_enabled(config: AgentConfig, agent: NestedMV2Agent | None) -> bool:
     return bool(
-        config.enable_semantic_orchestration
-        and config.provider != "mock"
+        _semantic_review_opt_in(config)
         and agent is not None
         and agent.llm.capabilities.supports_json_mode
     )
@@ -779,6 +958,50 @@ def _terminal_review_failure(
         "gate": "runtime_failure_gate",
         "artifact": artifact,
     }
+
+
+def _deterministic_review_with_authority(
+    *,
+    result: AgentTurnResult,
+    root_task: TaskNodeRecord | None,
+    evidence: list[dict[str, Any]],
+    review_authority: str,
+    off_mode_abstained: bool,
+    review_fallback: bool,
+    review_rejection_reasons: tuple[str, ...],
+    provider_review_status: str,
+) -> dict[str, Any]:
+    """Deterministic evidence gate with an explicit durable review-authority label.
+
+    This is the truthful fallback / abstention path for S4 (JOURNEY-004): the
+    reviewer role was satisfied either by the deterministic evidence gate
+    (``deterministic_fallback``, with the rejection reason codes preserved) or
+    not routed at all (``off_mode_abstained``, which is never mis-labeled as a
+    fallback).
+    """
+
+    artifact = _deterministic_review_artifact(
+        result=result,
+        root_task=root_task,
+        evidence=evidence,
+        decision=None,
+        evaluator="deterministic_runtime_evidence",
+    )
+    passed = artifact["decision"] == "pass"
+    review: dict[str, Any] = {
+        "status": "completed" if passed else "failed",
+        "stop_reason": result.stop_reason if passed else "acceptance_evidence_missing",
+        "gate": "deterministic_evidence_review" if passed else "deterministic_evidence_rejected",
+        "artifact": artifact,
+        "provider_review_status": provider_review_status,
+        "review_authority": review_authority,
+        "review_fallback": review_fallback,
+        "off_mode_abstained": off_mode_abstained,
+        "review_rejection_reasons": list(review_rejection_reasons),
+    }
+    if not passed:
+        review["error"] = "One or more acceptance criteria lack concrete runtime evidence"
+    return review
 
 
 def _deterministic_review_artifact(

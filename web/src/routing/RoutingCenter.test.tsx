@@ -137,6 +137,137 @@ const previewPayload = {
   }
 };
 
+const shadowObservationsPayload = [
+  {
+    observation_id: "shadow_obs_deterministic",
+    run_id: "run-1",
+    task_id: "task-1",
+    subagent_id: null,
+    attempt: 1,
+    role: "executor",
+    actual_authority: "deterministic_static",
+    actual_target_id: "local-worker",
+    actual_provider: "openai-compatible",
+    actual_model: "qwen-coder",
+    shadow_target_id: null,
+    shadow_provider: "",
+    shadow_model: "",
+    shadow_executed: false,
+    static_target_id: "local-worker",
+    candidates: [],
+    constraints: {},
+    qualification: {},
+    reason_codes: ["highest_admissible_score"],
+    usage: {},
+    verdict: "inconclusive",
+    verdict_reason: "no_shadow_recommendation",
+    evidence_basis: ["shadow_abstained"],
+    counterfactual_proven: false,
+    payload_digest: "d" .repeat(64),
+    created_at: "2026-08-22T00:00:00Z",
+    resolved_at: null,
+    validation_passed: null,
+    actual_cost_usd: null,
+    actual_latency_seconds: null
+  },
+  {
+    observation_id: "shadow_obs_differing",
+    run_id: "run-1",
+    task_id: "task-1",
+    subagent_id: null,
+    attempt: 2,
+    role: "executor",
+    actual_authority: "deterministic_static",
+    actual_target_id: "frontier-review",
+    actual_provider: "openai-compatible",
+    actual_model: "review-model",
+    shadow_target_id: "local-worker",
+    shadow_provider: "openai-compatible",
+    shadow_model: "qwen-coder",
+    shadow_executed: false,
+    static_target_id: "frontier-review",
+    candidates: [],
+    constraints: {},
+    qualification: { utility_delta: 0.2, confidence: 0.9 },
+    reason_codes: ["prior_evidence_favorable"],
+    usage: {},
+    verdict: "supported",
+    verdict_reason: "shadow_favored_by_prior_evidence",
+    evidence_basis: ["prior_evidence_favorable", "target_unexecuted"],
+    counterfactual_proven: false,
+    payload_digest: "e" .repeat(64),
+    created_at: "2026-08-22T00:00:01Z",
+    resolved_at: "2026-08-22T00:00:05Z",
+    validation_passed: true,
+    actual_cost_usd: 0.01,
+    actual_latency_seconds: 4
+  },
+  {
+    observation_id: "shadow_obs_activated",
+    run_id: "run-1",
+    task_id: "task-1",
+    subagent_id: null,
+    attempt: 3,
+    role: "executor",
+    actual_authority: "adaptive_activated",
+    actual_target_id: "local-worker",
+    actual_provider: "openai-compatible",
+    actual_model: "qwen-coder",
+    shadow_target_id: "local-worker",
+    shadow_provider: "openai-compatible",
+    shadow_model: "qwen-coder",
+    shadow_executed: true,
+    static_target_id: "frontier-review",
+    candidates: [],
+    constraints: {},
+    qualification: { utility_delta: 0.2, confidence: 0.9 },
+    reason_codes: ["learned_constrained"],
+    usage: {},
+    verdict: "supported",
+    verdict_reason: "shadow_executed_and_passed",
+    evidence_basis: ["shadow_executed", "terminal_validation_passed"],
+    counterfactual_proven: true,
+    payload_digest: "f" .repeat(64),
+    created_at: "2026-08-22T00:00:02Z",
+    resolved_at: "2026-08-22T00:00:06Z",
+    validation_passed: true,
+    actual_cost_usd: 0.01,
+    actual_latency_seconds: 4
+  },
+  {
+    observation_id: "shadow_obs_suspended",
+    run_id: "run-1",
+    task_id: "task-1",
+    subagent_id: null,
+    attempt: 4,
+    role: "executor",
+    actual_authority: "deterministic_fallback_after_suspension",
+    actual_target_id: "frontier-review",
+    actual_provider: "openai-compatible",
+    actual_model: "review-model",
+    shadow_target_id: "local-worker",
+    shadow_provider: "openai-compatible",
+    shadow_model: "qwen-coder",
+    shadow_executed: false,
+    static_target_id: "frontier-review",
+    candidates: [],
+    constraints: {},
+    qualification: {},
+    reason_codes: ["suspended_fallback"],
+    usage: {},
+    verdict: "inconclusive",
+    verdict_reason: "no_terminal_evidence",
+    evidence_basis: [],
+    counterfactual_proven: false,
+    payload_digest: "a" .repeat(64),
+    created_at: "2026-08-22T00:00:03Z",
+    resolved_at: null,
+    validation_passed: null,
+    actual_cost_usd: null,
+    actual_latency_seconds: null
+  }
+];
+
 let requests: Array<{ path: string; method: string; body: unknown }>;
 
 beforeEach(() => {
@@ -241,7 +372,8 @@ beforeEach(() => {
               effective_sample_size: 11.5,
               updated_at: "2026-07-27T00:00:00Z"
             }
-          ]
+          ],
+          shadow_observations: shadowObservationsPayload
         });
       }
       return new Response(JSON.stringify({ detail: `Unhandled ${method} ${path}` }), { status: 404 });
@@ -266,6 +398,27 @@ describe("RoutingCenter", () => {
     expect(screen.getByText("off")).toBeInTheDocument();
     expect(screen.getByText("frontier-review → local-worker")).toBeInTheDocument();
     expect(screen.getByText("The evidence-gated learned route executed.", { exact: false })).toBeInTheDocument();
+  });
+
+  it("distinguishes deterministic, shadow, activated, and suspended-fallback states", async () => {
+    render(<RoutingCenter activeRunId="run-1" activeTaskId="task-1" />);
+    await screen.findAllByText("Local server");
+
+    expect(screen.getByText(/Zero-authority shadow observations/i)).toBeInTheDocument();
+    // The four routing states are distinguishable in the evidence panel.
+    expect(screen.getByText("deterministic")).toBeInTheDocument();
+    expect(screen.getByText("shadow")).toBeInTheDocument();
+    expect(screen.getByText("activated")).toBeInTheDocument();
+    expect(screen.getByText("suspended-fallback")).toBeInTheDocument();
+    // Honest counterfactual framing: a differing unexecuted target is never
+    // presented as proven.
+    expect(
+      screen.getAllByText(/Not proven: the differing target was never executed/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Terminal evidence not yet recorded/).length).toBeGreaterThan(0);
+    // Evidence links back to the durable run/task.
+    expect(screen.getAllByText("run run-1").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("task task-1").length).toBeGreaterThan(0);
   });
 
   it("previews a task without executing it", async () => {

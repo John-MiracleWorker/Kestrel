@@ -466,6 +466,183 @@ def test_pause_waits_for_bounded_inflight_then_marks_paused(
     assert executor.started_attempts == [("case_1", "a"), ("case_1", "b")]
 
 
+def test_completion_wins_pause_revision_race_without_leaking_conflict(
+    state: AgentStateStore,
+    qualification_ledger: QualificationLedger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = run_with_cases(
+        state,
+        qualification_ledger,
+        1,
+        targets=("a", "b"),
+        tmp_path=tmp_path,
+    )
+    gate = threading.Event()
+    executor = recording_executor(gate=gate, block_after=1)
+    runner = _make_runner(state, qualification_ledger, executor, scenario)
+    pause_request_entered = threading.Event()
+    release_pause_request = threading.Event()
+    request_pause = qualification_ledger.request_pause
+
+    def request_after_completion(
+        run_id: str,
+        *,
+        expected_revision: int,
+    ) -> QualificationRun:
+        pause_request_entered.set()
+        assert release_pause_request.wait(timeout=15.0)
+        return request_pause(run_id, expected_revision=expected_revision)
+
+    monkeypatch.setattr(
+        qualification_ledger,
+        "request_pause",
+        request_after_completion,
+    )
+    starter = threading.Thread(target=runner.start, args=(scenario.run_id,))
+    starter.start()
+    assert executor.entered.wait(timeout=15.0)
+
+    def finish_before_pause_cas() -> None:
+        assert pause_request_entered.wait(timeout=15.0)
+        gate.set()
+        try:
+            _wait_until(lambda: runner.get(scenario.run_id).status == "completed")
+        finally:
+            release_pause_request.set()
+
+    finisher = threading.Thread(target=finish_before_pause_cas)
+    finisher.start()
+    view = runner.pause(scenario.run_id)
+    finisher.join(timeout=15.0)
+    starter.join(timeout=15.0)
+
+    assert not finisher.is_alive()
+    assert not starter.is_alive()
+    assert view.status == "completed"
+    assert runner.get(scenario.run_id).status == "completed"
+
+
+def test_pause_wins_completion_revision_race_without_failing_run(
+    state: AgentStateStore,
+    qualification_ledger: QualificationLedger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = run_with_cases(
+        state,
+        qualification_ledger,
+        1,
+        targets=("a", "b"),
+        tmp_path=tmp_path,
+    )
+    runner = _make_runner(
+        state,
+        qualification_ledger,
+        recording_executor(),
+        scenario,
+    )
+    finalize_entered = threading.Event()
+    release_finalize = threading.Event()
+    finalize_run_terminal = qualification_ledger.finalize_run_terminal
+
+    def finalize_after_pause(*args: object, **kwargs: object) -> object:
+        if not finalize_entered.is_set():
+            finalize_entered.set()
+            assert release_finalize.wait(timeout=15.0)
+        return finalize_run_terminal(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        qualification_ledger,
+        "finalize_run_terminal",
+        finalize_after_pause,
+    )
+    starter = threading.Thread(target=runner.start, args=(scenario.run_id,))
+    starter.start()
+    assert finalize_entered.wait(timeout=15.0)
+    pauser = threading.Thread(target=runner.pause, args=(scenario.run_id,))
+    pauser.start()
+    _wait_until(lambda: runner.get(scenario.run_id).status == "pausing")
+    release_finalize.set()
+    pauser.join(timeout=15.0)
+    starter.join(timeout=15.0)
+    assert not pauser.is_alive()
+    assert not starter.is_alive()
+    assert runner.get(scenario.run_id).status == "paused"
+    assert qualification_ledger.list_receipts(scenario.run_id) == []
+
+    runner.resume(scenario.run_id)
+
+    assert runner.get(scenario.run_id).status == "completed"
+    terminal = [
+        receipt
+        for receipt in qualification_ledger.list_receipts(scenario.run_id)
+        if receipt.receipt_type == "run_terminal"
+    ]
+    assert len(terminal) == 1
+
+
+def test_shutdown_pause_retries_concurrent_cap_revision_without_failing_run(
+    state: AgentStateStore,
+    qualification_ledger: QualificationLedger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = run_with_cases(
+        state,
+        qualification_ledger,
+        1,
+        targets=("a", "b"),
+        tmp_path=tmp_path,
+    )
+    gate = threading.Event()
+    executor = recording_executor(gate=gate, block_after=0)
+    runner = _make_runner(state, qualification_ledger, executor, scenario)
+    runner.start(scenario.run_id, wait=False)
+    assert executor.entered.wait(timeout=15.0)
+
+    request_pause = qualification_ledger.request_pause
+    request_revisions: list[int] = []
+
+    def request_after_first_cap_revision(
+        run_id: str,
+        *,
+        expected_revision: int,
+    ) -> QualificationRun:
+        request_revisions.append(expected_revision)
+        if len(request_revisions) == 1:
+            current = qualification_ledger.get_run(run_id)
+            assert current is not None
+            qualification_ledger.update_effective_stop_cap(
+                run_id,
+                expected_revision=current.revision,
+                new_cap=MoneyMicros(current.effective_stop_cap.micros - 1),
+            )
+        return request_pause(run_id, expected_revision=expected_revision)
+
+    monkeypatch.setattr(
+        qualification_ledger,
+        "request_pause",
+        request_after_first_cap_revision,
+    )
+    shutdown_result: list[bool] = []
+    shutdown = threading.Thread(target=lambda: shutdown_result.append(runner.shutdown()))
+    shutdown.start()
+    _wait_until(lambda: runner._shutdown)  # noqa: SLF001 - deterministic lifecycle race
+    gate.set()
+    shutdown.join(timeout=15.0)
+
+    assert not shutdown.is_alive()
+    assert shutdown_result == [True]
+    view = runner.get(scenario.run_id)
+    assert view.status == "paused"
+    assert view.run.effective_stop_cap == MoneyMicros(24_999_999)
+    assert len(request_revisions) == 2
+    assert request_revisions[1] > request_revisions[0]
+    assert qualification_ledger.list_receipts(scenario.run_id) == []
+
+
 def test_resume_skips_terminal_and_inflight_positions(
     state: AgentStateStore,
     qualification_ledger: QualificationLedger,
@@ -482,6 +659,7 @@ def test_resume_skips_terminal_and_inflight_positions(
     assert executor.entered.wait(timeout=15.0)
     pauser = threading.Thread(target=runner.pause, args=(scenario.run_id,))
     pauser.start()
+    _wait_until(lambda: runner.get(scenario.run_id).status == "pausing")
     gate.set()
     pauser.join(timeout=15.0)
     starter.join(timeout=15.0)

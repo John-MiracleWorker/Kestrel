@@ -447,7 +447,59 @@ function fixturePayload(path: string): unknown | typeof missingFixture {
   if (path.startsWith("/api/runtime/models?provider=")) {
     return apiFixtures["/api/runtime/models"];
   }
+  const missionProofMatch = path.match(
+    /^\/api\/runs\/([^/]+)\/mission-proof$/,
+  );
+  if (missionProofMatch) {
+    return missionProofFixture(missionProofMatch[1]);
+  }
   return missingFixture;
+}
+
+function missionProofFixture(runId: string): unknown {
+  const section = (status: string, detail: string) => ({
+    status,
+    detail,
+    evidence: {},
+  });
+  return {
+    schema: "kestrel.mission_proof.v1",
+    run_id: runId,
+    project_id: "fixture_project",
+    generated_at: fixtureTime,
+    binding: { persisted: true, preflight_persisted: true },
+    evidence: {
+      binding: section("present", "binding present"),
+      contract: section("present", "contract present"),
+      roles: section("present", "roles present"),
+      routing: section("missing", "no shadow observations"),
+      isolation: section("present", "isolation present"),
+      change: section("missing", "no change evidence"),
+      validation: section("missing", "no validation evidence"),
+      review: section("missing", "no review evidence"),
+      risks: section("present", "risks present"),
+      approval: section("missing", "no approvals"),
+      shipping: section("missing", "no shipping evidence"),
+      capsule: section("missing", "no capsule marker"),
+      learning: section("missing", "no learning evidence"),
+    },
+    summary: {
+      present: ["binding", "contract", "roles", "isolation", "risks"],
+      missing: [
+        "routing",
+        "change",
+        "validation",
+        "review",
+        "approval",
+        "shipping",
+        "capsule",
+        "learning",
+      ],
+      stale: [],
+      mismatched: [],
+      counts: { present: 5, missing: 8, stale: 0, mismatched: 0 },
+    },
+  };
 }
 
 function requestPath(input: RequestInfo | URL): string {

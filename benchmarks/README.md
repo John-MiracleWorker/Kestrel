@@ -102,7 +102,8 @@ cannot produce a successful process exit even if the comparison baseline is also
 
 Three-way comparative benchmark on the same corpus and ground-truth queries:
 
-1. **Kestrel** 6-layer Memvid memory (layer-aware retrieval)
+1. **Kestrel** layered memory (in-memory benchmark backend, layer-aware
+   retrieval)
 2. **Flat TF-IDF RAG** (document store, cosine similarity, no layers)
 3. **Flat transcript** (recency-biased chronological transcript — the
    "typical agent memory" proxy for chat-log style runtimes such as Hermes
@@ -114,15 +115,20 @@ Two phases:
 - **Baseline corpus**: the standard memory corpus.
 - **Recency stress**: the same corpus with a burst of recent episodic
   "conversation chatter" appended after the facts. This models a real agent
-  whose recent chat history buries older important facts. Kestrel's
-  layer-aware retrieval ignores cross-layer chatter; the flat transcript's
-  recency bias does not.
+  whose recent chat history buries older important facts. All three arms
+  search the full corpus (no arm receives the ground-truth layer label):
+  the flat transcript's recency bias is amplified by the chatter, and the
+  benchmark measures how each arm's ranking degrades as a result.
 
-The acceptance gate requires Kestrel to meet the absolute floors and to be
-at or above BOTH flat baselines on Recall@k and MRR in the stressed phase.
-The expected outcome is that the flat transcript degrades measurably more
-than Kestrel under recency stress — the concrete claim behind "layered
-memory keeps important facts retrievable even after a long conversation."
+The acceptance gate is methodological and fails closed: every arm must
+return evidence for every query in both phases (a retriever that silently
+returns nothing cannot pass, even if a comparison arm also returns
+nothing), and all metrics must be finite. No arm is required to win: the
+recency-stress scenario measurably degrades the flat transcript's recency
+bias, and the deltas for every arm are reported exactly as measured —
+including when Kestrel is not ahead. This follows BENCH-002, which removed
+the oracle layer filter that previously let the Kestrel arm ignore the
+episodic chatter and manufactured its recency advantage.
 
 ### Agent Benchmark (`agent_benchmark.py`)
 

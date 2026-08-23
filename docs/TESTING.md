@@ -451,9 +451,17 @@ streak, and observed flake rate:
 
 ```bash
 DETERMINISM_PARENT="$(mktemp -d)"
+WORKTREE_STATUS="$(git status --porcelain=v1 --untracked-files=normal)"
+if test -n "$WORKTREE_STATUS"; then
+  echo "determinism receipts require a clean worktree" >&2
+  exit 1
+fi
+SOURCE_COMMIT="$(git rev-parse --verify HEAD)"
 python scripts/run_determinism_evals.py \
+  --backend memory \
   --repeats 20 \
   --seed 1729 \
+  --source-commit "$SOURCE_COMMIT" \
   --run-root "$DETERMINISM_PARENT/runs" \
   --output "$DETERMINISM_PARENT/report.json" \
   --validation-container-image "$VALIDATION_IMAGE" \
@@ -466,7 +474,7 @@ The pinned image is part of the golden evidence: the procedural-promotion case e
 
 ## Release Validation
 
-Use `docs/RELEASE_CHECKLIST.md` before tagging or publishing a build. The checklist includes
+Use `docs/RELEASE_CHECKLIST.md` before dispatching the release candidate or publishing a build. The checklist includes
 compile, metadata alignment, lint, typecheck, unit tests, golden evals, the deterministic
 end-to-end agent learning gate, web build/test, required
 credential-free Memvid/MCP integration, executable-skill OCI containment, and packaging/Docker smoke checks.

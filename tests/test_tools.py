@@ -10,6 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from time import monotonic, sleep
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -20,6 +21,7 @@ from pytest import MonkeyPatch
 import nested_memvid_agent.tools.command_tools as command_tools
 import nested_memvid_agent.tools.git_tools as git_tools
 import nested_memvid_agent.tools.process_tools as process_tools
+import nested_memvid_agent.tools.registry as registry_module
 import nested_memvid_agent.tools.repair_tools as repair_tools
 from nested_memvid_agent.config import AgentConfig
 from nested_memvid_agent.extension_runner import (
@@ -116,6 +118,17 @@ def _isolated_repair_validation_stub(monkeypatch: MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr(process_tools, "run_isolated_validation", run_stub)
+
+
+def _use_host_supervised_test_run(monkeypatch: MonkeyPatch) -> None:
+    """Run TestRunTool process-lifecycle fixtures without OCI normalization."""
+
+    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
+        kwargs["require_container_isolation"] = False
+        return _run_subprocess(command, **kwargs)
+
+    monkeypatch.setattr(command_tools, "_normalize_python_command", lambda command: command)
+    monkeypatch.setattr(command_tools, "_run_subprocess", host_supervised_run)
 
 
 def test_windows_process_tree_uses_absolute_system_taskkill(
@@ -517,17 +530,52 @@ def test_windows_unverified_job_handle_close_is_indeterminate(
 class SlowTool(AgentTool):
     spec = ToolSpec(
         name="slow.tool",
-        description="Sleeps longer than the configured timeout.",
+        description="Blocks until cancellation releases it.",
         parameters={"type": "object", "properties": {}},
     )
 
+    def __init__(self) -> None:
+        self.started = Event()
+        self.release = Event()
+        self.cancelled = Event()
+        self.finished = Event()
+
     def run(self, arguments: dict[str, object], context: ToolContext) -> ToolExecution:
-        sleep(0.2)
-        return ToolExecution(
-            call=ToolCall(name=self.spec.name, arguments=arguments),
-            success=True,
-            content="finished",
-        )
+        del context
+        self.started.set()
+        try:
+            self.release.wait()
+            return ToolExecution(
+                call=ToolCall(name=self.spec.name, arguments=arguments),
+                success=True,
+                content="finished",
+            )
+        finally:
+            self.finished.set()
+
+    def cancel(self, call_id: str) -> None:
+        del call_id
+        self.cancelled.set()
+        self.release.set()
+
+
+def _release_and_await_tool_body(
+    release: Event,
+    terminal: Event,
+    *,
+    label: str,
+) -> bool:
+    """Release a gated tool body and prove it stopped without hiding a primary failure."""
+
+    release.set()
+    if terminal.wait(timeout=15.0):
+        return True
+    detail = f"{label} tool body did not terminate after release"
+    active_error = sys.exception()
+    if active_error is None:
+        raise AssertionError(detail)
+    active_error.add_note(detail)
+    return False
 
 
 class SystemExitTool(AgentTool):
@@ -872,20 +920,34 @@ def test_run_manager_registry_honors_enabled_tools_config(tmp_path: Path) -> Non
     assert names == ["memory.search", "file.read"]
 
 
-def test_tool_registry_reports_actual_quiesced_outcome_after_deadline(tmp_path: Path) -> None:
+def test_tool_registry_reports_actual_quiesced_outcome_after_deadline(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = ToolRegistry()
-    registry.register(SlowTool())
-    config = AgentConfig(tool_timeout_seconds=0.01)
+    tool = SlowTool()
+    registry.register(tool)
+    config = AgentConfig(tool_timeout_seconds=0.05)
+    # This test selects the resolved-late branch. Separate contract tests bind
+    # the production 0.50-second hard bound and its unresolved outcome.
+    monkeypatch.setattr(registry_module, "_CANCELLATION_SETTLEMENT_SECONDS", 5.0)
 
-    result = registry.execute(
-        ToolCall(name="slow.tool", arguments={}),
-        ToolContext(memory=memory, config=config, workspace=tmp_path),
-    )
+    try:
+        result = registry.execute(
+            ToolCall(name="slow.tool", arguments={}),
+            ToolContext(memory=memory, config=config, workspace=tmp_path),
+        )
+    finally:
+        _release_and_await_tool_body(tool.release, tool.finished, label="slow-tool")
 
+    assert tool.started.is_set()
+    assert tool.cancelled.is_set()
+    assert tool.finished.is_set()
     assert result.success is True
     assert result.error is None
     assert result.data["tool_deadline_exceeded"] is True
+    assert result.data["tool_timeout_seconds"] == 0.05
 
 
 def test_tool_registry_system_exit_always_signals_worker_completion(tmp_path: Path) -> None:
@@ -906,40 +968,91 @@ def test_tool_registry_system_exit_always_signals_worker_completion(tmp_path: Pa
     assert "SystemExit" in result.content
 
 
-def test_low_risk_memory_timeout_quiesces_before_memory_close(tmp_path: Path) -> None:
+def test_low_risk_memory_unresolved_outcome_quiesces_before_memory_close(
+    tmp_path: Path,
+) -> None:
+    import nested_memvid_agent.tools.builtin as builtin_tools
+
     calls: list[str] = []
+    retrieval_started = Event()
+    retrieval_release = Event()
+    retrieval_finished = Event()
+    tool_body_finished = Event()
+
+    class ObservableMemorySearchTool(builtin_tools.MemorySearchTool):
+        def run(
+            self,
+            arguments: dict[str, Any],
+            context: ToolContext,
+        ) -> ToolExecution:
+            try:
+                return super().run(arguments, context)
+            finally:
+                tool_body_finished.set()
 
     class SlowRetrievalMemory:
         closed = False
 
         def retrieve(self, _query: RetrievalQuery) -> list[object]:
-            for layer in ("working", "episodic", "semantic"):
-                sleep(0.04)
-                assert self.closed is False
-                calls.append(layer)
-            # Model retrieval metadata write-back as part of the same owned
-            # operation: it too must settle before registry terminality.
-            calls.append("retrieval_metadata_upsert")
-            return []
+            retrieval_started.set()
+            try:
+                retrieval_release.wait()
+                for layer in ("working", "episodic", "semantic"):
+                    assert self.closed is False
+                    calls.append(layer)
+                # Model retrieval metadata write-back as part of the same owned
+                # operation: it too must settle before registry terminality.
+                calls.append("retrieval_metadata_upsert")
+                return []
+            finally:
+                retrieval_finished.set()
 
         def close_all(self) -> None:
             self.closed = True
             calls.append("closed")
 
     memory = SlowRetrievalMemory()
-    registry = build_default_tools(("memory.search",))
-    result = registry.execute(
-        ToolCall(name="memory.search", arguments={"query": "slow"}),
-        ToolContext(
-            memory=cast(Any, memory),
-            config=AgentConfig(tool_timeout_seconds=0.01),
-            workspace=tmp_path,
-        ),
-    )
-    memory.close_all()
+    registry = ToolRegistry()
+    registry.register(ObservableMemorySearchTool())
+    try:
+        result = registry.execute(
+            ToolCall(
+                name="memory.search",
+                arguments={"query": "slow"},
+                id="slow-memory-search",
+            ),
+            ToolContext(
+                memory=cast(Any, memory),
+                config=AgentConfig(tool_timeout_seconds=0.05),
+                workspace=tmp_path,
+            ),
+        )
+        # A hosted worker may not be scheduled until after the registry's hard
+        # settlement bound. Prove it reached the closed gate before inspecting
+        # the still-unresolved operation.
+        assert retrieval_started.wait(timeout=15.0)
+        assert retrieval_finished.is_set() is False
+        assert tool_body_finished.is_set() is False
+        assert result.success is False
+        assert result.error == "tool_outcome_unresolved"
+        assert result.data["outcome_indeterminate"] is True
+        assert result.data["retryable"] is False
+        assert result.data["reconciliation_required"] is True
+        assert result.data["execution_may_still_be_running"] is True
+        assert result.data["resource_quarantine_required"] is True
+        assert calls == []
+        assert memory.closed is False
+    finally:
+        if _release_and_await_tool_body(
+            retrieval_release,
+            tool_body_finished,
+            label="memory-search",
+        ):
+            memory.close_all()
 
-    assert result.success is True
-    assert result.data["tool_deadline_exceeded"] is True
+    assert retrieval_started.is_set()
+    assert retrieval_finished.is_set()
+    assert tool_body_finished.is_set()
     assert calls == [
         "working",
         "episodic",
@@ -949,46 +1062,95 @@ def test_low_risk_memory_timeout_quiesces_before_memory_close(tmp_path: Path) ->
     ]
 
 
-def test_high_risk_file_write_never_mutates_after_terminal_result(
+def test_high_risk_file_write_unresolved_outcome_quarantines_replay_before_late_mutation(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
     import nested_memvid_agent.tools.workspace_tools as workspace_tools
 
     original_write = workspace_tools._atomic_workspace_write
-    write_started = False
+    write_started = Event()
+    write_release = Event()
+    write_completed = Event()
+    write_finished = Event()
+    tool_body_finished = Event()
+    mutations: list[str] = []
 
-    def delayed_write(workspace: Path, path: Path, text: str) -> None:
-        nonlocal write_started
-        write_started = True
-        sleep(0.1)
-        original_write(workspace, path, text)
+    class ObservableWriteFileTool(workspace_tools.WriteFileTool):
+        def run(
+            self,
+            arguments: dict[str, Any],
+            context: ToolContext,
+        ) -> ToolExecution:
+            try:
+                return super().run(arguments, context)
+            finally:
+                tool_body_finished.set()
 
-    monkeypatch.setattr(workspace_tools, "_atomic_workspace_write", delayed_write)
+    def gated_write(workspace: Path, path: Path, text: str) -> None:
+        write_started.set()
+        try:
+            write_release.wait()
+            original_write(workspace, path, text)
+            mutations.append(text)
+            write_completed.set()
+        finally:
+            write_finished.set()
+
+    monkeypatch.setattr(workspace_tools, "_atomic_workspace_write", gated_write)
     memory = build_memory_system("memory", tmp_path / "memory")
     call = ToolCall(
         name="file.write",
         arguments={"path": "delayed.txt", "content": "durable"},
         id="delayed-file-write",
     )
-
-    result = build_default_tools(("file.write",)).execute(
-        call,
-        ToolContext(
-            memory=memory,
-            config=AgentConfig(allow_file_write=True, tool_timeout_seconds=0.01),
-            workspace=tmp_path,
-            approved_tool_call_ids=frozenset({call.id}),
-            approved_tool_call_arguments={call.id: call.arguments},
-        ),
+    registry = ToolRegistry()
+    registry.register(ObservableWriteFileTool())
+    context = ToolContext(
+        memory=memory,
+        config=AgentConfig(allow_file_write=True, tool_timeout_seconds=0.05),
+        workspace=tmp_path,
+        approved_tool_call_ids=frozenset({call.id}),
+        approved_tool_call_arguments={call.id: call.arguments},
     )
 
-    assert write_started is True
-    assert result.success is True
+    try:
+        result = registry.execute(call, context)
+        # Keep the mutation gate closed while allowing a heavily starved hosted
+        # worker to prove that it eventually reached the operation boundary.
+        assert write_started.wait(timeout=15.0)
+        assert write_finished.is_set() is False
+        assert tool_body_finished.is_set() is False
+        assert result.success is False
+        assert result.error == "tool_outcome_unresolved"
+        assert result.data["outcome_indeterminate"] is True
+        assert result.data["retryable"] is False
+        assert result.data["reconciliation_required"] is True
+        assert result.data["execution_may_still_be_running"] is True
+        assert result.data["resource_quarantine_required"] is True
+        assert mutations == []
+        assert (tmp_path / "delayed.txt").exists() is False
+
+        quarantined = registry.execute(call, context)
+        assert quarantined.success is False
+        assert quarantined.error == "tool_quarantined_after_unresolved_outcome"
+        assert quarantined.data["tool_quarantined"] is True
+        assert quarantined.data["retryable"] is False
+        assert quarantined.data["reconciliation_required"] is True
+        assert mutations == []
+    finally:
+        _release_and_await_tool_body(
+            write_release,
+            tool_body_finished,
+            label="file-write",
+        )
+
+    assert write_started.is_set()
+    assert write_completed.is_set()
+    assert write_finished.is_set()
+    assert tool_body_finished.is_set()
+    assert mutations == ["durable"]
     assert (tmp_path / "delayed.txt").read_text(encoding="utf-8") == "durable"
-    snapshot = (tmp_path / "delayed.txt").stat().st_mtime_ns
-    sleep(0.05)
-    assert (tmp_path / "delayed.txt").stat().st_mtime_ns == snapshot
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
@@ -1146,14 +1308,7 @@ def test_same_public_call_id_across_runs_keeps_process_tracking_isolated(
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools(("test.run",))
 
-    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
-        kwargs["require_container_isolation"] = False
-        return _run_subprocess(command, **kwargs)
-
-    monkeypatch.setattr(
-        "nested_memvid_agent.tools.command_tools._run_subprocess",
-        host_supervised_run,
-    )
+    _use_host_supervised_test_run(monkeypatch)
 
     def invocation(run_id: str) -> tuple[ToolCall, ToolContext, Path]:
         pid_path = tmp_path / f"{run_id}.pid"
@@ -1226,14 +1381,7 @@ def test_subprocess_tool_timeout_kills_child_process_and_caps_requested_timeout(
     memory = build_memory_system("memory", tmp_path / "memory")
     registry = build_default_tools()
 
-    def host_supervised_run(command: list[str], **kwargs: Any) -> Any:
-        kwargs["require_container_isolation"] = False
-        return _run_subprocess(command, **kwargs)
-
-    monkeypatch.setattr(
-        "nested_memvid_agent.tools.command_tools._run_subprocess",
-        host_supervised_run,
-    )
+    _use_host_supervised_test_run(monkeypatch)
     call = ToolCall(
         name="test.run",
         arguments={"command": [sys.executable, str(script)], "timeout": 30},

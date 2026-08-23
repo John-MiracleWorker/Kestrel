@@ -16,6 +16,6 @@ WORKDIR /extension
 
 LABEL org.opencontainers.image.title="Kestrel contained browser validation" \
       org.opencontainers.image.description="Networkless Playwright, DOM, screenshot, and accessibility evidence runner" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="MIT"
 
 CMD ["/opt/kestrel/browser-validate", "--self-test"]

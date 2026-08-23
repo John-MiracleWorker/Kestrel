@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -41,6 +43,7 @@ from nested_memvid_agent.repair_integrity import (
     write_validation_receipt,
 )
 from nested_memvid_agent.runtime_models import (
+    AgentTurnResult,
     ChatMessage,
     LLMOptions,
     LLMResponse,
@@ -120,6 +123,7 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
             llm=MockLLMProvider([LLMResponse(content="hello back")]),
             tools=build_default_tools(),
             config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+            turn_id_factory=lambda: "turn_test_explicit",
         )
     )
 
@@ -133,6 +137,7 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
     working_records = memory.backends[MemoryLayer.WORKING].records
     episodic_records = memory.backends[MemoryLayer.EPISODIC].records
     user_record = next(record for record in working_records if record.title == "User message")
+    assert user_record.id == "turn_test_explicit_user"
     summary_record = next(
         record for record in episodic_records if record.title == "Conversation turn summary"
     )
@@ -146,6 +151,115 @@ def test_agent_chat_writes_working_and_episodic_memory(tmp_path: Path) -> None:
     assert assistant_record.content == "hello back"
     assert assistant_record.metadata["source_span"]["role"] == "assistant"
     assert assistant_record.id in summary_record.metadata["child_ids"]
+
+
+@pytest.mark.parametrize(
+    "turn_id",
+    ["turn/escape", "turn forged", "turn\nforged", " turn-leading"],
+)
+def test_agent_rejects_noncanonical_explicit_turn_id(
+    tmp_path: Path,
+    turn_id: str,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=MockLLMProvider([LLMResponse(content="unused")]),
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+            turn_id_factory=lambda: turn_id,
+        )
+    )
+
+    with pytest.raises(ValueError, match="turn_id"):
+        agent.chat("hello", session_id="test")
+
+
+@pytest.mark.parametrize("second_session", ["session-one", "session-two"])
+def test_injected_turn_identity_cannot_overwrite_same_or_cross_session_evidence(
+    tmp_path: Path,
+    second_session: str,
+) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    agent = NestedMV2Agent(
+        AgentDependencies(
+            memory=memory,
+            llm=MockLLMProvider(
+                [LLMResponse(content="first response"), LLMResponse(content="second response")]
+            ),
+            tools=build_default_tools(),
+            config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+            turn_id_factory=lambda: "turn_reused",
+        )
+    )
+    agent.chat("first message", session_id="session-one")
+    before = {
+        record.id: record.content
+        for record in memory.iter_records(include_inactive=True)
+        if record.id.startswith("turn_reused_")
+    }
+
+    with pytest.raises(ValueError, match="turn identity already exists"):
+        agent.chat("second message", session_id=second_session)
+
+    after = {
+        record.id: record.content
+        for record in memory.iter_records(include_inactive=True)
+        if record.id.startswith("turn_reused_")
+    }
+    assert after == before
+    assert all("second message" not in content for content in after.values())
+
+
+def test_concurrent_agents_atomically_reserve_reused_turn_identity(tmp_path: Path) -> None:
+    memory = build_memory_system("memory", tmp_path / "memory")
+    turn_ids_ready = Barrier(2)
+
+    def concurrent_turn_id() -> str:
+        turn_ids_ready.wait(timeout=5)
+        return "turn_concurrent_reuse"
+
+    def build_agent(response: str) -> NestedMV2Agent:
+        return NestedMV2Agent(
+            AgentDependencies(
+                memory=memory,
+                llm=MockLLMProvider([LLMResponse(content=response)]),
+                tools=build_default_tools(),
+                config=AgentConfig(memory_dir=tmp_path / "memory", log_dir=tmp_path / "logs"),
+                turn_id_factory=concurrent_turn_id,
+            )
+        )
+
+    def invoke(agent: NestedMV2Agent, message: str) -> AgentTurnResult | ValueError:
+        try:
+            return agent.chat(message, session_id=message)
+        except ValueError as exc:
+            return exc
+
+    agents = (build_agent("first response"), build_agent("second response"))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(
+            executor.map(
+                lambda arguments: invoke(*arguments),
+                zip(agents, ("first message", "second message"), strict=True),
+            )
+        )
+
+    assert sum(isinstance(outcome, AgentTurnResult) for outcome in outcomes) == 1
+    errors = [outcome for outcome in outcomes if isinstance(outcome, ValueError)]
+    assert len(errors) == 1
+    assert str(errors[0]) == "turn identity already exists: turn_concurrent_reuse"
+    turn_records = [
+        record
+        for record in memory.iter_records(include_inactive=True)
+        if record.id.startswith("turn_concurrent_reuse_")
+    ]
+    assert [record.id for record in turn_records].count("turn_concurrent_reuse_user") == 1
+    persisted_messages = {
+        record.content for record in turn_records if record.id == "turn_concurrent_reuse_user"
+    }
+    assert persisted_messages in ({"first message"}, {"second message"})
 
 
 def test_optional_llm_summary_uses_run_bounds_and_falls_back_without_failing_turn(

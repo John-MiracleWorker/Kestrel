@@ -27,6 +27,7 @@ def test_in_memory_backend_put_and_upsert_return_logical_record_ids(tmp_path: Pa
         content="The backend must retrieve auth profile memories.",
         layer=MemoryLayer.WORKING,
         confidence=0.5,
+        metadata={"frame_id": "logical-working-frame"},
     )
     record_id = backend.put(record)
     hits = backend.find("auth profile", k=3)
@@ -35,6 +36,10 @@ def test_in_memory_backend_put_and_upsert_return_logical_record_ids(tmp_path: Pa
     assert resolved is not None and resolved.id == record.id
     assert hits
     assert backend.verify()
+    assert backend.has_any_record_identity(
+        frozenset({"missing-record", "logical-working-record"})
+    )
+    assert backend.has_any_record_identity(frozenset({"logical-working-frame"}))
 
     replacement = MemoryRecord(
         id=record.id,
@@ -42,10 +47,18 @@ def test_in_memory_backend_put_and_upsert_return_logical_record_ids(tmp_path: Pa
         content="The logical record ID remains stable after an upsert.",
         layer=MemoryLayer.WORKING,
         confidence=0.6,
+        metadata={"frame_id": "replacement-working-frame"},
     )
     assert backend.upsert(replacement) == record.id
     resolved = backend.get_record(record.id)
     assert resolved is not None and resolved.content == replacement.content
+    assert not backend.has_any_record_identity(frozenset({"logical-working-frame"}))
+    assert backend.has_any_record_identity(frozenset({"replacement-working-frame"}))
+
+    resolved.metadata["frame_id"] = "mutated-working-frame"
+    assert backend.upsert(resolved) == record.id
+    assert not backend.has_any_record_identity(frozenset({"replacement-working-frame"}))
+    assert backend.has_any_record_identity(frozenset({"mutated-working-frame"}))
 
 
 def test_memvid_backend_put_and_upsert_return_logical_record_ids(
@@ -92,20 +105,32 @@ def test_memvid_backend_put_and_upsert_return_logical_record_ids(
             title="Logical Memvid ID",
             content="A physical frame ID is not a MemoryRecord ID.",
             layer=MemoryLayer.WORKING,
+            metadata={"frame_id": "logical-memvid-frame"},
         )
         assert backend.put(record) == record.id
         resolved = backend.get_record(record.id)
         assert resolved is not None and resolved.id == record.id
+        assert backend.has_any_record_identity(
+            frozenset({"missing-record", "logical-memvid-frame"})
+        )
 
         replacement = MemoryRecord(
             id=record.id,
             title=record.title,
             content="The logical ID remains resolvable immediately after upsert.",
             layer=MemoryLayer.WORKING,
+            metadata={"frame_id": "replacement-memvid-frame"},
         )
         assert backend.upsert(replacement) == record.id
         resolved = backend.get_record(record.id)
         assert resolved is not None and resolved.content == replacement.content
+        assert not backend.has_any_record_identity(frozenset({"logical-memvid-frame"}))
+        assert backend.has_any_record_identity(frozenset({"replacement-memvid-frame"}))
+
+        resolved.metadata["frame_id"] = "mutated-memvid-frame"
+        assert backend.upsert(resolved) == record.id
+        assert not backend.has_any_record_identity(frozenset({"replacement-memvid-frame"}))
+        assert backend.has_any_record_identity(frozenset({"mutated-memvid-frame"}))
     finally:
         backend.close()
 

@@ -17,6 +17,7 @@ from .ledger_records import (
     TargetCalibrationEntry,
 )
 from .models import ModelTarget, ProviderProfile, RoutePolicy
+from .shadow_observation import ShadowObservationEntry
 
 _SECRET_METADATA_KEYS = {
     "secret",
@@ -587,3 +588,73 @@ def _optional_float(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float, str, bytes, bytearray)):
         raise ValueError("SQLite floating-point value has an unsupported type")
     return float(value)
+
+
+def _shadow_observation_entry_from_row(row: sqlite3.Row) -> ShadowObservationEntry:
+    validation_raw = row["validation_passed"]
+    return ShadowObservationEntry(
+        observation_id=str(row["observation_id"]),
+        run_id=str(row["run_id"]),
+        task_id=str(row["task_id"]),
+        subagent_id=_optional_str(row["subagent_id"]),
+        attempt=int(row["attempt"]),
+        role=str(row["role"]),
+        actual_authority=str(row["actual_authority"]),
+        actual_target_id=_optional_str(row["actual_target_id"]),
+        actual_provider=str(row["actual_provider"]),
+        actual_model=str(row["actual_model"]),
+        shadow_target_id=_optional_str(row["shadow_target_id"]),
+        shadow_provider=str(row["shadow_provider"]),
+        shadow_model=str(row["shadow_model"]),
+        shadow_executed=bool(row["shadow_executed"]),
+        static_target_id=_optional_str(row["static_target_id"]),
+        candidates=tuple(
+            dict(item)
+            for item in json.loads(str(row["candidates_json"]))
+            if isinstance(item, dict)
+        ),
+        constraints=_json_dict(row["constraints_json"]),
+        qualification=_json_dict(row["qualification_json"]),
+        reason_codes=_json_tuple(row["reason_codes_json"]),
+        usage=_json_dict(row["usage_json"]),
+        verdict=str(row["verdict"]),
+        verdict_reason=str(row["verdict_reason"]),
+        evidence_basis=_json_tuple(row["evidence_basis_json"]),
+        counterfactual_proven=bool(row["counterfactual_proven"]),
+        payload_digest=str(row["payload_digest"]),
+        created_at=str(row["created_at"]),
+        resolved_at=_optional_str(row["resolved_at"]),
+        validation_passed=(
+            None if validation_raw is None else bool(validation_raw)
+        ),
+        actual_cost_usd=_optional_float(row["actual_cost_usd"]),
+        actual_latency_seconds=_optional_float(row["actual_latency_seconds"]),
+    )
+
+
+def _validate_shadow_observation_draft_payload(draft: Any) -> None:
+    """Validate the closed vocabularies and replay-stable digest of a draft."""
+
+    from .shadow_observation import (
+        ActualAuthority,
+        ShadowRole,
+        ShadowVerdict,
+        shadow_observation_payload_digest,
+    )
+
+    if isinstance(draft.attempt, bool) or draft.attempt < 1:
+        raise ValueError("shadow observation attempt must be a positive integer")
+    if draft.role.value not in {role.value for role in ShadowRole}:
+        raise ValueError(f"unknown shadow observation role: {draft.role}")
+    if draft.actual_authority.value not in {
+        authority.value for authority in ActualAuthority
+    }:
+        raise ValueError(
+            f"unknown shadow observation authority: {draft.actual_authority}"
+        )
+    if draft.verdict.value not in {verdict.value for verdict in ShadowVerdict}:
+        raise ValueError(f"unknown shadow observation verdict: {draft.verdict}")
+    if not draft.actual_provider or not draft.actual_model:
+        raise ValueError("shadow observation actual provider and model are required")
+    if draft.payload_digest != shadow_observation_payload_digest(draft):
+        raise ValueError("shadow observation payload digest does not match draft")

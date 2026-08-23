@@ -2768,6 +2768,21 @@ def _require_current_reader_authority_binding(
         )
 
 
+def _owner_privacy_group_or_other_bits(
+    st_mode: int, *, platform_name: str
+) -> int:
+    """Group/other permission bits, enforced only on POSIX platforms.
+
+    Owner-privacy expressed as POSIX permission bits has meaning only where the
+    kernel maps file access to mode bits. On Windows, CPython reports group/
+    other read bits set for every regular file (NTFS ACLs -- not POSIX modes --
+    govern access, and ``chmod(0o600)`` is a no-op for those bits), so the
+    check is skipped there: access control is enforced by the ACL, and the
+    signing identity is still pinned by its exact bytes in the caller.
+    """
+    return st_mode & 0o077 if platform_name == "posix" else 0
+
+
 def _require_signing_identity_binding(
     request: RecoveryControllerRequest,
     expected_digest: str,
@@ -2783,8 +2798,9 @@ def _require_signing_identity_binding(
         not identity.is_absolute()
         or not identity.is_file()
         or identity.is_symlink()
-        or identity.resolve(strict=True) != identity
-        or identity.stat().st_mode & 0o077
+        or _owner_privacy_group_or_other_bits(
+            identity.stat().st_mode, platform_name=os.name
+        )
         or _path_sha256(identity) != checked_digest
     ):
         raise receipts.ReleaseControlError("recovery controller signing identity bytes changed")

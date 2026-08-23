@@ -163,7 +163,7 @@ docker build -t kestrel-agent:local .
 docker run --rm kestrel-agent:local nest-agent doctor --backend memvid --memory-dir /data/memory --provider mock
 ```
 
-For a tag, the release workflow builds one platform-independent Kestrel wheel before starting its
+The release candidate lane builds one platform-independent Kestrel wheel before starting its
 artifact matrix. The identical checksummed wheel and hash-locked release requirements are then
 installed on Linux x86_64, macOS arm64 and x86_64, and native Windows x86_64 for Python 3.11,
 3.12, and 3.13. Each lane asserts its runner architecture, exercises the installed package outside

@@ -10,7 +10,7 @@ import time
 import urllib.request
 from collections import Counter
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
@@ -227,6 +227,43 @@ def _start_lifecycle(manager: Any) -> ThreadPoolExecutor:
     executor = ThreadPoolExecutor(max_workers=17, thread_name_prefix="task6-test-lan")
     manager.start_lifecycle(executor)
     return executor
+
+
+class ControlledExecutor:
+    """Run submitted controller work only when the test explicitly releases it."""
+
+    def __init__(self) -> None:
+        self._pending: list[
+            tuple[Future[Any], Any, tuple[Any, ...], dict[str, Any]]
+        ] = []
+        self.shutdown_calls: list[tuple[bool, bool]] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def submit(self, function: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+        future: Future[Any] = Future()
+        self._pending.append((future, function, args, kwargs))
+        return future
+
+    def run_next(self) -> Future[Any]:
+        if not self._pending:
+            raise AssertionError("controlled executor has no pending work")
+        future, function, args, kwargs = self._pending.pop(0)
+        if future.set_running_or_notify_cancel():
+            try:
+                result = function(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        self.shutdown_calls.append((wait, cancel_futures))
+        if self._pending:
+            raise AssertionError("controlled executor shut down with pending work")
 
 
 def test_construction_is_inert_and_recovery_runs_only_after_lifecycle_start(
@@ -1032,11 +1069,13 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
     submitted: list[str] = []
     submitted_event = Event()
     release = Event()
+    release_observed = Event()
 
     def scanner(*_args: Any, **_kwargs: Any) -> tuple[()]:
         submitted.append("scan")
         submitted_event.set()
-        release.wait(timeout=3)
+        release.wait()
+        release_observed.set()
         return ()
 
     managers = [
@@ -1058,29 +1097,63 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
         manager.create_draft(authorization)
         for manager, authorization in zip(managers, authorizations, strict=True)
     ]
-    outcomes: list[str] = []
+    outcomes: dict[int, str] = {}
+    winning_futures: dict[int, Any] = {}
+    worker_failures: dict[int, BaseException] = {}
+    outcomes_lock = Lock()
 
     def start(index: int) -> None:
-        barrier.wait()
         try:
-            managers[index].start(
-                drafts[index].scan_id,
-                expected_revision=drafts[index].revision,
-                authorization=authorizations[index],
-                preview_digest=authorizations[index].preview_digest,
-            )
-        except task6.LanScanAdmissionConflict:
-            outcomes.append("lost")
-        else:
-            outcomes.append("won")
+            barrier.wait()
+            try:
+                managers[index].start(
+                    drafts[index].scan_id,
+                    expected_revision=drafts[index].revision,
+                    authorization=authorizations[index],
+                    preview_digest=authorizations[index].preview_digest,
+                )
+            except task6.LanScanAdmissionConflict:
+                with outcomes_lock:
+                    outcomes[index] = "lost"
+                return
+            with managers[index]._lock:  # noqa: SLF001 - exact worker teardown proof
+                handle = managers[index]._active_scans[drafts[index].scan_id]  # noqa: SLF001
+                future = handle.future
+            if future is None:
+                raise AssertionError("winning LAN controller has no submitted future")
+            with outcomes_lock:
+                outcomes[index] = "won"
+                winning_futures[index] = future
+        except BaseException as exc:  # noqa: BLE001 - surface exact thread failure
+            with outcomes_lock:
+                worker_failures[index] = exc
 
     threads = [Thread(target=start, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=3)
+    primary_failure: BaseException | None = None
+    reported_worker_failures: set[int] = set()
     try:
-        assert sorted(outcomes) == ["lost", "won"]
+        for thread in threads:
+            thread.start()
+        start_deadline = time.monotonic() + 15.0
+        for thread in threads:
+            thread.join(timeout=max(0.0, start_deadline - time.monotonic()))
+        with outcomes_lock:
+            worker_failure_items = tuple(sorted(worker_failures.items()))
+        if worker_failure_items:
+            failed_index, failure = worker_failure_items[0]
+            reported_worker_failures.update(index for index, _ in worker_failure_items)
+            failure.add_note(f"raised by LAN start worker {failed_index}")
+            for additional_index, additional_failure in worker_failure_items[1:]:
+                failure.add_note(
+                    "additional LAN start worker "
+                    f"{additional_index} failure: {additional_failure!r}"
+                )
+            raise failure
+        assert all(not thread.is_alive() for thread in threads)
+        assert sorted(outcomes.values()) == ["lost", "won"]
+        assert sorted(winning_futures) == [
+            index for index, outcome in sorted(outcomes.items()) if outcome == "won"
+        ]
         assert submitted_event.wait(timeout=2.0)
         assert submitted == ["scan"]
         scans = ledger_a.list_scans(owner_principal=FIXED_OWNER)
@@ -1097,10 +1170,89 @@ def test_two_managers_same_owner_have_one_durable_start_winner_and_one_submissio
         assert ledger_a.list_events(losers[0].scan_id) == []
         assert ledger_a.list_observations(winners[0].scan_id) == []
         assert ledger_a.list_observations(losers[0].scan_id) == []
+    except BaseException as exc:
+        primary_failure = exc
+        raise
     finally:
         release.set()
-        for manager in managers:
-            assert manager.shutdown(timeout_seconds=5.0) is True
+        # Future completion is the lifecycle boundary. The longer deadline is only
+        # a guard for loaded Windows/SQLite cleanup; elapsed time is not the proof.
+        cleanup_deadline = time.monotonic() + 15.0
+        cleanup_failures: list[str] = []
+        barrier.abort()
+        for index, thread in enumerate(threads):
+            if thread.is_alive():
+                thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+            if thread.is_alive():
+                cleanup_failures.append(f"start thread {index} did not stop")
+        with outcomes_lock:
+            winner_items = tuple(sorted(winning_futures.items()))
+            late_worker_failure_items = tuple(
+                (index, failure)
+                for index, failure in sorted(worker_failures.items())
+                if index not in reported_worker_failures
+            )
+        cleanup_failures.extend(
+            f"start worker {index} failed: {failure!r}"
+            for index, failure in late_worker_failure_items
+        )
+        if winner_items and not release_observed.wait(
+            timeout=max(0.0, cleanup_deadline - time.monotonic())
+        ):
+            cleanup_failures.append("winning scanner did not observe release")
+        for index, future in winner_items:
+            try:
+                future.result(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+                terminal = managers[index].get(drafts[index].scan_id)
+                if terminal is None:
+                    raise AssertionError("winning LAN scan has no durable record")
+                if terminal.status != "completed":
+                    raise AssertionError(
+                        f"winning LAN scan has terminal status {terminal.status!r}"
+                    )
+                if terminal.terminal_reason != "scan_complete":
+                    raise AssertionError(
+                        "winning LAN scan has terminal reason "
+                        f"{terminal.terminal_reason!r}"
+                    )
+                event_types = [
+                    event.event_type
+                    for event in managers[index].events(drafts[index].scan_id)
+                ]
+                if event_types != ["scan_started", "scan_completed"]:
+                    raise AssertionError(
+                        f"winning LAN scan has durable events {event_types!r}"
+                    )
+            except BaseException as exc:  # noqa: BLE001 - preserve exact cleanup evidence
+                cleanup_failures.append(f"winner {index} future: {exc!r}")
+        shutdown_results: list[tuple[int, bool]] = []
+        for index, manager in enumerate(managers):
+            try:
+                shutdown_results.append(
+                    (
+                        index,
+                        manager.shutdown(
+                            timeout_seconds=max(0.0, cleanup_deadline - time.monotonic())
+                        ),
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - preserve exact cleanup evidence
+                cleanup_failures.append(f"manager {index} shutdown: {exc!r}")
+        if not cleanup_failures:
+            for index, manager in enumerate(managers):
+                try:
+                    if not manager.is_quiescent():
+                        cleanup_failures.append(f"manager {index} is not quiescent")
+                except BaseException as exc:  # noqa: BLE001 - preserve exact cleanup evidence
+                    cleanup_failures.append(f"manager {index} quiescence: {exc!r}")
+        if cleanup_failures or shutdown_results != [(0, True), (1, True)]:
+            detail = (
+                f"LAN cleanup failed: {cleanup_failures=}, "
+                f"{shutdown_results=}"
+            )
+            if primary_failure is None:
+                raise AssertionError(detail)
+            primary_failure.add_note(detail)
 
 
 def test_stale_cancel_has_no_token_side_effect_and_committed_cancel_signals_token(
@@ -1166,8 +1318,11 @@ def test_stale_cancel_has_no_token_side_effect_and_committed_cancel_signals_toke
 
 def test_real_scanner_cancel_drains_admitted_work_before_terminal_receipt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered = Event()
+    all_admitted = Event()
+    release = Event()
 
     class BlockingTcp:
         def tcp_reachable(
@@ -1181,7 +1336,7 @@ def test_real_scanner_cancel_drains_admitted_work_before_terminal_receipt(
         ) -> bool:
             del deadline
             entered.set()
-            while not cancellation.is_cancelled():
+            while not cancellation.is_cancelled() and not release.is_set():
                 time.sleep(0.001)
             raise LanTransportError(LanTransportFailure.CANCELLED)
 
@@ -1202,40 +1357,51 @@ def test_real_scanner_cancel_drains_admitted_work_before_terminal_receipt(
             **kwargs,
         )
 
-    manager, _state, _ledger, interface = _manager(tmp_path, scanner=scanner)
-    _start_lifecycle(manager)
-    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
-    draft = manager.create_draft(authorization)
-    manager.start(
-        draft.scan_id,
-        expected_revision=draft.revision,
-        authorization=authorization,
-        preview_digest=authorization.preview_digest,
-    )
-    assert entered.wait(timeout=2)
+    manager, _state, ledger, interface = _manager(tmp_path, scanner=scanner)
+    shutdown_succeeded = False
+    try:
+        _start_lifecycle(manager)
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        expected_admitted = len(authorization.preview.port_matrix)
+        record_scan_progress = ledger.record_scan_progress
 
-    expected_admitted = len(authorization.preview.port_matrix)
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
+        def record_and_observe_progress(scan_id: str, **kwargs: Any) -> LanScanRecord:
+            updated = record_scan_progress(scan_id, **kwargs)
+            if kwargs["admitted_count"] == expected_admitted:
+                all_admitted.set()
+            return updated
+
+        monkeypatch.setattr(ledger, "record_scan_progress", record_and_observe_progress)
+        draft = manager.create_draft(authorization)
+        manager.start(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            authorization=authorization,
+            preview_digest=authorization.preview_digest,
+        )
+        assert entered.wait(timeout=15.0)
+        assert all_admitted.wait(timeout=15.0), (
+            "real scanner did not durably admit its bounded work"
+        )
         progress_events = [
             event for event in manager.events(draft.scan_id) if event.event_type == "scan_progress"
         ]
-        if progress_events and progress_events[-1].payload["admitted_count"] == (expected_admitted):
-            break
-        time.sleep(0.005)
-    else:
-        raise AssertionError("real scanner did not durably admit its bounded work")
+        assert progress_events[-1].payload["admitted_count"] == expected_admitted
 
-    current = manager.get(draft.scan_id)
-    assert current is not None
-    manager.cancel(draft.scan_id, expected_revision=current.revision)
-    terminal = _wait_for_terminal(manager, draft.scan_id)
-    assert terminal.status == "cancelled"
-    assert terminal.terminal_receipt is not None
-    assert terminal.terminal_receipt["admitted_count"] == expected_admitted
-    assert terminal.terminal_receipt["completed_count"] == expected_admitted
-    assert terminal.terminal_receipt["unknown_inflight_count"] == 0
-    assert manager.shutdown(timeout_seconds=2.0) is True
+        current = manager.get(draft.scan_id)
+        assert current is not None
+        manager.cancel(draft.scan_id, expected_revision=current.revision)
+        terminal = _wait_for_terminal(manager, draft.scan_id, timeout=15.0)
+        assert terminal.status == "cancelled"
+        assert terminal.terminal_receipt is not None
+        assert terminal.terminal_receipt["admitted_count"] == expected_admitted
+        assert terminal.terminal_receipt["completed_count"] == expected_admitted
+        assert terminal.terminal_receipt["unknown_inflight_count"] == 0
+    finally:
+        release.set()
+        shutdown_succeeded = manager.shutdown(timeout_seconds=15.0)
+    assert shutdown_succeeded is True
+    assert manager.is_quiescent() is True
 
 
 def test_real_scanner_pre_admission_cancel_receipt_has_zero_admitted_work(
@@ -1445,6 +1611,11 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
     task6 = _task6()
     interface = _interface()
     probe_entered = Event()
+    probe_exited = Event()
+    release_probe = Event()
+    third_submit_attempted = Event()
+    allow_rejection = Event()
+    rejection_injected = Event()
     active_probes = 0
 
     class CancellingTcp:
@@ -1462,10 +1633,11 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
             active_probes += 1
             probe_entered.set()
             try:
-                while not cancellation.is_cancelled():
+                while not cancellation.is_cancelled() and not release_probe.is_set():
                     time.sleep(0.001)
             finally:
                 active_probes -= 1
+                probe_exited.set()
             raise LanTransportError(LanTransportFailure.CANCELLED)
 
     def scanner(scope: Any, limits: Any, **kwargs: Any) -> tuple[Any, ...]:
@@ -1489,14 +1661,25 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
         def __init__(self) -> None:
             super().__init__(max_workers=17, thread_name_prefix="task6-partial-reject")
             self.submit_calls = 0
+            self.submit_calls_lock = Lock()
+            self.controller_future: Any | None = None
 
         def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
-            self.submit_calls += 1
+            with self.submit_calls_lock:
+                self.submit_calls += 1
+                call_number = self.submit_calls
             # One submits the controller, two the first probe, and three
             # rejects the next probe after durable admission of the first.
-            if self.submit_calls == 3:
+            if call_number == 3:
+                third_submit_attempted.set()
+                if not allow_rejection.wait(timeout=15.0):
+                    raise RuntimeError("test did not authorize executor rejection")
+                rejection_injected.set()
                 raise RuntimeError("injected partial executor rejection")
-            return super().submit(fn, *args, **kwargs)
+            future = super().submit(fn, *args, **kwargs)
+            if call_number == 1:
+                self.controller_future = future
+            return future
 
     state = AgentStateStore(tmp_path / "state.db")
     utc = MutableUtcClock()
@@ -1511,29 +1694,89 @@ def test_partial_executor_rejection_drains_admitted_probe_before_failed_receipt(
         scan_id_factory=lambda: "lan_partial_executor_reject",
     )
     executor = RejectSecondProbeExecutor()
-    manager.start_lifecycle(executor)
-    authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
-    draft = manager.create_draft(authorization)
-    manager.start(
-        draft.scan_id,
-        expected_revision=draft.revision,
-        authorization=authorization,
-        preview_digest=authorization.preview_digest,
-    )
+    shutdown_succeeded = False
+    primary_failure: BaseException | None = None
+    try:
+        manager.start_lifecycle(executor)
+        authorization = manager.preview(interface.interface_id, "192.168.90.0/30")
+        draft = manager.create_draft(authorization)
+        manager.start(
+            draft.scan_id,
+            expected_revision=draft.revision,
+            authorization=authorization,
+            preview_digest=authorization.preview_digest,
+        )
 
-    assert probe_entered.wait(timeout=2.0)
-    terminal = _wait_for_terminal(manager, draft.scan_id)
-    receipt = terminal.terminal_receipt
-    assert terminal.status == "failed"
-    assert terminal.terminal_reason == "worker_error"
-    assert receipt is not None
-    assert receipt["admitted_count"] == 1
-    assert receipt["completed_count"] == 1
-    assert receipt["persisted_observation_count"] == 1
-    assert receipt["unknown_inflight_count"] == 0
-    assert active_probes == 0
-    assert executor.submit_calls == 3
-    assert manager.shutdown(timeout_seconds=1.0) is True
+        assert probe_entered.wait(timeout=15.0), "first admitted probe did not start"
+        assert third_submit_attempted.wait(timeout=15.0), (
+            f"third executor submission was not attempted: {executor.submit_calls=}"
+        )
+        allow_rejection.set()
+        assert rejection_injected.wait(timeout=15.0), (
+            f"third executor submission was not rejected: {executor.submit_calls=}"
+        )
+        controller_future = executor.controller_future
+        assert controller_future is not None, "controller future was not captured"
+        try:
+            controller_future.result(timeout=15.0)
+        except TimeoutError as exc:
+            current = manager.get(draft.scan_id)
+            raise AssertionError(
+                "controller did not finish after executor rejection: "
+                f"status={None if current is None else current.status!r}, "
+                f"{executor.submit_calls=}, probe_exited={probe_exited.is_set()}, "
+                f"active_probes={active_probes}"
+            ) from exc
+        terminal = manager.get(draft.scan_id)
+        assert terminal is not None and terminal.is_terminal, (
+            "controller completed without a durable terminal record: "
+            f"status={None if terminal is None else terminal.status!r}, "
+            f"{executor.submit_calls=}, probe_exited={probe_exited.is_set()}, "
+            f"active_probes={active_probes}"
+        )
+        receipt = terminal.terminal_receipt
+        assert terminal.status == "failed"
+        assert terminal.terminal_reason == "worker_error"
+        assert receipt is not None
+        assert receipt["planned_count"] == 8
+        assert receipt["admitted_count"] == 1
+        assert receipt["completed_count"] == 1
+        assert receipt["observation_count"] == 1
+        assert receipt["persisted_observation_count"] == 1
+        assert receipt["evidence_complete"] is True
+        assert receipt["error_category_counts"] == {"cancelled": 1}
+        assert receipt["unknown_inflight_count"] == 0
+        events = manager.events(draft.scan_id)
+        progress = [item.payload for item in events if item.event_type == "scan_progress"]
+        assert [
+            (
+                item["planned_count"],
+                item["admitted_count"],
+                item["completed_count"],
+            )
+            for item in progress
+        ] == [(8, 0, 0), (8, 1, 0), (8, 1, 1)]
+        assert events[-1].event_type == "scan_failed"
+        assert probe_exited.is_set()
+        assert active_probes == 0
+        assert executor.submit_calls == 3
+    except BaseException as exc:
+        primary_failure = exc
+        raise
+    finally:
+        allow_rejection.set()
+        release_probe.set()
+        try:
+            shutdown_succeeded = manager.shutdown(timeout_seconds=15.0)
+        except BaseException as cleanup_error:
+            if primary_failure is None:
+                raise
+            primary_failure.add_note(f"manager shutdown also raised: {cleanup_error!r}")
+        else:
+            if primary_failure is not None and not shutdown_succeeded:
+                primary_failure.add_note("manager shutdown also returned False")
+    assert shutdown_succeeded is True
+    assert manager.is_quiescent() is True
 
 
 def test_manager_passes_one_executor_and_one_absolute_deadline_through_all_phases(
@@ -3922,7 +4165,8 @@ def test_manual_confirm_requires_exact_consent_and_cached_authority_without_writ
         manual_scanner=_manual_probe_result,
         scan_id="lan_" + "2" * 32,
     )
-    _start_lifecycle(manager)
+    executor = ControlledExecutor()
+    manager.start_lifecycle(executor)
     try:
         authorization = manager.manual_preview(
             interface.interface_id,
@@ -3946,6 +4190,7 @@ def test_manual_confirm_requires_exact_consent_and_cached_authority_without_writ
 
         assert resolver_calls == ["model-box.local"]
         assert manager.list() == []
+        assert executor.pending_count == 0
         started = manager.confirm_manual(
             authorization.preview_digest,
             "192.168.90.2",
@@ -3953,11 +4198,16 @@ def test_manual_confirm_requires_exact_consent_and_cached_authority_without_writ
             confirmed=True,
             privacy_acknowledged=True,
         )
-        assert _wait_for_terminal(manager, started.scan_id).status == "completed"
+        assert executor.pending_count == 1
+        executor.run_next().result()
+        terminal = manager.get(started.scan_id)
+        assert terminal is not None
+        assert terminal.status == "completed"
         assert resolver_calls == ["model-box.local"]
         assert [item.scan_id for item in manager.list()] == [started.scan_id]
     finally:
         assert manager.shutdown(timeout_seconds=1.0) is True
+    assert executor.shutdown_calls == [(True, False)]
 
 
 def test_manual_confirm_never_reresolves_and_consumes_authority_only_after_commit(

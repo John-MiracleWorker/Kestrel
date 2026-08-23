@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.release_dispatch_reconciliation.v1.schema.json",
+  "title": "kestrel.release_dispatch_reconciliation.v1",
+  "type": "object",
+  "required": ["schema", "transaction", "dispatch", "containment", "polling", "candidates", "outcome", "tombstone", "evidence", "provenance", "validation_status"],
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {"const": "kestrel.release_dispatch_reconciliation.v1"},
+    "transaction": {"$ref": "#/$defs/transaction"},
+    "dispatch": {"$ref": "#/$defs/dispatch"},
+    "containment": {"$ref": "#/$defs/containment"},
+    "polling": {"$ref": "#/$defs/polling"},
+    "candidates": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 1024,
+      "uniqueItems": true,
+      "x-sort-key": ["run_id"],
+      "items": {"$ref": "#/$defs/candidate"}
+    },
+    "outcome": {"$ref": "#/$defs/outcome"},
+    "tombstone": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/tombstone"}]},
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12100,
+      "uniqueItems": true,
+      "x-sort-key": ["name"],
+      "items": {"$ref": "#/$defs/evidence_item"}
+    },
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "validation_status": {"enum": ["pending_tombstone_signature", "validated"]}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "nonnegative": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"},
+    "repository": {"type": "object", "required": ["full_name", "id"], "additionalProperties": false, "properties": {"full_name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"}, "id": {"$ref": "#/$defs/id"}}},
+    "workflow": {"type": "object", "required": ["id", "path", "default_branch_sha"], "additionalProperties": false, "properties": {"id": {"$ref": "#/$defs/id"}, "path": {"const": ".github/workflows/release.yml"}, "default_branch_sha": {"$ref": "#/$defs/git_sha"}}},
+    "target": {"type": "object", "required": ["mode", "short_ref", "full_ref", "head_sha", "workflow_ref", "workflow_sha"], "additionalProperties": false, "properties": {"mode": {"enum": ["initiate", "recover_committed"]}, "short_ref": {"type": "string", "pattern": "^(main|v[^/]+)$"}, "full_ref": {"type": "string", "pattern": "^refs/(heads/main|tags/v[^/]+)$"}, "head_sha": {"$ref": "#/$defs/git_sha"}, "workflow_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[.]github/workflows/release[.]yml@refs/(heads/main|tags/v[^/]+)$"}, "workflow_sha": {"$ref": "#/$defs/git_sha"}}},
+    "actor": {"type": "object", "required": ["login", "id", "app_id", "installation_id"], "additionalProperties": false, "properties": {"login": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+\\[bot\\]$"}, "id": {"$ref": "#/$defs/id"}, "app_id": {"$ref": "#/$defs/id"}, "installation_id": {"$ref": "#/$defs/id"}}},
+    "transaction": {
+      "type": "object",
+      "required": ["transaction_nonce", "dispatch_binding", "logical_dispatch_ordinal", "repository", "workflow", "target", "actor", "request_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "transaction_nonce": {"$ref": "#/$defs/nonce"},
+        "dispatch_binding": {"$ref": "#/$defs/digest"},
+        "logical_dispatch_ordinal": {"const": 1},
+        "repository": {"$ref": "#/$defs/repository"},
+        "workflow": {"$ref": "#/$defs/workflow"},
+        "target": {"$ref": "#/$defs/target"},
+        "actor": {"$ref": "#/$defs/actor"},
+        "request_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "returned_run": {"type": "object", "required": ["id", "run_url", "html_url"], "additionalProperties": false, "properties": {"id": {"$ref": "#/$defs/id"}, "run_url": {"type": "string", "pattern": "^https://api[.]github[.]com/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*$"}, "html_url": {"type": "string", "pattern": "^https://github[.]com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*$"}}},
+    "dispatch": {
+      "type": "object",
+      "required": ["api_version", "endpoint", "method", "classification", "send_started_at", "response_observed_at", "http_status", "response_headers_sha256", "response_body_sha256", "returned_run"],
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {"const": "2026-03-10"},
+        "endpoint": {"type": "string", "pattern": "^https://api[.]github[.]com/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/workflows/[1-9][0-9]*/dispatches$"},
+        "method": {"const": "POST"},
+        "classification": {"enum": ["response_details_received", "not_accepted", "outcome_unknown"]},
+        "send_started_at": {"$ref": "#/$defs/timestamp"},
+        "response_observed_at": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/timestamp"}]},
+        "http_status": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 100, "maximum": 599}]},
+        "response_headers_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
+        "response_body_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
+        "returned_run": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/returned_run"}]}
+      }
+    },
+    "token_probe": {"type": "object", "required": ["endpoint", "http_status", "observed_at", "response_sha256"], "additionalProperties": false, "properties": {"endpoint": {"const": "GET /installation/repositories"}, "http_status": {"const": 401}, "observed_at": {"$ref": "#/$defs/timestamp"}, "response_sha256": {"$ref": "#/$defs/digest"}}},
+    "containment": {"type": "object", "required": ["installation_id", "uninstalled_at", "installed_apps_snapshot_sha256", "pre_send_writer_inventory_digest", "post_containment_writer_inventory_digest", "token_probe", "validated"], "additionalProperties": false, "properties": {"installation_id": {"$ref": "#/$defs/id"}, "uninstalled_at": {"$ref": "#/$defs/timestamp"}, "installed_apps_snapshot_sha256": {"$ref": "#/$defs/digest"}, "pre_send_writer_inventory_digest": {"$ref": "#/$defs/digest"}, "post_containment_writer_inventory_digest": {"$ref": "#/$defs/digest"}, "token_probe": {"$ref": "#/$defs/token_probe"}, "validated": {"const": true}}},
+    "page": {"type": "object", "required": ["number", "http_status", "response_sha256", "next"], "additionalProperties": false, "properties": {"number": {"$ref": "#/$defs/id"}, "http_status": {"const": 200}, "response_sha256": {"$ref": "#/$defs/digest"}, "next": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/id"}]}}},
+    "poll": {
+      "type": "object",
+      "required": ["ordinal", "requested_at", "workflow_observation_sha256", "query", "pages", "complete", "result_count", "nonce_run_ids", "binding_conflict_run_ids", "rejection_reasons"],
+      "additionalProperties": false,
+      "properties": {
+        "ordinal": {"$ref": "#/$defs/id"},
+        "requested_at": {"$ref": "#/$defs/timestamp"},
+        "workflow_observation_sha256": {"$ref": "#/$defs/digest"},
+        "query": {"type": "string", "pattern": "^GET /repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/workflows/[1-9][0-9]*/runs[?]event=workflow_dispatch&per_page=100$"},
+        "pages": {"type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true, "x-sort-key": ["number"], "items": {"$ref": "#/$defs/page"}},
+        "complete": {"type": "boolean"},
+        "result_count": {"type": "integer", "minimum": 0, "maximum": 999},
+        "nonce_run_ids": {"type": "array", "minItems": 0, "maxItems": 1024, "uniqueItems": true, "x-sort-key": [], "items": {"$ref": "#/$defs/id"}},
+        "binding_conflict_run_ids": {"type": "array", "minItems": 0, "maxItems": 1024, "uniqueItems": true, "x-sort-key": [], "items": {"$ref": "#/$defs/id"}},
+        "rejection_reasons": {"type": "array", "minItems": 0, "maxItems": 256, "uniqueItems": true, "x-sort-key": [], "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,127}$"}}
+      }
+    },
+    "polling": {
+      "type": "object",
+      "required": ["started_at", "deadline_at", "schedule_seconds", "polls", "complete"],
+      "additionalProperties": false,
+      "properties": {
+        "started_at": {"$ref": "#/$defs/timestamp"},
+        "deadline_at": {"$ref": "#/$defs/timestamp"},
+        "schedule_seconds": {"type": "array", "minItems": 0, "maxItems": 121, "uniqueItems": true, "x-sort-key": [], "items": {"type": "integer", "minimum": 0, "maximum": 600}},
+        "polls": {"type": "array", "minItems": 0, "maxItems": 121, "uniqueItems": true, "x-sort-key": ["ordinal"], "items": {"$ref": "#/$defs/poll"}},
+        "complete": {"type": "boolean"}
+      }
+    },
+    "rest_run": {
+      "type": "object",
+      "required": ["workflow_id", "repository_id", "repository_full_name", "path", "event", "display_title", "head_branch", "head_sha", "run_attempt", "actor_login", "actor_id", "triggering_actor_login", "triggering_actor_id", "status", "conclusion"],
+      "additionalProperties": false,
+      "properties": {
+        "workflow_id": {"$ref": "#/$defs/id"}, "repository_id": {"$ref": "#/$defs/id"}, "repository_full_name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"}, "path": {"type": "string", "minLength": 1, "maxLength": 1024}, "event": {"type": "string", "minLength": 1, "maxLength": 128}, "display_title": {"type": "string", "minLength": 1, "maxLength": 512}, "head_branch": {"type": "string", "minLength": 1, "maxLength": 256}, "head_sha": {"$ref": "#/$defs/git_sha"}, "run_attempt": {"$ref": "#/$defs/id"}, "actor_login": {"type": "string", "minLength": 1, "maxLength": 128}, "actor_id": {"$ref": "#/$defs/id"}, "triggering_actor_login": {"type": "string", "minLength": 1, "maxLength": 128}, "triggering_actor_id": {"$ref": "#/$defs/id"}, "status": {"enum": ["completed", "in_progress", "pending", "queued", "requested", "waiting"]}, "conclusion": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 64}]}
+      }
+    },
+    "identity_artifact": {"type": "object", "required": ["artifact_id", "name", "api_digest", "archive_sha256", "content_sha256", "expired", "identity_observed_at"], "additionalProperties": false, "properties": {"artifact_id": {"$ref": "#/$defs/id"}, "name": {"type": "string", "minLength": 1, "maxLength": 256}, "api_digest": {"$ref": "#/$defs/digest"}, "archive_sha256": {"$ref": "#/$defs/digest"}, "content_sha256": {"$ref": "#/$defs/digest"}, "expired": {"type": "boolean"}, "identity_observed_at": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/timestamp"}]}}},
+    "candidate": {"type": "object", "required": ["run_id", "list_observation_sha256", "get_run_observation_sha256", "run", "identity_artifact", "predicate", "reasons"], "additionalProperties": false, "properties": {"run_id": {"$ref": "#/$defs/id"}, "list_observation_sha256": {"$ref": "#/$defs/digest"}, "get_run_observation_sha256": {"$ref": "#/$defs/digest"}, "run": {"$ref": "#/$defs/rest_run"}, "identity_artifact": {"$ref": "#/$defs/identity_artifact"}, "predicate": {"enum": ["accepted", "binding_conflict", "rejected", "unproven"]}, "reasons": {"type": "array", "minItems": 0, "maxItems": 256, "uniqueItems": true, "x-sort-key": [], "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,127}$"}}}},
+    "outcome": {"type": "object", "required": ["state", "cardinality", "adopted_run_id", "reason_code", "decided_at"], "additionalProperties": false, "properties": {"state": {"enum": ["duplicate_dispatch_detected", "nonce_binding_conflict", "reconciliation_unavailable", "response_identity_conflict", "run_adopted", "unsafe_orphan_or_tamper", "unresolved_single_unproven", "unresolved_zero"]}, "cardinality": {"type": "integer", "minimum": 0, "maximum": 2048}, "adopted_run_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/id"}]}, "reason_code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,127}$"}, "decided_at": {"$ref": "#/$defs/timestamp"}}},
+    "tombstone": {"type": "object", "required": ["transaction_nonce", "dispatch_binding", "known_run_ids", "prohibition", "created_at", "channel_locator", "canonical_sha256", "signature_sha256", "validation_status"], "additionalProperties": false, "properties": {"transaction_nonce": {"$ref": "#/$defs/nonce"}, "dispatch_binding": {"$ref": "#/$defs/digest"}, "known_run_ids": {"type": "array", "minItems": 0, "maxItems": 2048, "uniqueItems": true, "x-sort-key": [], "items": {"$ref": "#/$defs/id"}}, "prohibition": {"const": "never_issue_dispatch_admission"}, "created_at": {"$ref": "#/$defs/timestamp"}, "channel_locator": {"type": "string", "minLength": 1, "maxLength": 1024}, "canonical_sha256": {"$ref": "#/$defs/digest"}, "signature_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]}, "validation_status": {"enum": ["pending_signature", "validated"]}}},
+    "evidence_item": {"type": "object", "required": ["name", "provider", "endpoint", "sha256", "size_bytes", "media_type", "captured_at"], "additionalProperties": false, "properties": {"name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,255}$"}, "provider": {"const": "github.com"}, "endpoint": {"type": "string", "minLength": 1, "maxLength": 16384}, "sha256": {"$ref": "#/$defs/digest"}, "size_bytes": {"$ref": "#/$defs/id"}, "media_type": {"const": "application/json"}, "captured_at": {"$ref": "#/$defs/timestamp"}}},
+    "provenance": {"type": "object", "required": ["producer", "version", "source_sha"], "additionalProperties": false, "properties": {"producer": {"const": "scripts/release_control_receipt.py"}, "version": {"const": "1"}, "source_sha": {"$ref": "#/$defs/git_sha"}}}
+  }
+}

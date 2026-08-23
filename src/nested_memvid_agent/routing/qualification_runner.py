@@ -63,6 +63,7 @@ from .qualification_records import (
     QualificationAttempt,
     QualificationAttemptDraft,
     QualificationCase,
+    QualificationRevisionConflict,
     QualificationRun,
     QualificationRunDraft,
 )
@@ -79,6 +80,7 @@ __all__ = [
 DEFAULT_SERVER_MAX_CONCURRENCY = 4
 _RECOVERABLE_RUN_STATES = ("draft", "ready", "running", "pausing", "paused")
 RECEIPT_FINALIZATION_FAILURE = "receipt_finalization_failure"
+_REVISION_CONFLICT_BACKOFF_SECONDS = 0.01
 
 # Terminal attempt status -> learned-router execution status.  Cancelled
 # attempts never contacted a provider and are excluded from scope evidence.
@@ -288,13 +290,10 @@ class QualificationRunner:
         run = self._require_run(run_id)
         if run.is_terminal:
             return self.get(run_id)
-        if run.status == "running":
-            try:
-                self._ledger.request_pause(run_id, expected_revision=run.revision)
-            except ValueError:
-                # Raced with terminalization; the final view is authoritative.
-                return self.get(run_id)
-        elif run.status not in ("pausing", "paused"):
+        run = self._request_pause(run)
+        if run.is_terminal:
+            return self.get(run_id)
+        if run.status not in ("pausing", "paused"):
             raise ValueError(
                 f"qualification run must be running to pause; current status is {run.status}"
             )
@@ -547,7 +546,13 @@ class QualificationRunner:
                 with self._lock:
                     mode = worker.stop_mode
                 if mode == "pause" and run.status == "running":
-                    run = self._ledger.request_pause(run_id, expected_revision=run.revision)
+                    run = self._request_pause(run)
+                    if run.is_terminal:
+                        return
+                    # Cancellation may have superseded shutdown's pause while
+                    # a benign revision conflict was being retried.
+                    with self._lock:
+                        mode = worker.stop_mode
                 if run.status == "pausing" or mode == "cancel":
                     if inflight:
                         self._wait_for_any(inflight)
@@ -566,8 +571,9 @@ class QualificationRunner:
                     if inflight:
                         self._wait_for_any(inflight)
                         continue
-                    self._complete_run(run)
-                    return
+                    if self._complete_run(run):
+                        return
+                    continue
                 if len(inflight) >= max_inflight:
                     self._wait_for_any(inflight)
                     continue
@@ -719,10 +725,32 @@ class QualificationRunner:
 
     # -- terminalization -----------------------------------------------------------
 
-    def _complete_run(self, run: QualificationRun) -> None:
+    def _request_pause(self, run: QualificationRun) -> QualificationRun:
+        """Durably request pause without exposing benign revision races."""
+
+        while run.status == "running":
+            try:
+                return self._ledger.request_pause(
+                    run.run_id,
+                    expected_revision=run.revision,
+                )
+            except QualificationRevisionConflict:
+                # Completion or a monotonic cap update won this CAS. Terminal
+                # completion is authoritative; otherwise yield before retrying
+                # a still-running revision to avoid a contention hot loop.
+                run = self._require_run(run.run_id)
+                if run.is_terminal:
+                    return run
+                if run.status == "running":
+                    time.sleep(_REVISION_CONFLICT_BACKOFF_SECONDS)
+        return run
+
+    def _complete_run(self, run: QualificationRun) -> bool:
         fresh = self._require_run(run.run_id)
         if fresh.is_terminal:
-            return
+            return True
+        if fresh.status != "running":
+            return False
         actual_spend = self._conservative_spend(fresh)
         try:
             receipt = self._completion_receipt(fresh)
@@ -734,12 +762,21 @@ class QualificationRunner:
                 actual_spend=actual_spend,
                 receipt_payload=receipt,
             )
+        except QualificationRevisionConflict:
+            # A durable pause or cap reduction won the terminalization CAS.
+            # Reload in the drive loop so pausing can settle as paused and a
+            # still-running revision can rebuild its exact terminal receipt.
+            # Yield first because that replay/signing work is deliberately
+            # expensive and repeated concurrent cap changes must not hot-loop.
+            time.sleep(_REVISION_CONFLICT_BACKOFF_SECONDS)
+            return False
         except Exception:  # noqa: BLE001 - never invent an unsigned qualifying receipt
             self._fail_run(
                 run.run_id,
                 terminal_reason=RECEIPT_FINALIZATION_FAILURE,
                 receipt={"qualifying": False, "reason": RECEIPT_FINALIZATION_FAILURE},
             )
+        return True
 
     def _completion_receipt(self, run: QualificationRun) -> Mapping[str, Any]:
         """Evaluate, replay twenty times, and build the terminal receipt.

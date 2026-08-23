@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.actions_artifact_observation.v1.schema.json",
+  "title": "kestrel.actions_artifact_observation.v1",
+  "type": "object",
+  "required": ["schema", "artifact", "evidence", "provenance", "confidence", "validation_status"],
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {"const": "kestrel.actions_artifact_observation.v1"},
+    "artifact": {
+      "type": "object",
+      "required": ["artifact_id", "name", "api_digest", "size_bytes", "expired", "created_at", "expires_at", "run_id", "run_attempt", "source_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/positive_integer"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "api_digest": {"$ref": "#/$defs/digest"},
+        "size_bytes": {"$ref": "#/$defs/positive_integer"},
+        "expired": {"type": "boolean", "const": false},
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "expires_at": {"$ref": "#/$defs/timestamp"},
+        "run_id": {"$ref": "#/$defs/positive_integer"},
+        "run_attempt": {"type": "integer", "const": 1},
+        "source_sha": {"$ref": "#/$defs/git_sha"}
+      }
+    },
+    "evidence": {"$ref": "#/$defs/evidence"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "confidence": {"type": "integer", "const": 1},
+    "validation_status": {"const": "validated"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "positive_integer": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"},
+    "evidence": {
+      "type": "object",
+      "required": ["source_bundle_digest", "canonicalization_vector_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "source_bundle_digest": {"$ref": "#/$defs/digest"},
+        "canonicalization_vector_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["producer", "provider", "method"],
+      "additionalProperties": false,
+      "properties": {
+        "producer": {"const": "scripts/release_candidate_manifest.py"},
+        "provider": {"const": "github.com"},
+        "method": {"const": "actions-artifact-observation"}
+      }
+    }
+  }
+}

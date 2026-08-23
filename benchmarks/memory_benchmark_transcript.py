@@ -2,16 +2,21 @@
 
 Three-way head-to-head on the same synthetic corpus and ground-truth
 queries:
-  1. Kestrel 6-layer Memvid memory (layer-aware retrieval)
+  1. Kestrel layered memory (in-memory benchmark backend, layer-aware
+     retrieval)
   2. Flat TF-IDF RAG (document store, cosine similarity, no layers)
   3. Flat transcript (recency-biased chronological transcript, the
      "typical agent memory" proxy for chat-log style runtimes)
 
 Metrics: Recall@k, Precision@k, MRR, latency (avg + p99).
 
-Quality gate: Kestrel must meet absolute floors and must NOT be below
-either flat baseline on recall@k or MRR. The gate fails closed when a
-retriever returns no evidence.
+Methodology gate (fail-closed, no required winner): every arm must return
+evidence for every query in both phases and all metrics must be finite. A
+retriever that silently returns nothing fails the gate closed. The
+comparison is fair by construction — every arm sees the same corpus,
+queries, tokenization, and global k, and no arm receives the ground-truth
+layer label (BENCH-002). Deltas are reported for every arm exactly as
+measured, including when Kestrel is not ahead.
 
 Usage:
     python benchmarks/memory_benchmark_transcript.py --output results/memory_transcript.json
@@ -39,7 +44,7 @@ from nested_memvid_agent.backends.in_memory import InMemoryBackend
 from nested_memvid_agent.layers import DEFAULT_LAYER_SPECS, LayeredMemorySystem
 from nested_memvid_agent.models import MemoryKind, MemoryLayer, MemoryRecord, RetrievalQuery
 
-_QUALITY_FLOOR_VERSION = "kestrel.memory-transcript-quality-floor.v1"
+_QUALITY_FLOOR_VERSION = "kestrel.memory-transcript-methodology-gate.v1"
 _QUALITY_FLOOR_V1 = {
     "recall_at_k": 0.80,
     "precision_at_k": 0.20,
@@ -56,38 +61,49 @@ def _finite_metric(payload: dict[str, Any], key: str) -> float:
 
 
 def _evaluate_quality_gate(result: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed methodology gate (BENCH-001/BENCH-002 repair).
+
+    The benchmark compares arms fairly; it never requires a particular arm
+    to win. The gate fails closed when:
+
+      - any arm returns zero evidence for any query (a retriever that
+        silently returns nothing cannot pass, even if a comparison arm also
+        returns nothing), or
+      - any arm's per-query metrics are non-finite.
+
+    Recall@k, Precision@k, and MRR are reported for every arm and the
+    cross-arm deltas are published exactly as measured — including when
+    Kestrel is not ahead. The absolute floors are reported for
+    transparency but are not pass/fail gates: the pre-repair oracle layer
+    filter inflated Kestrel's numbers, so any floor calibrated against it
+    would re-encode the unfair advantage this benchmark was repaired to
+    remove.
+    """
+    query_details = result.get("query_details", {})
     overall = result.get("overall", {})
-    kestrel = overall.get("kestrel", {})
-    tfidf = overall.get("tfidf", {})
-    transcript = overall.get("transcript", {})
-    query_details = result.get("query_details", {}).get("kestrel", [])
-    observed = {metric: _finite_metric(kestrel, metric) for metric in _QUALITY_FLOOR_V1}
-    checks = {
-        "nonempty_query_evidence": bool(query_details),
-        **{
-            f"kestrel_{metric}_at_or_above_floor": (
-                math.isfinite(observed[metric]) and observed[metric] >= minimum
+    arms = ("kestrel", "tfidf", "transcript")
+    checks: dict[str, bool] = {}
+    for arm in arms:
+        details = query_details.get(arm, [])
+        checks[f"{arm}_evidence_every_query"] = bool(details) and all(
+            bool(d.get("evidence")) for d in details
+        )
+        checks[f"{arm}_finite_metrics"] = all(
+            all(
+                math.isfinite(_finite_metric(d, metric))
+                for metric in ("recall_at_k", "precision_at_k", "mrr")
             )
-            for metric, minimum in _QUALITY_FLOOR_V1.items()
-        },
-        "kestrel_recall_not_below_tfidf": (
-            _finite_metric(kestrel, "recall_at_k") >= _finite_metric(tfidf, "recall_at_k")
-        ),
-        "kestrel_mrr_not_below_tfidf": (
-            _finite_metric(kestrel, "mrr") >= _finite_metric(tfidf, "mrr")
-        ),
-        "kestrel_recall_not_below_transcript": (
-            _finite_metric(kestrel, "recall_at_k") >= _finite_metric(transcript, "recall_at_k")
-        ),
-        "kestrel_mrr_not_below_transcript": (
-            _finite_metric(kestrel, "mrr") >= _finite_metric(transcript, "mrr")
-        ),
+            for d in details
+        )
+    observed = {
+        metric: {arm: _finite_metric(overall.get(arm, {}), metric) for arm in arms}
+        for metric in _QUALITY_FLOOR_V1
     }
     return {
         "version": _QUALITY_FLOOR_VERSION,
         "minimums": dict(_QUALITY_FLOOR_V1),
         "observed": observed,
-        "query_count": len(query_details),
+        "query_count": len(query_details.get("kestrel", [])),
         "checks": checks,
         "passed": all(checks.values()),
     }
@@ -146,8 +162,9 @@ _RECENCY_CHATTER = [
     # Recent conversation chatter sharing vocabulary with the semantic
     # facts but carrying no ground truth. In a flat transcript these
     # land at the end (most recent) and crowd out the older facts under
-    # recency-biased scoring. Kestrel's layer-aware retrieval ignores
-    # them because they are not in the queried layer.
+    # recency-biased scoring. Kestrel retrieves across all eligible layers
+    # (no oracle layer filter), so it must also absorb this chatter; the
+    # benchmark measures how each arm's ranking degrades as a result.
     ("chatter_001", "episodic", "Just checked the API docs again, the base URL thing keeps tripping me up, the endpoint path and the key header."),
     ("chatter_002", "episodic", "Been hitting rate limits all afternoon with the standard key, definitely need the higher tier for this batch work."),
     ("chatter_003", "episodic", "The token refresh flow worked after I read the auth section, expiry is annoying though, keeps timing out."),
@@ -220,17 +237,26 @@ def _run_phase(corpus: Any, *, k: int) -> dict[str, Any]:
         latencies: dict[str, list[float]] = {"kestrel": [], "tfidf": [], "transcript": []}
 
         for q in corpus.queries:
-            layer = _layer_from_string(q.layer)
-
-            # Kestrel: layer-aware retrieval with the full k budget.
+            # Kestrel: production-equivalent retrieval. MemorySearchTool.run
+            # defaults an unspecified layer list to all MemoryLayer values and
+            # exposes only the global top-k of the cross-layer results, so no
+            # arm here receives the ground-truth layer label. The retrieval
+            # trims deterministically to the same global k every arm uses.
             t0 = time.perf_counter()
-            hits = kestrel.retrieve(RetrievalQuery(query=q.query, k_per_layer=k, layers=(layer,)))
+            hits = kestrel.retrieve(
+                RetrievalQuery(query=q.query, k_per_layer=k, layers=tuple(MemoryLayer))
+            )
             t1 = time.perf_counter()
             latencies["kestrel"].append(t1 - t0)
-            kestrel_ids = [hit.record.id for hit in hits]
+            kestrel_ids = [hit.record.id for hit in hits[:k]]
             kestrel_metrics = _compute_metrics(kestrel_ids, q.expected_doc_ids)
             kestrel_metrics.update(
-                {"query": q.query, "layer": q.layer, "latency_ms": round((t1 - t0) * 1000, 3)}
+                {
+                    "query": q.query,
+                    "layer": q.layer,
+                    "evidence": bool(kestrel_ids),
+                    "latency_ms": round((t1 - t0) * 1000, 3),
+                }
             )
             results["kestrel"].append(kestrel_metrics)
 
@@ -242,7 +268,12 @@ def _run_phase(corpus: Any, *, k: int) -> dict[str, Any]:
             tfidf_ids = [r.doc.metadata.get("id", r.doc.id) for r in tfidf_results]
             tfidf_metrics = _compute_metrics(tfidf_ids, q.expected_doc_ids)
             tfidf_metrics.update(
-                {"query": q.query, "layer": q.layer, "latency_ms": round((t1 - t0) * 1000, 3)}
+                {
+                    "query": q.query,
+                    "layer": q.layer,
+                    "evidence": bool(tfidf_ids),
+                    "latency_ms": round((t1 - t0) * 1000, 3),
+                }
             )
             results["tfidf"].append(tfidf_metrics)
 
@@ -254,7 +285,12 @@ def _run_phase(corpus: Any, *, k: int) -> dict[str, Any]:
             transcript_ids = [r.doc_id for r in transcript_results]
             transcript_metrics = _compute_metrics(transcript_ids, q.expected_doc_ids)
             transcript_metrics.update(
-                {"query": q.query, "layer": q.layer, "latency_ms": round((t1 - t0) * 1000, 3)}
+                {
+                    "query": q.query,
+                    "layer": q.layer,
+                    "evidence": bool(transcript_ids),
+                    "latency_ms": round((t1 - t0) * 1000, 3),
+                }
             )
             results["transcript"].append(transcript_metrics)
 

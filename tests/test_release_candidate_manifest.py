@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import stat
 import struct
 import subprocess
@@ -873,6 +874,7 @@ def test_public_candidate_manifest_apis_bound_root_mapping_iteration(
     assert manifest.iterated == len(plain) + 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 @pytest.mark.parametrize("api", ["digest", "verify"])
 def test_public_candidate_manifest_apis_snapshot_nested_values_immediately(
     candidate: CandidateFixture,
@@ -913,6 +915,7 @@ def test_public_candidate_manifest_apis_snapshot_nested_values_immediately(
     "field",
     ["checks", "attestation_subjects", "artifacts", "planned_surfaces"],
 )
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_public_candidate_manifest_apis_do_not_call_custom_collection_lengths(
     candidate: CandidateFixture,
     api: str,
@@ -1437,6 +1440,7 @@ def test_load_candidate_manifest_bounds_bytes_before_parsing(
         ),
     ],
 )
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_create_cli_bounds_json_inputs_before_parsing(
     candidate: CandidateFixture,
     tmp_path: Path,
@@ -1478,6 +1482,7 @@ def test_create_cli_bounds_json_inputs_before_parsing(
         ),
     ],
 )
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_create_cli_rejects_oversized_arrays_before_copying_items(
     candidate: CandidateFixture,
     tmp_path: Path,
@@ -1505,6 +1510,7 @@ def test_create_cli_rejects_oversized_arrays_before_copying_items(
     assert "too many" in captured.err
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_cli_create_verify_digest_round_trip(
     candidate: CandidateFixture, tmp_path: Path
 ) -> None:
@@ -1539,6 +1545,7 @@ def test_cli_create_verify_digest_round_trip(
     }
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_cli_create_is_idempotent_only_for_exact_existing_bytes(
     candidate: CandidateFixture, tmp_path: Path
 ) -> None:
@@ -1553,6 +1560,7 @@ def test_cli_create_is_idempotent_only_for_exact_existing_bytes(
     assert candidate.manifest_path.read_bytes() == b"{}"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_cli_create_removes_new_output_when_post_write_verification_fails(
     candidate: CandidateFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1610,6 +1618,7 @@ def _task7_run_identity_matches(
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_verify_summary_exposes_exact_task7_run_join_and_rejects_cross_splice(
     candidate: CandidateFixture,
 ) -> None:
@@ -1663,6 +1672,7 @@ def _replace_check_receipt(
     (candidate.root / str(check["receipt_path"])).write_bytes(raw)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_verify_accepts_git_and_exact_extracted_source_roots_with_dotfiles(
     candidate: CandidateFixture, tmp_path: Path
 ) -> None:
@@ -1674,6 +1684,7 @@ def test_verify_accepts_git_and_exact_extracted_source_roots_with_dotfiles(
     _verify(candidate, source_root=extracted)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_cli_create_rejects_extracted_source_root(
     candidate: CandidateFixture, tmp_path: Path
 ) -> None:
@@ -1691,6 +1702,7 @@ def test_cli_create_rejects_extracted_source_root(
     assert not candidate.manifest_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_create_time_source_verification_requires_exact_local_main_identity(
     candidate: CandidateFixture,
 ) -> None:
@@ -1718,6 +1730,7 @@ def test_create_time_source_verification_requires_exact_local_main_identity(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_create_time_source_verification_rejects_untracked_inputs(
     candidate: CandidateFixture,
 ) -> None:
@@ -1747,6 +1760,7 @@ def test_create_time_source_verification_rejects_untracked_inputs(
         ("unexpected", "field"),
     ],
 )
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_build_and_verify_reject_receipt_identity_drift(
     candidate: CandidateFixture, field: str, replacement: object
 ) -> None:
@@ -1956,6 +1970,7 @@ def test_qualification_receipt_size_is_bounded_before_json_parsing(
     assert parse_called is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_verify_rejects_source_tar_not_byte_equal_to_git_archive(
     candidate: CandidateFixture,
 ) -> None:
@@ -1996,6 +2011,7 @@ def test_verify_bounds_source_tar_before_parsing(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 @pytest.mark.parametrize("name", ["CON", "trailing."])
 def test_verify_rejects_nonportable_artifact_paths(
     candidate: CandidateFixture, name: str
@@ -3154,6 +3170,7 @@ def test_verify_validates_media_type_on_every_shared_oci_layer_reference(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_verify_streams_large_oci_bytes_without_path_read_bytes(
     candidate: CandidateFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4033,6 +4050,7 @@ def test_validate_zip_trie_rejects_file_ancestor_collisions(
         "dir/trailing ",
     ],
 )
+@pytest.mark.skipif(os.name == "nt", reason="release candidate manifest uses POSIX git-archive path model")
 def test_extract_rejects_unsafe_paths_without_partial_output(tmp_path: Path, name: str) -> None:
     result = _extract(tmp_path, _zip([(name, b"bad"), ("safe.txt", b"safe")]))
     assert result.returncode != 0

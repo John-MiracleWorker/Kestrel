@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kestrel.dev/schemas/kestrel.recovery_capsule_smoke.v1.schema.json",
+  "title": "kestrel.recovery_capsule_smoke.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "required": [
+    "schema",
+    "source_sha",
+    "dependency_staging_receipt_digest",
+    "capsule_manifest_digest",
+    "capsule_archive_digest",
+    "owner_key_fingerprint",
+    "host_actuator_binding_digest",
+    "network_policy",
+    "sandbox_execution",
+    "provenance",
+    "confidence",
+    "validation_status",
+    "report_digest"
+  ],
+  "properties": {
+    "schema": {"const": "kestrel.recovery_capsule_smoke.v1"},
+    "source_sha": {"$ref": "#/$defs/git_sha"},
+    "dependency_staging_receipt_digest": {"$ref": "#/$defs/digest"},
+    "capsule_manifest_digest": {"$ref": "#/$defs/digest"},
+    "capsule_archive_digest": {"$ref": "#/$defs/digest"},
+    "owner_key_fingerprint": {"$ref": "#/$defs/digest"},
+    "host_actuator_binding_digest": {"$ref": "#/$defs/digest"},
+    "network_policy": {"const": "offline"},
+    "sandbox_execution": {"const": "network_denied_verified"},
+    "provenance": {
+      "const": {
+        "producer": "scripts/run_recovery_capsule_smoke.py",
+        "provider": "local",
+        "method": "deterministic-recovery-capsule-smoke"
+      }
+    },
+    "confidence": {"type": "integer", "const": 1},
+    "validation_status": {"const": "validated"},
+    "report_digest": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+  }
+}
