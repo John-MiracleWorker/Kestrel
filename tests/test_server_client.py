@@ -129,7 +129,7 @@ def test_desktop_compatibility_probe_checks_profile_and_version_without_exposing
                 "profile_id": "default",
                 "launch_nonce_digest": "a" * 64,
                 "sidecar_version": "0.5.0",
-                "state_schema_version": 21,
+                "state_schema_version": 22,
                 "routing_schema_version": 2,
                 "memory_layers": [
                     "working",
@@ -171,7 +171,7 @@ def test_desktop_compatibility_probe_uses_the_lease_base_url() -> None:
         "profile_id": "default",
         "launch_nonce_digest": "a" * 64,
         "sidecar_version": "0.5.0",
-        "state_schema_version": 21,
+        "state_schema_version": 22,
         "routing_schema_version": 2,
         "memory_layers": [
             "working",
@@ -220,7 +220,7 @@ def test_desktop_compatibility_probe_rejects_a_nonce_mismatch_without_exposing_i
                 "profile_id": "default",
                 "launch_nonce_digest": "a" * 64,
                 "sidecar_version": "0.5.0",
-                "state_schema_version": 21,
+                "state_schema_version": 22,
                 "routing_schema_version": 2,
                 "memory_layers": [
                     "working",
@@ -259,7 +259,7 @@ def test_desktop_compatibility_probe_rejects_wrong_profile_or_version() -> None:
                 "profile_id": "other",
                 "launch_nonce_digest": "a" * 64,
                 "sidecar_version": "0.4.11",
-                "state_schema_version": 21,
+                "state_schema_version": 22,
                 "routing_schema_version": 2,
                 "memory_layers": [
                     "working",

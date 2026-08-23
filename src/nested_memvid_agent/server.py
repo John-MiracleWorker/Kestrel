@@ -985,6 +985,8 @@ def _create_app(
         http_request: Request,  # type: ignore[valid-type]
     ) -> dict[str, object]:
         project_revision = request.project_revision
+        provided_binding: dict[str, Any] | None = None
+        live_preflight: dict[str, Any] | None = None
         if request.mission_plan is not None:
             if (
                 request.project_id is None
@@ -1091,6 +1093,12 @@ def _create_app(
                     else tuple(task.model_dump() for task in request.mission_plan)
                 ),
                 project_revision=project_revision,
+                mission_binding=(
+                    provided_binding if request.mission_binding is not None else None
+                ),
+                mission_preflight=(
+                    live_preflight if request.mission_binding is not None else None
+                ),
             )
         except RunCapacityError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
