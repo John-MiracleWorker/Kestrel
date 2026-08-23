@@ -680,6 +680,63 @@ its separately approved plan. This closure grants no evidence or authority for
 S6 or later slices, installed-artifact final release qualification, promotion,
 publication, post-publication verification, or final v0.6 qualification.
 
+### S6 qualification closure (2026-08-22)
+
+[PR #358](https://github.com/John-MiracleWorker/Kestrel/pull/358)
+(`codex/v06-s6-shadow-verdict-api`, head
+`e719abdbe1586e3828d9c63807c4db74723b1401` — "feat(s6): shadow verdict API and
+Workbench/Mission evidence (SHADOW-005)") merged to protected `main` as commit
+`e7e96016e20126971b1eb0e64405eda2b98b0d68` at 2026-08-23T00:02:40Z. The branch
+made the S5 zero-authority shadow observation ledger inspectable through
+backward-compatible read-only routing APIs — `shadow_observations` added
+additively to `GET /api/runs/{run_id}/routing` (existing `decisions`/`outcomes`/
+`shadows`/`calibrations` unchanged) and a new `GET /api/routing/shadow-observations`
+returning `kestrel.routing.shadow_observations.v1` with explicit
+`actual_authority`, observational `verdict`
+(`supported`/`contradicted`/`inconclusive`), `evidence_basis`,
+`counterfactual_proven`, and explicit missing terminal data
+(`validation_passed: null`) — and an accessible "Routing authority & evidence"
+panel in the Workbench `RoutingCenter` that distinguishes deterministic / shadow /
+activated / suspended-fallback (plus `operator-pinned`) states and links each
+observation back to its durable `run_id` / `task_id`. All surfaces are read-only
+and never fabricate authority or counterfactual proof.
+
+All required hosted gates green at head `e719abd` (no rerun):
+
+- **CI push** [32604683427](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604683427)
+  and **CI pull_request** [32604705441](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705441):
+  14/14 jobs green — python matrix (Ubuntu 3.11/3.12/3.13, macOS 3.11/3.12,
+  Windows 3.11), the `docker` container-vulnerability-policy check, CodeQL, web,
+  desktop, secret-scan, foundational-integrations, extension-sandbox, and
+  browser-validation.
+- **Everyday golden determinism** [32604705403](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705403):
+  7/7 jobs green — memory, memvid, flock-qualification-determinism, runtime
+  reliability on Linux (3.11.15)/Windows (3.11.9)/macOS (3.11.9), and the
+  **Exact-SHA five-cell runtime reliability qualification** gate.
+- Also green at the head: **Release rehearsal battery** [32604705407](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705407)
+  and **Installed artifact mission matrix** [32604705428](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705428).
+
+Review outcome on PR #358 is CLEAN (no GAP). The independent orchestrator review
+cold-read the full 5-file diff (541 insertions, 2 deletions) and verified by
+execution: 5 focused endpoint tests (`test_shadow_verdict_api.py`) plus the 21
+S5 ledger tests green, a 2298-test routing/flock/adaptive-flock/LAN regression
+sweep green, `ruff` and `mypy` clean, and the web suite green (`tsc -b` clean,
+448 tests across 59 files including the new `RoutingCenter` evidence-panel test).
+The tests pin behavior, not text: the endpoint tests assert `shadow_observations`
+is additive to the existing routing report, that the new endpoint returns the
+`kestrel.routing.shadow_observations.v1` schema with explicit
+`actual_authority`/`verdict`/`counterfactual_proven`/missing-terminal fields,
+that task/role filtering works, and that the surface is read-only (a POST is not
+routed); the web test asserts the four states are distinguishable and that a
+differing unexecuted target renders "Not proven: the differing target was never
+executed" — never a proof claim.
+
+With the merge at `e7e96016` and every hosted gate green at the head, **S6 and
+SHADOW-005 move to `qualified`**. S7 becomes available under its separately
+approved plan. This closure grants no evidence or authority for S7 or later
+slices, installed-artifact final release qualification, promotion, publication,
+post-publication verification, or final v0.6 qualification.
+
 ## Requirement register
 
 ### Reliability (`REL`)
@@ -708,7 +765,7 @@ publication, post-publication verification, or final v0.6 qualification.
 | SHADOW-002 | Persist actual authority, actual target, shadow recommendation, candidates, qualification, constraints, structured reasons, usage/cost/latency, and terminal evidence. | Additive migration with backward-compatible readers and replay-stable payload digests. | `qualified` |
 | SHADOW-003 | Answer “would Adaptive Flock differ, and was the evidence favorable?” honestly. | `supported`, `contradicted`, or `inconclusive` observational verdict with evidence basis; mismatched unexecuted targets cannot claim counterfactual proof. | `qualified` |
 | SHADOW-004 | Keep shadow telemetry out of policy, calibration authority, grants, and control flow. | No-policy-memory/authority tests and fault injection showing observer failure cannot change the base decision. | `qualified` |
-| SHADOW-005 | Make routing evidence and authority inspectable in Workbench/Mission Control. | Accessible UI distinguishes deterministic, shadow, activated, and suspended-fallback states and links evidence to the durable run/task. | `not_started` |
+| SHADOW-005 | Make routing evidence and authority inspectable in Workbench/Mission Control. | Accessible UI distinguishes deterministic, shadow, activated, and suspended-fallback states and links evidence to the durable run/task. | `qualified` |
 
 ### Golden journey (`JOURNEY`)
 
@@ -749,7 +806,7 @@ publication, post-publication verification, or final v0.6 qualification.
 | S3 | 20-release rehearsal and installed-artifact mission matrix | S2 | `qualified` |
 | S4 | Live reviewer separation and truthful routing modes | S3 | `qualified` |
 | S5 | Default-on zero-authority shadow observation ledger | S4 | `qualified` |
-| S6 | Shadow verdict API and Workbench/Mission evidence | S5 | `not_started` |
+| S6 | Shadow verdict API and Workbench/Mission evidence | S5 | `qualified` |
 | S7 | Durable mission proof projection and retrieval references | S6 | `not_started` |
 | S8 | Golden Mission Control and two-task flagship | S7 | `not_started` |
 | S9 | PR #328 fairness repair | S8 | `not_started` |
@@ -953,5 +1010,6 @@ trust.
 | MAIN-2026-08-21-S3-QUAL | `7b175e32ab9f849746f38f43786d819ab5722e25` | `merged` | `7b175e32ab9f849746f38f43786d819ab5722e25` | [PR #347](https://github.com/John-MiracleWorker/Kestrel/pull/347) head `ba199454bd821ade4dd4f9fefc5435051b689512` merged normally as protected-main commit `7b175e32ab9f849746f38f43786d819ab5722e25` at 2026-08-21T22:55:20Z (per-OS Python pin: Linux 3.11.15, macOS/Windows 3.11.9); exact-main attempt-1 [CI 32534932295](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932295) 14/14 jobs, [everyday golden determinism 32534932310](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932310) 7/7 jobs including the **Exact-SHA five-cell runtime reliability qualification** gate (previously RED at `16144d67`), [release rehearsal battery 32534932300](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932300) 20/20 rehearsals with aggregate artifact `9465119477` and receipt digest `5947792d3f8b2ea8e04cc72a6e50d2b1d015916dacab5f5e276cc4758d477098` (uploaded artifact zip SHA-256 `aad498465851c58224a3b3a89917600efc398127d9013260f1ce3e66b9d7eb40`), [installed artifact mission matrix 32534932330](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32534932330) 9/9 cells green at `7b175e32` (payload wheel SHA-256 `0e32802f93001ec7f6b507fc48fa360d100ec8345499c347803c4d51ace4291c`; per-cell receipt SHA-256s macOS 3.11 `a9007f37…`, 3.12 `bee34988…`, 3.13 `9b27915b…`, Ubuntu 3.11 `862b8390…`, 3.12 `27312e33…`, 3.13 `0e661d58…`, Windows 3.11 `ba1ea64b…`, 3.12 `88f454ba…`, 3.13 `c699ed39…`); review CLEAN/APPROVED (owner-orchestrator review t_3e5fd237), the single stale Codex P1 thread resolved (`reviewThreads` → `isResolved: true`) | The exact-main five-cell gate is now green at `7b175e32`, binding S3/REL-004/REL-005 to `qualified` with the 20/20 battery and 9/9 matrix re-verified at the same merged SHA. The failed/incomplete receipts (`S3-2026-08-19-REL004-FAILCLOSED`, `S3-2026-08-19-REL004-LOCAL-PARTIAL`, and the RED five-cell gate at `16144d67`) remain failures and are never rewritten. S4 becomes available; no S4+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 | MAIN-2026-08-22-S4-QUAL | `added767db1c95313119df17e2f125fdff096438` (head) | `merged` | `5f7708389cfc8215846972204ad5ff0b01d2f163` | [PR #354](https://github.com/John-MiracleWorker/Kestrel/pull/354) head `added767db` merged as main commit `5f770838` at 2026-08-22T18:18:51Z; exact-head attempt-1 [push CI 32587763892](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587763892) 14/14 and [PR CI 32587766902](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587766902) 14/14 (docker container-vulnerability-policy check green, python matrix 6 legs green, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green); exact-head attempt-1 [everyday golden determinism 32587766901](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32587766901) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); review CLEAN (no GAP) — 6/6 Codex threads resolved with substantive tie-backs, `reviewThreads` all `isResolved: true` | JOURNEY-004 and S4 move to `qualified` at merged SHA `5f770838`. No S5+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 | MAIN-2026-08-22-S5-QUAL | `42d15f2626abc07e5e5ae75a590644168c40d283` (head) | `merged` | `18cbdf19652ab276dabf66dcbc0b8589e2841f4d` | [PR #356](https://github.com/John-MiracleWorker/Kestrel/pull/356) head `42d15f2` merged as main commit `18cbdf1` at 2026-08-22T22:05:58Z; exact-head attempt-1 [push CI 32595701262](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32595701262) 14/14 and [PR CI 32595729487](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32595729487) 14/14 (docker container-vulnerability-policy check green, python matrix 6 legs green, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green); exact-head attempt-1 [everyday golden determinism 32595729474](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32595729474) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); review CLEAN (no GAP) — independent orchestrator review, zero open threads | S5 and SHADOW-001..004 move to `qualified` at merged SHA `18cbdf1`. No S6+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
+| MAIN-2026-08-22-S6-QUAL | `e719abdbe1586e3828d9c63807c4db74723b1401` (head) | `merged` | `e7e96016e20126971b1eb0e64405eda2b98b0d68` | [PR #358](https://github.com/John-MiracleWorker/Kestrel/pull/358) head `e719abd` merged as main commit `e7e96016` at 2026-08-23T00:02:40Z; exact-head attempt-1 [push CI 32604683427](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604683427) 14/14 and [PR CI 32604705441](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705441) 14/14 (docker container-vulnerability-policy check green, python matrix 6 legs green, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green); exact-head attempt-1 [everyday golden determinism 32604705403](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705403) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); also green: [release rehearsal battery 32604705407](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705407) and [installed artifact mission matrix 32604705428](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32604705428); review CLEAN (no GAP) — independent orchestrator review, zero open threads | S6 and SHADOW-005 move to `qualified` at merged SHA `e7e96016`. No S7+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
