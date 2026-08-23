@@ -529,7 +529,14 @@ def test_slow_header_timeouts_release_transport_capacity_for_recovery() -> None:
                 try:
                     _fetch_json(
                         f"{base_url}/slow",
-                        timeout_seconds=1.0,
+                        # The isolated provider-HTTP worker spawns a fresh
+                        # `python -I` subprocess per request. Under 16-way
+                        # concurrency that startup can take well over a second
+                        # on a loaded host, so a 1s deadline kills the worker
+                        # before it ever connects and `started` stays unset.
+                        # The deadline must exceed worst-case worker startup so
+                        # at least one request reaches the slow-header handler.
+                        timeout_seconds=5.0,
                         api_key=None,
                     )
                 except TimeoutError as exc:
@@ -539,7 +546,7 @@ def test_slow_header_timeouts_release_transport_capacity_for_recovery() -> None:
             with ThreadPoolExecutor(max_workers=16) as executor:
                 outcomes = list(executor.map(slow_request, range(16)))
 
-            assert started.wait(timeout=2.0)
+            assert started.wait(timeout=5.0)
             assert outcomes == ["provider response deadline exceeded"] * 16
             assert _fetch_json(
                 f"{base_url}/healthy",
