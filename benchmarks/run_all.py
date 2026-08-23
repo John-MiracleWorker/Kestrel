@@ -16,6 +16,7 @@ from agent_benchmark import run_agent_benchmark
 from error_recovery_benchmark import run_error_recovery_benchmark
 from learning_benchmark import run_learning_benchmark
 from memory_benchmark import run_memory_benchmark
+from memory_benchmark_breadth import run_breadth_benchmark
 from memory_benchmark_transcript import run_memory_transcript_benchmark
 
 _MEMORY_QUALITY_FLOOR_VERSION = "kestrel.aggregate-memory-quality-floor.v1"
@@ -39,6 +40,7 @@ def main() -> int:
     parser.add_argument("--agent-only", action="store_true")
     parser.add_argument("--error-recovery-only", action="store_true")
     parser.add_argument("--learning-only", action="store_true")
+    parser.add_argument("--breadth-only", action="store_true")
     args = parser.parse_args()
 
     only_flags = {
@@ -46,6 +48,7 @@ def main() -> int:
         "agent": args.agent_only,
         "error_recovery": args.error_recovery_only,
         "learning": args.learning_only,
+        "breadth": args.breadth_only,
     }
     if sum(bool(enabled) for enabled in only_flags.values()) > 1:
         parser.error("select at most one --*-only benchmark")
@@ -104,6 +107,27 @@ def main() -> int:
                 assertions[f"memory_transcript_{phase}_{arm}_evidence_every_query"] = (
                     bool(details) and all(row.get("evidence") for row in details)
                 )
+
+    if run_everything or args.breadth_only:
+        print("Running breadth benchmark (BENCH-003/BENCH-004)...", file=sys.stderr)
+        breadth = run_breadth_benchmark()
+        report["memory_breadth"] = breadth
+        assertions["memory_breadth_methodology_gate_passed"] = bool(
+            breadth.get("acceptance", {}).get("passed")
+        )
+        # BENCH-003/004: raw per-query rows and digest-bound fixtures must be
+        # present; no arm is required to win.
+        assertions["memory_breadth_raw_rows_present"] = all(
+            bool(cell.get("raw_rows"))
+            for scenario in breadth.get("cells", {}).values()
+            for seed in scenario.values()
+            for cp in seed.values()
+            for cell in cp.values()
+        )
+        assertions["memory_breadth_digests_present"] = all(
+            bool(breadth.get("digests", {}).get(key))
+            for key in ("fixture_digest", "environment_digest", "methodology_digest")
+        )
 
     if run_everything or args.agent_only:
         print("Running agent benchmark...", file=sys.stderr)
