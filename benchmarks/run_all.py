@@ -92,20 +92,18 @@ def main() -> int:
         print("Running memory transcript benchmark...", file=sys.stderr)
         memory_transcript = run_memory_transcript_benchmark(k=args.memory_k)
         report["memory_transcript"] = memory_transcript
-        assertions["memory_transcript_comparative_gate_passed"] = bool(
+        assertions["memory_transcript_methodology_gate_passed"] = bool(
             memory_transcript.get("acceptance", {}).get("passed")
         )
-        stressed_overall = memory_transcript["recency_stress_corpus"]["overall"]
-        assertions["memory_transcript_recall_not_below_flat_baselines"] = (
-            stressed_overall["kestrel"]["recall_at_k"]
-            >= stressed_overall["tfidf"]["recall_at_k"]
-            and stressed_overall["kestrel"]["recall_at_k"]
-            >= stressed_overall["transcript"]["recall_at_k"]
-        )
-        assertions["memory_transcript_mrr_not_below_flat_baselines"] = (
-            stressed_overall["kestrel"]["mrr"] >= stressed_overall["tfidf"]["mrr"]
-            and stressed_overall["kestrel"]["mrr"] >= stressed_overall["transcript"]["mrr"]
-        )
+        # Every arm must return evidence for every query in both phases; no
+        # arm is required to beat another (BENCH-002 removed the oracle that
+        # manufactured Kestrel's recency advantage).
+        for phase in ("baseline_corpus", "recency_stress_corpus"):
+            for arm in ("kestrel", "tfidf", "transcript"):
+                details = memory_transcript[phase]["query_details"][arm]
+                assertions[f"memory_transcript_{phase}_{arm}_evidence_every_query"] = (
+                    bool(details) and all(row.get("evidence") for row in details)
+                )
 
     if run_everything or args.agent_only:
         print("Running agent benchmark...", file=sys.stderr)

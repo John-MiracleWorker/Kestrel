@@ -101,7 +101,11 @@ class FlatTranscriptMemory:
         for entry in self._entries:
             for term in set(_tokenize(entry.text)):
                 doc_freq[term] = doc_freq.get(term, 0) + 1
+        # Smoothed, strictly non-negative IDF: log((1+N)/(1+df)) + 1 stays
+        # >= 1 for every df in [1, N] (df == N gives log(1) + 1 == 1), so
+        # common terms never produce a zero or negative lexical score that
+        # retrieve() would silently discard.
         return {
-            term: math.log(total / (1 + freq))
+            term: math.log((1 + total) / (1 + freq)) + 1.0
             for term, freq in doc_freq.items()
         }
