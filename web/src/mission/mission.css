@@ -1497,3 +1497,91 @@ body:has(.mission-shell)
     flex-direction: column-reverse;
   }
 }
+
+/* S8 JOURNEY-003 — Mission Control command center: server-authored proof */
+.mission-proof-panel {
+  border: 1px solid var(--mission-rule);
+  border-radius: 12px;
+  background: var(--mission-paper);
+  margin-top: 1rem;
+  overflow: hidden;
+}
+
+.mission-proof-panel > header {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 1rem 1.15rem;
+  border-bottom: 1px solid var(--mission-rule);
+}
+
+.mission-proof-panel > header > svg {
+  margin-top: 0.15rem;
+  color: var(--mission-muted);
+  flex-shrink: 0;
+}
+
+.mission-proof-panel > header > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.mission-proof-panel > header h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.mission-proof-panel > header p {
+  margin: 0.2rem 0 0;
+  font-size: 0.82rem;
+  color: var(--mission-muted);
+}
+
+.mission-proof-panel .wf-notice {
+  margin: 0.85rem 1.15rem 0;
+}
+
+.mission-proof-sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 0.6rem;
+  padding: 0.9rem 1.15rem 1.15rem;
+}
+
+.mission-proof-section {
+  border: 1px solid var(--mission-rule);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  background: #fffefb;
+}
+
+.mission-proof-section.is-missing {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.mission-proof-section.is-mismatched {
+  border-color: var(--mission-danger);
+}
+
+.mission-proof-section.is-stale {
+  border-color: var(--mission-warn);
+}
+
+.mission-proof-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.mission-proof-section-head strong {
+  font-size: 0.85rem;
+}
+
+.mission-proof-section p {
+  margin: 0.35rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--mission-muted);
+}
