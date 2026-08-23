@@ -371,7 +371,8 @@ def run_memory_transcript_benchmark(*, k: int = 5, seed: int = 42) -> dict[str, 
         },
     }
     # Acceptance gate is evaluated against the stressed corpus, where the
-    # baselines are weakest and Kestrel must still hold the floor.
+    # flat baselines degrade the most; the methodology gate fails closed on
+    # any arm that returns no evidence or non-finite metrics.
     result["acceptance"] = _evaluate_quality_gate({"overall": stressed["overall"], "query_details": stressed["query_details"]})
     return result
 
