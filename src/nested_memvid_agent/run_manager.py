@@ -1431,6 +1431,8 @@ class RunManager:
         source: TurnSource | None = None,
         mission_plan: Sequence[Mapping[str, Any]] | None = None,
         project_revision: int | None = None,
+        mission_binding: Mapping[str, Any] | None = None,
+        mission_preflight: Mapping[str, Any] | None = None,
     ) -> RunRecord:
         self._require_mutable_runtime("create_run")
         resolved_workspace = workspace
@@ -1494,6 +1496,12 @@ class RunManager:
             transcript_scope=transcript_scope,
             mission_plan=normalized_mission_plan,
             project_revision=project_revision,
+            mission_binding=(
+                dict(mission_binding) if mission_binding is not None else None
+            ),
+            mission_preflight=(
+                dict(mission_preflight) if mission_preflight is not None else None
+            ),
         )
 
     def _validate_mission_plan(
@@ -1705,6 +1713,8 @@ class RunManager:
         transcript_scope: str,
         mission_plan: tuple[dict[str, Any], ...],
         project_revision: int | None,
+        mission_binding: dict[str, Any] | None = None,
+        mission_preflight: dict[str, Any] | None = None,
     ) -> RunRecord:
         self._reserve_primary_run(run_id)
         try:
@@ -1766,6 +1776,8 @@ class RunManager:
                 expected_project_revision=project_revision,
                 max_nonterminal_runs=self._primary_concurrency_limit(run_config)
                 + max(0, run_config.max_queued_runs),
+                mission_binding=mission_binding,
+                mission_preflight=mission_preflight,
             )
             self._initialize_primary_run(
                 run=run,

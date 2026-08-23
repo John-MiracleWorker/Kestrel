@@ -815,7 +815,7 @@ def test_desktop_readiness_is_auth_and_nonce_digest_bound(tmp_path: Path) -> Non
         "profile_id": "default",
         "launch_nonce_digest": sha256(b"launch-nonce").hexdigest(),
         "sidecar_version": _PACKAGE_VERSION,
-        "state_schema_version": 21,
+        "state_schema_version": 22,
         "routing_schema_version": 5,
         "memory_layers": list(_MEMORY_LAYERS),
     }

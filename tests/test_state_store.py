@@ -196,7 +196,7 @@ def test_multiprocess_fresh_database_initialization_is_serialized(tmp_path: Path
     assert all(payload["health"]["ok"] is True for payload in payloads)
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()[0] == 21
+        assert conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_schema_migration_rolls_back_all_ddl_on_failure(
@@ -509,7 +509,7 @@ def test_schema_17_migrates_existing_runs_to_primary_provenance_defaults(
     state = AgentStateStore(path)
     run = state.get_run("run_legacy")
 
-    assert state.schema_version() == SCHEMA_VERSION == 21
+    assert state.schema_version() == SCHEMA_VERSION
     assert run.turn_source is None
     assert run.turn_origin == "primary_user"
     assert run.transcript_scope == "primary"
@@ -564,7 +564,7 @@ def test_schema_17_to_18_adds_approval_execution_claims_and_preserves_cas(
         }
     approval = migrated.get_approval("approval_v17", expire=False)
 
-    assert migrated.schema_version() == SCHEMA_VERSION == 21
+    assert migrated.schema_version() == SCHEMA_VERSION
     assert set(claim_columns) <= columns
     assert approval["status"] == "approved"
     assert approval["result"] is None

@@ -417,7 +417,7 @@ def test_schema_19_migrates_projects_and_nullable_run_binding(
             for row in connection.execute("PRAGMA table_info(runs)").fetchall()
         }
 
-    assert migrated.schema_version() == SCHEMA_VERSION == 21
+    assert migrated.schema_version() == SCHEMA_VERSION
     assert reopened.schema_version() == SCHEMA_VERSION
     assert "project_id" in columns
     assert run.project_id is None

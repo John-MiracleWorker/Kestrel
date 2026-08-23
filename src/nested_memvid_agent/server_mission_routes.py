@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from .mission_control import (
@@ -11,6 +12,7 @@ from .mission_control import (
     inspect_provider_readiness,
     validated_mission_plan,
 )
+from .mission_proof import build_mission_proof
 from .server_capability_routes import _catalog
 from .server_models import MissionPreflightRequest
 
@@ -61,6 +63,28 @@ def register_mission_routes(
             )
         except (PermissionError, ValueError) as exc:
             raise http_exception(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/mission-proof")  # type: ignore[untyped-decorator]
+    def mission_proof(run_id: str) -> dict[str, Any]:
+        """Read-only server-authored mission proof projection (JOURNEY-002).
+
+        Aggregates contract, roles, routing, isolation, change, validation,
+        review, risks, approval, shipping, capsule, and learning evidence for
+        one admitted run, reporting each as present/missing/stale/mismatched
+        without UI inference. The projection is read-only and exposes only
+        bounded receipt/handle metadata.
+        """
+        try:
+            run = state.get_run(run_id)
+        except KeyError as exc:
+            raise http_exception(status_code=404, detail=str(exc)) from exc
+        runs_dir = Path(config().memory_dir).parent / "runs"
+        return build_mission_proof(
+            state=state,
+            run=run,
+            routing_ledger=routing_ledger,
+            runs_dir=runs_dir,
+        )
 
 
 def evaluate_mission_preflight(

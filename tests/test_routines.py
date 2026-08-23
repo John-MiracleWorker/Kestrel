@@ -32,6 +32,7 @@ from nested_memvid_agent.run_manager import RunCapacityError, RunManager
 from nested_memvid_agent.security_boundary import register_secret_value
 from nested_memvid_agent.skill_manager import SkillManager
 from nested_memvid_agent.state_store import (
+    SCHEMA_VERSION,
     AgentStateStore,
     RoutineConflictError,
     RoutineRunNowConflictError,
@@ -318,7 +319,7 @@ def test_schema_18_to_19_preserves_scheduled_occurrences(tmp_path: Path) -> None
     migrated = AgentStateStore(path)
     preserved = migrated.get_routine_occurrence(occurrence.occurrence_id)
 
-    assert migrated.schema_version() == 21
+    assert migrated.schema_version() == SCHEMA_VERSION
     assert preserved.trigger_kind == "scheduled"
     assert preserved.trigger_key_digest is None
     assert preserved.requested_at is None
