@@ -32,6 +32,14 @@ python benchmarks/unified_memory_benchmark.py \
   --output benchmark_results/unified-memory.json
 ```
 
+Run the flat-transcript comparative benchmark (Kestrel vs flat TF-IDF RAG vs
+recency-biased flat transcript, including the recency-stress scenario):
+
+```bash
+python benchmarks/memory_benchmark_transcript.py \
+  --output benchmark_results/memory-transcript.json
+```
+
 The unified runner always attempts the built-in lexical Kestrel and TF-IDF backends first. Dense
 VectorRAG, Qdrant, and Chroma are optional; when their local packages are absent, the JSON report
 records an explicit `skipped` row and an install hint instead of crashing at import time. Missing
@@ -89,6 +97,38 @@ absolute Recall@k, Precision@k, and MRR floors, and Kestrel quality that is not 
 The small runner uses `kestrel.memory-quality-floor.v1` (0.80 / 0.20 / 0.75); the large runner uses
 `kestrel.large-memory-quality-floor.v1` (0.30 / 0.06 / 0.15). A zero-result retriever therefore
 cannot produce a successful process exit even if the comparison baseline is also zero.
+
+### Flat-Transcript Benchmark (`memory_benchmark_transcript.py`)
+
+Three-way comparative benchmark on the same corpus and ground-truth queries:
+
+1. **Kestrel** layered memory (in-memory benchmark backend, layer-aware
+   retrieval)
+2. **Flat TF-IDF RAG** (document store, cosine similarity, no layers)
+3. **Flat transcript** (recency-biased chronological transcript — the
+   "typical agent memory" proxy for chat-log style runtimes such as Hermes
+   or OpenClaw: one transcript, no layers, no promotion, no trust ordering,
+   recent entries win ties)
+
+Two phases:
+
+- **Baseline corpus**: the standard memory corpus.
+- **Recency stress**: the same corpus with a burst of recent episodic
+  "conversation chatter" appended after the facts. This models a real agent
+  whose recent chat history buries older important facts. All three arms
+  search the full corpus (no arm receives the ground-truth layer label):
+  the flat transcript's recency bias is amplified by the chatter, and the
+  benchmark measures how each arm's ranking degrades as a result.
+
+The acceptance gate is methodological and fails closed: every arm must
+return evidence for every query in both phases (a retriever that silently
+returns nothing cannot pass, even if a comparison arm also returns
+nothing), and all metrics must be finite. No arm is required to win: the
+recency-stress scenario measurably degrades the flat transcript's recency
+bias, and the deltas for every arm are reported exactly as measured —
+including when Kestrel is not ahead. This follows BENCH-002, which removed
+the oracle layer filter that previously let the Kestrel arm ignore the
+episodic chatter and manufactured its recency advantage.
 
 ### Agent Benchmark (`agent_benchmark.py`)
 

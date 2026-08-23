@@ -16,6 +16,7 @@ from agent_benchmark import run_agent_benchmark
 from error_recovery_benchmark import run_error_recovery_benchmark
 from learning_benchmark import run_learning_benchmark
 from memory_benchmark import run_memory_benchmark
+from memory_benchmark_transcript import run_memory_transcript_benchmark
 
 _MEMORY_QUALITY_FLOOR_VERSION = "kestrel.aggregate-memory-quality-floor.v1"
 _MEMORY_QUALITY_FLOOR_V1 = {
@@ -87,6 +88,22 @@ def main() -> int:
             "checks": memory_floor_checks,
             "passed": all(memory_floor_checks.values()),
         }
+
+        print("Running memory transcript benchmark...", file=sys.stderr)
+        memory_transcript = run_memory_transcript_benchmark(k=args.memory_k)
+        report["memory_transcript"] = memory_transcript
+        assertions["memory_transcript_methodology_gate_passed"] = bool(
+            memory_transcript.get("acceptance", {}).get("passed")
+        )
+        # Every arm must return evidence for every query in both phases; no
+        # arm is required to beat another (BENCH-002 removed the oracle that
+        # manufactured Kestrel's recency advantage).
+        for phase in ("baseline_corpus", "recency_stress_corpus"):
+            for arm in ("kestrel", "tfidf", "transcript"):
+                details = memory_transcript[phase]["query_details"][arm]
+                assertions[f"memory_transcript_{phase}_{arm}_evidence_every_query"] = (
+                    bool(details) and all(row.get("evidence") for row in details)
+                )
 
     if run_everything or args.agent_only:
         print("Running agent benchmark...", file=sys.stderr)
