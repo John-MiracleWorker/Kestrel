@@ -3989,6 +3989,49 @@ function payloadFor(path: string): unknown {
       traces: { lifecycle: [] }
     };
   }
+  const missionProofMatch = path.match(
+    /^\/api\/runs\/([^/]+)\/mission-proof$/,
+  );
+  if (missionProofMatch) {
+    return {
+      schema: "kestrel.mission_proof.v1",
+      run_id: missionProofMatch[1],
+      project_id: "project_kestrel",
+      generated_at: "2026-05-16T00:00:00Z",
+      binding: { persisted: true, preflight_persisted: true },
+      evidence: {
+        binding: { status: "present", detail: "binding present", evidence: {} },
+        contract: { status: "present", detail: "contract present", evidence: {} },
+        roles: { status: "present", detail: "roles present", evidence: {} },
+        routing: { status: "missing", detail: "no observations", evidence: {} },
+        isolation: { status: "present", detail: "isolation present", evidence: {} },
+        change: { status: "missing", detail: "no change evidence", evidence: {} },
+        validation: { status: "missing", detail: "no validation evidence", evidence: {} },
+        review: { status: "missing", detail: "no review evidence", evidence: {} },
+        risks: { status: "present", detail: "risks present", evidence: {} },
+        approval: { status: "missing", detail: "no approvals", evidence: {} },
+        shipping: { status: "missing", detail: "no shipping evidence", evidence: {} },
+        capsule: { status: "missing", detail: "no capsule marker", evidence: {} },
+        learning: { status: "missing", detail: "no learning evidence", evidence: {} }
+      },
+      summary: {
+        present: ["binding", "contract", "roles", "isolation", "risks"],
+        missing: [
+          "routing",
+          "change",
+          "validation",
+          "review",
+          "approval",
+          "shipping",
+          "capsule",
+          "learning"
+        ],
+        stale: [],
+        mismatched: [],
+        counts: { present: 5, missing: 8, stale: 0, mismatched: 0 }
+      }
+    };
+  }
   return {};
 }
 

@@ -29,6 +29,7 @@ import type {
 } from "../types";
 import { ApprovalQueue } from "./ApprovalQueue";
 import { EvidenceDrawer } from "./EvidenceDrawer";
+import { MissionProofPanel } from "./MissionProofPanel";
 import type { MissionState } from "./types";
 
 export function ActiveMission({
@@ -332,6 +333,11 @@ export function ActiveMission({
       </section>
 
       {children}
+
+      <MissionProofPanel
+        runId={run.run_id}
+        onAuthRequired={onAuthRequired}
+      />
 
       <EvidenceDrawer
         title="Mission evidence"

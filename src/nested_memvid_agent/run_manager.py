@@ -2700,6 +2700,7 @@ class RunManager:
                     "tool.completed" if execution.success else "tool.failed",
                     _execution_payload(execution),
                 )
+                self._publish_shipping_evidence(run_id, execution)
             return execution
         finally:
             self.close_runtime_agent(agent, run_id=run_id)
@@ -4823,6 +4824,7 @@ class RunManager:
         self.events.publish(
             run_id, "tool.completed" if execution.success else "tool.failed", payload
         )
+        self._publish_shipping_evidence(run_id, safe_execution)
         return call, safe_execution
 
     def _finish_agent_turn(
@@ -5518,6 +5520,7 @@ class RunManager:
                     "tool.completed" if execution.success else "tool.failed",
                     _execution_payload(execution),
                 )
+                self._publish_shipping_evidence(run.run_id, execution)
             event_type = {
                 "blocked": "task.blocked",
                 "failed": "task.failed",
@@ -6555,6 +6558,22 @@ class RunManager:
                     "tool.completed" if execution.success else "tool.failed",
                     _execution_payload(execution),
                 )
+                self._publish_shipping_evidence(run_id, execution)
+
+    def _publish_shipping_evidence(
+        self, run_id: str, execution: ToolExecution | None
+    ) -> dict[str, Any] | None:
+        """Publish bounded ``commit.created``/``ship.completed`` shipping evidence.
+
+        JOURNEY-005: when an approved ``git.commit`` tool succeeds inside a
+        mission run, the mission proof projection's shipping section must be
+        able to report ``present``. This is the server-authored bridge — the
+        projection never infers authority from presentation state. No-op for
+        any other tool or a failed execution.
+        """
+        from .mission_flagship import publish_shipping_events
+
+        return publish_shipping_events(run_id, execution, self.events)
 
     def _abort_primary_admission(
         self,
