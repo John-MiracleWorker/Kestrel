@@ -40,6 +40,18 @@ python benchmarks/memory_benchmark_transcript.py \
   --output benchmark_results/memory-transcript.json
 ```
 
+Run the breadth benchmark (fixed multi-seed / k / checkpoint / scenario
+matrix, raw digest-bound results, aggregate metrics, deterministic
+confidence intervals — BENCH-003/BENCH-004):
+
+```bash
+python benchmarks/memory_benchmark_breadth.py \
+  --output benchmark_results/memory-breadth.json
+```
+
+You can narrow the matrix (e.g. for a quick smoke run) with
+`--seeds`, `--k-values`, `--checkpoints`, and `--scenarios`.
+
 The unified runner always attempts the built-in lexical Kestrel and TF-IDF backends first. Dense
 VectorRAG, Qdrant, and Chroma are optional; when their local packages are absent, the JSON report
 records an explicit `skipped` row and an install hint instead of crashing at import time. Missing
@@ -129,6 +141,46 @@ bias, and the deltas for every arm are reported exactly as measured —
 including when Kestrel is not ahead. This follows BENCH-002, which removed
 the oracle layer filter that previously let the Kestrel arm ignore the
 episodic chatter and manufactured its recency advantage.
+
+### Breadth Benchmark (`memory_benchmark_breadth.py`)
+
+Fixed reproducible matrix over the same three arms (Kestrel layered memory,
+flat TF-IDF RAG, recency-biased flat transcript):
+
+- **seeds** (default `42, 1337, 2026`) — multi-seed breadth and
+  seed-level variance.
+- **k values** (default `3, 5`) — cutoff sensitivity.
+- **corpus checkpoints** (default `0, 1, 2`) — growth: checkpoint `i` adds
+  `i * 6` deterministic ground-truth-free filler documents, so growth
+  degradation is measured against the same query set.
+- **scenarios** — `baseline`, `recency`, `conflict`, `update`, `obsolete`,
+  `distractor`, `overlap`, `common_term`. Each stressor is scenario-owned
+  (deterministic documents + ground-truth queries) and none hands the
+  Kestrel arm the ground-truth layer label (BENCH-002).
+
+Published artifact (schema `kestrel.memory_benchmark.v3`):
+
+- **Raw per-query rows** for every arm in every cell: query, layer,
+  expected ids, retrieved ids, Recall@k, Precision@k, MRR, latency.
+- **Aggregate metrics** per arm per cell: Recall@k, Precision@k, MRR,
+  p50/p95/p99 latency.
+- **Deterministic confidence intervals** — percentile bootstrap over the
+  per-query metric values with a fixed RNG seed; deterministic because the
+  per-query metrics are deterministic for the fixed matrix.
+- **Degradation** — recency (baseline vs recency scenario) and growth
+  (smallest vs largest checkpoint) deltas for every arm, exactly as
+  measured, including when Kestrel is not ahead.
+- **Digests** — `fixture_digest` (exact documents + queries of every cell),
+  `environment_digest` (runtime snapshot), `methodology_digest` (matrix
+  config + gate definition), all sha256 of canonical JSON.
+
+The acceptance gate is methodological and fails closed (BENCH-004): every
+arm must return evidence for every query in every cell and all per-query
+metrics and CI bounds must be finite. **No arm is required to win**; the
+report is honest about unfavorable results (for example, under recency
+stress the flat transcript's recency bias degrades, and the honest
+post-BENCH-002 comparison shows Kestrel can also degrade — those deltas are
+reported exactly as measured).
 
 ### Agent Benchmark (`agent_benchmark.py`)
 
