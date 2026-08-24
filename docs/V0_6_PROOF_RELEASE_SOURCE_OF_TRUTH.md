@@ -956,6 +956,90 @@ BENCH-003, BENCH-004, S10 or later slices, installed-artifact final release
 qualification, promotion, publication, post-publication verification, or final
 v0.6 qualification.
 
+### S10 qualification closure (2026-08-24)
+
+[PR #365](https://github.com/John-MiracleWorker/Kestrel/pull/365)
+(`codex/v06-s10-benchmark-breadth`, head
+`d2c51e9f59c28c7df8daa3433a6e8c13c3d580ab` — "fix(bench): make breadth corpus
+module importable in isolation (BENCH-003)", on top of
+`d85926bc4a07661dadbf385a33aea2d1b7fb78a2` "feat(bench): S10 breadth benchmark
+and public artifact (BENCH-003/BENCH-004)") merged to protected `main` as commit
+`b23633f1f46aeae17c59f7f3c294e284b4ef92f3` at 2026-08-24T12:30:57Z. The branch
+implemented BENCH-003 and BENCH-004 (reproducible benchmark breadth and honest
+metric reporting) for the S10 slice:
+
+- **BENCH-003** — a fixed reproducible matrix over three seeds (`42`, `1337`,
+  `2026`) × two k values (`3`, `5`) × three corpus checkpoints (`0`, `1`, `2`,
+  where checkpoint `i` adds `i * 6` deterministic ground-truth-free filler
+  documents) × eight scenario families (`baseline`, `recency`, `conflict`,
+  `update`, `obsolete`, `distractor`, `overlap`, `common_term`) = 144 cells,
+  each run by three arms (Kestrel layered in-memory memory, flat TF-IDF RAG,
+  recency-biased flat transcript) = 11,988 raw per-query rows. Every scenario
+  is scenario-owned (deterministic documents + ground-truth queries) and none
+  hands the Kestrel arm the ground-truth layer label (BENCH-002 carried
+  forward; a spy test proves `layers == tuple(MemoryLayer)` on every query).
+  The published artifact
+  (`benchmark_results/memory-breadth.json`, schema `kestrel.memory_benchmark.v3`)
+  is bound by three sha256 canonical-JSON digests: `fixture_digest`
+  (recomputed from the exact documents + queries of every cell),
+  `environment_digest` (runtime snapshot), and `methodology_digest` (matrix
+  config + gate definition).
+- **BENCH-004** — aggregate Recall@k, Precision@k, MRR, p50/p95/p99 latency
+  per arm per cell, plus deterministic percentile-bootstrap 95% confidence
+  intervals (2000 replicates, fixed seed `1729`, reproducible because the
+  per-query metrics are deterministic for the fixed matrix), and recency +
+  growth degradation deltas for every arm. The methodology gate is
+  fail-closed and never requires Kestrel to win: it passes only when every
+  arm returns evidence for every query in every cell and all per-query
+  metrics and CI bounds are finite. It passed 2160/2160 checks.
+- **Honest results reported exactly as measured (BENCH-004)** — Kestrel is
+  not ahead on most scenarios: flat TF-IDF RAG and/or the recency-biased
+  transcript achieve higher MRR on every scenario except the pathological
+  `common_term` (where all arms are 1.0). Recency stress degrades Kestrel
+  most (MRR −0.1004 vs tfidf −0.0540, transcript −0.0984), matching the S9
+  honest post-BENCH-002 result. Growth (cp0→cp2, baseline) degrades Kestrel
+  −0.0222 vs tfidf 0.0000, transcript −0.0167. For the update-scenario
+  "current rate limits" query all three arms rank the superseded base fact
+  above the newer update doc (measured, not fixed). All of these are recorded
+  as honest unfavorable results, not engineered away.
+
+All required hosted gates green at head `d2c51e9` (attempt 1, no rerun):
+
+- **CI pull_request** [32721063962](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063962):
+  14/14 jobs green — python matrix (Ubuntu/macOS/Windows 3.11/3.12/3.13),
+  docker container-vulnerability-policy, CodeQL, web, desktop, secret-scan,
+  foundational-integrations, extension-sandbox, browser-validation; **push CI**
+  [32721061146](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721061146)
+  14/14 green.
+- **Everyday golden determinism** [32721063906](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063906):
+  7/7 jobs green — memory, memvid, flock-qualification-determinism, runtime
+  reliability Linux/Windows/macOS, and the **Exact-SHA five-cell runtime
+  reliability qualification** gate.
+- Also green at the head: **Installed artifact mission matrix** [32721063911](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063911)
+  (10/10 mission cells) and **Release rehearsal battery** [32721064014](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721064014).
+
+Review outcome on PR #365 is CLEAN (no GAP). The independent orchestrator review
+cold-read the full 7-file diff (all additions; benchmark work only) and verified
+by execution at the exact head `d2c51e9` in a clean detached worktree: the
+focused breadth suite `tests/test_memory_benchmark_breadth.py` 12/12 green in
+isolation (the exact test-isolation defect fixed by `d2c51e9` — the corpus
+module's top-level `from datasets_corpus.memory_corpus import ...` now resolves
+via the same `src/benchmarks` sys.path bootstrap used by sibling modules) and
+12/12 green again in the combined run with the S9 transcript + runner suites
+(24/24 total, no regression); the published `fixture_digest`
+`fddbf80fa90d6438c6495ffa9f5e1ec91f1b81e62f6ee9e66b3d2db378326b5a` was
+independently recomputed from the matrix and matches byte-for-byte; the
+published artifact's 144-cell / 2160-check / 11,988-row shape and the reported
+degradation deltas match the report and the code exactly; zero review threads on
+the PR (CodeRabbit skipped, OSS manual review — the independent orchestrator
+review is the review, matching the S4–S9 precedent).
+
+With the merge at `b23633f` and every hosted gate green at the head, **S10,
+BENCH-003, and BENCH-004 move to `qualified`**. S11 becomes available under its
+separately approved plan. This closure grants no evidence or authority for
+S11/S12, installed-artifact final release qualification, promotion,
+publication, post-publication verification, or final v0.6 qualification.
+
 ## Requirement register
 
 ### Reliability (`REL`)
@@ -1003,8 +1087,8 @@ v0.6 qualification.
 | --- | --- | --- | --- |
 | BENCH-001 | Repair PR #328 before merge. | Standard `log((1+N)/(1+df))+1` IDF; regressions for `df=N-1` and `df=N`; honest backend naming; every review thread resolved. | `qualified` |
 | BENCH-002 | Remove oracle information and enforce one global top-k. | No arm receives ground-truth layer labels; same corpus/query/tokenization/k; Kestrel searches all eligible layers and is trimmed deterministically to global top-k. | `qualified` |
-| BENCH-003 | Measure breadth and growth reproducibly. | Fixed multi-seed matrix, k values, corpus checkpoints, recency/conflict/update/obsolete/distractor/overlap/common-term scenarios, raw results, manifest/environment digests. | `not_started` |
-| BENCH-004 | Report credible metrics and unfavorable results honestly. | Recall@k, Precision@k, MRR, p50/p95/p99 latency, deterministic confidence intervals, recency and growth degradation; methodology gates do not require Kestrel to win. | `not_started` |
+| BENCH-003 | Measure breadth and growth reproducibly. | Fixed multi-seed matrix, k values, corpus checkpoints, recency/conflict/update/obsolete/distractor/overlap/common-term scenarios, raw results, manifest/environment digests. | `qualified` |
+| BENCH-004 | Report credible metrics and unfavorable results honestly. | Recall@k, Precision@k, MRR, p50/p95/p99 latency, deterministic confidence intervals, recency and growth degradation; methodology gates do not require Kestrel to win. | `qualified` |
 
 ### Constrained authority (`AUTH`)
 
@@ -1029,7 +1113,7 @@ v0.6 qualification.
 | S7 | Durable mission proof projection and retrieval references | S6 | `qualified` |
 | S8 | Golden Mission Control and two-task flagship | S7 | `qualified` |
 | S9 | PR #328 fairness repair | S8 | `qualified` |
-| S10 | Benchmark breadth/public artifact | S9 | `not_started` |
+| S10 | Benchmark breadth/public artifact | S9 | `qualified` |
 | S11 | Optional constrained authority and truthful PR #311 reconciliation | S10 | `not_started` |
 | S12 | Final exact-artifact v0.6 qualification and promotion | S0–S11 | `not_started` |
 
@@ -1233,5 +1317,6 @@ trust.
 | MAIN-2026-08-23-S7-QUAL | `741facaa4b06529091a06be87c4a0e99bb640651` (head) | `merged` | `9972ba2e24338cb18e4ea7e7bd674dd8f7b8c924` | [PR #360](https://github.com/John-MiracleWorker/Kestrel/pull/360) head `741faca` merged as main commit `9972ba2` at 2026-08-23T05:23:51Z; exact-head attempt-1 [push CI 32611148694](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32611148694) 14/14 and [PR CI 32611159476](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32611159476) 14/14 (docker container-vulnerability-policy check green, python matrix 6 legs green, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green); exact-head attempt-1 [everyday golden determinism 32611159498](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32611159498) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); also green: [release rehearsal battery 32611159492](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32611159492) and [installed artifact mission matrix 32611159499](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32611159499); review CLEAN (no GAP) — independent orchestrator review, zero open threads | S7, JOURNEY-001, and JOURNEY-002 move to `qualified` at merged SHA `9972ba2`. No S8+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 | MAIN-2026-08-23-S8-QUAL | `8e8de6420bc68c81733d05e42b2da826bf99e621` (head) | `merged` | `140d5412fd41618f910c6754e8c507c517e9ed1c` | [PR #362](https://github.com/John-MiracleWorker/Kestrel/pull/362) head `8e8de64` merged as main commit `140d541` at 2026-08-23T11:28:26Z; exact-head attempt-1 [push CI 32626914550](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626914550) 14/14 and [PR CI 32626959542](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959542) 14/14 (docker container-vulnerability-policy check green, python matrix 6 legs green, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green); exact-head attempt-1 [everyday golden determinism 32626959486](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959486) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); also green: [release rehearsal battery 32626959501](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959501) and [build the exact release payload / mission matrix 32626959493](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959493) (9/9 mission cells); review CLEAN (no GAP) — independent orchestrator review, zero open threads | S8, JOURNEY-003, JOURNEY-005, and JOURNEY-006 move to `qualified` at merged SHA `140d541`. No S9+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 | MAIN-2026-08-23-S9-QUAL | `cdbb117379d0ffe1528f73ded21c328b7d1bd75c` (head) | `merged` | `af41903ae05173e5f7c7c05d708765f5e9adacb7` | [PR #328](https://github.com/John-MiracleWorker/Kestrel/pull/328) head `cdbb117` merged as main commit `af41903` at 2026-08-23T17:32:30Z; exact-head attempt-1 [CI pull_request 32643003961](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003961) 14/14 (python matrix Ubuntu 3.11/3.12/3.13, macOS 3.11/3.12, Windows 3.11, docker container-vulnerability-policy, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green) and [everyday golden determinism 32643003978](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003978) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); also green: [installed artifact mission matrix 32643003985](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003985) (10/10 cells) and [release rehearsal battery 32643003967](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003967) (`rehearse-twenty-consecutive`); review CLEAN (no GAP) — independent orchestrator review: 5-file/777-line cold read + focused `test_memory_transcript_benchmark.py` 9/9 green + benchmark acceptance gate `passed: true` + `run_all.py --memory-only` exit 0 at exact head, 3/3 review threads `isResolved: true` | S9, BENCH-001, and BENCH-002 move to `qualified` at merged SHA `af41903`. No BENCH-003/BENCH-004 (S10 scope), S10+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
+| MAIN-2026-08-24-S10-QUAL | `d2c51e9f59c28c7df8daa3433a6e8c13c3d580ab` (head) | `merged` | `b23633f1f46aeae17c59f7f3c294e284b4ef92f3` | [PR #365](https://github.com/John-MiracleWorker/Kestrel/pull/365) head `d2c51e9` merged as main commit `b23633f` at 2026-08-24T12:30:57Z; exact-head attempt-1 [CI pull_request 32721063962](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063962) 14/14 and [push CI 32721061146](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721061146) 14/14 (python matrix Ubuntu/macOS/Windows 3.11/3.12/3.13, docker container-vulnerability-policy, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green), [everyday golden determinism 32721063906](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063906) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate), [installed artifact mission matrix 32721063911](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063911) (10/10 cells), [release rehearsal battery 32721064014](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721064014); review CLEAN (no GAP) — independent orchestrator review: 7-file cold read (benchmark work only) + `test_memory_benchmark_breadth.py` 12/12 green in isolation at exact head (test-isolation fix `d2c51e9` verified) + combined breadth/S9 suites 24/24 green + published `fixture_digest` `fddbf80fa90d6438c6495ffa9f5e1ec91f1b81e62f6ee9e66b3d2db378326b5a` independently recomputed byte-for-byte + artifact shape 144 cells/2160 checks/11,988 rows verified against report and code, zero review threads | S10, BENCH-003, and BENCH-004 move to `qualified` at merged SHA `b23633f`. No S11/S12, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
