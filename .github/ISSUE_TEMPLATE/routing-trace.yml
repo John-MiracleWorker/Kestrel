@@ -1,0 +1,82 @@
+name: Adaptive Flock routing trace
+description: Report an unexpected target selection or eligibility decision.
+title: "[routing] "
+labels:
+  - routing
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Adaptive Flock. Remove API keys, tokens,
+        private URLs, proprietary prompts, and repository contents before
+        submitting. Reason codes and sanitized target metadata are usually
+        enough to investigate a routing decision.
+  - type: input
+    id: version
+    attributes:
+      label: Kestrel version or commit
+      placeholder: v0.4.8 or a commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Routing mode
+      options:
+        - shadow
+        - constrained
+        - adaptive
+        - off
+    validations:
+      required: true
+  - type: input
+    id: role
+    attributes:
+      label: Task role and family
+      placeholder: reviewer / review
+    validations:
+      required: true
+  - type: input
+    id: selected
+    attributes:
+      label: Selected target
+      placeholder: Sanitized target ID
+    validations:
+      required: true
+  - type: input
+    id: expected
+    attributes:
+      label: Expected target or outcome
+      placeholder: Another target, or no eligible target
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Sanitized task contract
+      description: Include risk, locality, required capabilities, context, and budget. Do not include proprietary task content.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Sanitized routing decision
+      description: Include candidate reason codes and scores when available.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe sequence that reproduces the decision.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private URLs, proprietary prompts, and sensitive repository content.
+          required: true

@@ -58,6 +58,10 @@ from .qualification_records import (
     QualificationRun,
 )
 from .qualification_replay import QualificationReplayer
+from .v06_authority import (
+    V06_AUTHORITY_CLASS_RESTRICTED,
+    scope_is_v06_authorized,
+)
 
 __all__ = [
     "NON_SUSPENSION_REASONS",
@@ -91,6 +95,7 @@ NON_SUSPENSION_REASONS: tuple[str, ...] = (
     "grant_suspended",
     "grant_revoked",
     "high_risk_deterministic_only",
+    "v06_authority_class_restricted",
 )
 
 TARGET_ELIGIBILITY_STATES: tuple[str, ...] = (
@@ -214,6 +219,7 @@ class ActivationEvaluator:
         master_permit: Callable[[], bool] | None = None,
         disabled_scopes: Callable[[], frozenset[str]] | None = None,
         clock: Callable[[], datetime] | None = None,
+        v06_authority_class: bool = False,
     ) -> None:
         if not isinstance(ledger, QualificationLedger):
             raise ValueError("ledger must be a QualificationLedger")
@@ -235,6 +241,7 @@ class ActivationEvaluator:
         self._master_permit = master_permit or env_master_permit
         self._disabled_scopes = disabled_scopes or (lambda: frozenset())
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._v06_authority_class = bool(v06_authority_class)
 
     def evaluate(self, contract: AgentTaskContract) -> ActivationEvaluation:
         """Evaluate the effective grant for one new route decision."""
@@ -272,6 +279,12 @@ class ActivationEvaluator:
             )
 
         reasons: list[str] = []
+
+        # 1b. v0.6 authority class: an out-of-class grant is never
+        #     effective (a class restriction, not drift, so it never
+        #     suspends the grant).
+        if self._v06_authority_class and not scope_is_v06_authorized(grant.scope_json):
+            reasons.append(V06_AUTHORITY_CLASS_RESTRICTED)
 
         # 2. global/scope kill switches.
         if not self._master_permit():

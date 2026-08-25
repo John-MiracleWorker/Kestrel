@@ -62,6 +62,10 @@ from .qualification_records import (
     QualificationRevisionConflict,
     QualificationRun,
 )
+from .v06_authority import (
+    V06_AUTHORITY_CLASS_RESTRICTED,
+    is_v06_authorized_scope,
+)
 
 __all__ = [
     "REVOCATION_BEHAVIOR",
@@ -281,11 +285,13 @@ class ActivationService:
         *,
         integrity: ControlPlaneIntegrity | None = None,
         master_permit: Callable[[], bool] | None = None,
+        v06_authority_class: bool = False,
     ) -> None:
         self._ledger = ledger
         self._integrity = integrity
         self._master_permit = master_permit or env_master_permit
         self._grant_authority = ledger._grant_activation_authority()
+        self._v06_authority_class = bool(v06_authority_class)
 
     def list_grants(self, *, receipt_id: str | None = None) -> list[ActivationGrant]:
         return self._ledger.list_grants(receipt_id=receipt_id)
@@ -341,6 +347,17 @@ class ActivationService:
         # 1. owner principal and expected receipt revision/digest.
         if request.principal != run.owner_principal:
             raise PermissionError("owner confirmation required")
+        # 1b. v0.6 authority class: when the class policy is enabled, the
+        #     only learned authority that may ever be granted is an exact
+        #     low-risk summarizer scope.  An out-of-class activation is
+        #     rejected as a conflict; it never creates a grant.
+        if self._v06_authority_class:
+            run_scope = json.loads(run.scope_json)
+            if not is_v06_authorized_scope(
+                task_family=str(run_scope.get("task_family") or ""),
+                risk=str(run_scope.get("risk") or ""),
+            ):
+                raise ActivationConflict(V06_AUTHORITY_CLASS_RESTRICTED)
         run_section = receipt.payload.get("run")
         bound_revision = 0
         if isinstance(run_section, Mapping):
