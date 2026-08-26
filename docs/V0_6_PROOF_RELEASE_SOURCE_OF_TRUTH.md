@@ -1040,6 +1040,103 @@ separately approved plan. This closure grants no evidence or authority for
 S11/S12, installed-artifact final release qualification, promotion,
 publication, post-publication verification, or final v0.6 qualification.
 
+### S11 qualification closure (2026-08-26)
+
+[PR #367](https://github.com/John-MiracleWorker/Kestrel/pull/367)
+(`codex/v06-s11-constrained-authority`, head
+`5a029e0eacd669217b575fa530851cfda17cf13a` — "feat(s11): constrained v0.6
+authority and truthful PR #311 reconciliation (AUTH-001..004)") merged to
+protected `main` as commit
+`6154a837cae88f8cbb96dc7d608a9021664c2869` at 2026-08-26T10:52:15Z. The
+branch implemented AUTH-001..AUTH-004 and the truthful PR #311 reconciliation
+for the S11 slice:
+
+- **AUTH-001** — the durable-grant acceptance evidence pins the full binding
+  surface: `test_auth001_grant_binds_every_digest_and_rejects_stale_or_mismatched_evidence`
+  walks the 12-mutation matrix (receipt tamper, evidence decay, project
+  authority, privacy, target inventory, model/endpoint, price, policy, learned
+  config, hard ineligibility, replay failure) and asserts each makes the grant
+  ineffective with the correct reason code **and** appends exactly one automatic
+  `suspended` transition (material drift is suspended, never rewritten, never
+  silently accepted); plus scope-mismatch rejection (`durable_grant_required`)
+  and stale-receipt activation rejection (`receipt_digest_changed`).
+- **AUTH-002** — new `src/nested_memvid_agent/routing/v06_authority.py`
+  defines the only v0.6 learned-authority class: an exact, owner-activated,
+  **low-risk summarizer** scope. Fail-closed predicates
+  (`is_v06_authorized_scope`, `scope_is_v06_authorized`,
+  `scope_class_digest`) are wired opt-in (`v06_authority_class=True`) into
+  `ActivationService.activate_scopes` (out-of-class activation rejected as
+  `ActivationConflict` — no grant is ever created) and
+  `ActivationEvaluator.evaluate` (out-of-class grants are never effective,
+  with a non-suspension `v06_authority_class_restricted` reason, so a class
+  restriction is never mislabeled as drift). Tests pin no default grant,
+  owner-only principal activation, receipt-meets-thresholds, and the unchanged
+  capability boundary.
+- **AUTH-003** — the coordinator's shadow observation now records the durable
+  `deterministic_fallback_after_suspension` authority label whenever a resolved
+  grant is suspended, revoked, kill-switched, or drift-suspended (the value was
+  previously reserved and never produced); `actual_authority_for` gains a
+  backward-compatible `activation_ineffective_reasons` parameter (default `()`).
+  Tests cover the label unit-level, end-to-end (kill switch / revocation /
+  policy drift), and a threaded concurrent-drift-evaluator convergence test
+  (exactly one `suspended` transition, both racers fail closed).
+- **AUTH-004** — `docs/RELEASE_CHECKLIST.md` gains a "v0.6 Learned Authority
+  Qualification (AUTH-004)" section that records the qualification outcome
+  **without** converting lack of activation evidence into a failure and without
+  weakening activation thresholds; shadow-only is a valid, expected outcome.
+  Pinned by a checklist test.
+- **Truthful PR #311 reconciliation** — `docs/PR311_RECONCILIATION.md` records
+  that [PR #311](https://github.com/John-MiracleWorker/Kestrel/pull/311)
+  (`agent/adaptive-flock-launch`, based on v0.4.8) is superseded and now
+  closed, that learned routing is inert in production by design (verified at
+  the review head: `server.py`/`cli.py` wire no `activation_evaluator`; the
+  coordinator falls back to the deterministic static path with
+  `durable_grant_required`), and that the reconciled demo/docs/README content
+  now states that truth. The demo script is provider-free, deterministic, and
+  non-authoritative; no routing behavior changed.
+
+All required hosted gates green at head `5a029e0` (attempt 1, no rerun):
+
+- **CI pull_request** [32850502799](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502799):
+  14/14 jobs green — python matrix (Ubuntu/macOS/Windows 3.11/3.12/3.13),
+  docker container-vulnerability-policy, CodeQL, web, desktop, secret-scan,
+  foundational-integrations, extension-sandbox, browser-validation; **push CI**
+  [32850481063](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850481063)
+  green.
+- **Everyday golden determinism** [32850502865](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502865):
+  7/7 jobs green — memory, memvid, flock-qualification-determinism, runtime
+  reliability Linux/Windows/macOS, and the **Exact-SHA five-cell runtime
+  reliability qualification** gate.
+- Also green at the head: **Installed artifact mission matrix**
+  [32850502830](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502830)
+  (10/10 mission cells) and **Release rehearsal battery**
+  [32850502862](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502862).
+
+Review outcome on PR #367 is CLEAN (no GAP). The independent orchestrator
+review cold-read the full 14-file diff in a clean detached worktree at the
+exact head `5a029e0` and verified by execution: the S11 acceptance evidence
+`tests/test_v06_authority_class.py` (16 tests) and
+`tests/test_adaptive_flock_demo.py` (4 tests) 20/20 green in isolation; the
+combined focused suite (activation evaluator/service/transitions, authority
+boundaries, grant runtime, shadow-observation ledger, learned routing, learned
+shadow router, plus the S11 files) 139/139 green — no regression; the PR #311
+reconciliation's core factual claims were re-verified against the code
+(`server.py`/`cli.py` wire no `activation_evaluator`; the coordinator records
+`durable_grant_required` on the no-grant path; PR #311 is never-merged/closed);
+the v0.6 class guard is fail-closed (malformed scopes never authorized;
+out-of-class activation rejected; out-of-class evaluation never effective and
+never suspends the grant); and the `actual_authority_for` change is
+backward-compatible (default `activation_ineffective_reasons=()` preserves
+every pre-S11 call site). Zero review threads on the PR (OSS manual review —
+the independent orchestrator review is the review, matching the S4–S10
+precedent).
+
+With the merge at `6154a837` and every hosted gate green at the head, **S11 and
+AUTH-001..AUTH-004 move to `qualified`**. S12 becomes available under its
+separately approved plan. This closure grants no evidence or authority for
+S12, installed-artifact final release qualification, promotion, publication,
+post-publication verification, or final v0.6 qualification.
+
 ## Requirement register
 
 ### Reliability (`REL`)
@@ -1094,10 +1191,10 @@ publication, post-publication verification, or final v0.6 qualification.
 
 | ID | Requirement | Acceptance evidence | Status |
 | --- | --- | --- | --- |
-| AUTH-001 | Qualification grants zero authority; exact owner activation remains mandatory. | Durable grant tests bind scope, policy/inventory/config/receipt digests and reject stale or mismatched evidence. | `not_started` |
-| AUTH-002 | Initial v0.6 authority is limited to qualified low-risk summarizer selection. | No default grant; current qualification receipt meets existing thresholds; explicit owner action; unchanged capability boundary. | `not_started` |
-| AUTH-003 | Drift, suspension, kill switch, or revocation immediately restores deterministic routing for new decisions. | Concurrent/state-transition tests plus durable fallback evidence and Workbench status. | `not_started` |
-| AUTH-004 | v0.6 may ship shadow-only when evidence does not support activation. | Release checklist records qualification outcome without converting lack of evidence into a failure or weakening thresholds. | `not_started` |
+| AUTH-001 | Qualification grants zero authority; exact owner activation remains mandatory. | Durable grant tests bind scope, policy/inventory/config/receipt digests and reject stale or mismatched evidence. | `qualified` |
+| AUTH-002 | Initial v0.6 authority is limited to qualified low-risk summarizer selection. | No default grant; current qualification receipt meets existing thresholds; explicit owner action; unchanged capability boundary. | `qualified` |
+| AUTH-003 | Drift, suspension, kill switch, or revocation immediately restores deterministic routing for new decisions. | Concurrent/state-transition tests plus durable fallback evidence and Workbench status. | `qualified` |
+| AUTH-004 | v0.6 may ship shadow-only when evidence does not support activation. | Release checklist records qualification outcome without converting lack of evidence into a failure or weakening thresholds. | `qualified` |
 
 ## Delivery slices and dependencies
 
@@ -1114,7 +1211,7 @@ publication, post-publication verification, or final v0.6 qualification.
 | S8 | Golden Mission Control and two-task flagship | S7 | `qualified` |
 | S9 | PR #328 fairness repair | S8 | `qualified` |
 | S10 | Benchmark breadth/public artifact | S9 | `qualified` |
-| S11 | Optional constrained authority and truthful PR #311 reconciliation | S10 | `not_started` |
+| S11 | Optional constrained authority and truthful PR #311 reconciliation | S10 | `qualified` |
 | S12 | Final exact-artifact v0.6 qualification and promotion | S0–S11 | `not_started` |
 
 ## Executable task briefs
@@ -1318,5 +1415,6 @@ trust.
 | MAIN-2026-08-23-S8-QUAL | `8e8de6420bc68c81733d05e42b2da826bf99e621` (head) | `merged` | `140d5412fd41618f910c6754e8c507c517e9ed1c` | [PR #362](https://github.com/John-MiracleWorker/Kestrel/pull/362) head `8e8de64` merged as main commit `140d541` at 2026-08-23T11:28:26Z; exact-head attempt-1 [push CI 32626914550](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626914550) 14/14 and [PR CI 32626959542](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959542) 14/14 (docker container-vulnerability-policy check green, python matrix 6 legs green, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green); exact-head attempt-1 [everyday golden determinism 32626959486](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959486) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); also green: [release rehearsal battery 32626959501](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959501) and [build the exact release payload / mission matrix 32626959493](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32626959493) (9/9 mission cells); review CLEAN (no GAP) — independent orchestrator review, zero open threads | S8, JOURNEY-003, JOURNEY-005, and JOURNEY-006 move to `qualified` at merged SHA `140d541`. No S9+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 | MAIN-2026-08-23-S9-QUAL | `cdbb117379d0ffe1528f73ded21c328b7d1bd75c` (head) | `merged` | `af41903ae05173e5f7c7c05d708765f5e9adacb7` | [PR #328](https://github.com/John-MiracleWorker/Kestrel/pull/328) head `cdbb117` merged as main commit `af41903` at 2026-08-23T17:32:30Z; exact-head attempt-1 [CI pull_request 32643003961](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003961) 14/14 (python matrix Ubuntu 3.11/3.12/3.13, macOS 3.11/3.12, Windows 3.11, docker container-vulnerability-policy, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green) and [everyday golden determinism 32643003978](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003978) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate); also green: [installed artifact mission matrix 32643003985](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003985) (10/10 cells) and [release rehearsal battery 32643003967](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32643003967) (`rehearse-twenty-consecutive`); review CLEAN (no GAP) — independent orchestrator review: 5-file/777-line cold read + focused `test_memory_transcript_benchmark.py` 9/9 green + benchmark acceptance gate `passed: true` + `run_all.py --memory-only` exit 0 at exact head, 3/3 review threads `isResolved: true` | S9, BENCH-001, and BENCH-002 move to `qualified` at merged SHA `af41903`. No BENCH-003/BENCH-004 (S10 scope), S10+, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 | MAIN-2026-08-24-S10-QUAL | `d2c51e9f59c28c7df8daa3433a6e8c13c3d580ab` (head) | `merged` | `b23633f1f46aeae17c59f7f3c294e284b4ef92f3` | [PR #365](https://github.com/John-MiracleWorker/Kestrel/pull/365) head `d2c51e9` merged as main commit `b23633f` at 2026-08-24T12:30:57Z; exact-head attempt-1 [CI pull_request 32721063962](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063962) 14/14 and [push CI 32721061146](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721061146) 14/14 (python matrix Ubuntu/macOS/Windows 3.11/3.12/3.13, docker container-vulnerability-policy, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green), [everyday golden determinism 32721063906](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063906) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate), [installed artifact mission matrix 32721063911](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721063911) (10/10 cells), [release rehearsal battery 32721064014](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32721064014); review CLEAN (no GAP) — independent orchestrator review: 7-file cold read (benchmark work only) + `test_memory_benchmark_breadth.py` 12/12 green in isolation at exact head (test-isolation fix `d2c51e9` verified) + combined breadth/S9 suites 24/24 green + published `fixture_digest` `fddbf80fa90d6438c6495ffa9f5e1ec91f1b81e62f6ee9e66b3d2db378326b5a` independently recomputed byte-for-byte + artifact shape 144 cells/2160 checks/11,988 rows verified against report and code, zero review threads | S10, BENCH-003, and BENCH-004 move to `qualified` at merged SHA `b23633f`. No S11/S12, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
+| MAIN-2026-08-26-S11-QUAL | `5a029e0eacd669217b575fa530851cfda17cf13a` (head) | `merged` | `6154a837cae88f8cbb96dc7d608a9021664c2869` | [PR #367](https://github.com/John-MiracleWorker/Kestrel/pull/367) head `5a029e0` merged as main commit `6154a837` at 2026-08-26T10:52:15Z; exact-head attempt-1 [CI pull_request 32850502799](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502799) 14/14 and [push CI 32850481063](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850481063) 14/14 (python matrix Ubuntu/macOS/Windows 3.11/3.12/3.13, docker container-vulnerability-policy, CodeQL/web/desktop/secret-scan/foundational-integrations/extension-sandbox/browser-validation green), [everyday golden determinism 32850502865](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502865) 7/7 (memory, memvid, flock-qualification-determinism, runtime reliability Linux/Windows/macOS, Exact-SHA five-cell gate), [installed artifact mission matrix 32850502830](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502830) (10/10 cells), [release rehearsal battery 32850502862](https://github.com/John-MiracleWorker/Kestrel/actions/runs/32850502862); review CLEAN (no GAP) — independent orchestrator review: 14-file/1,750-line cold read in a clean detached worktree at the exact head + S11 acceptance evidence `tests/test_v06_authority_class.py` 16/16 and `tests/test_adaptive_flock_demo.py` 4/4 green in isolation at the exact head + combined focused suite (activation, grant runtime, shadow-observation, learned routing, S11 files) 139/139 green — no regression + PR #311 reconciliation claims re-verified against the code (no `activation_evaluator` wiring, `durable_grant_required` fallback, PR #311 never-merged/closed) + v0.6 class guard fail-closed (malformed/out-of-class never authorized; activation rejected; evaluation never effective and never suspends the grant) + `actual_authority_for` backward-compatible (default `activation_ineffective_reasons=()`), zero review threads | S11 and AUTH-001, AUTH-002, AUTH-003, and AUTH-004 move to `qualified` at merged SHA `6154a837`. No S12, installed-artifact final release, promotion, publication, or final v0.6 qualification is granted. |
 
 Append new rows; do not rewrite a failed or superseded receipt into a pass.
