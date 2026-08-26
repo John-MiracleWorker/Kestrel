@@ -188,12 +188,54 @@ SQLite is not used as a substitute for Kestrel's layered memory model.
 | Context compilation | Token-aware retrieval, deduplication, conflict warnings, summary-first packing, and raw evidence expansion. |
 | Failure-aware execution | Failure classification, recalled lessons, proof-of-work summaries, and changed-strategy retry gates. |
 | Controlled learning | Run capsules, promotion decisions, validation evidence, behavior deltas, activation metrics, outcome records, and rollback. |
+| Adaptive Flock | Inspectable, policy-bound routing contracts across configured model targets, with shadow-first observation, hard eligibility filters, review diversity, and durable outcomes. Learned routing is inert in production until an exact owner-activated grant exists. |
 | Safe repair | Repair branches or worktrees, approval-gated patching, isolated validation, review artifacts, literal-tree commits, and rollback quarantine. |
 | Capability control | Per-tool, MCP-server, and skill switches with configured state, effective state, revision history, and blocker explanations. |
 | Proactive routines | Disabled-by-default one-shot and interval routines with revision checks, leased occurrences, overlap suppression, and manual run-now. |
 | Extensibility | Built-in tools, managed MCP sessions, local skills, and a review-first GitHub plugin flow. |
 | Channels | Telegram-shaped, Discord-shaped, generic webhook, and custom JSON ingress with outbound delivery disabled by default. |
 | Operations | Doctor checks, setup readiness, provider certification, support bundles, backups, restores, traces, tests, and golden evals. |
+
+---
+
+## Adaptive Flock: Inspectable Routing Contracts, Preserved Guardrails
+
+Adaptive Flock's routing contracts let Kestrel score how planner, executor,
+and reviewer work *could* be assigned across different configured model
+targets. Each decision starts from a typed task contract and applies hard
+constraints before scoring eligible candidates: locality, tools, context
+size, structured output, risk quality floors, cost budgets, health, and
+reviewer independence.
+
+Routing does not grant authority. The selected target receives only the
+tools, workspace scope, and approvals already permitted for that task. The
+runtime is disabled by default, and shadow mode records a counterfactual
+choice without making it actionable.
+
+**Production truth (S11 / PR #311):** learned routing is inert in the
+shipped runtime by design — neither `server.py` nor `cli.py` wires an
+activation evaluator, so every real decision falls back to the
+deterministic static path with `durable_grant_required`. The only v0.6
+learned-authority class is an exact, owner-activated, low-risk summarizer
+scope (AUTH-002). Qualification and shadow observation grant zero
+authority; a live grant requires a separate, durable, owner-activated
+decision, and drift, suspension, a kill switch, or revocation immediately
+restores deterministic routing for new decisions (AUTH-003).
+
+Run the deterministic, provider-free demo:
+
+```bash
+python scripts/demo_adaptive_flock.py
+python scripts/demo_adaptive_flock.py --json
+```
+
+The demo uses Kestrel's real routing contracts and scoring logic to route a
+planner, local tool-capable executor, and independent reviewer. It makes no
+provider calls, executes no assignment, modifies no files, performs no Git
+operations, and grants no production authority — the JSON report carries a
+`production_truth` block stating so. See
+[the Adaptive Flock demo guide](docs/ADAPTIVE_FLOCK_DEMO.md) for the output
+contract, modes, and safe rollout path.
 
 ---
 

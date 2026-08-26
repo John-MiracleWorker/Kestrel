@@ -1,0 +1,76 @@
+name: Provider profile request
+description: Propose a provider or model-target configuration for Adaptive Flock.
+title: "[provider-profile] "
+labels:
+  - routing
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe public configuration metadata only. Never paste API keys,
+        tokens, credential files, or private endpoint URLs into an issue.
+        Kestrel stores secret references separately from public provider
+        profile metadata.
+  - type: input
+    id: provider
+    attributes:
+      label: Provider or adapter
+      placeholder: OpenAI-compatible, Anthropic, Gemini, local server, or Codex CLI
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model or deployment
+      placeholder: Public model name or a sanitized deployment label
+    validations:
+      required: true
+  - type: dropdown
+    id: locality
+    attributes:
+      label: Locality
+      options:
+        - local
+        - cloud
+        - hybrid
+    validations:
+      required: true
+  - type: checkboxes
+    id: capabilities
+    attributes:
+      label: Capabilities
+      options:
+        - label: Tool calling
+        - label: Structured JSON output
+        - label: Vision input
+        - label: Reasoning
+        - label: Streaming
+  - type: textarea
+    id: roles
+    attributes:
+      label: Intended roles and task families
+      placeholder: Planner, bounded code executor, independent reviewer…
+    validations:
+      required: true
+  - type: textarea
+    id: metadata
+    attributes:
+      label: Public routing metadata
+      description: Include known context limits, cost or latency tiers, model family, and trust considerations. Use estimates only when clearly labeled.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation evidence
+      description: Explain how the target was tested and what remains unverified.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: This request contains no credentials, tokens, or private endpoint URLs.
+          required: true

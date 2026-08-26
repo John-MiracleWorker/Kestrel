@@ -259,6 +259,11 @@ class DurableRoutingCoordinator:
                 selection_kind=decision.selection_kind,
                 activation_effective=authority is not None and authority.effective,
                 operator_pinned=operator_pinned,
+                activation_ineffective_reasons=(
+                    authority.reason_codes
+                    if authority is not None and not authority.effective
+                    else ()
+                ),
             ),
             decision=decision,
             contract=contract,

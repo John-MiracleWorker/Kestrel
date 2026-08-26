@@ -384,6 +384,32 @@ Run the authenticated mock-provider soak command from `docs/PRODUCTION_OPERATION
   deletion outside an explicit incident-recovery procedure.
 - `docs/CONTROLLED_SELF_MODIFICATION.md` documents behavior-delta gates, review, replay, rollback, and live-learning boundaries.
 
+## v0.6 Learned Authority Qualification (AUTH-004)
+
+Record the v0.6 learned-authority outcome in the release evidence **without
+converting lack of activation evidence into a failure and without weakening
+the activation thresholds**:
+
+- State whether the release activates a live learned-authority grant. If it
+  does, the grant must be an **exact, owner-activated, low-risk summarizer
+  scope** bound to a qualification receipt that meets the existing thresholds
+  (AUTH-001/AUTH-002). Record the grant id, scope digest, receipt id, and the
+  current drift/suspension/revocation state.
+- If no live grant is activated, record the release as **shadow-only**: the
+  production runtime ships with learned routing inert (no wired activation
+  evaluator) and every decision falls back to the deterministic static path
+  with `durable_grant_required`. Shadow-only is a **valid, expected v0.6
+  outcome**, not a failure.
+- Verify the AUTH-001..004 evidence is present in the candidate:
+  `tests/test_v06_authority_class.py` (durable grant digest bindings, the
+  v0.6 low-risk summarizer class guard, drift/suspension/kill-switch/
+  revocation deterministic fallback with durable
+  `deterministic_fallback_after_suspension` evidence, and this checklist
+  pin).
+- Verify the Workbench Routing authority panel still distinguishes
+  deterministic / shadow / activated / suspended-fallback states
+  (`web/src/routing/RoutingCenter.test.tsx`).
+
 ## Release Gate
 
 Do not tag the release if any of these are true:

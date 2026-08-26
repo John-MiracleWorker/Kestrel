@@ -29,6 +29,7 @@ Actual authority values (the SOT durable-interface vocabulary) are closed:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
@@ -541,25 +542,65 @@ def shadow_role_for(role: str) -> ShadowRole:
     return ShadowRole.EXECUTOR
 
 
+#: Reason codes that mean a durable grant was resolved but its authority
+#: state currently blocks it (suspension, revocation, a kill switch, or a
+#: drift condition that suspends the grant).  When one of these is present
+#: on an ineffective activation evaluation, the durable authority label is
+#: ``deterministic_fallback_after_suspension`` (AUTH-003) rather than plain
+#: ``deterministic_static`` -- the fallback is real, state-driven, and
+#: truthfully recorded.
+FALLBACK_AUTHORITY_REASONS: frozenset[str] = frozenset(
+    {
+        "grant_suspended",
+        "grant_revoked",
+        "global_learned_authority_disabled",
+        "scope_learned_authority_disabled",
+        "receipt_authentication_failed",
+        "evidence_below_threshold",
+        "project_authority_changed",
+        "privacy_binding_changed",
+        "target_inventory_changed",
+        "price_snapshot_changed",
+        "routing_policy_changed",
+        "learned_configuration_changed",
+        "target_hard_ineligible",
+        "replay_verification_failed",
+        "activation_evaluation_failed",
+    }
+)
+
+
 def actual_authority_for(
     *,
     selection_kind: str,
     activation_effective: bool,
     operator_pinned: bool,
+    activation_ineffective_reasons: Sequence[str] = (),
 ) -> ActualAuthority:
     """Derive the durable authority label for one executed routing decision.
 
     ``operator_pinned`` wins (an explicit override is always authoritative),
     then a genuinely effective learned grant (``adaptive_activated``), and
-    otherwise ordinary deterministic static routing.  The suspension-fallback
-    value is reserved for AUTH-003; this coordinator path never produces it
-    because suspension/revocation is not yet a live state.
+    then ordinary deterministic static routing.
+
+    When a durable grant *was* resolved but its authority state currently
+    blocks it -- suspension, revocation, a global/scope kill switch, or a
+    drift condition that suspends the grant -- the durable label is
+    ``deterministic_fallback_after_suspension`` (AUTH-003).  Every new
+    decision routes deterministically, and the recorded label makes the
+    fallback evidence-backed rather than indistinguishable from a system
+    that never had a grant.
     """
 
     if operator_pinned or selection_kind == "operator_override":
         return ActualAuthority.OPERATOR_PINNED
     if activation_effective or selection_kind == "learned_constrained":
         return ActualAuthority.ADAPTIVE_ACTIVATED
+    if any(
+        reason in FALLBACK_AUTHORITY_REASONS
+        for reason in activation_ineffective_reasons
+    ):
+        return ActualAuthority.DETERMINISTIC_FALLBACK_AFTER_SUSPENSION
     return ActualAuthority.DETERMINISTIC_STATIC
 
 
