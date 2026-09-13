@@ -12,8 +12,10 @@ ambient code.
 ## Current implementation boundary
 
 This document describes the intended production boundary and the locally implemented
-protocol/staging/controller slices. It does **not** claim that S2 is production-operable or
-qualified. `scripts/recovery_capsule_controller.py` is an explicit Ubuntu x86_64 owner-side
+protocol/staging/controller slices. The S2 exact-SHA candidate/promotion transaction is
+`qualified` in the source of truth (PR #344 merged as `a29b2e02` on 2026-08-18, reflected by PR
+#345). That qualification covers the mechanism and its green hosted gates; it does **not** claim
+that S2 is production-operable. `scripts/recovery_capsule_controller.py` is an explicit Ubuntu x86_64 owner-side
 controller. It observes and downloads the authorization and dependency artifacts by exact server
 artifact ID, binds both server-computed digests, reconstructs the installed environment at the
 exact later runner path, creates and publishes the immutable recovery capsule, independently
@@ -25,9 +27,13 @@ recovery repository, and it does not replace the later per-role `release-prepara
 `release-commit-authority`, verification, PyPI, and final authority publications. The private
 recovery repository, owner signing material, protected environments, scoped credentials, later
 role authorities, and exact-SHA hosted qualification are separate external owner gates. Until
-those gates produce append-only receipts, the implementation grants no release authority, does
-not make the production transaction qualified, and does not change the `not_started` S2 status in
-`docs/V0_6_PROOF_RELEASE_SOURCE_OF_TRUTH.md`.
+those gates produce append-only receipts, the implementation grants no release authority.
+
+The S2 `qualified` status recorded in `docs/V0_6_PROOF_RELEASE_SOURCE_OF_TRUTH.md` (by PR #345,
+owner decision 2026-08-18) reflects the merged mechanism plus green hosted gates only. Per the
+owner directive, owner-controlled gate receipts are deferred to S12 final qualification; this
+boundary is unchanged by the S2 status, and production release authority still requires the
+append-only receipts named above.
 
 ## Owner-side controller invocation
 
